@@ -99,6 +99,7 @@ mod pipeline;
 pub mod reader;
 pub mod sort;
 pub mod tags_count;
+pub mod tags_filter;
 pub mod writer;
 
 #[allow(clippy::all, clippy::pedantic, clippy::restriction)]

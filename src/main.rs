@@ -59,6 +59,20 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
     },
+    /// Filter elements by tag expressions
+    TagsFilter {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Omit referenced objects (faster, single pass)
+        #[arg(short = 'R', long = "omit-referenced")]
+        omit_referenced: bool,
+        /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
+        #[arg(required = true)]
+        expressions: Vec<String>,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -91,6 +105,12 @@ fn main() {
             type_filter,
         } => run_cat(&files, &output, type_filter.as_deref()),
         Command::Sort { file, output } => run_sort(&file, &output),
+        Command::TagsFilter {
+            file,
+            output,
+            omit_referenced,
+            expressions,
+        } => run_tags_filter(&file, &output, &expressions, omit_referenced),
         Command::Merge {
             base,
             changes,
@@ -227,6 +247,17 @@ fn run_sort(
     output: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::sort::sort(file, output)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_tags_filter(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    expressions: &[String],
+    omit_referenced: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced)?;
     stats.print_summary();
     Ok(())
 }

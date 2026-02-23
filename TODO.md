@@ -91,17 +91,13 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   CLI: `pbfhogg sort <input.osm.pbf> -o <output.osm.pbf>`
   Equivalent to: `osmium sort`
 
-### Low-hanging fruit
-
-- [ ] `pbfhogg tags-filter` — filter elements by tag expressions
+- [x] `pbfhogg tags-filter` — filter elements by tag expressions
   CLI: `pbfhogg tags-filter <input.osm.pbf> -o <output.osm.pbf> <expressions...>`
   Equivalent to: `osmium tags-filter`
   Expression parser supporting: key-only (`amenity`), exact value (`highway=primary`),
   negation (`highway!=primary`), multiple values (`type=multipolygon,boundary`), wildcard
-  prefix (`addr:*`), type prefixes (`n/`, `w/`, `r/`, `nw/`). Single-pass filter. By
-  default include referenced objects (nodes of matching ways); `-R` to omit them (faster,
-  single pass). `IndexedReader` already does two-pass way+deps filtering — extend with the
-  expression syntax.
+  prefix (`addr:*`), type prefixes (`n/`, `w/`, `r/`, `nw/`). Two-pass filter by default
+  (include referenced nodes of matching ways); `-R` for single-pass (omit references, faster).
 
 ### Medium effort
 

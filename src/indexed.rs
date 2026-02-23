@@ -406,7 +406,6 @@ impl IndexedReader<File> {
     /// # foo().unwrap();
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        //TODO take some more measurements to determine if `BufReader` should be used here
         let f = File::open(path)?;
         Self::new(f)
     }

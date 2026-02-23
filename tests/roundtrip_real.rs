@@ -1,6 +1,6 @@
 //! Real-data round-trip: read Denmark PBF → write back → read again → compare.
 //!
-//! Skipped if `data/denmark-latest.osm.pbf` doesn't exist.
+//! Skipped if `data/denmark-20260220-seq4704.osm.pbf` doesn't exist.
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -13,7 +13,7 @@ fn denmark_path() -> std::path::PathBuf {
     if let Ok(p) = std::env::var("PBFHOGG_TEST_PBF") {
         return std::path::PathBuf::from(p);
     }
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("data/denmark-latest.osm.pbf")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("data/denmark-20260220-seq4704.osm.pbf")
 }
 
 fn output_path() -> std::path::PathBuf {

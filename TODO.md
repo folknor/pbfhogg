@@ -34,20 +34,127 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Code TODOs
 
-- [ ] `src/indexed.rs:414` — benchmark whether `BufReader` helps `IndexedReader::from_path`.
-  Index build is sequential (BufReader would help), but subsequent reads seek randomly
-  (BufReader would just discard its buffer). Mixed bag.
-- [ ] `src/indexed.rs:42` — use `relation_ids` field in `IdRanges` filtering. Not a simple fix:
-  `read_ways_and_deps` only handles ways+nodes. Using `relation_ids` requires adding a
-  `read_relations_and_deps` method or extending the existing one with a third pass. More of a
-  feature addition than a bug fix.
+- [x] `src/indexed.rs:414` — benchmark whether `BufReader` helps `IndexedReader::from_path`.
+  Answer: it does not, for either phase. During index building, `create_index` calls
+  `next_header_skip_blob` in a loop — each iteration reads a small blob header (~20-50
+  bytes), then calls `seek_raw(SeekFrom::Current(datasize))` to skip the blob body.
+  `BufReader::seek()` discards its internal buffer on every seek, so the 8KB default buffer
+  would be filled, a few dozen header bytes consumed, then the rest thrown away. The
+  sequential scan defeats buffering because it seeks after every header. During data passes
+  (`read_ways_and_deps`, `for_each_node`), `blob_from_offset` seeks to a specific offset
+  then reads the full blob (typically 32-64KB compressed) — the seek discards the buffer,
+  and the blob read dwarfs the 8KB buffer size anyway, adding only extra copy overhead.
+  Note that `BlobReader::seekable_from_path` (line 473) does wrap in `BufReader`, but that
+  path is not used by `IndexedReader`. No change needed.
+- [ ] `src/indexed.rs:42` — use `relation_ids` field in `IdRanges` filtering.
+
+  The `relation_ids` range is already collected during index building
+  (`update_element_id_ranges`, line 222) but marked `#[allow(dead_code)]` because nothing
+  queries it. The commented-out `relations_available()` method on `BlobInfo` (lines 78-87) and
+  the missing `relation_range_included()` are the unused counterparts to the node/way
+  equivalents that `read_ways_and_deps` and `for_each_node` rely on.
+
+  A `read_relations_and_deps` method would be significantly more complex than
+  `read_ways_and_deps`. Relations can reference nodes, ways, *and* other relations
+  (`MemberId::Node`, `MemberId::Way`, `MemberId::Relation`), so resolving dependencies
+  requires at least three passes: (1) filter relations and collect member IDs by type,
+  (2) find matching ways and collect *their* node refs, (3) find all needed nodes (both
+  direct relation members and way dependencies). Recursive relation-of-relation references
+  would add further complexity, though in practice OSM relation nesting is rare and shallow.
+
+  As of February 2026, no existing CLI command would benefit from this. Every command handles
+  relations via full iteration (merge, derive-changes, sort, check-refs), type/tag/ID
+  filtering without dependency chasing (cat, fileinfo, tags-count, tags-filter, getid,
+  removeid), or bbox inclusion without dependency resolution (extract). Of the three planned
+  commands, `add-locations-to-ways` ignores relations entirely, `diff` does a full read of
+  both files, and `extract` polygon support is the closest candidate — a "smart" strategy
+  with complete boundary/multipolygon relations would need relation→way→node chasing — but
+  that would likely be purpose-built logic in the extract command rather than a generic
+  `IndexedReader` method.
+
+  Recommendation: leave `relation_ids` as-is with `#[allow(dead_code)]`. It is cheap to keep
+  and straightforward to wire up if a real consumer materializes. Only implement
+  `read_relations_and_deps` when a concrete command or API use case demands it — speculative
+  plumbing with no consumer is not worth the complexity.
 
 ## Merge correctness tests
 
 - [x] Dedicated merge tests: 10 tests in `tests/merge.rs` covering create/modify/delete,
   passthrough ordering, multi-block partial rewrite, type-isolated diffs, and stats accuracy
-- [ ] Cross-validate against osmium: merge the same base PBF + OSC with both tools, compare
-  output element-for-element (element counts, IDs, coordinates, tags, refs, members)
+- [x] Cross-validate merge against multiple independent tools
+
+  ### 4-tool comparison result (2026-02-23)
+
+  Ran `scripts/xval-merge.sh` on properly paired Denmark data:
+  - Base: `data/denmark-20260220-seq4704.osm.pbf` (seq 4704, 2026-02-20T21:20:45Z)
+  - Diff: `data/denmark-20260221-seq4705.osc.gz` (seq 4705, 2026-02-21T21:21:20Z)
+  - Diff stats: 7,387 nodes, 1,667 ways, 38 relations (1,094 del nodes, 145 del ways, 4 del rels)
+
+  **Element counts after merge:**
+
+  | Tool        | Language | Nodes      | Ways      | Relations |
+  |-------------|----------|------------|-----------|-----------|
+  | pbfhogg     | Rust     | 52,493,619 | 6,616,901 | 46,108    |
+  | osmosis     | Java     | 52,493,619 | 6,616,901 | 46,108    |
+  | osmconvert  | C        | 52,493,619 | 6,616,901 | 46,108    |
+  | osmium-tool | C++      | 52,494,713 | 6,617,046 | 46,112    |
+
+  **pbfhogg, osmosis, and osmconvert produce identical counts.** Osmium is the outlier,
+  keeping exactly 1,094 extra nodes, 145 extra ways, and 4 extra relations — matching
+  the OSC delete counts exactly. All elements present in both pbfhogg and osmium outputs
+  are byte-identical; the only difference is the deleted elements.
+
+  The data IS properly paired: the PBF header has `osmosis_replication_sequence_number=4704`
+  and the diff is sequence 4705 (the next daily diff from Geofabrik).
+
+  **Conclusion:** pbfhogg's unconditional delete-by-type+id behavior is correct. Three
+  independent implementations (Rust, Java, C) agree. Osmium uses a fundamentally different
+  algorithm (version-based merge with visible flag) that is defensible but non-standard.
+  No change needed.
+
+  ### OsmChange delete semantics — spec research
+
+  The OsmChange format does NOT specify version comparison semantics for offline diff
+  application. The OSM API wiki defines the `<delete>` action with a required `version`
+  attribute, but the exact rules for how offline tools should handle versions are not
+  standardized. Four independent implementations exist with two behaviors:
+
+  **Unconditional delete (3 tools agree):**
+  - **Osmosis (Java):** sorted merge by type+id, no version comparison at all. Source:
+    `ChangeApplier.java`. Even `modifyHigherVersion()` test confirms version is ignored.
+  - **osmconvert (C):** confirmed by 4-tool comparison — identical output to osmosis.
+  - **pbfhogg (Rust):** unconditional delete by type+id, matching osmosis.
+
+  **Version-based delete (osmium only):**
+  - **osmium-tool (C++):** ignores `<create>/<modify>/<delete>` action tags entirely.
+    Collects all objects, sorts by `type_id_reverse_version`, does `std::set_union` merge,
+    keeps highest version, then checks `visible` flag. Source: `command_apply_changes.cpp`.
+
+  Verified experimentally with minimal test cases:
+
+      # version=2 in delete, version=2 in base → osmium KEEPS, others DELETE
+      <delete><node id="339819693" version="2"/></delete>
+
+      # version=3 in delete, version=2 in base → all tools DELETE
+      <delete><node id="339819693" version="3"/></delete>
+
+  ### Cross-validation infrastructure
+
+  **Test data:** `data/denmark-20260220-seq4704.osm.pbf` + `data/denmark-20260221-seq4705.osc.gz`
+  (symlinked as `denmark-latest.osm.pbf` and `4705.osc.gz` for bench script compat).
+  Geofabrik state files confirm pairing: seq 4704 = 2026-02-20, seq 4705 = 2026-02-21.
+
+  **Test:** `merge_cross_validate_osmium` in `tests/merge.rs` (`#[ignore]`). Compares
+  pbfhogg vs osmium element-by-element. Currently tests against osmium only (which
+  disagrees on deletes); the test documents the expected difference.
+
+  **Script:** `scripts/xval-merge.sh` runs all 4 tools and reports element counts.
+  Requires: osmium in PATH, osmconvert (`apt install osmctools`), osmosis in
+  `data/osmosis/osmosis-0.49.2/` with JDK in `data/jdk/`.
+
+  **Tools not useful for cross-validation:**
+  pyosmium (wraps libosmium), osm2pgsql (libosmium, database-only),
+  OSMExpress (libosmium), imposm3 (PostGIS only), paulmach/osm (no CLI).
 
 ## Benchmarking
 

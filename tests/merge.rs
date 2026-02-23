@@ -1,5 +1,6 @@
 //! Merge correctness tests: build known PBFs + OSC diffs, run merge(), verify output.
 
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
@@ -9,7 +10,7 @@ use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::MemberId;
 use pbfhogg::merge::merge;
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element};
+use pbfhogg::{BlobDecode, BlobReader, Element, MemberType};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -784,4 +785,262 @@ fn merge_stats_accuracy() {
     assert_eq!(stats.deleted, 1, "node 3 deleted");
     assert_eq!(stats.diff_ways, 1, "way 10 modified from diff");
     assert_eq!(stats.base_relations, 1, "relation 100 passed through");
+}
+
+// ---------------------------------------------------------------------------
+// Cross-validation against osmium
+// ---------------------------------------------------------------------------
+
+/// An element read from a PBF, keyed by (type, id) for comparison.
+#[derive(Debug, PartialEq)]
+struct CmpNode {
+    lat: i32,
+    lon: i32,
+    tags: Vec<(String, String)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CmpWay {
+    refs: Vec<i64>,
+    tags: Vec<(String, String)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct CmpRelation {
+    members: Vec<(i64, String, String)>, // (id, type, role)
+    tags: Vec<(String, String)>,
+}
+
+struct CmpContents {
+    nodes: HashMap<i64, CmpNode>,
+    ways: HashMap<i64, CmpWay>,
+    relations: HashMap<i64, CmpRelation>,
+}
+
+fn read_all_for_comparison(path: &Path) -> CmpContents {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut contents = CmpContents {
+        nodes: HashMap::new(),
+        ways: HashMap::new(),
+        relations: HashMap::new(),
+    };
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        let mut tags: Vec<(String, String)> = dn
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                        tags.sort();
+                        contents.nodes.insert(
+                            dn.id(),
+                            CmpNode {
+                                lat: dn.decimicro_lat(),
+                                lon: dn.decimicro_lon(),
+                                tags,
+                            },
+                        );
+                    }
+                    Element::Node(n) => {
+                        let mut tags: Vec<(String, String)> = n
+                            .tags()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect();
+                        tags.sort();
+                        contents.nodes.insert(
+                            n.id(),
+                            CmpNode {
+                                lat: n.decimicro_lat(),
+                                lon: n.decimicro_lon(),
+                                tags,
+                            },
+                        );
+                    }
+                    Element::Way(w) => {
+                        let refs: Vec<i64> = w.refs().collect();
+                        let mut tags: Vec<(String, String)> =
+                            w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        tags.sort();
+                        contents.ways.insert(w.id(), CmpWay { refs, tags });
+                    }
+                    Element::Relation(r) => {
+                        let members: Vec<(i64, String, String)> = r
+                            .members()
+                            .map(|m| {
+                                let type_str = match m.id.member_type() {
+                                    MemberType::Node => "node",
+                                    MemberType::Way => "way",
+                                    MemberType::Relation => "relation",
+                                };
+                                (
+                                    m.id.id(),
+                                    type_str.to_string(),
+                                    m.role().unwrap_or("").to_string(),
+                                )
+                            })
+                            .collect();
+                        let mut tags: Vec<(String, String)> =
+                            r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+                        tags.sort();
+                        contents
+                            .relations
+                            .insert(r.id(), CmpRelation { members, tags });
+                    }
+                }
+            }
+        }
+    }
+
+    contents
+}
+
+/// Compare two maps and count content mismatches + extra/missing IDs.
+/// Returns (mismatches, extra_in_ours, missing_from_ours).
+fn compare_maps<V: std::fmt::Debug + PartialEq>(
+    label: &str,
+    ours: &HashMap<i64, V>,
+    theirs: &HashMap<i64, V>,
+) -> (u64, Vec<i64>, Vec<i64>) {
+    let mut mismatches = 0u64;
+    for (id, ours_val) in ours {
+        if let Some(theirs_val) = theirs.get(id)
+            && ours_val != theirs_val
+        {
+            if mismatches < 5 {
+                eprintln!("{label} {id} mismatch:\n  ours:   {ours_val:?}\n  theirs: {theirs_val:?}");
+            }
+            mismatches += 1;
+        }
+    }
+    let extra: Vec<i64> = ours.keys().filter(|id| !theirs.contains_key(id)).copied().collect();
+    let missing: Vec<i64> = theirs.keys().filter(|id| !ours.contains_key(id)).copied().collect();
+    (mismatches, extra, missing)
+}
+
+/// Cross-validate pbfhogg merge against osmium apply-changes on real data.
+///
+/// Runs both tools on `data/denmark-20260220-seq4704.osm.pbf` +
+/// `data/denmark-20260221-seq4705.osc.gz`, reads both outputs, and verifies:
+/// 1. All elements shared by both outputs have identical content
+/// 2. pbfhogg has no extra elements that osmium doesn't
+/// 3. Elements in osmium but not pbfhogg are exactly the OSC delete set
+///    (osmium uses version-based deletes; pbfhogg/osmosis/osmconvert use unconditional)
+///
+/// Skipped if the data files don't exist or osmium isn't installed.
+/// Run with: `scripts/test.sh -- --ignored`
+#[test]
+#[ignore]
+#[allow(clippy::cognitive_complexity)]
+fn merge_cross_validate_osmium() {
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let base_pbf = manifest.join("data/denmark-20260220-seq4704.osm.pbf");
+    let osc = manifest.join("data/denmark-20260221-seq4705.osc.gz");
+
+    if !base_pbf.exists() {
+        eprintln!("Skipping: {} not found", base_pbf.display());
+        return;
+    }
+    if !osc.exists() {
+        eprintln!("Skipping: {} not found", osc.display());
+        return;
+    }
+
+    let osmium_ok = std::process::Command::new("osmium")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !osmium_ok {
+        eprintln!("Skipping: osmium not found in PATH");
+        return;
+    }
+
+    let target_dir = manifest.join("target");
+    std::fs::create_dir_all(&target_dir).ok();
+    let pbfhogg_out = target_dir.join("merge-xval-pbfhogg.osm.pbf");
+    let osmium_out = target_dir.join("merge-xval-osmium.osm.pbf");
+
+    let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
+
+    eprintln!("Running pbfhogg merge...");
+    merge(&base_pbf, &osc, &pbfhogg_out).expect("pbfhogg merge");
+
+    eprintln!("Running osmium apply-changes...");
+    let osmium_result = std::process::Command::new("osmium")
+        .args([
+            "apply-changes",
+            &base_pbf.to_string_lossy(),
+            &osc.to_string_lossy(),
+            "-o",
+            &osmium_out.to_string_lossy(),
+            "-O",
+            "--no-progress",
+        ])
+        .output()
+        .expect("run osmium");
+    assert!(
+        osmium_result.status.success(),
+        "osmium apply-changes failed: {}",
+        String::from_utf8_lossy(&osmium_result.stderr)
+    );
+
+    eprintln!("Reading pbfhogg output...");
+    let ours = read_all_for_comparison(&pbfhogg_out);
+    eprintln!("Reading osmium output...");
+    let theirs = read_all_for_comparison(&osmium_out);
+
+    eprintln!(
+        "pbfhogg: {} nodes, {} ways, {} relations",
+        ours.nodes.len(), ours.ways.len(), ours.relations.len()
+    );
+    eprintln!(
+        "osmium:  {} nodes, {} ways, {} relations",
+        theirs.nodes.len(), theirs.ways.len(), theirs.relations.len()
+    );
+
+    let (node_mm, extra_n, missing_n) = compare_maps("node", &ours.nodes, &theirs.nodes);
+    let (way_mm, extra_w, missing_w) = compare_maps("way", &ours.ways, &theirs.ways);
+    let (rel_mm, extra_r, missing_r) = compare_maps("relation", &ours.relations, &theirs.relations);
+
+    let mut failures = node_mm + way_mm + rel_mm;
+    failures += extra_n.len() as u64 + extra_w.len() as u64 + extra_r.len() as u64;
+
+    if !extra_n.is_empty() { eprintln!("FAIL: {} extra nodes in pbfhogg", extra_n.len()); }
+    if !extra_w.is_empty() { eprintln!("FAIL: {} extra ways in pbfhogg", extra_w.len()); }
+    if !extra_r.is_empty() { eprintln!("FAIL: {} extra relations in pbfhogg", extra_r.len()); }
+
+    // Elements in osmium but not pbfhogg should be in the OSC delete set.
+    // osmium uses version-based deletes; pbfhogg/osmosis/osmconvert delete unconditionally.
+    eprintln!(
+        "Delete difference: {} nodes, {} ways, {} rels (OSC: {}, {}, {})",
+        missing_n.len(), missing_w.len(), missing_r.len(),
+        diff.deleted_nodes.len(), diff.deleted_ways.len(), diff.deleted_relations.len(),
+    );
+    for id in &missing_n {
+        if !diff.deleted_nodes.contains(id) {
+            eprintln!("FAIL: node {id} missing but NOT in delete set");
+            failures += 1;
+        }
+    }
+    for id in &missing_w {
+        if !diff.deleted_ways.contains(id) {
+            eprintln!("FAIL: way {id} missing but NOT in delete set");
+            failures += 1;
+        }
+    }
+    for id in &missing_r {
+        if !diff.deleted_relations.contains(id) {
+            eprintln!("FAIL: relation {id} missing but NOT in delete set");
+            failures += 1;
+        }
+    }
+
+    assert_eq!(failures, 0, "{failures} total failures");
+    eprintln!("Cross-validation passed.");
+
+    drop(std::fs::remove_file(&pbfhogg_out));
+    drop(std::fs::remove_file(&osmium_out));
 }

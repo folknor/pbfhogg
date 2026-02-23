@@ -1,0 +1,9 @@
+date	commit	subject	pbf	tool	mode	elapsed_ms	nodes	ways	relations	file_mb
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	pbfhogg	sequential	5160	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	pbfhogg	parallel	524	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	pbfhogg	pipelined	2125	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	pbfhogg	mmap	5524	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	pbfhogg	blobreader	5448	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	osmpbf	sequential	5584	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	osmpbf	parallel	531	52489653	6616526	46103	483
+2026-02-23	42d1d5b	Add merge and OSC modules: apply OSC diffs to PBF files	denmark-latest	osmium	cat-opl	5711	-	-	-	483

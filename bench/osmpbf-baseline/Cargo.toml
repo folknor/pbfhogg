@@ -1,0 +1,8 @@
+[package]
+name = "osmpbf-baseline"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+osmpbf = { version = "0.3", default-features = false, features = ["zlib-ng"] }

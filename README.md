@@ -32,6 +32,27 @@ reader.for_each(|element| {
 # Ok::<(), std::io::Error>(())
 ```
 
+## Performance
+
+Read throughput — count all 59M elements in Denmark extract (483 MB), best of 3 runs, `zlib-ng`:
+
+<!-- BENCH:START -->
+| Tool | Mode | Time | Notes |
+|------|------|------|-------|
+| **pbfhogg** | parallel | **0.52s** | `par_map_reduce` on all cores |
+| osmpbf 0.3 | parallel | 0.53s | upstream crate, same API |
+| **pbfhogg** | pipelined | **2.1s** | `for_each_pipelined`, preserves file order |
+| **pbfhogg** | sequential | 5.2s | `for_each` |
+| **pbfhogg** | blobreader | 5.4s | `BlobReader` sequential decode |
+| **pbfhogg** | mmap | 5.5s | `MmapBlobReader` sequential decode |
+| osmpbf 0.3 | sequential | 5.6s | upstream `for_each` |
+| osmium 1.19 | cat → opl | 5.7s | `osmium cat -f opl -o /dev/null` |
+<!-- BENCH:END -->
+
+System: Linux 6.18, Ryzen 9 7950X.
+
+Measured with `scripts/bench.sh`. Results are logged to `benchmarks.tsv` for tracking over time.
+
 ## License
 
 Licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0).

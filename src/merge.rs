@@ -104,13 +104,26 @@ fn to_decimicro(deg: f64) -> i32 {
 // Diff ID ranges for fast overlap checking
 // ---------------------------------------------------------------------------
 
-/// Pre-computed sorted ID vectors and ranges from the diff, for fast overlap checks.
+/// Pre-computed sorted ID vectors from the diff, for fast overlap checks.
+///
+/// These IDs include both upserts (creates + modifies) and deletes. They are
+/// used to determine whether a blob's ID range overlaps the diff at all.
+///
+/// **Important nuance**: `range_overlaps` can return true even when no element
+/// *in the base PBF* is affected — e.g. if the diff only contains pure creates
+/// with IDs that fall within a blob's [min_id, max_id] range. In that case,
+/// `classify_blob` returns `MayOverlap`, but the secondary check
+/// `block_overlaps_diff` (which tests actual element IDs in the block against
+/// the diff) returns false, and the blob is passed through raw. The creates
+/// are then emitted after the passthrough blob by `CreateEmitter`, which means
+/// they may appear out of strict ID order relative to the passthrough block.
+/// This is intentional — see the comment on `block_overlaps_diff` for details.
 struct DiffRanges {
-    /// Sorted affected node IDs (modified + deleted).
+    /// Sorted node IDs affected by the diff (upserts + deletes).
     node_ids: Vec<i64>,
-    /// Sorted affected way IDs (modified + deleted).
+    /// Sorted way IDs affected by the diff (upserts + deletes).
     way_ids: Vec<i64>,
-    /// Sorted affected relation IDs (modified + deleted).
+    /// Sorted relation IDs affected by the diff (upserts + deletes).
     rel_ids: Vec<i64>,
 }
 
@@ -151,6 +164,11 @@ impl DiffRanges {
     }
 
     /// Check if any affected ID of the given type falls within [min_id, max_id].
+    ///
+    /// This is a coarse range check used during blob classification. A true
+    /// result means the blob *might* need rewriting — it still gets a secondary
+    /// check via `block_overlaps_diff` after full parsing. A false result means
+    /// the blob is safe for raw passthrough (no diff IDs in its range at all).
     fn range_overlaps(&self, kind: ElemKind, min_id: i64, max_id: i64) -> bool {
         let ids = match kind {
             ElemKind::Node => &self.node_ids,
@@ -566,8 +584,24 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> 
 // Quick-scan: check if a block has any IDs that overlap the diff
 // ---------------------------------------------------------------------------
 
-/// Check if any element in the block is affected by the diff.
+/// Check if any element *actually in the block* has a matching ID in the diff.
 /// Returns true if the block needs re-encoding, false for safe passthrough.
+///
+/// This is the secondary, precise overlap check. It runs after `classify_blob`
+/// returned `MayOverlap` (the coarse range check found diff IDs within the
+/// blob's [min_id, max_id]). This function iterates actual element IDs in the
+/// parsed block and checks them against the diff's HashMap/HashSet.
+///
+/// **Key distinction from `range_overlaps`**: a diff with only pure creates
+/// (new IDs not present in the base PBF) can cause `range_overlaps` to return
+/// true (the create IDs fall within the blob's range), but this function
+/// returns false (no element in the block has a matching diff ID). In that
+/// case the blob is passed through raw, and the creates are emitted afterward
+/// by `CreateEmitter`. This means creates that fall within a passthrough
+/// blob's ID range will appear after it in the output, not interleaved at
+/// their exact sorted position. This is intentional — rewriting an otherwise
+/// unaffected block just to interleave pure creates would be wasted work.
+/// OSM consumers handle non-strictly-sorted IDs across block boundaries.
 fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
     for element in block.elements() {
         let dominated = match &element {
@@ -955,6 +989,16 @@ fn rewrite_relation(
 /// Tracks sorted diff element IDs per type with cursors, emitting new creates
 /// (elements in the diff but not in the base) at the correct sorted position
 /// in the output stream.
+///
+/// `emit_before(kind, min_id)` emits all creates with ID < min_id for the
+/// given type. This is called before writing each blob (passthrough or
+/// rewritten). For passthrough blobs, min_id is the blob's scanned min_id,
+/// so creates with smaller IDs are placed before the blob. Creates with IDs
+/// *within* a passthrough blob's range are deferred — they get emitted when
+/// the next blob arrives (with a higher min_id) or during `flush_all` at EOF.
+/// This means they appear after the passthrough blob, not interleaved within
+/// it. This out-of-order placement is an accepted trade-off for avoiding
+/// unnecessary block rewrites. See `block_overlaps_diff` for details.
 struct CreateEmitter {
     node_ids: Vec<i64>,
     way_ids: Vec<i64>,
@@ -984,8 +1028,18 @@ impl CreateEmitter {
         }
     }
 
-    /// Emit new creates that should appear before the given ID for the given type.
-    /// Called before writing each blob. Also handles type transitions.
+    /// Emit new creates with ID < `min_id` for the given element type.
+    ///
+    /// Called before writing each blob (passthrough or rewritten). For
+    /// passthrough blobs, `min_id` is the blob's scanned minimum ID. This
+    /// means creates with IDs *within* the passthrough blob's range (>= min_id
+    /// and <= max_id) are not emitted here — they will be emitted when the
+    /// next blob arrives with a higher min_id, or during `flush_all` at EOF.
+    /// This can place them after the passthrough blob in the output, which is
+    /// an accepted trade-off (see `block_overlaps_diff` comment).
+    ///
+    /// Also handles type transitions: when switching from e.g. Node to Way,
+    /// flushes all remaining node creates before starting way creates.
     #[allow(clippy::too_many_arguments, clippy::cognitive_complexity)]
     fn emit_before(
         &mut self,
@@ -1204,8 +1258,11 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
 
             match class {
                 BlobClassified::Passthrough(scan) => {
+                    // Coarse check found no diff IDs in this blob's range.
+                    // Safe to write the raw compressed frame without any parsing.
+                    // Creates with ID < min_id are emitted first; creates with
+                    // IDs *within* this blob's range are deferred to later.
                     skip_state.update(scan.kind, scan.max_id, &ranges);
-                    // Emit new creates that sort before this blob's min_id
                     create_emitter.emit_before(
                         scan.kind, scan.min_id, &diff,
                         &emitted_nodes, &emitted_ways, &emitted_relations,
@@ -1241,6 +1298,8 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
                     }
 
                     if block_overlaps_diff(&block, &diff) {
+                        // Precise check: at least one element in this block
+                        // has a matching diff ID. Rewrite element-by-element.
                         flush_block(&mut bb, &mut writer)?;
                         let mut ctx = RewriteContext {
                             diff: &diff,
@@ -1254,6 +1313,13 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
                         rewrite_block(&block, &mut ctx, &mut bb, &mut writer)?;
                         stats.blobs_rewritten += 1;
                     } else {
+                        // Precise check: no element in this block is affected.
+                        // The coarse range check was a false positive — e.g.
+                        // the diff only has pure creates with IDs within this
+                        // blob's range, but no modifies or deletes of existing
+                        // elements. Pass through the raw frame. The creates
+                        // will be emitted by CreateEmitter when the next blob
+                        // arrives or during flush_all at EOF.
                         flush_block(&mut bb, &mut writer)?;
                         writer.write_raw(&batch[i].frame_bytes)?;
                         count_block_elements(&block, &mut stats);
@@ -1290,10 +1356,23 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
 const BATCH_SIZE: usize = 64;
 
 /// Result of parallel blob classification.
+///
+/// The classification pipeline has two stages:
+///
+/// 1. **Coarse** (`classify_blob`): decompress, scan element type + ID range,
+///    check `DiffRanges::range_overlaps`. Fast — no full protobuf parse.
+///    Produces `Passthrough` or `MayOverlap`.
+///
+/// 2. **Precise** (main loop): for `MayOverlap` blobs, do a full parse and
+///    check `block_overlaps_diff` — tests each actual element ID against the
+///    diff. If no actual element is affected, the blob is passed through raw
+///    (even though the coarse check flagged it). This happens when the diff
+///    only contains pure creates with IDs in the blob's range.
 enum BlobClassified {
     /// No overlap — passthrough the raw frame directly.
     Passthrough(BlobScan),
-    /// Range overlaps diff — decompressed bytes ready for full parse.
+    /// Coarse range overlaps diff — decompressed bytes ready for full parse.
+    /// May still be passed through if the precise check finds no actual overlap.
     MayOverlap(Vec<u8>),
     /// Decompression or scan failed — decompressed bytes for fallback.
     Fallback(Vec<u8>),

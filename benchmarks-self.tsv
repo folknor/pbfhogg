@@ -1,0 +1,11 @@
+date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
+2026-02-23	01a8405	Add development scripts and self-benchmark for iteration	denmark-latest	sequential	5378	52489653	6616526	46103	483
+2026-02-23	01a8405	Add development scripts and self-benchmark for iteration	denmark-latest	parallel	541	52489653	6616526	46103	483
+2026-02-23	01a8405	Add development scripts and self-benchmark for iteration	denmark-latest	pipelined	2202	52489653	6616526	46103	483
+2026-02-23	01a8405	Add development scripts and self-benchmark for iteration	denmark-latest	mmap	5699	52489653	6616526	46103	483
+2026-02-23	01a8405	Add development scripts and self-benchmark for iteration	denmark-latest	blobreader	5720	52489653	6616526	46103	483
+2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	sequential	5420	52489653	6616526	46103	483
+2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	parallel	588	52489653	6616526	46103	483
+2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	pipelined	2548	52489653	6616526	46103	483
+2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	mmap	5802	52489653	6616526	46103	483
+2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	blobreader	5845	52489653	6616526	46103	483

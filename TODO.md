@@ -113,17 +113,18 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   (coordinates, tags, refs, members); emits create/modify/delete entries. Output as .osc.gz
   (gzipped OsmChange XML). Roundtrip-tested: derive → merge back → compare.
 
+- [x] `pbfhogg extract` — extract geographic region by bounding box
+  CLI: `pbfhogg extract <input.osm.pbf> -o <output.osm.pbf> -b minlon,minlat,maxlon,maxlat [-s]`
+  Equivalent to: `osmium extract`
+  Two strategies: **complete_ways** (default, two-pass, all nodes of matching ways included)
+  and **simple** (`-s`, single-pass, faster but ways may reference nodes outside the extract).
+  Relations included if any member is in the extract. Output header bbox set to the extract region.
+
 ### Medium effort
 
-- [ ] `pbfhogg extract` — extract geographic region
-  CLI: `pbfhogg extract -b <minlon,minlat,maxlon,maxlat> <input.osm.pbf> -o <output.osm.pbf>`
-  Equivalent to: `osmium extract`
-  Bbox extraction is straightforward (compare node coords against bounds). Polygon extraction
-  (`-p region.geojson`) needs point-in-polygon test. Three strategies mirror osmium:
-  **simple**: single pass, nodes in region + ways referencing them.
-  **complete_ways** (default): two passes, all nodes of matching ways included. This
-  follows the same pattern as `IndexedReader::read_ways_and_deps`.
-  **smart**: three passes, complete ways + complete boundary/multipolygon relations.
+- [ ] `pbfhogg extract` polygon support — add `-p region.geojson` for polygon extraction
+  with point-in-polygon test (ray casting). Also: **smart** strategy (three passes,
+  complete ways + complete boundary/multipolygon relations).
 
 - [ ] `pbfhogg add-locations-to-ways` — embed node coordinates in ways
   CLI: `pbfhogg add-locations-to-ways <input.osm.pbf> -o <output.osm.pbf>`

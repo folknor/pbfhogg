@@ -112,6 +112,20 @@ enum Command {
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
     },
+    /// Extract elements within a geographic bounding box
+    Extract {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Bounding box: minlon,minlat,maxlon,maxlat
+        #[arg(short = 'b', long)]
+        bbox: String,
+        /// Simple strategy (single pass, may have dangling refs)
+        #[arg(short = 's', long)]
+        simple: bool,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -168,6 +182,12 @@ fn main() {
             id_file,
             ids,
         } => run_removeid(&file, &output, id_file.as_deref(), &ids),
+        Command::Extract {
+            file,
+            output,
+            bbox,
+            simple,
+        } => run_extract(&file, &output, &bbox, simple),
         Command::Merge {
             base,
             changes,
@@ -360,6 +380,18 @@ fn run_removeid(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = resolve_ids(id_file, ids)?;
     let stats = pbfhogg::getid::removeid(file, output, &id_set)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_extract(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    bbox_str: &str,
+    simple: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bbox = pbfhogg::extract::parse_bbox(bbox_str)?;
+    let stats = pbfhogg::extract::extract(file, output, &bbox, simple)?;
     stats.print_summary();
     Ok(())
 }

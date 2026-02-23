@@ -20,6 +20,7 @@ impl Counts {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_sequential(path: &Path) -> (u64, Counts) {
     let reader = ElementReader::from_path(path).expect("open pbf");
     let mut counts = Counts::default();
@@ -36,6 +37,7 @@ fn bench_sequential(path: &Path) -> (u64, Counts) {
     (start.elapsed().as_millis() as u64, counts)
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_parallel(path: &Path) -> (u64, Counts) {
     let reader = ElementReader::from_path(path).expect("open pbf");
     let start = Instant::now();
@@ -62,6 +64,7 @@ fn bench_parallel(path: &Path) -> (u64, Counts) {
     )
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_pipelined(path: &Path) -> (u64, Counts) {
     let reader = ElementReader::from_path(path).expect("open pbf");
     let mut counts = Counts::default();
@@ -78,6 +81,7 @@ fn bench_pipelined(path: &Path) -> (u64, Counts) {
     (start.elapsed().as_millis() as u64, counts)
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_mmap(path: &Path) -> (u64, Counts) {
     let mmap = unsafe { Mmap::from_path(path) }.expect("mmap pbf");
     let reader = MmapBlobReader::new(mmap);
@@ -100,6 +104,7 @@ fn bench_mmap(path: &Path) -> (u64, Counts) {
     (start.elapsed().as_millis() as u64, counts)
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn bench_mmap_blobread(path: &Path) -> (u64, Counts) {
     let file = std::fs::File::open(path).expect("open pbf");
     let reader = BlobReader::new(BufReader::new(file));

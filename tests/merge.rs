@@ -50,40 +50,40 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
 
     // Nodes
     for n in nodes {
-        if !bb.can_add_node() {
-            if let Some(bytes) = bb.take().expect("take") {
-                writer.write_primitive_block(&bytes).expect("write block");
-            }
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(&bytes).expect("write block");
         }
         bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
     }
-    if !bb.is_empty() {
-        if let Some(bytes) = bb.take().expect("take") {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(&bytes).expect("write block");
     }
 
     // Ways
     for w in ways {
-        if !bb.can_add_way() {
-            if let Some(bytes) = bb.take().expect("take") {
-                writer.write_primitive_block(&bytes).expect("write block");
-            }
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(&bytes).expect("write block");
         }
         bb.add_way(w.id, &w.tags, &w.refs, None);
     }
-    if !bb.is_empty() {
-        if let Some(bytes) = bb.take().expect("take") {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(&bytes).expect("write block");
     }
 
     // Relations
     for r in relations {
-        if !bb.can_add_relation() {
-            if let Some(bytes) = bb.take().expect("take") {
-                writer.write_primitive_block(&bytes).expect("write block");
-            }
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(&bytes).expect("write block");
         }
         let members: Vec<MemberData<'_>> = r
             .members
@@ -95,10 +95,10 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
             .collect();
         bb.add_relation(r.id, &r.tags, &members, None);
     }
-    if !bb.is_empty() {
-        if let Some(bytes) = bb.take().expect("take") {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(&bytes).expect("write block");
     }
 
     writer.flush().expect("flush");
@@ -113,6 +113,7 @@ fn write_osc(path: &Path, xml: &str) {
 
 /// Collected element data from a PBF, for easy assertion.
 #[derive(Debug)]
+#[allow(clippy::type_complexity)]
 struct PbfContents {
     nodes: Vec<(i64, i32, i32, Vec<(String, String)>)>, // (id, lat, lon, tags)
     ways: Vec<(i64, Vec<i64>, Vec<(String, String)>)>,   // (id, refs, tags)

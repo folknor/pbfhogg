@@ -90,6 +90,7 @@ pub mod check_refs;
 pub mod dense;
 pub mod derive_changes;
 pub mod elements;
+pub mod extract;
 mod error;
 pub mod fileinfo;
 pub mod getid;

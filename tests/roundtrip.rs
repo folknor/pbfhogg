@@ -1,4 +1,5 @@
 //! Round-trip tests: write PBF → read back → verify.
+#![allow(clippy::unwrap_used, clippy::cognitive_complexity, clippy::too_many_lines)]
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::MemberId;

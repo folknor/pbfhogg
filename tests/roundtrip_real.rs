@@ -80,10 +80,10 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         }
                         last_type = Some("node");
                     }
-                    if !bb.can_add_node() {
-                        if let Some(bytes) = bb.take().expect("take") {
-                            writer.write_primitive_block(&bytes).expect("write");
-                        }
+                    if !bb.can_add_node()
+                        && let Some(bytes) = bb.take().expect("take")
+                    {
+                        writer.write_primitive_block(&bytes).expect("write");
                     }
 
                     let tags: Vec<(&str, &str)> = dn.tags().collect();
@@ -113,10 +113,10 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         }
                         last_type = Some("way");
                     }
-                    if !bb.can_add_way() {
-                        if let Some(bytes) = bb.take().expect("take") {
-                            writer.write_primitive_block(&bytes).expect("write");
-                        }
+                    if !bb.can_add_way()
+                        && let Some(bytes) = bb.take().expect("take")
+                    {
+                        writer.write_primitive_block(&bytes).expect("write");
                     }
 
                     let tags: Vec<(&str, &str)> = w.tags().collect();
@@ -139,10 +139,10 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         }
                         last_type = Some("relation");
                     }
-                    if !bb.can_add_relation() {
-                        if let Some(bytes) = bb.take().expect("take") {
-                            writer.write_primitive_block(&bytes).expect("write");
-                        }
+                    if !bb.can_add_relation()
+                        && let Some(bytes) = bb.take().expect("take")
+                    {
+                        writer.write_primitive_block(&bytes).expect("write");
                     }
 
                     let tags: Vec<(&str, &str)> = r.tags().collect();
@@ -216,5 +216,5 @@ fn roundtrip_denmark() {
     );
 
     // Cleanup
-    let _ = std::fs::remove_file(&out);
+    drop(std::fs::remove_file(&out));
 }

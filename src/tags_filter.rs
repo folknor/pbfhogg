@@ -792,9 +792,9 @@ mod tests {
             },
         };
         let tags = [("highway", "primary")];
-        assert!(!element_matches(&[expr.clone()], &tags, true, false, false));
-        assert!(element_matches(&[expr.clone()], &tags, false, true, false));
-        assert!(!element_matches(&[expr], &tags, false, false, true));
+        assert!(!element_matches(std::slice::from_ref(&expr), &tags, true, false, false));
+        assert!(element_matches(std::slice::from_ref(&expr), &tags, false, true, false));
+        assert!(!element_matches(std::slice::from_ref(&expr), &tags, false, false, true));
     }
 
     #[test]

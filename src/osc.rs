@@ -510,7 +510,7 @@ mod tests {
     /// Create a unique temp directory for test isolation.
     fn make_test_dir(suffix: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("pbfhogg_osc_test_{suffix}"));
-        let _ = std::fs::remove_dir_all(&dir);
+        drop(std::fs::remove_dir_all(&dir));
         std::fs::create_dir_all(&dir).expect("create test dir");
         dir
     }

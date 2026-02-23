@@ -33,9 +33,10 @@ fn main() {
     let mut best_stats = None;
 
     for _ in 0..runs {
-        let _ = std::fs::remove_file(&output);
+        drop(std::fs::remove_file(&output));
         let start = Instant::now();
         let stats = pbfhogg::merge::merge(base, diff, &output).expect("merge failed");
+        #[allow(clippy::cast_possible_truncation)]
         let ms = start.elapsed().as_millis() as u64;
         if ms < best_ms {
             best_ms = ms;
@@ -48,7 +49,7 @@ fn main() {
         .map(|m| m.len() / 1_000_000)
         .unwrap_or(0);
 
-    let _ = std::fs::remove_file(&output);
+    drop(std::fs::remove_file(&output));
 
     eprintln!("---");
     eprintln!("tool=pbfhogg");

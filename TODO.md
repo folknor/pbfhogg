@@ -34,16 +34,7 @@
 
 ## Benchmarking
 
-- [ ] Add Criterion read benchmarks: sequential (`for_each`), pipelined (`for_each_pipelined`),
-  parallel (`par_map_reduce`). Measure element count/sec and GB/sec. Compare against upstream
-  `osmpbf` crate and libosmium (`osmium cat -o /dev/null`).
-- [ ] Add Criterion write benchmarks: `BlockBuilder` + `PbfWriter` at various compression levels
-  (None, Zlib 1/6/9). Measure elements/sec and output bytes/sec.
-- [ ] Add reproducible merge benchmark (currently informal: Denmark 4.5s vs osmium 7.4s).
-  Criterion or standalone script. Compare against `osmium apply-changes`.
-- [ ] Track peak RSS during reads at scale. Denmark for CI, planet for release validation.
-- [ ] Document how to obtain test fixtures: small PBF for CI (`tests/test.osm.pbf`, already
-  exists), Denmark (~460 MB) for real benchmarks, planet (~73 GB) for release validation.
+- [ ] Track peak RSS during reads and merges at scale. Denmark for CI, planet for release validation.
 
 ## Feature parity with osmium-tool
 

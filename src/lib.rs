@@ -85,15 +85,18 @@ pub use reader::*;
 pub mod blob;
 pub mod block;
 pub mod block_builder;
+pub mod check_refs;
 pub mod dense;
 pub mod elements;
 mod error;
+pub mod fileinfo;
 pub mod indexed;
 pub mod merge;
 pub mod mmap_blob;
 pub mod osc;
 mod pipeline;
 pub mod reader;
+pub mod tags_count;
 pub mod writer;
 
 #[allow(clippy::all, clippy::pedantic, clippy::restriction)]

@@ -22,13 +22,8 @@
 
 ## Merge correctness tests
 
-- [ ] Add a dedicated merge test: build a small PBF programmatically, build an OSC diff with
-  known creates/modifies/deletes, run `merge()`, read back the output, and verify the
-  element-for-element result matches expectations
-- [ ] Test edge cases: create with ID between existing IDs, delete first/last element,
-  modify node coordinates and tags, create node with ID beyond max in base PBF
-- [ ] Test type transitions: diff that only affects ways (nodes passed through unchanged),
-  diff that only adds relations, diff with operations across all three types
+- [x] Dedicated merge tests: 10 tests in `tests/merge.rs` covering create/modify/delete,
+  passthrough ordering, multi-block partial rewrite, type-isolated diffs, and stats accuracy
 - [ ] Cross-validate against osmium: merge the same base PBF + OSC with both tools, compare
   output element-for-element (element counts, IDs, coordinates, tags, refs, members)
 
@@ -54,22 +49,19 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   wire-format scanner for skip-decompress optimization, parallel blob classification with
   rayon, sorted output with interleaved creates via `CreateEmitter`.
 
-### Low-hanging fruit
-
-- [ ] `pbfhogg fileinfo` — display PBF file metadata
-  CLI: `pbfhogg fileinfo <file.osm.pbf>`
+- [x] `pbfhogg fileinfo` — display PBF file metadata
+  CLI: `pbfhogg fileinfo <file.osm.pbf> [--extended]`
   Equivalent to: `osmium fileinfo`
-  Read the HeaderBlock and print: bbox, required/optional features, writing program,
-  replication timestamp/sequence/URL. With `--extended` flag, do a full scan to report blob
-  count and element counts per type. Trivial to implement — HeaderBlock parsing already
-  exists in `blob.rs`.
 
-- [ ] `pbfhogg check-refs` — validate referential integrity
-  CLI: `pbfhogg check-refs <file.osm.pbf>`
+- [x] `pbfhogg check-refs` — validate referential integrity
+  CLI: `pbfhogg check-refs <file.osm.pbf> [--check-relations]`
   Equivalent to: `osmium check-refs`
-  Single-pass: track seen node IDs in a bitset/hashset, then check all way node refs exist.
-  With `--check-relations`, also verify relation member refs. With `--show-ids`, list all
-  missing IDs. Exit code 0 = valid, 1 = broken refs.
+
+- [x] `pbfhogg tags-count` — count tag frequencies
+  CLI: `pbfhogg tags-count <file.osm.pbf> [--min-count N] [-t node|way|relation]`
+  Equivalent to: `osmium tags-count`
+
+### Low-hanging fruit
 
 - [ ] `pbfhogg sort` — sort PBF into standard order
   CLI: `pbfhogg sort <input.osm.pbf> -o <output.osm.pbf>`
@@ -95,13 +87,6 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   default include referenced objects (nodes of matching ways); `-R` to omit them (faster,
   single pass). `IndexedReader` already does two-pass way+deps filtering — extend with the
   expression syntax.
-
-- [ ] `pbfhogg tags-count` — count tag frequencies
-  CLI: `pbfhogg tags-count <input.osm.pbf>`
-  Equivalent to: `osmium tags-count`
-  Single-pass element scan, accumulate key or key=value counts in a HashMap. Output
-  tab-separated: count, key, value. Options: `--min-count`, `--sort` (by count or name),
-  `-t` (filter by element type). Straightforward.
 
 ### Medium effort
 

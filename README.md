@@ -41,12 +41,14 @@ Read throughput — count all 59M elements in Denmark extract (483 MB), best of 
 |------|------|------|-------|
 | **pbfhogg** | parallel | **0.52s** | `par_map_reduce` on all cores |
 | osmpbf 0.3 | parallel | 0.53s | upstream crate, same API |
+| Planetiler 0.10 | parallel | 2.0s | Java, `OsmInputFile` + thread pool |
 | **pbfhogg** | pipelined | **2.1s** | `for_each_pipelined`, preserves file order |
 | **pbfhogg** | sequential | 5.2s | `for_each` |
 | **pbfhogg** | blobreader | 5.4s | `BlobReader` sequential decode |
 | **pbfhogg** | mmap | 5.5s | `MmapBlobReader` sequential decode |
 | osmpbf 0.3 | sequential | 5.6s | upstream `for_each` |
 | osmium 1.19 | cat → opl | 5.7s | `osmium cat -f opl -o /dev/null` |
+| Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |
 <!-- BENCH:END -->
 
 Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:

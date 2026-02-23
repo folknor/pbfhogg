@@ -129,6 +129,17 @@ if command -v osmium &>/dev/null; then
     echo ""
 fi
 
+# Run Planetiler if curl and jq are available
+if command -v curl &>/dev/null && command -v jq &>/dev/null; then
+    echo "--- planetiler ---"
+    scripts/bench-planetiler.sh "$PBF" "$RUNS" 2> "$STDERR_FILE"
+    record_results
+    echo ""
+else
+    echo "Skipping Planetiler (curl and jq required)"
+    echo ""
+fi
+
 # Run merge benchmark if diff file exists
 OSC="${OSC:-data/4705.osc.gz}"
 if [ -f "$OSC" ]; then

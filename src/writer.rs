@@ -97,7 +97,7 @@ impl<W: Write> PbfWriter<W> {
         self.writer
     }
 
-    #[allow(clippy::cast_possible_truncation)]
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
         // Step 1: Build the Blob protobuf (optionally compressed)
         let mut blob = fileformat::Blob::new();
@@ -118,7 +118,7 @@ impl<W: Write> PbfWriter<W> {
 
         let blob_bytes = blob
             .write_to_bytes()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         // Step 2: Build the BlobHeader
         let mut header = fileformat::BlobHeader::new();
@@ -127,7 +127,7 @@ impl<W: Write> PbfWriter<W> {
 
         let header_bytes = header
             .write_to_bytes()
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
 
         // Step 3: Write [4-byte BE header_len][BlobHeader][Blob]
         let header_len = header_bytes.len() as u32;

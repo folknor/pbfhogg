@@ -39,6 +39,26 @@ enum Command {
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
     },
+    /// Concatenate PBF files with optional type filtering
+    Cat {
+        /// Input PBF files
+        #[arg(required = true)]
+        files: Vec<PathBuf>,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Filter by element type (comma-separated: node, way, relation)
+        #[arg(short = 't', long = "type")]
+        type_filter: Option<String>,
+    },
+    /// Sort PBF into standard order (nodes → ways → relations, by ID)
+    Sort {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -65,6 +85,12 @@ fn main() {
             min_count,
             type_filter,
         } => run_tags_count(&file, min_count, type_filter.as_deref()),
+        Command::Cat {
+            files,
+            output,
+            type_filter,
+        } => run_cat(&files, &output, type_filter.as_deref()),
+        Command::Sort { file, output } => run_sort(&file, &output),
         Command::Merge {
             base,
             changes,
@@ -182,6 +208,26 @@ fn run_tags_count(
     }
 
     eprintln!("{} distinct tag values", results.len());
+    Ok(())
+}
+
+fn run_cat(
+    files: &[PathBuf],
+    output: &std::path::Path,
+    type_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_sort(
+    file: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = pbfhogg::sort::sort(file, output)?;
+    stats.print_summary();
     Ok(())
 }
 

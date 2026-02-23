@@ -85,6 +85,7 @@ pub use reader::*;
 pub mod blob;
 pub mod block;
 pub mod block_builder;
+pub mod cat;
 pub mod check_refs;
 pub mod dense;
 pub mod elements;
@@ -96,6 +97,7 @@ pub mod mmap_blob;
 pub mod osc;
 mod pipeline;
 pub mod reader;
+pub mod sort;
 pub mod tags_count;
 pub mod writer;
 

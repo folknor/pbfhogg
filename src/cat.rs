@@ -1,0 +1,305 @@
+//! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
+
+use std::fs::File;
+use std::io::{self, BufReader, Read};
+use std::path::Path;
+
+use crate::block_builder::{build_header, BlockBuilder, MemberData, MemberType, Metadata};
+use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
+use crate::writer::{Compression, PbfWriter};
+use crate::{BlobDecode, BlobReader, Element, RelMemberType};
+
+type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Statistics from a cat operation.
+pub struct CatStats {
+    pub blobs_passthrough: u64,
+    pub blobs_decoded: u64,
+    pub elements_written: u64,
+}
+
+impl CatStats {
+    pub fn print_summary(&self) {
+        if self.blobs_decoded > 0 {
+            eprintln!(
+                "Decoded {} blobs, wrote {} elements",
+                self.blobs_decoded, self.elements_written,
+            );
+        } else {
+            eprintln!("{} blobs passed through", self.blobs_passthrough);
+        }
+    }
+}
+
+/// Concatenate one or more PBF files into a single output.
+///
+/// If `type_filter` is set (comma-separated: "node", "way", "relation"),
+/// only elements of matching types are included (requires full decode).
+/// Without a filter, blobs are passed through as raw bytes (zero decode).
+pub fn cat(files: &[&Path], output: &Path, type_filter: Option<&str>) -> Result<CatStats> {
+    match type_filter {
+        None => cat_passthrough(files, output),
+        Some(filter) => cat_filtered(files, output, filter),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough path: no type filter, zero decode
+// ---------------------------------------------------------------------------
+
+/// Raw blob frame: complete framed bytes for write_raw() passthrough.
+struct RawBlobFrame {
+    frame_bytes: Vec<u8>,
+    blob_type: String,
+    blob_bytes: Vec<u8>,
+}
+
+/// Read the next raw blob frame. Returns None at EOF.
+fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let header_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut header_bytes = vec![0u8; header_len];
+    reader.read_exact(&mut header_bytes)?;
+    let (blob_type, data_size) = parse_blob_header(&header_bytes)?;
+
+    let mut blob_bytes = vec![0u8; data_size];
+    reader.read_exact(&mut blob_bytes)?;
+
+    let frame_len = 4 + header_len + data_size;
+    let mut frame_bytes = Vec::with_capacity(frame_len);
+    frame_bytes.extend_from_slice(&len_buf);
+    frame_bytes.extend_from_slice(&header_bytes);
+    frame_bytes.extend_from_slice(&blob_bytes);
+
+    Ok(Some(RawBlobFrame {
+        frame_bytes,
+        blob_type,
+        blob_bytes,
+    }))
+}
+
+fn cat_passthrough(files: &[&Path], output: &Path) -> Result<CatStats> {
+    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut header_written = false;
+    let mut blobs: u64 = 0;
+
+    for file in files {
+        let f = File::open(file)?;
+        let mut reader = BufReader::new(f);
+
+        while let Some(frame) = read_raw_frame(&mut reader)? {
+            match frame.blob_type.as_str() {
+                "OSMHeader" => {
+                    if !header_written {
+                        let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                        rebuild_header(&header, &mut writer)?;
+                        header_written = true;
+                    }
+                }
+                "OSMData" => {
+                    writer.write_raw(&frame.frame_bytes)?;
+                    blobs += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(CatStats {
+        blobs_passthrough: blobs,
+        blobs_decoded: 0,
+        elements_written: 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Filtered path: decode + rebuild
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats> {
+    let filter_node = filter.contains("node");
+    let filter_way = filter.contains("way");
+    let filter_relation = filter.contains("relation");
+
+    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut bb = BlockBuilder::new();
+    let mut header_written = false;
+    let mut blobs_decoded: u64 = 0;
+    let mut elements: u64 = 0;
+
+    for file in files {
+        let reader = BlobReader::from_path(file)?;
+
+        for blob in reader {
+            let blob = blob?;
+            match blob.decode()? {
+                BlobDecode::OsmHeader(header) => {
+                    if !header_written {
+                        rebuild_header(&header, &mut writer)?;
+                        header_written = true;
+                    }
+                }
+                BlobDecode::OsmData(block) => {
+                    blobs_decoded += 1;
+                    for element in block.elements() {
+                        match &element {
+                            Element::DenseNode(dn) if filter_node => {
+                                if !bb.can_add_node() {
+                                    flush_block(&mut bb, &mut writer)?;
+                                }
+                                let tags: Vec<(&str, &str)> = dn.tags().collect();
+                                let meta = dn.info().and_then(|info| {
+                                    let user = info.user().ok()?;
+                                    Some(Metadata {
+                                        version: info.version(),
+                                        timestamp: info.milli_timestamp() / 1000,
+                                        changeset: info.changeset(),
+                                        uid: info.uid(),
+                                        user,
+                                        visible: info.visible(),
+                                    })
+                                });
+                                bb.add_node(
+                                    dn.id(),
+                                    dn.decimicro_lat(),
+                                    dn.decimicro_lon(),
+                                    &tags,
+                                    meta.as_ref(),
+                                );
+                                elements += 1;
+                            }
+                            Element::Node(n) if filter_node => {
+                                if !bb.can_add_node() {
+                                    flush_block(&mut bb, &mut writer)?;
+                                }
+                                let tags: Vec<(&str, &str)> = n.tags().collect();
+                                let info = n.info();
+                                let meta = info.version().map(|v| Metadata {
+                                    version: v,
+                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+                                    changeset: info.changeset().unwrap_or(0),
+                                    uid: info.uid().unwrap_or(0),
+                                    user: info
+                                        .user()
+                                        .and_then(std::result::Result::ok)
+                                        .unwrap_or(""),
+                                    visible: info.visible(),
+                                });
+                                bb.add_node(
+                                    n.id(),
+                                    n.decimicro_lat(),
+                                    n.decimicro_lon(),
+                                    &tags,
+                                    meta.as_ref(),
+                                );
+                                elements += 1;
+                            }
+                            Element::Way(w) if filter_way => {
+                                if !bb.can_add_way() {
+                                    flush_block(&mut bb, &mut writer)?;
+                                }
+                                let tags: Vec<(&str, &str)> = w.tags().collect();
+                                let refs: Vec<i64> = w.refs().collect();
+                                let info = w.info();
+                                let meta = info.version().map(|v| Metadata {
+                                    version: v,
+                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+                                    changeset: info.changeset().unwrap_or(0),
+                                    uid: info.uid().unwrap_or(0),
+                                    user: info
+                                        .user()
+                                        .and_then(std::result::Result::ok)
+                                        .unwrap_or(""),
+                                    visible: info.visible(),
+                                });
+                                bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                                elements += 1;
+                            }
+                            Element::Relation(r) if filter_relation => {
+                                if !bb.can_add_relation() {
+                                    flush_block(&mut bb, &mut writer)?;
+                                }
+                                let tags: Vec<(&str, &str)> = r.tags().collect();
+                                let members: Vec<MemberData<'_>> = r
+                                    .members()
+                                    .map(|m| MemberData {
+                                        member_id: m.member_id,
+                                        member_type: match m.member_type {
+                                            RelMemberType::Node => MemberType::Node,
+                                            RelMemberType::Way => MemberType::Way,
+                                            RelMemberType::Relation => MemberType::Relation,
+                                        },
+                                        role: m.role().unwrap_or(""),
+                                    })
+                                    .collect();
+                                let info = r.info();
+                                let meta = info.version().map(|v| Metadata {
+                                    version: v,
+                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+                                    changeset: info.changeset().unwrap_or(0),
+                                    uid: info.uid().unwrap_or(0),
+                                    user: info
+                                        .user()
+                                        .and_then(std::result::Result::ok)
+                                        .unwrap_or(""),
+                                    visible: info.visible(),
+                                });
+                                bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                                elements += 1;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                BlobDecode::Unknown(_) => {}
+            }
+        }
+    }
+
+    flush_block(&mut bb, &mut writer)?;
+    writer.flush()?;
+
+    Ok(CatStats {
+        blobs_passthrough: 0,
+        blobs_decoded,
+        elements_written: elements,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn flush_block(
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<io::BufWriter<File>>,
+) -> Result<()> {
+    if let Some(bytes) = bb.take()? {
+        writer.write_primitive_block(&bytes)?;
+    }
+    Ok(())
+}
+
+fn rebuild_header(
+    header: &crate::HeaderBlock,
+    writer: &mut PbfWriter<io::BufWriter<File>>,
+) -> Result<()> {
+    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
+    let header_bytes = build_header(
+        bbox,
+        header.osmosis_replication_timestamp(),
+        header.osmosis_replication_sequence_number(),
+        header.osmosis_replication_base_url(),
+    )?;
+    writer.write_header(&header_bytes)?;
+    Ok(())
+}

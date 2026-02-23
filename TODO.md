@@ -61,22 +61,15 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   CLI: `pbfhogg tags-count <file.osm.pbf> [--min-count N] [-t node|way|relation]`
   Equivalent to: `osmium tags-count`
 
-### Low-hanging fruit
+- [x] `pbfhogg cat` — concatenate and filter PBF files
+  CLI: `pbfhogg cat <file1.osm.pbf> [file2...] -o <output.osm.pbf> [-t node,way,relation]`
+  Equivalent to: `osmium cat`
 
-- [ ] `pbfhogg sort` — sort PBF into standard order
+- [x] `pbfhogg sort` — sort PBF into standard order (in-memory)
   CLI: `pbfhogg sort <input.osm.pbf> -o <output.osm.pbf>`
   Equivalent to: `osmium sort`
-  External merge sort: nodes by ID -> ways by ID -> relations by ID. Nidhogg already has
-  `sort.rs` with scalable external merge sort that spills to disk — far more memory-efficient
-  than osmium's in-memory approach (~10x RAM expansion). Move or adapt for standalone use.
 
-- [ ] `pbfhogg cat` — concatenate and filter PBF files
-  CLI: `pbfhogg cat <input1.osm.pbf> [input2.osm.pbf ...] -o <output.osm.pbf>`
-  Equivalent to: `osmium cat`
-  Read blobs from one or more input PBFs, write to output. PBF->PBF passthrough is trivial.
-  With `-t node`, `-t way`, `-t relation` flags, filter to only include blobs/elements of
-  the specified types. Would also serve as the format-conversion entry point if XML/OPL
-  writers are ever added.
+### Low-hanging fruit
 
 - [ ] `pbfhogg tags-filter` — filter elements by tag expressions
   CLI: `pbfhogg tags-filter <input.osm.pbf> -o <output.osm.pbf> <expressions...>`

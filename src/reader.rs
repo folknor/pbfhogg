@@ -68,7 +68,6 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        //TODO do something useful with header blocks
         for blob in self.blob_iter {
             match blob?.decode() {
                 Ok(BlobDecode::OsmHeader(_)) | Ok(BlobDecode::Unknown(_)) => {}

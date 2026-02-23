@@ -5,7 +5,6 @@ use crate::error::Result;
 use crate::proto::osmformat;
 use std;
 
-//TODO Add getter functions for id, version, uid, ...
 /// An OpenStreetMap node element from a compressed array of dense nodes (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Node)).
 #[derive(Clone, Debug)]
 pub struct DenseNode<'a> {
@@ -13,7 +12,7 @@ pub struct DenseNode<'a> {
 
     /// The node id. It should be unique between nodes and might be negative to indicate
     /// that the element has not yet been uploaded to a server.
-    pub id: i64,
+    pub(crate) id: i64,
     lat: i64,
     lon: i64,
     keys_vals_indices: &'a [i32],

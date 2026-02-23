@@ -39,7 +39,6 @@ impl<'a> BlobType<'a> {
     }
 }
 
-//TODO rename variants to fit proto files
 /// The decoded content of a blob (analogous to [`BlobType`]).
 #[derive(Clone, Debug)]
 pub enum BlobDecode<'a> {
@@ -200,23 +199,30 @@ impl<R: Read + Send> BlobReader<R> {
     fn read_blob_header(&mut self) -> Option<Result<fileformat::BlobHeader>> {
         let header_size: u64 = {
             let mut buf = [0u8; 4];
-            match self.reader.read_exact(&mut buf) {
+            // Read the first byte separately to distinguish clean EOF (0 bytes
+            // available) from corruption (1-3 trailing bytes).
+            match self.reader.read_exact(&mut buf[..1]) {
+                Ok(()) => {}
+                Err(e) if e.kind() == ::std::io::ErrorKind::UnexpectedEof => {
+                    // Clean EOF: no bytes remaining.
+                    return None;
+                }
+                Err(_) => {
+                    self.offset = None;
+                    self.last_blob_ok = false;
+                    return Some(Err(new_blob_error(BlobError::InvalidHeaderSize)));
+                }
+            }
+            match self.reader.read_exact(&mut buf[1..]) {
                 Ok(()) => {
                     self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
                     u64::from(u32::from_be_bytes(buf))
                 }
-                Err(e) => {
+                Err(_) => {
+                    // Had 1-3 bytes then EOF: truncated header length.
                     self.offset = None;
-                    return match e.kind() {
-                        ::std::io::ErrorKind::UnexpectedEof => {
-                            //TODO This also accepts corrupted files in the case of 1-3 available bytes
-                            None
-                        }
-                        _ => {
-                            self.last_blob_ok = false;
-                            Some(Err(new_blob_error(BlobError::InvalidHeaderSize)))
-                        }
-                    };
+                    self.last_blob_ok = false;
+                    return Some(Err(new_blob_error(BlobError::InvalidHeaderSize)));
                 }
             }
         };

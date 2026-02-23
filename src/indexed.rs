@@ -39,7 +39,7 @@ enum RangeIncluded {
 pub struct IdRanges {
     node_ids: Option<RangeInclusive<i64>>,
     way_ids: Option<RangeInclusive<i64>>,
-    //TODO actually use this field
+    // Not yet used — needs a read_relations_and_deps method or third pass.
     #[allow(dead_code)]
     relation_ids: Option<RangeInclusive<i64>>,
 }
@@ -198,7 +198,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
                 check_min_max(node.id(), &mut min_node_id, &mut max_node_id);
             }
             for node in group.dense_nodes() {
-                check_min_max(node.id, &mut min_node_id, &mut max_node_id);
+                check_min_max(node.id(), &mut min_node_id, &mut max_node_id);
             }
             for way in group.ways() {
                 check_min_max(way.id(), &mut min_way_id, &mut max_way_id);
@@ -276,7 +276,6 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
         // First pass:
         //   * Filter ways and store their dependencies as node IDs
         for info in &mut self.index {
-            //TODO do something useful with header blocks
             if info.blob_type == SimpleBlobType::Primitive
                 && info.ways_available() != ElementsAvailable::No
             {
@@ -320,7 +319,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
                         }
                     }
                     for node in group.dense_nodes() {
-                        if node_ids.binary_search(&node.id).is_ok() {
+                        if node_ids.binary_search(&node.id()).is_ok() {
                             // ID found, return dense node
                             element_callback(&Element::DenseNode(node));
                         }

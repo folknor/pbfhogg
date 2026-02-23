@@ -73,39 +73,32 @@ std::compile_error!(
     for example by using these cargo flags: --no-default-features --features zlib-ng"
 );
 
-pub use blob::*;
-pub use block::*;
-pub use dense::*;
-pub use elements::*;
-pub use error::{BlobError, Error, ErrorKind, Result};
-pub use indexed::*;
-pub use mmap_blob::*;
-pub use reader::*;
-
-pub mod blob;
-pub mod block;
-pub mod block_builder;
-pub mod cat;
-pub mod check_refs;
-pub mod dense;
-pub mod derive_changes;
-pub mod elements;
-pub mod extract;
-mod error;
-pub mod fileinfo;
-pub mod getid;
-pub mod indexed;
-pub mod merge;
-pub mod mmap_blob;
+// Module tree
+pub mod read;
+pub mod write;
+pub mod commands;
 pub mod osc;
-mod pipeline;
-pub mod reader;
-pub mod sort;
-pub mod tags_count;
-pub mod tags_filter;
-pub mod writer;
+mod error;
 
 #[allow(clippy::all, clippy::pedantic, clippy::restriction)]
 pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 }
+
+// Item-level re-exports (public API: `use pbfhogg::Element`, etc.)
+pub use read::blob::*;
+pub use read::block::*;
+pub use read::dense::*;
+pub use read::elements::*;
+pub use read::indexed::*;
+pub use read::mmap_blob::*;
+pub use read::reader::*;
+pub use error::{BlobError, Error, ErrorKind, Result};
+
+// Module-level re-exports (preserves `crate::blob`, `crate::block_builder`, etc.)
+pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
+pub use write::{block_builder, writer};
+pub use commands::{
+    cat, check_refs, derive_changes, extract, fileinfo, getid, merge, sort, tags_count,
+    tags_filter,
+};

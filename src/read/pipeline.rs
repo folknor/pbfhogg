@@ -3,8 +3,8 @@
 //! Overlaps sequential I/O with parallel decompression and protobuf parsing,
 //! delivering decoded `PrimitiveBlock`s to a caller-supplied closure in file order.
 
-use crate::blob::{BlobReader, BlobType};
-use crate::block::PrimitiveBlock;
+use super::blob::{BlobReader, BlobType};
+use super::block::PrimitiveBlock;
 use crate::error::Result;
 use std::collections::HashMap;
 use std::io::Read;

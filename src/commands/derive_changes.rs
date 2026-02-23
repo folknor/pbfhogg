@@ -75,7 +75,7 @@ fn read_elements(input: &Path) -> Result<ReadResult> {
                                     .tags()
                                     .map(|(k, v)| (k.to_owned(), v.to_owned()))
                                     .collect(),
-                                version: dn.info().map(super::dense::DenseNodeInfo::version),
+                                version: dn.info().map(crate::dense::DenseNodeInfo::version),
                             });
                         }
                         Element::Node(n) => {

@@ -1,7 +1,7 @@
 //! Nodes, ways and relations
 
-use crate::block::{get_stringtable_key_value, str_from_stringtable};
-use crate::dense::DenseNode;
+use super::block::{get_stringtable_key_value, str_from_stringtable};
+use super::dense::DenseNode;
 use crate::error::Result;
 use crate::proto::osmformat;
 use crate::proto::osmformat::PrimitiveBlock;

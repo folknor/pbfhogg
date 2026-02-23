@@ -1,6 +1,6 @@
 //! Iterate over the dense nodes in a `PrimitiveGroup`
 
-use crate::block::{get_stringtable_key_value, str_from_stringtable};
+use super::block::{get_stringtable_key_value, str_from_stringtable};
 use crate::error::Result;
 use crate::proto::osmformat;
 use std;

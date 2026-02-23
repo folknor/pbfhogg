@@ -1,7 +1,9 @@
 //! Speed up searches by using an index
 
 use crate::error::Result;
-use crate::{BlobReader, BlobType, ByteOffset, Element, PrimitiveBlock, Way};
+use super::blob::{BlobReader, BlobType, ByteOffset};
+use super::block::PrimitiveBlock;
+use super::elements::{Element, Way};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Seek};

@@ -1,11 +1,10 @@
 //! Iterate over blobs from a memory map
 
 use self::fileformat::BlobHeader;
-use crate::blob::{decode_blob, BlobDecode, BlobType, ByteOffset};
-use crate::block::{HeaderBlock, PrimitiveBlock};
+use super::blob::{decode_blob, BlobDecode, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE};
+use super::block::{HeaderBlock, PrimitiveBlock};
 use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
 use crate::proto::{fileformat, osmformat};
-use crate::MAX_BLOB_HEADER_SIZE;
 use bytes::Bytes;
 use protobuf::Message;
 use std::fs::File;

@@ -1,7 +1,7 @@
 //! `HeaderBlock`, `PrimitiveBlock` and `PrimitiveGroup`s
 
-use crate::dense::DenseNodeIter;
-use crate::elements::{Element, Node, Relation, Way};
+use super::dense::DenseNodeIter;
+use super::elements::{Element, Node, Relation, Way};
 use crate::error::{new_error, ErrorKind, Result};
 use crate::proto::osmformat;
 use std;

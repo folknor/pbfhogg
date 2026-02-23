@@ -1,7 +1,7 @@
 //! High level reader interface
 
-use crate::blob::{BlobDecode, BlobReader};
-use crate::elements::Element;
+use super::blob::{BlobDecode, BlobReader};
+use super::elements::Element;
 use crate::error::Result;
 use rayon::prelude::*;
 use std::fs::File;
@@ -88,7 +88,7 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        crate::pipeline::run_pipeline(self.blob_iter, |block| {
+        super::pipeline::run_pipeline(self.blob_iter, |block| {
             block.for_each_element(&mut f);
             Ok(())
         })

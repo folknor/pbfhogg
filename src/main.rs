@@ -73,6 +73,35 @@ enum Command {
         #[arg(required = true)]
         expressions: Vec<String>,
     },
+    /// Extract elements by ID
+    Getid {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Include referenced nodes of matching ways (two-pass)
+        #[arg(short = 'r', long = "add-referenced")]
+        add_referenced: bool,
+        /// Read IDs from file instead of arguments
+        #[arg(short = 'i', long = "id-file")]
+        id_file: Option<PathBuf>,
+        /// Element IDs (e.g. n123 w456 r789)
+        ids: Vec<String>,
+    },
+    /// Remove elements by ID
+    Removeid {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Read IDs from file instead of arguments
+        #[arg(short = 'i', long = "id-file")]
+        id_file: Option<PathBuf>,
+        /// Element IDs (e.g. n123 w456 r789)
+        ids: Vec<String>,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -111,6 +140,19 @@ fn main() {
             omit_referenced,
             expressions,
         } => run_tags_filter(&file, &output, &expressions, omit_referenced),
+        Command::Getid {
+            file,
+            output,
+            add_referenced,
+            id_file,
+            ids,
+        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids),
+        Command::Removeid {
+            file,
+            output,
+            id_file,
+            ids,
+        } => run_removeid(&file, &output, id_file.as_deref(), &ids),
         Command::Merge {
             base,
             changes,
@@ -258,6 +300,41 @@ fn run_tags_filter(
     omit_referenced: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn resolve_ids(
+    id_file: Option<&std::path::Path>,
+    ids: &[String],
+) -> Result<pbfhogg::getid::IdSet, Box<dyn std::error::Error>> {
+    match id_file {
+        Some(path) => pbfhogg::getid::parse_ids_from_file(path),
+        None => pbfhogg::getid::parse_ids(ids),
+    }
+}
+
+fn run_getid(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    add_referenced: bool,
+    id_file: Option<&std::path::Path>,
+    ids: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id_set = resolve_ids(id_file, ids)?;
+    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_removeid(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    id_file: Option<&std::path::Path>,
+    ids: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let id_set = resolve_ids(id_file, ids)?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set)?;
     stats.print_summary();
     Ok(())
 }

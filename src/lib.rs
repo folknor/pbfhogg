@@ -91,6 +91,7 @@ pub mod dense;
 pub mod elements;
 mod error;
 pub mod fileinfo;
+pub mod getid;
 pub mod indexed;
 pub mod merge;
 pub mod mmap_blob;

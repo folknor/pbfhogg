@@ -95,6 +95,13 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   prefix (`addr:*`), type prefixes (`n/`, `w/`, `r/`, `nw/`). Two-pass filter by default
   (include referenced nodes of matching ways); `-R` for single-pass (omit references, faster).
 
+- [x] `pbfhogg getid` / `pbfhogg removeid` — extract or remove objects by ID
+  CLI: `pbfhogg getid <input.osm.pbf> -o <output.osm.pbf> [-r] [-i ids.txt] n123 w456 r789`
+  CLI: `pbfhogg removeid <input.osm.pbf> -o <output.osm.pbf> [-i ids.txt] n123 w456 r789`
+  Equivalent to: `osmium getid` / `osmium removeid`
+  Single pass against sorted ID list. IDs from command line or file (`-i ids.txt`).
+  `getid -r` (add-referenced) includes dependent nodes of matching ways via two-pass.
+
 ### Medium effort
 
 - [ ] `pbfhogg extract` — extract geographic region
@@ -126,14 +133,6 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   Equivalent to: `osmium diff`
   Same merge-join as `derive-changes` but output human-readable differences: tags changed,
   coordinates moved, members added/removed. Compact (default) and verbose modes.
-
-- [ ] `pbfhogg getid` / `pbfhogg removeid` — extract or remove objects by ID
-  CLI: `pbfhogg getid <input.osm.pbf> -o <output.osm.pbf> n123 w456 r789`
-  CLI: `pbfhogg removeid <input.osm.pbf> -o <output.osm.pbf> n123 w456 r789`
-  Equivalent to: `osmium getid` / `osmium removeid`
-  Sorted input makes this a merge-join against a sorted ID list. Single pass. IDs from
-  command line or file (`-i ids.txt`). `getid --add-referenced` needs two passes (like
-  IndexedReader) to include dependent nodes of matching ways.
 
 ## Nice to have
 

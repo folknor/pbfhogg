@@ -20,6 +20,18 @@
 - [ ] Add crate-level documentation for write/merge workflows (lib.rs)
 - [ ] Add CHANGELOG.md
 
+## Merge correctness tests
+
+- [ ] Add a dedicated merge test: build a small PBF programmatically, build an OSC diff with
+  known creates/modifies/deletes, run `merge()`, read back the output, and verify the
+  element-for-element result matches expectations
+- [ ] Test edge cases: create with ID between existing IDs, delete first/last element,
+  modify node coordinates and tags, create node with ID beyond max in base PBF
+- [ ] Test type transitions: diff that only affects ways (nodes passed through unchanged),
+  diff that only adds relations, diff with operations across all three types
+- [ ] Cross-validate against osmium: merge the same base PBF + OSC with both tools, compare
+  output element-for-element (element counts, IDs, coordinates, tags, refs, members)
+
 ## Benchmarking
 
 ### Read throughput

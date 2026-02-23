@@ -304,23 +304,19 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
         // Second pass:
         //   * Iterate only over blobs that may include the node IDs we're searching for
         for info in &mut self.index {
-            if let RangeIncluded::Yes(node_id_range) = info.node_range_included(&node_ids) {
-                //TODO Only collect into Vec if range has a reasonable size
-                let node_ids: Vec<i64> = node_ids.range(node_id_range).copied().collect();
+            if let RangeIncluded::Yes(_) = info.node_range_included(&node_ids) {
                 let block = self
                     .reader
                     .blob_from_offset(info.offset)?
                     .to_primitiveblock()?;
                 for group in block.groups() {
                     for node in group.nodes() {
-                        if node_ids.binary_search(&node.id()).is_ok() {
-                            // ID found, return node
+                        if node_ids.contains(&node.id()) {
                             element_callback(&Element::Node(node));
                         }
                     }
                     for node in group.dense_nodes() {
-                        if node_ids.binary_search(&node.id()).is_ok() {
-                            // ID found, return dense node
+                        if node_ids.contains(&node.id()) {
                             element_callback(&Element::DenseNode(node));
                         }
                     }

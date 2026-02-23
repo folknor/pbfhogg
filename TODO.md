@@ -25,10 +25,6 @@
 
 ## Code TODOs
 
-- [ ] `src/indexed.rs:309` — avoid collecting node IDs into Vec when range is large. **Perf:**
-  in `read_ways_and_deps` second pass, a blob whose node range overlaps a large chunk of the
-  dependency set causes a multi-million-element Vec allocation just for `binary_search`. Could
-  iterate the BTreeSet range directly instead.
 - [ ] `src/elements.rs:528`, `src/dense.rs:330` — tag iterators should return Result instead
   of panicking on bad stringtable index. **Perf tradeoff:** adding Result wrapping adds a
   branch per tag lookup; current panic-on-bad-index is effectively free. Correctness gain vs

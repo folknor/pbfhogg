@@ -164,7 +164,7 @@ fn relation_ids(c: &PbfContents) -> Vec<i64> {
 }
 
 fn ids(strs: &[&str]) -> Vec<String> {
-    strs.iter().map(|s| s.to_string()).collect()
+    strs.iter().map(ToString::to_string).collect()
 }
 
 // ---------------------------------------------------------------------------

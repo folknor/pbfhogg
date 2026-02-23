@@ -73,6 +73,16 @@ enum Command {
         #[arg(required = true)]
         expressions: Vec<String>,
     },
+    /// Generate OSC diff from two PBF snapshots
+    DeriveChanges {
+        /// Old PBF file
+        old: PathBuf,
+        /// New PBF file
+        new: PathBuf,
+        /// Output OSC file (.osc.gz)
+        #[arg(short, long)]
+        output: PathBuf,
+    },
     /// Extract elements by ID
     Getid {
         /// Input PBF file
@@ -140,6 +150,11 @@ fn main() {
             omit_referenced,
             expressions,
         } => run_tags_filter(&file, &output, &expressions, omit_referenced),
+        Command::DeriveChanges {
+            old,
+            new,
+            output,
+        } => run_derive_changes(&old, &new, &output),
         Command::Getid {
             file,
             output,
@@ -312,6 +327,16 @@ fn resolve_ids(
         Some(path) => pbfhogg::getid::parse_ids_from_file(path),
         None => pbfhogg::getid::parse_ids(ids),
     }
+}
+
+fn run_derive_changes(
+    old: &std::path::Path,
+    new: &std::path::Path,
+    output: &std::path::Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = pbfhogg::derive_changes::derive_changes(old, new, output)?;
+    stats.print_summary();
+    Ok(())
 }
 
 fn run_getid(

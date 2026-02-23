@@ -88,6 +88,7 @@ pub mod block_builder;
 pub mod cat;
 pub mod check_refs;
 pub mod dense;
+pub mod derive_changes;
 pub mod elements;
 mod error;
 pub mod fileinfo;

@@ -102,6 +102,13 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   Single pass against sorted ID list. IDs from command line or file (`-i ids.txt`).
   `getid -r` (add-referenced) includes dependent nodes of matching ways via two-pass.
 
+- [x] `pbfhogg derive-changes` — generate OSC diff from two snapshots
+  CLI: `pbfhogg derive-changes <old.osm.pbf> <new.osm.pbf> -o <changes.osc.gz>`
+  Equivalent to: `osmium derive-changes`
+  In-memory merge-join of two sorted PBF files by (type, id). Compares element content
+  (coordinates, tags, refs, members); emits create/modify/delete entries. Output as .osc.gz
+  (gzipped OsmChange XML). Roundtrip-tested: derive → merge back → compare.
+
 ### Medium effort
 
 - [ ] `pbfhogg extract` — extract geographic region
@@ -121,12 +128,6 @@ Reference: https://osmcode.org/osmium-tool/manual.html
   nidhogg's `node_index.rs`), second pass rewrites ways with the `LocationsOnWays` PBF
   feature enabled. Drop untagged nodes by default (`--keep-untagged-nodes` to retain).
   Index backend options: in-memory, mmap dense, mmap sparse.
-
-- [ ] `pbfhogg derive-changes` — generate OSC diff from two snapshots
-  CLI: `pbfhogg derive-changes <old.osm.pbf> <new.osm.pbf> -o <changes.osc.gz>`
-  Equivalent to: `osmium derive-changes`
-  Parallel merge-join of two sorted PBF files by (type, id). Compare versions; emit
-  create/modify/delete entries for differences. Output as .osc.gz (gzipped OsmChange XML).
 
 - [ ] `pbfhogg diff` — compare two PBF files
   CLI: `pbfhogg diff <old.osm.pbf> <new.osm.pbf>`

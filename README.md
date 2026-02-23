@@ -49,6 +49,13 @@ Read throughput — count all 59M elements in Denmark extract (483 MB), best of 
 | osmium 1.19 | cat → opl | 5.7s | `osmium cat -f opl -o /dev/null` |
 <!-- BENCH:END -->
 
+Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
+
+| Tool | Time | Notes |
+|------|------|-------|
+| **pbfhogg** | **5.2s** | blob passthrough for unaffected blocks |
+| osmium 1.19 | 7.2s | `osmium apply-changes` |
+
 System: Linux 6.18, Ryzen 9 7950X.
 
 Measured with `scripts/bench.sh`. Results are logged to `benchmarks.tsv` for tracking over time.

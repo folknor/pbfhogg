@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PBF="${1:-../nidhogg/data/denmark-latest.osm.pbf}"
+PBF="${1:-data/denmark-latest.osm.pbf}"
 RUNS="${2:-3}"
 LOG="benchmarks.tsv"
 
@@ -27,8 +27,10 @@ echo ""
 # Build everything and locate binaries
 # Both pbfhogg and osmpbf use zlib-ng for fair comparison
 echo "Building pbfhogg with zlib-ng (release)..."
-cargo build --release --example bench_read --no-default-features --features zlib-ng 2>&1 | tail -1
+cargo build --release --examples --no-default-features --features zlib-ng 2>&1 | tail -1
 PBFHOGG_BIN=$(cargo build --release --example bench_read --no-default-features --features zlib-ng --message-format=json 2>/dev/null \
+    | grep '"executable"' | grep -oP '"executable":"\K[^"]+')
+MERGE_BIN=$(cargo build --release --example bench_merge --no-default-features --features zlib-ng --message-format=json 2>/dev/null \
     | grep '"executable"' | grep -oP '"executable":"\K[^"]+')
 echo "Building osmpbf baseline (release)..."
 cargo build --release --manifest-path bench/osmpbf-baseline/Cargo.toml 2>&1 | tail -1
@@ -127,5 +129,37 @@ if command -v osmium &>/dev/null; then
     echo ""
 fi
 
+# Run merge benchmark if diff file exists
+OSC="${OSC:-data/4705.osc.gz}"
+if [ -f "$OSC" ]; then
+    echo "--- merge ---"
+    "$MERGE_BIN" "$PBF" "$OSC" "$RUNS" 2> "$STDERR_FILE"
+    record_results
+    echo ""
+
+    # Run osmium apply-changes if available
+    if command -v osmium &>/dev/null; then
+        echo "--- osmium merge ---"
+        OSMIUM_OUT=$(mktemp /tmp/osmium-bench-merge.XXXXXX.osm.pbf)
+        BEST_MS=999999
+        for i in $(seq 1 "$RUNS"); do
+            rm -f "$OSMIUM_OUT"
+            START=$(date +%s%N)
+            osmium apply-changes "$PBF" "$OSC" -o "$OSMIUM_OUT" -O --no-progress 2>/dev/null
+            END=$(date +%s%N)
+            MS=$(( (END - START) / 1000000 ))
+            if [ "$MS" -lt "$BEST_MS" ]; then
+                BEST_MS=$MS
+            fi
+        done
+        rm -f "$OSMIUM_OUT"
+        printf "  %-12s %-12s %6s ms\n" "osmium" "merge" "$BEST_MS"
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$DATE" "$COMMIT" "$SUBJECT" "$NAME" \
+            "osmium" "merge" "$BEST_MS" "-" "-" "-" "$FILE_MB" >> "$LOG"
+        echo ""
+    fi
+fi
+
 echo "=== Results recorded to $LOG ==="
-tail -10 "$LOG" | column -t -s$'\t'
+tail -15 "$LOG" | column -t -s$'\t'

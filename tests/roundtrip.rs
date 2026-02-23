@@ -1,6 +1,7 @@
 //! Round-trip tests: write PBF → read back → verify.
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType, Metadata};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
+use pbfhogg::MemberId;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
 use std::io::Cursor;
@@ -312,18 +313,15 @@ fn roundtrip_relations() {
             &[("type", "multipolygon"), ("natural", "water")],
             &[
                 MemberData {
-                    member_id: 100,
-                    member_type: MemberType::Way,
+                    id: MemberId::Way(100),
                     role: "outer",
                 },
                 MemberData {
-                    member_id: 200,
-                    member_type: MemberType::Way,
+                    id: MemberId::Way(200),
                     role: "inner",
                 },
                 MemberData {
-                    member_id: 300,
-                    member_type: MemberType::Node,
+                    id: MemberId::Node(300),
                     role: "admin_centre",
                 },
             ],
@@ -365,16 +363,13 @@ fn roundtrip_relations() {
             let members: Vec<_> = r.members().collect();
             assert_eq!(members.len(), 3);
 
-            assert_eq!(members[0].member_id, 100);
-            assert_eq!(members[0].member_type, pbfhogg::RelMemberType::Way);
+            assert_eq!(members[0].id, MemberId::Way(100));
             assert_eq!(members[0].role().unwrap(), "outer");
 
-            assert_eq!(members[1].member_id, 200);
-            assert_eq!(members[1].member_type, pbfhogg::RelMemberType::Way);
+            assert_eq!(members[1].id, MemberId::Way(200));
             assert_eq!(members[1].role().unwrap(), "inner");
 
-            assert_eq!(members[2].member_id, 300);
-            assert_eq!(members[2].member_type, pbfhogg::RelMemberType::Node);
+            assert_eq!(members[2].id, MemberId::Node(300));
             assert_eq!(members[2].role().unwrap(), "admin_centre");
 
             let info = r.info();

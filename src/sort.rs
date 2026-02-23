@@ -7,9 +7,9 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, MemberType, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element, RelMemberType};
+use crate::{BlobDecode, BlobReader, Element, MemberId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -58,8 +58,7 @@ struct OwnedWay {
 }
 
 struct OwnedMember {
-    member_id: i64,
-    member_type: MemberType,
+    id: MemberId,
     role: String,
 }
 
@@ -235,12 +234,7 @@ fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
         members: r
             .members()
             .map(|m| OwnedMember {
-                member_id: m.member_id,
-                member_type: match m.member_type {
-                    RelMemberType::Node => MemberType::Node,
-                    RelMemberType::Way => MemberType::Way,
-                    RelMemberType::Relation => MemberType::Relation,
-                },
+                id: m.id,
                 role: m.role().unwrap_or("").to_owned(),
             })
             .collect(),
@@ -333,8 +327,7 @@ fn write_sorted(output: &Path, data: &ReadResult) -> Result<()> {
             .members
             .iter()
             .map(|m| MemberData {
-                member_id: m.member_id,
-                member_type: m.member_type,
+                id: m.id,
                 role: &m.role,
             })
             .collect();

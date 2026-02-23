@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::MemberId;
 use pbfhogg::derive_changes::derive_changes;
 use pbfhogg::merge::merge;
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -33,8 +34,7 @@ struct TestRelation {
 }
 
 struct TestMember {
-    id: i64,
-    member_type: MemberType,
+    id: MemberId,
     role: &'static str,
 }
 
@@ -83,8 +83,7 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
             .members
             .iter()
             .map(|m| MemberData {
-                member_id: m.id,
-                member_type: m.member_type,
+                id: m.id,
                 role: m.role,
             })
             .collect();
@@ -149,13 +148,13 @@ fn read_all_elements(path: &Path) -> PbfContents {
                         let members: Vec<(i64, String, String)> = r
                             .members()
                             .map(|m| {
-                                let type_str = match m.member_type {
-                                    pbfhogg::RelMemberType::Node => "node",
-                                    pbfhogg::RelMemberType::Way => "way",
-                                    pbfhogg::RelMemberType::Relation => "relation",
+                                let type_str = match m.id.member_type() {
+                                    pbfhogg::MemberType::Node => "node",
+                                    pbfhogg::MemberType::Way => "way",
+                                    pbfhogg::MemberType::Relation => "relation",
                                 };
                                 (
-                                    m.member_id,
+                                    m.id.id(),
                                     type_str.to_string(),
                                     m.role().unwrap_or("").to_string(),
                                 )
@@ -356,7 +355,7 @@ fn modify_relation_members() {
         &[],
         &[TestRelation {
             id: 100,
-            members: vec![TestMember { id: 1, member_type: MemberType::Node, role: "stop" }],
+            members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
             tags: vec![("type", "route")],
         }],
     );
@@ -367,8 +366,8 @@ fn modify_relation_members() {
         &[TestRelation {
             id: 100,
             members: vec![
-                TestMember { id: 1, member_type: MemberType::Node, role: "stop" },
-                TestMember { id: 2, member_type: MemberType::Way, role: "outer" },
+                TestMember { id: MemberId::Node(1), role: "stop" },
+                TestMember { id: MemberId::Way(2), role: "outer" },
             ],
             tags: vec![("type", "route")],
         }],

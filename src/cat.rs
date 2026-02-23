@@ -4,10 +4,10 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, MemberType, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element, RelMemberType};
+use crate::{BlobDecode, BlobReader, Element};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -232,12 +232,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                 let members: Vec<MemberData<'_>> = r
                                     .members()
                                     .map(|m| MemberData {
-                                        member_id: m.member_id,
-                                        member_type: match m.member_type {
-                                            RelMemberType::Node => MemberType::Node,
-                                            RelMemberType::Way => MemberType::Way,
-                                            RelMemberType::Relation => MemberType::Relation,
-                                        },
+                                        id: m.id,
                                         role: m.role().unwrap_or(""),
                                     })
                                     .collect();

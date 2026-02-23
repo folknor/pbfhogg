@@ -2,9 +2,9 @@
 //!
 //! Skipped if `data/denmark-latest.osm.pbf` doesn't exist.
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType, Metadata};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element, RelMemberType};
+use pbfhogg::{BlobDecode, BlobReader, Element};
 use std::io::BufReader;
 use std::path::Path;
 
@@ -49,14 +49,6 @@ fn count_elements(path: &Path) -> Counts {
     }
 
     counts
-}
-
-fn convert_rel_member_type(t: &RelMemberType) -> MemberType {
-    match t {
-        RelMemberType::Node => MemberType::Node,
-        RelMemberType::Way => MemberType::Way,
-        RelMemberType::Relation => MemberType::Relation,
-    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
@@ -157,8 +149,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                     let members: Vec<MemberData<'_>> = r
                         .members()
                         .map(|m| MemberData {
-                            member_id: m.member_id,
-                            member_type: convert_rel_member_type(&m.member_type),
+                            id: m.id,
                             role: m.role().unwrap_or(""),
                         })
                         .collect();
@@ -185,6 +176,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
 }
 
 #[test]
+#[ignore] // 54s on Denmark — run with: cargo test -- --ignored
 fn roundtrip_denmark() {
     let dk = denmark_path();
     let out = output_path();

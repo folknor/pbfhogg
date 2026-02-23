@@ -1,5 +1,14 @@
 # pbfhogg TODO
 
+## Important: ignored tests
+
+`roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` — it roundtrips the entire
+Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run before any
+release and after completing major work** (especially changes to reader, writer, block_builder,
+or BlockBuilder/PbfWriter APIs):
+
+    scripts/test.sh -- --ignored
+
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
@@ -25,14 +34,9 @@
 
 ## Code TODOs
 
-- [ ] `src/elements.rs:528`, `src/dense.rs:330` — tag iterators should return Result instead
-  of panicking on bad stringtable index. **Perf tradeoff:** adding Result wrapping adds a
-  branch per tag lookup; current panic-on-bad-index is effectively free. Correctness gain vs
-  hot-path overhead.
 - [ ] `src/indexed.rs:414` — benchmark whether `BufReader` helps `IndexedReader::from_path`.
   Index build is sequential (BufReader would help), but subsequent reads seek randomly
   (BufReader would just discard its buffer). Mixed bag.
-- [ ] `src/elements.rs:449` — encapsulate member_id by type (NodeId/WayId/RelationId) instead of bare i64
 - [ ] `src/indexed.rs:42` — use `relation_ids` field in `IdRanges` filtering. Not a simple fix:
   `read_ways_and_deps` only handles ways+nodes. Using `relation_ids` requires adding a
   `read_relations_and_deps` method or extending the existing one with a third pass. More of a

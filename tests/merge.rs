@@ -5,7 +5,8 @@ use std::io::Write;
 use std::path::Path;
 
 use flate2::write::GzEncoder;
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::MemberId;
 use pbfhogg::merge::merge;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
@@ -35,8 +36,7 @@ struct TestRelation {
 }
 
 struct TestMember {
-    id: i64,
-    member_type: MemberType,
+    id: MemberId,
     role: &'static str,
 }
 
@@ -89,8 +89,7 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
             .members
             .iter()
             .map(|m| MemberData {
-                member_id: m.id,
-                member_type: m.member_type,
+                id: m.id,
                 role: m.role,
             })
             .collect();
@@ -152,12 +151,12 @@ fn read_all_elements(path: &Path) -> PbfContents {
                         let members: Vec<(i64, String, String)> = r
                             .members()
                             .map(|m| {
-                                let type_str = match m.member_type {
-                                    pbfhogg::RelMemberType::Node => "node",
-                                    pbfhogg::RelMemberType::Way => "way",
-                                    pbfhogg::RelMemberType::Relation => "relation",
+                                let type_str = match m.id.member_type() {
+                                    pbfhogg::MemberType::Node => "node",
+                                    pbfhogg::MemberType::Way => "way",
+                                    pbfhogg::MemberType::Relation => "relation",
                                 };
-                                (m.member_id, type_str.to_string(), m.role().unwrap_or("").to_string())
+                                (m.id.id(), type_str.to_string(), m.role().unwrap_or("").to_string())
                             })
                             .collect();
                         contents.relations.push((r.id(), members, tags));
@@ -207,7 +206,7 @@ fn merge_basic_create_modify_delete() {
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: 10, member_type: MemberType::Way, role: "outer" }],
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
             },
         ],
@@ -544,12 +543,12 @@ fn merge_relations_only_diff() {
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: 10, member_type: MemberType::Way, role: "outer" }],
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("type", "multipolygon")],
             },
             TestRelation {
                 id: 200,
-                members: vec![TestMember { id: 1, member_type: MemberType::Node, role: "stop" }],
+                members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
                 tags: vec![("type", "route")],
             },
         ],
@@ -616,7 +615,7 @@ fn merge_all_types() {
         &[
             TestRelation {
                 id: 100,
-                members: vec![TestMember { id: 10, member_type: MemberType::Way, role: "outer" }],
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
                 tags: vec![("old", "tags")],
             },
             TestRelation {

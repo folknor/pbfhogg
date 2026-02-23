@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use crate::{Element, ElementReader, RelMemberType};
+use crate::{Element, ElementReader, MemberId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -89,22 +89,22 @@ pub fn check_refs(path: &Path, check_relations: bool) -> Result<RefCheckResult> 
                 result.relation_count += 1;
                 if check_relations {
                     for member in r.members() {
-                        match member.member_type {
-                            RelMemberType::Node => {
-                                if !node_ids.contains(&member.member_id) {
+                        match member.id {
+                            MemberId::Node(id) => {
+                                if !node_ids.contains(&id) {
                                     result.missing_node_members += 1;
                                 }
                             }
-                            RelMemberType::Way => {
-                                if !way_ids.contains(&member.member_id) {
+                            MemberId::Way(id) => {
+                                if !way_ids.contains(&id) {
                                     result.missing_way_refs += 1;
                                 }
                             }
-                            RelMemberType::Relation => {
+                            MemberId::Relation(id) => {
                                 // Relations can reference other relations that
                                 // appear later in the file, so we can only check
                                 // relations seen so far. This matches osmium behavior.
-                                if !relation_ids.contains(&member.member_id) {
+                                if !relation_ids.contains(&id) {
                                     result.missing_relation_members += 1;
                                 }
                             }

@@ -1,6 +1,7 @@
 //! Generate the `tests/test.osm.pbf` fixture used by doc examples.
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType, Metadata};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData, Metadata};
+use pbfhogg::MemberId;
 use pbfhogg::writer::{Compression, PbfWriter};
 use std::path::Path;
 
@@ -55,8 +56,7 @@ fn main() {
         1,
         &[("type", "multipolygon")],
         &[MemberData {
-            member_id: 1,
-            member_type: MemberType::Way,
+            id: MemberId::Way(1),
             role: "outer",
         }],
         Some(&Metadata {

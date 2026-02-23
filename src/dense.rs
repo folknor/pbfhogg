@@ -326,7 +326,8 @@ pub struct DenseTagIter<'a> {
     keys_vals_indices: std::slice::Iter<'a, i32>,
 }
 
-//TODO return Result
+// Same tradeoff as TagIter in elements.rs: Item could be Result to propagate stringtable
+// errors, but it's a breaking API change for minimal real-world benefit.
 #[allow(clippy::cast_sign_loss)]
 impl<'a> Iterator for DenseTagIter<'a> {
     type Item = (&'a str, &'a str);

@@ -84,31 +84,21 @@ pub struct Metadata<'a> {
     pub visible: bool,
 }
 
+use crate::elements::{MemberId, MemberType};
+
 /// A relation member.
 pub struct MemberData<'a> {
-    /// The referenced element's ID.
-    pub member_id: i64,
-    /// The referenced element's type.
-    pub member_type: MemberType,
+    /// The typed member reference (element type + ID).
+    pub id: MemberId,
     /// The member's role string.
     pub role: &'a str,
 }
 
-/// Relation member types, matching the PBF `MemberType` enum.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MemberType {
-    Node,
-    Way,
-    Relation,
-}
-
-impl MemberType {
-    fn to_proto(self) -> osmformat::relation::MemberType {
-        match self {
-            MemberType::Node => osmformat::relation::MemberType::NODE,
-            MemberType::Way => osmformat::relation::MemberType::WAY,
-            MemberType::Relation => osmformat::relation::MemberType::RELATION,
-        }
+fn member_type_to_proto(mt: MemberType) -> osmformat::relation::MemberType {
+    match mt {
+        MemberType::Node => osmformat::relation::MemberType::NODE,
+        MemberType::Way => osmformat::relation::MemberType::WAY,
+        MemberType::Relation => osmformat::relation::MemberType::RELATION,
     }
 }
 
@@ -389,10 +379,10 @@ impl BlockBuilder {
             #[allow(clippy::cast_possible_wrap)]
             rel.roles_sid
                 .push(self.string_table.add(m.role) as i32);
-            rel.memids.push(m.member_id - last_memid);
-            last_memid = m.member_id;
+            rel.memids.push(m.id.id() - last_memid);
+            last_memid = m.id.id();
             rel.types
-                .push(EnumOrUnknown::new(m.member_type.to_proto()));
+                .push(EnumOrUnknown::new(member_type_to_proto(m.id.member_type())));
         }
 
         // Metadata

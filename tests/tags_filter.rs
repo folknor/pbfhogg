@@ -2,7 +2,8 @@
 
 use std::path::Path;
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData, MemberType};
+use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::MemberId;
 use pbfhogg::tags_filter::tags_filter;
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
@@ -32,8 +33,7 @@ struct TestRelation {
 }
 
 struct TestMember {
-    id: i64,
-    member_type: MemberType,
+    id: MemberId,
     role: &'static str,
 }
 
@@ -82,8 +82,7 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
             .members
             .iter()
             .map(|m| MemberData {
-                member_id: m.id,
-                member_type: m.member_type,
+                id: m.id,
                 role: m.role,
             })
             .collect();

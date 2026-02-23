@@ -5,9 +5,9 @@ use std::fs::File;
 use std::io;
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, MemberType, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element, RelMemberType};
+use crate::{BlobDecode, BlobReader, Element};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -347,12 +347,7 @@ fn tags_filter_single_pass(
                                 let members: Vec<MemberData<'_>> = r
                                     .members()
                                     .map(|m| MemberData {
-                                        member_id: m.member_id,
-                                        member_type: match m.member_type {
-                                            RelMemberType::Node => MemberType::Node,
-                                            RelMemberType::Way => MemberType::Way,
-                                            RelMemberType::Relation => MemberType::Relation,
-                                        },
+                                        id: m.id,
                                         role: m.role().unwrap_or(""),
                                     })
                                     .collect();
@@ -564,12 +559,7 @@ fn tags_filter_two_pass(
                                 let members: Vec<MemberData<'_>> = r
                                     .members()
                                     .map(|m| MemberData {
-                                        member_id: m.member_id,
-                                        member_type: match m.member_type {
-                                            RelMemberType::Node => MemberType::Node,
-                                            RelMemberType::Way => MemberType::Way,
-                                            RelMemberType::Relation => MemberType::Relation,
-                                        },
+                                        id: m.id,
                                         role: m.role().unwrap_or(""),
                                     })
                                     .collect();

@@ -20,6 +20,7 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
 
+Bench scripts build internally — no need to run `build.sh` first.
 If you need something these scripts don't cover, write a new script.
 
 ## Subagents

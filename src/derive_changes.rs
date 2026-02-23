@@ -8,8 +8,7 @@ use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use crate::block_builder::MemberType;
-use crate::{BlobDecode, BlobReader, Element, RelMemberType};
+use crate::{BlobDecode, BlobReader, Element, MemberId, MemberType};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -33,8 +32,7 @@ struct OwnedWay {
 }
 
 struct OwnedMember {
-    member_id: i64,
-    member_type: MemberType,
+    id: MemberId,
     role: String,
 }
 
@@ -113,12 +111,7 @@ fn read_elements(input: &Path) -> Result<ReadResult> {
                                 members: r
                                     .members()
                                     .map(|m| OwnedMember {
-                                        member_id: m.member_id,
-                                        member_type: match m.member_type {
-                                            RelMemberType::Node => MemberType::Node,
-                                            RelMemberType::Way => MemberType::Way,
-                                            RelMemberType::Relation => MemberType::Relation,
-                                        },
+                                        id: m.id,
                                         role: m.role().unwrap_or("").to_owned(),
                                     })
                                     .collect(),
@@ -155,11 +148,9 @@ fn ways_equal(a: &OwnedWay, b: &OwnedWay) -> bool {
 
 fn members_equal(a: &[OwnedMember], b: &[OwnedMember]) -> bool {
     a.len() == b.len()
-        && a.iter().zip(b.iter()).all(|(ma, mb)| {
-            ma.member_id == mb.member_id
-                && ma.member_type == mb.member_type
-                && ma.role == mb.role
-        })
+        && a.iter()
+            .zip(b.iter())
+            .all(|(ma, mb)| ma.id == mb.id && ma.role == mb.role)
 }
 
 fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
@@ -420,8 +411,7 @@ fn take_relation(r: &OwnedRelation) -> OwnedRelation {
             .members
             .iter()
             .map(|m| OwnedMember {
-                member_id: m.member_id,
-                member_type: m.member_type,
+                id: m.id,
                 role: m.role.clone(),
             })
             .collect(),
@@ -569,12 +559,12 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
         writer.write_event(Event::Start(elem))?;
         for m in &rel.members {
             let mut member = BytesStart::new("member");
-            let type_str = match m.member_type {
+            let type_str = match m.id.member_type() {
                 MemberType::Node => "node",
                 MemberType::Way => "way",
                 MemberType::Relation => "relation",
             };
-            let id_str = m.member_id.to_string();
+            let id_str = m.id.id().to_string();
             member.push_attribute(("type", type_str));
             member.push_attribute(("ref", id_str.as_str()));
             member.push_attribute(("role", m.role.as_str()));

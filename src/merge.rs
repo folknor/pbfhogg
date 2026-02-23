@@ -16,7 +16,7 @@ use crate::blob::{
     decode_blob_to_headerblock, decompress_blob_data, parse_blob_header,
     parse_primitive_block_from_bytes,
 };
-use crate::block_builder::{BlockBuilder, MemberData, MemberType, Metadata};
+use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
@@ -508,23 +508,11 @@ impl SkipState {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Member type conversion helpers
-// ---------------------------------------------------------------------------
-
-fn osc_member_type_to_bb(s: &str) -> MemberType {
+fn osc_member_type_to_member_type(s: &str) -> crate::MemberType {
     match s {
-        "way" => MemberType::Way,
-        "relation" => MemberType::Relation,
-        _ => MemberType::Node,
-    }
-}
-
-fn reader_member_type_to_bb(mt: &crate::RelMemberType) -> MemberType {
-    match mt {
-        crate::RelMemberType::Node => MemberType::Node,
-        crate::RelMemberType::Way => MemberType::Way,
-        crate::RelMemberType::Relation => MemberType::Relation,
+        "way" => crate::MemberType::Way,
+        "relation" => crate::MemberType::Relation,
+        _ => crate::MemberType::Node,
     }
 }
 
@@ -698,10 +686,12 @@ fn write_osc_relation(
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()
-        .map(|m: &OscRelMember| MemberData {
-            member_id: m.ref_id,
-            member_type: osc_member_type_to_bb(&m.member_type),
-            role: &m.role,
+        .map(|m: &OscRelMember| {
+            let mt = osc_member_type_to_member_type(&m.member_type);
+            MemberData {
+                id: crate::MemberId::from_id_and_type(m.ref_id, mt),
+                role: &m.role,
+            }
         })
         .collect();
     bb.add_relation(rel.id, &tags, &members, None);
@@ -765,8 +755,7 @@ fn write_base_relation(
     let members: Vec<MemberData<'_>> = rel
         .members()
         .map(|m| MemberData {
-            member_id: m.member_id,
-            member_type: reader_member_type_to_bb(&m.member_type),
+            id: m.id,
             role: m.role().unwrap_or(""),
         })
         .collect();

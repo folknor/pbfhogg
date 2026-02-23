@@ -5,7 +5,7 @@ use crate::dense::DenseNode;
 use crate::error::Result;
 use crate::proto::osmformat;
 use crate::proto::osmformat::PrimitiveBlock;
-use osmformat::relation::MemberType;
+use osmformat::relation::MemberType as ProtoMemberType;
 use protobuf::EnumOrUnknown;
 
 /// An enum with the OSM core elements: nodes, ways and relations.
@@ -428,34 +428,67 @@ impl Iterator for WayNodeLocationsIter<'_> {
 impl ExactSizeIterator for WayNodeLocationsIter<'_> {}
 
 /// The element type of a relation member.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum RelMemberType {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberType {
     Node,
     Way,
     Relation,
 }
 
-impl From<EnumOrUnknown<MemberType>> for RelMemberType {
+impl From<EnumOrUnknown<ProtoMemberType>> for MemberType {
     #[allow(clippy::unwrap_used)]
-    fn from(rmt: EnumOrUnknown<MemberType>) -> RelMemberType {
+    fn from(rmt: EnumOrUnknown<ProtoMemberType>) -> MemberType {
         match rmt.unwrap() {
-            MemberType::NODE => RelMemberType::Node,
-            MemberType::WAY => RelMemberType::Way,
-            MemberType::RELATION => RelMemberType::Relation,
+            ProtoMemberType::NODE => MemberType::Node,
+            ProtoMemberType::WAY => MemberType::Way,
+            ProtoMemberType::RELATION => MemberType::Relation,
         }
     }
 }
 
-//TODO encapsulate member_id based on member_type (NodeId, WayId, RelationId)
+/// A typed relation member reference combining element type and ID.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberId {
+    Node(i64),
+    Way(i64),
+    Relation(i64),
+}
+
+impl MemberId {
+    /// Returns the raw element ID regardless of type.
+    pub fn id(self) -> i64 {
+        match self {
+            MemberId::Node(id) | MemberId::Way(id) | MemberId::Relation(id) => id,
+        }
+    }
+
+    /// Returns the element type of this member reference.
+    pub fn member_type(self) -> MemberType {
+        match self {
+            MemberId::Node(_) => MemberType::Node,
+            MemberId::Way(_) => MemberType::Way,
+            MemberId::Relation(_) => MemberType::Relation,
+        }
+    }
+
+    /// Construct a MemberId from a raw id and type.
+    pub fn from_id_and_type(id: i64, member_type: MemberType) -> Self {
+        match member_type {
+            MemberType::Node => MemberId::Node(id),
+            MemberType::Way => MemberId::Way(id),
+            MemberType::Relation => MemberId::Relation(id),
+        }
+    }
+}
+
 /// A member of a relation.
 ///
-/// Each member has a member type and a member id that references an element of that type.
+/// Each member has a typed id ([`MemberId`]) and a role string.
 #[derive(Clone, Debug)]
 pub struct RelMember<'a> {
     block: &'a PrimitiveBlock,
     pub role_sid: i32,
-    pub member_id: i64,
-    pub member_type: RelMemberType,
+    pub id: MemberId,
 }
 
 impl<'a> RelMember<'a> {
@@ -472,7 +505,7 @@ pub struct RelMemberIter<'a> {
     block: &'a PrimitiveBlock,
     role_sids: std::slice::Iter<'a, i32>,
     member_id_deltas: std::slice::Iter<'a, i64>,
-    member_types: std::slice::Iter<'a, EnumOrUnknown<MemberType>>,
+    member_types: std::slice::Iter<'a, EnumOrUnknown<ProtoMemberType>>,
     current_member_id: i64,
 }
 
@@ -499,11 +532,11 @@ impl<'a> Iterator for RelMemberIter<'a> {
         ) {
             (Some(role_sid), Some(mem_id_delta), Some(member_type)) => {
                 self.current_member_id += *mem_id_delta;
+                let mt = MemberType::from(*member_type);
                 Some(RelMember {
                     block: self.block,
                     role_sid: *role_sid,
-                    member_id: self.current_member_id,
-                    member_type: RelMemberType::from(*member_type),
+                    id: MemberId::from_id_and_type(self.current_member_id, mt),
                 })
             }
             _ => None,
@@ -525,7 +558,10 @@ pub struct TagIter<'a> {
     val_indices: std::slice::Iter<'a, u32>,
 }
 
-//TODO return Result?
+// Item could be Result<(&str, &str)> to surface stringtable index-out-of-bounds and UTF-8
+// errors instead of silently yielding None. Not worth the churn: it's a breaking API change
+// that ripples through every .tags() consumer, and the per-tag branch already exists inside
+// get_stringtable_key_value — the only difference is whether errors are silent or propagated.
 #[allow(clippy::cast_sign_loss)]
 impl<'a> Iterator for TagIter<'a> {
     type Item = (&'a str, &'a str);

@@ -2,12 +2,12 @@
 layout: home
 
 hero:
-  name: "pbfhogg"
+  name: "Nidhogg"
   text: "Project tagline goes here"
-  tagline: "A brief description of what pbfhogg does and why you should use it."
+  tagline: "A brief description of what Nidhogg does and why you should use it."
   image:
-    src: /pbfhogg-logo.svg
-    alt: pbfhogg logo
+    src: /nidhogg-logo.svg
+    alt: Nidhogg logo
   actions:
     - theme: brand
       text: Get Started
@@ -17,7 +17,7 @@ hero:
       link: /api/
     - theme: alt
       text: GitHub
-      link: https://github.com/user/pbfhogg
+      link: https://github.com/user/nidhogg
 
 features:
   - icon:

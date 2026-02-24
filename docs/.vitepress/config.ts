@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
-const projectName = 'pbfhogg'
+const projectName = 'Nidhogg'
 const projectDescription = 'A project description goes here'
-const githubUrl = 'https://github.com/user/pbfhogg'
+const githubUrl = 'https://github.com/user/nidhogg'
 const base = '/' // set to '/repo-name/' for GitHub Pages project sites
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/pbfhogg-logo.svg',
+    logo: '/nidhogg-logo.svg',
 
     nav: [
       { text: 'Guide', link: '/guide/' },

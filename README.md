@@ -43,6 +43,7 @@ pbfhogg cat <files...> -o <out>           Concatenate PBF files (-t node,way,rel
 pbfhogg sort <file> -o <out>              Sort into standard order (nodes → ways → relations, by ID)
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box (minlon,minlat,maxlon,maxlat)
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
+pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
 pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file
 pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
 pbfhogg tags-count <file>                 Count tag key=value frequencies

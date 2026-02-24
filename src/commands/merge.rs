@@ -786,6 +786,7 @@ fn write_header(
         header.osmosis_replication_timestamp(),
         header.osmosis_replication_sequence_number(),
         header.osmosis_replication_base_url(),
+        &[],
     )?;
     writer.write_header(&header_bytes)?;
     Ok(())

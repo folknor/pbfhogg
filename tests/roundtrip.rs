@@ -21,6 +21,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             Some(1_700_000_000),
             Some(42),
             Some("https://example.com/replication"),
+            &[],
         )
         .unwrap();
         writer.write_header(&header_bytes).unwrap();
@@ -177,7 +178,7 @@ fn roundtrip_dense_nodes_no_metadata() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None).unwrap();
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -228,7 +229,7 @@ fn roundtrip_ways() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
-        let header = block_builder::build_header(None, None, None, None).unwrap();
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -305,7 +306,7 @@ fn roundtrip_relations() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::None);
-        let header = block_builder::build_header(None, None, None, None).unwrap();
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -412,7 +413,7 @@ fn roundtrip_multi_block() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None).unwrap();
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
         writer.write_header(&header).unwrap();
 
         // Block 1: nodes
@@ -462,13 +463,82 @@ fn roundtrip_multi_block() {
     }
 }
 
+/// Round-trip ways with node locations (LocationsOnWays feature).
+#[test]
+fn roundtrip_way_with_locations() {
+    let mut buf = Vec::new();
+    {
+        let mut writer = PbfWriter::new(&mut buf, Compression::default());
+        let header =
+            block_builder::build_header(None, None, None, None, &["LocationsOnWays"]).unwrap();
+        writer.write_header(&header).unwrap();
+
+        let mut bb = BlockBuilder::new();
+        bb.add_way_with_locations(
+            100,
+            &[("highway", "primary")],
+            &[1, 2, 3],
+            &[(550_000_000, 120_000_000), (551_000_000, 121_000_000), (552_000_000, 122_000_000)],
+            None,
+        );
+        let bytes = bb.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    let reader = BlobReader::new(Cursor::new(&buf));
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    assert_eq!(blobs.len(), 2);
+
+    // Verify header has LocationsOnWays feature
+    match blobs[0].decode().unwrap() {
+        BlobDecode::OsmHeader(header) => {
+            let features: Vec<&str> = header
+                .optional_features()
+                .iter()
+                .map(|s| s.as_ref())
+                .collect();
+            assert!(features.contains(&"LocationsOnWays"));
+        }
+        _ => panic!("expected OsmHeader"),
+    }
+
+    // Verify way has locations
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 1);
+    match &elements[0] {
+        Element::Way(w) => {
+            assert_eq!(w.id(), 100);
+            let refs: Vec<i64> = w.refs().collect();
+            assert_eq!(refs, vec![1, 2, 3]);
+            let locs: Vec<(i32, i32)> = w
+                .node_locations()
+                .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                .collect();
+            assert_eq!(
+                locs,
+                vec![
+                    (550_000_000, 120_000_000),
+                    (551_000_000, 121_000_000),
+                    (552_000_000, 122_000_000),
+                ]
+            );
+        }
+        _ => panic!("expected Way"),
+    }
+}
+
 /// Uncompressed round-trip to test Compression::None path.
 #[test]
 fn roundtrip_uncompressed() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::None);
-        let header = block_builder::build_header(None, None, None, None).unwrap();
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();

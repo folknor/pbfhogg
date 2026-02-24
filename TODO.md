@@ -54,13 +54,9 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 - [ ] `pbfhogg extract --smart` strategy — three passes, complete boundary/multipolygon
   relations (all member ways + their nodes included even if outside the extract region).
 
-- [ ] `pbfhogg add-locations-to-ways` — embed node coordinates in ways
-  CLI: `pbfhogg add-locations-to-ways <input.osm.pbf> -o <output.osm.pbf>`
-  Equivalent to: `osmium add-locations-to-ways`
-  Two-pass: first pass builds node ID -> coordinate index (flat mmap file, same approach as
-  nidhogg's `node_index.rs`), second pass rewrites ways with the `LocationsOnWays` PBF
-  feature enabled. Drop untagged nodes by default (`--keep-untagged-nodes` to retain).
-  Index backend options: in-memory, mmap dense, mmap sparse.
+- [ ] `pbfhogg add-locations-to-ways` mmap index backends — currently in-memory only
+  (HashMap), which limits to country-scale PBFs. Add mmap dense and mmap sparse backends
+  for planet-scale processing.
 
 - [ ] `pbfhogg diff` — compare two PBF files
   CLI: `pbfhogg diff <old.osm.pbf> <new.osm.pbf>`

@@ -129,6 +129,17 @@ enum Command {
         #[arg(short = 's', long)]
         simple: bool,
     },
+    /// Embed node coordinates in ways
+    AddLocationsToWays {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Keep untagged nodes in output (default: drop them)
+        #[arg(long)]
+        keep_untagged_nodes: bool,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -192,6 +203,11 @@ fn main() {
             polygon,
             simple,
         } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple),
+        Command::AddLocationsToWays {
+            file,
+            output,
+            keep_untagged_nodes,
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes),
         Command::Merge {
             base,
             changes,
@@ -405,6 +421,17 @@ fn run_extract(
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
     let stats = pbfhogg::extract::extract(file, output, &region, simple)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_add_locations_to_ways(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    keep_untagged_nodes: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats =
+        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes)?;
     stats.print_summary();
     Ok(())
 }

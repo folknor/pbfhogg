@@ -268,10 +268,11 @@ fn write_sorted(output: &Path, data: &ReadResult) -> Result<()> {
             header.osmosis_replication_timestamp(),
             header.osmosis_replication_sequence_number(),
             header.osmosis_replication_base_url(),
+            &[],
         )?;
         writer.write_header(&header_bytes)?;
     } else {
-        let header_bytes = build_header(None, None, None, None)?;
+        let header_bytes = build_header(None, None, None, None, &[])?;
         writer.write_header(&header_bytes)?;
     }
 

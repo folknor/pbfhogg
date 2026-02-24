@@ -348,6 +348,57 @@ impl BlockBuilder {
         self.count += 1;
     }
 
+    /// Add a way with node locations embedded.
+    ///
+    /// `refs` are absolute node IDs, `locations` are `(decimicro_lat, decimicro_lon)` pairs.
+    /// Both slices must have the same length.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_way_with_locations(
+        &mut self,
+        id: i64,
+        tags: &[(&str, &str)],
+        refs: &[i64],
+        locations: &[(i32, i32)],
+        metadata: Option<&Metadata<'_>>,
+    ) {
+        debug_assert_eq!(refs.len(), locations.len(), "refs and locations must match");
+        assert!(
+            self.can_add_way(),
+            "cannot add way: block full or wrong type"
+        );
+        self.block_type = Some(BlockType::Ways);
+
+        let mut way = osmformat::Way::new();
+        way.set_id(id);
+
+        for &(key, val) in tags {
+            way.keys.push(self.string_table.add(key));
+            way.vals.push(self.string_table.add(val));
+        }
+
+        let mut last_ref: i64 = 0;
+        let mut last_lat: i64 = 0;
+        let mut last_lon: i64 = 0;
+        for (i, &r) in refs.iter().enumerate() {
+            way.refs.push(r - last_ref);
+            last_ref = r;
+
+            let lat = i64::from(locations[i].0);
+            let lon = i64::from(locations[i].1);
+            way.lat.push(lat - last_lat);
+            way.lon.push(lon - last_lon);
+            last_lat = lat;
+            last_lon = lon;
+        }
+
+        if let Some(meta) = metadata {
+            way.info = protobuf::MessageField::some(self.build_info(meta));
+        }
+
+        self.ways.push(way);
+        self.count += 1;
+    }
+
     /// Add a relation.
     ///
     /// `members` are absolute member IDs (the builder handles delta encoding internally).
@@ -507,6 +558,7 @@ pub fn build_header(
     replication_timestamp: Option<i64>,
     replication_sequence_number: Option<i64>,
     replication_base_url: Option<&str>,
+    optional_features: &[&str],
 ) -> io::Result<Vec<u8>> {
     let mut header = osmformat::HeaderBlock::new();
 
@@ -517,6 +569,13 @@ pub fn build_header(
     header
         .required_features
         .push(protobuf::Chars::from("DenseNodes"));
+
+    // Optional features
+    for feature in optional_features {
+        header
+            .optional_features
+            .push(protobuf::Chars::from(*feature));
+    }
 
     // Writing program
     header.set_writingprogram(protobuf::Chars::from("pbfhogg"));

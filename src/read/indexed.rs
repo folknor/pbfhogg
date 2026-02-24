@@ -184,6 +184,13 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
     }
 
     /// Check element IDs of this block. Record min and max for every node, way and relation.
+    ///
+    /// This is an ID-only consumer — it iterates all elements but only calls `.id()`.
+    /// A lightweight "scan mode" that skips protobuf parsing of tags, coordinates, refs,
+    /// and metadata was considered but deemed not worth the complexity: this runs once per
+    /// `IndexedReader` session (during `create_index`), not in a hot loop. The full parse
+    /// is already needed for the subsequent filtered iteration passes. See the doc comment
+    /// on `PrimitiveBlock` in block.rs for the full rationale.
     #[allow(clippy::cognitive_complexity)]
     fn update_element_id_ranges(info: &mut BlobInfo, block: &PrimitiveBlock) {
         if info.id_ranges.is_some() {

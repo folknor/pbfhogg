@@ -45,6 +45,17 @@ impl RefCheckResult {
 ///
 /// Relies on PBF sort order: nodes before ways before relations.
 ///
+/// # Why this is NOT an ID-only consumer
+///
+/// Despite appearances, check_refs needs more than just element IDs:
+/// - Way node refs (`w.refs()`) — the delta-decoded refs array
+/// - Relation member IDs and types (`r.members()`) — the memids and types arrays
+///
+/// A pure "ID-only scan mode" that skips refs/members would not work here.
+/// A **selective parse** that skips stringtable, tags, coordinates, and metadata
+/// but keeps IDs + refs + members could help — this has not been benchmarked yet.
+/// See `PrimitiveBlock` doc comment in block.rs and TODO.md for the full analysis.
+///
 /// # Planet-scale memory usage
 ///
 /// Uses `roaring::RoaringTreemap` instead of `HashSet<i64>` for ID storage.

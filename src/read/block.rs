@@ -102,6 +102,26 @@ pub struct HeaderBBox {
 
 /// A `PrimitiveBlock`. It contains a sequence of groups.
 ///
+/// # Why there is no "scan" or "ID-only" parse mode
+///
+/// It may seem tempting to add a lightweight parse path that extracts only element
+/// IDs (skipping stringtable, tags, coordinates, refs, metadata) for consumers like
+/// `IndexedReader::update_element_id_ranges()`. Investigation found this is probably
+/// not worth the complexity:
+///
+/// - **Decompression dominates:** zlib/zstd decompression of the blob is ~60% of total
+///   read time and is unavoidable (compression covers the entire serialized block).
+///   Even skipping ALL protobuf parsing only saves ~35-40% of the remaining ~40%.
+/// - **Few consumers:** Only `IndexedReader` index-building is truly ID-only (one-time
+///   pass, not a hot path). `check_refs` needs way refs and relation members too.
+/// - **Maintenance cost:** A custom wire-format parser for PrimitiveBlock, PrimitiveGroup,
+///   DenseNodes, Way, and Relation (~200-400 lines) must stay in sync with the proto
+///   schema — two parallel parse paths is a classic source of subtle bugs.
+///
+/// A potentially useful variant is a **selective parse for check_refs** that skips
+/// stringtable + tags + coordinates + metadata but keeps IDs + way refs + relation
+/// members. This has not been benchmarked yet. See TODO.md for details.
+///
 /// # Stringtable UTF-8 invariant
 ///
 /// At construction time (`new()`), every entry in the block's stringtable is validated

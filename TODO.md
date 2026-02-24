@@ -65,9 +65,26 @@ or BlockBuilder/PbfWriter APIs):
 - [x] `elements.rs`, `dense.rs` — `WayNodeLocationsIter`, `Node`, `DenseNode`, `DenseNodeIter`
   now cache `granularity`, `lat_offset`, `lon_offset` as plain `i64` fields at construction
   time. Eliminates protobuf `Option` check + default-value fallback on every coordinate access.
-- [ ] Implement lightweight "scan" mode for protobuf blocks — extract only IDs without full
-  parse (skip string table, tags, info, coordinates, refs). Used by `IndexedReader`,
-  `check_refs`, and anywhere only IDs are needed.
+- [ ] **ID-only scan mode — probably not worth it.** The original idea was a lightweight
+  protobuf parser that extracts only element IDs, skipping stringtable, tags, coordinates,
+  refs, and metadata. Investigation (Feb 2025) found:
+  (1) The main supposed consumer, `check_refs`, actually needs way `refs()` and relation
+  `members()` — not just IDs. So a pure ID scan doesn't help it.
+  (2) The only true ID-only consumer is `IndexedReader::update_element_id_ranges()`, which
+  runs once per session and is not a hot path.
+  (3) Decompression (zlib/zstd) is ~60% of total read time and unavoidable — even a perfect
+  scan that skips ALL protobuf parsing would only save ~35-40% of the remaining ~40%.
+  (4) A custom wire-format parser for 5 message types is ~200-400 lines that must stay in
+  sync with the proto schema — significant maintenance burden for two non-critical consumers.
+  **Not yet benchmarked** — these estimates are based on code analysis, not profiling. If
+  profiling shows protobuf parsing is a larger fraction than estimated, revisit.
+- [ ] **Selective parse for check_refs** — skip stringtable, tags, coordinates, and metadata
+  but keep IDs + way refs + relation member IDs/types. Unlike the ID-only scan above, this
+  targets fields that check_refs actually needs. A planet check_refs must decompress+parse
+  ~2.5M blocks; skipping stringtable (~20-40% of block), coordinates (~30% for dense nodes),
+  tags, and metadata could meaningfully reduce the protobuf parsing cost. Implementation
+  would require custom wire-format parsing (same maintenance concern as above) or a two-tier
+  protobuf parse where certain fields are conditionally skipped. **Not yet benchmarked.**
 
 ## Performance: compression
 

@@ -409,6 +409,16 @@ impl IndexedReader<File> {
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let f = File::open(path)?;
+        // BufReader is intentionally NOT used here. IndexedReader performs random
+        // seeks to jump between blobs (e.g. first pass reads ways, second pass seeks
+        // back to read dependent nodes). A large read-ahead buffer would be wasted
+        // on every seek — the buffered data would be discarded immediately.
+        //
+        // This was investigated and confirmed: adding BufReader here showed no
+        // improvement and slightly increased memory overhead. See commit a38c258.
+        //
+        // For sequential reads, see BlobReader::from_path in blob.rs which uses a
+        // 256KB BufReader to amortize syscall overhead.
         Self::new(f)
     }
 }

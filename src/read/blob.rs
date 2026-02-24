@@ -12,10 +12,14 @@ use std::path::Path;
 use flate2::read::ZlibDecoder;
 
 /// Maximum allowed [`BlobHeader`] size in bytes.
-pub static MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
+/// Compile-time constant per the PBF spec. Uses `const` (not `static`) so the value
+/// is inlined at each use site with no memory address or indirection overhead.
+pub const MAX_BLOB_HEADER_SIZE: u64 = 64 * 1024;
 
 /// Maximum allowed uncompressed [`Blob`] content size in bytes.
-pub static MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
+/// Compile-time constant per the PBF spec. Uses `const` (not `static`) so the value
+/// is inlined at each use site with no memory address or indirection overhead.
+pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 
 /// The content type of a blob.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -271,7 +275,21 @@ impl BlobReader<BufReader<File>> {
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let f = File::open(path)?;
-        let reader = BufReader::new(f);
+        // Use a 256KB BufReader instead of the default 8KB.
+        //
+        // PBF blobs are typically 16-32KB compressed, so the default 8KB buffer
+        // requires 2-4 read syscalls per blob. For an 80GB planet file (~2.5M blobs),
+        // that adds up to 5-10M unnecessary syscalls.
+        //
+        // 256KB comfortably fits several blobs per syscall, reducing overhead
+        // significantly on the sequential read path where we consume blobs in order.
+        //
+        // Note: this large buffer is appropriate here because BlobReader reads
+        // sequentially. IndexedReader, which does random seeks, intentionally does NOT
+        // use BufReader — a large read-ahead buffer would be wasted and
+        // counterproductive for seek-heavy access patterns. See IndexedReader::from_path
+        // in indexed.rs.
+        let reader = BufReader::with_capacity(256 * 1024, f);
 
         Ok(BlobReader {
             reader,
@@ -472,7 +490,16 @@ impl BlobReader<BufReader<File>> {
     /// ```
     pub fn seekable_from_path<P: AsRef<Path>>(path: P) -> Result<BlobReader<BufReader<File>>> {
         let f = File::open(path.as_ref())?;
-        let buf_reader = BufReader::new(f);
+        // Use a 256KB BufReader for the same reasons as from_path above:
+        // PBF blobs are 16-32KB compressed, so the default 8KB buffer causes 2-4
+        // syscalls per blob. 256KB fits several blobs per read and dramatically
+        // reduces syscall overhead on sequential iteration.
+        //
+        // Although seekable_from_path supports seeking, in practice callers that need
+        // random access use IndexedReader (which has no BufReader). This path is
+        // mostly used for sequential iteration with occasional seek-back, where the
+        // large buffer is still beneficial.
+        let buf_reader = BufReader::with_capacity(256 * 1024, f);
         Self::new_seekable(buf_reader)
     }
 }
@@ -512,10 +539,21 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
             }
         }
         Some(fileformat::blob::Data::ZlibData(bytes)) => {
+            // When raw_size is set (the common case for modern PBF files), we use
+            // the exact decompressed size — one perfect allocation, no reallocs.
+            //
+            // When raw_size is missing (rare, older PBF files), compressed size alone
+            // is 3-10x too small because zlib typically achieves that compression ratio.
+            // Using compressed size as capacity would cause multiple Vec reallocations
+            // as read_to_end grows the buffer.
+            //
+            // 4x is a conservative middle ground: it avoids most reallocations without
+            // grossly over-allocating. Even if we over-estimate, the Vec only uses
+            // actual bytes written after read_to_end returns.
             let capacity = if blob.raw_size() > 0 {
                 blob.raw_size() as usize
             } else {
-                bytes.len()
+                bytes.len() * 4
             };
             let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
             let mut decoded = Vec::with_capacity(capacity);
@@ -553,10 +591,21 @@ pub fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
         }
         Some(fileformat::blob::Data::ZlibData(bytes)) => {
             let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
+            // When raw_size is set (the common case for modern PBF files), we use
+            // the exact decompressed size — one perfect allocation, no reallocs.
+            //
+            // When raw_size is missing (rare, older PBF files), compressed size alone
+            // is 3-10x too small because zlib typically achieves that compression ratio.
+            // Using compressed size as capacity would cause multiple Vec reallocations
+            // as read_to_end grows the buffer.
+            //
+            // 4x is a conservative middle ground: it avoids most reallocations without
+            // grossly over-allocating. Even if we over-estimate, the Vec only uses
+            // actual bytes written after read_to_end returns.
             let capacity = if blob.raw_size() > 0 {
                 blob.raw_size() as usize
             } else {
-                bytes.len()
+                bytes.len() * 4
             };
             let mut decoded_bytes = Vec::with_capacity(capacity);
             decoder.read_to_end(&mut decoded_bytes)?;

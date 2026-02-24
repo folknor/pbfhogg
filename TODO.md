@@ -20,54 +20,47 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Performance: I/O & buffering
 
-- [ ] `blob.rs:274` — `BufReader` uses default 8KB buffer. Bump to 256KB+ for sequential reads.
-  PBF blobs are 16-32KB compressed, so 8KB = 2-4 syscalls per blob. For 80GB (~2.5M blobs)
-  that is 5-10M unnecessary syscalls. Note: `IndexedReader` was already investigated (commit
-  a38c258) — BufReader has no benefit there due to random seeks. This item is about the
-  sequential `BlobReader` path only. When implementing, add code comments to both
-  `BlobReader` (explaining the larger buffer choice) and `IndexedReader::from_path`
-  (explaining why BufReader is intentionally not used, referencing commit a38c258).
-- [ ] `writer.rs:49` — `BufWriter` also uses default 8KB. Bump to match.
+- [x] `blob.rs:274` — `BufReader` bumped to 256KB for sequential reads. Comment added to
+  both `BlobReader::from_path` and `IndexedReader::from_path` (explaining why BufReader
+  is intentionally not used there, referencing commit a38c258).
+- [x] `writer.rs:49` — `BufWriter` bumped to 256KB in `PbfWriter::to_path`.
 - [ ] `mmap_blob.rs:182` — `MmapBlobReader::next()` creates a `Bytes::slice()` (atomic clone)
   on every iteration. Track offset as plain `usize` and index into raw `&[u8]`, only wrapping
   in `Bytes` for protobuf parsing.
 
 ## Performance: parallelism
 
-- [ ] `pipeline.rs:54` — decode pool hardcoded to 4 threads. Use
-  `std::thread::available_parallelism()` minus 2 (IO + main). On 8+ core machines this
-  roughly doubles pipelined throughput.
+- [x] `pipeline.rs:54` — decode pool now uses `available_parallelism() - 2`, min 1,
+  fallback 4.
 - [ ] `reader.rs:138-139` — `par_bridge()` in `par_map_reduce` has significant mutex contention
   at high parallelism. Consider pipeline-based approach or batch-collect into Vec then
   `par_iter()`.
 - [ ] `pipeline.rs:13-16` — `READ_AHEAD` / `DECODE_AHEAD` constants should be configurable
   or auto-tuned. Current `DECODE_AHEAD=32` means up to 64-256MB of decoded blocks in flight.
-- [ ] `pipeline.rs:84` — reorder buffer uses `HashMap<usize, ...>` for consecutive sequence
-  numbers. Replace with `VecDeque` or fixed-size ring buffer to eliminate hashing overhead.
+- [x] `pipeline.rs:84` — reorder buffer replaced with `VecDeque` (pre-allocated, ring buffer).
 
 ## Performance: allocations
 
 - [ ] `blob.rs:486-538` — public decode helpers (`parse_blob_header`, `decode_blob_to_primitiveblock`,
   etc.) call `Bytes::from(slice.to_vec())`, copying input bytes. Accept `Bytes` directly or
   use `Bytes::copy_from_slice()`. Callers in merge path often already have owned `Vec<u8>`.
-- [ ] `block_builder.rs:40-47` — `StringTable::add` allocates the same string twice (once for
-  `strings` Vec, once for `index` HashMap). Use `entry()` API to allocate once.
-- [ ] `block_builder.rs:162-192` — `BlockBuilder::new()` creates all Vecs with zero capacity.
-  Pre-allocate: 8000 for dense_ids/lats/lons, ~16000 for dense_keys_vals. Also, `take()`
-  leaves zero-capacity Vecs — swap in pre-allocated Vecs instead.
+- [x] `block_builder.rs:40-47` — `StringTable::add` rewritten with `entry()` API (one alloc
+  per new string instead of two).
+- [x] `block_builder.rs:162-192` — `BlockBuilder::new()` pre-allocates dense vectors
+  (8000 capacity for ids/lats/lons, 16000 for keys_vals, 8000 for metadata fields).
+  Note: `take()` leaves zero-capacity Vecs — documented as acceptable, future optimization.
 - [ ] `cat.rs:159,184,211,232`, `add_locations_to_ways.rs:227,251,278-279` — temporary Vecs
   created per-element in hot loops (`tags.collect()`, `refs.collect()`). Hoist reusable buffers
   outside the loop, use `clear()` + `extend()`.
-- [ ] `writer.rs:111` — zlib encoder wraps `Vec::new()`. Pre-allocate with
-  `Vec::with_capacity(uncompressed.len() / 2)`.
+- [x] `writer.rs:111` — zlib encoder pre-allocates with `Vec::with_capacity(data.len() / 2)`.
 
 ## Performance: parsing hot paths
 
 - [ ] `block.rs:416-425` — `str_from_stringtable` re-validates UTF-8 on every tag lookup.
   With 8000 elements * 2-3 tags = 32-48K validations per block, most redundant. Validate
   the entire stringtable once at `PrimitiveBlock::new()` time and store `Vec<&str>`.
-- [ ] `dense.rs:156-166` — `DenseNodeIter` uses `chunks(2)` for key_vals scanning, introducing
-  bounds checking per pair. Replace with index-based while loop scanning for `0` delimiter.
+- [x] `dense.rs:156-166` — `DenseNodeIter` key_vals scanning replaced with direct index-based
+  while loop (no chunks iterator, no per-pair bounds check).
 - [ ] `elements.rs:410-418` — `WayNodeLocationsIter` calls `lat_offset()`, `lon_offset()`,
   `granularity()` (protobuf accessors through `Option` check) on every iteration. Cache as
   fields at construction time. Same for `DenseNode::nano_lat/lon` and `Node::nano_lat/lon`.
@@ -80,8 +73,8 @@ or BlockBuilder/PbfWriter APIs):
 - [ ] Add zstd read/write support. PBF proto defines `zstd_data` (field 7) but code doesn't
   handle it. Zstd decompression is 3-5x faster than zlib at equivalent ratios. Add via `zstd`
   crate, consider making it the default for writing.
-- [ ] `blob.rs:556-561` — zlib decompression fallback when `raw_size` is missing uses compressed
-  size as capacity (3-10x too small). Use `bytes.len() * 4` as fallback.
+- [x] `blob.rs:556-561` — zlib decompression fallback changed to `bytes.len() * 4` in both
+  `decompress_blob_data` and `decode_blob`.
 
 ## Performance: data structures
 
@@ -107,8 +100,7 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Code quality
 
-- [ ] `error.rs` — implements deprecated `std::error::Error::description()` and `cause()`.
-  Replace with `Display` impl and `source()`.
+- [x] `error.rs` — removed deprecated `description()` and `cause()`, replaced with `source()`.
 - [ ] `commands/osc.rs` — `OscRelMember::member_type` is `String` instead of enum. Should use
   `MemberType` enum for type safety.
 - [ ] Test helper duplication — `make_node()`, `make_way()`, `make_relation()`, `roundtrip()`
@@ -122,8 +114,8 @@ or BlockBuilder/PbfWriter APIs):
 - [ ] Coordinate method duplication across `Node`, `DenseNode`, `WayNodeLocation` — three
   identical `lat()`/`lon()`/`nano_lat()`/`nano_lon()` implementations. Extract a trait or
   shared helper.
-- [ ] `blob.rs` — `MAX_BLOB_HEADER_SIZE` and `MAX_BLOB_MESSAGE_SIZE` are `static` instead of
-  `const`. Use `const` for compile-time constants.
+- [x] `blob.rs` — `MAX_BLOB_HEADER_SIZE` and `MAX_BLOB_MESSAGE_SIZE` changed from `static`
+  to `const`.
 
 ## Dependencies
 

@@ -153,17 +153,64 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 self.clat += *dlat;
                 self.clon += *dlon;
 
+                // --- Hot path: dense node key_vals scanning ---
+                //
+                // This runs once per dense node. A planet file contains ~8 billion
+                // dense nodes, so every branch and bounds check matters here.
+                //
+                // PBF dense node tag encoding (from the OSMPBF spec):
+                //   The `keys_vals` array stores tags for ALL dense nodes in a block
+                //   as a flat interleaved sequence:
+                //     [k1, v1, k2, v2, ..., 0, k1, v1, 0, 0, ...]
+                //   Each node's tags are a run of (key_index, val_index) pairs,
+                //   terminated by a single 0 delimiter. A node with no tags has
+                //   just the 0 delimiter (the while loop below doesn't execute,
+                //   i stays 0, and we get an empty slice — which is correct).
+                //
+                // Why a direct index loop instead of the previous chunks(2) iterator:
+                //   - No Iterator trait overhead (no next() calls, no Option unwraps)
+                //   - No per-chunk bounds check — chunks(2) must check chunk.len()
+                //     on every iteration because the last chunk might have 1 element
+                //   - No extra branch: the old code checked both chunk[0] != 0 AND
+                //     chunk.len() == 2 on every pair. We only check kv_slice[i] != 0.
+                //   - The compiler can see the simple loop structure and optimize the
+                //     bounds check on kv_slice[i] more aggressively.
                 let start_index = self.keys_vals_index;
-                let mut end_index = start_index;
-                for chunk in self.keys_vals_slice[self.keys_vals_index..].chunks(2) {
-                    if chunk[0] != 0 && chunk.len() == 2 {
-                        end_index += 2;
-                        self.keys_vals_index += 2;
-                    } else {
-                        self.keys_vals_index += 1;
-                        break;
-                    }
+
+                // Slice from current position to end of the key_vals array.
+                let kv_slice = &self.keys_vals_slice[self.keys_vals_index..];
+                let mut i = 0;
+
+                // Scan forward through key-value pairs until we hit the 0 delimiter.
+                // We advance by 2 each iteration (one key index + one value index).
+                // The 0 delimiter is always a key position — valid key string table
+                // indices are never 0 (index 0 is reserved as empty in the PBF
+                // string table), so we only need to check the key position.
+                while i < kv_slice.len() && kv_slice[i] != 0 {
+                    i += 2; // skip past both key_idx and val_idx
                 }
+
+                // end_index points past the last val_idx, giving us the slice
+                // [start_index..end_index] containing exactly the key-value pairs
+                // for this node (no delimiter included).
+                let end_index = start_index + i;
+
+                // Advance past the pairs we consumed, plus 1 for the 0 delimiter.
+                //
+                // Safety of the +1: the PBF spec guarantees that every node's tag
+                // run is terminated by a 0, and the keys_vals array has exactly as
+                // many delimiters as there are dense nodes in the block. The only
+                // case where kv_slice could be empty (len == 0) is when the block
+                // has no key_vals data at all (i.e. no node in this block has any
+                // tags). In that case i == 0 and we'd add 1, but this is safe
+                // because keys_vals_index is only used on the *next* call to next(),
+                // where dids.next() will return None first (since the id/lat/lon
+                // arrays are the same length as the number of nodes, and we've
+                // consumed them all if we've consumed all key_vals delimiters).
+                // We use saturating_add to make this robust even if the data is
+                // somehow truncated — we'll just point past the end and the next
+                // call will produce an empty kv_slice.
+                self.keys_vals_index = self.keys_vals_index.saturating_add(i + 1);
 
                 Some(DenseNode {
                     block: self.block,

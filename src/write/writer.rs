@@ -46,7 +46,19 @@ impl PbfWriter<io::BufWriter<std::fs::File>> {
     /// Create a `PbfWriter` that writes to a file at the given path.
     pub fn to_path(path: &Path, compression: Compression) -> io::Result<Self> {
         let file = std::fs::File::create(path)?;
-        let writer = io::BufWriter::new(file);
+        // Use a 256KB BufWriter instead of the default 8KB.
+        //
+        // The default BufWriter capacity is 8KB, but PBF blobs are typically
+        // 16–64KB compressed (each write_blob call emits a full framed blob).
+        // With 8KB buffers, a single blob write triggers multiple write
+        // syscalls as the buffer fills and flushes mid-blob. A 256KB buffer
+        // comfortably holds several blobs before flushing, reducing syscall
+        // overhead — especially important for large planet files where
+        // millions of blobs are written.
+        //
+        // 256KB also matches the BufReader capacity used on the read path
+        // (see BlobReader::from_path in blob.rs) for consistency.
+        let writer = io::BufWriter::with_capacity(256 * 1024, file);
         Ok(PbfWriter {
             writer,
             compression,
@@ -56,6 +68,12 @@ impl PbfWriter<io::BufWriter<std::fs::File>> {
 
 impl<W: Write> PbfWriter<W> {
     /// Create a new `PbfWriter` wrapping the given writer.
+    ///
+    /// If `writer` is backed by a file, callers should wrap it in
+    /// `BufWriter::with_capacity(256 * 1024, file)` for best performance.
+    /// PBF blobs are typically 16–64KB compressed, so the default 8KB
+    /// `BufWriter` causes excessive write syscalls. See [`to_path`](Self::to_path)
+    /// which applies this automatically.
     pub fn new(writer: W, compression: Compression) -> Self {
         PbfWriter {
             writer,
@@ -108,7 +126,36 @@ impl<W: Write> PbfWriter<W> {
                 )));
             }
             Compression::Zlib(level) => {
-                let mut encoder = ZlibEncoder::new(Vec::new(), FlateCompression::new(level));
+                // Pre-allocate the compression output buffer to avoid
+                // progressive reallocation during encoding.
+                //
+                // Vec::new() starts at 0 capacity, so as ZlibEncoder writes
+                // compressed bytes the Vec would repeatedly reallocate: 0 -> 8
+                // -> 16 -> 32 -> ... -> final size, copying accumulated data
+                // each time. For typical PBF blocks (128KB–8MB uncompressed),
+                // this causes many allocations and memcpys.
+                //
+                // Zlib typically achieves 2–10x compression on OSM data
+                // (dense nodes compress very well due to delta encoding;
+                // string-heavy relation blocks compress less). We pre-allocate
+                // for 2x compression (half the input size), which is the
+                // conservative/worst-case estimate:
+                //
+                // - If actual compression is better (e.g. 5x), we over-
+                //   allocate slightly but the excess is freed when the Vec
+                //   is consumed into Bytes::from(). No reallocation occurs.
+                // - If actual compression is worse than 2x (rare for OSM data),
+                //   the Vec grows once or twice instead of many times — still
+                //   a large improvement over starting from zero.
+                //
+                // This trades a small amount of transient over-allocation for
+                // eliminating virtually all reallocation churn in the common
+                // case.
+                let estimated_compressed_size = uncompressed.len() / 2;
+                let mut encoder = ZlibEncoder::new(
+                    Vec::with_capacity(estimated_compressed_size),
+                    FlateCompression::new(level),
+                );
                 encoder.write_all(uncompressed)?;
                 let compressed = encoder.finish()?;
                 blob.set_raw_size(uncompressed.len() as i32);

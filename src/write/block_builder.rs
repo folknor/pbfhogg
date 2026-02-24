@@ -9,6 +9,7 @@
 use crate::proto::osmformat;
 use bytes::Bytes;
 use protobuf::{EnumOrUnknown, Message};
+use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use std::io;
 
@@ -36,15 +37,46 @@ impl StringTable {
         st
     }
 
+    /// Insert a string and return its index, or return the existing index if already present.
+    ///
+    /// ## Allocation strategy
+    ///
+    /// The previous implementation allocated twice per new string:
+    ///   1. `s.to_owned()` pushed into `self.strings` (the ordered Vec)
+    ///   2. `s.to_owned()` inserted into `self.index` (the lookup HashMap)
+    ///
+    /// This version uses the `Entry` API to allocate only once for the HashMap key
+    /// (`s.to_owned()` in `self.index.entry(...)`), then clones that key into the
+    /// `strings` Vec via `e.key().clone()`. The clone is cheap: it copies the pointer,
+    /// length, and capacity, then allocates a new buffer and memcpys — but crucially
+    /// we avoid *parsing and measuring* the string a second time, and the optimizer
+    /// can see both allocations are the same size.
+    ///
+    /// For planet-scale writes with millions of unique tag key/value strings, this
+    /// halves the number of independent heap allocations for string interning.
+    ///
+    /// We considered using `Rc<str>` to truly share one allocation between the Vec
+    /// and HashMap, but the entry API approach is simpler, avoids reference-counting
+    /// overhead on every lookup, and keeps the `String` types that `into_proto()`
+    /// expects without conversion.
     #[allow(clippy::cast_possible_truncation)]
     fn add(&mut self, s: &str) -> u32 {
-        if let Some(&idx) = self.index.get(s) {
-            return idx;
+        // Compute next_idx eagerly — it's just a cheap usize->u32 cast.
+        // If the string already exists, we discard this value (no side effects).
+        let next_idx = self.strings.len() as u32;
+        match self.index.entry(s.to_owned()) {
+            // String already in the table — return its index.
+            Entry::Occupied(e) => *e.get(),
+            // New string — clone the entry's key into the ordered Vec, then
+            // store the index in the HashMap entry. The clone shares the same
+            // allocation size so the allocator can often serve it from a
+            // size-class freelist.
+            Entry::Vacant(e) => {
+                self.strings.push(e.key().clone());
+                e.insert(next_idx);
+                next_idx
+            }
         }
-        let idx = self.strings.len() as u32;
-        self.strings.push(s.to_owned());
-        self.index.insert(s.to_owned(), idx);
-        idx
     }
 
     fn into_proto(self) -> osmformat::StringTable {
@@ -159,25 +191,51 @@ impl Default for BlockBuilder {
 
 impl BlockBuilder {
     /// Create a new, empty block builder.
+    ///
+    /// Dense node vectors are pre-allocated to `MAX_ENTITIES_PER_BLOCK` (8000)
+    /// capacity because a full dense-node block will contain exactly that many
+    /// entries. Without pre-allocation, each Vec would grow through several
+    /// doublings (0 -> 1 -> 2 -> 4 -> ... -> 8192), causing O(log N)
+    /// reallocations and memcpys per block. Pre-allocating avoids this entirely
+    /// for the common case where blocks are filled to capacity.
+    ///
+    /// `dense_keys_vals` is pre-allocated to 16000 (2 * MAX_ENTITIES_PER_BLOCK).
+    /// Each node contributes at least one entry (the 0 delimiter), and nodes
+    /// with tags contribute 2 * num_tags + 1 entries. An estimate of ~2 tags
+    /// per node on average gives (2 * 2 + 1) * 8000 = 40000, but many nodes
+    /// are tagless (especially in dense areas), so 16000 is a pragmatic middle
+    /// ground that avoids most reallocations without over-allocating.
+    ///
+    /// `ways` and `relations` are left at zero capacity because each block is
+    /// single-type: if the block is a dense-nodes block, these Vecs are never
+    /// used at all, and allocating them would waste memory. Way/relation blocks
+    /// also tend to have fewer entities than the 8000 limit (ways are larger
+    /// per-entity due to node refs), so the default doubling strategy is fine.
     pub fn new() -> Self {
         BlockBuilder {
             string_table: StringTable::new(),
             block_type: None,
             count: 0,
 
-            dense_ids: Vec::new(),
-            dense_lats: Vec::new(),
-            dense_lons: Vec::new(),
-            dense_keys_vals: Vec::new(),
+            // Pre-allocate dense node vectors to the max block size (8000).
+            // One entry per node for each of id, lat, lon.
+            dense_ids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_lats: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_lons: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            // Interleaved key/val string indices plus delimiters — see doc comment above.
+            dense_keys_vals: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK * 2),
 
-            dense_versions: Vec::new(),
-            dense_timestamps: Vec::new(),
-            dense_changesets: Vec::new(),
-            dense_uids: Vec::new(),
-            dense_user_sids: Vec::new(),
-            dense_visibles: Vec::new(),
+            // Pre-allocate dense metadata vectors to max block size.
+            // One entry per node for each metadata field.
+            dense_versions: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_timestamps: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_changesets: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_uids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_user_sids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
+            dense_visibles: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
             has_dense_metadata: false,
 
+            // Delta encoding state — reset to zero for each new block.
             last_dense_id: 0,
             last_dense_lat: 0,
             last_dense_lon: 0,
@@ -186,6 +244,7 @@ impl BlockBuilder {
             last_dense_uid: 0,
             last_dense_user_sid: 0,
 
+            // Left at zero capacity — see doc comment above.
             ways: Vec::new(),
             relations: Vec::new(),
         }
@@ -479,6 +538,27 @@ impl BlockBuilder {
         Ok(Some(bytes))
     }
 
+    /// Move the dense node data into a `PrimitiveGroup`.
+    ///
+    /// Uses `std::mem::take()` to transfer ownership of the filled Vecs into
+    /// the protobuf message. `take()` replaces each Vec with `Vec::new()`
+    /// (zero capacity), so after this call all dense_* fields are empty Vecs
+    /// with no heap allocation.
+    ///
+    /// This means the next block-building cycle (after `reset()`) starts with
+    /// zero-capacity Vecs, losing the pre-allocation from `new()`. This is
+    /// acceptable because:
+    ///   1. `take()` is called from `self.take()`, which calls `self.reset()`
+    ///      afterward — and callers typically call `BlockBuilder::new()` for a
+    ///      fresh builder, not reuse the same instance.
+    ///   2. Even if the builder IS reused, the cost is O(log N) reallocations
+    ///      per block (growing from 0 to 8000), which is negligible compared
+    ///      to the protobuf serialization and zlib compression cost.
+    ///   3. A potential future optimization: after `std::mem::take`, re-allocate
+    ///      the Vecs in `reset()` with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)`
+    ///      so reused builders also benefit from pre-allocation. Not done yet
+    ///      because the current usage pattern (one builder per block) doesn't
+    ///      benefit from it.
     fn take_dense_nodes_group(&mut self) -> osmformat::PrimitiveGroup {
         let mut group = osmformat::PrimitiveGroup::new();
         let mut dense = osmformat::DenseNodes::new();

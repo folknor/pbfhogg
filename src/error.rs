@@ -92,55 +92,19 @@ impl From<Error> for io::Error {
     }
 }
 
+// Removed deprecated `description()` (deprecated since Rust 1.42) and `cause()` (deprecated
+// since Rust 1.33). Callers should use the `Display` impl (below) for human-readable error
+// messages — it covers all ErrorKind variants. The `source()` method is the modern replacement
+// for `cause()` with the same semantics. BlobError variants have no underlying source error,
+// so they return None.
 impl StdError for Error {
-    fn description(&self) -> &str {
-        match *self.0 {
-            ErrorKind::Io(ref err, ..) => {
-                use std::io::ErrorKind;
-                match err.kind() {
-                    ErrorKind::NotFound => "io error: not found",
-                    ErrorKind::PermissionDenied => "io error: permission denied",
-                    ErrorKind::ConnectionRefused => "io error: connection refused",
-                    ErrorKind::ConnectionReset => "io error: connection reset",
-                    ErrorKind::ConnectionAborted => "io error: connection aborted",
-                    ErrorKind::NotConnected => "io error: not connected",
-                    ErrorKind::AddrInUse => "io error: address in use",
-                    ErrorKind::AddrNotAvailable => "io error: address not available",
-                    ErrorKind::BrokenPipe => "io error: broken pipe",
-                    ErrorKind::AlreadyExists => "io error: already exists",
-                    ErrorKind::WouldBlock => "io error: would block",
-                    ErrorKind::InvalidInput => "io error: invalid input",
-                    ErrorKind::InvalidData => "io error: invalid data",
-                    ErrorKind::TimedOut => "io error: timed out",
-                    ErrorKind::WriteZero => "io error: write zero",
-                    ErrorKind::Interrupted => "io error: interrupted",
-                    ErrorKind::Other => "io error: other",
-                    ErrorKind::UnexpectedEof => "io error: unexpected EOF",
-                    _ => "io error",
-                }
-            }
-            ErrorKind::Protobuf { .. } => "protobuf error",
-            ErrorKind::StringtableUtf8 { .. } => "UTF-8 error in stringtable",
-            ErrorKind::StringtableIndexOutOfBounds { .. } => "stringtable index out of bounds",
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => {
-                "blob header size could not be decoded"
-            }
-            ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => "blob header is too big",
-            ErrorKind::Blob(BlobError::MessageTooBig { .. }) => "blob message is too big",
-            ErrorKind::Blob(BlobError::Empty) => "blob is missing fields 'raw' and 'zlib_data",
-        }
-    }
-
-    fn cause(&self) -> Option<&dyn StdError> {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self.0 {
             ErrorKind::Io(ref err) => Some(err),
             ErrorKind::Protobuf { ref err, .. } => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => None,
-            ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => None,
-            ErrorKind::Blob(BlobError::MessageTooBig { .. }) => None,
-            ErrorKind::Blob(BlobError::Empty) => None,
+            ErrorKind::Blob(_) => None,
         }
     }
 }

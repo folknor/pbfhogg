@@ -9,6 +9,143 @@ or BlockBuilder/PbfWriter APIs):
 
     scripts/test.sh -- --ignored
 
+## Performance: hotpath profiling results (Denmark 483 MB, Feb 2026)
+
+**Primary consumers:** Both elivagar and nidhogg use the same pattern:
+`ElementReader::from_path` -> `for_each_pipelined`. Nidhogg does 3 pipelined
+passes per ingest. Nidhogg also uses `pbfhogg::merge::merge()` for weekly
+planet updates. **Findings 1 and 3 are the top priorities** — they affect
+every pipelined read, which is the only read path the consumers use.
+Merge has not been profiled yet.
+
+Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
+Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
+tags-count to keep stdout manageable.
+
+### Finding 1: `decode_blob` allocation churn — 10.2 GB for a 483 MB file
+
+`decode_blob` is called 7,396 times (one per blob), averaging 1.4 MB per call
+(P95: 5.2 MB, P99: 5.9 MB). Total cumulative allocations: **10.2 GB** — a 21x
+amplification over the compressed file size. These are `Vec<u8>` decompression
+buffers that are allocated and freed per blob.
+
+**Planet extrapolation: ~1.7 TB of cumulative alloc/dealloc through decode_blob.**
+
+The allocations are short-lived (10 GB allocated = 10 GB deallocated), so RSS stays
+reasonable, but the allocation throughput hammers the allocator.
+
+- [ ] **Reuse decompression buffers across blobs.** Instead of allocating a new
+  `Vec<u8>` per blob in `decode_blob` / `decompress_blob_data_from_bytes`, pass a
+  reusable buffer that grows to high-water mark and gets reused. This eliminates
+  ~7,396 large allocations (Denmark) / ~2.5M (planet). The sequential and pipelined
+  readers can own one buffer per thread; `par_map_reduce` can use rayon's
+  `try_fold` initializer for per-thread buffers.
+
+### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
+
+The `HashMap<(String, String), u64>` for tag counting uses `k.to_string(),
+v.to_string()` on every tag of every element (`tags_count.rs:51-55`). For Denmark's
+59M elements (~118M tags), this creates ~236M temporary String allocations — most
+immediately dropped when the HashMap entry already exists. The HashMap itself retains
+2.5 GB for 3.3M distinct entries.
+
+**Planet extrapolation: ~40-50 GB HashMap + ~40B temporary String allocations.**
+
+- [ ] **Intern tag strings in tags_count.** Replace `HashMap<(String, String), u64>`
+  with a string interner (e.g. `lasso` crate or manual arena). Look up the interned
+  key first; only allocate a new String if the key is truly new. This eliminates
+  ~99% of the temporary String allocations (most tags are repeats).
+- [ ] **Avoid Box<dyn Iterator> in tags_count.** Line 44 uses `Box::new(dn.tags())`
+  for dynamic dispatch on every element. Use a match-with-inline-body or a macro
+  instead. Minor allocation but called 59M times.
+
+### Finding 3: main thread is the bottleneck in pipelined reads
+
+In both check-refs and tags-count, the main thread (element consumer) is at
+99-100% CPU while pipeline worker threads sit at 4-7% CPU. The pipeline is
+consumer-bound, not producer-bound. `for_each_pipelined` delivers decoded blocks
+faster than the main thread can process elements.
+
+This means optimizing the consumer closure matters more than optimizing decode
+throughput for pipelined reads. For `par_map_reduce` (which is fully parallel),
+`decode_blob` is the bottleneck instead.
+
+### Finding 4: `block::new` is allocation-free and cheap
+
+`PrimitiveBlock::new()` (stringtable validation) allocates 0 bytes and takes
+P50=3.8µs, P99=141µs, total 75ms (1.1% of wall time). Not a target.
+
+### Finding 5: missing hotpath instrumentation
+
+Only `check_refs` is instrumented among the commands. Add `#[hotpath::measure]`
+to the main function in each command file for per-command visibility:
+
+- [ ] `tags_count.rs` — `tags_count()`
+- [ ] `sort.rs` — `sort()`
+- [ ] `cat.rs` — `cat()`
+- [ ] `merge.rs` — `merge()`
+- [ ] `extract.rs` — `extract()`
+- [ ] `derive_changes.rs` — `derive_changes()`
+- [ ] `diff.rs` — `diff()`
+- [ ] `getid.rs` — `getid()`
+- [ ] `tags_filter.rs` — `tags_filter()`
+- [ ] `add_locations_to_ways.rs` — `add_locations_to_ways()`
+
+### Raw data
+
+**check-refs (Denmark, 52M nodes, 6.6M ways, 46K relations):**
+```
+Wall: 6.73s, RSS: 437.6 MB
+decode_blob:          7396 calls, 8.81s total (130%), 10.2 GB alloc
+for_each_pipelined:   1 call, 6.72s (99.83%), 262.4 MB alloc
+block::new:           7396 calls, 70.87ms (1.05%), 0 B alloc
+Main thread: 99% CPU. Workers: 4-5% CPU each (5 threads).
+Process: 10.0 GB alloc, 10.0 GB dealloc.
+```
+
+**tags-count (Denmark, same file):**
+```
+Wall: 8.11s, RSS: 1.1 GB
+decode_blob:          7396 calls, 11.61s total (143%), 10.2 GB alloc
+for_each_pipelined:   1 call, 7.19s (88.72%), 2.5 GB alloc
+block::new:           7396 calls, 70.44ms (0.86%), 0 B alloc
+Main thread: 100% CPU, 2.5 GB alloc, 10.6 GB dealloc (sole consumer).
+No worker threads visible (finished before report).
+Process: 2.6 GB alloc, 10.6 GB dealloc.
+```
+
+**merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**
+```
+Wall: 8.63s, RSS: 97.6 MB
+write_blob:                    632 calls, 5.32s (61.70%), 434.2 MB alloc
+decompress_blob_data_from_bytes: 7384 calls, 2.90s (33.64%), 1.6 GB alloc
+block_builder::take:           7407 calls, 692.85ms (8.02%), 266.1 MB alloc
+block::new:                    630 calls, 10.66ms (0.12%), 0 B alloc
+decode_blob:                   1 call, 21.98µs (0.00%), 74.8 KB alloc
+Main thread: 99% CPU. Workers: 1% CPU each.
+Process: 7.7 GB alloc, 7.7 GB dealloc.
+```
+
+### Finding 6: merge spends 62% of time compressing rewritten blobs
+
+`write_blob` (zlib compression) takes 5.32s for only 632 blobs. The other 6,766
+are raw passthrough (no decode, no re-encode). Compression is the bottleneck.
+
+- [ ] **Parallel compression in merge.** Rewritten blobs are independent — compress
+  them on a rayon thread pool instead of sequentially on the main thread. This is
+  the biggest single win for merge.
+
+### Finding 7: merge decompresses all blobs for ID range scanning
+
+`decompress_blob_data_from_bytes` is called 7,384 times (33.6% of wall time,
+1.6 GB alloc) to scan each blob's ID ranges and decide passthrough vs rewrite.
+The merge log confirms "6766 scan-only, 0 skip-decompress".
+
+- [ ] **Skip decompression for passthrough blobs in merge.** If blob headers or
+  a pre-scan index can determine ID ranges without decompression, 6,766 of 7,384
+  decompressions become unnecessary. Planet extrapolation: ~2.4M unnecessary
+  decompressions saved, ~250 GB of avoided allocations.
+
 ## Performance: parallelism
 
 - [ ] `pipeline.rs:13-16` — `READ_AHEAD` / `DECODE_AHEAD` constants should be configurable

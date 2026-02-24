@@ -67,12 +67,118 @@
 
 /* ── Typography ─────────────────────────────────────────────────────────── */
 
+@font-face {
+  font-family: 'Jomhuria';
+  src: url('/fonts/Jomhuria-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Almendra';
+  src: url('/fonts/Almendra-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Almendra';
+  src: url('/fonts/Almendra-Italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Almendra';
+  src: url('/fonts/Almendra-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Almendra';
+  src: url('/fonts/Almendra-BoldItalic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EB Garamond_regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EB Garamond_italic.ttf') format('truetype');
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EB Garamond_700.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'EB Garamond';
+  src: url('/fonts/EB Garamond_700italic.ttf') format('truetype');
+  font-weight: 700;
+  font-style: italic;
+  font-display: swap;
+}
+
 :root {
-  --vp-font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
-    Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+  /* swap between 'Almendra' and 'EB Garamond' to compare */
+  --vp-font-family-base: 'EB Garamond', Georgia, 'Times New Roman', serif;
   --vp-font-family-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code',
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
+
+/* ── Headings — Jomhuria ───────────────────────────────────────────────── *
+ * Jomhuria's glyphs sit high in the em box and render visually small,
+ * so we scale font-size by ~1.8× and tighten line-height / bottom spacing
+ * to keep the rhythm consistent with body text.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+.vp-doc h1,
+.vp-doc h2,
+.vp-doc h3,
+.vp-doc h4,
+.vp-doc h5,
+.vp-doc h6,
+.VPHero .name,
+.VPHero .text {
+  font-family: 'Jomhuria', cursive;
+  line-height: 0.75;
+  letter-spacing: 0.03em !important;
+}
+
+/* default 32px → 58px */
+.vp-doc h1 { font-size: 58px; margin-bottom: -0.15em; }
+
+/* default 24px → 43px */
+.vp-doc h2 { font-size: 43px; margin-bottom: -0.1em; }
+
+/* default 20px → 36px */
+.vp-doc h3 { font-size: 36px; margin-bottom: -0.1em; }
+
+/* default 18px → 32px */
+.vp-doc h4 { font-size: 32px; margin-bottom: -0.1em; }
+
+.vp-doc h5 { font-size: 29px; margin-bottom: -0.1em; }
+.vp-doc h6 { font-size: 26px; margin-bottom: -0.1em; }
 
 /* ── Nav logo hover ─────────────────────────────────────────────────────── */
 
@@ -114,10 +220,19 @@
 
 .VPHero .name {
   font-weight: 800;
+  font-size: 58px !important;
   letter-spacing: -0.02em;
   background-size: 200% 200%;
   animation: gradient-shift 6s ease infinite;
   text-shadow: 0 0 30px var(--vp-c-brand-soft), 0 0 60px var(--vp-c-brand-soft);
+}
+
+@media (min-width: 640px) {
+  .VPHero .name { font-size: 86px !important; }
+}
+
+@media (min-width: 960px) {
+  .VPHero .name { font-size: 101px !important; }
 }
 
 @keyframes gradient-shift {
@@ -128,7 +243,7 @@
 
 .VPHero .text {
   font-weight: 600;
-  font-size: 2rem !important;
+  font-size: 3.6rem !important;
   letter-spacing: -0.01em;
 }
 

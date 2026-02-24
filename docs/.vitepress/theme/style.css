@@ -20,7 +20,6 @@
   --vp-button-brand-bg: var(--vp-c-brand-2);
   --vp-button-brand-hover-bg: var(--vp-c-brand-1);
 
-  /* match nav + content widths (nav = this - 64px, hero default = 1152px) */
   --vp-layout-max-width: 1216px;
 
   /* muted light mode — no stark white */
@@ -63,6 +62,598 @@
   --vp-button-alt-bg: #2a2a2e;
   --vp-button-alt-hover-bg: #333336;
   --vp-button-alt-text: rgba(255, 255, 245, 0.86);
+}
+
+/* ── Fluid root size ───────────────────────────────────────────────────── *
+ * VitePress defaults to 16px. We use clamp() so the entire rem-based UI
+ * scales up on wider / 4K viewports instead of staying tiny.
+ *   ~16px at ≤1080p  →  ~19px at 1920px  →  24px at 4K
+ * ──────────────────────────────────────────────────────────────────────── */
+
+html {
+  font-size: clamp(16px, 10px + 0.5vw, 28px);
+}
+
+/* ── Wide-screen layout ────────────────────────────────────────────────── */
+
+@media (min-width: 2000px) {
+  :root {
+    --vp-layout-max-width: 1940px;
+  }
+}
+
+/* VPHero, VPFeatures, VPHomeSponsors, VPTeamPageSection, VPTeamMembers
+ * all hardcode max-width: 1152px instead of using the layout variable.
+ * Override them so the home page content fills wide screens too. */
+
+.VPHero .container,
+.VPFeatures .container,
+.VPHomeSponsors .container,
+.VPTeamPageSection .container,
+.VPTeamMembers .container {
+  max-width: calc(var(--vp-layout-max-width) - 64px);
+}
+
+/* ── Rem-ify VitePress px values ───────────────────────────────────────── *
+ * VitePress hardcodes px in scoped component styles throughout. We
+ * override to rem so everything scales with the fluid root font-size.
+ * Doubled class selectors (.Foo.Foo) beat Vue scoped attribute selectors.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+:root {
+  --vp-nav-height: 4rem;
+  --vp-nav-logo-height: 1.5rem;
+  --vp-sidebar-width: 17rem;
+  --vp-custom-block-font-size: 0.875rem;
+  --vp-custom-block-code-font-size: 0.8125rem;
+}
+
+/* ── Buttons ───────────────────────────────────────────────────────────── */
+
+.VPButton.medium.medium {
+  border-radius: 1.25rem;
+  padding: 0 1.25rem;
+  font-size: 0.875rem;
+  line-height: 2.375rem;
+}
+
+.VPButton.big.big {
+  border-radius: 1.5rem;
+  padding: 0 1.5rem;
+  font-size: 1rem;
+  line-height: 2.875rem;
+}
+
+/* ── Feature cards ─────────────────────────────────────────────────────── */
+
+.VPFeature.VPFeature {
+  border-radius: 0.75rem;
+}
+
+.VPFeature.VPFeature .box {
+  padding: 1.5rem;
+}
+
+.VPFeature.VPFeature .box > :deep(.VPImage) {
+  margin-bottom: 1.25rem;
+}
+
+.VPFeature.VPFeature .icon {
+  margin-bottom: 1.25rem;
+  border-radius: 0.375rem;
+  width: 3rem;
+  height: 3rem;
+  font-size: 1.5rem;
+}
+
+.VPFeature.VPFeature .title {
+  line-height: 1.5rem;
+  font-size: 1rem;
+}
+
+.VPFeature.VPFeature .details {
+  padding-top: 0.5rem;
+  line-height: 1.5rem;
+  font-size: 0.875rem;
+}
+
+.VPFeature.VPFeature .link-text {
+  padding-top: 0.5rem;
+}
+
+.VPFeature.VPFeature .link-text-value {
+  font-size: 0.875rem;
+}
+
+.VPFeature.VPFeature .link-text-icon {
+  margin-left: 0.375rem;
+}
+
+/* ── Features (outer grid) ─────────────────────────────────────────────── */
+
+.VPFeatures.VPHomeFeatures {
+  padding: 0 1.5rem;
+}
+
+.VPFeatures.VPHomeFeatures .items {
+  margin: -0.5rem;
+}
+
+.VPFeatures.VPHomeFeatures .item {
+  padding: 0.5rem;
+}
+
+@media (min-width: 640px) {
+  .VPFeatures.VPHomeFeatures { padding: 0 3rem; }
+}
+
+@media (min-width: 960px) {
+  .VPFeatures.VPHomeFeatures { padding: 0 4rem; }
+}
+
+/* ── Hero ──────────────────────────────────────────────────────────────── */
+
+.VPHero.VPHomeHero {
+  padding: calc(var(--vp-nav-height) + 3rem) 1.5rem 3rem;
+}
+
+.VPHero.VPHomeHero .tagline {
+  padding-top: 0.5rem;
+  max-width: 24.5rem;
+  line-height: 1.75rem;
+  font-size: 1.125rem;
+}
+
+.VPHero.VPHomeHero .actions {
+  margin: -0.375rem;
+  padding-top: 1.5rem;
+}
+
+.VPHero.VPHomeHero .action {
+  padding: 0.375rem;
+}
+
+@media (min-width: 640px) {
+  .VPHero.VPHomeHero {
+    padding: calc(var(--vp-nav-height) + 5rem) 3rem 4rem;
+  }
+  .VPHero.VPHomeHero .tagline {
+    padding-top: 0.75rem;
+    max-width: 36rem;
+    line-height: 2rem;
+    font-size: 1.25rem;
+  }
+  .VPHero.VPHomeHero .actions {
+    padding-top: 2rem;
+  }
+}
+
+@media (min-width: 960px) {
+  .VPHero.VPHomeHero {
+    padding: calc(var(--vp-nav-height) + 5rem) 4rem 4rem;
+  }
+  .VPHero.VPHomeHero .tagline {
+    line-height: 2.25rem;
+    font-size: 1.5rem;
+  }
+}
+
+/* ── Navbar ─────────────────────────────────────────────────────────────── */
+
+.VPNavBar.VPNavBar .wrapper {
+  padding: 0 0.5rem 0 1.5rem;
+}
+
+.VPNavBar.VPNavBar .divider {
+  padding-left: 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .VPNavBar.VPNavBar .wrapper {
+    padding: 0 2rem;
+  }
+}
+
+.VPNavBarTitle.VPNavBarTitle .title {
+  font-size: 1rem;
+}
+
+.VPNavBarTitle.VPNavBarTitle :deep(.logo) {
+  margin-right: 0.5rem;
+}
+
+.VPNavBarMenuLink.VPNavBarMenuLink {
+  padding: 0 0.75rem;
+  font-size: 0.875rem;
+}
+
+/* nav separators */
+.VPNavBar.VPNavBar .menu + .translations::before,
+.VPNavBar.VPNavBar .menu + .appearance::before,
+.VPNavBar.VPNavBar .translations + .appearance::before {
+  margin-right: 0.5rem;
+  margin-left: 0.5rem;
+  width: 0.0625rem;
+  height: 1.5rem;
+}
+
+.VPNavBar.VPNavBar .menu + .appearance::before,
+.VPNavBar.VPNavBar .translations + .appearance::before {
+  margin-right: 1rem;
+}
+
+.VPNavBar.VPNavBar .appearance + .social-links::before {
+  margin-left: 1rem;
+}
+
+.VPNavBar.VPNavBar .social-links {
+  margin-right: -0.5rem;
+}
+
+/* ── Social links ──────────────────────────────────────────────────────── */
+
+.VPSocialLink.VPSocialLink {
+  width: 2.25rem;
+  height: 2.25rem;
+}
+
+.VPSocialLink.VPSocialLink > :deep(svg),
+.VPSocialLink.VPSocialLink > :deep(img) {
+  width: 1.25rem;
+  height: 1.25rem;
+}
+
+/* ── Flyout menus ──────────────────────────────────────────────────────── */
+
+.VPFlyout.VPFlyout .button {
+  padding: 0 0.75rem;
+}
+
+.VPFlyout.VPFlyout .text {
+  font-size: 0.875rem;
+}
+
+.VPFlyout.VPFlyout .text-icon {
+  margin-left: 0.25rem;
+  font-size: 0.875rem;
+}
+
+.VPFlyout.VPFlyout .option-icon {
+  font-size: 1rem;
+}
+
+.VPFlyout.VPFlyout .icon {
+  font-size: 1.25rem;
+}
+
+.VPFlyout.VPFlyout .menu {
+  top: calc(var(--vp-nav-height) / 2 + 1.25rem);
+}
+
+/* ── Menus ─────────────────────────────────────────────────────────────── */
+
+.VPMenu.VPMenu {
+  border-radius: 0.75rem;
+  padding: 0.75rem;
+  min-width: 8rem;
+}
+
+.VPMenu.VPMenu :deep(.group) {
+  margin: 0 -0.75rem;
+  padding: 0 0.75rem 0.75rem;
+}
+
+.VPMenu.VPMenu :deep(.group + .group) {
+  padding: 0.6875rem 0.75rem 0.75rem;
+}
+
+.VPMenu.VPMenu :deep(.item) {
+  padding: 0 1rem;
+}
+
+.VPMenu.VPMenu :deep(.label) {
+  line-height: 1.75rem;
+  font-size: 0.75rem;
+}
+
+.VPMenu.VPMenu :deep(.action) {
+  padding-left: 1.5rem;
+}
+
+.VPMenuLink.VPMenuLink .link {
+  border-radius: 0.375rem;
+  padding: 0 0.75rem;
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+/* ── Sidebar ───────────────────────────────────────────────────────────── */
+
+.VPSidebar.VPSidebar {
+  padding: 2rem 2rem 6rem;
+  width: calc(100vw - 4rem);
+  max-width: 20rem;
+}
+
+.VPSidebarItem.level-0.level-0 {
+  padding-bottom: 1.5rem;
+}
+
+.VPSidebarItem.collapsed.level-0.level-0 {
+  padding-bottom: 0.625rem;
+}
+
+.VPSidebarItem.VPSidebarItem .indicator {
+  top: 0.375rem;
+  bottom: 0.375rem;
+  left: -1.0625rem;
+  width: 0.125rem;
+  border-radius: 0.125rem;
+}
+
+.VPSidebarItem.VPSidebarItem .text {
+  padding: 0.25rem 0;
+  line-height: 1.5rem;
+  font-size: 0.875rem;
+}
+
+.VPSidebarItem.VPSidebarItem .caret {
+  margin-right: -0.4375rem;
+  width: 2rem;
+  height: 2rem;
+}
+
+.VPSidebarItem.VPSidebarItem .caret-icon {
+  font-size: 1.125rem;
+}
+
+.VPSidebarItem.VPSidebarItem .items {
+  padding-left: 1rem;
+}
+
+/* ── Doc layout ────────────────────────────────────────────────────────── */
+
+.VPDoc.VPDoc {
+  padding: 2rem 1.5rem 6rem;
+}
+
+@media (min-width: 768px) {
+  .VPDoc.VPDoc { padding: 3rem 2rem 8rem; }
+}
+
+@media (min-width: 960px) {
+  .VPDoc.VPDoc { padding: 3rem 2rem 0; }
+}
+
+.VPDoc.VPDoc .aside {
+  padding-left: 2rem;
+  max-width: 16rem;
+}
+
+.VPDoc.VPDoc .left-aside {
+  padding-right: 2rem;
+}
+
+.VPDoc.VPDoc .aside-container {
+  width: 14rem;
+}
+
+.VPDoc.VPDoc .aside-curtain {
+  width: 14rem;
+  height: 2rem;
+}
+
+@media (min-width: 960px) {
+  .VPDoc.VPDoc .content {
+    padding: 0 2rem 8rem;
+  }
+}
+
+/* ── Doc footer (prev/next) ────────────────────────────────────────────── */
+
+.VPDocFooter.VPDocFooter {
+  margin-top: 4rem;
+}
+
+.VPDocFooter.VPDocFooter .edit-info {
+  padding-bottom: 1.125rem;
+}
+
+@media (min-width: 640px) {
+  .VPDocFooter.VPDocFooter .edit-info { padding-bottom: 0.875rem; }
+}
+
+.VPDocFooter.VPDocFooter .edit-link-button {
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+.VPDocFooter.VPDocFooter .edit-link-icon {
+  margin-right: 0.5rem;
+}
+
+.VPDocFooter.VPDocFooter .prev-next {
+  padding-top: 1.5rem;
+  grid-row-gap: 0.5rem;
+}
+
+@media (min-width: 640px) {
+  .VPDocFooter.VPDocFooter .prev-next { grid-column-gap: 1rem; }
+}
+
+.VPDocFooter.VPDocFooter .pager-link {
+  border-radius: 0.5rem;
+  padding: 0.6875rem 1rem 0.8125rem;
+}
+
+.VPDocFooter.VPDocFooter .desc {
+  line-height: 1.25rem;
+  font-size: 0.75rem;
+}
+
+.VPDocFooter.VPDocFooter .title {
+  line-height: 1.25rem;
+  font-size: 0.875rem;
+}
+
+/* ── Footer ────────────────────────────────────────────────────────────── */
+
+.VPFooter.VPFooter {
+  padding: 2rem 1.5rem;
+}
+
+@media (min-width: 768px) {
+  .VPFooter.VPFooter { padding: 2rem; }
+}
+
+.VPFooter.VPFooter .message,
+.VPFooter.VPFooter .copyright {
+  line-height: 1.5rem;
+  font-size: 0.875rem;
+}
+
+/* ── Local nav ─────────────────────────────────────────────────────────── */
+
+.VPLocalNav.VPLocalNav .menu {
+  line-height: 1.5rem;
+  font-size: 0.75rem;
+}
+
+.VPLocalNav.VPLocalNav .menu-icon {
+  margin-right: 0.5rem;
+  font-size: 0.875rem;
+}
+
+.VPLocalNav.VPLocalNav .menu,
+.VPLocalNav.VPLocalNav :deep(.VPLocalNavOutlineDropdown > button) {
+  padding: 0.75rem 1.5rem 0.6875rem;
+}
+
+@media (min-width: 768px) {
+  .VPLocalNav.VPLocalNav .menu,
+  .VPLocalNav.VPLocalNav :deep(.VPLocalNavOutlineDropdown > button) {
+    padding: 0.75rem 2rem 0.6875rem;
+  }
+}
+
+/* ── Outline (aside TOC) ──────────────────────────────────────────────── */
+
+.VPDocAsideOutline.VPDocAsideOutline .content {
+  padding-left: 1rem;
+  font-size: 0.8125rem;
+}
+
+.VPDocAsideOutline.VPDocAsideOutline .outline-marker {
+  top: 2rem;
+  left: -0.0625rem;
+  width: 0.125rem;
+  border-radius: 0.125rem;
+  height: 1.125rem;
+}
+
+.VPDocAsideOutline.VPDocAsideOutline .outline-title {
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+.VPDocOutlineItem.VPDocOutlineItem .nested {
+  padding-right: 1rem;
+  padding-left: 1rem;
+}
+
+.VPDocOutlineItem.VPDocOutlineItem .outline-link {
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+.VPDocOutlineItem.VPDocOutlineItem .outline-link.nested {
+  padding-left: 0.8125rem;
+}
+
+/* ── Search button ─────────────────────────────────────────────────────── */
+
+.VPNavBarSearchButton.VPNavBarSearchButton {
+  gap: 0.5rem;
+  padding: 0.5rem 0.875rem;
+  font-size: 1.25rem;
+}
+
+@media (min-width: 768px) {
+  .VPNavBarSearchButton.VPNavBarSearchButton {
+    padding: 0.5rem 0.75rem;
+    border-radius: 0.5rem;
+    font-size: 0.875rem;
+    line-height: 1;
+  }
+  .VPNavBarSearchButton.VPNavBarSearchButton .text {
+    font-size: 0.8125rem;
+  }
+  .VPNavBarSearchButton.VPNavBarSearchButton .keys {
+    gap: 0.25rem;
+    padding: 0.25rem 0.375rem;
+    border-radius: 0.25rem;
+    font-size: 0.75rem;
+  }
+}
+
+/* ── Nav screen (mobile) ───────────────────────────────────────────────── */
+
+.VPNavScreenMenuGroup.VPNavScreenMenuGroup {
+  height: 3rem;
+}
+
+.VPNavScreenMenuGroup.VPNavScreenMenuGroup.open {
+  padding-bottom: 0.625rem;
+}
+
+.VPNavScreenMenuGroup.VPNavScreenMenuGroup.open .button {
+  padding-bottom: 0.375rem;
+}
+
+.VPNavScreenMenuGroup.VPNavScreenMenuGroup .button {
+  padding: 0.75rem 0.25rem 0.6875rem 0;
+  line-height: 1.5rem;
+  font-size: 0.875rem;
+}
+
+.VPNavScreenMenuGroupLink.VPNavScreenMenuGroupLink {
+  margin-left: 0.75rem;
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+/* ── Hamburger ─────────────────────────────────────────────────────────── */
+
+.VPNavBarHamburger.VPNavBarHamburger {
+  width: 3rem;
+}
+
+/* ── Nav extra menu ────────────────────────────────────────────────────── */
+
+.VPNavBarExtra.VPNavBarExtra .trans-title {
+  padding: 0 1.5rem 0 0.75rem;
+  line-height: 2rem;
+  font-size: 0.875rem;
+}
+
+.VPNavBarExtra.VPNavBarExtra .item.appearance,
+.VPNavBarExtra.VPNavBarExtra .item.social-links {
+  padding: 0 0.75rem;
+}
+
+/* ── Nav search ────────────────────────────────────────────────────────── */
+
+@media (min-width: 768px) {
+  .VPNavBarSearch.VPNavBarSearch {
+    gap: 0.5rem;
+    padding-left: 1.5rem;
+  }
+}
+
+@media (min-width: 960px) {
+  .VPNavBarSearch.VPNavBarSearch {
+    padding-left: 2rem;
+  }
 }
 
 /* ── Typography ─────────────────────────────────────────────────────────── */
@@ -162,23 +753,15 @@
 .VPHero .text {
   font-family: 'Jomhuria', cursive;
   line-height: 0.75;
-  letter-spacing: 0.03em !important;
+  letter-spacing: 0.02em;
 }
 
-/* default 32px → 58px */
-.vp-doc h1 { font-size: 58px; margin-bottom: -0.15em; }
-
-/* default 24px → 43px */
-.vp-doc h2 { font-size: 43px; margin-bottom: -0.1em; }
-
-/* default 20px → 36px */
-.vp-doc h3 { font-size: 36px; margin-bottom: -0.1em; }
-
-/* default 18px → 32px */
-.vp-doc h4 { font-size: 32px; margin-bottom: -0.1em; }
-
-.vp-doc h5 { font-size: 29px; margin-bottom: -0.1em; }
-.vp-doc h6 { font-size: 26px; margin-bottom: -0.1em; }
+.vp-doc h1 { font-size: 3.625rem; margin-bottom: -0.15em; }
+.vp-doc h2 { font-size: 2.7rem;   margin-bottom: -0.1em; }
+.vp-doc h3 { font-size: 2.25rem;  margin-bottom: -0.1em; }
+.vp-doc h4 { font-size: 2rem;     margin-bottom: -0.1em; }
+.vp-doc h5 { font-size: 1.8rem;   margin-bottom: -0.1em; }
+.vp-doc h6 { font-size: 1.625rem; margin-bottom: -0.1em; }
 
 /* ── Nav logo hover ─────────────────────────────────────────────────────── */
 
@@ -220,19 +803,18 @@
 
 .VPHero .name {
   font-weight: 800;
-  font-size: 58px !important;
-  letter-spacing: -0.02em;
+  font-size: 3.625rem;
   background-size: 200% 200%;
   animation: gradient-shift 6s ease infinite;
   text-shadow: 0 0 30px var(--vp-c-brand-soft), 0 0 60px var(--vp-c-brand-soft);
 }
 
 @media (min-width: 640px) {
-  .VPHero .name { font-size: 86px !important; }
+  .VPHero .name { font-size: 5.375rem; }
 }
 
 @media (min-width: 960px) {
-  .VPHero .name { font-size: 101px !important; }
+  .VPHero .name { font-size: 6.3rem; }
 }
 
 @keyframes gradient-shift {
@@ -243,8 +825,7 @@
 
 .VPHero .text {
   font-weight: 600;
-  font-size: 3.6rem !important;
-  letter-spacing: -0.01em;
+  font-size: 3.6rem;
 }
 
 .VPHero .tagline {

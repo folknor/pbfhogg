@@ -2,11 +2,11 @@
 
 use super::block::{get_stringtable_key_value, str_from_stringtable};
 use super::dense::DenseNode;
+use super::wire::{
+    PackedInt32Iter, PackedSint64Iter, PackedUint32Iter, WireBlock, WireInfo, WireNode,
+    WireRelation, WireWay,
+};
 use crate::error::Result;
-use crate::proto::osmformat;
-use crate::proto::osmformat::PrimitiveBlock;
-use osmformat::relation::MemberType as ProtoMemberType;
-use protobuf::EnumOrUnknown;
 
 /// Generates degree-conversion coordinate methods from nanodegree accessors.
 ///
@@ -36,9 +36,6 @@ macro_rules! impl_coordinate_conversions {
         /// Returns the latitude coordinate in degrees.
         #[allow(clippy::cast_precision_loss)]
         pub fn lat(&self) -> f64 {
-            // Precision loss is acceptable: f64 has ~15.9 significant digits,
-            // which is more than enough for geographic coordinates (at most
-            // ~10 significant digits for nanodegree precision).
             1e-9 * self.nano_lat() as f64
         }
 
@@ -51,10 +48,6 @@ macro_rules! impl_coordinate_conversions {
         /// Returns the latitude coordinate in decimicrodegrees (10^-7).
         #[allow(clippy::cast_possible_truncation)]
         pub fn decimicro_lat(&self) -> i32 {
-            // Truncation is intentional: decimicrodegrees are by definition the
-            // integer part of (nanodegrees / 100). The i32 range is sufficient
-            // since valid latitudes span -900_000_000..=900_000_000 nanodegrees,
-            // yielding -9_000_000..=9_000_000 decimicrodegrees — well within i32.
             (self.nano_lat() / 100) as i32
         }
 
@@ -87,234 +80,147 @@ pub enum Element<'a> {
 /// An OpenStreetMap node element (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Node)).
 #[derive(Clone, Debug)]
 pub struct Node<'a> {
-    block: &'a PrimitiveBlock,
-    osmnode: &'a osmformat::Node,
-    /// Cached coordinate transform values from the PrimitiveBlock header.
-    ///
-    /// These values (`granularity`, `lat_offset`, `lon_offset`) are the same for every
-    /// element within a PrimitiveBlock. They come from the block's header fields and are
-    /// used to convert raw protobuf coordinate values to nanodegrees.
-    ///
-    /// Caching avoids the protobuf accessor overhead on every `nano_lat()`/`nano_lon()`
-    /// call. Each protobuf accessor (e.g. `block.granularity()`) performs an `Option`
-    /// check and default-value fallback per call. By reading them once at construction
-    /// time and storing plain `i64` values, we eliminate that overhead for every
-    /// coordinate access.
+    block: &'a WireBlock<'static>,
+    node: WireNode<'a>,
     granularity: i64,
     lat_offset: i64,
     lon_offset: i64,
 }
 
 impl<'a> Node<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmnode: &'a osmformat::Node) -> Node<'a> {
+    pub(crate) fn new(block: &'a WireBlock<'static>, node: WireNode<'a>) -> Node<'a> {
         Node {
             block,
-            osmnode,
-            // Cache the block-level coordinate transform parameters once at construction
-            // time. These are identical for all nodes within this PrimitiveBlock.
-            granularity: i64::from(block.granularity()),
-            lat_offset: block.lat_offset(),
-            lon_offset: block.lon_offset(),
+            node,
+            granularity: i64::from(block.granularity),
+            lat_offset: block.lat_offset,
+            lon_offset: block.lon_offset,
         }
     }
 
-    /// Returns the node id. It should be unique between nodes and might be negative to indicate
-    /// that the element has not yet been uploaded to a server.
+    /// Returns the node id.
     pub fn id(&self) -> i64 {
-        self.osmnode.id()
+        self.node.id
     }
 
-    /// Returns an iterator over the tags of this node
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of strings (key and value).
-    ///
-    /// # Example
-    /// ```
-    /// use pbfhogg::*;
-    ///
-    /// # fn foo() -> Result<()> {
-    /// let reader = ElementReader::from_path("tests/test.osm.pbf")?;
-    ///
-    /// reader.for_each(|element| {
-    ///     if let Element::Node(node) = element {
-    ///         for (key, value) in node.tags() {
-    ///             println!("key: {key}, value: {value}");
-    ///         }
-    ///     }
-    /// })?;
-    ///
-    /// # Ok(())
-    /// # }
-    /// # foo().unwrap();
-    /// ```
+    /// Returns an iterator over the tags of this node.
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmnode.keys.iter(),
-            val_indices: self.osmnode.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.node.keys_data),
+            val_indices: PackedUint32Iter::new(self.node.vals_data),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmnode.info.get_or_default())
+        let wire_info = self
+            .node
+            .info_data
+            .and_then(|data| WireInfo::parse(data).ok())
+            .unwrap_or_default();
+        Info::new(self.block, wire_info)
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
-    ///
-    /// This is the "raw" coordinate accessor — it applies the PBF block's lat_offset and
-    /// granularity to the node's stored latitude value. The `lat()`, `lon()`,
-    /// `decimicro_lat()`, and `decimicro_lon()` convenience methods are generated by the
-    /// `impl_coordinate_conversions!` macro and delegate to this and `nano_lon()`.
-    ///
-    /// Uses cached `lat_offset` and `granularity` fields (set once at construction time
-    /// from the PrimitiveBlock header) to avoid protobuf accessor overhead per call.
     pub fn nano_lat(&self) -> i64 {
-        self.lat_offset + self.granularity * self.osmnode.lat()
+        self.lat_offset + self.granularity * self.node.lat
     }
 
     /// Returns the longitude in nanodegrees (10^-9).
-    ///
-    /// Uses cached `lon_offset` and `granularity` fields to avoid protobuf accessor
-    /// overhead. See `nano_lat()` for details.
     pub fn nano_lon(&self) -> i64 {
-        self.lon_offset + self.granularity * self.osmnode.lon()
+        self.lon_offset + self.granularity * self.node.lon
     }
 
     impl_coordinate_conversions!();
 
-    /// Returns an iterator over the tags of this node
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// Returns an iterator over the tags of this node as raw index pairs.
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmnode.keys.iter(),
-            val_indices: self.osmnode.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.node.keys_data),
+            val_indices: PackedUint32Iter::new(self.node.vals_data),
         }
-    }
-
-    /// Returns the raw stringtable. Elements in a `PrimitiveBlock` do not store strings
-    /// themselves; instead, they just store indices to a common stringtable. By convention, the
-    /// contained strings are UTF-8 encoded but it is not safe to assume that (use
-    /// `std::str::from_utf8`).
-    pub fn raw_stringtable(&self) -> &[bytes::Bytes] {
-        self.block.stringtable.s.as_slice()
     }
 }
 
 /// An OpenStreetMap way element (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Way)).
 ///
-/// A way contains an ordered list of node references that can be accessed with the `refs` or the
-/// `raw_refs` method.
+/// A way contains an ordered list of node references that can be accessed with the `refs`
+/// method.
 #[derive(Clone, Debug)]
 pub struct Way<'a> {
-    block: &'a PrimitiveBlock,
-    osmway: &'a osmformat::Way,
+    block: &'a WireBlock<'static>,
+    way: WireWay<'a>,
+    granularity: i64,
+    lat_offset: i64,
+    lon_offset: i64,
 }
 
 impl<'a> Way<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmway: &'a osmformat::Way) -> Way<'a> {
-        Way { block, osmway }
+    pub(crate) fn new(block: &'a WireBlock<'static>, way: WireWay<'a>) -> Way<'a> {
+        Way {
+            block,
+            way,
+            granularity: i64::from(block.granularity),
+            lat_offset: block.lat_offset,
+            lon_offset: block.lon_offset,
+        }
     }
 
     /// Returns the way id.
     pub fn id(&self) -> i64 {
-        self.osmway.id()
+        self.way.id
     }
 
-    /// Returns an iterator over the tags of this way
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of strings (key and value).
-    ///
-    /// # Example
-    /// ```
-    /// use pbfhogg::*;
-    ///
-    /// # fn foo() -> Result<()> {
-    /// let reader = ElementReader::from_path("tests/test.osm.pbf")?;
-    ///
-    /// reader.for_each(|element| {
-    ///     if let Element::Way(way) = element {
-    ///         for (key, value) in way.tags() {
-    ///             println!("key: {key}, value: {value}");
-    ///         }
-    ///     }
-    /// })?;
-    ///
-    /// # Ok(())
-    /// # }
-    /// # foo().unwrap();
-    /// ```
+    /// Returns an iterator over the tags of this way.
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmway.keys.iter(),
-            val_indices: self.osmway.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.way.keys_data),
+            val_indices: PackedUint32Iter::new(self.way.vals_data),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmway.info.get_or_default())
+        let wire_info = self
+            .way
+            .info_data
+            .and_then(|data| WireInfo::parse(data).ok())
+            .unwrap_or_default();
+        Info::new(self.block, wire_info)
     }
 
     /// Returns an iterator over the references of this way. Each reference should correspond to a
     /// node id.
-    ///
-    /// Finding the corresponding node might involve iterating over the whole PBF structure, but
-    /// (to save space) ways themselves usually do not contain geo coordinates.
     pub fn refs(&self) -> WayRefIter<'a> {
         WayRefIter {
-            deltas: self.osmway.refs.iter(),
+            deltas: PackedSint64Iter::new(self.way.refs_data),
             current: 0,
         }
     }
 
     /// Returns an iterator over the way's node locations (latitude, longitude).
     /// Only available if the optional `LocationsOnWays` feature is included in the
-    /// [`HeaderBlock`](crate::block::HeaderBlock) and should return an empty iterator otherwise
-    /// (See the [`optional_features`](crate::block::HeaderBlock::optional_features) method).
-    ///
-    /// Use [`refs`](Way::refs) if this feature is not present or to get information other than
-    /// coordinates about the nodes that constitute a way.
+    /// [`HeaderBlock`](crate::block::HeaderBlock) and should return an empty iterator otherwise.
     pub fn node_locations(&self) -> WayNodeLocationsIter<'a> {
         WayNodeLocationsIter {
-            dlats: self.osmway.lat.iter(),
-            dlons: self.osmway.lon.iter(),
+            dlats: PackedSint64Iter::new(self.way.lat_data),
+            dlons: PackedSint64Iter::new(self.way.lon_data),
             clat: 0,
             clon: 0,
-            // Cache block-level coordinate transform parameters once for the entire
-            // iteration. These values come from the PrimitiveBlock header and are
-            // identical for all elements within this block.
-            granularity: i64::from(self.block.granularity()),
-            lat_offset: self.block.lat_offset(),
-            lon_offset: self.block.lon_offset(),
+            granularity: self.granularity,
+            lat_offset: self.lat_offset,
+            lon_offset: self.lon_offset,
         }
     }
 
-    /// Returns a slice of delta coded node ids.
-    pub fn raw_refs(&self) -> &[i64] {
-        self.osmway.refs.as_slice()
-    }
-
-    /// Returns an iterator over the tags of this way
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// Returns an iterator over the tags of this way as raw index pairs.
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmway.keys.iter(),
-            val_indices: self.osmway.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.way.keys_data),
+            val_indices: PackedUint32Iter::new(self.way.vals_data),
         }
-    }
-
-    /// Returns the raw stringtable. Elements in a `PrimitiveBlock` do not store strings
-    /// themselves; instead, they just store indices to a common stringtable. By convention, the
-    /// contained strings are UTF-8 encoded but it is not safe to assume that (use
-    /// `std::str::from_utf8`).
-    pub fn raw_stringtable(&self) -> &[bytes::Bytes] {
-        self.block.stringtable.s.as_slice()
     }
 }
 
@@ -323,87 +229,62 @@ impl<'a> Way<'a> {
 /// A relation contains an ordered list of members that can be of any element type.
 #[derive(Clone, Debug)]
 pub struct Relation<'a> {
-    block: &'a PrimitiveBlock,
-    osmrel: &'a osmformat::Relation,
+    block: &'a WireBlock<'static>,
+    rel: WireRelation<'a>,
 }
 
 impl<'a> Relation<'a> {
-    pub(crate) fn new(block: &'a PrimitiveBlock, osmrel: &'a osmformat::Relation) -> Relation<'a> {
-        Relation { block, osmrel }
+    pub(crate) fn new(
+        block: &'a WireBlock<'static>,
+        rel: WireRelation<'a>,
+    ) -> Relation<'a> {
+        Relation { block, rel }
     }
 
     /// Returns the relation id.
     pub fn id(&self) -> i64 {
-        self.osmrel.id()
+        self.rel.id
     }
 
-    /// Returns an iterator over the tags of this relation
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of strings (key and value).
-    ///
-    /// # Example
-    /// ```
-    /// use pbfhogg::*;
-    ///
-    /// # fn foo() -> Result<()> {
-    /// let reader = ElementReader::from_path("tests/test.osm.pbf")?;
-    ///
-    /// reader.for_each(|element| {
-    ///     if let Element::Relation(relation) = element {
-    ///         for (key, value) in relation.tags() {
-    ///             println!("key: {key}, value: {value}");
-    ///         }
-    ///     }
-    /// })?;
-    ///
-    /// # Ok(())
-    /// # }
-    /// # foo().unwrap();
-    /// ```
+    /// Returns an iterator over the tags of this relation.
     pub fn tags(&self) -> TagIter<'a> {
         TagIter {
             block: self.block,
-            key_indices: self.osmrel.keys.iter(),
-            val_indices: self.osmrel.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.rel.keys_data),
+            val_indices: PackedUint32Iter::new(self.rel.vals_data),
         }
     }
 
     /// Returns additional metadata for this element.
     pub fn info(&self) -> Info<'a> {
-        Info::new(self.block, self.osmrel.info.get_or_default())
+        let wire_info = self
+            .rel
+            .info_data
+            .and_then(|data| WireInfo::parse(data).ok())
+            .unwrap_or_default();
+        Info::new(self.block, wire_info)
     }
 
     /// Returns an iterator over the members of this relation.
     pub fn members(&self) -> RelMemberIter<'a> {
-        RelMemberIter::new(self.block, self.osmrel)
+        RelMemberIter::new(self.block, &self.rel)
     }
 
-    /// Returns an iterator over the tags of this relation
-    /// (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Tags)).
-    /// A tag is represented as a pair of indices (key and value) to the stringtable of the current
-    /// [`PrimitiveBlock`](crate::block::PrimitiveBlock).
+    /// Returns an iterator over the tags of this relation as raw index pairs.
     pub fn raw_tags(&self) -> RawTagIter<'a> {
         RawTagIter {
-            key_indices: self.osmrel.keys.iter(),
-            val_indices: self.osmrel.vals.iter(),
+            key_indices: PackedUint32Iter::new(self.rel.keys_data),
+            val_indices: PackedUint32Iter::new(self.rel.vals_data),
         }
-    }
-
-    /// Returns the raw stringtable. Elements in a `PrimitiveBlock` do not store strings
-    /// themselves; instead, they just store indices to a common stringtable. By convention, the
-    /// contained strings are UTF-8 encoded but it is not safe to assume that (use
-    /// `std::str::from_utf8`).
-    pub fn raw_stringtable(&self) -> &[bytes::Bytes] {
-        self.block.stringtable.s.as_slice()
     }
 }
 
 /// An iterator over the references of a way.
 ///
 /// Each reference corresponds to a node id.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WayRefIter<'a> {
-    deltas: std::slice::Iter<'a, i64>,
+    deltas: PackedSint64Iter<'a>,
     current: i64,
 }
 
@@ -411,7 +292,7 @@ impl Iterator for WayRefIter<'_> {
     type Item = i64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.deltas.next().map(|&d| {
+        self.deltas.next().map(|d| {
             self.current += d;
             self.current
         })
@@ -422,8 +303,6 @@ impl Iterator for WayRefIter<'_> {
     }
 }
 
-impl ExactSizeIterator for WayRefIter<'_> {}
-
 pub struct WayNodeLocation {
     lat: i64,
     lon: i64,
@@ -431,44 +310,26 @@ pub struct WayNodeLocation {
 
 /// A node location that contains latitude and longitude coordinates.
 impl WayNodeLocation {
-    /// Returns the latitude coordinate in nanodegrees (10^-9).
-    ///
-    /// For `WayNodeLocation`, the nanodegree value is already fully resolved
-    /// (offset + granularity applied by `WayNodeLocationsIter` at construction time),
-    /// so this is a simple field access.
     pub fn nano_lat(&self) -> i64 {
         self.lat
     }
 
-    /// Returns the longitude in nanodegrees (10^-9).
     pub fn nano_lon(&self) -> i64 {
         self.lon
     }
 
-    // lat(), lon(), decimicro_lat(), decimicro_lon() generated from nano accessors above.
     impl_coordinate_conversions!();
 }
 
 /// An iterator over the node locations of a way.
-/// Each element is a pair of coordinates consisting of latitude and longitude.
-///
-/// The `granularity`, `lat_offset`, and `lon_offset` fields are cached from the
-/// PrimitiveBlock header at construction time. These values are the same for every
-/// element within a block. Caching them here as plain `i64` fields avoids repeated
-/// protobuf accessor overhead (Option check + default-value fallback) on every
-/// `next()` call. For ways with hundreds or thousands of node locations, this
-/// eliminates three protobuf accessor calls per iteration.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct WayNodeLocationsIter<'a> {
-    dlats: std::slice::Iter<'a, i64>,
-    dlons: std::slice::Iter<'a, i64>,
+    dlats: PackedSint64Iter<'a>,
+    dlons: PackedSint64Iter<'a>,
     clat: i64,
     clon: i64,
-    /// Cached from PrimitiveBlock header — set once per block, used for all locations.
     granularity: i64,
-    /// Cached from PrimitiveBlock header — latitude offset in nanodegrees.
     lat_offset: i64,
-    /// Cached from PrimitiveBlock header — longitude offset in nanodegrees.
     lon_offset: i64,
 }
 
@@ -477,11 +338,9 @@ impl Iterator for WayNodeLocationsIter<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match (self.dlats.next(), self.dlons.next()) {
-            (Some(&dlat), Some(&dlon)) => {
+            (Some(dlat), Some(dlon)) => {
                 self.clat += dlat;
                 self.clon += dlon;
-                // Uses cached granularity/lat_offset/lon_offset instead of calling
-                // protobuf accessors on every iteration. See struct-level docs.
                 Some(WayNodeLocation {
                     lat: self.lat_offset + self.granularity * self.clat,
                     lon: self.lon_offset + self.granularity * self.clon,
@@ -496,53 +355,33 @@ impl Iterator for WayNodeLocationsIter<'_> {
     }
 }
 
-impl ExactSizeIterator for WayNodeLocationsIter<'_> {}
-
 /// The element type of a relation member.
-///
-/// The OSM PBF spec currently defines three member types (Node, Way, Relation), but
-/// protobuf enums are open-ended: a newer version of the spec (or a buggy encoder) could
-/// produce a value outside the known range. The `Unknown(i32)` variant captures such
-/// values without panicking, making deserialization forward-compatible. Callers that
-/// exhaustively match on `MemberType` should include a wildcard or `Unknown(_)` arm.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemberType {
     Node,
     Way,
     Relation,
     /// A member type value not recognized by this version of the library.
-    /// Contains the raw protobuf enum integer. This can occur if the PBF was written
-    /// by a tool using a newer version of the OSMPBF spec that defines additional
-    /// member types, or if the file is malformed.
     Unknown(i32),
 }
 
-impl From<EnumOrUnknown<ProtoMemberType>> for MemberType {
-    fn from(rmt: EnumOrUnknown<ProtoMemberType>) -> MemberType {
-        // `EnumOrUnknown::enum_value()` returns `Ok(variant)` for known protobuf enum
-        // values and `Err(raw_i32)` for unrecognized ones. This replaces the previous
-        // `unwrap()` which would panic on unknown values — a correctness hazard when
-        // reading PBF files produced by newer or non-conforming encoders.
-        match rmt.enum_value() {
-            Ok(ProtoMemberType::NODE) => MemberType::Node,
-            Ok(ProtoMemberType::WAY) => MemberType::Way,
-            Ok(ProtoMemberType::RELATION) => MemberType::Relation,
-            Err(raw) => MemberType::Unknown(raw),
+impl From<i32> for MemberType {
+    fn from(v: i32) -> MemberType {
+        match v {
+            0 => MemberType::Node,
+            1 => MemberType::Way,
+            2 => MemberType::Relation,
+            other => MemberType::Unknown(other),
         }
     }
 }
 
 /// A typed relation member reference combining element type and ID.
-///
-/// Mirrors `MemberType`: includes an `Unknown` variant for forward-compatibility with
-/// unrecognized protobuf member type values.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MemberId {
     Node(i64),
     Way(i64),
     Relation(i64),
-    /// A member with an unrecognized type. The first field is the raw protobuf enum
-    /// value; the second is the element ID. See [`MemberType::Unknown`] for details.
     Unknown(i32, i64),
 }
 
@@ -579,11 +418,9 @@ impl MemberId {
 }
 
 /// A member of a relation.
-///
-/// Each member has a typed id ([`MemberId`]) and a role string.
 #[derive(Clone, Debug)]
 pub struct RelMember<'a> {
-    block: &'a PrimitiveBlock,
+    block: &'a WireBlock<'static>,
     pub role_sid: i32,
     pub id: MemberId,
 }
@@ -597,22 +434,22 @@ impl<'a> RelMember<'a> {
 }
 
 /// An iterator over the members of a relation.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RelMemberIter<'a> {
-    block: &'a PrimitiveBlock,
-    role_sids: std::slice::Iter<'a, i32>,
-    member_id_deltas: std::slice::Iter<'a, i64>,
-    member_types: std::slice::Iter<'a, EnumOrUnknown<ProtoMemberType>>,
+    block: &'a WireBlock<'static>,
+    role_sids: PackedInt32Iter<'a>,
+    member_id_deltas: PackedSint64Iter<'a>,
+    member_types: PackedInt32Iter<'a>,
     current_member_id: i64,
 }
 
 impl<'a> RelMemberIter<'a> {
-    fn new(block: &'a PrimitiveBlock, osmrel: &'a osmformat::Relation) -> RelMemberIter<'a> {
+    fn new(block: &'a WireBlock<'static>, rel: &WireRelation<'a>) -> RelMemberIter<'a> {
         RelMemberIter {
             block,
-            role_sids: osmrel.roles_sid.iter(),
-            member_id_deltas: osmrel.memids.iter(),
-            member_types: osmrel.types.iter(),
+            role_sids: PackedInt32Iter::new(rel.roles_sid_data),
+            member_id_deltas: PackedSint64Iter::new(rel.memids_data),
+            member_types: PackedInt32Iter::new(rel.types_data),
             current_member_id: 0,
         }
     }
@@ -628,11 +465,11 @@ impl<'a> Iterator for RelMemberIter<'a> {
             self.member_types.next(),
         ) {
             (Some(role_sid), Some(mem_id_delta), Some(member_type)) => {
-                self.current_member_id += *mem_id_delta;
-                let mt = MemberType::from(*member_type);
+                self.current_member_id += mem_id_delta;
+                let mt = MemberType::from(member_type);
                 Some(RelMember {
                     block: self.block,
-                    role_sid: *role_sid,
+                    role_sid,
                     id: MemberId::from_id_and_type(self.current_member_id, mt),
                 })
             }
@@ -645,20 +482,14 @@ impl<'a> Iterator for RelMemberIter<'a> {
     }
 }
 
-impl ExactSizeIterator for RelMemberIter<'_> {}
-
 /// An iterator over the tags of an element. It returns a pair of strings (key and value).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TagIter<'a> {
-    block: &'a PrimitiveBlock,
-    key_indices: std::slice::Iter<'a, u32>,
-    val_indices: std::slice::Iter<'a, u32>,
+    block: &'a WireBlock<'static>,
+    key_indices: PackedUint32Iter<'a>,
+    val_indices: PackedUint32Iter<'a>,
 }
 
-// Item could be Result<(&str, &str)> to surface stringtable index-out-of-bounds and UTF-8
-// errors instead of silently yielding None. Not worth the churn: it's a breaking API change
-// that ripples through every .tags() consumer, and the per-tag branch already exists inside
-// get_stringtable_key_value — the only difference is whether errors are silent or propagated.
 #[allow(clippy::cast_sign_loss)]
 impl<'a> Iterator for TagIter<'a> {
     type Item = (&'a str, &'a str);
@@ -666,8 +497,8 @@ impl<'a> Iterator for TagIter<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         get_stringtable_key_value(
             self.block,
-            self.key_indices.next().map(|v| *v as usize),
-            self.val_indices.next().map(|v| *v as usize),
+            self.key_indices.next().map(|v| v as usize),
+            self.val_indices.next().map(|v| v as usize),
         )
     }
 
@@ -676,35 +507,19 @@ impl<'a> Iterator for TagIter<'a> {
     }
 }
 
-impl ExactSizeIterator for TagIter<'_> {}
-
-/// An iterator over the tags of an element. It returns a pair of indices (key and value) to the
-/// stringtable of the current [`PrimitiveBlock`](crate::block::PrimitiveBlock).
-#[derive(Clone, Debug)]
+/// An iterator over the tags of an element as raw index pairs.
+#[derive(Clone)]
 pub struct RawTagIter<'a> {
-    key_indices: std::slice::Iter<'a, u32>,
-    val_indices: std::slice::Iter<'a, u32>,
+    key_indices: PackedUint32Iter<'a>,
+    val_indices: PackedUint32Iter<'a>,
 }
 
-// Note on error handling (previously marked "TODO return Result?"):
-//
-// `RawTagIter` returns raw u32 index pairs — it does NOT perform stringtable lookups,
-// so there is no operation that can fail. The indices are simply forwarded from the
-// protobuf arrays. Any error (out-of-bounds index, invalid UTF-8) only manifests when
-// the caller subsequently looks up these indices in the stringtable.
-//
-// The iterators that DO perform stringtable lookups are `TagIter` and `DenseTagIter`.
-// Those silently swallow errors via `get_stringtable_key_value` (returning None for bad
-// entries). Changing their Item to `Result<(&str, &str), Error>` would be the correct
-// fix, but it is too disruptive: `tags()` is called in 50+ places across commands and
-// tests (all expecting `(&str, &str)`), and the practical risk is low — stringtable
-// corruption is extremely rare in real-world PBF files.
 impl Iterator for RawTagIter<'_> {
     type Item = (u32, u32);
 
     fn next(&mut self) -> Option<Self::Item> {
         match (self.key_indices.next(), self.val_indices.next()) {
-            (Some(&key_index), Some(&val_index)) => Some((key_index, val_index)),
+            (Some(key_index), Some(val_index)) => Some((key_index, val_index)),
             _ => None,
         }
     }
@@ -714,17 +529,15 @@ impl Iterator for RawTagIter<'_> {
     }
 }
 
-impl ExactSizeIterator for RawTagIter<'_> {}
-
 /// Additional metadata that might be included in each element.
 #[derive(Clone, Debug)]
 pub struct Info<'a> {
-    block: &'a PrimitiveBlock,
-    info: &'a osmformat::Info,
+    block: &'a WireBlock<'static>,
+    info: WireInfo,
 }
 
 impl<'a> Info<'a> {
-    fn new(block: &'a PrimitiveBlock, info: &'a osmformat::Info) -> Info<'a> {
+    fn new(block: &'a WireBlock<'static>, info: WireInfo) -> Info<'a> {
         Info { block, info }
     }
 
@@ -735,11 +548,9 @@ impl<'a> Info<'a> {
 
     /// Returns the time stamp in milliseconds since the epoch.
     pub fn milli_timestamp(&self) -> Option<i64> {
-        if self.info.has_timestamp() {
-            Some(self.info.timestamp() * i64::from(self.block.date_granularity()))
-        } else {
-            None
-        }
+        self.info
+            .timestamp
+            .map(|ts| ts * i64::from(self.block.date_granularity))
     }
 
     /// Returns the changeset id.
@@ -755,25 +566,17 @@ impl<'a> Info<'a> {
     /// Returns the user name.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Option<Result<&'a str>> {
-        if self.info.has_user_sid() {
-            Some(str_from_stringtable(
-                self.block,
-                self.info.user_sid() as usize,
-            ))
-        } else {
-            None
-        }
+        self.info
+            .user_sid
+            .map(|sid| str_from_stringtable(self.block, sid as usize))
     }
 
-    /// Returns the visibility status of an element. This is only relevant if the PBF file contains
-    /// historical information.
+    /// Returns the visibility status of an element.
     pub fn visible(&self) -> bool {
-        // If the visible flag is not present it must be assumed to be true.
         self.info.visible.unwrap_or(true)
     }
 
     /// Returns true if the element was deleted.
-    /// This is a convenience function that just returns the inverse of [`Info::visible`].
     pub fn deleted(&self) -> bool {
         !self.visible()
     }

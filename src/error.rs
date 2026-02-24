@@ -58,6 +58,8 @@ pub enum ErrorKind {
     StringtableIndexOutOfBounds { index: usize },
     /// An error that occurs when decoding `Blob`s.
     Blob(BlobError),
+    /// An error that occurs when decoding protobuf wire format.
+    WireFormat { msg: &'static str },
 }
 
 /// An error that occurs when decoding a blob.
@@ -105,6 +107,7 @@ impl StdError for Error {
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
             ErrorKind::Blob(_) => None,
+            ErrorKind::WireFormat { .. } => None,
         }
     }
 }
@@ -134,6 +137,13 @@ impl fmt::Display for Error {
             ErrorKind::Blob(BlobError::Empty) => {
                 write!(f, "blob is missing fields 'raw' and 'zlib_data'")
             }
+            ErrorKind::WireFormat { msg } => {
+                write!(f, "wire format error: {msg}")
+            }
         }
     }
+}
+
+pub(crate) fn new_wire_error(msg: &'static str) -> Error {
+    new_error(ErrorKind::WireFormat { msg })
 }

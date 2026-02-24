@@ -16,49 +16,29 @@ or BlockBuilder/PbfWriter APIs):
 passes per ingest. Nidhogg also uses `pbfhogg::merge::merge()` for weekly
 planet updates. **Finding 6 (parallel merge compression) is the top remaining
 priority** — merge is the only path with a clear, large optimization available.
-The pipelined read path is now well-optimized: decode_blob allocation churn
-solved with `DecompressPool` + `Bytes::from_owner` (97% reduction in process
-alloc, 7% wall time improvement on balanced workloads). Merge has been profiled
-(see Findings 6–7).
+The read path is now highly optimized: decompression buffer pooling
+(`DecompressPool` + `Bytes::from_owner`) eliminated 97% of process-level
+alloc, and the custom wire-format parser (`wire.rs`) eliminated the remaining
+9.3 GB of protobuf Vec allocations, yielding **43-44% wall time improvement**
+across all single-threaded read modes. Merge has been profiled (see Findings 6–7).
 
 Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
 Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
 tags-count to keep stdout manageable.
 
-### Finding 1: `decode_blob` allocation churn — 10.2 GB for a 483 MB file
+### Finding 1: `decode_blob` allocation churn — SOLVED
 
-`decode_blob` is called 7,396 times (one per blob), averaging 1.4 MB per call
-(P95: 5.2 MB, P99: 5.9 MB). Total cumulative allocations: **10.2 GB** — a 21x
-amplification over the compressed file size. These are `Vec<u8>` decompression
-buffers that are allocated and freed per blob.
+Originally 10.2 GB of cumulative alloc/dealloc for Denmark (21x amplification).
+Fully solved in three steps:
 
-**Planet extrapolation: ~1.7 TB of cumulative alloc/dealloc through decode_blob.**
-
-The allocations are short-lived (10 GB allocated = 10 GB deallocated), so RSS stays
-reasonable, but the allocation throughput hammers the allocator.
-
-- [x] **Reuse decompression buffers in merge.** Added `decompress_blob_data_into()`
-  with caller-provided buffer. Merge's `classify_blob` uses `map_init(Vec::new, ...)`
-  for per-thread buffer reuse via rayon. Passthrough blobs (91%) reuse the buffer;
-  only MayOverlap/Fallback (9%) take ownership via `mem::take`. Also fixed double-copy:
-  `parse_primitive_block_from_bytes(&raw)` → `parse_primitive_block_from_bytes_owned(&Bytes::from(raw))`.
-  Result: `decompress_blob_data_from_bytes` dropped from hotpath report entirely,
-  process alloc -100 MB, main thread alloc -200 MB.
-- [x] **Investigate alternative allocators for decode_blob (read path).**
-  Benchmarked jemalloc and mimalloc as drop-in replacements (features `jemalloc`,
-  `mimalloc` in Cargo.toml). **Result: allocator is not the bottleneck.** Denmark
-  check-refs (3 runs each): default 7.01s, jemalloc 6.93s (-1%), mimalloc 6.98s (~0%).
+- [x] **Reuse decompression buffers in merge.** `decompress_blob_data_into()` with
+  caller-provided buffer. Merge passthrough blobs (91%) reuse the buffer.
+- [x] **Investigate alternative allocators.** jemalloc/mimalloc showed <1% impact.
   Features kept for consumers who want lower RSS at planet scale.
-- [x] **Pool decompression buffers in decode_blob (read path).** `decode_blob` wraps
-  the decompressed Vec as `Bytes::from(decoded)` for zero-copy protobuf parsing.
-  The parsed PrimitiveBlock holds Bytes slices referencing the buffer, so the buffer
-  can't be reclaimed until the message drops. Solved with `Bytes::from_owner()` and
-  a `DecompressPool`: a custom owner type returns the Vec to the pool on drop instead
-  of freeing it. Pool created in `pipeline.rs`, shared across rayon decode threads via
-  Arc. Pool stabilizes at ~40 buffers (pipeline depth). Process-level cumulative alloc:
-  10.2 GB → 264.6 MB (**-97%**). Page faults: 384K → 340K (**-12%**). Wall time for
-  balanced workloads (tags-count): 4.77s → 4.43s (**-7%**). Main-thread-bound workloads
-  (check-refs) show no wall time change since workers aren't the bottleneck.
+- [x] **Pool decompression buffers in pipelined read path.** `DecompressPool` +
+  `Bytes::from_owner()` returns Vec to pool on drop. Process alloc: 10.2 GB → 265 MB (-97%).
+- [x] **Custom wire-format parser.** Eliminated remaining 9.3 GB of protobuf Vec
+  allocations. See "Reduce protobuf parsing allocations" below.
 
 ### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
 
@@ -74,18 +54,18 @@ Results (Denmark):
 
 ### Finding 3: main thread is the bottleneck in pipelined reads
 
-**Partially fixed.** After the tags_count optimization, tags-count main thread
-dropped from 100% to 11-16% CPU — no longer consumer-bound. check-refs still
-shows 99% main thread (RoaringTreemap insertions are the bottleneck there).
+**Partially fixed.** check-refs: main thread 100% CPU, workers 1% each (5 threads).
+The decode workers are almost completely idle — RoaringTreemap insertions on the
+main thread are the bottleneck. tags-count: main thread 100% CPU, pipelined
+section takes 3.97s of 7.15s total (the remaining 3.18s is stdout I/O + hashmap
+sorting). Both commands are consumer-bound, not worker-bound.
 
-For commands where the consumer closure is lightweight, the pipeline is now
-balanced. For commands with heavy consumer logic (check-refs), the main thread
-remains the bottleneck.
+### Finding 4: `block::new` — wire-format parsing is cheap
 
-### Finding 4: `block::new` is allocation-free and cheap
-
-`PrimitiveBlock::new()` (stringtable validation) allocates 0 bytes and takes
-P50=3.8µs, P99=141µs, total 75ms (1.1% of wall time). Not a target.
+After the wire parser rewrite, `PrimitiveBlock::new()` now does full wire-format
+parsing (stringtable index + group range extraction). Allocates 18 KB avg
+(stringtable `Vec<(u32,u32)>` + group_ranges), takes P50=5.6µs, P99=173µs,
+total 107ms (1.5% of wall time). 130 MB cumulative for Denmark.
 
 ### Finding 5: missing hotpath instrumentation
 
@@ -103,77 +83,52 @@ to the main function in each command file for per-command visibility:
 - [ ] `tags_filter.rs` — `tags_filter()`
 - [ ] `add_locations_to_ways.rs` — `add_locations_to_ways()`
 
-### Raw data
+### Raw data (current, with wire parser + pool)
 
 **check-refs (Denmark, 52M nodes, 6.6M ways, 46K relations):**
 ```
-Wall: 6.73s, RSS: 437.6 MB (with hotpath-alloc)
-decode_blob:          7396 calls, 8.81s total (130%), 10.2 GB alloc
-for_each_pipelined:   1 call, 6.72s (99.83%), 262.4 MB alloc
-block::new:           7396 calls, 70.87ms (1.05%), 0 B alloc
-Main thread: 99% CPU. Workers: 4-5% CPU each (5 threads).
-Process: 10.0 GB alloc, 10.0 GB dealloc.
-```
-
-**check-refs allocator comparison (Denmark, no hotpath, 3 runs each):**
-```
-default (glibc): 7.01s avg, RSS 902 MB, 384K minor faults, sys 0.67s
-jemalloc:        6.93s avg, RSS 735 MB, 272K minor faults, sys 0.45s  (-1% wall, -18% RSS)
-mimalloc:        6.98s avg, RSS 841 MB, 447K minor faults, sys 0.64s  (~0% wall, -7% RSS)
-Conclusion: allocator is not a meaningful bottleneck for pipelined reads.
-```
-
-**check-refs with DecompressPool (Denmark, no hotpath, 3 runs each):**
-```
-default (no pool): 7.01s avg, RSS 902 MB, 384K minor faults
-with pool:         6.97s avg, RSS 970 MB, 340K minor faults  (-12% faults, ~0% wall)
-Process alloc (hotpath): 10.2 GB → 264.6 MB (-97%)
-Wall time unchanged because check-refs is main-thread bound (RoaringTreemap).
-```
-
-**tags-count with DecompressPool (Denmark, no hotpath, 3 runs each):**
-```
-without pool: 4.77s avg
-with pool:    4.43s avg, RSS 1.2 GB, 360K minor faults  (-7% wall)
-Balanced workload — both workers and consumer busy, pool helps.
+Wall: 7.35s, RSS: 202 MB (with hotpath-alloc overhead)
+decompress_blob:      7396 calls, 2.61s (35.6%), avg 354µs, 671 MB cumulative alloc (pooled)
+block::new:           7396 calls, 113ms (1.5%), avg 15µs, 130 MB cumulative alloc
+for_each_pipelined:   1 call, 7.34s (99.9%), 262 MB alloc
+Process: 1.0 GB alloc, 1.3 GB dealloc.
+Main thread: 100% CPU. Workers: 1% CPU each (5 threads, vastly idle).
 ```
 
 **tags-count (Denmark, same file):**
 ```
-BEFORE (flat HashMap + Box<dyn Iterator>):
-Wall: 8.11s, RSS: 1.1 GB
-main alloc: 2.5 GB, for_each_pipelined alloc: 2.5 GB
-Main thread: 100% CPU (bottleneck). Workers: invisible.
-Process: 2.6 GB alloc, 10.6 GB dealloc.
-
-AFTER (two-level FxHashMap + inlined iteration):
-Wall: 4.77s, RSS: 1019 MB
-main alloc: 436 MB, for_each_pipelined alloc: 436 MB
-Main thread: 11-16% CPU. Workers: 11-16% each (balanced).
-Process: 10.0 GB alloc, 10.0 GB dealloc.
+Wall: 7.15s, RSS: 705 MB (with hotpath-alloc overhead)
+for_each_pipelined:   1 call, 3.97s (55.6%), 436 MB alloc
+decompress_blob:      7396 calls, 2.74s (38.3%), 692 MB cumulative alloc (pooled)
+block::new:           7396 calls, 118ms (1.6%), 130 MB cumulative alloc
+Process: 1016 MB alloc, 880 MB dealloc.
+Main thread: 100% CPU.
 ```
 
 **merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**
 ```
-BEFORE (buffer reuse):
-Wall: 8.63s, RSS: 97.6 MB
-write_blob:                    632 calls, 5.32s (61.70%), 434.2 MB alloc
-decompress_blob_data_from_bytes: 7384 calls, 2.90s (33.64%), 1.6 GB alloc
-block_builder::take:           7407 calls, 692.85ms (8.02%), 266.1 MB alloc
-Main thread: 99% CPU. Process: 7.7 GB alloc, 7.7 GB dealloc.
-
-AFTER (buffer reuse + double-copy fix):
-Wall: 8.57s, RSS: 94.5 MB
-write_blob:                    632 calls, 5.32s (62.05%), 434.2 MB alloc
-block_builder::take:           7407 calls, 683ms (7.97%), 266.1 MB alloc
-decompress_blob_data_from_bytes: GONE from report (buffer reuse)
-Main thread: 99% CPU, alloc 5.5 GB (was 5.7 GB). Process: 7.6 GB alloc (was 7.7 GB).
+Wall: 8.06s, RSS: 85.5 MB (with hotpath-alloc overhead)
+write_blob:           632 calls, 5.30s (65.7%), avg 8.4ms, 434 MB alloc
+block_builder::take:  7407 calls, 686ms (8.5%), 266 MB alloc
+block::new:           630 calls, 14ms (0.2%), 17 MB alloc
+decode_blob:          1 call, 18µs (HeaderBlock only)
+Process: 6.6 GB alloc, 6.6 GB dealloc. Main thread: 99% CPU.
 ```
 
-### Finding 6: merge spends 62% of time compressing rewritten blobs
+**bench-self (Denmark, best of 3, no hotpath overhead):**
+```
+sequential:  3076 ms
+parallel:     302 ms
+pipelined:   1599 ms
+mmap:        3229 ms
+blobreader:  3215 ms
+```
 
-`write_blob` (zlib compression) takes 5.32s for only 632 blobs. The other 6,766
-are raw passthrough (no decode, no re-encode). Compression is the bottleneck.
+### Finding 6: merge spends 66% of time compressing rewritten blobs
+
+`write_blob` (zlib compression) takes 5.30s for only 632 blobs (8.06s wall).
+The other 6,766 are raw passthrough (no decode, no re-encode). Compression is
+the clear bottleneck — everything else combined is only 2.76s.
 
 - [ ] **Parallel compression in merge.** Rewritten blobs are independent — compress
   them on a rayon thread pool instead of sequentially on the main thread. This is
@@ -181,45 +136,65 @@ are raw passthrough (no decode, no re-encode). Compression is the bottleneck.
 
 ### Finding 7: merge decompresses all blobs for ID range scanning
 
-`decompress_blob_data_from_bytes` was called 7,384 times (33.6% of wall time,
-1.6 GB alloc) to scan each blob's ID ranges and decide passthrough vs rewrite.
-
-**Partially addressed:** Buffer reuse via `decompress_blob_data_into` eliminates
-allocation churn for the 6,766 passthrough blobs. The decompression CPU work still
-happens but the allocation cost is gone.
+All 7,396 blobs are decompressed to scan ID ranges and decide passthrough vs
+rewrite. Buffer reuse via `decompress_blob_data_into` eliminates allocation churn.
+The wire parser makes the actual block parsing for the 630 rewritten blobs very
+cheap (14ms total, 17 MB alloc).
 
 - [ ] **Skip decompression entirely for passthrough blobs in merge.** If blob
   headers or a pre-scan index can determine ID ranges without decompression,
-  6,766 of 7,384 decompressions become unnecessary. This would save the CPU
-  time (~2.9s Denmark, ~8 min planet) not just the allocations.
+  ~6,766 decompressions become unnecessary.
 
 ## Performance: parallelism
 
 - [ ] `pipeline.rs:13-16` — `READ_AHEAD` / `DECODE_AHEAD` constants should be configurable
   or auto-tuned. Current `DECODE_AHEAD=32` means up to 64-256MB of decoded blocks in flight.
 
+- [ ] **Rayon alternatives for slice-based parallelism** — Wild linker discussion
+  ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
+  the landscape. Key options:
+  - **paralight** (v0.0.8) — lightweight, targets slice/mut-slice parallelism. Can run on top of
+    rayon's thread pool via `RayonThreadPool::new_global` (no extra threads). Has proper
+    `try_for_each_init` that inits once per thread (rayon inits once per work item). Only needs
+    `&` not `&mut` for the rayon backend. Limitation: no scopes, no graph algorithms, no recursive
+    parallelism. Max `u32::MAX` elements.
+  - **orx-parallel** — has `using()` API for guaranteed per-thread init. No thread pool yet
+    (spawns threads per pipeline), on roadmap. No scopes/graph support.
+  - **chili** — low-level, only provides `join`. A rayon fork (`par-iter`) builds par_iter on top
+    of it. Uses lazy scheduling (less overhead for fine-grained work).
+  - **forte** — experimental, rayon-like API with lazy scheduling. Supports spawn, join, scopes,
+    scoped spawns. No par_iter or par_bridge yet.
+  - **spindle** — built on rayon, optimised for small tasks. Very early.
+
+  Wild's `thread_local` crate trick is also relevant: wrap per-thread state in
+  `thread_local::ThreadLocal` and `.get_or()` inside rayon closures to guarantee one init per
+  thread. Simple and works today without switching libraries.
+
+  **Relevance to pbfhogg:** `par_map_reduce` uses rayon's `par_bridge` which has known overhead
+  for ordered iteration. `for_each_pipelined` uses a custom 3-stage pipeline that doesn't depend
+  on rayon's par_iter at all (it uses `rayon::spawn` for the decode pool). The main rayon
+  consumer is merge's `par_bridge` in `classify_blob`. The `thread_local::ThreadLocal` trick
+  could replace merge's `map_init(Vec::new, ...)` pattern for per-thread buffer reuse.
+
 ## Performance: parsing hot paths
 
-- [ ] **ID-only scan mode — probably not worth it.** The original idea was a lightweight
-  protobuf parser that extracts only element IDs, skipping stringtable, tags, coordinates,
-  refs, and metadata. Investigation (Feb 2025) found:
-  (1) The main supposed consumer, `check_refs`, actually needs way `refs()` and relation
-  `members()` — not just IDs. So a pure ID scan doesn't help it.
-  (2) The only true ID-only consumer is `IndexedReader::update_element_id_ranges()`, which
-  runs once per session and is not a hot path.
-  (3) Decompression (zlib/zstd) is ~60% of total read time and unavoidable — even a perfect
-  scan that skips ALL protobuf parsing would only save ~35-40% of the remaining ~40%.
-  (4) A custom wire-format parser for 5 message types is ~200-400 lines that must stay in
-  sync with the proto schema — significant maintenance burden for two non-critical consumers.
-  **Not yet benchmarked** — these estimates are based on code analysis, not profiling. If
-  profiling shows protobuf parsing is a larger fraction than estimated, revisit.
-- [ ] **Selective parse for check_refs** — skip stringtable, tags, coordinates, and metadata
-  but keep IDs + way refs + relation member IDs/types. Unlike the ID-only scan above, this
-  targets fields that check_refs actually needs. A planet check_refs must decompress+parse
-  ~2.5M blocks; skipping stringtable (~20-40% of block), coordinates (~30% for dense nodes),
-  tags, and metadata could meaningfully reduce the protobuf parsing cost. Implementation
-  would require custom wire-format parsing (same maintenance concern as above) or a two-tier
-  protobuf parse where certain fields are conditionally skipped. **Not yet benchmarked.**
+- [x] **ID-only scan mode — not worth it.** check-refs is main-thread bound at
+  100% CPU (RoaringTreemap). Decode workers run at 1% CPU. The wire parser already
+  skips unnecessary fields during single-pass tag scanning.
+- [x] **Selective parse for check_refs — not worth it.** Same conclusion: consumer-bound.
+- [x] **Reduce protobuf parsing allocations (~9.3 GB for Denmark).** Implemented
+  option (c): protozero-style custom wire-format decoder in `src/read/wire.rs`
+  (~900 lines). All packed repeated fields (ids, lats, lons, refs, keys, vals)
+  are now iterated on-the-fly from raw bytes via `PackedIter` — zero Vec alloc.
+  `WireStringTable` stores `Vec<(u32,u32)>` offsets (8 bytes/entry vs 32).
+  `PrimitiveBlock` owns `Bytes` + `WireBlock<'static>` (self-referential struct
+  with lifetime erased via unsafe transmute). HeaderBlock and write path stay on
+  `protobuf` crate. Results (Denmark):
+  - Cumulative decode alloc: 9.3 GB → 130 MB (block::new only, **-98.6%**)
+  - Sequential: 5378 → 3076 ms (**-43%**)
+  - Parallel: 541 → 302 ms (**-44%**)
+  - Pipelined: 1599 ms (**-27%**)
+  - Mmap/blobreader: ~3200 ms (**-43%**)
 
 ## Performance: memory / planet-scale
 
@@ -244,20 +219,21 @@ happens but the allocation cost is gone.
   **Total memory: ~2 GB regardless of input size.**
   Note: the existing `PbfWriter`/`BlockBuilder` are fully streaming and already support this —
   no writer changes needed.
-- [ ] `dense.rs` — Lazy `DenseNodeInfo` decoding — **probably not worth it.** Investigation
-  (Feb 2025) found the premise was wrong: only 1 `DenseNode` is alive at any time (iterator
-  yields them one at a time, no production code collects them), so peak memory is ~136 bytes
-  total, not ~136 × 8000 per block. The DenseInfo packed arrays are already fully decoded by
-  protobuf deserialization — making `DenseNodeInfo` lazy only avoids reading 4-5 cached values
-  per node (~5-10 ns). 10 of 16 call sites need `.info()`. Overall speedup: ~0.5-1%.
-  Any lazy approach requires breaking API change or dual iterators. See `DenseNode` doc comment
-  in dense.rs for full rationale. **Not yet benchmarked.**
+- [x] `dense.rs` — Lazy `DenseNodeInfo` decoding — **solved by wire parser.** The custom
+  wire-format parser already achieves this: `DenseNodeInfoIter` now uses packed varint
+  iterators that decode on-the-fly from raw bytes, rather than pre-materialized `Vec<i64>`
+  arrays. No separate lazy decoding pass needed.
 
 ## Dependencies
 
 - [ ] CLI-only dependencies (`clap`, `quick-xml`, `serde_json`) are runtime deps of the library
   crate. Library-only users pay the compile cost. Consider a `cli` feature gate or separate
   `pbfhogg-cli` binary crate.
+- [ ] `protobuf` crate: currently v3.7 (stepancheg/rust-protobuf, community, approaching EOL).
+  Only used for HeaderBlock parsing, blob envelope (BlobHeader/Blob), and write path.
+  The hot read path (PrimitiveBlock) now uses the custom wire-format parser in `wire.rs`.
+  Migration to v4 or prost would be lower-impact now since the performance-critical path
+  no longer depends on it.
 
 ## Before crates.io publish
 

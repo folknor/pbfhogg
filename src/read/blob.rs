@@ -211,7 +211,7 @@ impl Blob {
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        decode_blob(&self.blob, None).and_then(PrimitiveBlock::new)
+        decompress_blob(&self.blob, None).and_then(PrimitiveBlock::new)
     }
 
     /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
@@ -220,7 +220,7 @@ impl Blob {
         &self,
         pool: &Arc<DecompressPool>,
     ) -> Result<PrimitiveBlock> {
-        decode_blob(&self.blob, Some(pool)).and_then(PrimitiveBlock::new)
+        decompress_blob(&self.blob, Some(pool)).and_then(PrimitiveBlock::new)
     }
 }
 
@@ -709,8 +709,7 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 ) -> Result<crate::PrimitiveBlock> {
     let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
-    decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob, None)
-        .and_then(crate::PrimitiveBlock::new)
+    decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
 }
 
 /// Decompress a blob's data without parsing it into a typed message.
@@ -857,10 +856,7 @@ pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
 /// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
 /// [`parse_primitive_block_from_bytes_owned`] to avoid the copy.
 pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBlock> {
-    // Delegates to the Bytes-accepting variant. The copy here
-    // (Bytes::copy_from_slice) is the same cost as the old
-    // Bytes::from(raw.to_vec()), just more direct.
-    parse_primitive_block_from_bytes_owned(&Bytes::copy_from_slice(raw))
+    crate::PrimitiveBlock::new(Bytes::copy_from_slice(raw))
 }
 
 /// Zero-copy variant of [`parse_primitive_block_from_bytes`].
@@ -874,9 +870,7 @@ pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBl
 /// `from_bytes` in its name. The `_owned` suffix signals that this
 /// variant takes ownership of the buffer.
 pub fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
-    let block = crate::proto::osmformat::PrimitiveBlock::parse_from_tokio_bytes(raw)
-        .map_err(|e| new_protobuf_error(e, "parse primitive block"))?;
-    crate::PrimitiveBlock::new(block)
+    crate::PrimitiveBlock::new(raw.clone())
 }
 
 /// Decode raw Blob protobuf bytes into a [`HeaderBlock`].
@@ -897,6 +891,55 @@ pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate
     let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
     decode_blob::<crate::proto::osmformat::HeaderBlock>(&blob, None).map(crate::HeaderBlock::new)
+}
+
+/// Decompress a blob's data into `Bytes` without parsing it as a protobuf message.
+///
+/// This is the PrimitiveBlock hot path: decompress → wrap as Bytes →
+/// pass to `PrimitiveBlock::new()` which does zero-copy wire-format parsing.
+/// `decode_blob<T: Message>` is kept only for HeaderBlock parsing.
+#[allow(clippy::cast_sign_loss)]
+#[hotpath::measure]
+pub(crate) fn decompress_blob(
+    blob: &fileformat::Blob,
+    pool: Option<&Arc<DecompressPool>>,
+) -> Result<Bytes> {
+    match &blob.data {
+        Some(fileformat::blob::Data::Raw(bytes)) => {
+            let size = bytes.len() as u64;
+            if size < MAX_BLOB_MESSAGE_SIZE {
+                Ok(bytes.clone())
+            } else {
+                Err(new_blob_error(BlobError::MessageTooBig { size }))
+            }
+        }
+        Some(fileformat::blob::Data::ZlibData(bytes)) => {
+            let capacity = if blob.raw_size() > 0 {
+                blob.raw_size() as usize
+            } else {
+                bytes.len() * 4
+            };
+            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
+            let mut decoded_bytes = pool_get(pool, capacity);
+            decoder.read_to_end(&mut decoded_bytes)?;
+            Ok(pool_wrap(decoded_bytes, pool))
+        }
+        Some(fileformat::blob::Data::ZstdData(bytes)) => {
+            let capacity = if blob.raw_size() > 0 {
+                blob.raw_size() as usize
+            } else {
+                bytes.len() * 4
+            };
+            let mut decoded_bytes = pool_get(pool, capacity);
+            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded_bytes)?;
+            let size = decoded_bytes.len() as u64;
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                return Err(new_blob_error(BlobError::MessageTooBig { size }));
+            }
+            Ok(pool_wrap(decoded_bytes, pool))
+        }
+        _ => Err(new_blob_error(BlobError::Empty)),
+    }
 }
 
 #[allow(clippy::cast_sign_loss)]

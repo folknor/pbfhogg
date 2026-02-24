@@ -6,3 +6,4 @@ pub mod indexed;
 pub mod mmap_blob;
 pub mod reader;
 pub(crate) mod pipeline;
+pub(crate) mod wire;

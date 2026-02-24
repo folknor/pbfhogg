@@ -24,3 +24,8 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	pipelined	1399	52489653	6616526	46103	483
 2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	mmap	5527	52489653	6616526	46103	483
 2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	blobreader	5448	52489653	6616526	46103	483
+2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	sequential	3076	52489653	6616526	46103	483
+2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	parallel	302	52489653	6616526	46103	483
+2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	pipelined	1599	52489653	6616526	46103	483
+2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	mmap	3229	52489653	6616526	46103	483
+2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	blobreader	3215	52489653	6616526	46103	483

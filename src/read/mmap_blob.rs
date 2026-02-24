@@ -1,10 +1,12 @@
 //! Iterate over blobs from a memory map
 
 use self::fileformat::BlobHeader;
-use super::blob::{decode_blob, BlobDecode, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE};
+use super::blob::{
+    decode_blob, decompress_blob, BlobDecode, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE,
+};
 use super::block::{HeaderBlock, PrimitiveBlock};
 use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
-use crate::proto::{fileformat, osmformat};
+use crate::proto::fileformat;
 use bytes::Bytes;
 use protobuf::Message;
 use std::fs::File;
@@ -91,8 +93,8 @@ impl MmapBlob {
                 Ok(BlobDecode::OsmHeader(block))
             }
             "OSMData" => {
-                let block: osmformat::PrimitiveBlock = decode_blob(&blob, None)?;
-                Ok(BlobDecode::OsmData(PrimitiveBlock::new(block)?))
+                let block = PrimitiveBlock::new(decompress_blob(&blob, None)?)?;
+                Ok(BlobDecode::OsmData(block))
             }
             x => Ok(BlobDecode::Unknown(x)),
         }

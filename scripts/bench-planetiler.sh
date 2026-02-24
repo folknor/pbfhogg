@@ -23,7 +23,7 @@ FILE_MB=$(( $(stat -c%s "$PBF") / 1000000 ))
 
 # --- Temurin JRE setup ---
 # We need a JDK (not JRE) for javac to compile our benchmark
-JDK_MAJOR=21
+JDK_MAJOR=25
 JDK_DIR="data/jdk"
 JDK_VERSION_FILE="data/.jdk-version"
 JAVA="$JDK_DIR/bin/java"

@@ -1,7 +1,8 @@
 //! Count tag frequencies in a PBF file. Equivalent to `osmium tags-count`.
 
-use std::collections::HashMap;
 use std::path::Path;
+
+use rustc_hash::FxHashMap;
 
 use crate::{Element, ElementReader};
 
@@ -19,13 +20,21 @@ pub struct TagCount {
 /// If `type_filter` is set, only count tags on elements of that type
 /// ("node", "way", or "relation"). Results are sorted by count descending,
 /// then by key, then by value. Entries below `min_count` are excluded.
+///
+/// ## Allocation strategy
+///
+/// Uses a two-level `FxHashMap<String, FxHashMap<String, u64>>` so that
+/// lookups use `get_mut(&str)` — no allocation for existing entries.
+/// Only genuinely new (key, value) pairs allocate Strings. For Denmark
+/// (59M elements, ~118M tags, 3.3M distinct pairs), this reduces String
+/// allocations from ~236M (two per tag) to ~6.6M (two per distinct pair).
 pub fn tags_count(
     path: &Path,
     min_count: u64,
     type_filter: Option<&str>,
 ) -> Result<Vec<TagCount>> {
     let reader = ElementReader::from_path(path)?;
-    let mut counts: HashMap<(String, String), u64> = HashMap::new();
+    let mut counts: FxHashMap<String, FxHashMap<String, u64>> = FxHashMap::default();
 
     let filter_node = type_filter.is_none() || type_filter == Some("node");
     let filter_way = type_filter.is_none() || type_filter == Some("way");
@@ -41,25 +50,44 @@ pub fn tags_count(
             return;
         }
 
-        let tags: Box<dyn Iterator<Item = (&str, &str)>> = match &element {
-            Element::DenseNode(dn) => Box::new(dn.tags()),
-            Element::Node(n) => Box::new(n.tags()),
-            Element::Way(w) => Box::new(w.tags()),
-            Element::Relation(r) => Box::new(r.tags()),
-        };
-
-        for (k, v) in tags {
-            *counts
-                .entry((k.to_string(), v.to_string()))
-                .or_insert(0) += 1;
+        // Inline tag iteration per element type to avoid Box<dyn Iterator>
+        // heap allocation on every element (was 59M allocations for Denmark).
+        match &element {
+            Element::DenseNode(dn) => {
+                for (k, v) in dn.tags() {
+                    increment_tag(&mut counts, k, v);
+                }
+            }
+            Element::Node(n) => {
+                for (k, v) in n.tags() {
+                    increment_tag(&mut counts, k, v);
+                }
+            }
+            Element::Way(w) => {
+                for (k, v) in w.tags() {
+                    increment_tag(&mut counts, k, v);
+                }
+            }
+            Element::Relation(r) => {
+                for (k, v) in r.tags() {
+                    increment_tag(&mut counts, k, v);
+                }
+            }
         }
     })?;
 
-    let mut results: Vec<TagCount> = counts
-        .into_iter()
-        .filter(|(_, count)| *count >= min_count)
-        .map(|((key, value), count)| TagCount { key, value, count })
-        .collect();
+    let mut results: Vec<TagCount> = Vec::new();
+    for (key, inner) in counts {
+        for (value, count) in inner {
+            if count >= min_count {
+                results.push(TagCount {
+                    key: key.clone(),
+                    value,
+                    count,
+                });
+            }
+        }
+    }
 
     results.sort_by(|a, b| {
         b.count
@@ -69,4 +97,23 @@ pub fn tags_count(
     });
 
     Ok(results)
+}
+
+/// Increment the count for a (key, value) pair, allocating only on first insert.
+///
+/// Two-level lookup via `get_mut(&str)` avoids `to_string()` when the entry
+/// already exists. For typical PBF files, >98% of tags are repeats.
+#[inline]
+fn increment_tag(counts: &mut FxHashMap<String, FxHashMap<String, u64>>, k: &str, v: &str) {
+    if let Some(inner) = counts.get_mut(k) {
+        if let Some(count) = inner.get_mut(v) {
+            *count += 1;
+        } else {
+            inner.insert(v.to_string(), 1);
+        }
+    } else {
+        let mut inner = FxHashMap::default();
+        inner.insert(v.to_string(), 1);
+        counts.insert(k.to_string(), inner);
+    }
 }

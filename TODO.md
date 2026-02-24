@@ -50,32 +50,25 @@ reasonable, but the allocation throughput hammers the allocator.
 
 ### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
 
-The `HashMap<(String, String), u64>` for tag counting uses `k.to_string(),
-v.to_string()` on every tag of every element (`tags_count.rs:51-55`). For Denmark's
-59M elements (~118M tags), this creates ~236M temporary String allocations — most
-immediately dropped when the HashMap entry already exists. The HashMap itself retains
-2.5 GB for 3.3M distinct entries.
+**Fixed.** Two-level `FxHashMap<String, FxHashMap<String, u64>>` with `get_mut(&str)`
+lookups — no allocation for existing entries. Only new (key, value) pairs allocate.
+Also removed `Box<dyn Iterator>` by inlining tag iteration per element type.
 
-**Planet extrapolation: ~40-50 GB HashMap + ~40B temporary String allocations.**
-
-- [ ] **Intern tag strings in tags_count.** Replace `HashMap<(String, String), u64>`
-  with a string interner (e.g. `lasso` crate or manual arena). Look up the interned
-  key first; only allocate a new String if the key is truly new. This eliminates
-  ~99% of the temporary String allocations (most tags are repeats).
-- [ ] **Avoid Box<dyn Iterator> in tags_count.** Line 44 uses `Box::new(dn.tags())`
-  for dynamic dispatch on every element. Use a match-with-inline-body or a macro
-  instead. Minor allocation but called 59M times.
+Results (Denmark):
+- Wall time: 8.11s → **4.77s** (-41%)
+- `main` alloc: 2.5 GB → **436 MB** (-83%)
+- Main thread CPU: 100% → **11-16%** (no longer bottleneck)
+- Process dealloc: 10.6 GB → **10.0 GB** (-600 MB, temporary Strings eliminated)
 
 ### Finding 3: main thread is the bottleneck in pipelined reads
 
-In both check-refs and tags-count, the main thread (element consumer) is at
-99-100% CPU while pipeline worker threads sit at 4-7% CPU. The pipeline is
-consumer-bound, not producer-bound. `for_each_pipelined` delivers decoded blocks
-faster than the main thread can process elements.
+**Partially fixed.** After the tags_count optimization, tags-count main thread
+dropped from 100% to 11-16% CPU — no longer consumer-bound. check-refs still
+shows 99% main thread (RoaringTreemap insertions are the bottleneck there).
 
-This means optimizing the consumer closure matters more than optimizing decode
-throughput for pipelined reads. For `par_map_reduce` (which is fully parallel),
-`decode_blob` is the bottleneck instead.
+For commands where the consumer closure is lightweight, the pipeline is now
+balanced. For commands with heavy consumer logic (check-refs), the main thread
+remains the bottleneck.
 
 ### Finding 4: `block::new` is allocation-free and cheap
 
@@ -112,13 +105,17 @@ Process: 10.0 GB alloc, 10.0 GB dealloc.
 
 **tags-count (Denmark, same file):**
 ```
+BEFORE (flat HashMap + Box<dyn Iterator>):
 Wall: 8.11s, RSS: 1.1 GB
-decode_blob:          7396 calls, 11.61s total (143%), 10.2 GB alloc
-for_each_pipelined:   1 call, 7.19s (88.72%), 2.5 GB alloc
-block::new:           7396 calls, 70.44ms (0.86%), 0 B alloc
-Main thread: 100% CPU, 2.5 GB alloc, 10.6 GB dealloc (sole consumer).
-No worker threads visible (finished before report).
+main alloc: 2.5 GB, for_each_pipelined alloc: 2.5 GB
+Main thread: 100% CPU (bottleneck). Workers: invisible.
 Process: 2.6 GB alloc, 10.6 GB dealloc.
+
+AFTER (two-level FxHashMap + inlined iteration):
+Wall: 4.77s, RSS: 1019 MB
+main alloc: 436 MB, for_each_pipelined alloc: 436 MB
+Main thread: 11-16% CPU. Workers: 11-16% each (balanced).
+Process: 10.0 GB alloc, 10.0 GB dealloc.
 ```
 
 **merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**

@@ -3,12 +3,13 @@
 //! Overlaps sequential I/O with parallel decompression and protobuf parsing,
 //! delivering decoded `PrimitiveBlock`s to a caller-supplied closure in file order.
 
-use super::blob::{BlobReader, BlobType};
+use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
 use crate::error::Result;
 use std::collections::VecDeque;
 use std::io::Read;
 use std::sync::mpsc::sync_channel;
+use std::sync::Arc;
 
 /// Number of raw blobs the I/O thread can read ahead.
 const READ_AHEAD: usize = 16;
@@ -78,13 +79,15 @@ where
                 .num_threads(decode_threads)
                 .build()
                 .expect("failed to build decode pool");
+            let buffer_pool = DecompressPool::new();
             for (seq, blob_result) in raw_rx {
                 let tx = dispatch_tx.clone();
+                let bp = Arc::clone(&buffer_pool);
                 match blob_result {
                     Ok(blob) => {
                         decode_pool.spawn(move || {
                             let item = match blob.get_type() {
-                                BlobType::OsmData => Some(blob.to_primitiveblock()),
+                                BlobType::OsmData => Some(blob.to_primitiveblock_pooled(&bp)),
                                 _ => None,
                             };
                             drop(tx.send((seq, item)));

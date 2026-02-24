@@ -8,9 +8,93 @@ use protobuf::Message;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
 use flate2::read::ZlibDecoder;
 use std::io::Cursor;
+
+/// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
+///
+/// In the pipelined read path, each blob decompresses into a fresh `Vec<u8>`
+/// (~1.4 MB average), which is then wrapped as `Bytes` for zero-copy protobuf
+/// parsing. Without pooling, this causes 10.2 GB of cumulative alloc/dealloc for
+/// Denmark (483 MB), or ~1.7 TB for a planet file.
+///
+/// The pool holds `Vec<u8>` buffers returned by [`PooledBuffer`]'s `Drop` impl.
+/// Buffers are popped via [`DecompressPool::get`] and returned automatically when
+/// the `Bytes` (and the `PrimitiveBlock` holding slices of it) is dropped.
+pub(crate) struct DecompressPool {
+    buffers: Mutex<Vec<Vec<u8>>>,
+}
+
+impl DecompressPool {
+    /// Create a new empty pool wrapped in `Arc` for shared ownership.
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            buffers: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Pop a buffer from the pool, or return an empty Vec if the pool is empty.
+    pub fn get(&self) -> Vec<u8> {
+        self.buffers
+            .lock()
+            .ok()
+            .and_then(|mut v| v.pop())
+            .unwrap_or_default()
+    }
+
+    /// Return a buffer to the pool for reuse.
+    fn put(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        if let Ok(mut v) = self.buffers.lock() {
+            v.push(buf);
+        }
+    }
+}
+
+/// Owner type for `Bytes::from_owner` that returns its buffer to a
+/// [`DecompressPool`] on drop instead of freeing it.
+struct PooledBuffer {
+    vec: Vec<u8>,
+    pool: Arc<DecompressPool>,
+}
+
+impl AsRef<[u8]> for PooledBuffer {
+    fn as_ref(&self) -> &[u8] {
+        &self.vec
+    }
+}
+
+impl Drop for PooledBuffer {
+    fn drop(&mut self) {
+        let v = std::mem::take(&mut self.vec);
+        self.pool.put(v);
+    }
+}
+
+/// Get a decompression buffer — from the pool if available, otherwise fresh.
+fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> Vec<u8> {
+    match pool {
+        Some(p) => {
+            let mut buf = p.get();
+            buf.reserve(capacity.saturating_sub(buf.capacity()));
+            buf
+        }
+        None => Vec::with_capacity(capacity),
+    }
+}
+
+/// Wrap decoded bytes as `Bytes` — returning to pool on drop if pooled.
+fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
+    match pool {
+        Some(p) => Bytes::from_owner(PooledBuffer {
+            vec: decoded,
+            pool: Arc::clone(p),
+        }),
+        None => Bytes::from(decoded),
+    }
+}
 
 /// Maximum allowed [`BlobHeader`] size in bytes.
 /// Compile-time constant per the PBF spec. Uses `const` (not `static`) so the value
@@ -121,13 +205,22 @@ impl Blob {
     /// Tries to decode the blob to a [`HeaderBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_headerblock(&self) -> Result<HeaderBlock> {
-        decode_blob(&self.blob).map(HeaderBlock::new)
+        decode_blob(&self.blob, None).map(HeaderBlock::new)
     }
 
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        decode_blob(&self.blob).and_then(PrimitiveBlock::new)
+        decode_blob(&self.blob, None).and_then(PrimitiveBlock::new)
+    }
+
+    /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
+    /// from a [`DecompressPool`]. Used by the pipeline for buffer reuse.
+    pub(crate) fn to_primitiveblock_pooled(
+        &self,
+        pool: &Arc<DecompressPool>,
+    ) -> Result<PrimitiveBlock> {
+        decode_blob(&self.blob, Some(pool)).and_then(PrimitiveBlock::new)
     }
 }
 
@@ -616,7 +709,7 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 ) -> Result<crate::PrimitiveBlock> {
     let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
-    decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob)
+    decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob, None)
         .and_then(crate::PrimitiveBlock::new)
 }
 
@@ -803,12 +896,15 @@ pub fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBloc
 pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
     let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
-    decode_blob::<crate::proto::osmformat::HeaderBlock>(&blob).map(crate::HeaderBlock::new)
+    decode_blob::<crate::proto::osmformat::HeaderBlock>(&blob, None).map(crate::HeaderBlock::new)
 }
 
 #[allow(clippy::cast_sign_loss)]
 #[hotpath::measure]
-pub fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
+pub(crate) fn decode_blob<T: Message>(
+    blob: &fileformat::Blob,
+    pool: Option<&Arc<DecompressPool>>,
+) -> Result<T> {
     match &blob.data {
         Some(fileformat::blob::Data::Raw(bytes)) => {
             let size = bytes.len() as u64;
@@ -836,10 +932,10 @@ pub fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
             } else {
                 bytes.len() * 4
             };
-            let mut decoded_bytes = Vec::with_capacity(capacity);
+            let mut decoded_bytes = pool_get(pool, capacity);
             decoder.read_to_end(&mut decoded_bytes)?;
 
-            T::parse_from_tokio_bytes(&Bytes::from(decoded_bytes))
+            T::parse_from_tokio_bytes(&pool_wrap(decoded_bytes, pool))
                 .map_err(|e| new_protobuf_error(e, "blob zlib data"))
         }
         Some(fileformat::blob::Data::ZstdData(bytes)) => {
@@ -848,13 +944,13 @@ pub fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
             } else {
                 bytes.len() * 4
             };
-            let mut decoded_bytes = Vec::with_capacity(capacity);
+            let mut decoded_bytes = pool_get(pool, capacity);
             zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded_bytes)?;
             let size = decoded_bytes.len() as u64;
             if size > MAX_BLOB_MESSAGE_SIZE {
                 return Err(new_blob_error(BlobError::MessageTooBig { size }));
             }
-            T::parse_from_tokio_bytes(&Bytes::from(decoded_bytes))
+            T::parse_from_tokio_bytes(&pool_wrap(decoded_bytes, pool))
                 .map_err(|e| new_protobuf_error(e, "blob zstd data"))
         }
         _ => Err(new_blob_error(BlobError::Empty)),

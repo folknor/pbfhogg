@@ -87,11 +87,11 @@ impl MmapBlob {
             .map_err(|e| new_protobuf_error(e, "blob content"))?;
         match self.header.type_() {
             "OSMHeader" => {
-                let block = Box::new(HeaderBlock::new(decode_blob(&blob)?));
+                let block = Box::new(HeaderBlock::new(decode_blob(&blob, None)?));
                 Ok(BlobDecode::OsmHeader(block))
             }
             "OSMData" => {
-                let block: osmformat::PrimitiveBlock = decode_blob(&blob)?;
+                let block: osmformat::PrimitiveBlock = decode_blob(&blob, None)?;
                 Ok(BlobDecode::OsmData(PrimitiveBlock::new(block)?))
             }
             x => Ok(BlobDecode::Unknown(x)),

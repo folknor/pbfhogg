@@ -6,7 +6,8 @@ hero:
   text: "Project tagline goes here"
   tagline: "A brief description of what Nidhogg does and why you should use it."
   image:
-    src: /nidhogg-logo.svg
+    light: /nidhogg-logo.svg
+    dark: /nidhogg-logo-dark.svg
     alt: Nidhogg logo
   actions:
     - theme: brand

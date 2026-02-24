@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/nidhogg-logo.svg',
+    logo: { light: '/nidhogg-logo.svg', dark: '/nidhogg-logo-dark.svg' },
 
     nav: [
       { text: 'Guide', link: '/guide/' },

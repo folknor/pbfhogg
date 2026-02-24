@@ -13,9 +13,10 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data, parse_blob_header,
-    parse_primitive_block_from_bytes,
+    decode_blob_to_headerblock, decompress_blob_data_into, parse_blob_header,
+    parse_primitive_block_from_bytes_owned,
 };
+use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
 use crate::writer::{Compression, PbfWriter};
@@ -1227,10 +1228,10 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
             continue;
         }
 
-        // Parallel decompress + classify
+        // Parallel decompress + classify (reusable per-thread buffer via map_init)
         let classified: Vec<Result<BlobClassified, String>> = batch
             .par_iter()
-            .map(|frame| classify_blob(frame, &ranges))
+            .map_init(Vec::new, |buf, frame| classify_blob(frame, &ranges, buf))
             .collect();
 
         // Sequential processing: write passthrough frames, rewrite overlapping blocks
@@ -1261,7 +1262,7 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
                     stats.blobs_scan_only += 1;
                 }
                 BlobClassified::MayOverlap(raw) | BlobClassified::Fallback(raw) => {
-                    let block = parse_primitive_block_from_bytes(&raw)?;
+                    let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
 
                     // Emit new creates that sort before this block's first element
                     if let Some(first) = block.elements().next() {
@@ -1361,18 +1362,28 @@ enum BlobClassified {
 }
 
 /// Classify a blob in parallel: decompress + scan + range check.
+///
+/// Uses a caller-provided `buf` for decompression buffer reuse. Passthrough
+/// blobs (~91% of total) leave the buffer intact for the next call. Only
+/// MayOverlap/Fallback blobs take ownership of the buffer contents via
+/// `mem::take`, causing a one-time reallocation on the next call.
+///
 /// Returns `Result<_, String>` instead of `MergeResult` so it's Send for rayon.
-fn classify_blob(frame: &RawBlobFrame, ranges: &DiffRanges) -> Result<BlobClassified, String> {
-    let raw = decompress_blob_data(&frame.blob_bytes).map_err(|e| e.to_string())?;
+fn classify_blob(
+    frame: &RawBlobFrame,
+    ranges: &DiffRanges,
+    buf: &mut Vec<u8>,
+) -> Result<BlobClassified, String> {
+    decompress_blob_data_into(&frame.blob_bytes, buf).map_err(|e| e.to_string())?;
 
-    if let Some(scan) = scan_block_ids(&raw) {
+    if let Some(scan) = scan_block_ids(buf) {
         if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
             return Ok(BlobClassified::Passthrough(scan));
         }
-        // Range might overlap — need full parse
-        Ok(BlobClassified::MayOverlap(raw))
+        // Range might overlap — need full parse. Take buffer contents.
+        Ok(BlobClassified::MayOverlap(std::mem::take(buf)))
     } else {
-        Ok(BlobClassified::Fallback(raw))
+        Ok(BlobClassified::Fallback(std::mem::take(buf)))
     }
 }
 

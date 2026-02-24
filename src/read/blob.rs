@@ -632,6 +632,60 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
     decompress_blob_data_from_bytes(&Bytes::copy_from_slice(blob_bytes))
 }
 
+/// Decompress a blob's data into a caller-provided buffer for reuse.
+///
+/// Like [`decompress_blob_data`] but clears and reuses `buf` instead of
+/// allocating a new `Vec` each time. For loops that decompress many blobs,
+/// this avoids repeated large allocations — the buffer grows to high-water
+/// mark and stays there.
+#[allow(clippy::cast_sign_loss)]
+pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    decompress_blob_data_into_from_bytes(&Bytes::copy_from_slice(blob_bytes), buf)
+}
+
+/// Zero-copy variant of [`decompress_blob_data_into`].
+///
+/// Accepts a `Bytes` value directly, avoiding the envelope copy.
+#[allow(clippy::cast_sign_loss)]
+pub fn decompress_blob_data_into_from_bytes(blob_bytes: &Bytes, buf: &mut Vec<u8>) -> Result<()> {
+    let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
+        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    buf.clear();
+    match &blob.data {
+        Some(fileformat::blob::Data::Raw(bytes)) => {
+            let size = bytes.len() as u64;
+            if size < MAX_BLOB_MESSAGE_SIZE {
+                buf.extend_from_slice(bytes);
+                Ok(())
+            } else {
+                Err(new_blob_error(BlobError::MessageTooBig { size }))
+            }
+        }
+        Some(fileformat::blob::Data::ZlibData(bytes)) => {
+            if blob.raw_size() > 0 {
+                let capacity = blob.raw_size() as usize;
+                buf.reserve(capacity.saturating_sub(buf.capacity()));
+            }
+            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
+            decoder.read_to_end(buf)?;
+            Ok(())
+        }
+        Some(fileformat::blob::Data::ZstdData(bytes)) => {
+            if blob.raw_size() > 0 {
+                let capacity = blob.raw_size() as usize;
+                buf.reserve(capacity.saturating_sub(buf.capacity()));
+            }
+            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
+            let size = buf.len() as u64;
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                return Err(new_blob_error(BlobError::MessageTooBig { size }));
+            }
+            Ok(())
+        }
+        _ => Err(new_blob_error(BlobError::Empty)),
+    }
+}
+
 /// Zero-copy variant of [`decompress_blob_data`].
 ///
 /// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`

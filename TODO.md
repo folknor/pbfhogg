@@ -34,12 +34,19 @@ buffers that are allocated and freed per blob.
 The allocations are short-lived (10 GB allocated = 10 GB deallocated), so RSS stays
 reasonable, but the allocation throughput hammers the allocator.
 
-- [ ] **Reuse decompression buffers across blobs.** Instead of allocating a new
-  `Vec<u8>` per blob in `decode_blob` / `decompress_blob_data_from_bytes`, pass a
-  reusable buffer that grows to high-water mark and gets reused. This eliminates
-  ~7,396 large allocations (Denmark) / ~2.5M (planet). The sequential and pipelined
-  readers can own one buffer per thread; `par_map_reduce` can use rayon's
-  `try_fold` initializer for per-thread buffers.
+- [x] **Reuse decompression buffers in merge.** Added `decompress_blob_data_into()`
+  with caller-provided buffer. Merge's `classify_blob` uses `map_init(Vec::new, ...)`
+  for per-thread buffer reuse via rayon. Passthrough blobs (91%) reuse the buffer;
+  only MayOverlap/Fallback (9%) take ownership via `mem::take`. Also fixed double-copy:
+  `parse_primitive_block_from_bytes(&raw)` → `parse_primitive_block_from_bytes_owned(&Bytes::from(raw))`.
+  Result: `decompress_blob_data_from_bytes` dropped from hotpath report entirely,
+  process alloc -100 MB, main thread alloc -200 MB.
+- [ ] **Reuse decompression buffers in decode_blob (read path).** `decode_blob` wraps
+  the decompressed Vec as `Bytes::from(decoded)` for zero-copy protobuf parsing.
+  The parsed PrimitiveBlock holds references into the Bytes, so the buffer cannot be
+  reclaimed until the message is dropped. Buffer reuse here requires either switching
+  to `parse_from_bytes` (copying parse, creates many small String allocations — likely
+  worse) or a custom allocator like jemalloc that pools large alloc/free efficiently.
 
 ### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
 
@@ -116,14 +123,19 @@ Process: 2.6 GB alloc, 10.6 GB dealloc.
 
 **merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**
 ```
+BEFORE (buffer reuse):
 Wall: 8.63s, RSS: 97.6 MB
 write_blob:                    632 calls, 5.32s (61.70%), 434.2 MB alloc
 decompress_blob_data_from_bytes: 7384 calls, 2.90s (33.64%), 1.6 GB alloc
 block_builder::take:           7407 calls, 692.85ms (8.02%), 266.1 MB alloc
-block::new:                    630 calls, 10.66ms (0.12%), 0 B alloc
-decode_blob:                   1 call, 21.98µs (0.00%), 74.8 KB alloc
-Main thread: 99% CPU. Workers: 1% CPU each.
-Process: 7.7 GB alloc, 7.7 GB dealloc.
+Main thread: 99% CPU. Process: 7.7 GB alloc, 7.7 GB dealloc.
+
+AFTER (buffer reuse + double-copy fix):
+Wall: 8.57s, RSS: 94.5 MB
+write_blob:                    632 calls, 5.32s (62.05%), 434.2 MB alloc
+block_builder::take:           7407 calls, 683ms (7.97%), 266.1 MB alloc
+decompress_blob_data_from_bytes: GONE from report (buffer reuse)
+Main thread: 99% CPU, alloc 5.5 GB (was 5.7 GB). Process: 7.6 GB alloc (was 7.7 GB).
 ```
 
 ### Finding 6: merge spends 62% of time compressing rewritten blobs
@@ -137,14 +149,17 @@ are raw passthrough (no decode, no re-encode). Compression is the bottleneck.
 
 ### Finding 7: merge decompresses all blobs for ID range scanning
 
-`decompress_blob_data_from_bytes` is called 7,384 times (33.6% of wall time,
+`decompress_blob_data_from_bytes` was called 7,384 times (33.6% of wall time,
 1.6 GB alloc) to scan each blob's ID ranges and decide passthrough vs rewrite.
-The merge log confirms "6766 scan-only, 0 skip-decompress".
 
-- [ ] **Skip decompression for passthrough blobs in merge.** If blob headers or
-  a pre-scan index can determine ID ranges without decompression, 6,766 of 7,384
-  decompressions become unnecessary. Planet extrapolation: ~2.4M unnecessary
-  decompressions saved, ~250 GB of avoided allocations.
+**Partially addressed:** Buffer reuse via `decompress_blob_data_into` eliminates
+allocation churn for the 6,766 passthrough blobs. The decompression CPU work still
+happens but the allocation cost is gone.
+
+- [ ] **Skip decompression entirely for passthrough blobs in merge.** If blob
+  headers or a pre-scan index can determine ID ranges without decompression,
+  6,766 of 7,384 decompressions become unnecessary. This would save the CPU
+  time (~2.9s Denmark, ~8 min planet) not just the allocations.
 
 ## Performance: parallelism
 

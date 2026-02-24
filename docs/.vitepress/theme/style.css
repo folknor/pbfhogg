@@ -1,0 +1,243 @@
+/*
+ * Shared project page theme
+ *
+ * Inspired by:
+ *   - velomail.app  → hero structure, clean restraint
+ *   - mise.jdx.dev  → feature cards, docs-first layout
+ *   - helix-editor.com → section dividers, confident tone, dark palette
+ */
+
+/* ── Brand color ────────────────────────────────────────────────────────────
+ * Change --vp-c-brand-* per project to give each site its own accent.
+ * These map to VitePress's built-in color system.
+ * ──────────────────────────────────────────────────────────────────────── */
+:root {
+  --vp-c-brand-1: #7c6af2;
+  --vp-c-brand-2: #694ef0;
+  --vp-c-brand-3: #5b3de8;
+  --vp-c-brand-soft: rgba(124, 106, 242, 0.12);
+
+  --vp-button-brand-bg: var(--vp-c-brand-2);
+  --vp-button-brand-hover-bg: var(--vp-c-brand-1);
+
+  /* match nav + content widths (nav = this - 64px, hero default = 1152px) */
+  --vp-layout-max-width: 1216px;
+
+  /* muted light mode — no stark white */
+  --vp-c-bg: #f0ede8;
+  --vp-c-bg-alt: #e8e4de;
+  --vp-c-bg-elv: #e8e4de;
+  --vp-c-bg-soft: #e0dbd4;
+
+  /* stronger text contrast on warm bg */
+  --vp-c-text-1: #1a1a1a;
+  --vp-c-text-2: #3d3832;
+  --vp-c-text-3: #6b6259;
+
+  /* alt buttons — visible against warm bg */
+  --vp-button-alt-bg: #d5d0c8;
+  --vp-button-alt-hover-bg: #c9c3ba;
+  --vp-button-alt-text: #1a1a1a;
+
+  /* hide nav borders */
+  --vp-c-divider: transparent;
+  --vp-c-gutter: transparent;
+}
+
+.dark {
+  --vp-c-brand-1: #9b8aff;
+  --vp-c-brand-2: #7c6af2;
+  --vp-c-brand-3: #694ef0;
+  --vp-c-brand-soft: rgba(124, 106, 242, 0.16);
+
+  /* reset dark mode to VitePress defaults */
+  --vp-c-bg: #1b1b1f;
+  --vp-c-bg-alt: #161618;
+  --vp-c-bg-elv: #202127;
+  --vp-c-bg-soft: #202127;
+
+  --vp-c-text-1: rgba(255, 255, 245, 0.86);
+  --vp-c-text-2: rgba(235, 235, 245, 0.6);
+  --vp-c-text-3: rgba(235, 235, 245, 0.38);
+
+  --vp-button-alt-bg: #2a2a2e;
+  --vp-button-alt-hover-bg: #333336;
+  --vp-button-alt-text: rgba(255, 255, 245, 0.86);
+}
+
+/* ── Typography ─────────────────────────────────────────────────────────── */
+
+:root {
+  --vp-font-family-base: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+    Roboto, Oxygen, Ubuntu, Cantarell, 'Helvetica Neue', sans-serif;
+  --vp-font-family-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code',
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+/* ── Nav logo hover ─────────────────────────────────────────────────────── */
+
+.VPNavBarTitle .logo {
+  transition: transform 0.3s ease, filter 0.3s ease;
+}
+
+.VPNavBarTitle .title:hover .logo {
+  transform: scale(1.15) rotate(-5deg);
+  filter: drop-shadow(0 0 8px var(--vp-c-brand-soft));
+}
+
+/* ── Button hover lift ──────────────────────────────────────────────────── */
+
+.VPHero .actions .VPButton {
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.VPHero .actions .VPButton.alt:hover {
+  transform: translateY(-3px);
+}
+
+.VPHero .actions .VPButton.brand:hover {
+  transform: scale(0.97);
+}
+
+/* ── Home hero tweaks (velomail-inspired) ───────────────────────────────── */
+
+:root {
+  --vp-home-hero-name-color: transparent;
+  --vp-home-hero-name-background: linear-gradient(
+    135deg,
+    var(--vp-c-brand-1) 0%,
+    var(--vp-c-brand-3) 40%,
+    var(--vp-c-brand-1) 60%,
+    var(--vp-c-brand-3) 100%
+  );
+}
+
+.VPHero .name {
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  background-size: 200% 200%;
+  animation: gradient-shift 6s ease infinite;
+  text-shadow: 0 0 30px var(--vp-c-brand-soft), 0 0 60px var(--vp-c-brand-soft);
+}
+
+@keyframes gradient-shift {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
+}
+
+.VPHero .text {
+  font-weight: 600;
+  font-size: 2rem !important;
+  letter-spacing: -0.01em;
+}
+
+.VPHero .tagline {
+  font-size: 1.1rem;
+  line-height: 1.6;
+  color: var(--vp-c-text-2);
+  max-width: 560px;
+}
+
+/* ── Feature cards (mise-inspired) ──────────────────────────────────────── */
+
+.VPFeatures .VPFeature {
+  border: 1px solid var(--vp-c-brand-soft);
+  border-radius: 12px;
+  box-shadow: 0 2px 12px var(--vp-c-brand-soft);
+}
+
+.VPFeature .icon {
+  font-size: 1.75rem;
+}
+
+.VPFeature .icon img {
+  width: 40px;
+  height: 40px;
+}
+
+/* ── Section dividers (helix-inspired) ──────────────────────────────────── */
+/* Use in markdown with:  <div class="divider">* * *</div>  */
+
+.divider {
+  text-align: center;
+  margin: 3rem 0;
+  color: var(--vp-c-text-3);
+  letter-spacing: 0.5em;
+  font-size: 0.9rem;
+  user-select: none;
+}
+
+/* Also style regular <hr> in markdown content */
+.vp-doc hr {
+  border: none;
+  text-align: center;
+  margin: 3rem 0;
+  color: var(--vp-c-text-3);
+  letter-spacing: 0.5em;
+}
+
+.vp-doc hr::after {
+  content: '* * *';
+  font-size: 0.85rem;
+}
+
+/* ── Inline code styling ────────────────────────────────────────────────── */
+
+.vp-doc :not(pre) > code {
+  border-radius: 4px;
+  padding: 2px 6px;
+  background-color: var(--vp-c-bg-soft);
+  font-size: 0.9em;
+}
+
+/* ── Content area breathing room ────────────────────────────────────────── */
+
+.vp-doc h2 {
+  margin-top: 2.5rem;
+  padding-top: 1.5rem;
+  border-top: 1px solid var(--vp-c-divider);
+}
+
+.vp-doc h2:first-child {
+  margin-top: 0;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* ── Screenshot / demo container ────────────────────────────────────────── */
+/* Use in markdown:
+ *   <div class="demo-frame">
+ *     <img src="./screenshot.png" alt="Screenshot" />
+ *   </div>
+ */
+
+.demo-frame {
+  margin: 2rem auto;
+  max-width: 720px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--vp-c-divider);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+}
+
+.dark .demo-frame {
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
+}
+
+.demo-frame img {
+  display: block;
+  width: 100%;
+}
+
+/* ── Asciinema embed container ──────────────────────────────────────────── */
+/* Use in markdown:
+ *   <div class="terminal-demo">
+ *     <script ...></script>
+ *   </div>
+ */
+
+.terminal-demo {
+  margin: 2rem auto;
+  max-width: 720px;
+}

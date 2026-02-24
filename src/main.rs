@@ -169,6 +169,10 @@ enum Command {
 }
 
 fn main() {
+    let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
+        .percentiles(&[50, 95, 99])
+        .build();
+
     let cli = Cli::parse();
 
     let result = match cli.command {

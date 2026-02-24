@@ -546,6 +546,7 @@ impl BlockBuilder {
     /// Serialize the current block to `PrimitiveBlock` bytes and reset.
     ///
     /// Returns `None` if the block is empty.
+    #[hotpath::measure]
     pub fn take(&mut self) -> io::Result<Option<Vec<u8>>> {
         let block_type = match self.block_type {
             Some(t) => t,

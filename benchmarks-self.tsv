@@ -19,3 +19,8 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	pipelined	1332	52489653	6616526	46103	483
 2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	mmap	5480	52489653	6616526	46103	483
 2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	blobreader	5488	52489653	6616526	46103	483
+2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	sequential	5130	52489653	6616526	46103	483
+2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	parallel	554	52489653	6616526	46103	483
+2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	pipelined	1399	52489653	6616526	46103	483
+2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	mmap	5527	52489653	6616526	46103	483
+2026-02-24	09f664c	Performance: stringtable validate-once, cached accessors, par_bridge removal, FxHashMap, hoisted buffers	denmark-latest	blobreader	5448	52489653	6616526	46103	483

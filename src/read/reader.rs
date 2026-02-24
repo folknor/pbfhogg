@@ -64,6 +64,7 @@ impl<R: Read + Send> ElementReader<R> {
     /// # }
     /// # foo().unwrap();
     /// ```
+    #[hotpath::measure]
     pub fn for_each<F>(self, mut f: F) -> Result<()>
     where
         F: for<'a> FnMut(Element<'a>),
@@ -84,6 +85,7 @@ impl<R: Read + Send> ElementReader<R> {
     /// Decodes the PBF structure using a pipelined approach and calls the given closure on each
     /// element, preserving file order. Overlaps I/O with parallel decompression and protobuf
     /// parsing while delivering elements to an `FnMut` closure on the calling thread.
+    #[hotpath::measure]
     pub fn for_each_pipelined<F>(self, mut f: F) -> Result<()>
     where
         F: for<'a> FnMut(Element<'a>),
@@ -255,6 +257,7 @@ impl ElementReader<BufReader<File>> {
 /// This is used by `par_map_reduce` to separate the sequential I/O phase from
 /// the parallel decode phase. See the comments on `par_map_reduce` for the full
 /// rationale.
+#[hotpath::measure]
 fn collect_osm_data_blobs<R: Read + Send>(blob_iter: BlobReader<R>) -> Result<Vec<Blob>> {
     let mut blobs = Vec::new();
     for blob_result in blob_iter {

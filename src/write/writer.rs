@@ -128,6 +128,7 @@ impl<W: Write> PbfWriter<W> {
     }
 
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
         // Step 1: Build the Blob protobuf (optionally compressed)
         let mut blob = fileformat::Blob::new();

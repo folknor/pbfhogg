@@ -640,6 +640,7 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Returns the raw decompressed protobuf bytes.
 #[allow(clippy::cast_sign_loss)]
+#[hotpath::measure]
 pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
     // parse_from_tokio_bytes takes &Bytes and internally uses Bytes::slice()
     // for zero-copy access to sub-fields. By accepting &Bytes here instead of
@@ -752,6 +753,7 @@ pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate
 }
 
 #[allow(clippy::cast_sign_loss)]
+#[hotpath::measure]
 pub fn decode_blob<T: Message>(blob: &fileformat::Blob) -> Result<T> {
     match &blob.data {
         Some(fileformat::blob::Data::Raw(bytes)) => {

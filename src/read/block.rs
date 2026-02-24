@@ -163,6 +163,7 @@ impl PrimitiveBlock {
     ///
     /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains invalid
     /// UTF-8 bytes.
+    #[hotpath::measure]
     pub fn new(block: osmformat::PrimitiveBlock) -> Result<PrimitiveBlock> {
         // Validate every stringtable entry once at construction time.
         // This establishes the invariant that all entries are valid UTF-8,

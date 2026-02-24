@@ -77,6 +77,7 @@ impl RefCheckResult {
 /// RoaringTreemap (not RoaringBitmap) is required because RoaringBitmap only
 /// supports `u32` (max ~4.3B), which cannot hold current node IDs exceeding
 /// 10 billion.
+#[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool) -> Result<RefCheckResult> {
     let reader = ElementReader::from_path(path)?;
 

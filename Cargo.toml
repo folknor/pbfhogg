@@ -13,6 +13,8 @@ default = ["rust-zlib"]
 rust-zlib = ["flate2/rust_backend"]
 zlib = ["flate2/zlib"]
 zlib-ng = ["flate2/zlib-ng"]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 
 [dependencies]
 bytes = "1"
@@ -26,6 +28,7 @@ roaring = "0.11"
 rustc-hash = "2"
 serde_json = "1"
 zstd = "0.13"
+hotpath = "0.12"
 
 [build-dependencies]
 protobuf-codegen = "3.7"

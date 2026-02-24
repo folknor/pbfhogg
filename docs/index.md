@@ -5,6 +5,9 @@ hero:
   name: "Elivagar"
   text: "Shortbread vector tile generator"
   tagline: "Reads OSM PBF files and produces PMTiles v3 archives with 26 layers. Fast, single-binary, no runtime dependencies."
+  image:
+    src: /elivagar-logo.svg
+    alt: Elivagar logo
   actions:
     - theme: brand
       text: Get Started

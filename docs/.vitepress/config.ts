@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
-const projectName = 'Project Name'
-const projectDescription = 'A short description of your project'
-const githubUrl = 'https://github.com/user/project'
+const projectName = 'Elivagar'
+const projectDescription = 'Shortbread vector tile generator'
+const githubUrl = 'https://github.com/user/elivagar'
 const base = '/' // set to '/repo-name/' for GitHub Pages project sites
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/icons/globe.svg', // replace with your project logo
+    logo: '/elivagar-logo.svg',
 
     nav: [
       { text: 'Guide', link: '/guide/' },

@@ -82,18 +82,35 @@ or BlockBuilder/PbfWriter APIs):
 - [x] `extract.rs`, `tags_filter.rs` — `BTreeSet<i64>` replaced with sorted `Vec<i64>` +
   `binary_search()`. ~5x memory reduction (8 bytes/entry vs ~40). Lazy sorting via boolean
   flags exploits OSM PBF node→way→relation ordering.
-- [ ] `check_refs.rs:49-51` — `HashSet<i64>` for all node/way/relation IDs. ~72GB for planet.
-  Use roaring bitmap or sorted vec with binary search.
+- [x] `check_refs.rs` — `HashSet<i64>` replaced with `roaring::RoaringTreemap`. Planet-scale
+  memory: ~2-3 GB instead of ~400 GB (100x reduction). `i64→u64` via `cast_unsigned()`.
 - [x] `block_builder.rs` — write-side `StringTable` switched from `HashMap` (SipHash) to
   `FxHashMap` (rustc-hash). Faster hashing for short OSM tag strings, safe because write-side
   has no untrusted input (no DoS concern).
 
 ## Performance: memory / planet-scale
 
-- [ ] `commands/sort.rs` — reads entire file into memory. Unusable for 80GB. Implement external
-  merge sort: split into sorted chunks, write temporary PBF segments, merge back.
-- [ ] `commands/check_refs.rs` — stores all IDs in `HashSet<i64>`. See data structures item
-  above. Needs two-pass or bitmap approach for planet scale.
+- [ ] `commands/sort.rs` — reads entire PBF into fully-decoded owned Rust structs (`OwnedNode`,
+  `OwnedWay`, `OwnedRelation` with heap-allocated String tags, metadata, refs, members).
+  Planet estimate: ~9B nodes × ~140 bytes + ~1B ways × ~312 bytes + ~17M relations × ~500 bytes
+  = **~1,400 GB RAM**. Even without metadata, nodes alone require ~430 GB. Osmium has the same
+  limitation (in-memory sort, recommends splitting first for large files).
+  **Solution: external merge sort in 3 phases:**
+  Phase 1 — Partitioned streaming split: read blob-by-blob, decode, classify by type, write
+  into sharded temp PBF files by type+ID range (~256MB per shard). Memory: one decoded block
+  at a time (~few MB) + K open file handles.
+  Phase 2 — Sort each shard: each shard fits in memory (~1-2 GB decoded), sort with existing
+  `sort_by_key`, write back. For mostly-sorted input (typical: planet downloads are pre-sorted),
+  most shards may already be in order — verify with O(n) scan of block min/max IDs.
+  Phase 3 — Sequential concatenation: shards are non-overlapping ID ranges, so writing is just
+  sequential concatenation per type (nodes shards in order, then ways, then relations) through
+  `BlockBuilder` + `PbfWriter`. Memory: one `BlockBuilder` buffer (~few hundred KB).
+  **Optimization: block-level raw passthrough** — for blobs already in correct position with
+  non-overlapping ID ranges vs neighbors, use `PbfWriter::write_raw()` to copy compressed bytes
+  directly without decode/re-encode. Only decode+re-sort blobs with overlapping ranges.
+  **Total memory: ~2 GB regardless of input size.**
+  Note: the existing `PbfWriter`/`BlockBuilder` are fully streaming and already support this —
+  no writer changes needed.
 - [ ] `dense.rs:10-20` — `DenseNode` is ~96 bytes due to always-decoded `DenseNodeInfo` (~48
   bytes). Make info decoding lazy — store raw iterator state, decode only when `.info()` called.
 - [ ] `blob.rs:63-67` / `block.rs:104` — `Blob` and `PrimitiveBlock` derive `Clone`, making

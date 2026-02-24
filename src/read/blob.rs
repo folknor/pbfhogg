@@ -504,30 +504,143 @@ impl BlobReader<BufReader<File>> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Public decode helpers
+// ---------------------------------------------------------------------------
+//
+// ## Why `Bytes` matters here
+//
+// protobuf's `parse_from_tokio_bytes` takes `&Bytes` and performs zero-copy
+// field access: parsed string/bytes fields reference the original `Bytes`
+// buffer via `Bytes::slice()` rather than allocating new memory for each
+// field. This is why the protobuf layer needs `Bytes`, not `&[u8]`.
+//
+// ## The copy problem (what was here before)
+//
+// Previously, every function below accepted `&[u8]` and internally called
+// `Bytes::from(slice.to_vec())`. This has two costs:
+//   1. `to_vec()` allocates a new `Vec<u8>` and copies all bytes into it.
+//   2. `Bytes::from(vec)` then takes ownership of that `Vec`.
+//
+// The irony is that callers in the merge and cat commands already *have*
+// owned `Vec<u8>` data (read from the file into `RawBlobFrame::blob_bytes`
+// or `RawBlobFrame::header_bytes`). They pass `&frame.blob_bytes`, which
+// borrows the Vec, and then this code copies it right back into a new Vec.
+// For a typical PBF blob of 16-32KB, that's 16-32KB of unnecessary memcpy
+// plus an allocation per blob. Over a full planet file (~2.5M blobs), this
+// adds up to tens of GB of redundant copies.
+//
+// ## The solution: dual signatures
+//
+// Each helper now has two variants:
+//
+// - `foo(bytes: &[u8])` -- the original signature, kept for backward
+//   compatibility. Internally calls `Bytes::copy_from_slice(bytes)` which
+//   is the same cost as the old `Bytes::from(slice.to_vec())` but more
+//   idiomatic. Then delegates to the `_from_bytes` variant.
+//
+// - `foo_from_bytes(bytes: Bytes)` -- the new zero-copy variant. Takes
+//   ownership of a `Bytes` value directly. Callers with `Vec<u8>` can
+//   use `Bytes::from(vec)` which is O(1) -- it wraps the existing
+//   allocation without copying. Callers with `Bytes` (e.g. from mmap)
+//   can pass it directly.
+//
+// ## Alternatives considered
+//
+// - `impl Into<Bytes>`: Would provide a single function signature, but
+//   `&[u8]` does not implement `Into<Bytes>` (only `&'static [u8]` does),
+//   so existing callers passing `&slice` would not compile. We'd need
+//   `impl AsRef<[u8]>` which would still require copying internally.
+//
+// - Changing all callers to pass `Bytes`: Would work but requires
+//   modifying merge.rs, cat.rs, and any external consumers. The dual-
+//   signature approach is non-breaking and lets callers migrate at their
+//   own pace.
+//
+// - Generic `Into<Bytes>` with `Bytes::copy_from_slice` fallback for
+//   non-owned data: Not possible because the compiler can't distinguish
+//   "owned vs borrowed" at the trait level without specialization.
+// ---------------------------------------------------------------------------
+
 /// Parse raw blob frame bytes into a BlobHeader type string and Blob payload bytes.
 ///
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
+///
+/// This variant accepts `&[u8]` for convenience but must copy the bytes
+/// internally (protobuf needs `Bytes` for zero-copy field access). If you
+/// already have a `Vec<u8>` or `Bytes`, prefer [`parse_blob_header_from_bytes`]
+/// to avoid the copy.
 pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(String, usize)> {
-    let header =
-        fileformat::BlobHeader::parse_from_tokio_bytes(&Bytes::from(header_bytes.to_vec()))
-            .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    // Bytes::copy_from_slice: allocates + copies, same cost as the old
+    // Bytes::from(slice.to_vec()) but more idiomatic -- it avoids the
+    // intermediate Vec and goes straight to the Bytes shared buffer.
+    parse_blob_header_from_bytes(&Bytes::copy_from_slice(header_bytes))
+}
+
+/// Zero-copy variant of [`parse_blob_header`].
+///
+/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
+/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
+/// O(1) -- the existing allocation is reused, not copied.
+///
+/// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
+/// Returns: `(blob_type, data_size)`.
+pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usize)> {
+    let header = fileformat::BlobHeader::parse_from_tokio_bytes(header_bytes)
+        .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
     #[allow(clippy::cast_sign_loss)]
     Ok((header.type_().to_string(), header.datasize() as usize))
 }
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
+///
+/// This variant accepts `&[u8]` for convenience but must copy the bytes
+/// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
+/// [`decode_blob_to_primitiveblock_from_bytes`] to avoid the copy.
 pub fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
-    let blob = fileformat::Blob::parse_from_tokio_bytes(&Bytes::from(blob_bytes.to_vec()))
+    decode_blob_to_primitiveblock_from_bytes(&Bytes::copy_from_slice(blob_bytes))
+}
+
+/// Zero-copy variant of [`decode_blob_to_primitiveblock`].
+///
+/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
+/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
+/// O(1).
+pub fn decode_blob_to_primitiveblock_from_bytes(
+    blob_bytes: &Bytes,
+) -> Result<crate::PrimitiveBlock> {
+    let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
     decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob).map(crate::PrimitiveBlock::new)
 }
 
 /// Decompress a blob's data without parsing it into a typed message.
 /// Returns the raw decompressed protobuf bytes.
+///
+/// This variant accepts `&[u8]` for convenience but must copy the bytes
+/// internally to parse the Blob protobuf envelope. If you already have a
+/// `Vec<u8>` or `Bytes`, prefer [`decompress_blob_data_from_bytes`] to
+/// avoid the copy.
 #[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
-    let blob = fileformat::Blob::parse_from_tokio_bytes(&Bytes::from(blob_bytes.to_vec()))
+    decompress_blob_data_from_bytes(&Bytes::copy_from_slice(blob_bytes))
+}
+
+/// Zero-copy variant of [`decompress_blob_data`].
+///
+/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
+/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
+/// O(1).
+///
+/// Returns the raw decompressed protobuf bytes.
+#[allow(clippy::cast_sign_loss)]
+pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
+    // parse_from_tokio_bytes takes &Bytes and internally uses Bytes::slice()
+    // for zero-copy access to sub-fields. By accepting &Bytes here instead of
+    // &[u8], callers with owned Vec<u8> avoid a redundant memcpy -- they can
+    // do Bytes::from(vec) which is O(1) pointer handoff, then pass &bytes.
+    let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
     match &blob.data {
         Some(fileformat::blob::Data::Raw(bytes)) => {
@@ -540,7 +653,7 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
         }
         Some(fileformat::blob::Data::ZlibData(bytes)) => {
             // When raw_size is set (the common case for modern PBF files), we use
-            // the exact decompressed size — one perfect allocation, no reallocs.
+            // the exact decompressed size -- one perfect allocation, no reallocs.
             //
             // When raw_size is missing (rare, older PBF files), compressed size alone
             // is 3-10x too small because zlib typically achieves that compression ratio.
@@ -565,15 +678,49 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Parse already-decompressed bytes into a [`PrimitiveBlock`].
+///
+/// This variant accepts `&[u8]` for convenience but must copy the bytes
+/// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
+/// [`parse_primitive_block_from_bytes_owned`] to avoid the copy.
 pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBlock> {
-    crate::proto::osmformat::PrimitiveBlock::parse_from_tokio_bytes(&Bytes::from(raw.to_vec()))
+    // Delegates to the Bytes-accepting variant. The copy here
+    // (Bytes::copy_from_slice) is the same cost as the old
+    // Bytes::from(raw.to_vec()), just more direct.
+    parse_primitive_block_from_bytes_owned(&Bytes::copy_from_slice(raw))
+}
+
+/// Zero-copy variant of [`parse_primitive_block_from_bytes`].
+///
+/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
+/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
+/// O(1).
+///
+/// Named `_owned` rather than `_from_bytes` to avoid confusion with the
+/// existing `parse_primitive_block_from_bytes` which already has
+/// `from_bytes` in its name. The `_owned` suffix signals that this
+/// variant takes ownership of the buffer.
+pub fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
+    crate::proto::osmformat::PrimitiveBlock::parse_from_tokio_bytes(raw)
         .map(crate::PrimitiveBlock::new)
         .map_err(|e| new_protobuf_error(e, "parse primitive block"))
 }
 
 /// Decode raw Blob protobuf bytes into a [`HeaderBlock`].
+///
+/// This variant accepts `&[u8]` for convenience but must copy the bytes
+/// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
+/// [`decode_blob_to_headerblock_from_bytes`] to avoid the copy.
 pub fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBlock> {
-    let blob = fileformat::Blob::parse_from_tokio_bytes(&Bytes::from(blob_bytes.to_vec()))
+    decode_blob_to_headerblock_from_bytes(&Bytes::copy_from_slice(blob_bytes))
+}
+
+/// Zero-copy variant of [`decode_blob_to_headerblock`].
+///
+/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
+/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
+/// O(1).
+pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
+    let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
     decode_blob::<crate::proto::osmformat::HeaderBlock>(&blob).map(crate::HeaderBlock::new)
 }

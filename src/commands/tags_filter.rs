@@ -1,6 +1,5 @@
 //! Filter elements by tag expressions. Equivalent to `osmium tags-filter`.
 
-use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::path::Path;
@@ -397,10 +396,38 @@ fn tags_filter_two_pass(
     };
 
     // --- Pass 1: Collect match results and way dependencies ---
-    let mut matched_node_ids: BTreeSet<i64> = BTreeSet::new();
-    let mut matched_way_ids: BTreeSet<i64> = BTreeSet::new();
-    let mut matched_relation_ids: BTreeSet<i64> = BTreeSet::new();
-    let mut way_dep_node_ids: BTreeSet<i64> = BTreeSet::new();
+    //
+    // OPTIMIZATION: Use Vec<i64> instead of BTreeSet<i64> for matched element IDs.
+    //
+    // Previously these were BTreeSet<i64>, which stores each entry in a B-tree node
+    // with ~40 bytes overhead per entry (node pointers, balance metadata, alignment
+    // padding). For large tag filters on planet-scale files with millions of matched
+    // elements, this overhead dominates memory usage.
+    //
+    // Sorted Vec<i64> uses exactly 8 bytes per entry (just the i64 itself), giving
+    // a ~5x memory reduction. Lookups use binary_search() which is O(log n) -- the
+    // same asymptotic complexity as BTreeSet::contains() -- but with much better
+    // cache locality since the data is stored contiguously in memory rather than
+    // scattered across heap-allocated tree nodes.
+    //
+    // The pattern is straightforward here because tags_filter_two_pass has a clean
+    // separation: pass 1 ONLY inserts IDs (no lookups within pass 1), and pass 2
+    // ONLY does lookups. The sort+dedup happens in the gap between passes.
+    //
+    // Alternatives considered:
+    // - HashSet<i64>: Even worse memory overhead (~72 bytes/entry due to hash table
+    //   bucket array, load factor headroom, and per-entry hash + metadata storage).
+    // - roaring::RoaringBitmap: Excellent compression for dense ID ranges, but adds
+    //   an external dependency. Overkill for typical filter result sizes where the
+    //   simple sorted Vec approach is sufficient.
+    //
+    // sort_unstable() is used instead of sort() because i64 has no meaningful
+    // stability requirement (equal elements are identical), and sort_unstable()
+    // avoids the temporary allocation that sort() needs for its merge step.
+    let mut matched_node_ids: Vec<i64> = Vec::new();
+    let mut matched_way_ids: Vec<i64> = Vec::new();
+    let mut matched_relation_ids: Vec<i64> = Vec::new();
+    let mut way_dep_node_ids: Vec<i64> = Vec::new();
 
     let reader = BlobReader::from_path(input)?;
     for blob in reader {
@@ -413,26 +440,26 @@ fn tags_filter_two_pass(
                         Element::DenseNode(dn) => {
                             let tags: Vec<(&str, &str)> = dn.tags().collect();
                             if element_matches(expressions, &tags, true, false, false) {
-                                matched_node_ids.insert(dn.id());
+                                matched_node_ids.push(dn.id());
                             }
                         }
                         Element::Node(n) => {
                             let tags: Vec<(&str, &str)> = n.tags().collect();
                             if element_matches(expressions, &tags, true, false, false) {
-                                matched_node_ids.insert(n.id());
+                                matched_node_ids.push(n.id());
                             }
                         }
                         Element::Way(w) => {
                             let tags: Vec<(&str, &str)> = w.tags().collect();
                             if element_matches(expressions, &tags, false, true, false) {
-                                matched_way_ids.insert(w.id());
+                                matched_way_ids.push(w.id());
                                 way_dep_node_ids.extend(w.refs());
                             }
                         }
                         Element::Relation(r) => {
                             let tags: Vec<(&str, &str)> = r.tags().collect();
                             if element_matches(expressions, &tags, false, false, true) {
-                                matched_relation_ids.insert(r.id());
+                                matched_relation_ids.push(r.id());
                             }
                         }
                     }
@@ -441,6 +468,26 @@ fn tags_filter_two_pass(
             BlobDecode::Unknown(_) => {}
         }
     }
+
+    // Sort and deduplicate all ID Vecs between pass 1 and pass 2. This is the key
+    // step that converts the unsorted append-only Vecs into sorted arrays suitable
+    // for binary_search() lookups in pass 2.
+    //
+    // sort_unstable() is preferred over sort() for primitive types: no stability is
+    // needed (equal i64 values are identical), and it avoids the temporary buffer
+    // allocation that sort()'s merge step requires.
+    //
+    // dedup() removes consecutive duplicates (requires prior sorting). Duplicates
+    // can arise from the same element appearing in multiple blocks, or from
+    // way_dep_node_ids collecting the same node ref from multiple matching ways.
+    matched_node_ids.sort_unstable();
+    matched_node_ids.dedup();
+    matched_way_ids.sort_unstable();
+    matched_way_ids.dedup();
+    matched_relation_ids.sort_unstable();
+    matched_relation_ids.dedup();
+    way_dep_node_ids.sort_unstable();
+    way_dep_node_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
     let mut writer = PbfWriter::to_path(output, Compression::default())?;
@@ -461,8 +508,11 @@ fn tags_filter_two_pass(
                 for element in block.elements() {
                     match &element {
                         Element::DenseNode(dn) => {
-                            let direct = matched_node_ids.contains(&dn.id());
-                            let from_way = way_dep_node_ids.contains(&dn.id());
+                            // binary_search on sorted slices: O(log n) lookup, same
+                            // as BTreeSet but with contiguous memory for better cache
+                            // performance.
+                            let direct = matched_node_ids.binary_search(&dn.id()).is_ok();
+                            let from_way = way_dep_node_ids.binary_search(&dn.id()).is_ok();
                             if direct || from_way {
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
@@ -494,8 +544,8 @@ fn tags_filter_two_pass(
                             }
                         }
                         Element::Node(n) => {
-                            let direct = matched_node_ids.contains(&n.id());
-                            let from_way = way_dep_node_ids.contains(&n.id());
+                            let direct = matched_node_ids.binary_search(&n.id()).is_ok();
+                            let from_way = way_dep_node_ids.binary_search(&n.id()).is_ok();
                             if direct || from_way {
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
@@ -528,7 +578,7 @@ fn tags_filter_two_pass(
                             }
                         }
                         Element::Way(w) => {
-                            if matched_way_ids.contains(&w.id()) {
+                            if matched_way_ids.binary_search(&w.id()).is_ok() {
                                 if !bb.can_add_way() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
@@ -551,7 +601,7 @@ fn tags_filter_two_pass(
                             }
                         }
                         Element::Relation(r) => {
-                            if matched_relation_ids.contains(&r.id()) {
+                            if matched_relation_ids.binary_search(&r.id()).is_ok() {
                                 if !bb.can_add_relation() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }

@@ -25,9 +25,9 @@ or BlockBuilder/PbfWriter APIs):
   both `BlobReader::from_path` and `IndexedReader::from_path` (explaining why BufReader
   is intentionally not used there, referencing commit a38c258).
 - [x] `writer.rs:49` — `BufWriter` bumped to 256KB in `PbfWriter::to_path`.
-- [ ] `mmap_blob.rs:182` — `MmapBlobReader::next()` creates a `Bytes::slice()` (atomic clone)
-  on every iteration. Track offset as plain `usize` and index into raw `&[u8]`, only wrapping
-  in `Bytes` for protobuf parsing.
+- [x] `mmap_blob.rs:182` — `MmapBlobReader` now stores raw `memmap2::Mmap` directly instead
+  of `Bytes`. Iteration uses plain `usize` offset arithmetic, `Bytes::copy_from_slice()` only
+  for protobuf parsing. Eliminates ~48K atomic ops per 500 MB file (3 `slice()` per blob).
 
 ## Performance: parallelism
 
@@ -42,9 +42,9 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Performance: allocations
 
-- [ ] `blob.rs:486-538` — public decode helpers (`parse_blob_header`, `decode_blob_to_primitiveblock`,
-  etc.) call `Bytes::from(slice.to_vec())`, copying input bytes. Accept `Bytes` directly or
-  use `Bytes::copy_from_slice()`. Callers in merge path often already have owned `Vec<u8>`.
+- [x] `blob.rs:486-538` — public decode helpers now have dual signatures: original `&[u8]`
+  variants (backward-compatible) plus `_from_bytes(&Bytes)` variants for zero-copy callers.
+  Callers with `Vec<u8>` can use `Bytes::from(vec)` (O(1) wrap) to avoid the copy.
 - [x] `block_builder.rs:40-47` — `StringTable::add` rewritten with `entry()` API (one alloc
   per new string instead of two).
 - [x] `block_builder.rs:162-192` — `BlockBuilder::new()` pre-allocates dense vectors
@@ -79,9 +79,9 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Performance: data structures
 
-- [ ] `extract.rs:374-375,443-446`, `tags_filter.rs:400-403` — `BTreeSet<i64>` for matched IDs.
-  ~40 bytes/entry overhead. Replace with sorted `Vec<i64>` + binary search (~8 bytes/entry)
-  or roaring bitmaps for dense sets.
+- [x] `extract.rs`, `tags_filter.rs` — `BTreeSet<i64>` replaced with sorted `Vec<i64>` +
+  `binary_search()`. ~5x memory reduction (8 bytes/entry vs ~40). Lazy sorting via boolean
+  flags exploits OSM PBF node→way→relation ordering.
 - [ ] `check_refs.rs:49-51` — `HashSet<i64>` for all node/way/relation IDs. ~72GB for planet.
   Use roaring bitmap or sorted vec with binary search.
 - [ ] `block_builder.rs:26` — write-side `StringTable` uses `HashMap<String, u32>` with default

@@ -14,3 +14,8 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	pipelined	1425	52489653	6616526	46103	483
 2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	mmap	5543	52489653	6616526	46103	483
 2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	blobreader	5527	52489653	6616526	46103	483
+2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	sequential	5108	52489653	6616526	46103	483
+2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	parallel	544	52489653	6616526	46103	483
+2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	pipelined	1332	52489653	6616526	46103	483
+2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	mmap	5480	52489653	6616526	46103	483
+2026-02-24	c0a4649*	Correctness and code quality improvements across 23 files	denmark-latest	blobreader	5488	52489653	6616526	46103	483

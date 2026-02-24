@@ -19,6 +19,18 @@ pub enum Compression {
     /// Zlib compression at the given level (0–9).
     /// Level 6 matches osmium's default (`Z_DEFAULT_COMPRESSION`).
     Zlib(u32),
+    /// Zstd compression at the given level (1–22, default 3).
+    ///
+    /// Zstd decompresses 3-5x faster than zlib at equivalent compression ratios,
+    /// making it ideal for read-heavy workflows (planet imports, tile generation).
+    /// Level 3 (zstd's default) provides a good balance of compression ratio and
+    /// speed. Higher levels (e.g. 19) compress ~10-15% better but are much slower
+    /// to write — use for archival PBFs that will be read many times.
+    ///
+    /// **Compatibility warning:** Not all PBF consumers support zstd yet. As of
+    /// 2025, osmium, osm2pgsql, and most tools only read zlib-compressed PBFs.
+    /// Use zstd for internal pipelines where you control both writer and reader.
+    Zstd(i32),
 }
 
 impl Default for Compression {
@@ -160,6 +172,14 @@ impl<W: Write> PbfWriter<W> {
                 let compressed = encoder.finish()?;
                 blob.set_raw_size(uncompressed.len() as i32);
                 blob.data = Some(fileformat::blob::Data::ZlibData(Bytes::from(compressed)));
+            }
+            Compression::Zstd(level) => {
+                // Zstd compression: 3-5x faster decompression than zlib at similar
+                // ratios. zstd::bulk::compress returns a Vec<u8> directly.
+                let compressed =
+                    zstd::bulk::compress(uncompressed, level).map_err(io::Error::other)?;
+                blob.set_raw_size(uncompressed.len() as i32);
+                blob.data = Some(fileformat::blob::Data::ZstdData(Bytes::from(compressed)));
             }
         }
 

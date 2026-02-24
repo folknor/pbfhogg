@@ -567,3 +567,64 @@ fn roundtrip_uncompressed() {
         _ => panic!("expected DenseNode"),
     }
 }
+
+/// Write a PBF with zstd compression, read it back, verify the data survives the roundtrip.
+#[test]
+fn roundtrip_zstd() {
+    let mut buf = Vec::new();
+    {
+        let mut writer = PbfWriter::new(&mut buf, Compression::Zstd(3));
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        writer.write_header(&header).unwrap();
+
+        let mut bb = BlockBuilder::new();
+        bb.add_node(100, 556_789_000, 126_543_000, &[("name", "ZstdNode")], None);
+        bb.add_node(200, -335_000_000, -580_000_000, &[("natural", "tree")], None);
+        let bytes = bb.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes).unwrap();
+
+        let mut bb2 = BlockBuilder::new();
+        bb2.add_way(300, &[("highway", "residential")], &[100, 200], None);
+        let bytes2 = bb2.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes2).unwrap();
+        writer.flush().unwrap();
+    }
+
+    // Read back and verify
+    let reader = BlobReader::new(Cursor::new(&buf));
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    assert_eq!(blobs.len(), 3); // header + nodes block + ways block
+
+    // Verify nodes
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 2);
+    match &elements[0] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 100);
+            assert_eq!(dn.decimicro_lat(), 556_789_000);
+            let tags: Vec<_> = dn.tags().collect();
+            assert_eq!(tags, vec![("name", "ZstdNode")]);
+        }
+        _ => panic!("expected DenseNode"),
+    }
+
+    // Verify way
+    let prim2 = match blobs[2].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements2: Vec<_> = prim2.elements().collect();
+    assert_eq!(elements2.len(), 1);
+    match &elements2[0] {
+        Element::Way(w) => {
+            assert_eq!(w.id(), 300);
+            let refs: Vec<_> = w.refs().collect();
+            assert_eq!(refs, vec![100, 200]);
+        }
+        _ => panic!("expected Way"),
+    }
+}

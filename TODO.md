@@ -71,9 +71,9 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Performance: compression
 
-- [ ] Add zstd read/write support. PBF proto defines `zstd_data` (field 7) but code doesn't
-  handle it. Zstd decompression is 3-5x faster than zlib at equivalent ratios. Add via `zstd`
-  crate, consider making it the default for writing.
+- [x] Zstd read/write support added. Read side handles `zstd_data` (field 7) in both
+  `decompress_blob_data` and `decode_blob`. Write side adds `Compression::Zstd(level)`.
+  Default remains zlib for compatibility — most tools don't read zstd PBFs yet.
 - [x] `blob.rs:556-561` — zlib decompression fallback changed to `bytes.len() * 4` in both
   `decompress_blob_data` and `decode_blob`.
 

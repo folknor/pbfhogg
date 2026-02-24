@@ -80,6 +80,10 @@ html {
   font-size: clamp(16px, 10px + 0.5vw, 28px);
 }
 
+body {
+  font-size: inherit;
+}
+
 /* ── Wide-screen layout ────────────────────────────────────────────────── */
 
 @media (min-width: 2000px) {
@@ -495,6 +499,24 @@ html {
   padding-left: 1rem;
 }
 
+/* ── Doc content wrapper ───────────────────────────────────────────────── */
+/* Override VPContent scoped centering so doc pages fill the same width as
+ * the navbar instead of being squeezed by the layout-max-width formula. */
+
+@media (min-width: 960px) {
+  .VPContent.has-sidebar {
+    padding-left: calc(var(--vp-sidebar-width) + 2rem) !important;
+    padding-right: 2rem !important;
+  }
+}
+
+@media (min-width: 1440px) {
+  .VPContent.has-sidebar {
+    padding-left: calc(var(--vp-sidebar-width) + 2rem) !important;
+    padding-right: 2rem !important;
+  }
+}
+
 /* ── Doc layout ────────────────────────────────────────────────────────── */
 
 .VPDoc.VPDoc {
@@ -531,6 +553,25 @@ html {
   .VPDoc.VPDoc .content {
     padding: 0 2rem 8rem;
   }
+
+  .VPDoc.VPDoc:not(.has-sidebar) .container {
+    max-width: 100% !important;
+  }
+
+  .VPDoc.VPDoc:not(.has-sidebar) .content {
+    max-width: 100% !important;
+  }
+}
+
+@media (min-width: 1280px) {
+  .VPDoc.VPDoc .content {
+    min-width: 40rem;
+  }
+}
+
+.VPDoc.VPDoc.has-aside .content-container,
+.content-container {
+  max-width: none !important;
 }
 
 /* ── Doc footer (prev/next) ────────────────────────────────────────────── */
@@ -571,13 +612,13 @@ html {
 }
 
 .VPDocFooter.VPDocFooter .desc {
-  line-height: 1.25rem;
-  font-size: 0.75rem;
+  line-height: 1.5rem;
+  font-size: 1rem;
 }
 
 .VPDocFooter.VPDocFooter .title {
-  line-height: 1.25rem;
-  font-size: 0.875rem;
+  line-height: 1.5rem;
+  font-size: 1rem;
 }
 
 /* ── Footer ────────────────────────────────────────────────────────────── */
@@ -976,13 +1017,42 @@ html {
 .vp-doc h2 {
   margin-top: 2.5rem;
   padding-top: 1.5rem;
-  border-top: 1px solid var(--vp-c-divider);
+  border-top: none;
 }
 
 .vp-doc h2:first-child {
   margin-top: 0;
   padding-top: 0;
+}
+
+.vp-doc hr {
   border-top: none;
+}
+
+/* ── Nuke horizontal divider lines on doc pages ────────────────────────── */
+
+.VPNavBar {
+  border-bottom: none !important;
+}
+
+.VPNavBar .divider-line {
+  background-color: transparent !important;
+}
+
+.VPNavBarTitle.has-sidebar .title {
+  border-bottom-color: transparent !important;
+}
+
+.VPLocalNav {
+  border-bottom: none !important;
+}
+
+.VPSidebarGroup .group + .group {
+  border-top: none !important;
+}
+
+.VPDocFooter .prev-next {
+  border-top: none !important;
 }
 
 /* ── Screenshot / demo container ────────────────────────────────────────── */

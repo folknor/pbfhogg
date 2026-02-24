@@ -10,13 +10,9 @@ cargo build --release
 
 The binary will be at `target/release/project`.
 
----
-
 ## Pre-built binaries
 
 Download from the [GitHub Releases](https://github.com/user/project/releases) page.
-
----
 
 ## Requirements
 

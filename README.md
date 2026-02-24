@@ -32,6 +32,27 @@ reader.for_each(|element| {
 # Ok::<(), std::io::Error>(())
 ```
 
+## CLI
+
+pbfhogg includes a command-line toolkit for common OSM PBF operations:
+
+```
+pbfhogg fileinfo <file>                   Show PBF metadata (--extended for element counts)
+pbfhogg check-refs <file>                 Validate referential integrity
+pbfhogg cat <files...> -o <out>           Concatenate PBF files (-t node,way,relation to filter)
+pbfhogg sort <file> -o <out>              Sort into standard order (nodes → ways → relations, by ID)
+pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box (minlon,minlat,maxlon,maxlat)
+pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
+pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file
+pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
+pbfhogg tags-count <file>                 Count tag key=value frequencies
+pbfhogg tags-filter <file> -o <out> <exp> Filter elements by tag expressions
+pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456 r789)
+pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
+```
+
+Extract supports two strategies: `--simple` (single pass, fast, may have dangling refs) and complete-ways (default, two passes, all way nodes included).
+
 ## Performance
 
 Read throughput — count all 59M elements in Denmark extract (483 MB), best of 3 runs, `zlib-ng`:

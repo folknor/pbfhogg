@@ -51,9 +51,8 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 
 ## Planned commands
 
-- [ ] `pbfhogg extract` polygon support — add `-p region.geojson` for polygon extraction
-  with point-in-polygon test (ray casting). Also: **smart** strategy (three passes,
-  complete ways + complete boundary/multipolygon relations).
+- [ ] `pbfhogg extract --smart` strategy — three passes, complete boundary/multipolygon
+  relations (all member ways + their nodes included even if outside the extract region).
 
 - [ ] `pbfhogg add-locations-to-ways` — embed node coordinates in ways
   CLI: `pbfhogg add-locations-to-ways <input.osm.pbf> -o <output.osm.pbf>`

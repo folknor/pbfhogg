@@ -112,7 +112,7 @@ enum Command {
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
     },
-    /// Extract elements within a geographic bounding box
+    /// Extract elements within a geographic region (bbox or polygon)
     Extract {
         /// Input PBF file
         file: PathBuf,
@@ -120,8 +120,11 @@ enum Command {
         #[arg(short, long)]
         output: PathBuf,
         /// Bounding box: minlon,minlat,maxlon,maxlat
-        #[arg(short = 'b', long)]
-        bbox: String,
+        #[arg(short = 'b', long, group = "area")]
+        bbox: Option<String>,
+        /// Polygon GeoJSON file
+        #[arg(short = 'p', long, group = "area")]
+        polygon: Option<PathBuf>,
         /// Simple strategy (single pass, may have dangling refs)
         #[arg(short = 's', long)]
         simple: bool,
@@ -186,8 +189,9 @@ fn main() {
             file,
             output,
             bbox,
+            polygon,
             simple,
-        } => run_extract(&file, &output, &bbox, simple),
+        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple),
         Command::Merge {
             base,
             changes,
@@ -387,11 +391,20 @@ fn run_removeid(
 fn run_extract(
     file: &std::path::Path,
     output: &std::path::Path,
-    bbox_str: &str,
+    bbox_str: Option<&str>,
+    polygon_path: Option<&std::path::Path>,
     simple: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bbox = pbfhogg::extract::parse_bbox(bbox_str)?;
-    let stats = pbfhogg::extract::extract(file, output, &bbox, simple)?;
+    let region = match (bbox_str, polygon_path) {
+        (Some(s), None) => {
+            let bbox = pbfhogg::extract::parse_bbox(s)?;
+            pbfhogg::extract::Region::Bbox(bbox)
+        }
+        (None, Some(p)) => pbfhogg::extract::parse_geojson(p)?,
+        (None, None) => return Err("one of --bbox or --polygon is required".into()),
+        (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
+    };
+    let stats = pbfhogg::extract::extract(file, output, &region, simple)?;
     stats.print_summary();
     Ok(())
 }

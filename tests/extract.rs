@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
-use pbfhogg::extract::{extract, parse_bbox};
+use pbfhogg::extract::{extract, parse_bbox, parse_geojson, PolygonRings, Region};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
 use tempfile::TempDir;
@@ -228,7 +228,8 @@ fn simple_filters_nodes_by_bbox() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, true).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, true).expect("extract");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -245,7 +246,8 @@ fn simple_includes_ways_with_nodes_in_bbox() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, true).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Ways 10 and 12 have at least one node in bbox; way 11 does not
@@ -262,7 +264,8 @@ fn simple_does_not_add_extra_nodes() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, true).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Simple mode: only nodes actually in bbox, not way dependencies
@@ -279,7 +282,8 @@ fn complete_ways_includes_all_way_nodes() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, false).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, false).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 refs [1, 2]: node 1 in bbox → way matches → node 2 pulled in
@@ -300,7 +304,8 @@ fn complete_ways_includes_relations() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &test_relations());
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, false).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, false).expect("extract");
     let c = read_all_elements(&output);
 
     // Relation 100 has member node 1 (in bbox) → included
@@ -324,7 +329,8 @@ fn simple_includes_relations_with_matched_ways() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, true).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 matched → relation 200 should be included
@@ -342,7 +348,8 @@ fn empty_extract() {
 
     // Bbox far away from all test data
     let bbox = parse_bbox("0.0,0.0,1.0,1.0").expect("parse bbox");
-    let stats = extract(&input, &output, &bbox, false).expect("extract");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, false).expect("extract");
     let c = read_all_elements(&output);
 
     assert!(c.nodes.is_empty());
@@ -361,7 +368,8 @@ fn tags_preserved_in_extract() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
-    extract(&input, &output, &bbox, false).expect("extract");
+    let region = Region::Bbox(bbox);
+    extract(&input, &output, &region, false).expect("extract");
     let c = read_all_elements(&output);
 
     // Check node 1 tags
@@ -374,4 +382,156 @@ fn tags_preserved_in_extract() {
         way10.2,
         vec![("highway".to_string(), "primary".to_string())]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Polygon tests
+// ---------------------------------------------------------------------------
+//
+// Test polygon: a triangle covering nodes 1 and 3 but NOT node 2 or 4.
+//
+//   Node 1: lat=55.70, lon=12.50 → INSIDE triangle
+//   Node 2: lat=54.00, lon=12.50 → OUTSIDE (too far south)
+//   Node 3: lat=55.65, lon=12.55 → INSIDE triangle
+//   Node 4: lat=55.70, lon=14.00 → OUTSIDE (too far east)
+//
+// Triangle vertices (lon, lat):
+//   (12.3, 55.5), (12.8, 55.5), (12.55, 55.9)
+
+fn test_polygon_region() -> Region {
+    Region::Polygon {
+        polygons: vec![PolygonRings {
+            exterior: vec![
+                (12.3, 55.5),
+                (12.8, 55.5),
+                (12.55, 55.9),
+                (12.3, 55.5),
+            ],
+            holes: vec![],
+        }],
+        bbox: pbfhogg::extract::Bbox {
+            min_lon: 12.3,
+            min_lat: 55.5,
+            max_lon: 12.8,
+            max_lat: 55.9,
+        },
+    }
+}
+
+#[test]
+fn polygon_simple_filters_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+
+    let region = test_polygon_region();
+    let stats = extract(&input, &output, &region, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    // Nodes 1 and 3 are inside the triangle; nodes 2 and 4 are outside
+    assert_eq!(node_ids(&c), vec![1, 3]);
+    assert_eq!(stats.nodes_in_bbox, 2);
+}
+
+#[test]
+fn polygon_complete_ways_includes_all_way_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let region = test_polygon_region();
+    let stats = extract(&input, &output, &region, false).expect("extract");
+    let c = read_all_elements(&output);
+
+    // Way 10 [1,2]: node 1 in polygon → way matches → node 2 pulled in
+    // Way 12 [1,3]: both in polygon → no extra deps
+    // Way 11 [2,4]: no nodes in polygon → excluded
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    assert_eq!(stats.nodes_in_bbox, 2);
+    assert_eq!(stats.nodes_from_ways, 1);
+}
+
+#[test]
+fn polygon_with_hole_excludes_interior() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Use a square polygon with a hole that excludes node 1 but includes node 3
+    //
+    // Node 1: lat=55.70, lon=12.50 → inside hole → EXCLUDED
+    // Node 3: lat=55.65, lon=12.55 → inside exterior, outside hole → INCLUDED
+    //
+    // Exterior: large square covering both nodes
+    // Hole: small square around node 1 only
+    let region = Region::Polygon {
+        polygons: vec![PolygonRings {
+            exterior: vec![
+                (12.0, 55.0),
+                (13.0, 55.0),
+                (13.0, 56.0),
+                (12.0, 56.0),
+                (12.0, 55.0),
+            ],
+            holes: vec![vec![
+                (12.45, 55.68),
+                (12.55, 55.68),
+                (12.55, 55.72),
+                (12.45, 55.72),
+                (12.45, 55.68),
+            ]],
+        }],
+        bbox: pbfhogg::extract::Bbox {
+            min_lon: 12.0,
+            min_lat: 55.0,
+            max_lon: 13.0,
+            max_lat: 56.0,
+        },
+    };
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+
+    let stats = extract(&input, &output, &region, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    // Node 1 is inside the hole → excluded
+    // Node 3 is inside exterior, outside hole → included
+    // Node 2 is far south (lat=54) → outside exterior
+    // Node 4 is far east (lon=14) → outside exterior
+    assert_eq!(node_ids(&c), vec![3]);
+    assert_eq!(stats.nodes_in_bbox, 1);
+}
+
+#[test]
+fn polygon_from_geojson_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+    let geojson_path = dir.path().join("region.geojson");
+
+    // Write a GeoJSON triangle that covers nodes 1 and 3
+    std::fs::write(
+        &geojson_path,
+        r#"{
+            "type": "Polygon",
+            "coordinates": [
+                [[12.3, 55.5], [12.8, 55.5], [12.55, 55.9], [12.3, 55.5]]
+            ]
+        }"#,
+    )
+    .expect("write geojson");
+
+    write_test_pbf(&input, &test_nodes(), &[], &[]);
+
+    let region = parse_geojson(&geojson_path).expect("parse geojson");
+    let stats = extract(&input, &output, &region, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 3]);
+    assert_eq!(stats.nodes_in_bbox, 2);
 }

@@ -128,8 +128,14 @@ or BlockBuilder/PbfWriter APIs):
   **Total memory: ~2 GB regardless of input size.**
   Note: the existing `PbfWriter`/`BlockBuilder` are fully streaming and already support this —
   no writer changes needed.
-- [ ] `dense.rs:10-20` — `DenseNode` is ~96 bytes due to always-decoded `DenseNodeInfo` (~48
-  bytes). Make info decoding lazy — store raw iterator state, decode only when `.info()` called.
+- [ ] `dense.rs` — Lazy `DenseNodeInfo` decoding — **probably not worth it.** Investigation
+  (Feb 2025) found the premise was wrong: only 1 `DenseNode` is alive at any time (iterator
+  yields them one at a time, no production code collects them), so peak memory is ~136 bytes
+  total, not ~136 × 8000 per block. The DenseInfo packed arrays are already fully decoded by
+  protobuf deserialization — making `DenseNodeInfo` lazy only avoids reading 4-5 cached values
+  per node (~5-10 ns). 10 of 16 call sites need `.info()`. Overall speedup: ~0.5-1%.
+  Any lazy approach requires breaking API change or dual iterators. See `DenseNode` doc comment
+  in dense.rs for full rationale. **Not yet benchmarked.**
 - [ ] `blob.rs:63-67` / `block.rs:104` — `Blob` and `PrimitiveBlock` derive `Clone`, making
   accidental clones extremely expensive (atomic refcount on every `Bytes` in stringtable).
   Consider removing `Clone` or using `Arc<PrimitiveBlock>` for shared access.

@@ -6,6 +6,31 @@ use crate::proto::osmformat;
 use std;
 
 /// An OpenStreetMap node element from a compressed array of dense nodes (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Node)).
+///
+/// # Why `info` is always decoded (not lazy)
+///
+/// It may seem wasteful that `DenseNodeInfo` (~56 bytes) is always decoded into each
+/// `DenseNode`, even when the caller only needs the ID or coordinates. However:
+///
+/// - **Only 1 `DenseNode` is alive at any time.** The iterator produces nodes one at a
+///   time and callers consume them immediately — no production code collects them into a
+///   Vec (the `'a` lifetime prevents cross-block collection anyway). So the memory cost is
+///   ~136 bytes total, not ~136 × 8000 per block.
+///
+/// - **The DenseInfo packed arrays are already decoded by protobuf.** The `Vec<i32>` /
+///   `Vec<i64>` / `Vec<bool>` arrays for timestamp, changeset, uid, etc. are materialized
+///   during `PrimitiveBlock` deserialization. Making `DenseNodeInfo` lazy does NOT avoid
+///   decoding those arrays — it only avoids reading 4-5 values per node from arrays already
+///   in L1 cache (~5-10 ns per node).
+///
+/// - **10 of 16 call sites need `.info()`.** Every command that writes PBF output (cat,
+///   sort, extract, merge, tags_filter, getid, add_locations_to_ways) needs metadata. Only
+///   counting/indexing operations (check_refs, fileinfo, bench_read, indexed.rs) skip it.
+///
+/// - **A lazy approach has real API cost.** Options: breaking change (remove `info` field),
+///   dual iterators (`dense_nodes()` vs `dense_nodes_with_info()`), or a mode flag. All add
+///   complexity for ~0.5-1% overall speedup (the info copy is ~10% of the iterator loop,
+///   which is ~10% of total read time).
 #[derive(Clone, Debug)]
 pub struct DenseNode<'a> {
     block: &'a osmformat::PrimitiveBlock,

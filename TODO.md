@@ -14,9 +14,11 @@ or BlockBuilder/PbfWriter APIs):
 **Primary consumers:** Both elivagar and nidhogg use the same pattern:
 `ElementReader::from_path` -> `for_each_pipelined`. Nidhogg does 3 pipelined
 passes per ingest. Nidhogg also uses `pbfhogg::merge::merge()` for weekly
-planet updates. **Findings 1 and 3 are the top priorities** — they affect
-every pipelined read, which is the only read path the consumers use.
-Merge has not been profiled yet.
+planet updates. **Finding 6 (parallel merge compression) is the top remaining
+priority** — merge is the only path with a clear, large optimization available.
+The pipelined read path is now well-optimized: decode_blob allocation churn is
+unavoidable (zero-copy protobuf constraint) and alternative allocators showed <1%
+wall time difference (Finding 1). Merge has been profiled (see Findings 6–7).
 
 Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
 Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
@@ -41,12 +43,18 @@ reasonable, but the allocation throughput hammers the allocator.
   `parse_primitive_block_from_bytes(&raw)` → `parse_primitive_block_from_bytes_owned(&Bytes::from(raw))`.
   Result: `decompress_blob_data_from_bytes` dropped from hotpath report entirely,
   process alloc -100 MB, main thread alloc -200 MB.
-- [ ] **Reuse decompression buffers in decode_blob (read path).** `decode_blob` wraps
-  the decompressed Vec as `Bytes::from(decoded)` for zero-copy protobuf parsing.
+- [x] **Investigate alternative allocators for decode_blob (read path).** `decode_blob`
+  wraps the decompressed Vec as `Bytes::from(decoded)` for zero-copy protobuf parsing.
   The parsed PrimitiveBlock holds references into the Bytes, so the buffer cannot be
-  reclaimed until the message is dropped. Buffer reuse here requires either switching
-  to `parse_from_bytes` (copying parse, creates many small String allocations — likely
-  worse) or a custom allocator like jemalloc that pools large alloc/free efficiently.
+  reclaimed until the message is dropped — true buffer reuse is not possible.
+  Benchmarked jemalloc and mimalloc as drop-in replacements (features `jemalloc`,
+  `mimalloc` in Cargo.toml). **Result: allocator is not the bottleneck.** Denmark
+  check-refs (3 runs each): default 7.01s, jemalloc 6.93s (-1%), mimalloc 6.98s (~0%).
+  Jemalloc does reduce RSS (735 MB vs 902 MB, -18%) and minor page faults (272K vs
+  384K, -29%) due to pooling, but wall time is dominated by zlib decompression CPU
+  work, not allocator overhead. The decode workers are not the pipeline bottleneck
+  (main thread consumer is), so faster allocations don't help wall time.
+  Features kept for consumers who want lower RSS at planet scale.
 
 ### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
 
@@ -95,12 +103,20 @@ to the main function in each command file for per-command visibility:
 
 **check-refs (Denmark, 52M nodes, 6.6M ways, 46K relations):**
 ```
-Wall: 6.73s, RSS: 437.6 MB
+Wall: 6.73s, RSS: 437.6 MB (with hotpath-alloc)
 decode_blob:          7396 calls, 8.81s total (130%), 10.2 GB alloc
 for_each_pipelined:   1 call, 6.72s (99.83%), 262.4 MB alloc
 block::new:           7396 calls, 70.87ms (1.05%), 0 B alloc
 Main thread: 99% CPU. Workers: 4-5% CPU each (5 threads).
 Process: 10.0 GB alloc, 10.0 GB dealloc.
+```
+
+**check-refs allocator comparison (Denmark, no hotpath, 3 runs each):**
+```
+default (glibc): 7.01s avg, RSS 902 MB, 384K minor faults, sys 0.67s
+jemalloc:        6.93s avg, RSS 735 MB, 272K minor faults, sys 0.45s  (-1% wall, -18% RSS)
+mimalloc:        6.98s avg, RSS 841 MB, 447K minor faults, sys 0.64s  (~0% wall, -7% RSS)
+Conclusion: allocator is not a meaningful bottleneck for pipelined reads.
 ```
 
 **tags-count (Denmark, same file):**

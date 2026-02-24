@@ -1,3 +1,11 @@
+#[cfg(feature = "jemalloc")]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc_crate::MiMalloc = mimalloc_crate::MiMalloc;
+
 use std::path::PathBuf;
 use std::process;
 

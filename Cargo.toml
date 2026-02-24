@@ -15,8 +15,12 @@ zlib = ["flate2/zlib"]
 zlib-ng = ["flate2/zlib-ng"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc-crate"]
 
 [dependencies]
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc-crate = { package = "mimalloc", version = "0.1", optional = true }
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1.0", default-features = false }

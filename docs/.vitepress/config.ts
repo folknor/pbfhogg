@@ -2,7 +2,7 @@ import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
 const projectName = 'Nidhogg'
-const projectDescription = 'A project description goes here'
+const projectDescription = 'Shortbread vector tiles from OpenStreetMap'
 const githubUrl = 'https://github.com/user/nidhogg'
 const base = '/' // set to '/repo-name/' for GitHub Pages project sites
 // ────────────────────────────────────────────────────────────────────────────
@@ -34,7 +34,6 @@ export default defineConfig({
       message: `Released under the MIT License.`,
     },
 
-    // Disable sidebar on home page, enable on guide pages
     sidebar: {
       '/guide/': [
         {
@@ -42,6 +41,20 @@ export default defineConfig({
           items: [
             { text: 'Getting Started', link: '/guide/' },
             { text: 'Installation', link: '/guide/install' },
+            { text: 'Configuration', link: '/guide/configuration' },
+            { text: 'Usage', link: '/guide/usage' },
+            { text: 'Advanced', link: '/guide/advanced' },
+          ],
+        },
+      ],
+      '/api/': [
+        {
+          text: 'API Reference',
+          items: [
+            { text: 'Overview', link: '/api/' },
+            { text: 'nidhogg::config', link: '/api/config' },
+            { text: 'nidhogg::tile', link: '/api/tile' },
+            { text: 'nidhogg::pipeline', link: '/api/pipeline' },
           ],
         },
       ],

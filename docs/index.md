@@ -3,8 +3,8 @@ layout: home
 
 hero:
   name: "Nidhogg"
-  text: "Project tagline goes here"
-  tagline: "A brief description of what Nidhogg does and why you should use it."
+  text: "Shortbread vector tiles from OpenStreetMap"
+  tagline: "A fast, single-binary tile generator that turns OSM extracts into production-ready PMTiles. No database, no Java, no Docker."
   image:
     light: /nidhogg-logo.svg
     dark: /nidhogg-logo-dark.svg
@@ -28,7 +28,7 @@ features:
   - icon:
       src: /icons/gauge.svg
     title: Planet-Scale Performance
-    details: External merge sort, parallel processing with rayon, streaming PMTiles output. Handles 75GB planet extracts.
+    details: External merge sort, parallel processing with rayon, streaming PMTiles output. Handles 75GB planet extracts in under 3 hours.
   - icon:
       src: /icons/wrench.svg
     title: Single Binary
@@ -36,13 +36,43 @@ features:
 ---
 
 <div class="demo-frame">
-  <div style="background: var(--vp-c-bg-soft); padding: 3rem; text-align: center; color: var(--vp-c-text-3); font-family: var(--vp-font-family-mono); font-size: 0.85rem;">
-    screenshot or terminal recording goes here
-  </div>
+  <div id="asciinema-container"></div>
 </div>
 
-<!-- To use with a real image:
-<div class="demo-frame">
-  <img src="/screenshot.png" alt="Screenshot" />
-</div>
--->
+<script setup>
+import { onMounted } from 'vue'
+
+onMounted(() => {
+  const s = document.createElement('script')
+  s.src = 'https://asciinema.org/a/569727.js'
+  s.id = 'asciicast-569727'
+  s.async = true
+  document.getElementById('asciinema-container').appendChild(s)
+})
+</script>
+
+## Why Nidhogg?
+
+Generating vector tiles from OpenStreetMap has traditionally required a complex stack: a PostgreSQL database with PostGIS, imposm or osm2pgsql for import, Tegola or T-Rex for serving, and Tippecanoe for packaging. A planet build can take days and requires careful tuning of dozens of moving parts.
+
+Nidhogg replaces all of that with a single Rust binary. It reads `.osm.pbf` files directly, applies the [Shortbread](https://shortbread-tiles.org/) tag-matching rules, and streams tiles into a PMTiles archive that can be served straight from S3 or any static file host. The entire planet builds in 2-3 hours on a 16-core machine.
+
+### Benchmarks
+
+Tested on a 16-core AMD EPYC with 64 GB RAM and NVMe storage:
+
+| Input | Size | Time | Output |
+|---|---|---|---|
+| Germany | 4.1 GB | 4 min | 1.2 GB |
+| Europe | 27 GB | 38 min | 9.8 GB |
+| Planet | 75 GB | 2h 12min | 31 GB |
+
+All runs used `--max-zoom 14` with Zstandard compression.
+
+### How It Works
+
+1. **Parse** — PBF blocks are decoded in parallel across all available cores
+2. **Match** — Each OSM element is tested against 65+ Shortbread layer rules
+3. **Sort** — Features are sorted by tile coordinate using an external merge sort
+4. **Encode** — Tiles are built, simplified per zoom level, and written as MVT protobufs
+5. **Package** — The tile stream is written directly to PMTiles with a clustered B-tree index

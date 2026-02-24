@@ -18,14 +18,14 @@ zlib-ng = ["flate2/zlib-ng"]
 bytes = "1"
 clap = { version = "4", features = ["derive"] }
 flate2 = { version = "1.0", default-features = false }
-memmap2 = "0.5"
-protobuf = { version = "3.1", features = ["with-bytes"] }
-quick-xml = "0.37"
+memmap2 = "0.9"
+protobuf = { version = "3.7", features = ["with-bytes"] }
+quick-xml = "0.39"
 rayon = "1.5"
 serde_json = "1"
 
 [build-dependencies]
-protobuf-codegen = "3.1"
+protobuf-codegen = "3.7"
 
 [dev-dependencies]
 tempfile = "3"

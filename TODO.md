@@ -119,10 +119,10 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Dependencies
 
-- [ ] `memmap2` pinned at 0.5, current is 0.9+. Newer versions have soundness fixes.
-- [ ] Generally check for updates to all dependencies.
-- [ ] `protobuf` / `protobuf-codegen` at 3.1 (2022). Update to 3.7+ for varint decoding and
-  packed field performance improvements.
+- [x] `memmap2` bumped from 0.5 to 0.9 (soundness fixes).
+- [x] `protobuf` / `protobuf-codegen` bumped from 3.1 to 3.7 (varint decoding and packed field
+  performance improvements).
+- [x] `quick-xml` bumped from 0.37 to 0.39.
 - [ ] CLI-only dependencies (`clap`, `quick-xml`, `serde_json`) are runtime deps of the library
   crate. Library-only users pay the compile cost. Consider a `cli` feature gate or separate
   `pbfhogg-cli` binary crate.

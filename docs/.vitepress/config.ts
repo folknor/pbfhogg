@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/elivagar-logo.svg',
+    logo: { light: '/elivagar-logo.svg', dark: '/elivagar-logo-dark.svg' },
 
     nav: [
       { text: 'Guide', link: '/guide/' },

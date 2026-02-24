@@ -73,6 +73,22 @@ enum Command {
         #[arg(required = true)]
         expressions: Vec<String>,
     },
+    /// Compare two PBF files and show differences
+    Diff {
+        /// Old PBF file
+        old: PathBuf,
+        /// New PBF file
+        new: PathBuf,
+        /// Hide unchanged elements (show only created/modified/deleted)
+        #[arg(short = 'c', long = "suppress-common")]
+        suppress_common: bool,
+        /// Show detailed changes for modified elements
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        /// Filter by element type (comma-separated: node, way, relation)
+        #[arg(short = 't', long = "type")]
+        type_filter: Option<String>,
+    },
     /// Generate OSC diff from two PBF snapshots
     DeriveChanges {
         /// Old PBF file
@@ -178,6 +194,13 @@ fn main() {
             omit_referenced,
             expressions,
         } => run_tags_filter(&file, &output, &expressions, omit_referenced),
+        Command::Diff {
+            old,
+            new,
+            suppress_common,
+            verbose,
+            type_filter,
+        } => run_diff(&old, &new, suppress_common, verbose, type_filter.as_deref()),
         Command::DeriveChanges {
             old,
             new,
@@ -367,6 +390,27 @@ fn resolve_ids(
         Some(path) => pbfhogg::getid::parse_ids_from_file(path),
         None => pbfhogg::getid::parse_ids(ids),
     }
+}
+
+fn run_diff(
+    old: &std::path::Path,
+    new: &std::path::Path,
+    suppress_common: bool,
+    verbose: bool,
+    type_filter: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let options = pbfhogg::diff::DiffOptions {
+        suppress_common,
+        verbose,
+        type_filter: type_filter.map(String::from),
+    };
+    let mut stdout = std::io::stdout().lock();
+    let stats = pbfhogg::diff::diff(old, new, &mut stdout, &options)?;
+    stats.print_summary();
+    if stats.has_differences() {
+        process::exit(1);
+    }
+    Ok(())
 }
 
 fn run_derive_changes(

@@ -99,6 +99,6 @@ pub use error::{BlobError, Error, ErrorKind, Result};
 pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
 pub use write::{block_builder, writer};
 pub use commands::{
-    add_locations_to_ways, cat, check_refs, derive_changes, extract, fileinfo, getid, merge, sort,
-    tags_count, tags_filter,
+    add_locations_to_ways, cat, check_refs, derive_changes, diff, extract, fileinfo, getid, merge,
+    sort, tags_count, tags_filter,
 };

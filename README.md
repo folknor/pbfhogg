@@ -46,6 +46,7 @@ pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
 pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
 pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file
 pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
+pbfhogg diff <old> <new>                 Compare two PBF files (-v for verbose, -c to hide common)
 pbfhogg tags-count <file>                 Count tag key=value frequencies
 pbfhogg tags-filter <file> -o <out> <exp> Filter elements by tag expressions
 pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456 r789)

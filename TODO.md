@@ -58,11 +58,22 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
   (HashMap), which limits to country-scale PBFs. Add mmap dense and mmap sparse backends
   for planet-scale processing.
 
-- [ ] `pbfhogg diff` — compare two PBF files
-  CLI: `pbfhogg diff <old.osm.pbf> <new.osm.pbf>`
-  Equivalent to: `osmium diff`
-  Same merge-join as `derive-changes` but output human-readable differences: tags changed,
-  coordinates moved, members added/removed. Compact (default) and verbose modes.
+## CLI cross-validation
+
+Commands need cross-validation against osmium-tool (and where applicable osmosis/osmconvert)
+on real PBF data, like the merge cross-validation in `scripts/xval-merge.sh`. Run each
+command with pbfhogg and osmium on the same input, diff the outputs.
+
+- [x] `merge` — cross-validated against osmium, osmosis, osmconvert (commit a38c258)
+- [ ] `sort` — compare `pbfhogg sort` vs `osmium sort` output
+- [ ] `cat` — compare `pbfhogg cat` vs `osmium cat` output (with and without type filters)
+- [ ] `extract` — compare bbox and polygon extract vs `osmium extract`
+- [ ] `derive-changes` — compare OSC output vs `osmium derive-changes`
+- [ ] `diff` — compare output vs `osmium diff`
+- [ ] `add-locations-to-ways` — compare vs `osmium add-locations-to-ways`
+- [ ] `tags-filter` — compare vs `osmium tags-filter`
+- [ ] `getid` / `removeid` — compare vs `osmium getid` / `osmium removeid`
+- [ ] `check-refs` — compare vs `osmium check-refs`
 
 ## Nice to have
 

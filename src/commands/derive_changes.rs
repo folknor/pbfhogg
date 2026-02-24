@@ -8,162 +8,13 @@ use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use crate::{BlobDecode, BlobReader, Element, MemberId, MemberType};
+use super::owned_elements::{
+    from_decimicro, format_coord, nodes_equal, read_elements, relations_equal, take_node,
+    take_relation, take_way, ways_equal, OwnedNode, OwnedRelation, OwnedWay,
+};
+use crate::MemberType;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-// ---------------------------------------------------------------------------
-// Owned element types (same pattern as sort.rs)
-// ---------------------------------------------------------------------------
-
-struct OwnedNode {
-    id: i64,
-    decimicro_lat: i32,
-    decimicro_lon: i32,
-    tags: Vec<(String, String)>,
-    version: Option<i32>,
-}
-
-struct OwnedWay {
-    id: i64,
-    tags: Vec<(String, String)>,
-    refs: Vec<i64>,
-    version: Option<i32>,
-}
-
-struct OwnedMember {
-    id: MemberId,
-    role: String,
-}
-
-struct OwnedRelation {
-    id: i64,
-    tags: Vec<(String, String)>,
-    members: Vec<OwnedMember>,
-    version: Option<i32>,
-}
-
-// ---------------------------------------------------------------------------
-// Reading PBF into owned vectors
-// ---------------------------------------------------------------------------
-
-struct ReadResult {
-    nodes: Vec<OwnedNode>,
-    ways: Vec<OwnedWay>,
-    relations: Vec<OwnedRelation>,
-}
-
-fn read_elements(input: &Path) -> Result<ReadResult> {
-    let reader = BlobReader::from_path(input)?;
-    let mut nodes: Vec<OwnedNode> = Vec::new();
-    let mut ways: Vec<OwnedWay> = Vec::new();
-    let mut relations: Vec<OwnedRelation> = Vec::new();
-
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) => {}
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            nodes.push(OwnedNode {
-                                id: dn.id(),
-                                decimicro_lat: dn.decimicro_lat(),
-                                decimicro_lon: dn.decimicro_lon(),
-                                tags: dn
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                version: dn.info().map(crate::dense::DenseNodeInfo::version),
-                            });
-                        }
-                        Element::Node(n) => {
-                            nodes.push(OwnedNode {
-                                id: n.id(),
-                                decimicro_lat: n.decimicro_lat(),
-                                decimicro_lon: n.decimicro_lon(),
-                                tags: n
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                version: n.info().version(),
-                            });
-                        }
-                        Element::Way(w) => {
-                            ways.push(OwnedWay {
-                                id: w.id(),
-                                tags: w
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                refs: w.refs().collect(),
-                                version: w.info().version(),
-                            });
-                        }
-                        Element::Relation(r) => {
-                            relations.push(OwnedRelation {
-                                id: r.id(),
-                                tags: r
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                members: r
-                                    .members()
-                                    .map(|m| OwnedMember {
-                                        id: m.id,
-                                        role: m.role().unwrap_or("").to_owned(),
-                                    })
-                                    .collect(),
-                                version: r.info().version(),
-                            });
-                        }
-                    }
-                }
-            }
-            BlobDecode::Unknown(_) => {}
-        }
-    }
-
-    Ok(ReadResult {
-        nodes,
-        ways,
-        relations,
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Element comparison
-// ---------------------------------------------------------------------------
-
-fn nodes_equal(a: &OwnedNode, b: &OwnedNode) -> bool {
-    a.decimicro_lat == b.decimicro_lat
-        && a.decimicro_lon == b.decimicro_lon
-        && a.tags == b.tags
-}
-
-fn ways_equal(a: &OwnedWay, b: &OwnedWay) -> bool {
-    a.refs == b.refs && a.tags == b.tags
-}
-
-fn members_equal(a: &[OwnedMember], b: &[OwnedMember]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b.iter())
-            .all(|(ma, mb)| ma.id == mb.id && ma.role == mb.role)
-}
-
-fn relations_equal(a: &OwnedRelation, b: &OwnedRelation) -> bool {
-    a.tags == b.tags && members_equal(&a.members, &b.members)
-}
-
-// ---------------------------------------------------------------------------
-// Coordinate conversion
-// ---------------------------------------------------------------------------
-
-fn from_decimicro(d: i32) -> f64 {
-    f64::from(d) / 1e7
-}
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -383,42 +234,6 @@ fn merge_join_relations(
     }
 }
 
-// Clone helpers (owned types don't derive Clone to keep it explicit)
-fn take_node(n: &OwnedNode) -> OwnedNode {
-    OwnedNode {
-        id: n.id,
-        decimicro_lat: n.decimicro_lat,
-        decimicro_lon: n.decimicro_lon,
-        tags: n.tags.clone(),
-        version: n.version,
-    }
-}
-
-fn take_way(w: &OwnedWay) -> OwnedWay {
-    OwnedWay {
-        id: w.id,
-        tags: w.tags.clone(),
-        refs: w.refs.clone(),
-        version: w.version,
-    }
-}
-
-fn take_relation(r: &OwnedRelation) -> OwnedRelation {
-    OwnedRelation {
-        id: r.id,
-        tags: r.tags.clone(),
-        members: r
-            .members
-            .iter()
-            .map(|m| OwnedMember {
-                id: m.id,
-                role: m.role.clone(),
-            })
-            .collect(),
-        version: r.version,
-    }
-}
-
 // ---------------------------------------------------------------------------
 // OSC XML writer
 // ---------------------------------------------------------------------------
@@ -613,14 +428,4 @@ fn write_tags<W: Write>(writer: &mut Writer<W>, tags: &[(String, String)]) -> Re
         writer.write_event(Event::Empty(tag))?;
     }
     Ok(())
-}
-
-/// Format a coordinate, stripping unnecessary trailing zeros.
-fn format_coord(deg: f64) -> String {
-    // Use 7 decimal places (matches decimicrodegree precision)
-    let s = format!("{deg:.7}");
-    // Strip trailing zeros after decimal point, but keep at least one decimal
-    let s = s.trim_end_matches('0');
-    let s = s.trim_end_matches('.');
-    s.to_string()
 }

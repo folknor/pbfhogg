@@ -45,7 +45,10 @@ impl<'a> BlobType<'a> {
 }
 
 /// The decoded content of a blob (analogous to [`BlobType`]).
-#[derive(Clone, Debug)]
+///
+/// Does not implement `Clone` because `OsmData` contains a `PrimitiveBlock`, which is
+/// intentionally not `Clone` (see `PrimitiveBlock` docs for rationale).
+#[derive(Debug)]
 pub enum BlobDecode<'a> {
     /// Blob contains a [`HeaderBlock`].
     OsmHeader(Box<HeaderBlock>),

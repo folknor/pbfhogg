@@ -136,9 +136,11 @@ or BlockBuilder/PbfWriter APIs):
   per node (~5-10 ns). 10 of 16 call sites need `.info()`. Overall speedup: ~0.5-1%.
   Any lazy approach requires breaking API change or dual iterators. See `DenseNode` doc comment
   in dense.rs for full rationale. **Not yet benchmarked.**
-- [ ] `blob.rs:63-67` / `block.rs:104` — `Blob` and `PrimitiveBlock` derive `Clone`, making
-  accidental clones extremely expensive (atomic refcount on every `Bytes` in stringtable).
-  Consider removing `Clone` or using `Arc<PrimitiveBlock>` for shared access.
+- [x] `block.rs` / `blob.rs` — Removed `Clone` from `PrimitiveBlock` and `BlobDecode`.
+  Cloning a `PrimitiveBlock` triggered 200-1500 atomic Arc increments (stringtable) +
+  ~100-200 KB memcpy (packed arrays) — silently catastrophic at planet scale. Zero call
+  sites existed. `Blob` keeps `Clone` (cheap: 2-3 atomic ops, no large memcpy). Use
+  `Arc<PrimitiveBlock>` for shared access.
 
 ## Code quality
 

@@ -134,7 +134,18 @@ pub struct HeaderBBox {
 /// tricks: the `&str` slices would borrow from `block.stringtable.s` while `block`
 /// itself is owned by the same struct. The validation-at-construction approach achieves
 /// the same performance benefit (validate once, use many) without any lifetime complexity.
-#[derive(Clone, Debug)]
+///
+/// # Why `PrimitiveBlock` does not implement `Clone`
+///
+/// Cloning a `PrimitiveBlock` is silently expensive: the stringtable contains 200-1500
+/// `Bytes` entries, each requiring an atomic Arc increment. The packed integer arrays
+/// (node IDs, lats, lons, way refs, relation members) total ~100-200 KB of data that
+/// must be memcpy'd. On a planet file (2.5M blocks), an accidental `.clone()` in a
+/// hot loop would trigger ~1.25 billion atomic ops and ~250-500 GB of memcpy.
+///
+/// No code in the crate needs to clone a `PrimitiveBlock`. For shared access, use
+/// `Arc<PrimitiveBlock>` — a single atomic increment regardless of stringtable size.
+#[derive(Debug)]
 pub struct PrimitiveBlock {
     block: osmformat::PrimitiveBlock,
 }

@@ -92,7 +92,7 @@ impl MmapBlob {
             }
             "OSMData" => {
                 let block: osmformat::PrimitiveBlock = decode_blob(&blob)?;
-                Ok(BlobDecode::OsmData(PrimitiveBlock::new(block)))
+                Ok(BlobDecode::OsmData(PrimitiveBlock::new(block)?))
             }
             x => Ok(BlobDecode::Unknown(x)),
         }

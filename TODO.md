@@ -33,9 +33,9 @@ or BlockBuilder/PbfWriter APIs):
 
 - [x] `pipeline.rs:54` — decode pool now uses `available_parallelism() - 2`, min 1,
   fallback 4.
-- [ ] `reader.rs:138-139` — `par_bridge()` in `par_map_reduce` has significant mutex contention
-  at high parallelism. Consider pipeline-based approach or batch-collect into Vec then
-  `par_iter()`.
+- [x] `reader.rs:138-139` — `par_bridge()` replaced with two-phase batch-collect: sequentially
+  collect compressed blobs into `Vec<Blob>`, then `into_par_iter()` for lock-free parallel
+  decode+map+reduce. Eliminates mutex contention at high parallelism.
 - [ ] `pipeline.rs:13-16` — `READ_AHEAD` / `DECODE_AHEAD` constants should be configurable
   or auto-tuned. Current `DECODE_AHEAD=32` means up to 64-256MB of decoded blocks in flight.
 - [x] `pipeline.rs:84` — reorder buffer replaced with `VecDeque` (pre-allocated, ring buffer).
@@ -50,21 +50,21 @@ or BlockBuilder/PbfWriter APIs):
 - [x] `block_builder.rs:162-192` — `BlockBuilder::new()` pre-allocates dense vectors
   (8000 capacity for ids/lats/lons, 16000 for keys_vals, 8000 for metadata fields).
   Note: `take()` leaves zero-capacity Vecs — documented as acceptable, future optimization.
-- [ ] `cat.rs:159,184,211,232`, `add_locations_to_ways.rs:227,251,278-279` — temporary Vecs
-  created per-element in hot loops (`tags.collect()`, `refs.collect()`). Hoist reusable buffers
-  outside the loop, use `clear()` + `extend()`.
+- [x] `cat.rs`, `add_locations_to_ways.rs` — per-element `.collect()` allocations replaced with
+  hoisted reusable `Vec` buffers using `clear()` + `extend()`. Eliminates ~150M alloc/dealloc
+  pairs for Denmark-sized files.
 - [x] `writer.rs:111` — zlib encoder pre-allocates with `Vec::with_capacity(data.len() / 2)`.
 
 ## Performance: parsing hot paths
 
-- [ ] `block.rs:416-425` — `str_from_stringtable` re-validates UTF-8 on every tag lookup.
+- [x] `block.rs:416-425` — `str_from_stringtable` re-validates UTF-8 on every tag lookup.
   With 8000 elements * 2-3 tags = 32-48K validations per block, most redundant. Validate
-  the entire stringtable once at `PrimitiveBlock::new()` time and store `Vec<&str>`.
+  the entire stringtable once at `PrimitiveBlock::new()` time, then use `from_utf8_unchecked`.
 - [x] `dense.rs:156-166` — `DenseNodeIter` key_vals scanning replaced with direct index-based
   while loop (no chunks iterator, no per-pair bounds check).
-- [ ] `elements.rs:410-418` — `WayNodeLocationsIter` calls `lat_offset()`, `lon_offset()`,
-  `granularity()` (protobuf accessors through `Option` check) on every iteration. Cache as
-  fields at construction time. Same for `DenseNode::nano_lat/lon` and `Node::nano_lat/lon`.
+- [x] `elements.rs`, `dense.rs` — `WayNodeLocationsIter`, `Node`, `DenseNode`, `DenseNodeIter`
+  now cache `granularity`, `lat_offset`, `lon_offset` as plain `i64` fields at construction
+  time. Eliminates protobuf `Option` check + default-value fallback on every coordinate access.
 - [ ] Implement lightweight "scan" mode for protobuf blocks — extract only IDs without full
   parse (skip string table, tags, info, coordinates, refs). Used by `IndexedReader`,
   `check_refs`, and anywhere only IDs are needed.
@@ -84,8 +84,9 @@ or BlockBuilder/PbfWriter APIs):
   flags exploits OSM PBF node→way→relation ordering.
 - [ ] `check_refs.rs:49-51` — `HashSet<i64>` for all node/way/relation IDs. ~72GB for planet.
   Use roaring bitmap or sorted vec with binary search.
-- [ ] `block_builder.rs:26` — write-side `StringTable` uses `HashMap<String, u32>` with default
-  SipHash. Use `rustc_hash::FxHashMap` for faster hashing (short strings, no DoS concern).
+- [x] `block_builder.rs` — write-side `StringTable` switched from `HashMap` (SipHash) to
+  `FxHashMap` (rustc-hash). Faster hashing for short OSM tag strings, safe because write-side
+  has no untrusted input (no DoS concern).
 
 ## Performance: memory / planet-scale
 

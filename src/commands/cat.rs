@@ -150,13 +150,33 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                 }
                 BlobDecode::OsmData(block) => {
                     blobs_decoded += 1;
+
+                    // Reusable buffers for element data, hoisted outside the element loop.
+                    //
+                    // WHY: Without hoisting, each element allocates fresh Vecs via .collect(),
+                    // producing N allocations where N = number of elements. For Denmark (~50M
+                    // elements), that is ~150M alloc/dealloc pairs across the 3 buffer types.
+                    //
+                    // HOW: Vec::clear() sets len to 0 but keeps the underlying heap allocation.
+                    // The subsequent extend() refills the buffer without reallocating once the
+                    // capacity is warm (i.e. after the first few elements in each block).
+                    //
+                    // These buffers grow to the size of the largest element in the block and
+                    // stabilize — there is no unbounded growth because PBF blocks have a max
+                    // of 8000 entities. They are scoped to the OsmData arm so that the borrowed
+                    // string references (which point into `block`) do not outlive the block.
+                    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+                    let mut refs_buf: Vec<i64> = Vec::new();
+                    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
                     for element in block.elements() {
                         match &element {
                             Element::DenseNode(dn) if filter_node => {
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let tags: Vec<(&str, &str)> = dn.tags().collect();
+                                tags_buf.clear();
+                                tags_buf.extend(dn.tags());
                                 let meta = dn.info().and_then(|info| {
                                     let user = info.user().ok()?;
                                     Some(Metadata {
@@ -172,7 +192,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                     dn.id(),
                                     dn.decimicro_lat(),
                                     dn.decimicro_lon(),
-                                    &tags,
+                                    &tags_buf,
                                     meta.as_ref(),
                                 );
                                 elements += 1;
@@ -181,7 +201,8 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let tags: Vec<(&str, &str)> = n.tags().collect();
+                                tags_buf.clear();
+                                tags_buf.extend(n.tags());
                                 let info = n.info();
                                 let meta = info.version().map(|v| Metadata {
                                     version: v,
@@ -198,7 +219,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                     n.id(),
                                     n.decimicro_lat(),
                                     n.decimicro_lon(),
-                                    &tags,
+                                    &tags_buf,
                                     meta.as_ref(),
                                 );
                                 elements += 1;
@@ -207,8 +228,10 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                 if !bb.can_add_way() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let tags: Vec<(&str, &str)> = w.tags().collect();
-                                let refs: Vec<i64> = w.refs().collect();
+                                tags_buf.clear();
+                                tags_buf.extend(w.tags());
+                                refs_buf.clear();
+                                refs_buf.extend(w.refs());
                                 let info = w.info();
                                 let meta = info.version().map(|v| Metadata {
                                     version: v,
@@ -221,21 +244,20 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                         .unwrap_or(""),
                                     visible: info.visible(),
                                 });
-                                bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                                bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                                 elements += 1;
                             }
                             Element::Relation(r) if filter_relation => {
                                 if !bb.can_add_relation() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let tags: Vec<(&str, &str)> = r.tags().collect();
-                                let members: Vec<MemberData<'_>> = r
-                                    .members()
-                                    .map(|m| MemberData {
-                                        id: m.id,
-                                        role: m.role().unwrap_or(""),
-                                    })
-                                    .collect();
+                                tags_buf.clear();
+                                tags_buf.extend(r.tags());
+                                members_buf.clear();
+                                members_buf.extend(r.members().map(|m| MemberData {
+                                    id: m.id,
+                                    role: m.role().unwrap_or(""),
+                                }));
                                 let info = r.info();
                                 let meta = info.version().map(|v| Metadata {
                                     version: v,
@@ -248,7 +270,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
                                         .unwrap_or(""),
                                     visible: info.visible(),
                                 });
-                                bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                                bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                                 elements += 1;
                             }
                             _ => {}

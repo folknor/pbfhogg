@@ -101,14 +101,46 @@ pub struct HeaderBBox {
 }
 
 /// A `PrimitiveBlock`. It contains a sequence of groups.
+///
+/// # Stringtable UTF-8 invariant
+///
+/// At construction time (`new()`), every entry in the block's stringtable is validated
+/// with `std::str::from_utf8()`. This means all subsequent stringtable lookups
+/// (`str_from_stringtable()`) can use `from_utf8_unchecked` — eliminating 16-48K
+/// redundant UTF-8 validations per block (8000 elements × 2-6 tag lookups each).
+///
+/// The alternative of storing `Vec<&str>` alongside the block was considered but
+/// rejected because it would require a self-referential struct or `unsafe` lifetime
+/// tricks: the `&str` slices would borrow from `block.stringtable.s` while `block`
+/// itself is owned by the same struct. The validation-at-construction approach achieves
+/// the same performance benefit (validate once, use many) without any lifetime complexity.
 #[derive(Clone, Debug)]
 pub struct PrimitiveBlock {
     block: osmformat::PrimitiveBlock,
 }
 
 impl PrimitiveBlock {
-    pub fn new(block: osmformat::PrimitiveBlock) -> PrimitiveBlock {
-        PrimitiveBlock { block }
+    /// Parse a `PrimitiveBlock` from its protobuf representation.
+    ///
+    /// Validates every entry in the stringtable as UTF-8. This up-front validation
+    /// allows all later stringtable lookups to skip per-access UTF-8 checks, which
+    /// eliminates 16-48K redundant `std::str::from_utf8()` calls per block (a typical
+    /// block has up to 8000 elements, each with 2-6 tag key/value lookups into the
+    /// stringtable).
+    ///
+    /// # Errors
+    ///
+    /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains invalid
+    /// UTF-8 bytes.
+    pub fn new(block: osmformat::PrimitiveBlock) -> Result<PrimitiveBlock> {
+        // Validate every stringtable entry once at construction time.
+        // This establishes the invariant that all entries are valid UTF-8,
+        // which str_from_stringtable() relies on for its unsafe from_utf8_unchecked.
+        for (index, entry) in block.stringtable.s.iter().enumerate() {
+            std::str::from_utf8(entry)
+                .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
+        }
+        Ok(PrimitiveBlock { block })
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`.
@@ -143,9 +175,10 @@ impl PrimitiveBlock {
     }
 
     /// Returns the raw stringtable. Elements in a `PrimitiveBlock` do not store strings
-    /// themselves; instead, they just store indices to the stringtable. By convention, the
-    /// contained strings are UTF-8 encoded but it is not safe to assume that (use
-    /// `std::str::from_utf8`).
+    /// themselves; instead, they just store indices to the stringtable.
+    ///
+    /// All entries are guaranteed to be valid UTF-8: this is checked at construction time
+    /// in `PrimitiveBlock::new()`, which rejects blocks with invalid stringtable entries.
     pub fn raw_stringtable(&self) -> &[bytes::Bytes] {
         self.block.stringtable.s.as_slice()
     }
@@ -412,13 +445,28 @@ impl<'a> Iterator for GroupRelationIter<'a> {
 
 impl ExactSizeIterator for GroupRelationIter<'_> {}
 
+/// Look up a stringtable entry by index, returning it as a `&str`.
+///
+/// # Performance
+///
+/// This function uses `from_utf8_unchecked` instead of `from_utf8`, avoiding a
+/// per-call O(n) UTF-8 validation scan. For a typical PBF block with 8000 elements
+/// and 2-3 tags each, this eliminates 32-48K redundant validations per block.
+///
+/// The safety of this relies on the invariant established by `PrimitiveBlock::new()`,
+/// which validates every stringtable entry at construction time. Since `PrimitiveBlock`
+/// has no API that allows mutating the stringtable after construction, the invariant
+/// holds for the lifetime of the block.
 pub(crate) fn str_from_stringtable(
     block: &osmformat::PrimitiveBlock,
     index: usize,
 ) -> Result<&str> {
-    if let Some(vec) = block.stringtable.s.get(index) {
-        std::str::from_utf8(vec)
-            .map_err(|e| new_error(ErrorKind::StringtableUtf8 { err: e, index }))
+    if let Some(bytes) = block.stringtable.s.get(index) {
+        // SAFETY: All stringtable entries were validated as UTF-8 in
+        // PrimitiveBlock::new(). The PrimitiveBlock struct does not expose any
+        // mutable access to the underlying osmformat::PrimitiveBlock, so the
+        // stringtable entries cannot have been modified since construction.
+        Ok(unsafe { std::str::from_utf8_unchecked(bytes) })
     } else {
         Err(new_error(ErrorKind::StringtableIndexOutOfBounds { index }))
     }

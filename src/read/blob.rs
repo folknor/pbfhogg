@@ -123,7 +123,7 @@ impl Blob {
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
-        decode_blob(&self.blob).map(PrimitiveBlock::new)
+        decode_blob(&self.blob).and_then(PrimitiveBlock::new)
     }
 }
 
@@ -612,7 +612,8 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 ) -> Result<crate::PrimitiveBlock> {
     let blob = fileformat::Blob::parse_from_tokio_bytes(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
-    decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob).map(crate::PrimitiveBlock::new)
+    decode_blob::<crate::proto::osmformat::PrimitiveBlock>(&blob)
+        .and_then(crate::PrimitiveBlock::new)
 }
 
 /// Decompress a blob's data without parsing it into a typed message.
@@ -700,9 +701,9 @@ pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBl
 /// `from_bytes` in its name. The `_owned` suffix signals that this
 /// variant takes ownership of the buffer.
 pub fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
-    crate::proto::osmformat::PrimitiveBlock::parse_from_tokio_bytes(raw)
-        .map(crate::PrimitiveBlock::new)
-        .map_err(|e| new_protobuf_error(e, "parse primitive block"))
+    let block = crate::proto::osmformat::PrimitiveBlock::parse_from_tokio_bytes(raw)
+        .map_err(|e| new_protobuf_error(e, "parse primitive block"))?;
+    crate::PrimitiveBlock::new(block)
 }
 
 /// Decode raw Blob protobuf bytes into a [`HeaderBlock`].

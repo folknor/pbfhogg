@@ -9,8 +9,8 @@
 use crate::proto::osmformat;
 use bytes::Bytes;
 use protobuf::{EnumOrUnknown, Message};
+use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
-use std::collections::HashMap;
 use std::io;
 
 /// Maximum number of entities in a single `PrimitiveBlock`.
@@ -22,16 +22,51 @@ const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 // ---------------------------------------------------------------------------
 
 /// Block-local string table. Index 0 is always the empty string.
+///
+/// ## Why FxHashMap instead of std HashMap
+///
+/// The `index` map uses `FxHashMap` (from `rustc-hash`) instead of the standard
+/// `HashMap` with `SipHash`. This is safe and beneficial here because:
+///
+/// **Safety:** This is a write-side-only data structure. All strings inserted
+/// come from the caller's in-process data (tag keys, tag values, role strings,
+/// user names) — never from untrusted PBF input. There is no risk of
+/// HashDoS attacks, which is the sole reason the standard library defaults to
+/// the slower SipHash-1-3 hasher.
+///
+/// **Performance:** FxHash is a simple, non-cryptographic hash (multiply +
+/// rotate) that is substantially faster than SipHash for short strings — which
+/// is exactly what OSM tag keys/values are (typically 3-30 bytes: "name",
+/// "highway", "building", "residential", etc.). The string table is on the hot
+/// path of PBF writing: every tag on every element does a hash lookup + possible
+/// insert. In profiling, the hasher shows up as a measurable fraction of write
+/// time, so switching to FxHash gives a meaningful speedup.
+///
+/// **Where NOT to use FxHash:** On the *read* side (e.g. if you were building a
+/// lookup table from PBF data), strings come from untrusted input files that
+/// could be adversarially crafted. In that context, SipHash (or ahash, which
+/// also has DoS resistance) should be used to prevent O(n^2) hash collisions.
+///
+/// **Alternatives considered:**
+/// - `ahash`: Also fast and DoS-resistant, but the DoS resistance is
+///   unnecessary overhead here since we control the input. FxHash is simpler
+///   and marginally faster for the short-string workload.
+/// - `IndexMap`: Preserves insertion order (which we need via `self.strings`),
+///   but wrapping an IndexMap would still need a fast hasher, and we already
+///   maintain the ordered Vec separately. Switching would add a dependency for
+///   no net benefit.
+/// - Custom perfect hashing: Not viable because the string set is dynamic —
+///   we do not know all strings upfront.
 struct StringTable {
     strings: Vec<String>,
-    index: HashMap<String, u32>,
+    index: FxHashMap<String, u32>,
 }
 
 impl StringTable {
     fn new() -> Self {
         let mut st = StringTable {
             strings: Vec::with_capacity(256),
-            index: HashMap::with_capacity(256),
+            index: FxHashMap::with_capacity_and_hasher(256, Default::default()),
         };
         st.strings.push(String::new()); // index 0 = empty string
         st

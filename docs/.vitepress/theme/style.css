@@ -11,62 +11,63 @@
  * Change --vp-c-brand-* per project to give each site its own accent.
  * These map to VitePress's built-in color system.
  * ──────────────────────────────────────────────────────────────────────── */
-/* ── Elivagar — Icy / Arctic palette ───────────────────────────────────── */
+/* ── Pbfhogg — Blood & Iron palette ───────────────────────────────────── */
 
 :root {
-  --vp-c-brand-1: #00b8db;
-  --vp-c-brand-2: #00a3c4;
-  --vp-c-brand-3: #008da8;
-  --vp-c-brand-soft: rgba(0, 163, 196, 0.12);
+  --vp-c-brand-1: #a82020;
+  --vp-c-brand-2: #880808;
+  --vp-c-brand-3: #6e0606;
+  --vp-c-brand-soft: rgba(136, 8, 8, 0.1);
 
   --vp-button-brand-bg: var(--vp-c-brand-2);
   --vp-button-brand-hover-bg: var(--vp-c-brand-1);
 
   --vp-layout-max-width: 1216px;
 
-  /* frost white background */
-  --vp-c-bg: #f0f8ff;
-  --vp-c-bg-alt: #e6f0f8;
-  --vp-c-bg-elv: #e6f0f8;
-  --vp-c-bg-soft: #dae8f2;
+  /* parchment-warm light bg */
+  --vp-c-bg: #f2efe9;
+  --vp-c-bg-alt: #e9e5dd;
+  --vp-c-bg-elv: #e9e5dd;
+  --vp-c-bg-soft: #dfd9cf;
 
-  /* dark text on frost */
-  --vp-c-text-1: #1a2a3a;
-  --vp-c-text-2: #3a4a5a;
-  --vp-c-text-3: #6a7a8a;
+  /* deep forest text */
+  --vp-c-text-1: #1b2e21;
+  --vp-c-text-2: #3a4a3f;
+  --vp-c-text-3: #6a7a6f;
 
-  /* alt buttons */
-  --vp-button-alt-bg: #d6e2ec;
-  --vp-button-alt-hover-bg: #c8d8e6;
-  --vp-button-alt-text: #1a2a3a;
+  /* alt buttons — forest-tinted */
+  --vp-button-alt-bg: #d4cec4;
+  --vp-button-alt-hover-bg: #c6bfb4;
+  --vp-button-alt-text: #1b2e21;
 
-  /* subtle silver dividers */
-  --vp-c-divider: #bfc1c2;
-  --vp-c-gutter: #bfc1c2;
+  /* dividers */
+  --vp-c-divider: rgba(27, 46, 33, 0.12);
+  --vp-c-gutter: rgba(27, 46, 33, 0.12);
 }
 
 .dark {
-  --vp-c-brand-1: #33d4f0;
-  --vp-c-brand-2: #00b8db;
-  --vp-c-brand-3: #00a3c4;
-  --vp-c-brand-soft: rgba(0, 163, 196, 0.18);
+  --vp-c-brand-1: #cc3030;
+  --vp-c-brand-2: #a82020;
+  --vp-c-brand-3: #880808;
+  --vp-c-brand-soft: rgba(168, 32, 32, 0.2);
 
-  /* arctic blue background */
-  --vp-c-bg: #1a2a3a;
-  --vp-c-bg-alt: #142230;
-  --vp-c-bg-elv: #1f3244;
-  --vp-c-bg-soft: #1f3244;
+  /* gunmetal background */
+  --vp-c-bg: #1e2426;
+  --vp-c-bg-alt: #181e20;
+  --vp-c-bg-elv: #262e30;
+  --vp-c-bg-soft: #262e30;
 
-  --vp-c-text-1: rgba(240, 248, 255, 0.9);
-  --vp-c-text-2: rgba(220, 235, 248, 0.65);
-  --vp-c-text-3: rgba(200, 220, 240, 0.4);
+  /* silver grey text */
+  --vp-c-text-1: rgba(209, 209, 209, 0.95);
+  --vp-c-text-2: rgba(209, 209, 209, 0.65);
+  --vp-c-text-3: rgba(209, 209, 209, 0.38);
 
-  --vp-button-alt-bg: #243a4e;
-  --vp-button-alt-hover-bg: #2e4a5e;
-  --vp-button-alt-text: rgba(240, 248, 255, 0.9);
+  --vp-button-alt-bg: #2e3638;
+  --vp-button-alt-hover-bg: #3a4244;
+  --vp-button-alt-text: rgba(209, 209, 209, 0.95);
 
-  --vp-c-divider: rgba(191, 193, 194, 0.15);
-  --vp-c-gutter: rgba(191, 193, 194, 0.15);
+  --vp-c-divider: rgba(209, 209, 209, 0.1);
+  --vp-c-gutter: rgba(209, 209, 209, 0.1);
 }
 
 /* ── Fluid root size ───────────────────────────────────────────────────── *

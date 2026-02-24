@@ -2,13 +2,12 @@
 layout: home
 
 hero:
-  name: "Elivagar"
-  text: "Shortbread vector tile generator"
-  tagline: "Reads OSM PBF files and produces PMTiles v3 archives with 26 layers. Fast, single-binary, no runtime dependencies."
+  name: "pbfhogg"
+  text: "Project tagline goes here"
+  tagline: "A brief description of what pbfhogg does and why you should use it."
   image:
-    light: /elivagar-logo.svg
-    dark: /elivagar-logo-dark.svg
-    alt: Elivagar logo
+    src: /pbfhogg-logo.svg
+    alt: pbfhogg logo
   actions:
     - theme: brand
       text: Get Started
@@ -18,7 +17,7 @@ hero:
       link: /api/
     - theme: alt
       text: GitHub
-      link: https://github.com/user/elivagar
+      link: https://github.com/user/pbfhogg
 
 features:
   - icon:

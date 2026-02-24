@@ -1,0 +1,66 @@
+/*
+ * Elivagar — Icy / Arctic palette
+ *
+ * Primary:   Icy Cyan    #00A3C4
+ * Secondary: Frost White  #F0F8FF
+ * Accent:    Subtle Silver #BFC1C2
+ * Deep Note: Arctic Blue   #1A2A3A
+ */
+
+/* ── Light mode ────────────────────────────────────────────────────────── */
+
+:root {
+  --vp-c-brand-1: #00b8db;
+  --vp-c-brand-2: #00a3c4;
+  --vp-c-brand-3: #008da8;
+  --vp-c-brand-soft: rgba(0, 163, 196, 0.12);
+
+  --vp-button-brand-bg: var(--vp-c-brand-2);
+  --vp-button-brand-hover-bg: var(--vp-c-brand-1);
+
+  /* frost white background */
+  --vp-c-bg: #f0f8ff;
+  --vp-c-bg-alt: #e6f0f8;
+  --vp-c-bg-elv: #e6f0f8;
+  --vp-c-bg-soft: #dae8f2;
+
+  /* dark text on frost */
+  --vp-c-text-1: #1a2a3a;
+  --vp-c-text-2: #3a4a5a;
+  --vp-c-text-3: #6a7a8a;
+
+  /* alt buttons */
+  --vp-button-alt-bg: #d6e2ec;
+  --vp-button-alt-hover-bg: #c8d8e6;
+  --vp-button-alt-text: #1a2a3a;
+
+  /* subtle silver dividers */
+  --vp-c-divider: #bfc1c2;
+  --vp-c-gutter: #bfc1c2;
+}
+
+/* ── Dark mode ─────────────────────────────────────────────────────────── */
+
+.dark {
+  --vp-c-brand-1: #33d4f0;
+  --vp-c-brand-2: #00b8db;
+  --vp-c-brand-3: #00a3c4;
+  --vp-c-brand-soft: rgba(0, 163, 196, 0.18);
+
+  /* arctic blue background */
+  --vp-c-bg: #1a2a3a;
+  --vp-c-bg-alt: #142230;
+  --vp-c-bg-elv: #1f3244;
+  --vp-c-bg-soft: #1f3244;
+
+  --vp-c-text-1: rgba(240, 248, 255, 0.9);
+  --vp-c-text-2: rgba(220, 235, 248, 0.65);
+  --vp-c-text-3: rgba(200, 220, 240, 0.4);
+
+  --vp-button-alt-bg: #243a4e;
+  --vp-button-alt-hover-bg: #2e4a5e;
+  --vp-button-alt-text: rgba(240, 248, 255, 0.9);
+
+  --vp-c-divider: rgba(191, 193, 194, 0.15);
+  --vp-c-gutter: rgba(191, 193, 194, 0.15);
+}

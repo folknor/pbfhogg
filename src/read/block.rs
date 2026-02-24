@@ -94,9 +94,9 @@ pub struct HeaderBBox {
     pub left: f64,
     /// right coordinate in degrees (maximum longitude)
     pub right: f64,
-    /// top coordinate in degrees (minimum latitude)
+    /// top coordinate in degrees (maximum latitude)
     pub top: f64,
-    /// bottom coordinate in degrees (maximum latitude)
+    /// bottom coordinate in degrees (minimum latitude)
     pub bottom: f64,
 }
 

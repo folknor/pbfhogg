@@ -480,6 +480,7 @@ fn member_type_str(mt: MemberType) -> &'static str {
         MemberType::Node => "node",
         MemberType::Way => "way",
         MemberType::Relation => "relation",
+        MemberType::Unknown(_) => "unknown",
     }
 }
 

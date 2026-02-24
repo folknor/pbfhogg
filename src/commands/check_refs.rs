@@ -108,6 +108,10 @@ pub fn check_refs(path: &Path, check_relations: bool) -> Result<RefCheckResult> 
                                     result.missing_relation_members += 1;
                                 }
                             }
+                            // Unknown member types from newer PBF producers —
+                            // skip for ref-checking since we don't know what
+                            // collection to check against.
+                            MemberId::Unknown(_, _) => {}
                         }
                     }
                 }

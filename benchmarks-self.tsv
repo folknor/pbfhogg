@@ -9,3 +9,8 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	pipelined	2548	52489653	6616526	46103	483
 2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	mmap	5802	52489653	6616526	46103	483
 2026-02-23	f04dcfa	Replace bare member_id with typed MemberId enum	denmark-latest	blobreader	5845	52489653	6616526	46103	483
+2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	sequential	5209	52489653	6616526	46103	483
+2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	parallel	560	52489653	6616526	46103	483
+2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	pipelined	1425	52489653	6616526	46103	483
+2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	mmap	5543	52489653	6616526	46103	483
+2026-02-24	b6c8ae7	Bump memmap2 0.5→0.9, protobuf 3.1→3.7, quick-xml 0.37→0.39	denmark-latest	blobreader	5527	52489653	6616526	46103	483

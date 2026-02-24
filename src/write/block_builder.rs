@@ -131,6 +131,10 @@ fn member_type_to_proto(mt: MemberType) -> osmformat::relation::MemberType {
         MemberType::Node => osmformat::relation::MemberType::NODE,
         MemberType::Way => osmformat::relation::MemberType::WAY,
         MemberType::Relation => osmformat::relation::MemberType::RELATION,
+        // Unknown member types from newer PBF producers — round-trip as NODE
+        // since the protobuf enum has no "unknown" value. Callers should filter
+        // these out before writing if lossless preservation is needed.
+        MemberType::Unknown(_) => osmformat::relation::MemberType::NODE,
     }
 }
 

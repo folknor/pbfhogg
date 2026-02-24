@@ -508,13 +508,8 @@ impl SkipState {
     }
 }
 
-fn osc_member_type_to_member_type(s: &str) -> crate::MemberType {
-    match s {
-        "way" => crate::MemberType::Way,
-        "relation" => crate::MemberType::Relation,
-        _ => crate::MemberType::Node,
-    }
-}
+// osc_member_type_to_member_type removed: OscRelMember.member_type is now
+// a MemberType enum directly (see osc.rs), so no string→enum conversion needed.
 
 // ---------------------------------------------------------------------------
 // Low-level blob frame reader (preserves raw bytes for passthrough)
@@ -686,12 +681,9 @@ fn write_osc_relation(
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()
-        .map(|m: &OscRelMember| {
-            let mt = osc_member_type_to_member_type(&m.member_type);
-            MemberData {
-                id: crate::MemberId::from_id_and_type(m.ref_id, mt),
-                role: &m.role,
-            }
+        .map(|m: &OscRelMember| MemberData {
+            id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
+            role: &m.role,
         })
         .collect();
     bb.add_relation(rel.id, &tags, &members, None);

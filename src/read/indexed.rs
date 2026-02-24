@@ -144,7 +144,6 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
     /// Initializes the index of the PBF structure without decompressing the blobs.
     /// You do not need to call this method explicitly as the other methods already take care of
     /// it.
-    #[allow(clippy::unwrap_used)]
     pub fn create_index(&mut self) -> Result<()> {
         if !self.index.is_empty() {
             // Index is already present -> Do nothing
@@ -156,8 +155,18 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
 
         while let Some(result) = self.reader.next_header_skip_blob() {
             let (header, offset) = result?;
-            // Reader is seekable, so offset should be Some(ByteOffset)
-            let offset = offset.unwrap();
+            // The original code used `offset.unwrap()` here because IndexedReader
+            // always constructs its BlobReader via `new_seekable`, which initializes
+            // offset tracking. A seekable BlobReader always returns
+            // `Some(ByteOffset)` from `next_header_skip_blob`. However, relying on
+            // that invariant via unwrap is fragile -- if the BlobReader internals
+            // ever change, this would panic at runtime. Instead, we propagate a
+            // descriptive IO error so callers get a clear message rather than a panic.
+            let offset = offset.ok_or_else(|| {
+                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    "IndexedReader requires a seekable BlobReader with offset tracking",
+                )))
+            })?;
             let blob_type = match header.blob_type() {
                 BlobType::OsmHeader => SimpleBlobType::Header,
                 BlobType::OsmData => SimpleBlobType::Primitive,
@@ -423,6 +432,12 @@ impl IndexedReader<File> {
     }
 }
 
+// Tests use `unwrap()` throughout because panicking is the correct failure mode
+// for unit tests -- it immediately fails the test with a clear backtrace pointing
+// to the exact call site. Propagating Results via `-> Result<()>` in tests would
+// lose the backtrace and produce less actionable error messages. The crate-wide
+// `unwrap_used = "deny"` lint is designed for production code where panics are
+// unacceptable; test code is exempt via this module-level allow.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

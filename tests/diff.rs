@@ -1,100 +1,17 @@
 //! diff correctness tests.
 
+mod common;
+
 use std::path::Path;
 
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use common::{write_test_pbf, TestMember, TestNode, TestRelation, TestWay};
 use pbfhogg::diff::{DiffOptions, diff};
 use pbfhogg::MemberId;
-use pbfhogg::writer::{Compression, PbfWriter};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (diff-specific — shared helpers are in tests/common/mod.rs)
 // ---------------------------------------------------------------------------
-
-struct TestNode {
-    id: i64,
-    lat: i32,
-    lon: i32,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestWay {
-    id: i64,
-    refs: Vec<i64>,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestRelation {
-    id: i64,
-    members: Vec<TestMember>,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestMember {
-    id: MemberId,
-    role: &'static str,
-}
-
-fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
-    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
-    let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
-    writer.write_header(&header).expect("write header");
-
-    let mut bb = BlockBuilder::new();
-
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        bb.add_way(w.id, &w.tags, &w.refs, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        bb.add_relation(r.id, &r.tags, &members, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    writer.flush().expect("flush");
-}
 
 fn run_diff(old: &Path, new: &Path, options: &DiffOptions) -> (String, pbfhogg::diff::DiffStats) {
     let mut output = Vec::new();

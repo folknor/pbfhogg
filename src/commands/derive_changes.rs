@@ -378,6 +378,7 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
                 MemberType::Node => "node",
                 MemberType::Way => "way",
                 MemberType::Relation => "relation",
+                MemberType::Unknown(_) => "node", // fallback for unrecognized types
             };
             let id_str = m.id.id().to_string();
             member.push_attribute(("type", type_str));

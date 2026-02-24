@@ -1,12 +1,19 @@
 //! Merge correctness tests: build known PBFs + OSC diffs, run merge(), verify output.
 
+mod common;
+
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+use common::{
+    node_ids_with_coords as node_ids, read_all_elements_with_coords as read_all_elements,
+    way_ids_with_coords as way_ids, relation_ids_with_coords as relation_ids,
+    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+};
 use flate2::write::GzEncoder;
-use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
+use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::MemberId;
 use pbfhogg::merge::merge;
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -14,174 +21,14 @@ use pbfhogg::{BlobDecode, BlobReader, Element, MemberType};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (merge-specific — shared helpers are in tests/common/mod.rs)
 // ---------------------------------------------------------------------------
-
-struct TestNode {
-    id: i64,
-    lat: i32, // decimicrodegrees
-    lon: i32,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestWay {
-    id: i64,
-    refs: Vec<i64>,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestRelation {
-    id: i64,
-    members: Vec<TestMember>,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestMember {
-    id: MemberId,
-    role: &'static str,
-}
-
-fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
-    let mut writer =
-        PbfWriter::to_path(path, Compression::default()).expect("create writer");
-    let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
-    writer.write_header(&header).expect("write header");
-
-    let mut bb = BlockBuilder::new();
-
-    // Nodes
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    // Ways
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        bb.add_way(w.id, &w.tags, &w.refs, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    // Relations
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(&bytes).expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        bb.add_relation(r.id, &r.tags, &members, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(&bytes).expect("write block");
-    }
-
-    writer.flush().expect("flush");
-}
 
 fn write_osc(path: &Path, xml: &str) {
     let file = File::create(path).expect("create osc file");
     let mut enc = GzEncoder::new(file, flate2::Compression::fast());
     enc.write_all(xml.as_bytes()).expect("write xml");
     enc.finish().expect("finish gz");
-}
-
-/// Collected element data from a PBF, for easy assertion.
-#[derive(Debug)]
-#[allow(clippy::type_complexity)]
-struct PbfContents {
-    nodes: Vec<(i64, i32, i32, Vec<(String, String)>)>, // (id, lat, lon, tags)
-    ways: Vec<(i64, Vec<i64>, Vec<(String, String)>)>,   // (id, refs, tags)
-    relations: Vec<(i64, Vec<(i64, String, String)>, Vec<(String, String)>)>, // (id, members(id,type,role), tags)
-}
-
-fn read_all_elements(path: &Path) -> PbfContents {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    let mut contents = PbfContents {
-        nodes: Vec::new(),
-        ways: Vec::new(),
-        relations: Vec::new(),
-    };
-
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
-            for element in block.elements() {
-                match element {
-                    Element::DenseNode(dn) => {
-                        let tags: Vec<(String, String)> = dn
-                            .tags()
-                            .map(|(k, v)| (k.to_string(), v.to_string()))
-                            .collect();
-                        contents.nodes.push((dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags));
-                    }
-                    Element::Way(w) => {
-                        let tags: Vec<(String, String)> =
-                            w.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-                        let refs: Vec<i64> = w.refs().collect();
-                        contents.ways.push((w.id(), refs, tags));
-                    }
-                    Element::Relation(r) => {
-                        let tags: Vec<(String, String)> =
-                            r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
-                        let members: Vec<(i64, String, String)> = r
-                            .members()
-                            .map(|m| {
-                                let type_str = match m.id.member_type() {
-                                    pbfhogg::MemberType::Node => "node",
-                                    pbfhogg::MemberType::Way => "way",
-                                    pbfhogg::MemberType::Relation => "relation",
-                                };
-                                (m.id.id(), type_str.to_string(), m.role().unwrap_or("").to_string())
-                            })
-                            .collect();
-                        contents.relations.push((r.id(), members, tags));
-                    }
-                    _ => {}
-                }
-            }
-        }
-    }
-
-    contents
-}
-
-fn node_ids(c: &PbfContents) -> Vec<i64> {
-    c.nodes.iter().map(|(id, _, _, _)| *id).collect()
-}
-
-fn way_ids(c: &PbfContents) -> Vec<i64> {
-    c.ways.iter().map(|(id, _, _)| *id).collect()
-}
-
-fn relation_ids(c: &PbfContents) -> Vec<i64> {
-    c.relations.iter().map(|(id, _, _)| *id).collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -875,6 +722,7 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                                     MemberType::Node => "node",
                                     MemberType::Way => "way",
                                     MemberType::Relation => "relation",
+                                    MemberType::Unknown(_) => "unknown",
                                 };
                                 (
                                     m.id.id(),

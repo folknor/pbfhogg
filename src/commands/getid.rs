@@ -394,6 +394,12 @@ fn rebuild_header(
 // Tests
 // ---------------------------------------------------------------------------
 
+// Tests use `unwrap()` throughout because panicking is the correct failure mode
+// for unit tests -- it immediately fails the test with a clear backtrace pointing
+// to the exact call site. Propagating Results via `-> Result<()>` in tests would
+// lose the backtrace and produce less actionable error messages. The crate-wide
+// `unwrap_used = "deny"` lint is designed for production code where panics are
+// unacceptable; test code is exempt via this module-level allow.
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

@@ -11,12 +11,13 @@ or BlockBuilder/PbfWriter APIs):
 
 ## Correctness & safety
 
-- [ ] `block.rs:~97-99` — `HeaderBBox` doc comments have swapped lat descriptions (top/bottom)
-- [ ] `elements.rs:439` — `MemberType::from()` can panic on unknown protobuf enum values.
-  Should return `Result` or a fallback variant instead of `#[allow(unwrap_used)]`.
-- [ ] `elements.rs:592`, `dense.rs:358` — `RawTagIter` / `DenseRawTagIter` silently produce
-  potentially invalid data when string table lookups fail. Should return `Result` (marked TODO
-  in code).
+- [x] `block.rs:~97-99` — `HeaderBBox` doc comments fixed (top/bottom lat were swapped).
+- [x] `elements.rs:439` — `MemberType::Unknown(i32)` and `MemberId::Unknown(i32, i64)` variants
+  added. No more panic on unknown protobuf enum values. All callers updated with Unknown arms.
+- [x] `elements.rs:592`, `dense.rs:358` — Documented: `RawTagIter` / `DenseRawTagIter` return
+  raw indices (no stringtable lookup), so `Result` is not needed. The higher-level `TagIter` /
+  `DenseTagIter` that do lookups would need `Result` but changing them is too disruptive (50+
+  call sites).
 
 ## Performance: I/O & buffering
 
@@ -101,19 +102,18 @@ or BlockBuilder/PbfWriter APIs):
 ## Code quality
 
 - [x] `error.rs` — removed deprecated `description()` and `cause()`, replaced with `source()`.
-- [ ] `commands/osc.rs` — `OscRelMember::member_type` is `String` instead of enum. Should use
-  `MemberType` enum for type safety.
-- [ ] Test helper duplication — `make_node()`, `make_way()`, `make_relation()`, `roundtrip()`
-  etc. are copy-pasted across 7+ test files. Extract into a shared `tests/common/mod.rs`.
-- [ ] `lib.rs:88-104` — redundant re-export strategy: both wildcard item-level (`pub use read::blob::*`)
-  and named module-level (`pub use read::blob`). Creates two paths to every public item.
-  Pick one approach.
-- [ ] Audit `#[allow(clippy::unwrap_used)]` sites (5+ occurrences: `elements.rs:439`,
-  `blob.rs:572`, `indexed.rs:147,417`, `osc.rs:503`, `extract.rs:755`, `tags_filter.rs:629`,
-  `getid.rs:398`). Convert to proper error handling where possible.
-- [ ] Coordinate method duplication across `Node`, `DenseNode`, `WayNodeLocation` — three
-  identical `lat()`/`lon()`/`nano_lat()`/`nano_lon()` implementations. Extract a trait or
-  shared helper.
+- [x] `commands/osc.rs` — `OscRelMember::member_type` changed from `String` to `MemberType` enum.
+  Test unwraps replaced with `?` error propagation.
+- [x] Test helper duplication — extracted shared helpers to `tests/common/mod.rs` (~700 lines of
+  duplication removed across 7 test files).
+- [x] `lib.rs:88-104` — documented: both re-export strategies are required (wildcards for external
+  API, module re-exports for internal `crate::blob::` paths used in 15+ files).
+- [x] Audited `#[allow(clippy::unwrap_used)]` sites. Fixed `indexed.rs:147` (proper error
+  propagation in `create_index()`). Remaining sites are test modules where `unwrap()` is
+  idiomatic — kept allows with explanatory comments.
+- [x] Coordinate method duplication — `impl_coordinate_conversions!` macro extracts shared
+  `lat()`/`lon()`/`decimicro_lat()`/`decimicro_lon()` across `Node`, `DenseNode`,
+  `WayNodeLocation`.
 - [x] `blob.rs` — `MAX_BLOB_HEADER_SIZE` and `MAX_BLOB_MESSAGE_SIZE` changed from `static`
   to `const`.
 

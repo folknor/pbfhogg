@@ -1,7 +1,10 @@
 //! Integration tests for the add-locations-to-ways command.
 
+mod common;
+
 use std::path::Path;
 
+use common::{TestNode, TestWay};
 use pbfhogg::add_locations_to_ways::add_locations_to_ways;
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -12,18 +15,11 @@ use tempfile::TempDir;
 // Helpers
 // ---------------------------------------------------------------------------
 
-struct TestNode {
-    id: i64,
-    lat: i32,
-    lon: i32,
-    tags: Vec<(&'static str, &'static str)>,
-}
-
-struct TestWay {
-    id: i64,
-    refs: Vec<i64>,
-    tags: Vec<(&'static str, &'static str)>,
-}
+// NOTE: This file uses a local TestRelation and write_test_pbf instead of the
+// shared versions in tests/common/mod.rs because the TestRelation here uses
+// tuple-based members `Vec<(MemberId, &str)>` rather than the `TestMember`
+// struct used everywhere else. This was the original design of this test file
+// and changing it would require updating all test call sites.
 
 struct TestRelation {
     id: i64,

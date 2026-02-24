@@ -12,6 +12,11 @@ use flate2::read::GzDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
 
+// Import MemberType from the crate's read::elements module for type-safe
+// representation of relation member types (Node, Way, Relation) instead of
+// raw strings.
+use crate::read::elements::MemberType;
+
 // ---------------------------------------------------------------------------
 // Data types
 // ---------------------------------------------------------------------------
@@ -30,7 +35,9 @@ pub struct OscWay {
 }
 
 pub struct OscRelMember {
-    pub member_type: String, // "node", "way", "relation"
+    /// The element type of this relation member, using the crate's `MemberType`
+    /// enum for type safety instead of a raw string.
+    pub member_type: MemberType,
     pub ref_id: i64,
     pub role: String,
 }
@@ -201,11 +208,26 @@ fn handle_nd(
     Ok(())
 }
 
+/// Convert an OSC XML member type string ("node", "way", "relation") to
+/// the crate's `MemberType` enum. Unknown values produce an error rather
+/// than panicking, so callers can decide how to handle malformed input.
+fn parse_member_type(s: &str) -> ParseResult<MemberType> {
+    match s {
+        "node" => Ok(MemberType::Node),
+        "way" => Ok(MemberType::Way),
+        "relation" => Ok(MemberType::Relation),
+        other => Err(format!("unknown relation member type: '{other}'").into()),
+    }
+}
+
 fn handle_member(
     e: &quick_xml::events::BytesStart,
     current_relation: &mut Option<OscRelation>,
 ) -> ParseResult<()> {
-    let member_type = parse_str_attr(e, b"type")?;
+    // Parse the "type" attribute as a string, then convert to MemberType.
+    // Unknown type values will propagate as an error to the caller.
+    let member_type_str = parse_str_attr(e, b"type")?;
+    let member_type = parse_member_type(&member_type_str)?;
     let ref_id = parse_i64_attr(e, b"ref")?;
     let role = parse_str_attr(e, b"role").unwrap_or_default();
     if let Some(rel) = current_relation.as_mut() {
@@ -500,7 +522,6 @@ pub fn load_all_diffs(diffs_dir: &Path) -> ParseResult<DiffOverlay> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use flate2::write::GzEncoder;
@@ -524,8 +545,14 @@ mod tests {
         enc.finish().expect("finish gz");
     }
 
+    // All test functions return Result so that fallible operations can use `?`
+    // instead of `.unwrap()`. This avoids the need for
+    // `#[allow(clippy::unwrap_used)]` on the entire test module and gives
+    // clearer error messages on failure (the error is printed rather than a
+    // bare panic with no context).
+
     #[test]
-    fn test_parse_osc_create_modify_delete() {
+    fn test_parse_osc_create_modify_delete() -> ParseResult<()> {
         let dir = make_test_dir("create_modify_delete");
 
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -546,10 +573,14 @@ mod tests {
 </osmChange>"#;
 
         write_osc_gz(&dir, "test.osc.gz", xml);
-        let overlay = parse_osc_file(&dir.join("test.osc.gz")).unwrap();
+        // Use `?` instead of `.unwrap()` to propagate parse errors with context.
+        let overlay = parse_osc_file(&dir.join("test.osc.gz"))?;
 
         // Modified node should overwrite created node
-        let node = overlay.nodes.get(&100).expect("node 100 exists");
+        let node = overlay
+            .nodes
+            .get(&100)
+            .ok_or("node 100 should exist in overlay")?;
         assert!((node.lat - 55.68).abs() < 0.0001);
         assert!((node.lon - 12.57).abs() < 0.0001);
         assert_eq!(node.tags.len(), 1);
@@ -560,11 +591,12 @@ mod tests {
         assert!(overlay.deleted_ways.contains(&200));
         assert!(!overlay.ways.contains_key(&200));
 
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
-    fn test_merge_later_wins() {
+    fn test_merge_later_wins() -> ParseResult<()> {
         let mut a = DiffOverlay::new();
         a.nodes.insert(
             100,
@@ -588,9 +620,10 @@ mod tests {
         );
 
         a.merge(b);
-        let node = a.nodes.get(&100).expect("node 100");
+        let node = a.nodes.get(&100).ok_or("node 100 should exist after merge")?;
         assert!((node.lat - 3.0).abs() < f64::EPSILON);
         assert!((node.lon - 4.0).abs() < f64::EPSILON);
+        Ok(())
     }
 
     #[test]
@@ -636,7 +669,7 @@ mod tests {
     }
 
     #[test]
-    fn test_numeric_sort() {
+    fn test_numeric_sort() -> ParseResult<()> {
         let dir = make_test_dir("numeric_sort");
 
         // Create files in non-numeric-alphabetical order
@@ -659,17 +692,22 @@ mod tests {
         write_osc_gz(&dir, "4705.osc.gz", xml_4705);
         write_osc_gz(&dir, "999.osc.gz", xml_999);
 
-        let overlay = load_all_diffs(&dir).unwrap();
+        // Use `?` instead of `.unwrap()` to propagate errors with context.
+        let overlay = load_all_diffs(&dir)?;
 
         // Node 1 should have been created by 999, then modified by 10000
-        let node1 = overlay.nodes.get(&1).expect("node 1");
+        let node1 = overlay
+            .nodes
+            .get(&1)
+            .ok_or("node 1 should exist after loading diffs")?;
         assert!((node1.lat - 10.0).abs() < f64::EPSILON);
         assert!((node1.lon - 10.0).abs() < f64::EPSILON);
 
         // Node 2 from 4705 should exist
         assert!(overlay.nodes.contains_key(&2));
 
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 
     #[test]
@@ -679,7 +717,7 @@ mod tests {
     }
 
     #[test]
-    fn test_self_closing_delete() {
+    fn test_self_closing_delete() -> ParseResult<()> {
         let dir = make_test_dir("self_closing_delete");
 
         let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -690,11 +728,13 @@ mod tests {
 </osmChange>"#;
 
         write_osc_gz(&dir, "test.osc.gz", xml);
-        let overlay = parse_osc_file(&dir.join("test.osc.gz")).unwrap();
+        // Use `?` instead of `.unwrap()` to propagate parse errors with context.
+        let overlay = parse_osc_file(&dir.join("test.osc.gz"))?;
 
         assert!(overlay.deleted_nodes.contains(&123));
         assert!(!overlay.nodes.contains_key(&123));
 
-        std::fs::remove_dir_all(&dir).expect("cleanup");
+        std::fs::remove_dir_all(&dir)?;
+        Ok(())
     }
 }

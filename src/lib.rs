@@ -85,7 +85,32 @@ pub(crate) mod proto {
     include!(concat!(env!("OUT_DIR"), "/mod.rs"));
 }
 
-// Item-level re-exports (public API: `use pbfhogg::Element`, etc.)
+// ---------------------------------------------------------------------------
+// Public API re-exports
+//
+// We use TWO complementary re-export strategies here, and both are required:
+//
+// 1. **Wildcard item-level re-exports** (`pub use read::blob::*`, etc.)
+//    These flatten every public type into the crate root so external consumers
+//    get the cleanest possible API surface:
+//      use pbfhogg::{Element, BlobReader, PrimitiveBlock};
+//
+// 2. **Named module-level re-exports** (`pub use read::blob`, etc.)
+//    These create short `crate::blob`, `crate::block_builder`, `crate::writer`
+//    module paths that are used extensively throughout the crate's own source:
+//      - Code imports in commands/*.rs  (e.g. `use crate::block_builder::BlockBuilder`)
+//      - Code imports in write/*.rs     (e.g. `use crate::elements::MemberId`)
+//      - Code imports in read/*.rs      (e.g. `crate::blob::Blob` in pipeline.rs)
+//      - Doc links in read/*.rs         (e.g. `[`PrimitiveBlock`](crate::block::PrimitiveBlock)`)
+//    Without these, every internal `use crate::blob::...` would need to become
+//    `use crate::read::blob::...`, affecting 15+ files across the crate.
+//
+// The two strategies do NOT conflict: wildcard re-exports provide `pbfhogg::Blob`
+// while module re-exports provide `pbfhogg::blob::Blob`. No public names collide
+// across the read sub-modules, so the wildcards merge cleanly.
+// ---------------------------------------------------------------------------
+
+// Wildcard re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use read::blob::*;
 pub use read::block::*;
 pub use read::dense::*;
@@ -95,7 +120,8 @@ pub use read::mmap_blob::*;
 pub use read::reader::*;
 pub use error::{BlobError, Error, ErrorKind, Result};
 
-// Module-level re-exports (preserves `crate::blob`, `crate::block_builder`, etc.)
+// Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
+// Required by imports and doc links in commands/, read/, and write/ modules.
 pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
 pub use write::{block_builder, writer};
 pub use commands::{

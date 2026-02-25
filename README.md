@@ -6,10 +6,11 @@ A VitePress documentation template with custom typography (Jomhuria + EB Garamon
 
 | Theme | Brand | File |
 |---|---|---|
-| Default | Purple | `docs/.vitepress/theme/colors-default.css` |
+| Default | (blank template) | `docs/.vitepress/theme/colors-default.css` |
+| Nidhogg | Wyrm's Emerald | `docs/.vitepress/theme/colors-nidhogg.css` |
 | Elivagar | Icy Cyan | `docs/.vitepress/theme/colors-elivagar.css` |
 | Pbfhogg | Blood Red | `docs/.vitepress/theme/colors-pbfhogg.css` |
-| Nidhogg | Emerald | Active in `docs/.vitepress/theme/style.css` |
+| Kvakk | Duck Bill Orange | `docs/.vitepress/theme/colors-kvakk.css` |
 
 ## Using this template in a project
 
@@ -66,8 +67,9 @@ git merge template/master --allow-unrelated-histories
    | Nidhogg | `#043927` | `#22d974` |
    | Elivagar | `#1a2a3a` | `#33d4f0` |
    | Pbfhogg | `#1b2e21` | `#cc3030` |
+   | Kvakk | `#d07810` | `#f0a040` |
 
-   These colors come from `--vp-c-brand-1` in the `.dark` block of each `colors-*.css` file.
+   These colors come from `--vp-c-brand-1` in the `.dark` block of each `colors-*.css` file. Kvakk's `#d07810` orange works on both light and dark backgrounds, so it doesn't need a separate dark variant.
 
    **Badges** use [shields.io](https://shields.io). Common ones for Rust projects:
    ```html
@@ -144,9 +146,11 @@ docs/
   .vitepress/
     theme/
       style.css              # main theme (colors, typography, layout overrides)
-      colors-default.css     # saved palette: purple
+      colors-default.css     # blank template for new themes
+      colors-nidhogg.css     # saved palette: wyrm's emerald
       colors-elivagar.css    # saved palette: icy cyan
       colors-pbfhogg.css     # saved palette: blood red
+      colors-kvakk.css       # saved palette: duck bill orange (catppuccin)
       index.ts               # theme entry point
     config.ts                # VitePress config (nav, sidebar, project info)
   public/
@@ -159,6 +163,6 @@ docs/
 raw/
   *-logo.svg                 # icon-only logos
   *-logo-text.svg            # logo + project name (light mode)
-  *-logo-text-dark.svg       # logo + project name (dark mode)
+  *-logo-text-dark.svg       # logo + project name (dark mode, not needed for kvakk)
   *-README.md                # ready-made README drafts with logos and badges
 ```

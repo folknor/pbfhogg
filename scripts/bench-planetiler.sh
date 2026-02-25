@@ -19,7 +19,7 @@ for cmd in jq curl; do
     fi
 done
 
-FILE_MB=$(( $(stat -c%s "$PBF") / 1000000 ))
+FILE_MB=$(( $(stat -Lc%s "$PBF") / 1000000 ))
 
 # --- Temurin JRE setup ---
 # We need a JDK (not JRE) for javac to compile our benchmark

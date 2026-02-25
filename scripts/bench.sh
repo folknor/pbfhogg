@@ -13,7 +13,7 @@ if [ ! -f "$PBF" ]; then
 fi
 
 NAME="$(basename "${PBF%.osm.pbf}")"
-FILE_MB=$(( $(stat -c%s "$PBF") / 1000000 ))
+FILE_MB=$(( $(stat -Lc%s "$PBF") / 1000000 ))
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DATE=$(date +%Y-%m-%d)
 SUBJECT=$(git log -1 --format=%s 2>/dev/null || echo "-")

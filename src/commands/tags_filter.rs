@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use super::{flush_block, rebuild_header};
-use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
 
@@ -269,17 +269,7 @@ fn tags_filter_single_pass(
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let meta = dn.info().and_then(|info| {
-                                    let user = info.user().ok()?;
-                                    Some(Metadata {
-                                        version: info.version(),
-                                        timestamp: info.milli_timestamp() / 1000,
-                                        changeset: info.changeset(),
-                                        uid: info.uid(),
-                                        user,
-                                        visible: info.visible(),
-                                    })
-                                });
+                                let meta = dense_node_metadata(dn);
                                 bb.add_node(
                                     dn.id(),
                                     dn.decimicro_lat(),
@@ -296,18 +286,7 @@ fn tags_filter_single_pass(
                                 if !bb.can_add_node() {
                                     flush_block(&mut bb, &mut writer)?;
                                 }
-                                let info = n.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&n.info());
                                 bb.add_node(
                                     n.id(),
                                     n.decimicro_lat(),
@@ -325,18 +304,7 @@ fn tags_filter_single_pass(
                                     flush_block(&mut bb, &mut writer)?;
                                 }
                                 let refs: Vec<i64> = w.refs().collect();
-                                let info = w.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&w.info());
                                 bb.add_way(w.id(), &tags, &refs, meta.as_ref());
                                 stats.ways_matched += 1;
                             }
@@ -354,18 +322,7 @@ fn tags_filter_single_pass(
                                         role: m.role().unwrap_or(""),
                                     })
                                     .collect();
-                                let info = r.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&r.info());
                                 bb.add_relation(r.id(), &tags, &members, meta.as_ref());
                                 stats.relations_matched += 1;
                             }
@@ -524,17 +481,7 @@ fn tags_filter_two_pass(
                                     flush_block(&mut bb, &mut writer)?;
                                 }
                                 let tags: Vec<(&str, &str)> = dn.tags().collect();
-                                let meta = dn.info().and_then(|info| {
-                                    let user = info.user().ok()?;
-                                    Some(Metadata {
-                                        version: info.version(),
-                                        timestamp: info.milli_timestamp() / 1000,
-                                        changeset: info.changeset(),
-                                        uid: info.uid(),
-                                        user,
-                                        visible: info.visible(),
-                                    })
-                                });
+                                let meta = dense_node_metadata(dn);
                                 bb.add_node(
                                     dn.id(),
                                     dn.decimicro_lat(),
@@ -557,18 +504,7 @@ fn tags_filter_two_pass(
                                     flush_block(&mut bb, &mut writer)?;
                                 }
                                 let tags: Vec<(&str, &str)> = n.tags().collect();
-                                let info = n.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&n.info());
                                 bb.add_node(
                                     n.id(),
                                     n.decimicro_lat(),
@@ -590,18 +526,7 @@ fn tags_filter_two_pass(
                                 }
                                 let tags: Vec<(&str, &str)> = w.tags().collect();
                                 let refs: Vec<i64> = w.refs().collect();
-                                let info = w.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&w.info());
                                 bb.add_way(w.id(), &tags, &refs, meta.as_ref());
                                 stats.ways_matched += 1;
                             }
@@ -619,18 +544,7 @@ fn tags_filter_two_pass(
                                         role: m.role().unwrap_or(""),
                                     })
                                     .collect();
-                                let info = r.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&r.info());
                                 bb.add_relation(r.id(), &tags, &members, meta.as_ref());
                                 stats.relations_matched += 1;
                             }

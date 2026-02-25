@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
@@ -163,17 +163,7 @@ fn write_output(
                                 }
                                 tags_buf.clear();
                                 tags_buf.extend(dn.tags());
-                                let meta = dn.info().and_then(|info| {
-                                    let user = info.user().ok()?;
-                                    Some(Metadata {
-                                        version: info.version(),
-                                        timestamp: info.milli_timestamp() / 1000,
-                                        changeset: info.changeset(),
-                                        uid: info.uid(),
-                                        user,
-                                        visible: info.visible(),
-                                    })
-                                });
+                                let meta = dense_node_metadata(dn);
                                 bb.add_node(
                                     dn.id(),
                                     dn.decimicro_lat(),
@@ -195,18 +185,7 @@ fn write_output(
                                 }
                                 tags_buf.clear();
                                 tags_buf.extend(n.tags());
-                                let info = n.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&n.info());
                                 bb.add_node(
                                     n.id(),
                                     n.decimicro_lat(),
@@ -237,18 +216,7 @@ fn write_output(
                                     }
                                 }
                             }));
-                            let info = w.info();
-                            let meta = info.version().map(|v| Metadata {
-                                version: v,
-                                timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                changeset: info.changeset().unwrap_or(0),
-                                uid: info.uid().unwrap_or(0),
-                                user: info
-                                    .user()
-                                    .and_then(std::result::Result::ok)
-                                    .unwrap_or(""),
-                                visible: info.visible(),
-                            });
+                            let meta = element_metadata(&w.info());
                             bb.add_way_with_locations(
                                 w.id(),
                                 &tags_buf,
@@ -269,18 +237,7 @@ fn write_output(
                                 id: m.id,
                                 role: m.role().unwrap_or(""),
                             }));
-                            let info = r.info();
-                            let meta = info.version().map(|v| Metadata {
-                                version: v,
-                                timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                changeset: info.changeset().unwrap_or(0),
-                                uid: info.uid().unwrap_or(0),
-                                user: info
-                                    .user()
-                                    .and_then(std::result::Result::ok)
-                                    .unwrap_or(""),
-                                visible: info.visible(),
-                            });
+                            let meta = element_metadata(&r.info());
                             bb.add_relation(
                                 r.id(),
                                 &tags_buf,
@@ -325,4 +282,4 @@ fn write_header(
 // Helpers
 // ---------------------------------------------------------------------------
 
-use super::flush_block;
+use super::{dense_node_metadata, element_metadata, flush_block};

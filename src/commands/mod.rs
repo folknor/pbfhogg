@@ -12,7 +12,7 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 
-use crate::block_builder::{build_header, BlockBuilder};
+use crate::block_builder::{build_header, BlockBuilder, Metadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -51,4 +51,35 @@ pub(crate) fn rebuild_header(
     )?;
     writer.write_header(&header_bytes)?;
     Ok(())
+}
+
+/// Extract [`Metadata`] from an [`Info`](crate::Info) (Node/Way/Relation).
+///
+/// Returns `None` if the info block has no version. On `user()` error (string
+/// table corruption), defaults to empty string.
+pub(crate) fn element_metadata<'a>(info: &crate::Info<'a>) -> Option<Metadata<'a>> {
+    info.version().map(|v| Metadata {
+        version: v,
+        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+        changeset: info.changeset().unwrap_or(0),
+        uid: info.uid().unwrap_or(0),
+        user: info.user().and_then(std::result::Result::ok).unwrap_or(""),
+        visible: info.visible(),
+    })
+}
+
+/// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode).
+///
+/// Returns `None` if the node has no info block. On `user()` error (string
+/// table corruption), defaults to empty string — consistent with the
+/// Node/Way/Relation path.
+pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Metadata<'a>> {
+    dn.info().map(|info| Metadata {
+        version: info.version(),
+        timestamp: info.milli_timestamp() / 1000,
+        changeset: info.changeset(),
+        uid: info.uid(),
+        user: info.user().unwrap_or(""),
+        visible: info.visible(),
+    })
 }

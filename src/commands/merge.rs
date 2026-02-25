@@ -17,7 +17,7 @@ use crate::blob::{
 };
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
-use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
@@ -352,7 +352,7 @@ fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
     false
 }
 
-use super::flush_block;
+use super::{dense_node_metadata, element_metadata, flush_block};
 
 // ---------------------------------------------------------------------------
 // Block flushing helpers
@@ -435,17 +435,7 @@ fn write_base_dense_node<'a>(
     ensure_node_capacity(bb, writer)?;
     tags_buf.clear();
     tags_buf.extend(dn.tags());
-    let meta = dn.info().and_then(|info| {
-        let user = info.user().ok()?;
-        Some(Metadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: info.changeset(),
-            uid: info.uid(),
-            user,
-            visible: info.visible(),
-        })
-    });
+    let meta = dense_node_metadata(dn);
     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags_buf, meta.as_ref());
     Ok(())
 }
@@ -462,15 +452,7 @@ fn write_base_way<'a>(
     tags_buf.extend(way.tags());
     refs_buf.clear();
     refs_buf.extend(way.refs());
-    let info = way.info();
-    let meta = info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info.user().and_then(Result::ok).unwrap_or(""),
-        visible: info.visible(),
-    });
+    let meta = element_metadata(&way.info());
     bb.add_way(way.id(), tags_buf, refs_buf, meta.as_ref());
     Ok(())
 }
@@ -490,15 +472,7 @@ fn write_base_relation<'a>(
         id: m.id,
         role: m.role().unwrap_or(""),
     }));
-    let info = rel.info();
-    let meta = info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info.user().and_then(Result::ok).unwrap_or(""),
-        visible: info.visible(),
-    });
+    let meta = element_metadata(&rel.info());
     bb.add_relation(rel.id(), tags_buf, members_buf, meta.as_ref());
     Ok(())
 }
@@ -652,15 +626,7 @@ fn rewrite_node<'a>(
         ensure_node_capacity(bb, writer)?;
         tags_buf.clear();
         tags_buf.extend(node.tags());
-        let info = node.info();
-        let meta = info.version().map(|v| Metadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info.user().and_then(Result::ok).unwrap_or(""),
-            visible: info.visible(),
-        });
+        let meta = element_metadata(&node.info());
         bb.add_node(node.id(), node.decimicro_lat(), node.decimicro_lon(), tags_buf, meta.as_ref());
         ctx.stats.base_nodes += 1;
     }

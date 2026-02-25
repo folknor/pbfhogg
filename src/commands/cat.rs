@@ -3,8 +3,8 @@
 use std::io::{self, Read};
 use std::path::Path;
 
-use super::{flush_block, rebuild_header};
-use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
@@ -208,17 +208,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
                                 }
                                 tags_buf.clear();
                                 tags_buf.extend(dn.tags());
-                                let meta = dn.info().and_then(|info| {
-                                    let user = info.user().ok()?;
-                                    Some(Metadata {
-                                        version: info.version(),
-                                        timestamp: info.milli_timestamp() / 1000,
-                                        changeset: info.changeset(),
-                                        uid: info.uid(),
-                                        user,
-                                        visible: info.visible(),
-                                    })
-                                });
+                                let meta = dense_node_metadata(dn);
                                 bb.add_node(
                                     dn.id(),
                                     dn.decimicro_lat(),
@@ -234,18 +224,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
                                 }
                                 tags_buf.clear();
                                 tags_buf.extend(n.tags());
-                                let info = n.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&n.info());
                                 bb.add_node(
                                     n.id(),
                                     n.decimicro_lat(),
@@ -263,18 +242,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
                                 tags_buf.extend(w.tags());
                                 refs_buf.clear();
                                 refs_buf.extend(w.refs());
-                                let info = w.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&w.info());
                                 bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                                 elements += 1;
                             }
@@ -289,18 +257,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
                                     id: m.id,
                                     role: m.role().unwrap_or(""),
                                 }));
-                                let info = r.info();
-                                let meta = info.version().map(|v| Metadata {
-                                    version: v,
-                                    timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-                                    changeset: info.changeset().unwrap_or(0),
-                                    uid: info.uid().unwrap_or(0),
-                                    user: info
-                                        .user()
-                                        .and_then(std::result::Result::ok)
-                                        .unwrap_or(""),
-                                    visible: info.visible(),
-                                });
+                                let meta = element_metadata(&r.info());
                                 bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                                 elements += 1;
                             }

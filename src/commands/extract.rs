@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element, MemberId};
@@ -777,17 +777,7 @@ fn write_dense_node(
         flush_block(bb, writer)?;
     }
     let tags: Vec<(&str, &str)> = dn.tags().collect();
-    let meta = dn.info().and_then(|info| {
-        let user = info.user().ok()?;
-        Some(Metadata {
-            version: info.version(),
-            timestamp: info.milli_timestamp() / 1000,
-            changeset: info.changeset(),
-            uid: info.uid(),
-            user,
-            visible: info.visible(),
-        })
-    });
+    let meta = dense_node_metadata(dn);
     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags, meta.as_ref());
     Ok(())
 }
@@ -801,18 +791,7 @@ fn write_node(
         flush_block(bb, writer)?;
     }
     let tags: Vec<(&str, &str)> = n.tags().collect();
-    let info = n.info();
-    let meta = info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info
-            .user()
-            .and_then(std::result::Result::ok)
-            .unwrap_or(""),
-        visible: info.visible(),
-    });
+    let meta = element_metadata(&n.info());
     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags, meta.as_ref());
     Ok(())
 }
@@ -827,18 +806,7 @@ fn write_way(
     }
     let tags: Vec<(&str, &str)> = w.tags().collect();
     let refs: Vec<i64> = w.refs().collect();
-    let info = w.info();
-    let meta = info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info
-            .user()
-            .and_then(std::result::Result::ok)
-            .unwrap_or(""),
-        visible: info.visible(),
-    });
+    let meta = element_metadata(&w.info());
     bb.add_way(w.id(), &tags, &refs, meta.as_ref());
     Ok(())
 }
@@ -859,18 +827,7 @@ fn write_relation(
             role: m.role().unwrap_or(""),
         })
         .collect();
-    let info = r.info();
-    let meta = info.version().map(|v| Metadata {
-        version: v,
-        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-        changeset: info.changeset().unwrap_or(0),
-        uid: info.uid().unwrap_or(0),
-        user: info
-            .user()
-            .and_then(std::result::Result::ok)
-            .unwrap_or(""),
-        visible: info.visible(),
-    });
+    let meta = element_metadata(&r.info());
     bb.add_relation(r.id(), &tags, &members, meta.as_ref());
     Ok(())
 }
@@ -879,7 +836,7 @@ fn write_relation(
 // Helpers
 // ---------------------------------------------------------------------------
 
-use super::flush_block;
+use super::{dense_node_metadata, element_metadata, flush_block};
 
 fn write_extract_header(
     region: &Region,

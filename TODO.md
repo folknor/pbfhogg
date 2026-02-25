@@ -257,19 +257,13 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
 
-## Refactoring: duplicated DenseNode metadata extraction
+## Refactoring: duplicated metadata extraction
 
-**DenseNode metadata extraction** (8 copies): merge.rs:446, cat.rs:211,
-extract.rs:780, sort.rs:539, getid.rs:274, add_locations_to_ways.rs:166,
-tags_filter.rs:272,527. All use `dn.info().and_then(|info| { info.user()
-.ok()?; Some(Metadata{...}) })`. **Inconsistency:** if `user()` fails
-(string table error), DenseNode path drops ALL metadata (`and_then` returns
-None), while Node/Way/Relation path keeps metadata with empty user
-(`info.user().and_then(Result::ok).unwrap_or("")`). Should pick one
-strategy and share a single `dense_node_metadata()` /
-`element_metadata()` helper.
+`dense_node_metadata()`, `element_metadata()`, `flush_block()`, and
+`rebuild_header()` are shared helpers in `commands/mod.rs`.
 
-(`flush_block` and `rebuild_header` were extracted to `commands/mod.rs`.)
+sort.rs still has its own inline metadata extraction (uses `OwnedMetadata`
+with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Code TODOs
 

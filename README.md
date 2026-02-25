@@ -78,7 +78,7 @@ Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
 
 | Tool | Time | Notes |
 |------|------|-------|
-| **pbfhogg** | **5.2s** | blob passthrough for unaffected blocks |
+| **pbfhogg** | **3.0s** | parallel compression + blob passthrough |
 | osmium 1.19 | 7.2s | `osmium apply-changes` |
 
 System: Linux 6.18, Ryzen 9 7950X.

@@ -14,13 +14,14 @@ or BlockBuilder/PbfWriter APIs):
 **Primary consumers:** Both elivagar and nidhogg use the same pattern:
 `ElementReader::from_path` -> `for_each_pipelined`. Nidhogg does 3 pipelined
 passes per ingest. Nidhogg also uses `pbfhogg::merge::merge()` for weekly
-planet updates. **Finding 6 (parallel merge compression) is the top remaining
-priority** — merge is the only path with a clear, large optimization available.
-The read path is now highly optimized: decompression buffer pooling
-(`DecompressPool` + `Bytes::from_owner`) eliminated 97% of process-level
-alloc, and the custom wire-format parser (`wire.rs`) eliminated the remaining
-9.3 GB of protobuf Vec allocations, yielding **43-44% wall time improvement**
-across all single-threaded read modes. Merge has been profiled (see Findings 6–7).
+planet updates. Both the read path and the merge write path are now heavily
+optimized. The read path has decompression buffer pooling (`DecompressPool` +
+`Bytes::from_owner`) and a zero-copy wire-format parser (`wire.rs`), yielding
+**43-44% wall time improvement** across all single-threaded read modes. The
+merge write path has parallel compression via `PbfWriter::to_path_pipelined`,
+yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). The top
+remaining merge optimization is Finding 7 (skip decompression for passthrough
+blobs).
 
 Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
 Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
@@ -107,12 +108,13 @@ Main thread: 100% CPU.
 
 **merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**
 ```
-Wall: 8.06s, RSS: 85.5 MB (with hotpath-alloc overhead)
-write_blob:           632 calls, 5.30s (65.7%), avg 8.4ms, 434 MB alloc
-block_builder::take:  7407 calls, 686ms (8.5%), 266 MB alloc
-block::new:           630 calls, 14ms (0.2%), 17 MB alloc
-decode_blob:          1 call, 18µs (HeaderBlock only)
-Process: 6.6 GB alloc, 6.6 GB dealloc. Main thread: 99% CPU.
+Wall: 3.15s, RSS: 91.9 MB (with hotpath-alloc overhead)
+frame_blob:           628 calls, 5.67s total (parallel, 180% of wall), avg 9.0ms, 511 MB alloc
+block_builder::take:  7407 calls, 735ms (23.3%), 266 MB alloc
+block::new:           630 calls, 14ms (0.5%), 17 MB alloc
+decode_blob:          1 call, 23µs (HeaderBlock only)
+Process: 7.1 GB alloc, 7.0 GB dealloc. 4 worker threads + 1 writer thread.
+Clean (no hotpath): 3.03s best of 3.
 ```
 
 **bench-self (Denmark, best of 3, no hotpath overhead):**
@@ -124,22 +126,26 @@ mmap:        3229 ms
 blobreader:  3215 ms
 ```
 
-### Finding 6: merge spends 66% of time compressing rewritten blobs
+### Finding 6: merge spends 66% of time compressing rewritten blobs — SOLVED
 
-`write_blob` (zlib compression) takes 5.30s for only 632 blobs (8.06s wall).
-The other 6,766 are raw passthrough (no decode, no re-encode). Compression is
-the clear bottleneck — everything else combined is only 2.76s.
+`frame_blob` (zlib compression) was 5.30s sequential for 632 blobs. Now runs
+in parallel via `PbfWriter::to_path_pipelined`: rayon tasks compress blobs,
+a dedicated writer thread reorders and writes them in sequence. Raw passthrough
+blobs (`write_raw`) bypass rayon and go directly to the writer thread.
 
-- [ ] **Parallel compression in merge.** Rewritten blobs are independent — compress
-  them on a rayon thread pool instead of sequentially on the main thread. This is
-  the biggest single win for merge.
+Result: **8.06s → 3.03s** (62% faster). 5.67s of compression spread across
+4 worker threads. The writer thread runs at 5% CPU (I/O bound).
+
+- [x] **Parallel compression in merge.** Implemented as `WritePipeline` in
+  `writer.rs` with `to_path_pipelined` constructor.
 
 ### Finding 7: merge decompresses all blobs for ID range scanning
 
 All 7,396 blobs are decompressed to scan ID ranges and decide passthrough vs
-rewrite. Buffer reuse via `decompress_blob_data_into` eliminates allocation churn.
-The wire parser makes the actual block parsing for the 630 rewritten blobs very
-cheap (14ms total, 17 MB alloc).
+rewrite. With parallel compression solved (Finding 6), this decompression +
+classification now dominates the remaining wall time. Buffer reuse via
+`decompress_blob_data_into` eliminates allocation churn. The wire parser makes
+actual block parsing for the 630 rewritten blobs very cheap (14ms, 17 MB alloc).
 
 - [ ] **Skip decompression entirely for passthrough blobs in merge.** If blob
   headers or a pre-scan index can determine ID ranges without decompression,

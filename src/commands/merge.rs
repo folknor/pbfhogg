@@ -769,20 +769,15 @@ fn write_base_relation(
 // Header handling
 // ---------------------------------------------------------------------------
 
-fn write_header(
-    header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
-) -> MergeResult<()> {
+fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
     let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    let header_bytes = crate::block_builder::build_header(
+    Ok(crate::block_builder::build_header(
         bbox,
         header.osmosis_replication_timestamp(),
         header.osmosis_replication_sequence_number(),
         header.osmosis_replication_base_url(),
         &[],
-    )?;
-    writer.write_header(&header_bytes)?;
-    Ok(())
+    )?)
 }
 
 // ---------------------------------------------------------------------------
@@ -1178,10 +1173,25 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
         ranges.node_ids.len(), ranges.way_ids.len(), ranges.rel_ids.len(),
     );
 
-    // Step 2: Open reader (low-level) and writer
+    // Step 2: Open reader, read header, create pipelined writer
     let file = File::open(base_pbf)?;
     let mut reader = BufReader::new(file);
-    let mut writer = PbfWriter::to_path(output_pbf, Compression::default())?;
+
+    // Read the header blob first — needed to construct the pipelined writer.
+    let header_bytes = loop {
+        match read_raw_frame(&mut reader)? {
+            Some(frame) if frame.blob_type == "OSMHeader" => {
+                let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                break build_header_bytes(&header)?;
+            }
+            Some(_) => {} // skip unknown blob types before header
+            None => {
+                return Err("base PBF has no OSMHeader blob".into());
+            }
+        }
+    };
+    let mut writer =
+        PbfWriter::to_path_pipelined(output_pbf, Compression::default(), &header_bytes)?;
 
     let mut bb = BlockBuilder::new();
     let mut emitted_nodes: HashSet<i64> = HashSet::new();
@@ -1200,10 +1210,6 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
         batch.clear();
         while batch.len() < BATCH_SIZE {
             match read_raw_frame(&mut reader)? {
-                Some(frame) if frame.blob_type == "OSMHeader" => {
-                    let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
-                    write_header(&header, &mut writer)?;
-                }
                 Some(frame) if frame.blob_type == "OSMData" => {
                     batch.push(frame);
                 }

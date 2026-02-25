@@ -262,31 +262,53 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 - [x] `block_builder.rs` — mixed metadata in dense node block: fixed. Push default metadata when `None` + `has_dense_metadata`, backfill when first `Some` arrives after `None` nodes. Tests: `roundtrip_mixed_metadata`, `roundtrip_backfill_metadata`.
 
 - [ ] **`cat.rs:160`, `diff.rs:79` — type filter uses substring matching.**
-  `"subway".contains("way")` is true; `"nodeways"` matches both node and way.
-  Should split on comma, then match exact tokens. Also inconsistent with
-  `tags_count.rs` which accepts only a single type string.
+  `filter.contains("way")` is true for `"subway"`. Verified: CLI passes a raw
+  user string (e.g. `"node,way"`) and each type is checked via
+  `.contains("node")` / `.contains("way")` / `.contains("relation")`. In
+  practice this works because users type `node`, `way`, `relation` or
+  comma-separated combos — triggering the bug requires deliberately nonsensical
+  input. **Very low severity.** Fix: split on comma, match exact tokens.
+  `tags_count.rs` already handles this differently (single type string only).
 
 - [ ] **`block.rs:320` — `BlockElementsIter` skips all remaining elements of a
-  type on first parse error.** One malformed Way causes all subsequent Ways in
-  the group to be silently dropped. The `if let && let` chain falls through to
-  the state transition. `GroupWayIter` (line 409) handles this correctly by
-  looping past individual parse errors. Fix: use the same loop-and-skip pattern.
+  type on first parse error.** The `if let Some(data) = self.nodes.next() &&
+  let Ok(wire_node) = WireNode::parse(data)` chain fails atomically — if parse
+  fails, the iterator transitions to the next element type, abandoning remaining
+  elements of the current type within that group. Only affects the current
+  group's remaining elements (not other groups). `GroupNodeIter` (line 413),
+  `GroupWayIter` (line 432), `GroupRelationIter` (line 451) all use a `loop`
+  that skips individual parse errors — the correct pattern.
+  **Low severity: only triggers on corrupt/malformed PBF input.** Fix: replace
+  `if let && let` with the same loop-and-skip pattern used by the Group*Iter
+  types.
 
 - [ ] **`blob.rs:423` — negative `datasize` wraps to huge allocation.** `header
-  .datasize` is `i32` (protobuf `int32`). A negative value via `as u64` wraps to
-  ~`u64::MAX`, and `Vec::with_capacity(huge)` causes OOM/panic. Fix: check
-  `datasize >= 0` before casting, return an error for negative values.
+  .datasize` is `i32` (prost maps protobuf `int32` to Rust `i32`). A negative
+  value cast via `as usize` sign-extends to `usize::MAX` on 64-bit, and
+  `Vec::with_capacity(usize::MAX)` causes OOM/abort. No validation of datasize
+  exists between `BlobHeader::decode` (line 341) and the cast (line 424). Same
+  cast also at lines 568 (`as i64` for seek — would seek backwards), 696 and
+  711 (`as usize` — both have `#[allow(clippy::cast_sign_loss)]` acknowledging
+  the issue). **Low severity: only triggers on corrupt/malicious input.** Fix:
+  check `datasize >= 0` after decoding BlobHeader, return `BlobError` for
+  negative values.
 
-- [ ] **`uring_writer.rs:260` — io_uring short write not detected.** CQE result
-  is only checked for `< 0` (OS error). A short write (result > 0 but less than
-  requested length) would silently lose data. O_DIRECT to regular files
-  practically never short-writes, but the check should verify `result ==
-  aligned_len` for correctness.
+- [ ] **`uring_writer.rs` — io_uring short write not detected.** `reap_cqes`
+  only checks CQE result for `< 0` (OS error). A short write (`0 < result <
+  aligned_len`) would silently lose data. O_DIRECT `WriteFixed` to a regular
+  file on a local filesystem practically never short-writes — the kernel
+  completes the full I/O or returns an error. Could theoretically happen on
+  network filesystems or under extreme memory pressure. **Very low severity.**
+  Fix: verify `result == aligned_len` and return an error on mismatch.
 
 - [ ] **`blob_index.rs:181` — `scan_dense_node_ids` only captures first ID as
-  `min_id`.** Sets `min_id` once on `count == 0`, then only updates `max_id`.
-  Wrong for unsorted IDs. All real PBFs have sorted IDs so this is latent, but
-  the fix is trivial: `min_id = min_id.min(current_id)` on every iteration.
+  `min_id`.** Sets `min_id = current_id` once on `count == 0`, then only
+  updates `max_id`. Wrong if IDs are unsorted. However, dense node IDs are
+  delta-encoded and ALL real PBFs have sorted ascending IDs, so the first ID
+  IS always the minimum. The sibling function `scan_repeated_element_ids`
+  (line 245) correctly uses `min_id = min_id.min(id)` on every iteration —
+  inconsistency. **No practical severity: latent bug, never triggers.** Fix is
+  trivial: `min_id = min_id.min(current_id)` on every iteration.
 
 ## Warnings (from code quality review, Feb 2026)
 

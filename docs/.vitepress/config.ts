@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
-const projectName = 'Nidhogg'
-const projectDescription = 'Shortbread vector tiles from OpenStreetMap'
-const githubUrl = 'https://github.com/user/nidhogg'
+const projectName = 'Kvakk'
+const projectDescription = 'Quick Share for Linux and Windows'
+const githubUrl = 'https://github.com/user/kvakk'
 const base = '/' // set to '/repo-name/' for GitHub Pages project sites
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: { light: '/nidhogg-logo.svg', dark: '/nidhogg-logo-dark.svg' },
+    logo: '/kvakk-logo.svg',
 
     nav: [
       { text: 'Guide', link: '/guide/' },
@@ -56,9 +56,6 @@ export default defineConfig({
           text: 'API Reference',
           items: [
             { text: 'Overview', link: '/api/' },
-            { text: 'nidhogg::config', link: '/api/config' },
-            { text: 'nidhogg::tile', link: '/api/tile' },
-            { text: 'nidhogg::pipeline', link: '/api/pipeline' },
           ],
         },
       ],

@@ -366,9 +366,21 @@ impl BlockBuilder {
         }
         self.dense_keys_vals.push(0); // delimiter (even for tagless nodes)
 
-        // Metadata
+        // Metadata — maintain parallel arrays with dense_ids.
+        // When mixing nodes with and without metadata in the same block
+        // (e.g. merge: base nodes have metadata, OSC replacements don't),
+        // we must keep all DenseInfo arrays the same length as dense_ids.
         if let Some(meta) = metadata {
+            if !self.has_dense_metadata && self.count > 0 {
+                // First metadata in this block, but previous nodes had none.
+                // Backfill zeroed entries so arrays stay aligned.
+                self.backfill_default_dense_metadata();
+            }
             self.add_dense_metadata(meta);
+        } else if self.has_dense_metadata {
+            // Previous nodes had metadata but this one doesn't.
+            // Push default entry to keep arrays aligned.
+            self.push_default_dense_metadata();
         }
 
         self.count += 1;
@@ -403,6 +415,47 @@ impl BlockBuilder {
 
         // Visible (only meaningful for history files, but we preserve it)
         self.dense_visibles.push(meta.visible);
+    }
+
+    /// Backfill zeroed metadata for `self.count` nodes already added without it.
+    ///
+    /// Called when the first metadata-bearing node arrives but the block already
+    /// contains nodes that were added with `metadata: None`. All delta accumulators
+    /// are still at their initial value (0), so every backfilled delta is 0.
+    fn backfill_default_dense_metadata(&mut self) {
+        self.has_dense_metadata = true;
+        for _ in 0..self.count {
+            self.dense_versions.push(0);
+            self.dense_timestamps.push(0);
+            self.dense_changesets.push(0);
+            self.dense_uids.push(0);
+            self.dense_user_sids.push(0);
+            self.dense_visibles.push(true);
+        }
+        // Delta state remains at 0 (initial value), matching the backfilled zeros.
+    }
+
+    /// Push a single default (zeroed) metadata entry for a node without metadata
+    /// in a block that already has metadata from other nodes.
+    ///
+    /// Delta-encodes the transition back to zero for all fields so that a
+    /// subsequent node with real metadata can delta from zero correctly.
+    fn push_default_dense_metadata(&mut self) {
+        self.dense_versions.push(0);
+
+        self.dense_timestamps.push(-self.last_dense_timestamp);
+        self.last_dense_timestamp = 0;
+
+        self.dense_changesets.push(-self.last_dense_changeset);
+        self.last_dense_changeset = 0;
+
+        self.dense_uids.push(-self.last_dense_uid);
+        self.last_dense_uid = 0;
+
+        self.dense_user_sids.push(-self.last_dense_user_sid);
+        self.last_dense_user_sid = 0;
+
+        self.dense_visibles.push(true);
     }
 
     /// Add a way.

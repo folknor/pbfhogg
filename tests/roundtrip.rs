@@ -785,3 +785,174 @@ fn roundtrip_zstd() {
         _ => panic!("expected Way"),
     }
 }
+
+/// Mixed metadata: some nodes have metadata, others don't (like merge OSC replacements).
+/// Tests that DenseInfo parallel arrays stay aligned with dense_ids.
+#[test]
+fn roundtrip_mixed_metadata() {
+    let mut buf = Vec::new();
+    {
+        let mut writer = PbfWriter::new(&mut buf, Compression::default());
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        writer.write_header(&header).unwrap();
+
+        let mut bb = BlockBuilder::new();
+
+        // Node 1: with metadata (like a base PBF node)
+        bb.add_node(
+            1, 100_000_000, 200_000_000,
+            &[("name", "base")],
+            Some(&Metadata {
+                version: 5,
+                timestamp: 1_700_000_000,
+                changeset: 100,
+                uid: 42,
+                user: "mapper",
+                visible: true,
+            }),
+        );
+
+        // Node 2: NO metadata (like an OSC replacement)
+        bb.add_node(2, 110_000_000, 210_000_000, &[("name", "osc")], None);
+
+        // Node 3: with metadata again (back to base)
+        bb.add_node(
+            3, 120_000_000, 220_000_000,
+            &[("name", "base2")],
+            Some(&Metadata {
+                version: 2,
+                timestamp: 1_600_000_000,
+                changeset: 200,
+                uid: 7,
+                user: "editor",
+                visible: true,
+            }),
+        );
+
+        let bytes = bb.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    // Read back — all 3 nodes must decode without panic
+    let reader = BlobReader::new(Cursor::new(&buf));
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 3);
+
+    // Node 1: has metadata
+    match &elements[0] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 1);
+            let tags: Vec<_> = dn.tags().collect();
+            assert_eq!(tags, vec![("name", "base")]);
+            let info = dn.info().unwrap();
+            assert_eq!(info.version(), 5);
+            assert_eq!(info.uid(), 42);
+            assert_eq!(info.user().unwrap(), "mapper");
+        }
+        _ => panic!("expected DenseNode"),
+    }
+
+    // Node 2: default metadata (version 0, uid 0, user "")
+    match &elements[1] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 2);
+            let tags: Vec<_> = dn.tags().collect();
+            assert_eq!(tags, vec![("name", "osc")]);
+            let info = dn.info().unwrap();
+            assert_eq!(info.version(), 0);
+            assert_eq!(info.uid(), 0);
+        }
+        _ => panic!("expected DenseNode"),
+    }
+
+    // Node 3: has metadata
+    match &elements[2] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 3);
+            let tags: Vec<_> = dn.tags().collect();
+            assert_eq!(tags, vec![("name", "base2")]);
+            let info = dn.info().unwrap();
+            assert_eq!(info.version(), 2);
+            assert_eq!(info.uid(), 7);
+            assert_eq!(info.user().unwrap(), "editor");
+        }
+        _ => panic!("expected DenseNode"),
+    }
+}
+
+/// Reverse mixed metadata: first node has no metadata, later ones do.
+/// Tests the backfill path in BlockBuilder.
+#[test]
+fn roundtrip_backfill_metadata() {
+    let mut buf = Vec::new();
+    {
+        let mut writer = PbfWriter::new(&mut buf, Compression::default());
+        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        writer.write_header(&header).unwrap();
+
+        let mut bb = BlockBuilder::new();
+
+        // Node 1: NO metadata
+        bb.add_node(1, 100_000_000, 200_000_000, &[], None);
+
+        // Node 2: NO metadata
+        bb.add_node(2, 110_000_000, 210_000_000, &[], None);
+
+        // Node 3: WITH metadata (triggers backfill of nodes 1 and 2)
+        bb.add_node(
+            3, 120_000_000, 220_000_000,
+            &[("name", "first_with_meta")],
+            Some(&Metadata {
+                version: 1,
+                timestamp: 1_700_000_000,
+                changeset: 300,
+                uid: 99,
+                user: "late_meta",
+                visible: true,
+            }),
+        );
+
+        let bytes = bb.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes).unwrap();
+        writer.flush().unwrap();
+    }
+
+    let reader = BlobReader::new(Cursor::new(&buf));
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 3);
+
+    // Nodes 1 and 2: backfilled default metadata
+    for (i, elem) in elements[..2].iter().enumerate() {
+        match elem {
+            Element::DenseNode(dn) => {
+                let info = dn.info().unwrap();
+                assert_eq!(info.version(), 0, "backfilled node {i} should have version 0");
+                assert_eq!(info.uid(), 0);
+            }
+            _ => panic!("expected DenseNode"),
+        }
+    }
+
+    // Node 3: real metadata
+    match &elements[2] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 3);
+            let info = dn.info().unwrap();
+            assert_eq!(info.version(), 1);
+            assert_eq!(info.uid(), 99);
+            assert_eq!(info.user().unwrap(), "late_meta");
+        }
+        _ => panic!("expected DenseNode"),
+    }
+}

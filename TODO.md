@@ -23,6 +23,10 @@ yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). Finding 7
 (blob-level indexdata) embeds element type + ID range in BlobHeader so that
 subsequent merges can classify passthrough blobs without decompression — saving
 ~8% on Denmark (3.07s → 2.81s) with larger gains expected at planet scale.
+O_DIRECT writes (`--direct-io`) add no measurable overhead on Denmark (2821ms
+BufWriter vs 2876ms O_DIRECT, within noise) — the pipeline is CPU-bound on zlib
+compression at this scale. The real win is page cache hygiene at planet scale
+(80GB writes not evicting useful host data).
 
 All command entry points, merge internals (`classify_blob`, `read_raw_frame`,
 `rewrite_block`), and pipeline (`run_pipeline`) are instrumented with

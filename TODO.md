@@ -105,9 +105,9 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   dense Vecs with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)` when `capacity()
   == 0` (after `take()` strips capacity via `mem::take`).
 
-- [ ] **Protobuf serialization in `take`** — `write_to_bytes()` uses the
-  `protobuf` crate (not the fastest). 673ms across 7408 calls (91µs avg) is
-  modest. Would only matter if the other items are addressed first.
+- [ ] **Protobuf serialization in `take`** — `encode_to_vec()` uses prost
+  (infallible, ~3x faster than old protobuf crate). 673ms across 7408 calls
+  (91µs avg) was measured with the old crate — re-benchmark with prost.
 
 ## Performance: parallelism
 
@@ -200,6 +200,16 @@ and kernel-space copy.
   `MmapBlobReader` could use `MADV_SEQUENTIAL` + `MADV_POPULATE_READ` in chunks
   (e.g. 256MB ahead) for predictable prefaulting without committing all 80GB at once.
 
+  **Caveat: low priority.** The mmap path (`MmapBlobReader`) is not the production
+  hot path — elivagar and nidhogg use `for_each_pipelined` (read) and `merge`
+  (write). Mmap is already the slowest read mode at Denmark scale (3.2s vs 0.3s
+  parallel, 1.6s pipelined). `MADV_POPULATE_READ` adds upfront page fault cost
+  that would hurt country-scale files (~120K faults for 483MB) where TLB pressure
+  isn't the bottleneck. The win is planet-scale only (80GB, 20M TLB entries). If
+  implemented, should be opt-in (`MmapBlobReader::with_prefault(true)` or similar)
+  to avoid regressing small-file performance. Consider skipping entirely in favor
+  of Tier 2 work (io_uring + erofs) which targets the actual production path.
+
 ### Tier 2: erofs + io_uring (nidhogg, Linux 6.14+, Compression::None)
 
 With erofs + `Compression::None`, zlib is eliminated entirely. erofs handles lz4 in
@@ -258,11 +268,9 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 - [ ] CLI-only dependencies (`clap`, `quick-xml`, `serde_json`) are runtime deps of the library
   crate. Library-only users pay the compile cost. Consider a `cli` feature gate or separate
   `pbfhogg-cli` binary crate.
-- [ ] `protobuf` crate: currently v3.7 (stepancheg/rust-protobuf, community, approaching EOL).
-  Only used for HeaderBlock parsing, blob envelope (BlobHeader/Blob), and write path.
-  The hot read path (PrimitiveBlock) now uses the custom wire-format parser in `wire.rs`.
-  Migration to v4 or prost would be lower-impact now since the performance-critical path
-  no longer depends on it.
+- [x] ~~`protobuf` crate~~ — migrated to `prost` v0.14 + `protox` v0.9. Both proto files
+  flatten into `crate::proto::*` (single `osmpbf.rs`). Public API change: `HeaderBlock::required_features()`
+  and `optional_features()` now return `&[String]` instead of `&[protobuf::Chars]`.
 
 ## Before crates.io publish
 

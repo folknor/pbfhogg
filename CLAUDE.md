@@ -38,7 +38,7 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 - `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block.
 - `PbfWriter`: blob framing, zlib compression, raw passthrough for merges
 
-**Proto:** `src/proto/{fileformat,osmformat}.proto` compiled by `protobuf-codegen` in `build.rs`
+**Proto:** `src/proto/{fileformat,osmformat}.proto` compiled by `prost-build` + `protox` in `build.rs`
 
 ## Conventions
 

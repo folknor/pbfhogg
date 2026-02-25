@@ -6,18 +6,18 @@ use super::wire::{
     WireBlock, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation, WireWay,
 };
 use crate::error::{new_error, ErrorKind, Result};
-use crate::proto::osmformat;
+use crate::proto;
 use bytes::Bytes;
 use std;
 
 /// A `HeaderBlock`. It contains metadata about following [`PrimitiveBlock`]s.
 #[derive(Clone, Debug)]
 pub struct HeaderBlock {
-    header: osmformat::HeaderBlock,
+    header: proto::HeaderBlock,
 }
 
 impl HeaderBlock {
-    pub fn new(header: osmformat::HeaderBlock) -> HeaderBlock {
+    pub fn new(header: proto::HeaderBlock) -> HeaderBlock {
         HeaderBlock { header }
     }
 
@@ -25,68 +25,48 @@ impl HeaderBlock {
     #[allow(clippy::cast_precision_loss)]
     pub fn bbox(&self) -> Option<HeaderBBox> {
         self.header.bbox.as_ref().map(|bbox| HeaderBBox {
-            left: (bbox.left() as f64) * 1.0e-9,
-            right: (bbox.right() as f64) * 1.0e-9,
-            top: (bbox.top() as f64) * 1.0e-9,
-            bottom: (bbox.bottom() as f64) * 1.0e-9,
+            left: (bbox.left as f64) * 1.0e-9,
+            right: (bbox.right as f64) * 1.0e-9,
+            top: (bbox.top as f64) * 1.0e-9,
+            bottom: (bbox.bottom as f64) * 1.0e-9,
         })
     }
 
     /// Returns a list of required features that a parser needs to implement to parse the following
     /// [`PrimitiveBlock`]s.
-    pub fn required_features(&self) -> &[protobuf::Chars] {
+    pub fn required_features(&self) -> &[String] {
         self.header.required_features.as_slice()
     }
 
     /// Returns a list of optional features that a parser can choose to ignore.
-    pub fn optional_features(&self) -> &[protobuf::Chars] {
+    pub fn optional_features(&self) -> &[String] {
         self.header.optional_features.as_slice()
     }
 
     /// Returns the name of the program that generated the file or `None` if unset.
     pub fn writing_program(&self) -> Option<&str> {
-        if self.header.has_writingprogram() {
-            Some(self.header.writingprogram())
-        } else {
-            None
-        }
+        self.header.writingprogram.as_deref()
     }
 
     /// Returns the source of the `bbox` field or `None` if unset.
     pub fn source(&self) -> Option<&str> {
-        if self.header.has_source() {
-            Some(self.header.source())
-        } else {
-            None
-        }
+        self.header.source.as_deref()
     }
 
     /// Returns the replication timestamp of the file, or `None` if unset.
     /// The timestamp is expressed in seconds since the UNIX epoch.
     pub fn osmosis_replication_timestamp(&self) -> Option<i64> {
-        if self.header.has_osmosis_replication_timestamp() {
-            Some(self.header.osmosis_replication_timestamp())
-        } else {
-            None
-        }
+        self.header.osmosis_replication_timestamp
     }
 
     /// Returns the replication sequence number of the file, or `None` if unset.
     pub fn osmosis_replication_sequence_number(&self) -> Option<i64> {
-        if self.header.has_osmosis_replication_sequence_number() {
-            Some(self.header.osmosis_replication_sequence_number())
-        } else {
-            None
-        }
+        self.header.osmosis_replication_sequence_number
     }
 
     /// Returns the replication base URL of the file, or `None` if unset.
     pub fn osmosis_replication_base_url(&self) -> Option<&str> {
-        if self.header.has_osmosis_replication_base_url() {
-            Some(self.header.osmosis_replication_base_url())
-        } else {
-            None
-        }
+        self.header.osmosis_replication_base_url.as_deref()
     }
 }
 

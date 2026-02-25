@@ -109,7 +109,7 @@ fn roundtrip_dense_nodes_with_metadata() {
     let features: Vec<&str> = header
         .required_features()
         .iter()
-        .map(|f| f.as_ref())
+        .map(String::as_str)
         .collect();
     assert!(features.contains(&"OsmSchema-V0.6"));
     assert!(features.contains(&"DenseNodes"));
@@ -497,7 +497,7 @@ fn roundtrip_way_with_locations() {
             let features: Vec<&str> = header
                 .optional_features()
                 .iter()
-                .map(|s| s.as_ref())
+                .map(String::as_str)
                 .collect();
             assert!(features.contains(&"LocationsOnWays"));
         }

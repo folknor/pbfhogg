@@ -1,14 +1,13 @@
 //! Iterate over blobs from a memory map
 
-use self::fileformat::BlobHeader;
 use super::blob::{
     decode_blob, decompress_blob, BlobDecode, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE,
 };
 use super::block::{HeaderBlock, PrimitiveBlock};
 use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
-use crate::proto::fileformat;
+use crate::proto;
 use bytes::Bytes;
-use protobuf::Message;
+use prost::Message;
 use std::fs::File;
 use std::path::Path;
 
@@ -76,7 +75,7 @@ impl Mmap {
 /// A PBF blob from a memory map.
 #[derive(Clone, Debug)]
 pub struct MmapBlob {
-    header: BlobHeader,
+    header: proto::BlobHeader,
     data: Bytes,
     offset: ByteOffset,
 }
@@ -85,9 +84,9 @@ impl MmapBlob {
     /// Decodes the blob and tries to obtain the inner content (usually a [`HeaderBlock`] or a
     /// [`PrimitiveBlock`]). This operation might involve an expensive decompression step.
     pub fn decode(&self) -> Result<BlobDecode<'_>> {
-        let blob = fileformat::Blob::parse_from_tokio_bytes(&self.data)
+        let blob = proto::Blob::decode(self.data.clone())
             .map_err(|e| new_protobuf_error(e, "blob content"))?;
-        match self.header.type_() {
+        match self.header.r#type.as_str() {
             "OSMHeader" => {
                 let block = Box::new(HeaderBlock::new(decode_blob(&blob, None)?));
                 Ok(BlobDecode::OsmHeader(block))
@@ -102,7 +101,7 @@ impl MmapBlob {
 
     /// Returns the type of a blob without decoding its content.
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.type_() {
+        match self.header.r#type.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
             "OSMData" => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -332,7 +331,7 @@ impl Iterator for MmapBlobReader {
         // anyway, so `copy_from_slice` + `parse_from_tokio_bytes` is equivalent and keeps
         // the code consistent with the rest of the codebase.
         let header_bytes = Bytes::copy_from_slice(&slice[4..4 + header_size]);
-        let header = match BlobHeader::parse_from_tokio_bytes(&header_bytes) {
+        let header = match proto::BlobHeader::decode(header_bytes) {
             Ok(x) => x,
             Err(e) => {
                 self.last_blob_ok = false;
@@ -340,7 +339,7 @@ impl Iterator for MmapBlobReader {
             }
         };
 
-        let data_size = header.datasize() as usize;
+        let data_size = header.datasize as usize;
         let chunk_size = 4 + header_size + data_size;
 
         if remaining < chunk_size {

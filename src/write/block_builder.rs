@@ -6,9 +6,9 @@
 //! Handles string table construction, delta encoding, dense node packing,
 //! and block size limits (8000 entities per block, matching osmium).
 
-use crate::proto::osmformat;
+use crate::proto;
 use bytes::Bytes;
-use protobuf::{EnumOrUnknown, Message};
+use prost::Message;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::io;
@@ -114,8 +114,8 @@ impl StringTable {
         }
     }
 
-    fn into_proto(self) -> osmformat::StringTable {
-        let mut st = osmformat::StringTable::new();
+    fn into_proto(self) -> proto::StringTable {
+        let mut st = proto::StringTable::default();
         for s in self.strings {
             st.s.push(Bytes::from(s.into_bytes()));
         }
@@ -161,15 +161,15 @@ pub struct MemberData<'a> {
     pub role: &'a str,
 }
 
-fn member_type_to_proto(mt: MemberType) -> osmformat::relation::MemberType {
+fn member_type_to_proto(mt: MemberType) -> proto::relation::MemberType {
     match mt {
-        MemberType::Node => osmformat::relation::MemberType::NODE,
-        MemberType::Way => osmformat::relation::MemberType::WAY,
-        MemberType::Relation => osmformat::relation::MemberType::RELATION,
-        // Unknown member types from newer PBF producers — round-trip as NODE
+        MemberType::Node => proto::relation::MemberType::Node,
+        MemberType::Way => proto::relation::MemberType::Way,
+        MemberType::Relation => proto::relation::MemberType::Relation,
+        // Unknown member types from newer PBF producers — round-trip as Node
         // since the protobuf enum has no "unknown" value. Callers should filter
         // these out before writing if lossless preservation is needed.
-        MemberType::Unknown(_) => osmformat::relation::MemberType::NODE,
+        MemberType::Unknown(_) => proto::relation::MemberType::Node,
     }
 }
 
@@ -216,10 +216,10 @@ pub struct BlockBuilder {
     last_dense_user_sid: i32,
 
     // Ways
-    ways: Vec<osmformat::Way>,
+    ways: Vec<proto::Way>,
 
     // Relations
-    relations: Vec<osmformat::Relation>,
+    relations: Vec<proto::Relation>,
 }
 
 impl Default for BlockBuilder {
@@ -421,8 +421,8 @@ impl BlockBuilder {
         );
         self.block_type = Some(BlockType::Ways);
 
-        let mut way = osmformat::Way::new();
-        way.set_id(id);
+        let mut way = proto::Way::default();
+        way.id = id;
 
         // Tags — plain string table indices (not delta-encoded)
         for &(key, val) in tags {
@@ -439,7 +439,7 @@ impl BlockBuilder {
 
         // Metadata
         if let Some(meta) = metadata {
-            way.info = protobuf::MessageField::some(self.build_info(meta));
+            way.info = Some(self.build_info(meta));
         }
 
         self.ways.push(way);
@@ -466,8 +466,8 @@ impl BlockBuilder {
         );
         self.block_type = Some(BlockType::Ways);
 
-        let mut way = osmformat::Way::new();
-        way.set_id(id);
+        let mut way = proto::Way::default();
+        way.id = id;
 
         for &(key, val) in tags {
             way.keys.push(self.string_table.add(key));
@@ -490,7 +490,7 @@ impl BlockBuilder {
         }
 
         if let Some(meta) = metadata {
-            way.info = protobuf::MessageField::some(self.build_info(meta));
+            way.info = Some(self.build_info(meta));
         }
 
         self.ways.push(way);
@@ -513,8 +513,8 @@ impl BlockBuilder {
         );
         self.block_type = Some(BlockType::Relations);
 
-        let mut rel = osmformat::Relation::new();
-        rel.set_id(id);
+        let mut rel = proto::Relation::default();
+        rel.id = id;
 
         // Tags
         for &(key, val) in tags {
@@ -531,12 +531,12 @@ impl BlockBuilder {
             rel.memids.push(m.id.id() - last_memid);
             last_memid = m.id.id();
             rel.types
-                .push(EnumOrUnknown::new(member_type_to_proto(m.id.member_type())));
+                .push(member_type_to_proto(m.id.member_type()) as i32);
         }
 
         // Metadata
         if let Some(meta) = metadata {
-            rel.info = protobuf::MessageField::some(self.build_info(meta));
+            rel.info = Some(self.build_info(meta));
         }
 
         self.relations.push(rel);
@@ -553,11 +553,11 @@ impl BlockBuilder {
             None => return Ok(None),
         };
 
-        let mut block = osmformat::PrimitiveBlock::new();
+        let mut block = proto::PrimitiveBlock::default();
 
         // String table
         let string_table = std::mem::replace(&mut self.string_table, StringTable::new());
-        block.stringtable = protobuf::MessageField::some(string_table.into_proto());
+        block.stringtable = string_table.into_proto();
 
         // Note: we do NOT set granularity, lat_offset, lon_offset, or date_granularity.
         // Omitting them uses the protobuf defaults (granularity=100, offsets=0, date_gran=1000).
@@ -570,9 +570,7 @@ impl BlockBuilder {
         };
         block.primitivegroup.push(group);
 
-        let bytes = block
-            .write_to_bytes()
-            .map_err(io::Error::other)?;
+        let bytes = block.encode_to_vec();
 
         self.reset();
         Ok(Some(bytes))
@@ -589,9 +587,9 @@ impl BlockBuilder {
     /// `reset()` detects this and re-allocates them with `Vec::with_capacity`,
     /// so the next block-building cycle starts with the same pre-allocation as
     /// `new()`.
-    fn take_dense_nodes_group(&mut self) -> osmformat::PrimitiveGroup {
-        let mut group = osmformat::PrimitiveGroup::new();
-        let mut dense = osmformat::DenseNodes::new();
+    fn take_dense_nodes_group(&mut self) -> proto::PrimitiveGroup {
+        let mut group = proto::PrimitiveGroup::default();
+        let mut dense = proto::DenseNodes::default();
 
         dense.id = std::mem::take(&mut self.dense_ids);
         dense.lat = std::mem::take(&mut self.dense_lats);
@@ -599,35 +597,35 @@ impl BlockBuilder {
         dense.keys_vals = std::mem::take(&mut self.dense_keys_vals);
 
         if self.has_dense_metadata {
-            let mut info = osmformat::DenseInfo::new();
+            let mut info = proto::DenseInfo::default();
             info.version = std::mem::take(&mut self.dense_versions);
             info.timestamp = std::mem::take(&mut self.dense_timestamps);
             info.changeset = std::mem::take(&mut self.dense_changesets);
             info.uid = std::mem::take(&mut self.dense_uids);
             info.user_sid = std::mem::take(&mut self.dense_user_sids);
             info.visible = std::mem::take(&mut self.dense_visibles);
-            dense.denseinfo = protobuf::MessageField::some(info);
+            dense.denseinfo = Some(info);
         }
 
-        group.dense = protobuf::MessageField::some(dense);
+        group.dense = Some(dense);
         group
     }
 
-    fn take_ways_group(&mut self) -> osmformat::PrimitiveGroup {
-        let mut group = osmformat::PrimitiveGroup::new();
+    fn take_ways_group(&mut self) -> proto::PrimitiveGroup {
+        let mut group = proto::PrimitiveGroup::default();
         group.ways = std::mem::take(&mut self.ways);
         group
     }
 
-    fn take_relations_group(&mut self) -> osmformat::PrimitiveGroup {
-        let mut group = osmformat::PrimitiveGroup::new();
+    fn take_relations_group(&mut self) -> proto::PrimitiveGroup {
+        let mut group = proto::PrimitiveGroup::default();
         group.relations = std::mem::take(&mut self.relations);
         group
     }
 
     #[allow(clippy::cast_possible_wrap)]
-    fn build_info(&mut self, meta: &Metadata<'_>) -> osmformat::Info {
-        let mut info = osmformat::Info::new();
+    fn build_info(&mut self, meta: &Metadata<'_>) -> proto::Info {
+        let mut info = proto::Info::default();
         info.version = Some(meta.version);
         info.timestamp = Some(meta.timestamp);
         info.changeset = Some(meta.changeset);
@@ -685,48 +683,46 @@ pub fn build_header(
     replication_base_url: Option<&str>,
     optional_features: &[&str],
 ) -> io::Result<Vec<u8>> {
-    let mut header = osmformat::HeaderBlock::new();
+    let mut header = proto::HeaderBlock::default();
 
     // Required features — every PBF reader must support these
     header
         .required_features
-        .push(protobuf::Chars::from("OsmSchema-V0.6"));
+        .push("OsmSchema-V0.6".to_string());
     header
         .required_features
-        .push(protobuf::Chars::from("DenseNodes"));
+        .push("DenseNodes".to_string());
 
     // Optional features
     for feature in optional_features {
         header
             .optional_features
-            .push(protobuf::Chars::from(*feature));
+            .push((*feature).to_string());
     }
 
     // Writing program
-    header.set_writingprogram(protobuf::Chars::from("pbfhogg"));
+    header.writingprogram = Some("pbfhogg".to_string());
 
     // Bounding box (nanodegrees)
     if let Some((left, bottom, right, top)) = bbox {
-        let mut bb = osmformat::HeaderBBox::new();
-        bb.set_left((left * 1e9) as i64);
-        bb.set_right((right * 1e9) as i64);
-        bb.set_top((top * 1e9) as i64);
-        bb.set_bottom((bottom * 1e9) as i64);
-        header.bbox = protobuf::MessageField::some(bb);
+        header.bbox = Some(proto::HeaderBBox {
+            left: (left * 1e9) as i64,
+            right: (right * 1e9) as i64,
+            top: (top * 1e9) as i64,
+            bottom: (bottom * 1e9) as i64,
+        });
     }
 
     // Replication metadata
     if let Some(ts) = replication_timestamp {
-        header.set_osmosis_replication_timestamp(ts);
+        header.osmosis_replication_timestamp = Some(ts);
     }
     if let Some(seq) = replication_sequence_number {
-        header.set_osmosis_replication_sequence_number(seq);
+        header.osmosis_replication_sequence_number = Some(seq);
     }
     if let Some(url) = replication_base_url {
-        header.set_osmosis_replication_base_url(protobuf::Chars::from(url));
+        header.osmosis_replication_base_url = Some(url.to_string());
     }
 
-    header
-        .write_to_bytes()
-        .map_err(io::Error::other)
+    Ok(header.encode_to_vec())
 }

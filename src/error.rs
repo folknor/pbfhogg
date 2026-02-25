@@ -5,7 +5,7 @@ use std::result;
 use std::str;
 use std::str::Utf8Error;
 
-use protobuf::Error as ProtobufError;
+use prost::DecodeError;
 
 // Error data structures are modeled just like in the `csv` crate by BurntSushi.
 
@@ -17,7 +17,7 @@ pub(crate) fn new_blob_error(kind: BlobError) -> Error {
     Error(Box::new(ErrorKind::Blob(kind)))
 }
 
-pub(crate) fn new_protobuf_error(err: ProtobufError, location: &'static str) -> Error {
+pub(crate) fn new_protobuf_error(err: DecodeError, location: &'static str) -> Error {
     Error(Box::new(ErrorKind::Protobuf { err, location }))
 }
 
@@ -48,7 +48,7 @@ pub enum ErrorKind {
     Io(io::Error),
     /// An error that occurs when decoding a protobuf message.
     Protobuf {
-        err: ProtobufError,
+        err: DecodeError,
         location: &'static str,
     },
     /// The stringtable contains an entry at `index` that could not be decoded to a valid UTF-8

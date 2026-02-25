@@ -12,12 +12,12 @@
 //! compression entirely.
 
 use crate::blob_index;
-use crate::proto::fileformat;
+use crate::proto;
 use crate::write::file_writer::FileWriter;
 use bytes::Bytes;
 use flate2::write::ZlibEncoder;
 use flate2::Compression as FlateCompression;
-use protobuf::Message;
+use prost::Message;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
@@ -496,10 +496,10 @@ pub(crate) fn frame_blob(
     indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     // Step 1: Build the Blob protobuf (optionally compressed)
-    let mut blob = fileformat::Blob::new();
+    let mut blob = proto::Blob::default();
     match compression {
         Compression::None => {
-            blob.data = Some(fileformat::blob::Data::Raw(Bytes::copy_from_slice(
+            blob.data = Some(proto::blob::Data::Raw(Bytes::copy_from_slice(
                 uncompressed,
             )));
         }
@@ -514,28 +514,28 @@ pub(crate) fn frame_blob(
             );
             encoder.write_all(uncompressed)?;
             let compressed = encoder.finish()?;
-            blob.set_raw_size(uncompressed.len() as i32);
-            blob.data = Some(fileformat::blob::Data::ZlibData(Bytes::from(compressed)));
+            blob.raw_size = Some(uncompressed.len() as i32);
+            blob.data = Some(proto::blob::Data::ZlibData(Bytes::from(compressed)));
         }
         Compression::Zstd(level) => {
             let compressed =
                 zstd::bulk::compress(uncompressed, *level).map_err(io::Error::other)?;
-            blob.set_raw_size(uncompressed.len() as i32);
-            blob.data = Some(fileformat::blob::Data::ZstdData(Bytes::from(compressed)));
+            blob.raw_size = Some(uncompressed.len() as i32);
+            blob.data = Some(proto::blob::Data::ZstdData(Bytes::from(compressed)));
         }
     }
 
-    let blob_bytes = blob.write_to_bytes().map_err(io::Error::other)?;
+    let blob_bytes = blob.encode_to_vec();
 
     // Step 2: Build the BlobHeader
-    let mut header = fileformat::BlobHeader::new();
-    header.set_type(protobuf::Chars::from(blob_type));
-    header.set_datasize(blob_bytes.len() as i32);
+    let mut header = proto::BlobHeader::default();
+    header.r#type = blob_type.to_string();
+    header.datasize = blob_bytes.len() as i32;
     if let Some(idx) = indexdata {
         header.indexdata = Some(Bytes::copy_from_slice(idx));
     }
 
-    let header_bytes = header.write_to_bytes().map_err(io::Error::other)?;
+    let header_bytes = header.encode_to_vec();
 
     // Step 3: Assemble [4-byte BE header_len][BlobHeader][Blob]
     let header_len = header_bytes.len() as u32;
@@ -561,12 +561,12 @@ pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let mut header = fileformat::BlobHeader::new();
-    header.set_type(protobuf::Chars::from("OSMData"));
-    header.set_datasize(blob_bytes.len() as i32);
+    let mut header = proto::BlobHeader::default();
+    header.r#type = "OSMData".to_string();
+    header.datasize = blob_bytes.len() as i32;
     header.indexdata = Some(Bytes::copy_from_slice(indexdata));
 
-    let header_bytes = header.write_to_bytes().map_err(io::Error::other)?;
+    let header_bytes = header.encode_to_vec();
 
     let header_len = header_bytes.len() as u32;
     let total_len = 4 + header_bytes.len() + blob_bytes.len();

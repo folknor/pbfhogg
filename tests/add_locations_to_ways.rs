@@ -180,7 +180,7 @@ fn header_has_locations_on_ways_feature() {
             let features: Vec<&str> = header
                 .optional_features()
                 .iter()
-                .map(|s| s.as_ref())
+                .map(String::as_str)
                 .collect();
             assert!(
                 features.contains(&"LocationsOnWays"),

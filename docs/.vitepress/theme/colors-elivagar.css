@@ -18,6 +18,8 @@
   --vp-button-brand-bg: var(--vp-c-brand-2);
   --vp-button-brand-hover-bg: var(--vp-c-brand-1);
 
+  --vp-layout-max-width: 1216px;
+
   /* frost white background */
   --vp-c-bg: #f0f8ff;
   --vp-c-bg-alt: #e6f0f8;

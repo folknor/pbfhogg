@@ -1,72 +1,62 @@
 /*
- * Default color scheme — purple/blue gradient
+ * Base color template
  *
- * To restore: copy these values back into style.css :root and .dark blocks.
+ * Copy this file and replace the values to create a new project theme.
+ * Only color variables go here — layout, hero gradient, and shared
+ * component styles live in style.css.
  */
 
 /* ── Light mode ────────────────────────────────────────────────────────── */
 
 :root {
-  --vp-c-brand-1: #7c6af2;
-  --vp-c-brand-2: #694ef0;
-  --vp-c-brand-3: #5b3de8;
-  --vp-c-brand-soft: rgba(124, 106, 242, 0.12);
+  --vp-c-brand-1: ;
+  --vp-c-brand-2: ;
+  --vp-c-brand-3: ;
+  --vp-c-brand-soft: ;
 
   --vp-button-brand-bg: var(--vp-c-brand-2);
   --vp-button-brand-hover-bg: var(--vp-c-brand-1);
 
-  /* muted light mode — no stark white */
-  --vp-c-bg: #f0ede8;
-  --vp-c-bg-alt: #e8e4de;
-  --vp-c-bg-elv: #e8e4de;
-  --vp-c-bg-soft: #e0dbd4;
+  --vp-layout-max-width: 1216px;
 
-  /* stronger text contrast on warm bg */
-  --vp-c-text-1: #1a1a1a;
-  --vp-c-text-2: #3d3832;
-  --vp-c-text-3: #6b6259;
+  --vp-c-bg: ;
+  --vp-c-bg-alt: ;
+  --vp-c-bg-elv: ;
+  --vp-c-bg-soft: ;
 
-  /* alt buttons — visible against warm bg */
-  --vp-button-alt-bg: #d5d0c8;
-  --vp-button-alt-hover-bg: #c9c3ba;
-  --vp-button-alt-text: #1a1a1a;
+  --vp-c-text-1: ;
+  --vp-c-text-2: ;
+  --vp-c-text-3: ;
 
-  /* hide nav borders */
-  --vp-c-divider: transparent;
-  --vp-c-gutter: transparent;
+  --vp-button-alt-bg: ;
+  --vp-button-alt-hover-bg: ;
+  --vp-button-alt-text: ;
+
+  --vp-c-divider: ;
+  --vp-c-gutter: ;
 }
 
 /* ── Dark mode ─────────────────────────────────────────────────────────── */
 
 .dark {
-  --vp-c-brand-1: #9b8aff;
-  --vp-c-brand-2: #7c6af2;
-  --vp-c-brand-3: #694ef0;
-  --vp-c-brand-soft: rgba(124, 106, 242, 0.16);
+  --vp-c-brand-1: ;
+  --vp-c-brand-2: ;
+  --vp-c-brand-3: ;
+  --vp-c-brand-soft: ;
 
-  --vp-c-bg: #1b1b1f;
-  --vp-c-bg-alt: #161618;
-  --vp-c-bg-elv: #202127;
-  --vp-c-bg-soft: #202127;
+  --vp-c-bg: ;
+  --vp-c-bg-alt: ;
+  --vp-c-bg-elv: ;
+  --vp-c-bg-soft: ;
 
-  --vp-c-text-1: rgba(255, 255, 245, 0.86);
-  --vp-c-text-2: rgba(235, 235, 245, 0.6);
-  --vp-c-text-3: rgba(235, 235, 245, 0.38);
+  --vp-c-text-1: ;
+  --vp-c-text-2: ;
+  --vp-c-text-3: ;
 
-  --vp-button-alt-bg: #2a2a2e;
-  --vp-button-alt-hover-bg: #333336;
-  --vp-button-alt-text: rgba(255, 255, 245, 0.86);
-}
+  --vp-button-alt-bg: ;
+  --vp-button-alt-hover-bg: ;
+  --vp-button-alt-text: ;
 
-/* ── Hero gradient ─────────────────────────────────────────────────────── */
-
-:root {
-  --vp-home-hero-name-color: transparent;
-  --vp-home-hero-name-background: linear-gradient(
-    135deg,
-    var(--vp-c-brand-1) 0%,
-    var(--vp-c-brand-3) 40%,
-    var(--vp-c-brand-1) 60%,
-    var(--vp-c-brand-3) 100%
-  );
+  --vp-c-divider: ;
+  --vp-c-gutter: ;
 }

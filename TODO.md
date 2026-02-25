@@ -167,28 +167,44 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   needed if input is heavily unsorted (rare in practice). The existing `PbfWriter`/`BlockBuilder`
   are fully streaming and already support this — no writer changes needed.
 
-## Performance: Linux 6.14+ kernel features for planet-scale I/O
+## Performance: Linux kernel features for planet-scale I/O
+
+Research notes: `docs/linux-async-io.md`.
 
 Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
+Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
+`Compression::None` PBFs on erofs is the baseline assumption for the optimized path.
+The library also needs to work well for the broader OSM ecosystem (standard
+zlib-compressed PBFs, any filesystem, any Linux 5.x+), so there are two tiers.
 
-- [ ] **erofs + uncompressed PBFs (single decompression layer).** Currently double
-  decompression: erofs lz4 in kernel → zlib in userspace. If pbfhogg writes
-  `Compression::None` PBFs stored on erofs, the stack becomes: erofs lz4 at ~4 GB/s
-  (kernel, SIMD-optimized) → raw blob data (no userspace decompression). The
-  `decompress_blob` call becomes a no-op. On-disk size is comparable (erofs lz4
-  achieves similar ratios to zlib on OSM data). Trade-off: PBF files are 3-4x larger
-  when copied off erofs, but for a local pipeline where you control storage this is
-  the single biggest throughput win. Add a `--compression none` flag to merge/sort/cat.
+### Tier 1: Generic path (any Linux, zlib PBFs, any filesystem)
 
-- [ ] **`copy_file_range` for blob passthrough in sort/merge.** For Approach A
-  (blob permutation sort) and merge passthrough, blobs can be copied between file
-  descriptors entirely in kernel space via `copy_file_range(in_fd, &offset, out_fd,
-  NULL, blob_len, 0)`. No userspace buffer allocation, no user/kernel boundary
-  crossing. On btrfs/xfs with reflinks, it's a metadata-only operation (instant,
-  zero I/O). For planet sort where 99.9% of blobs are passthrough, the kernel
-  shuffles 80GB of blobs without pbfhogg touching the data. Requires switching
-  `write_raw` from taking a `&[u8]` slice to accepting an fd+offset+len for the
-  kernel-copy path.
+The generic path is CPU-bound on zlib compression/decompression. io_uring adds
+negligible value here (~30ms syscall savings on 80GB). Focus on page cache hygiene
+and kernel-space copy.
+
+- [ ] **O_DIRECT for planet-scale cache hygiene.** Planet merge: 80GB read + 80GB
+  write = 160GB page cache churn that evicts useful data on the host. The read
+  pipeline already manages its own buffers (`DecompressPool` + `Bytes::from_owner`);
+  the page cache is pure overhead — we never re-read a blob. O_DIRECT bypasses it
+  entirely. Works with plain synchronous `write()` / `read()` — no io_uring needed.
+  Feature-gated (`linux-direct-io` or similar).
+
+  Implementation: `OpenOptionsExt::custom_flags(libc::O_DIRECT)` on both input and
+  output fds. Requires page-aligned buffers (4096) and sector-aligned I/O sizes (512).
+  `frame_blob()` output Vecs need to come from an aligned allocator or be copied into
+  aligned staging buffers. Final write needs `ftruncate` to actual file size since the
+  last blob is unlikely to be sector-aligned.
+
+- [ ] **`copy_file_range` for blob passthrough in sort/merge.** Blobs can be copied
+  between file descriptors entirely in kernel space via `copy_file_range(in_fd,
+  &offset, out_fd, NULL, blob_len, 0)`. No userspace buffer, no user/kernel boundary
+  crossing. On btrfs/xfs with reflinks, it's metadata-only (instant, zero I/O). For
+  planet sort where 99.9% of blobs are passthrough, the kernel shuffles 80GB without
+  pbfhogg touching the data. Independent of io_uring — there is no
+  `IORING_OP_COPY_FILE_RANGE` opcode in the kernel (verified through 6.18). Call the
+  syscall directly. Requires switching `write_raw` from `&[u8]` to accepting
+  fd+offset+len for the kernel-copy path.
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
@@ -197,25 +213,59 @@ Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erof
   `MmapBlobReader` could use `MADV_SEQUENTIAL` + `MADV_POPULATE_READ` in chunks
   (e.g. 256MB ahead) for predictable prefaulting without committing all 80GB at once.
 
-- [ ] **io_uring for the write path.** The current merge pipeline has a writer
-  thread doing synchronous `write_all` calls. With io_uring: register the output fd
-  + a buffer pool once, submit writes as SQEs — no syscall per write. Kernel batches
-  writes. For blob passthrough: submit `copy_file_range` SQEs directly (combine with
-  the item above). The writer thread becomes an SQE submission loop instead of a
-  blocking write loop. Crate: `io-uring` (low-level) or `tokio-uring`.
+### Tier 2: erofs + io_uring (nidhogg, Linux 6.14+, Compression::None)
 
-- [ ] **`O_DIRECT` + io_uring for page cache hygiene.** Planet merge reads 80GB and
-  writes 80GB — 160GB of page cache churn that evicts useful data on the host.
-  `O_DIRECT` + io_uring registered buffers reads directly into application buffers,
-  bypassing the page cache. The read-ahead pipeline already manages its own buffering
-  via `DecompressPool` — the page cache is pure overhead at planet scale. Requires
-  aligned buffers and sector-aligned reads, but io_uring registered buffers handle
-  this naturally.
+With erofs + `Compression::None`, zlib is eliminated entirely. erofs handles lz4 in
+kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
+pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
+buffers actually matter — the writer thread is the bottleneck, not compression.
 
-**Recommended combination for nidhogg:** erofs with `Compression::None` PBFs
-(eliminate zlib entirely) + blob permutation sort via `copy_file_range` (kernel-side
-copy) + `O_DIRECT` io_uring for merge write path (no cache pollution). This stack
-makes the merge I/O-bound at device speed rather than CPU-bound on decompression.
+- [ ] **erofs + uncompressed PBFs (single decompression layer).** Currently double
+  decompression: erofs lz4 in kernel → zlib in userspace. With `Compression::None`
+  on erofs, the stack becomes: erofs lz4 → raw blob data. On-disk size is comparable
+  (erofs lz4 achieves similar ratios to zlib on OSM data). Trade-off: PBF files are
+  3-4x larger when copied off erofs, but for a local pipeline where you control
+  storage this is the single biggest throughput win. Add `--compression none` flag
+  to merge/sort/cat.
+
+- [ ] **io_uring writer thread.** Replace the synchronous `BufWriter` + `write_all`
+  writer thread with an io_uring submission loop. Register the output fd
+  (`register_files`) + a pool of page-aligned buffers (`register_buffers`) once at
+  startup. Compression/framing threads fill registered buffers, send
+  `(buf_index, len)` to the I/O thread, which pushes `WriteFixed` SQEs and reaps
+  CQEs to recycle buffer indices via a free-list. No async runtime — the `io-uring`
+  crate (v0.7.x, tokio-rs org) works synchronously in a dedicated thread.
+
+  Key constraints discovered in research:
+  - `WRITEV` does NOT support registered buffers — each buffer needs its own
+    `WriteFixed` SQE (no scatter-gather with fixed buffers)
+  - Registered buffers are pinned in kernel memory, charged against `RLIMIT_MEMLOCK`
+    — must raise the limit
+  - Buffer ownership: kernel owns the buffer from SQE submission to CQE completion;
+    userspace must not touch it during that window
+  - `tokio-uring` is not production-ready and not needed; `io-uring` 0.7.x is the
+    right crate (synchronous, no async runtime, 1.6K stars, 17K dependents)
+  - SQ polling (`setup_sqpoll`) eliminates `io_uring_enter` syscalls entirely but
+    consumes a CPU core — worth benchmarking for the Compression::None case
+
+  This combines naturally with the O_DIRECT item from Tier 1: open the output fd
+  with `O_DIRECT` and all writes through registered (page-aligned) buffers bypass
+  the page cache automatically.
+
+  For blob passthrough: `copy_file_range(2)` called synchronously between SQE
+  batches (no io_uring opcode exists), or read into a registered buffer then
+  `WriteFixed` — the latter integrates more cleanly with the ring loop.
+
+### Implementation order
+
+1. **O_DIRECT (Tier 1)** — biggest real-world win (cache hygiene), minimal complexity,
+   benefits both tiers. Aligned buffer pool + `custom_flags(O_DIRECT)`. Feature-gated.
+2. **`copy_file_range` (Tier 1)** — orthogonal, change `write_raw` API. Kernel-space
+   blob copy for merge/sort passthrough.
+3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already
+   supported), needed to make the pipeline I/O-bound.
+4. **io_uring writer thread (Tier 2)** — only after Compression::None makes writes the
+   bottleneck. Registered buffers + WriteFixed + free-list pattern.
 
 ## Dependencies
 

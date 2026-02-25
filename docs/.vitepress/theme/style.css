@@ -499,12 +499,25 @@ body {
   padding-left: 1rem;
 }
 
-/* ── Doc content wrapper ───────────────────────────────────────────────── */
-/* Override VPContent scoped centering so doc pages fill the same width as
- * the navbar instead of being squeezed by the layout-max-width formula. */
+/* ── Sticky nav on sidebar pages ───────────────────────────────────────── */
+/* Make the navbar sticky (in-flow) instead of fixed on sidebar pages so it
+ * pushes content down naturally and never overlaps the sidebar.  Give it
+ * the sidebar background so it blends visually with the left column. */
 
 @media (min-width: 960px) {
+  .VPNav:has(.has-sidebar) {
+    position: sticky !important;
+    top: 0;
+    background-color: var(--vp-sidebar-bg-color);
+  }
+
+  .VPNavBar.has-sidebar .content-body {
+    background-color: var(--vp-sidebar-bg-color) !important;
+  }
+
+  /* No padding-top needed — the sticky nav is in the document flow now */
   .VPContent.has-sidebar {
+    padding-top: 0 !important;
     padding-left: calc(var(--vp-sidebar-width) + 2rem) !important;
     padding-right: 2rem !important;
   }
@@ -887,6 +900,16 @@ body {
 .vp-doc h4 { font-size: 2rem;     margin-bottom: -0.1em; }
 .vp-doc h5 { font-size: 1.8rem;   margin-bottom: -0.1em; }
 .vp-doc h6 { font-size: 1.625rem; margin-bottom: -0.1em; }
+
+/* Jomhuria glyphs sit high in the em box — nudge the # anchor to match */
+.vp-doc .header-anchor {
+  top: 0.025em;
+  margin-left: -0.6em;
+}
+
+.vp-doc h2 .header-anchor {
+  top: calc(1.5rem + 0.025em);
+}
 
 /* ── Nav logo hover ─────────────────────────────────────────────────────── */
 

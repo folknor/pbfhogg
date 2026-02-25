@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
+use pbfhogg::writer::Compression;
 
 #[derive(Parser)]
 #[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit")]
@@ -70,6 +71,9 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -81,6 +85,9 @@ enum Command {
         /// Output PBF file
         #[arg(short, long)]
         output: PathBuf,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -98,6 +105,9 @@ enum Command {
         /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
         #[arg(required = true)]
         expressions: Vec<String>,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -149,6 +159,9 @@ enum Command {
         id_file: Option<PathBuf>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -165,6 +178,9 @@ enum Command {
         id_file: Option<PathBuf>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -185,6 +201,9 @@ enum Command {
         /// Simple strategy (single pass, may have dangling refs)
         #[arg(short = 's', long)]
         simple: bool,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -199,6 +218,9 @@ enum Command {
         /// Keep untagged nodes in output (default: drop them)
         #[arg(long)]
         keep_untagged_nodes: bool,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -212,6 +234,9 @@ enum Command {
         /// Output PBF file
         #[arg(short, long)]
         output: PathBuf,
+        /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
@@ -242,16 +267,18 @@ fn main() {
             files,
             output,
             type_filter,
+            compression,
             direct_io,
-        } => run_cat(&files, &output, type_filter.as_deref(), direct_io),
-        Command::Sort { file, output, direct_io } => run_sort(&file, &output, direct_io),
+        } => run_cat(&files, &output, type_filter.as_deref(), &compression, direct_io),
+        Command::Sort { file, output, compression, direct_io } => run_sort(&file, &output, &compression, direct_io),
         Command::TagsFilter {
             file,
             output,
             omit_referenced,
             expressions,
+            compression,
             direct_io,
-        } => run_tags_filter(&file, &output, &expressions, omit_referenced, direct_io),
+        } => run_tags_filter(&file, &output, &expressions, omit_referenced, &compression, direct_io),
         Command::Diff {
             old,
             new,
@@ -272,35 +299,40 @@ fn main() {
             add_referenced,
             id_file,
             ids,
+            compression,
             direct_io,
-        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids, direct_io),
+        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids, &compression, direct_io),
         Command::Removeid {
             file,
             output,
             id_file,
             ids,
+            compression,
             direct_io,
-        } => run_removeid(&file, &output, id_file.as_deref(), &ids, direct_io),
+        } => run_removeid(&file, &output, id_file.as_deref(), &ids, &compression, direct_io),
         Command::Extract {
             file,
             output,
             bbox,
             polygon,
             simple,
+            compression,
             direct_io,
-        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple, direct_io),
+        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple, &compression, direct_io),
         Command::AddLocationsToWays {
             file,
             output,
             keep_untagged_nodes,
+            compression,
             direct_io,
-        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, direct_io),
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &compression, direct_io),
         Command::Merge {
             base,
             changes,
             output,
+            compression,
             direct_io,
-        } => run_merge(&base, &changes, &output, direct_io),
+        } => run_merge(&base, &changes, &output, &compression, direct_io),
     };
 
     if let Err(e) = result {
@@ -418,14 +450,36 @@ fn run_tags_count(
     Ok(())
 }
 
+fn parse_compression(s: &str) -> Result<Compression, Box<dyn std::error::Error>> {
+    match s {
+        "none" => Ok(Compression::None),
+        "zlib" => Ok(Compression::default()),
+        "zstd" => Ok(Compression::Zstd(3)),
+        _ if s.starts_with("zlib:") => {
+            let level: u32 = s[5..].parse().map_err(|_| format!("invalid zlib level: {s}"))?;
+            if level > 9 {
+                return Err(format!("zlib level must be 0-9, got {level}").into());
+            }
+            Ok(Compression::Zlib(level))
+        }
+        _ if s.starts_with("zstd:") => {
+            let level: i32 = s[5..].parse().map_err(|_| format!("invalid zstd level: {s}"))?;
+            Ok(Compression::Zstd(level))
+        }
+        _ => Err(format!("unknown compression: {s} (expected none, zlib, zlib:LEVEL, zstd, zstd:LEVEL)").into()),
+    }
+}
+
 fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
     type_filter: Option<&str>,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let compression = parse_compression(compression)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, direct_io)?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -433,9 +487,11 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: &std::path::Path,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::sort::sort(file, output, direct_io)?;
+    let compression = parse_compression(compression)?;
+    let stats = pbfhogg::sort::sort(file, output, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -445,9 +501,11 @@ fn run_tags_filter(
     output: &std::path::Path,
     expressions: &[String],
     omit_referenced: bool,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, direct_io)?;
+    let compression = parse_compression(compression)?;
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -501,10 +559,12 @@ fn run_getid(
     add_referenced: bool,
     id_file: Option<&std::path::Path>,
     ids: &[String],
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let compression = parse_compression(compression)?;
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, direct_io)?;
+    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -514,10 +574,12 @@ fn run_removeid(
     output: &std::path::Path,
     id_file: Option<&std::path::Path>,
     ids: &[String],
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let compression = parse_compression(compression)?;
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set, direct_io)?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -528,8 +590,10 @@ fn run_extract(
     bbox_str: Option<&str>,
     polygon_path: Option<&std::path::Path>,
     simple: bool,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let compression = parse_compression(compression)?;
     let region = match (bbox_str, polygon_path) {
         (Some(s), None) => {
             let bbox = pbfhogg::extract::parse_bbox(s)?;
@@ -539,7 +603,7 @@ fn run_extract(
         (None, None) => return Err("one of --bbox or --polygon is required".into()),
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
-    let stats = pbfhogg::extract::extract(file, output, &region, simple, direct_io)?;
+    let stats = pbfhogg::extract::extract(file, output, &region, simple, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -548,10 +612,12 @@ fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let compression = parse_compression(compression)?;
     let stats =
-        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes, direct_io)?;
+        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -560,9 +626,11 @@ fn run_merge(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
+    compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::merge::merge(base, changes, output, direct_io)?;
+    let compression = parse_compression(compression)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }

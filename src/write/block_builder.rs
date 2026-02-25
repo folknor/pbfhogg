@@ -585,20 +585,10 @@ impl BlockBuilder {
     /// (zero capacity), so after this call all dense_* fields are empty Vecs
     /// with no heap allocation.
     ///
-    /// This means the next block-building cycle (after `reset()`) starts with
-    /// zero-capacity Vecs, losing the pre-allocation from `new()`. This is
-    /// acceptable because:
-    ///   1. `take()` is called from `self.take()`, which calls `self.reset()`
-    ///      afterward — and callers typically call `BlockBuilder::new()` for a
-    ///      fresh builder, not reuse the same instance.
-    ///   2. Even if the builder IS reused, the cost is O(log N) reallocations
-    ///      per block (growing from 0 to 8000), which is negligible compared
-    ///      to the protobuf serialization and zlib compression cost.
-    ///   3. A potential future optimization: after `std::mem::take`, re-allocate
-    ///      the Vecs in `reset()` with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)`
-    ///      so reused builders also benefit from pre-allocation. Not done yet
-    ///      because the current usage pattern (one builder per block) doesn't
-    ///      benefit from it.
+    /// This means the dense_* fields are left at zero capacity after this call.
+    /// `reset()` detects this and re-allocates them with `Vec::with_capacity`,
+    /// so the next block-building cycle starts with the same pre-allocation as
+    /// `new()`.
     fn take_dense_nodes_group(&mut self) -> osmformat::PrimitiveGroup {
         let mut group = osmformat::PrimitiveGroup::new();
         let mut dense = osmformat::DenseNodes::new();
@@ -661,6 +651,21 @@ impl BlockBuilder {
         self.last_dense_changeset = 0;
         self.last_dense_uid = 0;
         self.last_dense_user_sid = 0;
+
+        // Re-allocate dense Vecs that were consumed by take_dense_nodes_group().
+        // mem::take() leaves zero capacity; this restores the pre-allocation from new().
+        if self.dense_ids.capacity() == 0 {
+            self.dense_ids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_lats = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_lons = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_keys_vals = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK * 2);
+            self.dense_versions = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_timestamps = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_changesets = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_uids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_user_sids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+            self.dense_visibles = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
+        }
     }
 }
 

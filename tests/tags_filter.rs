@@ -8,6 +8,7 @@ use common::{
     write_test_pbf, TestNode, TestRelation, TestWay,
 };
 use pbfhogg::tags_filter::tags_filter;
+use pbfhogg::writer::Compression;
 use tempfile::TempDir;
 
 fn exprs(strs: &[&str]) -> Vec<String> {
@@ -35,7 +36,7 @@ fn key_only_filter() {
         &[],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["amenity"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["amenity"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -63,7 +64,7 @@ fn exact_value_filter() {
         &[],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(way_ids(&c), vec![10]);
@@ -88,7 +89,7 @@ fn multi_value_filter() {
         ],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["type=multipolygon,boundary"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["type=multipolygon,boundary"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(relation_ids(&c), vec![1, 2]);
@@ -112,7 +113,7 @@ fn negation_filter() {
         &[],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["highway!=primary"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["highway!=primary"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     // Only way 11 matches: has highway tag with value != primary
@@ -139,7 +140,7 @@ fn wildcard_prefix_filter() {
         &[],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["addr:*"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["addr:*"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2]);
@@ -164,7 +165,7 @@ fn type_prefix_filter() {
     );
 
     // w/ prefix — only ways
-    let stats = tags_filter(&input, &output, &exprs(&["w/building=yes"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["w/building=yes"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert!(node_ids(&c).is_empty());
@@ -192,7 +193,7 @@ fn combined_type_prefix_nw() {
         ],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["nw/natural=tree"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["nw/natural=tree"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1]);
@@ -224,7 +225,7 @@ fn two_pass_includes_way_dep_nodes() {
     );
 
     // Default mode (include references)
-    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), false, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), false, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]); // referenced nodes included
@@ -253,7 +254,7 @@ fn omit_referenced_excludes_way_dep_nodes() {
     );
 
     // -R mode (omit references)
-    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["highway=primary"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert!(node_ids(&c).is_empty()); // no referenced nodes
@@ -287,6 +288,7 @@ fn two_pass_direct_node_match_plus_way_deps() {
         &output,
         &exprs(&["amenity", "highway=primary"]),
         false,
+        Compression::default(),
         false,
     )
     .expect("filter");
@@ -314,7 +316,7 @@ fn empty_result_produces_valid_pbf() {
         &[],
     );
 
-    let stats = tags_filter(&input, &output, &exprs(&["nonexistent_key"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["nonexistent_key"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert!(node_ids(&c).is_empty());
@@ -343,7 +345,7 @@ fn multiple_expressions_or_semantics() {
     );
 
     // Both "amenity" and "shop" — OR semantics
-    let stats = tags_filter(&input, &output, &exprs(&["amenity", "shop"]), true, false).expect("filter");
+    let stats = tags_filter(&input, &output, &exprs(&["amenity", "shop"]), true, Compression::default(), false).expect("filter");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2]);

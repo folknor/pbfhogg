@@ -109,7 +109,7 @@ struct OwnedRelation {
 /// sorted, and re-encoded.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path, direct_io: bool) -> Result<SortStats> {
+pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bool) -> Result<SortStats> {
     // Pass 1: Build blob index
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(input, direct_io)?;
@@ -127,7 +127,7 @@ pub fn sort(input: &Path, output: &Path, direct_io: bool) -> Result<SortStats> {
 
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing sorted output...");
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
 
     // Write header
     let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));

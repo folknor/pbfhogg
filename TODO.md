@@ -95,14 +95,15 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   Largest potential win but most complex — requires BlockBuilder to accept raw
   protobuf fragments, or a separate "patch block" codepath.
 
-- [ ] **Tag/ref Vec allocation churn** — `write_base_dense_node`, `write_base_way`,
-  etc. collect tags and refs into fresh Vecs per element (~4.4M small allocations).
-  Could reuse thread-local buffers, or pass iterators directly to BlockBuilder
-  instead of collecting.
+- [x] **Tag/ref Vec allocation churn** — `rewrite_block` now hoists 3 reusable
+  buffers (`tags_buf`, `refs_buf`, `members_buf`) and threads them through
+  `rewrite_element` → `write_base_*`. Uses `clear()` + `extend()` pattern (same
+  as cat.rs). OSC replacement writes (rare) keep local `collect()` to avoid
+  lifetime invariance issues between block and diff data.
 
-- [ ] **BlockBuilder Vec reuse across blocks** — after `take()`, internal Vecs
-  lose capacity via `mem::take`. Re-allocating with `Vec::with_capacity(8000)`
-  in `reset()` would avoid grow-from-zero on each of the ~550 rewritten blocks.
+- [x] **BlockBuilder Vec reuse across blocks** — `reset()` now re-allocates
+  dense Vecs with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)` when `capacity()
+  == 0` (after `take()` strips capacity via `mem::take`).
 
 - [ ] **Protobuf serialization in `take`** — `write_to_bytes()` uses the
   `protobuf` crate (not the fastest). 673ms across 7408 calls (91µs avg) is
@@ -207,12 +208,12 @@ pipeline becomes **I/O-bound**. Now io_uring's batched async writes and register
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
 - [ ] **erofs + uncompressed PBFs (single decompression layer).** Currently double
-  decompression: erofs lz4 in kernel → zlib in userspace. With `Compression::None`
+  decompression: erofs lz4 in kernel → zlib in userspace. With `--compression none`
   on erofs, the stack becomes: erofs lz4 → raw blob data. On-disk size is comparable
   (erofs lz4 achieves similar ratios to zlib on OSM data). Trade-off: PBF files are
   3-4x larger when copied off erofs, but for a local pipeline where you control
-  storage this is the single biggest throughput win. Add `--compression none` flag
-  to merge/sort/cat.
+  storage this is the single biggest throughput win. `--compression` flag is now
+  available on all 8 PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL).
 
 - [ ] **io_uring writer thread.** Replace the synchronous `BufWriter` + `write_all`
   writer thread with an io_uring submission loop. Register the output fd
@@ -246,8 +247,9 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 1. ~~**O_DIRECT (Tier 1)** — write + read paths done.~~
 2. ~~**`copy_file_range` (Tier 1)** — merge + cat + sort passthrough done.~~
-3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already
-   supported), needed to make the pipeline I/O-bound.
+3. ~~**`Compression::None` (Tier 2 prereq)** — `--compression` flag added to all 8
+   PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL). Pipeline is now
+   I/O-bound with `--compression none`.~~
 4. **io_uring writer thread (Tier 2)** — only after Compression::None makes writes the
    bottleneck. Registered buffers + WriteFixed + free-list pattern.
 

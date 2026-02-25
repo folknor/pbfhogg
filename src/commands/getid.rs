@@ -105,19 +105,20 @@ pub fn getid(
     output: &Path,
     ids: &IdSet,
     add_referenced: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<GetidStats> {
     if add_referenced {
-        getid_with_refs(input, output, ids, direct_io)
+        getid_with_refs(input, output, ids, compression, direct_io)
     } else {
-        filter_by_id(input, output, ids, true, direct_io)
+        filter_by_id(input, output, ids, true, compression, direct_io)
     }
 }
 
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &IdSet, direct_io: bool) -> Result<GetidStats> {
-    filter_by_id(input, output, ids, false, direct_io)
+pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
+    filter_by_id(input, output, ids, false, compression, direct_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -130,9 +131,10 @@ fn filter_by_id(
     output: &Path,
     ids: &IdSet,
     include: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<GetidStats> {
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
     let mut stats = GetidStats {
@@ -183,7 +185,7 @@ fn filter_by_id(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, direct_io: bool) -> Result<GetidStats> {
+fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -210,7 +212,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, direct_io: bool) ->
     }
 
     // Pass 2: Write matching elements + dependent nodes.
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 

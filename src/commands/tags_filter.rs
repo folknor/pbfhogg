@@ -216,13 +216,14 @@ pub fn tags_filter(
     output: &Path,
     expression_strs: &[String],
     omit_referenced: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let expressions = parse_expressions(expression_strs)?;
     if omit_referenced {
-        tags_filter_single_pass(input, output, &expressions, direct_io)
+        tags_filter_single_pass(input, output, &expressions, compression, direct_io)
     } else {
-        tags_filter_two_pass(input, output, &expressions, direct_io)
+        tags_filter_two_pass(input, output, &expressions, compression, direct_io)
     }
 }
 
@@ -235,9 +236,10 @@ fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
     let mut stats = TagsFilterStats {
@@ -389,6 +391,7 @@ fn tags_filter_two_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
@@ -493,7 +496,7 @@ fn tags_filter_two_pass(
     way_dep_node_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 

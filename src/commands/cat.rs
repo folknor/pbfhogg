@@ -42,11 +42,12 @@ pub fn cat(
     files: &[&Path],
     output: &Path,
     type_filter: Option<&str>,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<CatStats> {
     match type_filter {
-        None => cat_passthrough(files, output, direct_io),
-        Some(filter) => cat_filtered(files, output, filter, direct_io),
+        None => cat_passthrough(files, output, compression, direct_io),
+        Some(filter) => cat_filtered(files, output, filter, compression, direct_io),
     }
 }
 
@@ -103,8 +104,8 @@ fn read_raw_frame<R: Read>(
     }))
 }
 
-fn cat_passthrough(files: &[&Path], output: &Path, direct_io: bool) -> Result<CatStats> {
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool) -> Result<CatStats> {
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut header_written = false;
     let mut blobs: u64 = 0;
 
@@ -155,12 +156,12 @@ fn cat_passthrough(files: &[&Path], output: &Path, direct_io: bool) -> Result<Ca
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn cat_filtered(files: &[&Path], output: &Path, filter: &str, direct_io: bool) -> Result<CatStats> {
+fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool) -> Result<CatStats> {
     let filter_node = filter.contains("node");
     let filter_way = filter.contains("way");
     let filter_relation = filter.contains("relation");
 
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
     let mut blobs_decoded: u64 = 0;

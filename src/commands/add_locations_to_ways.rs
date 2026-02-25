@@ -57,10 +57,11 @@ pub fn add_locations_to_ways(
     input: &Path,
     output: &Path,
     keep_untagged_nodes: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<Stats> {
     let index = build_node_index(input, direct_io)?;
-    write_output(input, output, &index, keep_untagged_nodes, direct_io)
+    write_output(input, output, &index, keep_untagged_nodes, compression, direct_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -104,6 +105,7 @@ fn write_output(
     output: &Path,
     index: &HashMap<i64, (i32, i32)>,
     keep_untagged_nodes: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<Stats> {
     let mut stats = Stats {
@@ -115,7 +117,7 @@ fn write_output(
         missing_locations: 0,
     };
 
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 

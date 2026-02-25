@@ -8,11 +8,11 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 ## Features
 
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder
-- **Write** valid `.osm.pbf` files with `PbfWriter` and `BlockBuilder` — dense node packing, delta encoding, zlib compression
+- **Write** valid `.osm.pbf` files with `PbfWriter` and `BlockBuilder` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
 - **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
 - **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
 - **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
-- **Configurable compression** — pure Rust zlib (default), system zlib, or zlib-ng
+- **Configurable compression** — zlib (default), zstd, or none; pure Rust zlib, system zlib, or zlib-ng via feature flags
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
 
 ## Usage
@@ -56,6 +56,8 @@ pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
 ```
 
 Extract supports two strategies: `--simple` (single pass, fast, may have dangling refs) and complete-ways (default, two passes, all way nodes included).
+
+All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 
 ## Performance
 
@@ -123,6 +125,24 @@ let writer = PbfWriter::to_path_pipelined_direct(path, compression, &header_byte
 ```
 
 O_DIRECT requires a real filesystem (not tmpfs). Wall time is unchanged at country scale (CPU-bound on zlib compression) — the benefit is cache hygiene at planet scale.
+
+## Compression
+
+All write commands support `--compression` to control blob compression:
+
+```
+pbfhogg merge base.osm.pbf changes.osc.gz -o output.osm.pbf --compression none
+pbfhogg sort input.osm.pbf -o output.osm.pbf --compression zstd
+pbfhogg cat input.osm.pbf -o output.osm.pbf --compression zlib:9
+```
+
+| Value | Description |
+|-------|-------------|
+| `none` | No compression. Fastest writes, largest files. Ideal for intermediate files or erofs storage (where the filesystem handles compression). |
+| `zlib` | Zlib level 6 (default). Standard PBF compression, compatible with all tools. |
+| `zlib:LEVEL` | Zlib with explicit level (0-9). Higher = smaller + slower. |
+| `zstd` | Zstandard level 3. Better compression ratio and faster decompression than zlib. |
+| `zstd:LEVEL` | Zstandard with explicit level. |
 
 ## License
 

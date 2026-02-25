@@ -345,12 +345,13 @@ pub fn extract(
     output: &Path,
     region: &Region,
     simple: bool,
+    compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
     if simple {
-        extract_simple(input, output, region, direct_io)
+        extract_simple(input, output, region, compression, direct_io)
     } else {
-        extract_complete_ways(input, output, region, direct_io)
+        extract_complete_ways(input, output, region, compression, direct_io)
     }
 }
 
@@ -358,7 +359,7 @@ pub fn extract(
 // Simple strategy (single pass)
 // ---------------------------------------------------------------------------
 
-fn extract_simple(input: &Path, output: &Path, region: &Region, direct_io: bool) -> Result<ExtractStats> {
+fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -367,7 +368,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, direct_io: bool)
         strategy: "simple",
     };
 
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 
@@ -484,7 +485,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, direct_io: bool)
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
-fn extract_complete_ways(input: &Path, output: &Path, region: &Region, direct_io: bool) -> Result<ExtractStats> {
+fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -574,7 +575,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, direct_io
     matched_relation_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
-    let mut writer = PbfWriter::to_path(output, Compression::default())?;
+    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 

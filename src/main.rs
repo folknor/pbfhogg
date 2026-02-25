@@ -1,3 +1,6 @@
+// Optional allocator overrides. Benchmarked on Denmark (483 MB): both jemalloc and
+// mimalloc showed <1% wall time difference vs the system allocator. Kept as opt-in
+// features for consumers who want lower RSS at planet scale.
 #[cfg(feature = "jemalloc")]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;

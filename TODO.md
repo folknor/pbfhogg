@@ -27,32 +27,6 @@ Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
 Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
 tags-count to keep stdout manageable.
 
-### Finding 1: `decode_blob` allocation churn — SOLVED
-
-Originally 10.2 GB of cumulative alloc/dealloc for Denmark (21x amplification).
-Fully solved in three steps:
-
-- [x] **Reuse decompression buffers in merge.** `decompress_blob_data_into()` with
-  caller-provided buffer. Merge passthrough blobs (91%) reuse the buffer.
-- [x] **Investigate alternative allocators.** jemalloc/mimalloc showed <1% impact.
-  Features kept for consumers who want lower RSS at planet scale.
-- [x] **Pool decompression buffers in pipelined read path.** `DecompressPool` +
-  `Bytes::from_owner()` returns Vec to pool on drop. Process alloc: 10.2 GB → 265 MB (-97%).
-- [x] **Custom wire-format parser.** Eliminated remaining 9.3 GB of protobuf Vec
-  allocations. See "Reduce protobuf parsing allocations" below.
-
-### Finding 2: `tags_count` allocates 2.5 GB on the main thread (Denmark)
-
-**Fixed.** Two-level `FxHashMap<String, FxHashMap<String, u64>>` with `get_mut(&str)`
-lookups — no allocation for existing entries. Only new (key, value) pairs allocate.
-Also removed `Box<dyn Iterator>` by inlining tag iteration per element type.
-
-Results (Denmark):
-- Wall time: 8.11s → **4.77s** (-41%)
-- `main` alloc: 2.5 GB → **436 MB** (-83%)
-- Main thread CPU: 100% → **11-16%** (no longer bottleneck)
-- Process dealloc: 10.6 GB → **10.0 GB** (-600 MB, temporary Strings eliminated)
-
 ### Finding 3: main thread is the bottleneck in pipelined reads
 
 **Partially fixed.** check-refs: main thread 100% CPU, workers 1% each (5 threads).
@@ -126,19 +100,6 @@ mmap:        3229 ms
 blobreader:  3215 ms
 ```
 
-### Finding 6: merge spends 66% of time compressing rewritten blobs — SOLVED
-
-`frame_blob` (zlib compression) was 5.30s sequential for 632 blobs. Now runs
-in parallel via `PbfWriter::to_path_pipelined`: rayon tasks compress blobs,
-a dedicated writer thread reorders and writes them in sequence. Raw passthrough
-blobs (`write_raw`) bypass rayon and go directly to the writer thread.
-
-Result: **8.06s → 3.03s** (62% faster). 5.67s of compression spread across
-4 worker threads. The writer thread runs at 5% CPU (I/O bound).
-
-- [x] **Parallel compression in merge.** Implemented as `WritePipeline` in
-  `writer.rs` with `to_path_pipelined` constructor.
-
 ### Finding 7: merge decompresses all blobs for ID range scanning
 
 All 7,396 blobs are decompressed to scan ID ranges and decide passthrough vs
@@ -182,26 +143,6 @@ actual block parsing for the 630 rewritten blobs very cheap (14ms, 17 MB alloc).
   consumer is merge's `par_bridge` in `classify_blob`. The `thread_local::ThreadLocal` trick
   could replace merge's `map_init(Vec::new, ...)` pattern for per-thread buffer reuse.
 
-## Performance: parsing hot paths
-
-- [x] **ID-only scan mode — not worth it.** check-refs is main-thread bound at
-  100% CPU (RoaringTreemap). Decode workers run at 1% CPU. The wire parser already
-  skips unnecessary fields during single-pass tag scanning.
-- [x] **Selective parse for check_refs — not worth it.** Same conclusion: consumer-bound.
-- [x] **Reduce protobuf parsing allocations (~9.3 GB for Denmark).** Implemented
-  option (c): protozero-style custom wire-format decoder in `src/read/wire.rs`
-  (~900 lines). All packed repeated fields (ids, lats, lons, refs, keys, vals)
-  are now iterated on-the-fly from raw bytes via `PackedIter` — zero Vec alloc.
-  `WireStringTable` stores `Vec<(u32,u32)>` offsets (8 bytes/entry vs 32).
-  `PrimitiveBlock` owns `Bytes` + `WireBlock<'static>` (self-referential struct
-  with lifetime erased via unsafe transmute). HeaderBlock and write path stay on
-  `protobuf` crate. Results (Denmark):
-  - Cumulative decode alloc: 9.3 GB → 130 MB (block::new only, **-98.6%**)
-  - Sequential: 5378 → 3076 ms (**-43%**)
-  - Parallel: 541 → 302 ms (**-44%**)
-  - Pipelined: 1599 ms (**-27%**)
-  - Mmap/blobreader: ~3200 ms (**-43%**)
-
 ## Performance: memory / planet-scale
 
 - [ ] `commands/sort.rs` — reads entire PBF into fully-decoded owned Rust structs (`OwnedNode`,
@@ -225,10 +166,6 @@ actual block parsing for the 630 rewritten blobs very cheap (14ms, 17 MB alloc).
   **Total memory: ~2 GB regardless of input size.**
   Note: the existing `PbfWriter`/`BlockBuilder` are fully streaming and already support this —
   no writer changes needed.
-- [x] `dense.rs` — Lazy `DenseNodeInfo` decoding — **solved by wire parser.** The custom
-  wire-format parser already achieves this: `DenseNodeInfoIter` now uses packed varint
-  iterators that decode on-the-fly from raw bytes, rather than pre-materialized `Vec<i64>`
-  arrays. No separate lazy decoding pass needed.
 
 ## Dependencies
 

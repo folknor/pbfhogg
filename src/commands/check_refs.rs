@@ -52,9 +52,11 @@ impl RefCheckResult {
 /// - Relation member IDs and types (`r.members()`) — the memids and types arrays
 ///
 /// A pure "ID-only scan mode" that skips refs/members would not work here.
-/// A **selective parse** that skips stringtable, tags, coordinates, and metadata
-/// but keeps IDs + refs + members could help — this has not been benchmarked yet.
-/// See `PrimitiveBlock` doc comment in block.rs and TODO.md for the full analysis.
+/// A selective parse that skips stringtable, tags, coordinates, and metadata
+/// but keeps IDs + refs + members was considered but is **not worth it**: profiling
+/// shows check-refs is consumer-bound (main thread 100% CPU on RoaringTreemap
+/// insertions, decode workers idle at 1% CPU each). Faster parsing would not
+/// reduce wall time.
 ///
 /// # Planet-scale memory usage
 ///

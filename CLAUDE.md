@@ -28,6 +28,14 @@ If you need something these scripts don't cover, write a new script.
 Cross-validation scripts live in `verify/`. Each compares pbfhogg output against osmium (and other tools where applicable) on real PBF data. They build pbfhogg internally.
 - `verify/merge.sh [base.pbf] [changes.osc.gz]` — merge vs osmium/osmosis/osmconvert
 - `verify/sort.sh [input.pbf]` — sort vs osmium sort
+- `verify/cat.sh [input.pbf]` — cat with type filters vs osmium cat
+- `verify/extract.sh [input.pbf]` — bbox extract (simple + complete-ways) vs osmium extract
+- `verify/derive-changes.sh [old.pbf] [changes.osc.gz]` — derive-changes roundtrip vs osmium
+- `verify/diff.sh [old.pbf] [changes.osc.gz]` — diff summary vs osmium diff
+- `verify/add-locations-to-ways.sh [input.pbf]` — add-locations-to-ways vs osmium
+- `verify/tags-filter.sh [input.pbf]` — tags-filter with 3 expressions vs osmium
+- `verify/getid-removeid.sh [input.pbf]` — getid vs osmium getid, removeid complement test
+- `verify/check-refs.sh [input.pbf]` — check-refs vs osmium check-refs
 
 ## Subagents
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.

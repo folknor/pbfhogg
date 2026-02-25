@@ -305,14 +305,22 @@ command with pbfhogg and osmium on the same input, diff the outputs.
 
 - [x] `merge` — cross-validated against osmium, osmosis, osmconvert (commit a38c258)
 - [x] `sort` — cross-validated against osmium (`verify/sort.sh`, `tests/sort.rs`)
-- [ ] `cat` — compare `pbfhogg cat` vs `osmium cat` output (with and without type filters)
-- [ ] `extract` — compare bbox and polygon extract vs `osmium extract`
-- [ ] `derive-changes` — compare OSC output vs `osmium derive-changes`
-- [ ] `diff` — compare output vs `osmium diff`
-- [ ] `add-locations-to-ways` — compare vs `osmium add-locations-to-ways`
-- [ ] `tags-filter` — compare vs `osmium tags-filter`
-- [ ] `getid` / `removeid` — compare vs `osmium getid` / `osmium removeid`
-- [ ] `check-refs` — compare vs `osmium check-refs`
+- [x] `cat` — identical output for all 3 type filters (node/way/relation) (`verify/cat.sh`)
+- [x] `extract` — expected semantic differences in relation inclusion and boundary
+  precision. Simple: pbfhogg includes 127 more relations, osmium 2 more nodes + 1 way.
+  Complete-ways: osmium includes 133 more relations, 3 more nodes, 1 way. Node/way
+  counts 99.99% match. (`verify/extract.sh`)
+- [x] `derive-changes` — pbfhogg roundtrip is perfect (59.1M elements identical).
+  osmium roundtrip loses 1243 delete directives. (`verify/derive-changes.sh`)
+- [x] `diff` — 14-element discrepancy out of 59.1M (different comparison semantics
+  for version-only changes). (`verify/diff.sh`)
+- [x] `add-locations-to-ways` — identical output, 10.17M elements (`verify/add-locations-to-ways.sh`)
+- [x] `tags-filter` — identical for all 3 expressions with `-R` (`verify/tags-filter.sh`)
+- [x] `getid` / `removeid` — getid identical to osmium. removeid complement verified
+  (getid + removeid = original counts). osmium has no removeid command. (`verify/getid-removeid.sh`)
+- [x] `check-refs` — ways-only check identical (0 missing node refs). Relation check:
+  pbfhogg counts reference occurrences, osmium counts unique missing IDs — different
+  metric, not a bug. (`verify/check-refs.sh`)
 
 ## Nice to have
 

@@ -81,16 +81,18 @@ Read throughput — count all 59M elements in Denmark extract (483 MB), best of 
 
 CLI commands — Denmark extract (483 MB, 59M elements):
 
-| Tool | merge | sort | sort (unsorted) |
-|------|-------|------|-----------------|
-| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** |
-| osmium 1.19 | 7.2s | 11.6s | 21.3s |
+| Tool | merge | sort | sort (unsorted) | diff | extract |
+|------|-------|------|-----------------|------|---------|
+| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** | **24s** | 9s / 16s |
+| osmium 1.19 | 7.2s | 11.6s | 21.3s | 46s | **2s / 3s** |
 
-Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs).
+Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways strategy.
+
+All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria (99.99% node/way match). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
 System: Linux 6.18, Ryzen 9 7950X.
 
-Measured with `scripts/bench.sh`. Results are logged to `benchmarks.tsv` for tracking over time.
+Measured with `scripts/bench.sh`. Cross-validated with `verify/*.sh`.
 
 ## O_DIRECT I/O
 

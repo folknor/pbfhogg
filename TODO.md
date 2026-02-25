@@ -307,16 +307,21 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ## Test coverage gaps (from code quality review, Feb 2026)
 
-- [ ] No merge tests with metadata — a merge that strips metadata would pass all
-  existing tests. Add tests that verify version/timestamp/changeset preservation.
+- [x] No merge tests with metadata — added `merge_metadata_preservation` test
+  that builds a base PBF with version/timestamp/changeset/uid/user, applies an
+  OSC diff, and verifies unchanged nodes keep their metadata while OSC
+  replacements get default metadata (version 0, uid 0).
 
-- [ ] `roundtrip_real.rs` skips non-dense nodes (`Element::Node(_) => {}`). If
-  the Denmark PBF has any, the count assertion would catch it, but the actual
-  roundtrip of non-dense nodes is untested.
+- [x] `roundtrip_real.rs` skips non-dense nodes — this is by design.
+  `BlockBuilder` only produces dense nodes (there is no `add_node_non_dense()`).
+  Non-dense `Element::Node` from other PBF producers is read correctly but
+  converted to dense on write. The roundtrip_real test comment already documents
+  this. Not a test gap.
 
-- [ ] No test for `BlockBuilder` mixed-type assertion — what happens when you
-  `add_node` then `add_way` without `take()` in between? Currently panics, but
-  no test validates or documents this behavior.
+- [x] No test for `BlockBuilder` mixed-type assertion — added
+  `block_builder_mixed_type_panics` test with `#[should_panic]` that verifies
+  `add_way()` after `add_node()` without `take()` panics with the expected
+  message.
 
 ## Code TODOs
 

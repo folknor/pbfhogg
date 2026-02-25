@@ -634,6 +634,117 @@ fn merge_stats_accuracy() {
     assert_eq!(stats.base_relations, 1, "relation 100 passed through");
 }
 
+/// Verify that metadata (version/timestamp/changeset/uid/user) from base PBF
+/// nodes survives a merge. The OSC parser doesn't extract metadata, so OSC
+/// replacement nodes get default metadata — but unchanged base nodes must
+/// preserve their original version/timestamp/changeset/uid/user.
+#[test]
+fn merge_metadata_preservation() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Build base PBF with metadata on all nodes.
+    {
+        let mut writer =
+            PbfWriter::to_path(&base, Compression::default()).expect("create writer");
+        let header =
+            block_builder::build_header(None, None, None, None, &[]).expect("build header");
+        writer.write_header(&header).expect("write header");
+        let mut bb = BlockBuilder::new();
+
+        bb.add_node(
+            1, 100_000_000, 200_000_000,
+            &[("name", "one")],
+            Some(&block_builder::Metadata {
+                version: 5,
+                timestamp: 1_700_000_000,
+                changeset: 12345,
+                uid: 42,
+                user: "mapper",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            2, 300_000_000, 400_000_000,
+            &[("name", "two")],
+            Some(&block_builder::Metadata {
+                version: 3,
+                timestamp: 1_600_000_000,
+                changeset: 67890,
+                uid: 7,
+                user: "editor",
+                visible: true,
+            }),
+        );
+        bb.add_node(
+            3, 500_000_000, 600_000_000,
+            &[("name", "three")],
+            Some(&block_builder::Metadata {
+                version: 1,
+                timestamp: 1_500_000_000,
+                changeset: 11111,
+                uid: 99,
+                user: "creator",
+                visible: true,
+            }),
+        );
+        writer
+            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .expect("write");
+        writer.flush().expect("flush");
+    }
+
+    // Modify node 2, leave 1 and 3 unchanged.
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="4">
+      <tag k="name" v="two-modified"/>
+    </node>
+  </modify>
+</osmChange>"#);
+
+    merge(&base, &osc, &output, Compression::default(), false, false).expect("merge");
+
+    // Read output and verify metadata on unchanged nodes.
+    let reader = BlobReader::from_path(&output).expect("open pbf");
+    let mut node_meta: Vec<(i64, Option<(i32, i32)>)> = Vec::new();
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::DenseNode(dn) = element {
+                    let meta = dn.info().map(|info| (info.version(), info.uid()));
+                    node_meta.push((dn.id(), meta));
+                }
+            }
+        }
+    }
+
+    assert_eq!(node_meta.len(), 3);
+
+    // Node 1: unchanged, metadata preserved
+    assert_eq!(node_meta[0].0, 1);
+    let (version, uid) = node_meta[0].1.expect("node 1 should have metadata");
+    assert_eq!(version, 5, "node 1 version preserved");
+    assert_eq!(uid, 42, "node 1 uid preserved");
+
+    // Node 2: modified from OSC, gets default metadata (version 0, uid 0)
+    assert_eq!(node_meta[1].0, 2);
+    let (version, uid) = node_meta[1].1.expect("node 2 should have metadata (default)");
+    assert_eq!(version, 0, "OSC replacement gets default version");
+    assert_eq!(uid, 0, "OSC replacement gets default uid");
+
+    // Node 3: unchanged, metadata preserved
+    assert_eq!(node_meta[2].0, 3);
+    let (version, uid) = node_meta[2].1.expect("node 3 should have metadata");
+    assert_eq!(version, 1, "node 3 version preserved");
+    assert_eq!(uid, 99, "node 3 uid preserved");
+}
+
 // ---------------------------------------------------------------------------
 // Cross-validation against osmium
 // ---------------------------------------------------------------------------

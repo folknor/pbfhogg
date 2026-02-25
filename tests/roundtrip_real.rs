@@ -104,7 +104,11 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                     );
                 }
                 Element::Node(_) => {
-                    // Rare non-dense nodes — skip for this test
+                    // Non-dense nodes from other PBF producers are read correctly
+                    // but BlockBuilder only emits dense encoding (no
+                    // add_node_non_dense()), so they can't round-trip as-is.
+                    // They are counted in count_elements() and the count
+                    // assertion below will catch any that slip through.
                 }
                 Element::Way(w) => {
                     if last_type != Some("way") {

@@ -786,6 +786,16 @@ fn roundtrip_zstd() {
     }
 }
 
+/// Verify that adding a way after a node without take() panics.
+/// BlockBuilder enforces one element type per block.
+#[test]
+#[should_panic(expected = "cannot add way: block full or wrong type")]
+fn block_builder_mixed_type_panics() {
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 0, 0, &[], None);
+    bb.add_way(10, &[], &[1, 2], None); // should panic
+}
+
 /// Mixed metadata: some nodes have metadata, others don't (like merge OSC replacements).
 /// Tests that DenseInfo parallel arrays stay aligned with dense_ids.
 #[test]

@@ -1,0 +1,127 @@
+# gh-template
+
+A VitePress documentation template with custom typography (Jomhuria + EB Garamond), fluid 4K scaling, and pre-built color themes.
+
+## Themes
+
+| Theme | Brand | File |
+|---|---|---|
+| Default | Purple | `docs/.vitepress/theme/colors-default.css` |
+| Elivagar | Icy Cyan | `docs/.vitepress/theme/colors-elivagar.css` |
+| Pbfhogg | Blood Red | `docs/.vitepress/theme/colors-pbfhogg.css` |
+| Nidhogg | Emerald | Active in `docs/.vitepress/theme/style.css` |
+
+## Using this template in a project
+
+### Initial setup
+
+From your project repo:
+
+```sh
+# Add the template as a remote
+git remote add template git@github.com:user/gh-template.git
+
+# Fetch and merge the template into your repo
+git fetch template
+git merge template/master --allow-unrelated-histories
+```
+
+### Customize for your project
+
+1. **Config** — edit `docs/.vitepress/config.ts`:
+   ```ts
+   const projectName = 'YourProject'
+   const projectDescription = 'What it does'
+   const githubUrl = 'https://github.com/user/your-project'
+   const base = '/your-project/'  // must match your repo name
+   ```
+
+2. **Colors** — copy the palette you want into `style.css`, or replace the color variables in the `:root` and `.dark` blocks. The saved palettes are in `docs/.vitepress/theme/colors-*.css`.
+
+3. **Logos** — replace the SVGs in `docs/public/` with your own. Update the `logo` and hero `image` paths in `config.ts` and `docs/index.md`. If you need light/dark variants:
+   ```ts
+   logo: { light: '/my-logo.svg', dark: '/my-logo-dark.svg' }
+   ```
+
+4. **Content** — replace the placeholder docs in `docs/guide/` and `docs/api/` with your actual documentation. Update the sidebar entries in `config.ts` to match.
+
+### Pulling template updates
+
+When the template gets improvements (layout fixes, font tweaks, new features):
+
+```sh
+git fetch template
+git merge template/master
+```
+
+Resolve conflicts in the files you've customized (config, colors, content). The structural CSS and layout changes will merge cleanly.
+
+### Deploy to GitHub Pages
+
+Add `.github/workflows/docs.yml`:
+
+```yaml
+name: Deploy docs
+on:
+  push:
+    branches: [main]
+
+permissions:
+  pages: write
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install
+      - run: pnpm build
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+      - id: deployment
+        uses: actions/deploy-pages@v4
+```
+
+Then in your repo settings, enable Pages with source set to "GitHub Actions".
+
+Your site will be at `https://username.github.io/repo-name/`.
+
+## Local development
+
+```sh
+pnpm install
+pnpm dev        # http://localhost:5173
+pnpm build      # production build
+pnpm preview    # preview production build
+```
+
+## Structure
+
+```
+docs/
+  .vitepress/
+    theme/
+      style.css              # main theme (colors, typography, layout overrides)
+      colors-default.css     # saved palette: purple
+      colors-elivagar.css    # saved palette: icy cyan
+      colors-pbfhogg.css     # saved palette: blood red
+      index.ts               # theme entry point
+    config.ts                # VitePress config (nav, sidebar, project info)
+  public/
+    fonts/                   # Jomhuria, EB Garamond, Almendra
+    icons/                   # feature card icons (Fluent Color)
+    *.svg                    # project logos
+  guide/                     # guide pages
+  api/                       # API reference pages
+  index.md                   # home page
+```

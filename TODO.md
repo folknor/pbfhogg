@@ -49,16 +49,16 @@ block::new:           7396 calls, 97ms (1.3%), avg 13µs, P50 5µs, P99 166µs
 Main thread: 100% CPU. Workers: 1% CPU each (5 threads, vastly idle).
 ```
 
-**merge without indexdata (Denmark base + 1 OSC, osmium input):**
+**merge without indexdata (Denmark base + 1 OSC, osmium input, prost):**
 ```
-Wall: 3.16s, RSS: 91 MB (hotpath timing)
-frame_blob:           629 calls, 5.63s total (178%, parallel), avg 9.0ms
-classify_blob:        7386 calls, 3.25s (103%), avg 440µs, P50 259µs, P99 2.40ms
-rewrite_block:        630 calls, 1.82s (57.7%), avg 2.89ms
-block_builder::take:  7407 calls, 733ms (23.2%), avg 99µs
-read_raw_frame:       7399 calls, 103ms (3.2%), avg 14µs
-block::new:           630 calls, 14ms (0.5%), avg 23µs
-Clean (no hotpath): 3.07s best of 3.
+Wall: 2.78s, RSS: 97 MB (hotpath timing)
+frame_blob:           630 calls, 5.61s total (202%, parallel), avg 8.9ms
+classify_blob:        7385 calls, 3.23s (116%), avg 438µs, P50 263µs, P99 2.12ms
+rewrite_block:        630 calls, 1.49s (54%), avg 2.36ms, P50 2.83ms, P99 7.25ms
+block_builder::take:  7407 calls, 739ms (27%), avg 100µs, P50 10ns, P99 2.08ms
+read_raw_frame:       7399 calls, 82ms (3%), avg 11µs
+block::new:           630 calls, 14ms (0.5%), avg 21µs
+Clean (no hotpath): 2.61s best of 3.
 ```
 
 **merge with indexdata (Denmark base + 1 OSC, pbfhogg input):**
@@ -88,12 +88,36 @@ With indexdata, the merge bottleneck is `rewrite_block` (60%) + `block_builder::
 (24%) — the actual decode/re-encode work on the ~550 rewritten blocks. These
 process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
-- [ ] **Element-level raw passthrough in rewrite_block** — most elements in
-  rewritten blocks are unmodified. Currently they're fully decoded (tags, refs,
-  metadata) then re-encoded via BlockBuilder. Copying wire-format bytes directly
-  for unaffected elements would skip decode+re-encode for ~99% of elements.
-  Largest potential win but most complex — requires BlockBuilder to accept raw
-  protobuf fragments, or a separate "patch block" codepath.
+- [x] **Element-level raw passthrough in rewrite_block — investigated, not
+  feasible.** Two fundamental barriers prevent copying raw wire-format bytes for
+  unmodified elements:
+
+  1. **String table coupling (all element types).** Every element stores tag
+     keys/values, user names, and relation roles as varint-encoded indices into
+     the block-local StringTable. Raw bytes from one block can't be spliced into
+     another without remapping indices — and since varints change width with
+     value, remapping requires re-serializing the sub-message (same cost as full
+     reencode).
+
+  2. **Cross-element delta encoding (dense nodes).** Dense nodes store IDs, lat,
+     lon, timestamps as delta-encoded packed arrays across ALL nodes in the
+     block. There are no per-node byte boundaries. Removing or replacing one
+     node invalidates every subsequent delta. Ways and relations delta-encode
+     only within each element, but the string table barrier still blocks them.
+
+- [ ] **Pre-seed output StringTable from input block** — at the start of
+  `rewrite_block`, copy the input block's string table entries into the output
+  BlockBuilder's StringTable. Most `add()` calls would then hit the "already
+  exists" fast path (FxHashMap lookup) instead of hashing and inserting new
+  strings. Reduces per-element overhead for the ~99% unmodified elements that
+  reference the same tag keys/values as the input block.
+
+- [ ] **Raw packed bytes for non-string integer fields** — way refs and relation
+  memids/types are delta-encoded within each element (not across elements) and
+  have no string table dependency. BlockBuilder could accept pre-encoded packed
+  bytes for these fields instead of requiring decoded `Vec<i64>` / `Vec<MemberData>`,
+  skipping the decode-then-reencode round-trip for the largest arrays in each
+  element.
 
 - [x] **Tag/ref Vec allocation churn** — `rewrite_block` now hoists 3 reusable
   buffers (`tags_buf`, `refs_buf`, `members_buf`) and threads them through
@@ -105,9 +129,15 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   dense Vecs with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)` when `capacity()
   == 0` (after `take()` strips capacity via `mem::take`).
 
-- [ ] **Protobuf serialization in `take`** — `encode_to_vec()` uses prost
-  (infallible, ~3x faster than old protobuf crate). 673ms across 7408 calls
-  (91µs avg) was measured with the old crate — re-benchmark with prost.
+- [x] **Protobuf serialization in `take`** — re-benchmarked with prost.
+  `take()` is actually slightly slower: 739ms / 100µs avg (prost) vs 673ms /
+  91µs avg (old protobuf crate). However, overall `rewrite_block` improved 18%
+  (1.82s → 1.49s) and wall time improved 12% (3.16s → 2.78s) due to wire parser
+  changes elsewhere. P50 is 10ns (empty-block fast path — most of 7407 calls are
+  empty flushes). Real work is P95+ tail (475µs–2ms) for blocks with data.
+  `take()` at 27% of wall time is the second-largest cost after `rewrite_block`
+  (54%), but further optimization requires changing the serialization approach
+  (e.g. pre-sized buffer reuse instead of `encode_to_vec()`).
 
 ## Performance: parallelism
 

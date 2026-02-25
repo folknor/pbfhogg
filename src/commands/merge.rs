@@ -1,9 +1,9 @@
-// PBF merge: apply an OSC diff overlay to a base PBF, producing an updated PBF.
-//
-// Optimization: lightweight protobuf scanning extracts element type + ID range
-// from decompressed bytes without full parsing. Blocks outside the diff's ID
-// range are passed through without parsing. Once all element types are past
-// their max affected ID, remaining blobs skip decompression entirely.
+//! PBF merge: apply an OSC diff overlay to a base PBF, producing an updated PBF.
+//!
+//! Optimization: lightweight protobuf scanning extracts element type + ID range
+//! from decompressed bytes without full parsing. Blocks outside the diff's ID
+//! range are passed through without parsing. Once all element types are past
+//! their max affected ID, remaining blobs skip decompression entirely.
 
 use std::collections::HashSet;
 use std::io::{self, Read};

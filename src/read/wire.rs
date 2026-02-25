@@ -415,10 +415,16 @@ impl Iterator for PackedBoolIter<'_> {
 // WireStringTable — zero-copy indexed string table
 // ---------------------------------------------------------------------------
 
+/// String table storing buffer-relative offsets instead of `&[u8]` slices.
+///
+/// Offsets are relative to the decompressed buffer, not the StringTable message,
+/// because `PrimitiveBlock` in `block.rs` transmutes `WireBlock<'a>` to
+/// `WireBlock<'static>` for self-referential ownership — storing slices directly
+/// would create dangling references after the lifetime erasure.
 #[derive(Clone, Debug)]
 pub(crate) struct WireStringTable<'a> {
     buffer: &'a [u8],
-    entries: Vec<(u32, u32)>, // (offset, length) per string entry
+    entries: Vec<(u32, u32)>, // (offset, length) relative to buffer start
 }
 
 impl<'a> WireStringTable<'a> {
@@ -428,7 +434,7 @@ impl<'a> WireStringTable<'a> {
         while let Some((field, wire_type)) = cursor.read_tag()? {
             if field == 1 && wire_type == WIRE_LEN {
                 let bytes = cursor.read_len_delimited()?;
-                // Compute offset relative to buffer start
+                // Store buffer-relative offset (not a slice) — see WireStringTable doc.
                 let offset = bytes.as_ptr() as usize - buffer.as_ptr() as usize;
                 #[allow(clippy::cast_possible_truncation)]
                 entries.push((offset as u32, bytes.len() as u32));
@@ -456,11 +462,19 @@ impl<'a> WireStringTable<'a> {
 // WireBlock — parsed PrimitiveBlock
 // ---------------------------------------------------------------------------
 
+/// Parsed PrimitiveBlock — the root message of each data blob.
+///
+/// All fields borrow from `buffer` (the decompressed blob bytes). Group data
+/// and string table entries are stored as buffer-relative `(offset, length)`
+/// pairs rather than slices, because `PrimitiveBlock` in `block.rs` transmutes
+/// `WireBlock<'a>` to `WireBlock<'static>` for self-referential ownership.
+/// The `buffer` reference is reconstituted at access time via `group()` and
+/// `WireStringTable::get()`.
 #[derive(Debug)]
 pub(crate) struct WireBlock<'a> {
     buffer: &'a [u8],
     pub stringtable: WireStringTable<'a>,
-    pub group_ranges: Vec<(u32, u32)>,
+    pub group_ranges: Vec<(u32, u32)>, // (offset, length) relative to buffer start
     pub granularity: i32,
     pub lat_offset: i64,
     pub lon_offset: i64,
@@ -486,6 +500,7 @@ impl<'a> WireBlock<'a> {
                 // repeated PrimitiveGroup primitivegroup = 2
                 (2, WIRE_LEN) => {
                     let data = cursor.read_len_delimited()?;
+                    // Store buffer-relative offset (not a slice) — see WireBlock doc.
                     let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
                     #[allow(clippy::cast_possible_truncation)]
                     group_ranges.push((offset as u32, data.len() as u32));
@@ -541,6 +556,11 @@ impl<'a> WireBlock<'a> {
 // WireGroup — lazy PrimitiveGroup scanner
 // ---------------------------------------------------------------------------
 
+/// Lazy PrimitiveGroup scanner — yields raw sub-message bytes by element type.
+///
+/// Does not parse eagerly; each accessor (`nodes()`, `dense()`, `ways()`,
+/// `relations()`) scans the group's wire format for the target field number.
+/// A PrimitiveGroup contains exactly one element type per the OSM PBF spec.
 pub(crate) struct WireGroup<'a> {
     data: &'a [u8],
 }
@@ -579,6 +599,10 @@ impl<'a> WireGroup<'a> {
 // WireMessageIter — yields sub-message byte slices for a given field number
 // ---------------------------------------------------------------------------
 
+/// Iterator over length-delimited sub-messages matching a specific field number.
+///
+/// Used by `WireGroup` to yield raw bytes for each Node, Way, or Relation
+/// message within a PrimitiveGroup. Skips non-matching fields.
 pub(crate) struct WireMessageIter<'a> {
     cursor: Cursor<'a>,
     target_field: u32,

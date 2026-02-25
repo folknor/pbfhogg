@@ -36,7 +36,8 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 
 **Write path:** `BlockBuilder` (block_builder.rs) -> `PbfWriter` (writer.rs)
 - `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block.
-- `PbfWriter`: blob framing, zlib compression, raw passthrough for merges
+- `PbfWriter`: blob framing, compression (zlib/zstd/none), raw passthrough for merges. Sync mode (`to_path`) or pipelined mode (`to_path_pipelined`) with parallel compression via rayon + reorder buffer. O_DIRECT variants (`to_path_direct`, `to_path_pipelined_direct`) bypass page cache. io_uring variant (`to_path_pipelined_uring`) uses registered buffers + WriteFixed for I/O-bound workloads.
+- `uring_writer.rs`: io_uring writer thread — `AlignedBufferPool` (64×256KB registered buffers), `UringState` (buffered accumulation + WriteFixed submission + CQE reaping)
 
 **Proto:** `src/proto/{fileformat,osmformat}.proto` compiled by `prost-build` + `protox` in `build.rs`
 
@@ -52,4 +53,7 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 
 - `rust-zlib` (default): pure Rust zlib via flate2
 - `zlib`: system zlib
-- `zlib-ng`: zlib-ng (mutually exclusive)
+- `zlib-ng`: zlib-ng (mutually exclusive with above)
+- `zstd`: zstandard compression support
+- `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
+- `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)

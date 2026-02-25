@@ -42,12 +42,17 @@ echo "=== Diff (suppress-common) ==="
 echo ""
 
 # --- Dense index (verify output matches hash) ---
+# Dense index requires 128 GB virtual memory (vm.overcommit_memory=1 or large RAM).
+# Skipped gracefully if allocation fails.
 echo "--- pbfhogg add-locations-to-ways --index-type dense ---"
-time "$PBFHOGG" add-locations-to-ways "$INPUT" -o "$OUTDIR/pbfhogg-dense.osm.pbf" --index-type dense
-echo ""
-
-echo "=== Diff (hash vs dense) ==="
-"$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/pbfhogg-dense.osm.pbf"
-echo ""
+if time "$PBFHOGG" add-locations-to-ways "$INPUT" -o "$OUTDIR/pbfhogg-dense.osm.pbf" --index-type dense; then
+    echo ""
+    echo "=== Diff (hash vs dense) ==="
+    "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/pbfhogg-dense.osm.pbf"
+    echo ""
+else
+    echo "Dense index allocation failed (expected on <128 GB systems without vm.overcommit_memory=1)"
+    echo ""
+fi
 
 echo "Done."

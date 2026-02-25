@@ -56,7 +56,9 @@ pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456
 pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
 ```
 
-Extract supports two strategies: `--simple` (single pass, fast, may have dangling refs) and complete-ways (default, two passes, all way nodes included).
+Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
+
+Add-locations-to-ways supports `--index-type hash` (default, HashMap) and `--index-type dense` (anonymous mmap, 8 bytes/slot, for planet-scale — ~68 GB physical for 8.5B nodes vs HashMap's ~192 GB).
 
 All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 
@@ -81,14 +83,14 @@ Read throughput — count all 59M elements in Denmark extract (483 MB), best of 
 
 CLI commands — Denmark extract (483 MB, 59M elements):
 
-| Tool | merge | sort | sort (unsorted) | diff | extract |
-|------|-------|------|-----------------|------|---------|
-| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** | **24s** | 9s / 16s |
-| osmium 1.19 | 7.2s | 11.6s | 21.3s | 46s | **2s / 3s** |
+| Tool | merge | sort | sort (unsorted) | diff | extract | add-locs |
+|------|-------|------|-----------------|------|---------|----------|
+| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** | **24s** | 9 / 16 / 21s | 67s |
+| osmium 1.19 | 7.2s | 11.6s | 21.3s | 46s | **2 / 3 / 4s** | **13s** |
 
-Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways strategy.
+Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways / smart strategy. Add-locs is add-locations-to-ways (10.2M output elements, byte-identical output). osmium uses multi-threaded compression; pbfhogg extract and add-locations-to-ways are single-threaded.
 
-All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria (99.99% node/way match). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
+All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
 System: Linux 6.18, Ryzen 9 7950X.
 

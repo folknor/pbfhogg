@@ -88,22 +88,10 @@ With indexdata, the merge bottleneck is `rewrite_block` (60%) + `block_builder::
 (24%) — the actual decode/re-encode work on the ~550 rewritten blocks. These
 process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
-- [x] **Element-level raw passthrough in rewrite_block — investigated, not
-  feasible.** Two fundamental barriers prevent copying raw wire-format bytes for
-  unmodified elements:
-
-  1. **String table coupling (all element types).** Every element stores tag
-     keys/values, user names, and relation roles as varint-encoded indices into
-     the block-local StringTable. Raw bytes from one block can't be spliced into
-     another without remapping indices — and since varints change width with
-     value, remapping requires re-serializing the sub-message (same cost as full
-     reencode).
-
-  2. **Cross-element delta encoding (dense nodes).** Dense nodes store IDs, lat,
-     lon, timestamps as delta-encoded packed arrays across ALL nodes in the
-     block. There are no per-node byte boundaries. Removing or replacing one
-     node invalidates every subsequent delta. Ways and relations delta-encode
-     only within each element, but the string table barrier still blocks them.
+- [x] **Element-level raw passthrough in rewrite_block** — investigated, not
+  feasible. String table index coupling (all types) and cross-element delta
+  encoding (dense nodes) make per-element raw byte splicing impossible without
+  re-serialization that costs the same as full reencode.
 
 - [ ] **Pre-seed output StringTable from input block** — at the start of
   `rewrite_block`, copy the input block's string table entries into the output
@@ -119,25 +107,13 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   skipping the decode-then-reencode round-trip for the largest arrays in each
   element.
 
-- [x] **Tag/ref Vec allocation churn** — `rewrite_block` now hoists 3 reusable
-  buffers (`tags_buf`, `refs_buf`, `members_buf`) and threads them through
-  `rewrite_element` → `write_base_*`. Uses `clear()` + `extend()` pattern (same
-  as cat.rs). OSC replacement writes (rare) keep local `collect()` to avoid
-  lifetime invariance issues between block and diff data.
+- [x] **Tag/ref Vec allocation churn** — hoisted reusable buffers in `rewrite_block`.
 
-- [x] **BlockBuilder Vec reuse across blocks** — `reset()` now re-allocates
-  dense Vecs with `Vec::with_capacity(MAX_ENTITIES_PER_BLOCK)` when `capacity()
-  == 0` (after `take()` strips capacity via `mem::take`).
+- [x] **BlockBuilder Vec reuse across blocks** — `reset()` preserves capacity.
 
-- [x] **Protobuf serialization in `take`** — re-benchmarked with prost.
-  `take()` is actually slightly slower: 739ms / 100µs avg (prost) vs 673ms /
-  91µs avg (old protobuf crate). However, overall `rewrite_block` improved 18%
-  (1.82s → 1.49s) and wall time improved 12% (3.16s → 2.78s) due to wire parser
-  changes elsewhere. P50 is 10ns (empty-block fast path — most of 7407 calls are
-  empty flushes). Real work is P95+ tail (475µs–2ms) for blocks with data.
-  `take()` at 27% of wall time is the second-largest cost after `rewrite_block`
-  (54%), but further optimization requires changing the serialization approach
-  (e.g. pre-sized buffer reuse instead of `encode_to_vec()`).
+- [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
+  (slightly slower than old crate's 673ms). `take()` is 27% of wall time; further
+  gains need buffer reuse instead of `encode_to_vec()`.
 
 ## Performance: parallelism
 
@@ -172,14 +148,8 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
 ## Performance: memory / planet-scale
 
-- [x] `commands/sort.rs` — **blob-level permutation sort implemented.** Two-pass architecture:
-  pass 1 indexes each blob's element type + ID range (from indexdata or decompress+scan),
-  sorts by (type, min_id); pass 2 writes in sorted order. Non-overlapping blobs pass through
-  as raw bytes (`write_raw` or `copy_file_range`); overlapping blobs are decoded, sorted, and
-  re-encoded. Memory: O(num_blobs) (~42 bytes × 10K blobs for planet = ~420 KB). Passthrough
-  blobs without indexdata are reframed with `reframe_raw_with_index()` to enrich future ops.
-  Denmark benchmark: 3.0s (100% passthrough, 7396 blobs, zero overlap). Previously required
-  loading all ~59M elements into owned structs (~400 GB for planet).
+- [x] `commands/sort.rs` — blob-level permutation sort. O(num_blobs) memory,
+  passthrough for non-overlapping blobs. Denmark: 3.0s, 100% passthrough.
 
 ## Performance: Linux kernel features for planet-scale I/O
 
@@ -197,31 +167,12 @@ The generic path is CPU-bound on zlib compression/decompression. io_uring adds
 negligible value here (~30ms syscall savings on 80GB). Focus on page cache hygiene
 and kernel-space copy.
 
-- [x] **O_DIRECT for planet-scale writes (write path).** Feature-gated
-  `linux-direct-io`. `DirectWriter` uses page-aligned buffer (`AlignedBuffer` via
-  `std::alloc`), `O_DIRECT` + `libc::write`, and `ftruncate` for final partial page.
-  `FileWriter` enum wraps `BufWriter<File>` or `DirectWriter` — single concrete type
-  across all 7 command files, zero-cost when feature is off. Both sync (`to_path_direct`)
-  and pipelined (`to_path_pipelined_direct`) constructors. CLI: `--direct-io` on merge.
+- [x] **O_DIRECT writes + reads.** Feature-gated `linux-direct-io`. `DirectWriter`/
+  `DirectReader` with page-aligned buffers, wrapped in `FileWriter`/`FileReader` enums.
+  All commands accept `--direct-io`.
 
-- [x] **O_DIRECT for planet-scale reads (read path).** `DirectReader` uses
-  page-aligned buffer + `libc::read()`, wrapped in `FileReader` enum (mirrors
-  `FileWriter`). `BlobReader::open(path, direct_io)` and `ElementReader::open(path,
-  direct_io)` select at runtime. All commands accept `--direct-io` for both reads
-  and writes. Seekable/indexed paths stay on `BufReader<File>` (O_DIRECT + seek
-  requires complex alignment math, not on the planet-scale hot path).
-
-- [x] **`copy_file_range` for blob passthrough in merge/cat.** Passthrough blobs
-  are copied between file descriptors entirely in kernel space via
-  `copy_file_range(in_fd, &offset, out_fd, NULL, blob_len, 0)`. No userspace
-  buffer, no user/kernel boundary crossing. On btrfs/xfs with reflinks, it's
-  metadata-only (instant). `PbfWriter::write_raw_copy()` + `PipelinePayload::CopyRange`
-  handle both pipelined and sync paths. Gated behind `linux-direct-io` feature
-  (no new deps). O_DIRECT output falls back to `write_raw` (incompatible with
-  DirectWriter's page-aligned buffering). Denmark merge benchmark: 2.73s
-  (copy_file_range) vs 2.81s (write_raw), ~3% improvement. Sort also wired up
-  (passthrough blobs with indexdata use copy_file_range). Larger gains expected
-  at planet scale where 99%+ blobs are passthrough.
+- [x] **`copy_file_range` for blob passthrough.** Kernel-space copy in merge/cat/sort.
+  ~3% improvement on Denmark (2.73s vs 2.81s), larger gains at planet scale.
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
@@ -247,45 +198,23 @@ kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
 pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
-- [x] **erofs + uncompressed PBFs (single decompression layer).** `--compression`
-  flag available on all 8 PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL),
-  and `Compression` enum is public API for library consumers (nidhogg uses
-  `Compression::None` directly). On erofs the stack becomes: erofs lz4 → raw blob
-  data (single decompression layer). PBF files are 3-4x larger when copied off erofs,
-  but for a local pipeline where you control storage this is the single biggest
-  throughput win.
+- [x] **erofs + uncompressed PBFs.** `--compression` flag on all write commands,
+  `Compression` enum public API. On erofs: single lz4 decompression layer.
 
-- [x] **io_uring writer thread.** `--io-uring` on merge uses `O_DIRECT` + io_uring
-  `WriteFixed` with 64 pre-registered page-aligned 256KB buffers (16MB total,
-  charged against `RLIMIT_MEMLOCK`). `io-uring` crate v0.7 (tokio-rs, synchronous,
-  no async runtime). Data accumulated into registered buffers (same strategy as
-  `DirectWriter`), submitted as `WriteFixed` SQEs with explicit file offsets, CQEs
-  reaped to recycle buffer indices via free-list. CopyRange passthrough blobs handled
-  via `pread` into the ring write path (no `copy_file_range` — incompatible with
-  io_uring-managed O_DIRECT fd). Feature-gated: `linux-io-uring`.
+- [x] **io_uring writer thread.** `--io-uring` on merge. O_DIRECT + WriteFixed with
+  64 registered 256KB buffers (16MB). Feature-gated `linux-io-uring`.
 
   **Future optimizations:**
   - SQ polling (`setup_sqpoll`) — eliminates `io_uring_enter` syscalls, consumes a CPU core
   - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
   - `pread` directly into registered buffer instead of heap allocation
 
-### Implementation order
-
-1. ~~**O_DIRECT (Tier 1)** — write + read paths done.~~
-2. ~~**`copy_file_range` (Tier 1)** — merge + cat + sort passthrough done.~~
-3. ~~**`Compression::None` (Tier 2 prereq)** — `--compression` flag added to all 8
-   PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL). Pipeline is now
-   I/O-bound with `--compression none`.~~
-4. ~~**io_uring writer thread (Tier 2)** — registered buffers + WriteFixed + free-list.~~
-
 ## Dependencies
 
 - [ ] CLI-only dependencies (`clap`, `quick-xml`, `serde_json`) are runtime deps of the library
   crate. Library-only users pay the compile cost. Consider a `cli` feature gate or separate
   `pbfhogg-cli` binary crate.
-- [x] ~~`protobuf` crate~~ — migrated to `prost` v0.14 + `protox` v0.9. Both proto files
-  flatten into `crate::proto::*` (single `osmpbf.rs`). Public API change: `HeaderBlock::required_features()`
-  and `optional_features()` now return `&[String]` instead of `&[protobuf::Chars]`.
+- [x] ~~`protobuf` crate~~ — migrated to `prost` v0.14 + `protox` v0.9.
 
 ## Before crates.io publish
 

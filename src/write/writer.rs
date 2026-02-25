@@ -357,10 +357,18 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// In pipelined mode, the writer was moved to the writer thread and is
     /// not recoverable. Use [`flush`](Self::flush) before dropping instead.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the writer was consumed by a pipeline. This is a programming
+    /// error (misuse of the API), not a runtime condition.
     pub fn into_inner(mut self) -> W {
         self.writer.take().expect("writer consumed by pipeline")
     }
 
+    // Panics on misuse (calling after pipeline consumed the writer). This is an
+    // internal invariant — all public callers go through write_blob/write_raw which
+    // are only valid in sync mode or before pipeline handoff.
     fn writer_mut(&mut self) -> &mut W {
         self.writer
             .as_mut()
@@ -428,6 +436,7 @@ impl PbfWriter<FileWriter> {
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             Ok(())
         } else {
+            // Same invariant as writer_mut — programming error if None.
             let out_fd = self
                 .writer
                 .as_mut()

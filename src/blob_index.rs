@@ -15,7 +15,7 @@ pub(crate) enum ElemKind {
 ///
 /// Produced by [`scan_block_ids`] from decompressed PrimitiveBlock bytes,
 /// or deserialized from BlobHeader `indexdata`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct BlobIndex {
     pub kind: ElemKind,
     pub min_id: i64,

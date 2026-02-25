@@ -72,7 +72,7 @@ impl HeaderBlock {
 
 /// A bounding box that is usually included in a [`HeaderBlock`].
 /// The maximum precision of the coordinates is one nanodegree (10⁻⁹).
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug)]
 pub struct HeaderBBox {
     /// left coordinate in degrees (minimum longitude)
     pub left: f64,

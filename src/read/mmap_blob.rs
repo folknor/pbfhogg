@@ -288,6 +288,7 @@ impl Iterator for MmapBlobReader {
             _ => {}
         }
 
+        // Infallible: slice length is bounds-checked above (early return on < 4).
         let header_size = u32::from_be_bytes(slice[..4].try_into().expect("4-byte slice conversion")) as usize;
 
         if header_size as u64 >= MAX_BLOB_HEADER_SIZE {

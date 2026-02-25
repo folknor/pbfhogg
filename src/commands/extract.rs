@@ -29,6 +29,8 @@ impl Bbox {
 }
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
+// String errors are intentional for CLI arg parsing — the bad input value is more
+// useful to users than the underlying ParseFloatError ("invalid float literal").
 pub fn parse_bbox(s: &str) -> Result<Bbox> {
     let parts: Vec<&str> = s.split(',').collect();
     if parts.len() != 4 {

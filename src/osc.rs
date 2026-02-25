@@ -138,6 +138,8 @@ enum Section {
 // Attribute parsing helpers
 // ---------------------------------------------------------------------------
 
+// Box<dyn Error> is intentional — OSC parsing is CLI-internal, callers only
+// display errors. String errors include the missing attribute name for context.
 type ParseResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 fn parse_i64_attr(e: &quick_xml::events::BytesStart, name: &[u8]) -> ParseResult<i64> {

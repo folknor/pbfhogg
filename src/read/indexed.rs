@@ -25,6 +25,8 @@ enum ElementsAvailable {
 }
 
 /// Returns true if the given set contains at least one value that is inside the given range.
+// Takes RangeInclusive by value intentionally — it's 16 bytes (two i64s), copy is
+// cheaper than indirection. BTreeSet::range accepts both owned and borrowed.
 fn range_included(range: RangeInclusive<i64>, node_ids: &BTreeSet<i64>) -> bool {
     node_ids.range(range).next().is_some()
 }
@@ -164,6 +166,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
             // descriptive IO error so callers get a clear message rather than a panic.
             let offset = offset.ok_or_else(|| {
                 crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    // Starts with type name intentionally — it IS a proper noun here.
                     "IndexedReader requires a seekable BlobReader with offset tracking",
                 )))
             })?;

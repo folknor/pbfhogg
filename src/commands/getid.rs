@@ -24,6 +24,8 @@ pub struct IdSet {
 
 
 /// Parse an ID spec like "n123", "w456", "r789".
+// String errors are intentional — shows the bad input value, which is more helpful
+// for CLI users than the underlying ParseIntError.
 fn parse_id_spec(spec: &str) -> Result<(char, i64)> {
     if spec.len() < 2 {
         return Err(format!("invalid ID spec: {spec:?} (expected n/w/r prefix + number)").into());

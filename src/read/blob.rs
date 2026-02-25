@@ -305,10 +305,12 @@ impl<R: Read + Send> BlobReader<R> {
                     // Clean EOF: no bytes remaining.
                     return None;
                 }
-                Err(_) => {
+                Err(e) => {
+                    // Propagate the original I/O error (broken pipe, permission
+                    // denied, etc.) instead of masking it as InvalidHeaderSize.
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(new_blob_error(BlobError::InvalidHeaderSize)));
+                    return Some(Err(e.into()));
                 }
             }
             match self.reader.read_exact(&mut buf[1..]) {
@@ -316,11 +318,11 @@ impl<R: Read + Send> BlobReader<R> {
                     self.offset = self.offset.map(|x| ByteOffset(x.0 + 4));
                     u64::from(u32::from_be_bytes(buf))
                 }
-                Err(_) => {
-                    // Had 1-3 bytes then EOF: truncated header length.
+                Err(e) => {
+                    // Truncated header or I/O error — propagate the real cause.
                     self.offset = None;
                     self.last_blob_ok = false;
-                    return Some(Err(new_blob_error(BlobError::InvalidHeaderSize)));
+                    return Some(Err(e.into()));
                 }
             }
         };
@@ -704,6 +706,7 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usi
         }));
     }
     #[allow(clippy::cast_sign_loss)]
+    // Clone is fine: type string is short ("OSMData"/"OSMHeader"), called once per blob.
     Ok((header.r#type.clone(), header.datasize as usize))
 }
 
@@ -723,6 +726,7 @@ pub fn parse_blob_header_with_index(
         }));
     }
     let indexdata = header.indexdata.as_ref().map(|b| b.to_vec());
+    // Clone is fine: type string is short ("OSMData"/"OSMHeader"), called once per blob.
     #[allow(clippy::cast_sign_loss)]
     Ok((header.r#type.clone(), header.datasize as usize, indexdata))
 }

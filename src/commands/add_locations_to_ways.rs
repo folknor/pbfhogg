@@ -99,6 +99,8 @@ impl DenseMmapIndex {
         let byte_len = capacity
             .checked_mul(ENTRY_SIZE)
             .ok_or("dense index capacity overflow")?;
+        // String error is intentional — includes the allocation size and actionable
+        // recovery advice that the underlying io::Error wouldn't provide.
         let mmap = memmap2::MmapMut::map_anon(byte_len).map_err(|e| {
             format!(
                 "failed to create dense mmap index ({} GB virtual): {e}. \

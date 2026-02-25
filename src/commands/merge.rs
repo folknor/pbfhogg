@@ -1021,6 +1021,7 @@ pub fn merge(
 
         // Sequential processing: write passthrough frames, rewrite overlapping blocks
         for (i, result) in classified.into_iter().enumerate() {
+            // classify_blob returns String error (Send for rayon); convert to Box<dyn Error>.
             let class = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
             blob_count += 1;
 
@@ -1178,7 +1179,7 @@ fn classify_blob(
     if let Some(ref idx) = frame.index
         && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
     {
-        return Ok(BlobClassified::Passthrough(idx.clone()));
+        return Ok(BlobClassified::Passthrough(*idx));
     }
 
     // Slow path: decompress + lightweight scan.

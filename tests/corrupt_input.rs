@@ -59,6 +59,8 @@ fn empty_file() {
 }
 
 /// 1-3 bytes: not enough for the 4-byte header length prefix.
+/// The first byte reads successfully, then the second read_exact (bytes 1..4)
+/// fails with UnexpectedEof, which is now propagated as ErrorKind::Io.
 #[test]
 fn truncated_header_size() {
     for len in 1..=3 {
@@ -66,8 +68,8 @@ fn truncated_header_size() {
         let mut reader = BlobReader::new(Cursor::new(data));
         let err = reader.next().unwrap().unwrap_err();
         match err.into_kind() {
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => {}
-            other => panic!("expected InvalidHeaderSize for {len} bytes, got {other:?}"),
+            ErrorKind::Io(ref e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
+            other => panic!("expected Io(UnexpectedEof) for {len} bytes, got {other:?}"),
         }
     }
 }

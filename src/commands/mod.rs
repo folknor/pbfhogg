@@ -18,6 +18,8 @@ use crate::block_builder::{build_header, BlockBuilder, Metadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
+// Box<dyn Error> is intentional — commands are CLI internals, callers only display
+// errors and exit. Typed error enums would add complexity with no matching benefit.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Flush the current block from a [`BlockBuilder`] into a [`PbfWriter`].

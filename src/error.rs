@@ -7,7 +7,9 @@ use std::str::Utf8Error;
 
 use prost::DecodeError;
 
-// Error data structures are modeled just like in the `csv` crate by BurntSushi.
+// Error data structures are modeled on the `csv` crate by BurntSushi.
+// Manual Display/StdError impls are intentional — avoids a thiserror dependency
+// for a small, stable enum that rarely changes.
 
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
     Error(Box::new(kind))

@@ -14,7 +14,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 // ---------------------------------------------------------------------------
 
 /// Which element types an expression applies to.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TypeFilter {
     nodes: bool,
     ways: bool,

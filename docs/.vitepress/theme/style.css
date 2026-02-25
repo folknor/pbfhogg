@@ -1148,3 +1148,290 @@ body {
   margin: 2rem auto;
   max-width: 720px;
 }
+
+/* ── Feature card hover lift ──────────────────────────────────────────── */
+
+.VPFeatures .VPFeature {
+  transition: transform 0.3s ease, box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+.VPFeatures .VPFeature:hover {
+  border-color: var(--vp-c-brand-1);
+  transform: translateY(-4px);
+  box-shadow: 0 12px 24px var(--vp-c-brand-soft);
+}
+
+/* ── Code block polish ────────────────────────────────────────────────── */
+
+.vp-code-group {
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+  margin-top: 1.5rem;
+  background: var(--vp-code-block-bg);
+}
+
+.vp-code-group div[class*="language-"] {
+  border: none;
+  border-radius: 0;
+  box-shadow: none;
+  margin: 0;
+}
+
+div[class*="language-"] {
+  border-radius: 8px;
+  border: 1px solid var(--vp-code-block-divider-color);
+  transition: box-shadow 0.3s ease, border-color 0.3s ease;
+}
+
+div[class*="language-"]:hover {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.1);
+}
+
+div[class*="language-"] .lang {
+  color: var(--vp-c-brand-1);
+  font-weight: 600;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+}
+
+div[class*="language-"] .copy {
+  background-color: var(--vp-c-bg-soft);
+  border: 1px solid var(--vp-c-divider);
+  border-radius: 6px;
+  transition: all 0.2s ease;
+}
+
+div[class*="language-"] .copy:hover {
+  background-color: var(--vp-c-brand-1);
+  border-color: var(--vp-c-brand-1);
+  color: white;
+}
+
+/* ── Link underline animation ─────────────────────────────────────────── */
+
+.vp-doc a {
+  position: relative;
+  text-decoration: none;
+  transition: color 0.2s ease;
+}
+
+.vp-doc a:not(.header-anchor):not(.VPButton)::after {
+  content: "";
+  position: absolute;
+  width: 100%;
+  height: 2px;
+  bottom: -2px;
+  left: 0;
+  background-color: var(--vp-c-brand-1);
+  transform: scaleX(0);
+  transform-origin: bottom right;
+  transition: transform 0.25s ease-out;
+}
+
+.vp-doc a:not(.header-anchor):not(.VPButton):hover::after {
+  transform: scaleX(1);
+  transform-origin: bottom left;
+}
+
+/* ── Table styling ────────────────────────────────────────────────────── */
+
+.vp-doc table {
+  border-collapse: collapse;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 0 0 1px var(--vp-c-divider);
+  width: auto !important;
+  display: table;
+  margin-bottom: 1.5rem;
+}
+
+.vp-doc th {
+  background: var(--vp-c-bg-soft);
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size: 0.875rem;
+  letter-spacing: 0.025em;
+  color: var(--vp-c-text-2);
+}
+
+.vp-doc td {
+  font-size: 0.95rem;
+  padding: 0.625rem 1rem;
+}
+
+.vp-doc th {
+  padding: 0.625rem 1rem;
+}
+
+.vp-doc tr {
+  transition: background-color 0.2s ease;
+}
+
+.vp-doc tbody tr:hover {
+  background-color: var(--vp-c-bg-soft);
+}
+
+/* ── Custom scrollbar ─────────────────────────────────────────────────── */
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--vp-c-bg-soft);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--vp-c-divider);
+  border-radius: 5px;
+  border: 2px solid var(--vp-c-bg-soft);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--vp-c-text-3);
+}
+
+/* ── Page content transition ──────────────────────────────────────────── */
+
+.VPContent {
+  animation: fadeInUp 0.3s ease-out;
+}
+
+@keyframes fadeInUp {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* ── Sidebar hover effects ────────────────────────────────────────────── */
+
+.VPSidebarItem .link {
+  transition: all 0.2s ease;
+  border-radius: 4px;
+}
+
+.VPSidebarItem .link:hover {
+  background-color: var(--vp-c-bg-mute);
+  color: var(--vp-c-brand-1);
+  padding-left: 10px !important;
+}
+
+.VPSidebarItem .link.active {
+  background-color: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+  font-weight: 600;
+  border-left: 3px solid var(--vp-c-brand-1);
+}
+
+/* ── Tip / Warning / Danger blocks ────────────────────────────────────── */
+
+.custom-block {
+  border-radius: 8px;
+  border-width: 1px;
+  margin: 1.5rem 0;
+}
+
+.custom-block.tip {
+  border-color: var(--vp-c-brand-2);
+  background-color: var(--vp-c-brand-soft);
+}
+
+.custom-block.warning {
+  border-color: #e68200;
+  background-color: rgba(255, 145, 0, 0.1);
+}
+
+.custom-block.danger {
+  border-color: #f44336;
+  background-color: rgba(255, 82, 82, 0.1);
+}
+
+.custom-block-title {
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.025em;
+  font-size: 0.85rem;
+}
+
+/* ── Badge utility classes ────────────────────────────────────────────── */
+/* Use in markdown:  <span class="badge-new">New</span>  */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.5rem;
+  font-family: var(--vp-font-family-base);
+  font-size: 0.75rem;
+  font-weight: 600;
+  border-radius: 4px;
+  vertical-align: middle;
+  position: relative;
+  top: -0.15em;
+  margin-left: 0.5rem;
+  line-height: 1;
+}
+
+.badge-new {
+  background-color: var(--vp-c-brand-soft);
+  color: var(--vp-c-brand-1);
+  border: 1px solid var(--vp-c-brand-2);
+}
+
+.badge-beta {
+  background-color: rgba(255, 145, 0, 0.1);
+  color: #ff9100;
+  border: 1px solid #e68200;
+}
+
+.badge-deprecated {
+  background-color: rgba(255, 82, 82, 0.1);
+  color: #ff5252;
+  border: 1px solid #f44336;
+}
+
+/* ── Nav backdrop blur ────────────────────────────────────────────────── */
+
+.VPNav {
+  backdrop-filter: blur(12px);
+}
+
+.VPSidebar {
+  backdrop-filter: blur(8px);
+}
+
+/* ── Terminal-style block ─────────────────────────────────────────────── */
+/* Use in markdown:
+ *   <div class="terminal">
+ *     $ nidhogg serve data/denmark
+ *   </div>
+ */
+
+.terminal {
+  background: #0a0a0b;
+  color: var(--vp-c-brand-1);
+  padding: 1rem 1rem 1rem 1rem;
+  border-radius: 8px;
+  font-family: var(--vp-font-family-mono);
+  position: relative;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+  margin: 1.5rem 0;
+  padding-top: 2rem;
+}
+
+.terminal::before {
+  content: "● ● ●";
+  position: absolute;
+  top: 0.5rem;
+  left: 1rem;
+  color: #ff5252;
+  font-size: 0.75rem;
+  letter-spacing: 0.25rem;
+}

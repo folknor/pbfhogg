@@ -42,6 +42,14 @@ tolerance = 1.0                # Douglas-Peucker tolerance in tile units
 area_threshold = 4.0           # drop polygons smaller than this (tile units^2)
 ```
 
+::: tip
+Running without a config file? Nidhogg works out of the box with sensible defaults — you only need a config file when tuning performance or selecting specific layers.
+:::
+
+::: danger
+Never point `temp_dir` at a tmpfs mount for planet-scale runs. External sort can write 80 GB+ of intermediate data and will exhaust RAM-backed filesystems.
+:::
+
 ## Environment Variables
 
 All configuration options can be set via environment variables with the `NIDHOGG_` prefix. Nested keys use double underscores:
@@ -57,7 +65,7 @@ All configuration options can be set via environment variables with the `NIDHOGG
 
 ## Output Formats
 
-### PMTiles
+### PMTiles <span class="badge badge-new">Recommended</span>
 
 The default and recommended format. Produces a single `.pmtiles` file that can be served directly from cloud storage (S3, GCS, R2) without a tile server.
 
@@ -67,7 +75,7 @@ format = "pmtiles"
 compression = "zstd"
 ```
 
-### MBTiles
+### MBTiles <span class="badge badge-deprecated">Legacy</span>
 
 SQLite-based format compatible with most tile servers (Martin, TileServer GL, etc.).
 
@@ -77,7 +85,7 @@ format = "mbtiles"
 compression = "gzip"
 ```
 
-### Directory
+### Directory <span class="badge badge-beta">Beta</span>
 
 Writes individual `.mvt` files to a directory tree. Useful for debugging or serving from a static file server.
 
@@ -115,3 +123,16 @@ The `tile_size` option controls the extent of the vector tile coordinate space. 
 ::: warning
 Changing the tile size from the default `4096` may cause rendering issues with some map renderers. Only change this if you know what you're doing.
 :::
+
+## Validating Your Configuration
+
+Use the `check` subcommand to validate your config without running a full pipeline:
+
+<div class="terminal">
+$ nidhogg check --config production.toml<br>
+✓ Config file valid<br>
+✓ Ocean shapefile found (2.1 GB)<br>
+✓ Output directory writable<br>
+✓ 14 zoom levels, estimated ~270M tiles<br>
+⚠ memory_limit (4GB) may be low for planet-scale — consider 16GB+
+</div>

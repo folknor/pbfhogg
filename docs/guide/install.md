@@ -93,16 +93,20 @@ docker run --rm -v /data:/data ghcr.io/user/nidhogg:latest \
 - A C compiler (for native dependencies)
 - `protoc` (Protocol Buffers compiler) — usually available via your package manager:
 
-```sh
-# Ubuntu/Debian
+::: code-group
+```sh [Ubuntu/Debian]
 sudo apt install protobuf-compiler
-
-# macOS
+```
+```sh [macOS]
 brew install protobuf
-
-# Arch
+```
+```sh [Arch]
 sudo pacman -S protobuf
 ```
+```sh [Fedora]
+sudo dnf install protobuf-compiler
+```
+:::
 
 ## Verifying the Installation
 

@@ -141,38 +141,14 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
 ## Performance: memory / planet-scale
 
-- [ ] `commands/sort.rs` — reads entire PBF into fully-decoded owned Rust structs (`OwnedNode`,
-  `OwnedWay`, `OwnedRelation` with heap-allocated String tags, metadata, refs, members).
-  Planet estimate: ~9B nodes × ~140 bytes + ~1B ways × ~312 bytes + ~17M relations × ~500 bytes
-  = **~1,400 GB RAM**. Even without metadata, nodes alone require ~430 GB. Osmium has the same
-  limitation (in-memory sort, recommends splitting first for large files).
-
-  **Approach A: Blob-level permutation sort (preferred).** Use indexdata (element type +
-  min/max ID per blob) to build a permutation of blob offsets. If blobs have non-overlapping
-  ID ranges within each type (very common — planet PBFs have this property), the "sort" is
-  just rewriting the file with blobs in the correct order via `write_raw`. No decode at all.
-  Only blobs with overlapping ID ranges need decode+re-sort+re-encode. For typical planet PBFs
-  this means 99.9%+ of blobs are just copied. Memory: O(num_blobs) for the offset array
-  (~600K × 40 bytes = ~24 MB for planet). First pass scans indexdata (or falls back to
-  decompress+scan for blobs without it), second pass copies/rewrites.
-
-  **Approach B: Streaming overlap detection.** Single streaming pass: read blobs, check if
-  each blob's min_id > previous blob's max_id (same type). If yes, pass through raw. If not,
-  buffer the overlapping run, decode+sort+re-encode just that run. For already-sorted PBFs
-  (Geofabrik, planet.osm.org), this is essentially a verification pass that copies the file.
-  Memory: proportional to the longest overlapping run, not the file size.
-
-  **Approach C: Sort-on-read virtual view.** Don't rewrite the file at all. Build a blob-level
-  index and provide a `SortedReader` that yields elements in sorted order by seeking blobs in
-  the right sequence. Zero disk write, zero extra memory for already-sorted files. Degrades
-  for unsorted input (must sort within overlapping blob groups). Most useful if consumers
-  only need sorted iteration, not a sorted file on disk.
-
-  **Approach D: External merge sort (conventional).** Three phases: (1) streaming split into
-  sharded temp PBF files by type+ID range (~256MB per shard), (2) sort each shard in memory,
-  (3) sequential concatenation. Memory: ~2 GB regardless of input size. Most complex, only
-  needed if input is heavily unsorted (rare in practice). The existing `PbfWriter`/`BlockBuilder`
-  are fully streaming and already support this — no writer changes needed.
+- [x] `commands/sort.rs` — **blob-level permutation sort implemented.** Two-pass architecture:
+  pass 1 indexes each blob's element type + ID range (from indexdata or decompress+scan),
+  sorts by (type, min_id); pass 2 writes in sorted order. Non-overlapping blobs pass through
+  as raw bytes (`write_raw` or `copy_file_range`); overlapping blobs are decoded, sorted, and
+  re-encoded. Memory: O(num_blobs) (~42 bytes × 10K blobs for planet = ~420 KB). Passthrough
+  blobs without indexdata are reframed with `reframe_raw_with_index()` to enrich future ops.
+  Denmark benchmark: 3.0s (100% passthrough, 7396 blobs, zero overlap). Previously required
+  loading all ~59M elements into owned structs (~400 GB for planet).
 
 ## Performance: Linux kernel features for planet-scale I/O
 
@@ -211,10 +187,10 @@ and kernel-space copy.
   metadata-only (instant). `PbfWriter::write_raw_copy()` + `PipelinePayload::CopyRange`
   handle both pipelined and sync paths. Gated behind `linux-direct-io` feature
   (no new deps). O_DIRECT output falls back to `write_raw` (incompatible with
-  DirectWriter's page-aligned buffering). Denmark benchmark: 2.73s (copy_file_range)
-  vs 2.81s (write_raw), ~3% improvement. Larger gains expected at planet scale
-  where 99%+ blobs are passthrough. Sort passthrough not yet wired up (sort
-  doesn't use `write_raw` currently).
+  DirectWriter's page-aligned buffering). Denmark merge benchmark: 2.73s
+  (copy_file_range) vs 2.81s (write_raw), ~3% improvement. Sort also wired up
+  (passthrough blobs with indexdata use copy_file_range). Larger gains expected
+  at planet scale where 99%+ blobs are passthrough.
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
@@ -269,7 +245,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 ### Implementation order
 
 1. ~~**O_DIRECT (Tier 1)** — write + read paths done.~~
-2. ~~**`copy_file_range` (Tier 1)** — merge + cat passthrough done. Sort not yet wired up.~~
+2. ~~**`copy_file_range` (Tier 1)** — merge + cat + sort passthrough done.~~
 3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already
    supported), needed to make the pipeline I/O-bound.
 4. **io_uring writer thread (Tier 2)** — only after Compression::None makes writes the

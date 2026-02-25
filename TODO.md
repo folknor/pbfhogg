@@ -139,22 +139,83 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   Planet estimate: ~9B nodes × ~140 bytes + ~1B ways × ~312 bytes + ~17M relations × ~500 bytes
   = **~1,400 GB RAM**. Even without metadata, nodes alone require ~430 GB. Osmium has the same
   limitation (in-memory sort, recommends splitting first for large files).
-  **Solution: external merge sort in 3 phases:**
-  Phase 1 — Partitioned streaming split: read blob-by-blob, decode, classify by type, write
-  into sharded temp PBF files by type+ID range (~256MB per shard). Memory: one decoded block
-  at a time (~few MB) + K open file handles.
-  Phase 2 — Sort each shard: each shard fits in memory (~1-2 GB decoded), sort with existing
-  `sort_by_key`, write back. For mostly-sorted input (typical: planet downloads are pre-sorted),
-  most shards may already be in order — verify with O(n) scan of block min/max IDs.
-  Phase 3 — Sequential concatenation: shards are non-overlapping ID ranges, so writing is just
-  sequential concatenation per type (nodes shards in order, then ways, then relations) through
-  `BlockBuilder` + `PbfWriter`. Memory: one `BlockBuilder` buffer (~few hundred KB).
-  **Optimization: block-level raw passthrough** — for blobs already in correct position with
-  non-overlapping ID ranges vs neighbors, use `PbfWriter::write_raw()` to copy compressed bytes
-  directly without decode/re-encode. Only decode+re-sort blobs with overlapping ranges.
-  **Total memory: ~2 GB regardless of input size.**
-  Note: the existing `PbfWriter`/`BlockBuilder` are fully streaming and already support this —
-  no writer changes needed.
+
+  **Approach A: Blob-level permutation sort (preferred).** Use indexdata (element type +
+  min/max ID per blob) to build a permutation of blob offsets. If blobs have non-overlapping
+  ID ranges within each type (very common — planet PBFs have this property), the "sort" is
+  just rewriting the file with blobs in the correct order via `write_raw`. No decode at all.
+  Only blobs with overlapping ID ranges need decode+re-sort+re-encode. For typical planet PBFs
+  this means 99.9%+ of blobs are just copied. Memory: O(num_blobs) for the offset array
+  (~600K × 40 bytes = ~24 MB for planet). First pass scans indexdata (or falls back to
+  decompress+scan for blobs without it), second pass copies/rewrites.
+
+  **Approach B: Streaming overlap detection.** Single streaming pass: read blobs, check if
+  each blob's min_id > previous blob's max_id (same type). If yes, pass through raw. If not,
+  buffer the overlapping run, decode+sort+re-encode just that run. For already-sorted PBFs
+  (Geofabrik, planet.osm.org), this is essentially a verification pass that copies the file.
+  Memory: proportional to the longest overlapping run, not the file size.
+
+  **Approach C: Sort-on-read virtual view.** Don't rewrite the file at all. Build a blob-level
+  index and provide a `SortedReader` that yields elements in sorted order by seeking blobs in
+  the right sequence. Zero disk write, zero extra memory for already-sorted files. Degrades
+  for unsorted input (must sort within overlapping blob groups). Most useful if consumers
+  only need sorted iteration, not a sorted file on disk.
+
+  **Approach D: External merge sort (conventional).** Three phases: (1) streaming split into
+  sharded temp PBF files by type+ID range (~256MB per shard), (2) sort each shard in memory,
+  (3) sequential concatenation. Memory: ~2 GB regardless of input size. Most complex, only
+  needed if input is heavily unsorted (rare in practice). The existing `PbfWriter`/`BlockBuilder`
+  are fully streaming and already support this — no writer changes needed.
+
+## Performance: Linux 6.14+ kernel features for planet-scale I/O
+
+Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
+
+- [ ] **erofs + uncompressed PBFs (single decompression layer).** Currently double
+  decompression: erofs lz4 in kernel → zlib in userspace. If pbfhogg writes
+  `Compression::None` PBFs stored on erofs, the stack becomes: erofs lz4 at ~4 GB/s
+  (kernel, SIMD-optimized) → raw blob data (no userspace decompression). The
+  `decompress_blob` call becomes a no-op. On-disk size is comparable (erofs lz4
+  achieves similar ratios to zlib on OSM data). Trade-off: PBF files are 3-4x larger
+  when copied off erofs, but for a local pipeline where you control storage this is
+  the single biggest throughput win. Add a `--compression none` flag to merge/sort/cat.
+
+- [ ] **`copy_file_range` for blob passthrough in sort/merge.** For Approach A
+  (blob permutation sort) and merge passthrough, blobs can be copied between file
+  descriptors entirely in kernel space via `copy_file_range(in_fd, &offset, out_fd,
+  NULL, blob_len, 0)`. No userspace buffer allocation, no user/kernel boundary
+  crossing. On btrfs/xfs with reflinks, it's a metadata-only operation (instant,
+  zero I/O). For planet sort where 99.9% of blobs are passthrough, the kernel
+  shuffles 80GB of blobs without pbfhogg touching the data. Requires switching
+  `write_raw` from taking a `&[u8]` slice to accepting an fd+offset+len for the
+  kernel-copy path.
+
+- [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
+  2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
+  (4KB pages) to ~40K entries (2MB folios). Combined with `MADV_POPULATE_READ`
+  (5.14+) to prefault pages ahead, the mmap read path gets substantially faster.
+  `MmapBlobReader` could use `MADV_SEQUENTIAL` + `MADV_POPULATE_READ` in chunks
+  (e.g. 256MB ahead) for predictable prefaulting without committing all 80GB at once.
+
+- [ ] **io_uring for the write path.** The current merge pipeline has a writer
+  thread doing synchronous `write_all` calls. With io_uring: register the output fd
+  + a buffer pool once, submit writes as SQEs — no syscall per write. Kernel batches
+  writes. For blob passthrough: submit `copy_file_range` SQEs directly (combine with
+  the item above). The writer thread becomes an SQE submission loop instead of a
+  blocking write loop. Crate: `io-uring` (low-level) or `tokio-uring`.
+
+- [ ] **`O_DIRECT` + io_uring for page cache hygiene.** Planet merge reads 80GB and
+  writes 80GB — 160GB of page cache churn that evicts useful data on the host.
+  `O_DIRECT` + io_uring registered buffers reads directly into application buffers,
+  bypassing the page cache. The read-ahead pipeline already manages its own buffering
+  via `DecompressPool` — the page cache is pure overhead at planet scale. Requires
+  aligned buffers and sector-aligned reads, but io_uring registered buffers handle
+  this naturally.
+
+**Recommended combination for nidhogg:** erofs with `Compression::None` PBFs
+(eliminate zlib entirely) + blob permutation sort via `copy_file_range` (kernel-side
+copy) + `O_DIRECT` io_uring for merge write path (no cache pollution). This stack
+makes the merge I/O-bound at device speed rather than CPU-bound on decompression.
 
 ## Dependencies
 

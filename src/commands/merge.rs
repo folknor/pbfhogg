@@ -944,6 +944,7 @@ pub fn merge(
     output_pbf: &Path,
     compression: Compression,
     direct_io: bool,
+    io_uring: bool,
 ) -> MergeResult<MergeStats> {
     // Step 1: Parse the diff
     eprintln!("Parsing OSC diff: {}", osc_file.display());
@@ -979,7 +980,16 @@ pub fn merge(
             }
         }
     };
-    let mut writer = if direct_io {
+    let mut writer = if io_uring {
+        #[cfg(feature = "linux-io-uring")]
+        {
+            PbfWriter::to_path_pipelined_uring(output_pbf, compression, &header_bytes)?
+        }
+        #[cfg(not(feature = "linux-io-uring"))]
+        {
+            return Err("--io-uring requires the linux-io-uring feature".into());
+        }
+    } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
             PbfWriter::to_path_pipelined_direct(
@@ -998,8 +1008,9 @@ pub fn merge(
 
     // copy_file_range: get input fd and decide whether to use kernel-space copy.
     // O_DIRECT output is incompatible with copy_file_range (bypasses DirectWriter).
+    // io_uring output handles CopyRange via pread + ring write (no copy_file_range).
     #[cfg(feature = "linux-direct-io")]
-    let (input_fd, use_copy_range) = (reader.raw_fd(), !direct_io);
+    let (input_fd, use_copy_range) = (reader.raw_fd(), io_uring || !direct_io);
     #[cfg(not(feature = "linux-direct-io"))]
     let (input_fd, use_copy_range) = (0i32, false);
 

@@ -217,13 +217,13 @@ kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
 pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
-- [ ] **erofs + uncompressed PBFs (single decompression layer).** Currently double
-  decompression: erofs lz4 in kernel → zlib in userspace. With `--compression none`
-  on erofs, the stack becomes: erofs lz4 → raw blob data. On-disk size is comparable
-  (erofs lz4 achieves similar ratios to zlib on OSM data). Trade-off: PBF files are
-  3-4x larger when copied off erofs, but for a local pipeline where you control
-  storage this is the single biggest throughput win. `--compression` flag is now
-  available on all 8 PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL).
+- [x] **erofs + uncompressed PBFs (single decompression layer).** `--compression`
+  flag available on all 8 PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL),
+  and `Compression` enum is public API for library consumers (nidhogg uses
+  `Compression::None` directly). On erofs the stack becomes: erofs lz4 → raw blob
+  data (single decompression layer). PBF files are 3-4x larger when copied off erofs,
+  but for a local pipeline where you control storage this is the single biggest
+  throughput win.
 
 - [ ] **io_uring writer thread.** Replace the synchronous `BufWriter` + `write_all`
   writer thread with an io_uring submission loop. Register the output fd

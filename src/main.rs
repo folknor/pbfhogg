@@ -240,6 +240,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Use io_uring for output I/O (requires linux-io-uring feature)
+        #[arg(long)]
+        io_uring: bool,
     },
 }
 
@@ -332,7 +335,8 @@ fn main() {
             output,
             compression,
             direct_io,
-        } => run_merge(&base, &changes, &output, &compression, direct_io),
+            io_uring,
+        } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring),
     };
 
     if let Err(e) = result {
@@ -628,9 +632,10 @@ fn run_merge(
     output: &std::path::Path,
     compression: &str,
     direct_io: bool,
+    io_uring: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring)?;
     stats.print_summary();
     Ok(())
 }

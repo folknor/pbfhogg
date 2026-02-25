@@ -25,7 +25,7 @@ use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
 /// Maximum number of framed blobs in-flight before backpressure stalls senders.
-const WRITE_AHEAD: usize = 32;
+pub(crate) const WRITE_AHEAD: usize = 32;
 
 /// Compression algorithm for PBF output blobs.
 #[derive(Clone, Copy)]
@@ -56,7 +56,7 @@ impl Default for Compression {
 }
 
 /// Payload for the writer pipeline channel.
-enum PipelinePayload {
+pub(crate) enum PipelinePayload {
     /// Framed blob bytes ready to write.
     Bytes(io::Result<Vec<u8>>),
     /// Kernel-space copy from input fd (avoids userspace copy for passthrough).
@@ -69,9 +69,9 @@ enum PipelinePayload {
 }
 
 /// A framed blob with its sequence number, ready for the writer thread.
-struct PipelineItem {
-    seq: usize,
-    data: PipelinePayload,
+pub(crate) struct PipelineItem {
+    pub(crate) seq: usize,
+    pub(crate) data: PipelinePayload,
 }
 
 /// Write pipeline state — active when using pipelined mode.
@@ -157,6 +157,64 @@ impl PbfWriter<FileWriter> {
     ) -> io::Result<Self> {
         let writer = FileWriter::direct(path)?;
         Self::start_pipeline(writer, compression, header_block_bytes)
+    }
+
+    /// Create a pipelined `PbfWriter` that uses io_uring for output I/O.
+    ///
+    /// The writer thread uses `O_DIRECT` + io_uring `WriteFixed` with
+    /// registered page-aligned buffers. This provides maximum throughput
+    /// when the pipeline is I/O-bound (e.g. `Compression::None` on fast storage).
+    ///
+    /// Requires the `linux-io-uring` feature and Linux 5.1+.
+    #[cfg(feature = "linux-io-uring")]
+    pub fn to_path_pipelined_uring(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+    ) -> io::Result<Self> {
+        use crate::write::uring_writer;
+
+        let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
+
+        // Oneshot channel for init errors from the writer thread.
+        let (init_tx, init_rx) = sync_channel(1);
+
+        let (tx, rx) = sync_channel(WRITE_AHEAD);
+        let path_owned = path.to_path_buf();
+        let handle = std::thread::spawn(move || {
+            uring_writer::uring_writer_thread(rx, path_owned, framed_header, init_tx)
+        });
+
+        // Wait for the writer thread to complete initialization.
+        // If init fails, we get the error here before returning to the caller.
+        match init_rx.recv() {
+            Ok(Ok(())) => {} // init succeeded
+            Ok(Err(e)) => {
+                // Init failed. Join the thread to clean up.
+                drop(tx);
+                drop(handle.join());
+                return Err(e);
+            }
+            Err(_) => {
+                // Thread panicked or exited before sending init result.
+                drop(tx);
+                return Err(match handle.join() {
+                    Ok(Ok(())) => io::Error::other("writer thread exited without init signal"),
+                    Ok(Err(e)) => e,
+                    Err(_) => io::Error::other("writer thread panicked during init"),
+                });
+            }
+        }
+
+        Ok(PbfWriter {
+            writer: None,
+            compression,
+            pipeline: Some(WritePipeline {
+                tx,
+                seq: 0,
+                join_handle: Some(handle),
+            }),
+        })
     }
 
     /// Shared pipelined setup: write header, spawn writer thread.

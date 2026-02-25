@@ -340,6 +340,7 @@ impl ExtractStats {
 /// If `simple` is true, uses a single-pass strategy (fast but ways may reference
 /// nodes outside the extract). Otherwise uses `complete_ways` (two passes, all
 /// nodes of matching ways are included).
+#[hotpath::measure]
 pub fn extract(
     input: &Path,
     output: &Path,

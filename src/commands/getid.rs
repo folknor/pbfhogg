@@ -100,6 +100,7 @@ impl GetidStats {
 ///
 /// If `add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
+#[hotpath::measure]
 pub fn getid(
     input: &Path,
     output: &Path,
@@ -114,6 +115,7 @@ pub fn getid(
 }
 
 /// Remove elements matching the given IDs (output everything else).
+#[hotpath::measure]
 pub fn removeid(input: &Path, output: &Path, ids: &IdSet) -> Result<GetidStats> {
     filter_by_id(input, output, ids, false)
 }

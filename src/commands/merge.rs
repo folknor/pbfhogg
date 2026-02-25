@@ -254,6 +254,7 @@ struct RawBlobFrame {
 
 /// Read the next raw blob frame from the reader.
 /// Returns None at EOF.
+#[hotpath::measure]
 fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> {
     // Read 4-byte header length
     let mut len_buf = [0u8; 4];
@@ -529,6 +530,7 @@ struct RewriteContext<'a> {
     create_emitter: &'a mut CreateEmitter,
 }
 
+#[hotpath::measure]
 fn rewrite_block(
     block: &PrimitiveBlock,
     ctx: &mut RewriteContext<'_>,
@@ -875,6 +877,7 @@ impl CreateEmitter {
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[hotpath::measure]
 pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult<MergeStats> {
     // Step 1: Parse the diff
     eprintln!("Parsing OSC diff: {}", osc_file.display());
@@ -1109,6 +1112,7 @@ enum BlobClassified {
 /// take ownership via `mem::take`, causing a one-time reallocation on the next call.
 ///
 /// Returns `Result<_, String>` instead of `MergeResult` so it's Send for rayon.
+#[hotpath::measure]
 fn classify_blob(
     frame: &RawBlobFrame,
     ranges: &DiffRanges,

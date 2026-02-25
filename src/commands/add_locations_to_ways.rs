@@ -53,6 +53,7 @@ impl Stats {
 ///
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
+#[hotpath::measure]
 pub fn add_locations_to_ways(
     input: &Path,
     output: &Path,

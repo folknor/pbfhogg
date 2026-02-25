@@ -26,6 +26,7 @@ const DECODE_AHEAD: usize = 32;
 /// The closure runs on the calling thread and may hold mutable state.
 /// PBF ordering (nodes → ways → relations) is preserved.
 #[allow(clippy::needless_pass_by_value)]
+#[hotpath::measure]
 pub(crate) fn run_pipeline<R, F>(blob_reader: BlobReader<R>, mut block_fn: F) -> Result<()>
 where
     R: Read + Send,

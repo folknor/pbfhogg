@@ -36,6 +36,7 @@ impl CatStats {
 /// If `type_filter` is set (comma-separated: "node", "way", "relation"),
 /// only elements of matching types are included (requires full decode).
 /// Without a filter, blobs are passed through as raw bytes (zero decode).
+#[hotpath::measure]
 pub fn cat(files: &[&Path], output: &Path, type_filter: Option<&str>) -> Result<CatStats> {
     match type_filter {
         None => cat_passthrough(files, output),

@@ -22,6 +22,7 @@ pub struct FileInfo {
 }
 
 /// Read PBF metadata. If `extended`, do a full scan to count blobs and elements.
+#[hotpath::measure]
 pub fn fileinfo(path: &Path, extended: bool) -> Result<FileInfo> {
     let reader = BlobReader::from_path(path)?;
     let mut info = FileInfo {

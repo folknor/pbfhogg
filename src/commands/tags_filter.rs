@@ -211,6 +211,7 @@ impl TagsFilterStats {
 /// If `omit_referenced` is true (`-R` flag), only directly matching elements
 /// are output (single pass, faster). Otherwise, referenced nodes of matching
 /// ways are also included (two-pass).
+#[hotpath::measure]
 pub fn tags_filter(
     input: &Path,
     output: &Path,

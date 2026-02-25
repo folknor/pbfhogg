@@ -87,6 +87,7 @@ fn parse_type_filter(s: &str) -> TypeFilter {
 // ---------------------------------------------------------------------------
 
 /// Compare two sorted PBF files and write human-readable differences.
+#[hotpath::measure]
 pub fn diff(
     old_path: &Path,
     new_path: &Path,

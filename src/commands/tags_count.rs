@@ -28,6 +28,7 @@ pub struct TagCount {
 /// Only genuinely new (key, value) pairs allocate Strings. For Denmark
 /// (59M elements, ~118M tags, 3.3M distinct pairs), this reduces String
 /// allocations from ~236M (two per tag) to ~6.6M (two per distinct pair).
+#[hotpath::measure]
 pub fn tags_count(
     path: &Path,
     min_count: u64,

@@ -45,6 +45,7 @@ impl DeriveChangesStats {
 ///
 /// Reads both files into memory, performs a merge-join by (type, id),
 /// and writes differences as gzipped OsmChange XML.
+#[hotpath::measure]
 pub fn derive_changes(
     old_path: &Path,
     new_path: &Path,

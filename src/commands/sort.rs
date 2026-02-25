@@ -85,6 +85,7 @@ struct ReadResult {
 ///
 /// Reads the entire file into memory, sorts, and writes the output.
 /// Suitable for files that fit in RAM (typically up to ~1 GB PBF).
+#[hotpath::measure]
 pub fn sort(input: &Path, output: &Path) -> Result<SortStats> {
     let mut data = read_elements(input)?;
 

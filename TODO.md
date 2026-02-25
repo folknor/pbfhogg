@@ -24,72 +24,46 @@ yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). Finding 7
 subsequent merges can classify passthrough blobs without decompression — saving
 ~8% on Denmark (3.07s → 2.81s) with larger gains expected at planet scale.
 
-Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
-Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
-tags-count to keep stdout manageable.
+All command entry points, merge internals (`classify_blob`, `read_raw_frame`,
+`rewrite_block`), and pipeline (`run_pipeline`) are instrumented with
+`#[hotpath::measure]`. Run with `scripts/run-hotpath.sh` (timing only) or
+`scripts/run-hotpath-alloc.sh` (timing + allocation tracking).
 
-### Finding 3: main thread is the bottleneck in pipelined reads
-
-**Partially fixed.** check-refs: main thread 100% CPU, workers 1% each (5 threads).
-The decode workers are almost completely idle — RoaringTreemap insertions on the
-main thread are the bottleneck. tags-count: main thread 100% CPU, pipelined
-section takes 3.97s of 7.15s total (the remaining 3.18s is stdout I/O + hashmap
-sorting). Both commands are consumer-bound, not worker-bound.
-
-### Finding 4: `block::new` — wire-format parsing is cheap
-
-After the wire parser rewrite, `PrimitiveBlock::new()` now does full wire-format
-parsing (stringtable index + group range extraction). Allocates 18 KB avg
-(stringtable `Vec<(u32,u32)>` + group_ranges), takes P50=5.6µs, P99=173µs,
-total 107ms (1.5% of wall time). 130 MB cumulative for Denmark.
-
-### Finding 5: missing hotpath instrumentation
-
-Only `check_refs` is instrumented among the commands. Add `#[hotpath::measure]`
-to the main function in each command file for per-command visibility:
-
-- [ ] `tags_count.rs` — `tags_count()`
-- [ ] `sort.rs` — `sort()`
-- [ ] `cat.rs` — `cat()`
-- [ ] `merge.rs` — `merge()`
-- [ ] `extract.rs` — `extract()`
-- [ ] `derive_changes.rs` — `derive_changes()`
-- [ ] `diff.rs` — `diff()`
-- [ ] `getid.rs` — `getid()`
-- [ ] `tags_filter.rs` — `tags_filter()`
-- [ ] `add_locations_to_ways.rs` — `add_locations_to_ways()`
-
-### Raw data (current, with wire parser + pool)
+### Raw hotpath data (current, with wire parser + pool + blob indexdata)
 
 **check-refs (Denmark, 52M nodes, 6.6M ways, 46K relations):**
 ```
-Wall: 7.35s, RSS: 202 MB (with hotpath-alloc overhead)
-decompress_blob:      7396 calls, 2.61s (35.6%), avg 354µs, 671 MB cumulative alloc (pooled)
-block::new:           7396 calls, 113ms (1.5%), avg 15µs, 130 MB cumulative alloc
-for_each_pipelined:   1 call, 7.34s (99.9%), 262 MB alloc
-Process: 1.0 GB alloc, 1.3 GB dealloc.
+Wall: 7.51s, RSS: 143 MB (hotpath timing, no alloc tracking)
+check_refs:           1 call, 7.51s (100%)
+run_pipeline:         1 call, 7.50s (99.9%)
+for_each_pipelined:   1 call, 7.50s (99.9%)
+decompress_blob:      7396 calls, 2.55s (33.9%), avg 345µs, P50 198µs, P99 1.72ms
+block::new:           7396 calls, 97ms (1.3%), avg 13µs, P50 5µs, P99 166µs
 Main thread: 100% CPU. Workers: 1% CPU each (5 threads, vastly idle).
 ```
 
-**tags-count (Denmark, same file):**
+**merge without indexdata (Denmark base + 1 OSC, osmium input):**
 ```
-Wall: 7.15s, RSS: 705 MB (with hotpath-alloc overhead)
-for_each_pipelined:   1 call, 3.97s (55.6%), 436 MB alloc
-decompress_blob:      7396 calls, 2.74s (38.3%), 692 MB cumulative alloc (pooled)
-block::new:           7396 calls, 118ms (1.6%), 130 MB cumulative alloc
-Process: 1016 MB alloc, 880 MB dealloc.
-Main thread: 100% CPU.
+Wall: 3.16s, RSS: 91 MB (hotpath timing)
+frame_blob:           629 calls, 5.63s total (178%, parallel), avg 9.0ms
+classify_blob:        7386 calls, 3.25s (103%), avg 440µs, P50 259µs, P99 2.40ms
+rewrite_block:        630 calls, 1.82s (57.7%), avg 2.89ms
+block_builder::take:  7407 calls, 733ms (23.2%), avg 99µs
+read_raw_frame:       7399 calls, 103ms (3.2%), avg 14µs
+block::new:           630 calls, 14ms (0.5%), avg 23µs
+Clean (no hotpath): 3.07s best of 3.
 ```
 
-**merge (Denmark base + 1 OSC diff, 630/7396 blobs rewritten):**
+**merge with indexdata (Denmark base + 1 OSC, pbfhogg input):**
 ```
-Wall: 3.15s, RSS: 91.9 MB (with hotpath-alloc overhead)
-frame_blob:           628 calls, 5.67s total (parallel, 180% of wall), avg 9.0ms, 511 MB alloc
-block_builder::take:  7407 calls, 735ms (23.3%), 266 MB alloc
-block::new:           630 calls, 14ms (0.5%), 17 MB alloc
-decode_blob:          1 call, 23µs (HeaderBlock only)
-Process: 7.1 GB alloc, 7.0 GB dealloc. 4 worker threads + 1 writer thread.
-Clean (no hotpath): 3.03s best of 3.
+Wall: 2.86s, RSS: 85 MB (hotpath timing)
+frame_blob:           549 calls, 5.40s total (189%, parallel), avg 9.8ms
+rewrite_block:        550 calls, 1.71s (59.7%), avg 3.11ms
+block_builder::take:  7408 calls, 673ms (23.5%), avg 91µs
+classify_blob:        7382 calls, 603ms (21.1%), avg 82µs, P50 150ns, P99 1.99ms
+read_raw_frame:       7400 calls, 90ms (3.2%), avg 12µs
+block::new:           631 calls, 14ms (0.5%), avg 23µs
+Clean (no hotpath): 2.81s best of 3.
 ```
 
 **bench-self (Denmark, best of 3, no hotpath overhead):**
@@ -101,24 +75,31 @@ mmap:        3229 ms
 blobreader:  3215 ms
 ```
 
-### Finding 7: merge decompresses all blobs for ID range scanning
+### Merge: remaining optimization theories
 
-**Fixed.** Blob-level indexdata (26 bytes: element type + min/max ID + count)
-is now embedded in every OSMData BlobHeader via the standard `indexdata` field.
-On merge, blobs with indexdata skip decompression entirely for classification.
-Passthrough blobs without indexdata are re-framed (new BlobHeader, no recompression)
-so that all pbfhogg output carries indexdata for subsequent operations.
+With indexdata, the merge bottleneck is `rewrite_block` (60%) + `block_builder::take`
+(24%) — the actual decode/re-encode work on the ~550 rewritten blocks. These
+process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
-First merge against external PBF (no indexdata): falls back to decompress + scan.
-Second+ merge against pbfhogg output: 6766/7396 index hits, 0 unnecessary
-decompressions. Denmark: 3.07s → 2.81s (~8%). Hotpath profiling overstated
-decompression cost (402µs/blob measured vs ~35µs actual) due to instrumentation
-overhead; the real bottleneck at Denmark scale is I/O. Savings scale linearly
-with blob count — expected ~20s at planet scale (~600K blobs).
+- [ ] **Element-level raw passthrough in rewrite_block** — most elements in
+  rewritten blocks are unmodified. Currently they're fully decoded (tags, refs,
+  metadata) then re-encoded via BlockBuilder. Copying wire-format bytes directly
+  for unaffected elements would skip decode+re-encode for ~99% of elements.
+  Largest potential win but most complex — requires BlockBuilder to accept raw
+  protobuf fragments, or a separate "patch block" codepath.
 
-Implementation: `blob_index.rs` (shared scanner + serialization), `writer.rs`
-(embed on write + `reframe_raw_with_index`), `blob.rs`
-(`parse_blob_header_with_index`), `merge.rs` (fast path + stats).
+- [ ] **Tag/ref Vec allocation churn** — `write_base_dense_node`, `write_base_way`,
+  etc. collect tags and refs into fresh Vecs per element (~4.4M small allocations).
+  Could reuse thread-local buffers, or pass iterators directly to BlockBuilder
+  instead of collecting.
+
+- [ ] **BlockBuilder Vec reuse across blocks** — after `take()`, internal Vecs
+  lose capacity via `mem::take`. Re-allocating with `Vec::with_capacity(8000)`
+  in `reset()` would avoid grow-from-zero on each of the ~550 rewritten blocks.
+
+- [ ] **Protobuf serialization in `take`** — `write_to_bytes()` uses the
+  `protobuf` crate (not the fastest). 673ms across 7408 calls (91µs avg) is
+  modest. Would only matter if the other items are addressed first.
 
 ## Performance: parallelism
 

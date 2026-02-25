@@ -13,6 +13,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Blob passthrough** (`write_raw`) for copying unmodified blobs during merge/diff operations
 - **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
 - **Configurable compression** — pure Rust zlib (default), system zlib, or zlib-ng
+- **O_DIRECT writes** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) writes, preventing cache pollution on the host
 
 ## Usage
 
@@ -45,7 +46,7 @@ pbfhogg sort <file> -o <out>              Sort into standard order (nodes → wa
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box (minlon,minlat,maxlon,maxlat)
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
 pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
-pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file
+pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file (--direct-io for O_DIRECT)
 pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
 pbfhogg diff <old> <new>                 Compare two PBF files (-v for verbose, -c to hide common)
 pbfhogg tags-count <file>                 Count tag key=value frequencies
@@ -86,6 +87,35 @@ Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
 System: Linux 6.18, Ryzen 9 7950X.
 
 Measured with `scripts/bench.sh`. Results are logged to `benchmarks.tsv` for tracking over time.
+
+## O_DIRECT writes
+
+Planet-scale merges write 80 GB+, polluting the entire page cache and evicting useful data from co-resident processes. The `linux-direct-io` feature adds an O_DIRECT write path that bypasses the page cache entirely.
+
+```toml
+[dependencies]
+pbfhogg = { version = "0.1", features = ["linux-direct-io"] }
+```
+
+CLI usage:
+
+```
+pbfhogg merge base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io
+```
+
+Library usage:
+
+```rust
+use pbfhogg::writer::{PbfWriter, Compression};
+
+// Sync writer
+let writer = PbfWriter::to_path_direct(path, Compression::default())?;
+
+// Pipelined writer (parallel compression + O_DIRECT)
+let writer = PbfWriter::to_path_pipelined_direct(path, compression, &header_bytes)?;
+```
+
+O_DIRECT requires a real filesystem (not tmpfs). Wall time is unchanged at country scale (CPU-bound on zlib compression) — the benefit is cache hygiene at planet scale.
 
 ## License
 

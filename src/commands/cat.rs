@@ -59,10 +59,19 @@ struct RawBlobFrame {
     frame_bytes: Vec<u8>,
     blob_type: String,
     blob_bytes: Vec<u8>,
+    /// Byte offset of this frame in the input file (for copy_file_range).
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    file_offset: u64,
 }
 
 /// Read the next raw blob frame. Returns None at EOF.
-fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
+/// Updates `file_offset` to track position for copy_file_range.
+fn read_raw_frame<R: Read>(
+    reader: &mut R,
+    file_offset: &mut u64,
+) -> Result<Option<RawBlobFrame>> {
+    let frame_start = *file_offset;
+
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
         Ok(()) => {}
@@ -80,6 +89,7 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
     reader.read_exact(&mut blob_bytes)?;
 
     let frame_len = 4 + header_len + data_size;
+    *file_offset += frame_len as u64;
     let mut frame_bytes = Vec::with_capacity(frame_len);
     frame_bytes.extend_from_slice(&len_buf);
     frame_bytes.extend_from_slice(&header_bytes);
@@ -89,6 +99,7 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
         frame_bytes,
         blob_type,
         blob_bytes,
+        file_offset: frame_start,
     }))
 }
 
@@ -99,8 +110,14 @@ fn cat_passthrough(files: &[&Path], output: &Path, direct_io: bool) -> Result<Ca
 
     for file in files {
         let mut reader = FileReader::open(file, direct_io)?;
+        let mut file_offset: u64 = 0;
 
-        while let Some(frame) = read_raw_frame(&mut reader)? {
+        // copy_file_range: writer is always buffered in cat, so always safe.
+        // O_DIRECT input + copy_file_range works (explicit offset, kernel reads).
+        #[cfg(feature = "linux-direct-io")]
+        let input_fd = reader.raw_fd();
+
+        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             match frame.blob_type.as_str() {
                 "OSMHeader" => {
                     if !header_written {
@@ -110,6 +127,13 @@ fn cat_passthrough(files: &[&Path], output: &Path, direct_io: bool) -> Result<Ca
                     }
                 }
                 "OSMData" => {
+                    #[cfg(feature = "linux-direct-io")]
+                    writer.write_raw_copy(
+                        input_fd,
+                        frame.file_offset,
+                        frame.frame_bytes.len() as u64,
+                    )?;
+                    #[cfg(not(feature = "linux-direct-io"))]
                     writer.write_raw(&frame.frame_bytes)?;
                     blobs += 1;
                 }

@@ -26,7 +26,10 @@ subsequent merges can classify passthrough blobs without decompression — savin
 O_DIRECT writes (`--direct-io`) add no measurable overhead on Denmark (2821ms
 BufWriter vs 2876ms O_DIRECT, within noise) — the pipeline is CPU-bound on zlib
 compression at this scale. The real win is page cache hygiene at planet scale
-(80GB writes not evicting useful host data).
+(80GB writes not evicting useful host data). `copy_file_range` for passthrough
+blobs saves ~3% on Denmark (2.81s → 2.73s) by eliminating userspace buffer copy
+for index-hit blobs — larger gains expected at planet scale where passthrough
+dominates.
 
 All command entry points, merge internals (`classify_blob`, `read_raw_frame`,
 `rewrite_block`), and pipeline (`run_pipeline`) are instrumented with
@@ -201,15 +204,17 @@ and kernel-space copy.
   and writes. Seekable/indexed paths stay on `BufReader<File>` (O_DIRECT + seek
   requires complex alignment math, not on the planet-scale hot path).
 
-- [ ] **`copy_file_range` for blob passthrough in sort/merge.** Blobs can be copied
-  between file descriptors entirely in kernel space via `copy_file_range(in_fd,
-  &offset, out_fd, NULL, blob_len, 0)`. No userspace buffer, no user/kernel boundary
-  crossing. On btrfs/xfs with reflinks, it's metadata-only (instant, zero I/O). For
-  planet sort where 99.9% of blobs are passthrough, the kernel shuffles 80GB without
-  pbfhogg touching the data. Independent of io_uring — there is no
-  `IORING_OP_COPY_FILE_RANGE` opcode in the kernel (verified through 6.18). Call the
-  syscall directly. Requires switching `write_raw` from `&[u8]` to accepting
-  fd+offset+len for the kernel-copy path.
+- [x] **`copy_file_range` for blob passthrough in merge/cat.** Passthrough blobs
+  are copied between file descriptors entirely in kernel space via
+  `copy_file_range(in_fd, &offset, out_fd, NULL, blob_len, 0)`. No userspace
+  buffer, no user/kernel boundary crossing. On btrfs/xfs with reflinks, it's
+  metadata-only (instant). `PbfWriter::write_raw_copy()` + `PipelinePayload::CopyRange`
+  handle both pipelined and sync paths. Gated behind `linux-direct-io` feature
+  (no new deps). O_DIRECT output falls back to `write_raw` (incompatible with
+  DirectWriter's page-aligned buffering). Denmark benchmark: 2.73s (copy_file_range)
+  vs 2.81s (write_raw), ~3% improvement. Larger gains expected at planet scale
+  where 99%+ blobs are passthrough. Sort passthrough not yet wired up (sort
+  doesn't use `write_raw` currently).
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
@@ -264,8 +269,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 ### Implementation order
 
 1. ~~**O_DIRECT (Tier 1)** — write + read paths done.~~
-2. **`copy_file_range` (Tier 1)** — orthogonal, change `write_raw` API. Kernel-space
-   blob copy for merge/sort passthrough.
+2. ~~**`copy_file_range` (Tier 1)** — merge + cat passthrough done. Sort not yet wired up.~~
 3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already
    supported), needed to make the pipeline I/O-bound.
 4. **io_uring writer thread (Tier 2)** — only after Compression::None makes writes the

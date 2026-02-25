@@ -40,6 +40,26 @@ impl FileWriter {
     }
 }
 
+#[cfg(feature = "linux-direct-io")]
+impl FileWriter {
+    /// Flush internal buffers and return the raw output fd, if available.
+    ///
+    /// Returns `None` for O_DIRECT writers (`copy_file_range` is incompatible
+    /// with `DirectWriter`'s page-aligned buffering). Returns `Some(fd)` for
+    /// buffered writers after flushing the `BufWriter` so the fd position
+    /// matches the logical write position.
+    pub(crate) fn flush_and_raw_fd(&mut self) -> io::Result<Option<std::os::unix::io::RawFd>> {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            FileWriter::Buffered(w) => {
+                w.flush()?;
+                Ok(Some(w.get_ref().as_raw_fd()))
+            }
+            FileWriter::Direct(_) => Ok(None),
+        }
+    }
+}
+
 impl Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {

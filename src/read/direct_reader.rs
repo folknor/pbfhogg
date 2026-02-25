@@ -117,6 +117,11 @@ pub struct DirectReader {
 }
 
 impl DirectReader {
+    /// Return the raw file descriptor for `copy_file_range`.
+    pub(crate) fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.file.as_raw_fd()
+    }
+
     /// Open a file for reading with `O_DIRECT`.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()

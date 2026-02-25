@@ -251,12 +251,20 @@ struct RawBlobFrame {
     /// Blob-level index from BlobHeader indexdata, if present.
     /// When available, classify_blob can skip decompression entirely.
     index: Option<BlobIndex>,
+    /// Byte offset of this frame in the input file (for copy_file_range).
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    file_offset: u64,
 }
 
 /// Read the next raw blob frame from the reader.
-/// Returns None at EOF.
+/// Returns None at EOF. Updates `file_offset` to track position for copy_file_range.
 #[hotpath::measure]
-fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> {
+fn read_raw_frame<R: Read>(
+    reader: &mut R,
+    file_offset: &mut u64,
+) -> MergeResult<Option<RawBlobFrame>> {
+    let frame_start = *file_offset;
+
     // Read 4-byte header length
     let mut len_buf = [0u8; 4];
     match reader.read_exact(&mut len_buf) {
@@ -280,6 +288,7 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> 
 
     // Assemble the complete frame
     let frame_len = 4 + header_len + data_size;
+    *file_offset += frame_len as u64;
     let mut frame_bytes = Vec::with_capacity(frame_len);
     frame_bytes.extend_from_slice(&len_buf);
     frame_bytes.extend_from_slice(&header_bytes);
@@ -290,6 +299,7 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> 
         blob_type,
         blob_bytes,
         index,
+        file_offset: frame_start,
     }))
 }
 
@@ -866,6 +876,25 @@ impl CreateEmitter {
 
 
 // ---------------------------------------------------------------------------
+// Passthrough helper
+// ---------------------------------------------------------------------------
+
+/// Write a passthrough blob, using `copy_file_range` when available.
+#[allow(unused_variables)]
+fn write_passthrough(
+    writer: &mut PbfWriter<FileWriter>,
+    frame: &RawBlobFrame,
+    input_fd: i32,
+    use_copy_range: bool,
+) -> io::Result<()> {
+    #[cfg(feature = "linux-direct-io")]
+    if use_copy_range {
+        return writer.write_raw_copy(input_fd, frame.file_offset, frame.frame_bytes.len() as u64);
+    }
+    writer.write_raw(&frame.frame_bytes)
+}
+
+// ---------------------------------------------------------------------------
 // Public merge function
 // ---------------------------------------------------------------------------
 
@@ -904,10 +933,11 @@ pub fn merge(
 
     // Step 2: Open reader, read header, create pipelined writer
     let mut reader = FileReader::open(base_pbf, direct_io)?;
+    let mut file_offset: u64 = 0;
 
     // Read the header blob first — needed to construct the pipelined writer.
     let header_bytes = loop {
-        match read_raw_frame(&mut reader)? {
+        match read_raw_frame(&mut reader, &mut file_offset)? {
             Some(frame) if frame.blob_type == "OSMHeader" => {
                 let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
                 break build_header_bytes(&header)?;
@@ -935,6 +965,13 @@ pub fn merge(
         PbfWriter::to_path_pipelined(output_pbf, Compression::default(), &header_bytes)?
     };
 
+    // copy_file_range: get input fd and decide whether to use kernel-space copy.
+    // O_DIRECT output is incompatible with copy_file_range (bypasses DirectWriter).
+    #[cfg(feature = "linux-direct-io")]
+    let (input_fd, use_copy_range) = (reader.raw_fd(), !direct_io);
+    #[cfg(not(feature = "linux-direct-io"))]
+    let (input_fd, use_copy_range) = (0i32, false);
+
     let mut bb = BlockBuilder::new();
     let mut emitted_nodes: HashSet<i64> = HashSet::new();
     let mut emitted_ways: HashSet<i64> = HashSet::new();
@@ -951,7 +988,7 @@ pub fn merge(
         // Read next batch of data blob frames
         batch.clear();
         while batch.len() < BATCH_SIZE {
-            match read_raw_frame(&mut reader)? {
+            match read_raw_frame(&mut reader, &mut file_offset)? {
                 Some(frame) if frame.blob_type == "OSMData" => {
                     batch.push(frame);
                 }
@@ -969,7 +1006,7 @@ pub fn merge(
         if skip_state.all_done() {
             flush_block(&mut bb, &mut writer)?;
             for frame in &batch {
-                writer.write_raw(&frame.frame_bytes)?;
+                write_passthrough(&mut writer, frame, input_fd, use_copy_range)?;
                 stats.blobs_skip_decompress += 1;
             }
             blob_count += batch_len;
@@ -1002,7 +1039,7 @@ pub fn merge(
                     flush_block(&mut bb, &mut writer)?;
                     if batch[i].index.is_some() {
                         // Already has indexdata — pass through as-is.
-                        writer.write_raw(&batch[i].frame_bytes)?;
+                        write_passthrough(&mut writer, &batch[i], input_fd, use_copy_range)?;
                         stats.blobs_index_hit += 1;
                     } else {
                         // No indexdata — re-frame with index for future merges.
@@ -1064,7 +1101,7 @@ pub fn merge(
                         // will be emitted by CreateEmitter when the next blob
                         // arrives or during flush_all at EOF.
                         flush_block(&mut bb, &mut writer)?;
-                        writer.write_raw(&batch[i].frame_bytes)?;
+                        write_passthrough(&mut writer, &batch[i], input_fd, use_copy_range)?;
                         count_block_elements(&block, &mut stats);
                         stats.blobs_passthrough += 1;
                     }

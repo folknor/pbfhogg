@@ -10,7 +10,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder
 - **Write** valid `.osm.pbf` files with `PbfWriter` and `BlockBuilder` — dense node packing, delta encoding, zlib compression
 - **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
-- **Blob passthrough** (`write_raw`) for copying unmodified blobs during merge/diff operations
+- **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
 - **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
 - **Configurable compression** — pure Rust zlib (default), system zlib, or zlib-ng
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
@@ -80,8 +80,8 @@ Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
 
 | Tool | Time | Notes |
 |------|------|-------|
-| **pbfhogg** | **2.8s** | parallel compression + blob passthrough + blob indexdata |
-| **pbfhogg** | 3.1s | first merge (no indexdata in input, falls back to decompression) |
+| **pbfhogg** | **2.7s** | parallel compression + blob passthrough + blob indexdata + copy_file_range |
+| **pbfhogg** | 2.8s | first merge (no indexdata, falls back to decompression + userspace copy) |
 | osmium 1.19 | 7.2s | `osmium apply-changes` |
 
 System: Linux 6.18, Ryzen 9 7950X.

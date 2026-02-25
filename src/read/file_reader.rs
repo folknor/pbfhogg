@@ -57,6 +57,22 @@ impl FileReader {
     }
 }
 
+#[cfg(feature = "linux-direct-io")]
+impl FileReader {
+    /// Return the raw file descriptor for `copy_file_range`.
+    ///
+    /// The fd remains valid as long as the `FileReader` is alive. Used with
+    /// explicit offsets, so it does not interfere with buffered/direct read
+    /// position tracking.
+    pub fn raw_fd(&self) -> std::os::unix::io::RawFd {
+        use std::os::unix::io::AsRawFd;
+        match self {
+            Self::Buffered(r) => r.get_ref().as_raw_fd(),
+            Self::Direct(r) => r.raw_fd(),
+        }
+    }
+}
+
 impl Read for FileReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {

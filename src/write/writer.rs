@@ -55,10 +55,23 @@ impl Default for Compression {
     }
 }
 
+/// Payload for the writer pipeline channel.
+enum PipelinePayload {
+    /// Framed blob bytes ready to write.
+    Bytes(io::Result<Vec<u8>>),
+    /// Kernel-space copy from input fd (avoids userspace copy for passthrough).
+    #[cfg(feature = "linux-direct-io")]
+    CopyRange {
+        in_fd: std::os::unix::io::RawFd,
+        offset: u64,
+        len: u64,
+    },
+}
+
 /// A framed blob with its sequence number, ready for the writer thread.
 struct PipelineItem {
     seq: usize,
-    data: io::Result<Vec<u8>>,
+    data: PipelinePayload,
 }
 
 /// Write pipeline state — active when using pipelined mode.
@@ -222,7 +235,7 @@ impl<W: Write> PbfWriter<W> {
                     &compression,
                     indexdata.as_ref().map(<[u8; 26]>::as_slice),
                 );
-                drop(tx.send(PipelineItem { seq, data: result }));
+                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
             });
             Ok(())
         } else {
@@ -252,7 +265,7 @@ impl<W: Write> PbfWriter<W> {
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: Ok(raw_framed_bytes.to_vec()),
+                    data: PipelinePayload::Bytes(Ok(raw_framed_bytes.to_vec())),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             Ok(())
@@ -326,16 +339,66 @@ impl<W: Write> Drop for PbfWriter<W> {
     }
 }
 
+#[cfg(feature = "linux-direct-io")]
+impl PbfWriter<FileWriter> {
+    /// Write a passthrough blob via kernel-space copy (`copy_file_range`).
+    ///
+    /// Instead of copying blob bytes through userspace, this tells the kernel
+    /// to copy directly between file descriptors. On filesystems with reflink
+    /// support (btrfs, xfs), this is a metadata-only operation.
+    ///
+    /// `in_fd` is the input file descriptor (from `FileReader::raw_fd()`).
+    /// `offset` and `len` describe the framed blob's position in the input file.
+    ///
+    /// Callers must not use this when the output writer is O_DIRECT — use
+    /// [`write_raw`](Self::write_raw) instead.
+    pub fn write_raw_copy(
+        &mut self,
+        in_fd: std::os::unix::io::RawFd,
+        offset: u64,
+        len: u64,
+    ) -> io::Result<()> {
+        if let Some(ref mut pipeline) = self.pipeline {
+            let seq = pipeline.seq;
+            pipeline.seq += 1;
+            pipeline
+                .tx
+                .send(PipelineItem {
+                    seq,
+                    data: PipelinePayload::CopyRange { in_fd, offset, len },
+                })
+                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            Ok(())
+        } else {
+            let out_fd = self
+                .writer
+                .as_mut()
+                .expect("writer consumed by pipeline")
+                .flush_and_raw_fd()?
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "copy_file_range incompatible with O_DIRECT output",
+                    )
+                })?;
+            copy_range(in_fd, out_fd, offset, len)
+        }
+    }
+}
+
 /// Writer thread: receives framed blobs and writes them in sequence order.
 ///
 /// Uses a VecDeque reorder buffer (same pattern as the read-side pipeline)
 /// to handle out-of-order arrivals from parallel rayon tasks.
-fn writer_thread<W: Write>(
+///
+/// Specialized to `FileWriter` (not generic `W: Write`) to support
+/// `CopyRange` payloads that require `flush_and_raw_fd()`.
+fn writer_thread(
     rx: std::sync::mpsc::Receiver<PipelineItem>,
-    mut writer: W,
+    mut writer: FileWriter,
 ) -> io::Result<()> {
     let mut next_seq: usize = 0;
-    let mut pending: VecDeque<Option<io::Result<Vec<u8>>>> =
+    let mut pending: VecDeque<Option<PipelinePayload>> =
         VecDeque::with_capacity(WRITE_AHEAD);
 
     for item in rx {
@@ -352,13 +415,70 @@ fn writer_thread<W: Write>(
                 break;
             }
             #[allow(clippy::unwrap_used)]
-            let data = pending.pop_front().unwrap().unwrap();
+            let payload = pending.pop_front().unwrap().unwrap();
             next_seq += 1;
-            writer.write_all(&data?)?;
+            match payload {
+                PipelinePayload::Bytes(result) => writer.write_all(&result?)?,
+                #[cfg(feature = "linux-direct-io")]
+                PipelinePayload::CopyRange { in_fd, offset, len } => {
+                    let out_fd = writer
+                        .flush_and_raw_fd()?
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::Unsupported,
+                                "copy_file_range incompatible with O_DIRECT output",
+                            )
+                        })?;
+                    copy_range(in_fd, out_fd, offset, len)?;
+                }
+            }
         }
     }
 
     writer.flush()?;
+    Ok(())
+}
+
+/// Copy `len` bytes between file descriptors using `copy_file_range(2)`.
+///
+/// Uses an explicit input offset (does not change `in_fd`'s file position),
+/// safe when `in_fd` is wrapped in a `BufReader` or `DirectReader`.
+/// Output uses the fd's current position (sequential write).
+#[cfg(feature = "linux-direct-io")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn copy_range(
+    in_fd: std::os::unix::io::RawFd,
+    out_fd: std::os::unix::io::RawFd,
+    mut offset: u64,
+    mut len: u64,
+) -> io::Result<()> {
+    while len > 0 {
+        let mut off_in = offset as i64;
+        // Safety: fds are valid and open. off_in is explicit (doesn't change
+        // in_fd position). off_out is NULL (uses out_fd's current position).
+        let n = unsafe {
+            libc::copy_file_range(
+                in_fd,
+                &mut off_in,
+                out_fd,
+                std::ptr::null_mut(),
+                len as usize,
+                0,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "copy_file_range returned 0",
+            ));
+        }
+        let n = n.cast_unsigned() as u64;
+        offset += n;
+        len -= n;
+    }
     Ok(())
 }
 

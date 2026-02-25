@@ -78,6 +78,7 @@ pub mod read;
 pub mod write;
 pub mod commands;
 pub mod osc;
+pub(crate) mod blob_index;
 mod error;
 
 #[allow(clippy::all, clippy::pedantic, clippy::restriction)]

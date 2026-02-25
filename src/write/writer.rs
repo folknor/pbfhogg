@@ -11,6 +11,7 @@
 //! reorders results back into sequence order. Raw passthrough blobs bypass
 //! compression entirely.
 
+use crate::blob_index;
 use crate::proto::fileformat;
 use bytes::Bytes;
 use flate2::write::ZlibEncoder;
@@ -122,7 +123,7 @@ impl PbfWriter<io::BufWriter<std::fs::File>> {
         let mut writer = io::BufWriter::with_capacity(256 * 1024, file);
 
         // Write header synchronously before starting the pipeline.
-        let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression)?;
+        let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
         writer.write_all(&framed_header)?;
 
         // Spawn the writer thread and hand it the writer.
@@ -183,12 +184,25 @@ impl<W: Write> PbfWriter<W> {
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
             rayon::spawn(move || {
-                let result = frame_blob("OSMData", &uncompressed, &compression);
+                let indexdata = blob_index::scan_block_ids(&uncompressed)
+                    .map(|idx| idx.serialize());
+                let result = frame_blob(
+                    "OSMData",
+                    &uncompressed,
+                    &compression,
+                    indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                );
                 drop(tx.send(PipelineItem { seq, data: result }));
             });
             Ok(())
         } else {
-            self.write_blob("OSMData", block_bytes)
+            let indexdata = blob_index::scan_block_ids(block_bytes)
+                .map(|idx| idx.serialize());
+            self.write_blob_with_index(
+                "OSMData",
+                block_bytes,
+                indexdata.as_ref().map(<[u8; 26]>::as_slice),
+            )
         }
     }
 
@@ -254,7 +268,17 @@ impl<W: Write> PbfWriter<W> {
 
     #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
-        let framed = frame_blob(blob_type, uncompressed, &self.compression)?;
+        let framed = frame_blob(blob_type, uncompressed, &self.compression, None)?;
+        self.writer_mut().write_all(&framed)
+    }
+
+    fn write_blob_with_index(
+        &mut self,
+        blob_type: &str,
+        uncompressed: &[u8],
+        indexdata: Option<&[u8]>,
+    ) -> io::Result<()> {
+        let framed = frame_blob(blob_type, uncompressed, &self.compression, indexdata)?;
         self.writer_mut().write_all(&framed)
     }
 }
@@ -319,6 +343,7 @@ pub(crate) fn frame_blob(
     blob_type: &str,
     uncompressed: &[u8],
     compression: &Compression,
+    indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     // Step 1: Build the Blob protobuf (optionally compressed)
     let mut blob = fileformat::Blob::new();
@@ -356,6 +381,9 @@ pub(crate) fn frame_blob(
     let mut header = fileformat::BlobHeader::new();
     header.set_type(protobuf::Chars::from(blob_type));
     header.set_datasize(blob_bytes.len() as i32);
+    if let Some(idx) = indexdata {
+        header.indexdata = Some(Bytes::copy_from_slice(idx));
+    }
 
     let header_bytes = header.write_to_bytes().map_err(io::Error::other)?;
 
@@ -366,6 +394,36 @@ pub(crate) fn frame_blob(
     out.extend_from_slice(&header_len.to_be_bytes());
     out.extend_from_slice(&header_bytes);
     out.extend_from_slice(&blob_bytes);
+
+    Ok(out)
+}
+
+/// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
+///
+/// Takes the raw compressed Blob protobuf bytes (from a passthrough frame) and
+/// builds a new frame `[4-byte header_len][BlobHeader][Blob]` with the indexdata
+/// field set. The Blob bytes are not modified — only the BlobHeader is rebuilt.
+///
+/// This is used by merge to add blob-level index metadata to passthrough blobs
+/// so that subsequent merges can classify them without decompression.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub(crate) fn reframe_raw_with_index(
+    blob_bytes: &[u8],
+    indexdata: &[u8],
+) -> io::Result<Vec<u8>> {
+    let mut header = fileformat::BlobHeader::new();
+    header.set_type(protobuf::Chars::from("OSMData"));
+    header.set_datasize(blob_bytes.len() as i32);
+    header.indexdata = Some(Bytes::copy_from_slice(indexdata));
+
+    let header_bytes = header.write_to_bytes().map_err(io::Error::other)?;
+
+    let header_len = header_bytes.len() as u32;
+    let total_len = 4 + header_bytes.len() + blob_bytes.len();
+    let mut out = Vec::with_capacity(total_len);
+    out.extend_from_slice(&header_len.to_be_bytes());
+    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(blob_bytes);
 
     Ok(out)
 }

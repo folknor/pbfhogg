@@ -13,9 +13,10 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data_into, parse_blob_header,
+    decode_blob_to_headerblock, decompress_blob_data_into, parse_blob_header_with_index,
     parse_primitive_block_from_bytes_owned,
 };
+use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
@@ -41,6 +42,7 @@ pub struct MergeStats {
     pub blobs_rewritten: u64,
     pub blobs_skip_decompress: u64,
     pub blobs_scan_only: u64,
+    pub blobs_index_hit: u64,
 }
 
 impl MergeStats {
@@ -57,6 +59,7 @@ impl MergeStats {
             blobs_rewritten: 0,
             blobs_skip_decompress: 0,
             blobs_scan_only: 0,
+            blobs_index_hit: 0,
         }
     }
 
@@ -83,8 +86,9 @@ impl MergeStats {
         );
         eprintln!("  Deleted: {}", self.deleted);
         eprintln!(
-            "  Blobs: {} passthrough ({} scan-only, {} skip-decompress), {} rewritten (of {total_blobs} total)",
+            "  Blobs: {} passthrough ({} index-hit, {} scan-only, {} skip-decompress), {} rewritten (of {total_blobs} total)",
             self.blobs_passthrough + self.blobs_skip_decompress,
+            self.blobs_index_hit,
             self.blobs_scan_only,
             self.blobs_skip_decompress,
             self.blobs_rewritten,
@@ -194,288 +198,6 @@ impl DiffRanges {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Lightweight protobuf scanner: extract element type + ID range
-// without full PrimitiveBlock parsing.
-// ---------------------------------------------------------------------------
-
-/// Result of a lightweight blob scan.
-struct BlobScan {
-    kind: ElemKind,
-    min_id: i64,
-    max_id: i64,
-    count: u64,
-}
-
-/// Scan decompressed PrimitiveBlock bytes to extract element type and ID range.
-/// This walks the protobuf wire format manually, only reading element IDs.
-/// Much cheaper than a full PrimitiveBlock parse (skips string tables,
-/// coordinates, tags, metadata, etc.).
-#[allow(clippy::cast_possible_truncation)]
-fn scan_block_ids(raw: &[u8]) -> Option<BlobScan> {
-    let mut cursor = 0;
-    let mut result: Option<BlobScan> = None;
-
-    while cursor < raw.len() {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
-        if tag == 2 && wire_type == 2 {
-            // PrimitiveGroup (field 2, length-delimited)
-            let (group_len, new_pos) = read_varint(raw, cursor)?;
-            let group_end = new_pos + group_len as usize;
-            cursor = new_pos;
-
-            if let Some(scan) = scan_primitive_group(raw, cursor, group_end) {
-                result = Some(match result {
-                    None => scan,
-                    Some(mut prev) => {
-                        prev.min_id = prev.min_id.min(scan.min_id);
-                        prev.max_id = prev.max_id.max(scan.max_id);
-                        prev.count += scan.count;
-                        prev
-                    }
-                });
-            }
-            cursor = group_end;
-        } else {
-            // Skip other fields (StringTable, granularity, offsets, etc.)
-            cursor = skip_field(raw, wire_type, cursor)?;
-        }
-    }
-    result
-}
-
-/// Scan a PrimitiveGroup submessage for element type + IDs.
-#[allow(clippy::cast_possible_truncation)]
-fn scan_primitive_group(raw: &[u8], mut cursor: usize, end: usize) -> Option<BlobScan> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
-        match (tag, wire_type) {
-            (2, 2) => {
-                // DenseNodes (field 2, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let dense_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_dense_node_ids(raw, cursor, dense_end);
-            }
-            (3, 2) => {
-                // Way (field 3, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                // Scan this and remaining ways
-                return scan_repeated_element_ids(raw, cursor, msg_end, end, 3, ElemKind::Way);
-            }
-            (4, 2) => {
-                // Relation (field 4, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_repeated_element_ids(
-                    raw,
-                    cursor,
-                    msg_end,
-                    end,
-                    4,
-                    ElemKind::Relation,
-                );
-            }
-            (1, 2) => {
-                // Node (field 1, length-delimited) — rare, non-dense
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_repeated_element_ids(raw, cursor, msg_end, end, 1, ElemKind::Node);
-            }
-            _ => {
-                cursor = skip_field(raw, wire_type, cursor)?;
-            }
-        }
-    }
-    None
-}
-
-/// Scan DenseNodes to extract min/max IDs and count.
-/// DenseNodes stores IDs as packed delta-encoded sint64 in field 1.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn scan_dense_node_ids(raw: &[u8], mut cursor: usize, end: usize) -> Option<BlobScan> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
-        if tag == 1 && wire_type == 2 {
-            // Packed sint64 IDs
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            let ids_end = new_pos + len as usize;
-            cursor = new_pos;
-
-            let mut min_id = i64::MAX;
-            let mut max_id = i64::MIN;
-            let mut current_id: i64 = 0;
-            let mut count: u64 = 0;
-
-            while cursor < ids_end {
-                let (raw_val, new_pos) = read_varint(raw, cursor)?;
-                cursor = new_pos;
-                // Zigzag decode: sint64
-                let delta = ((raw_val >> 1) as i64) ^ -((raw_val & 1) as i64);
-                current_id += delta;
-                if count == 0 {
-                    min_id = current_id;
-                }
-                max_id = current_id;
-                count += 1;
-            }
-
-            if count > 0 {
-                return Some(BlobScan {
-                    kind: ElemKind::Node,
-                    min_id,
-                    max_id,
-                    count,
-                });
-            }
-            return None;
-        }
-        cursor = skip_field(raw, wire_type, cursor)?;
-    }
-    None
-}
-
-/// Scan repeated Way/Relation/Node messages to extract min/max IDs.
-/// We already have the first message boundaries; scan through the group
-/// to find additional messages of the same field tag.
-#[allow(clippy::cast_possible_truncation)]
-fn scan_repeated_element_ids(
-    raw: &[u8],
-    first_msg_start: usize,
-    first_msg_end: usize,
-    group_end: usize,
-    expected_tag: u32,
-    kind: ElemKind,
-) -> Option<BlobScan> {
-    // Extract ID from the first message
-    let first_id = extract_element_id(raw, first_msg_start, first_msg_end)?;
-    let mut min_id = first_id;
-    let mut max_id = first_id;
-    let mut count: u64 = 1;
-    let mut last_id = first_id;
-
-    // Scan remaining messages in the group
-    let mut cursor = first_msg_end;
-    while cursor < group_end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
-        if tag == expected_tag && wire_type == 2 {
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            let msg_end = new_pos + len as usize;
-            cursor = new_pos;
-
-            if let Some(id) = extract_element_id(raw, cursor, msg_end) {
-                min_id = min_id.min(id);
-                max_id = max_id.max(id);
-                last_id = id;
-                count += 1;
-            }
-            cursor = msg_end;
-        } else {
-            cursor = skip_field(raw, wire_type, cursor)?;
-        }
-    }
-
-    // For sorted PBFs, last_id == max_id, but be safe
-    max_id = max_id.max(last_id);
-
-    Some(BlobScan {
-        kind,
-        min_id,
-        max_id,
-        count,
-    })
-}
-
-/// Extract the element ID (field 1, varint/int64) from a Node/Way/Relation message.
-#[allow(clippy::cast_possible_wrap)]
-fn extract_element_id(raw: &[u8], mut cursor: usize, end: usize) -> Option<i64> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-        if tag == 1 && wire_type == 0 {
-            let (val, _) = read_varint(raw, cursor)?;
-            return Some(val as i64);
-        }
-        cursor = skip_field(raw, wire_type, cursor)?;
-    }
-    None
-}
-
-// ---------------------------------------------------------------------------
-// Protobuf wire format helpers
-// ---------------------------------------------------------------------------
-
-/// Read a varint from the buffer. Returns (value, new_cursor).
-fn read_varint(raw: &[u8], mut cursor: usize) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    loop {
-        if cursor >= raw.len() {
-            return None;
-        }
-        let byte = raw[cursor];
-        cursor += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, cursor));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
-}
-
-/// Read a field tag. Returns (field_number, wire_type, new_cursor).
-fn read_tag(raw: &[u8], cursor: usize) -> Option<(u32, u32, usize)> {
-    let (val, new_pos) = read_varint(raw, cursor)?;
-    #[allow(clippy::cast_possible_truncation)]
-    let wire_type = (val & 0x07) as u32;
-    #[allow(clippy::cast_possible_truncation)]
-    let field_number = (val >> 3) as u32;
-    Some((field_number, wire_type, new_pos))
-}
-
-/// Skip a field value based on wire type. Returns new cursor position.
-#[allow(clippy::cast_possible_truncation)]
-fn skip_field(raw: &[u8], wire_type: u32, mut cursor: usize) -> Option<usize> {
-    match wire_type {
-        0 => {
-            // Varint — skip bytes until MSB is 0
-            loop {
-                if cursor >= raw.len() {
-                    return None;
-                }
-                let byte = raw[cursor];
-                cursor += 1;
-                if byte & 0x80 == 0 {
-                    return Some(cursor);
-                }
-            }
-        }
-        1 => Some(cursor + 8),  // 64-bit fixed
-        2 => {
-            // Length-delimited
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            Some(new_pos + len as usize)
-        }
-        5 => Some(cursor + 4),  // 32-bit fixed
-        _ => None,              // Unknown wire type
-    }
-}
-
 /// State for tracking whether we've passed the max affected ID for each type.
 struct SkipState {
     node_done: bool,
@@ -525,6 +247,9 @@ struct RawBlobFrame {
     blob_type: String,
     /// The raw Blob protobuf message bytes (for selective decoding).
     blob_bytes: Vec<u8>,
+    /// Blob-level index from BlobHeader indexdata, if present.
+    /// When available, classify_blob can skip decompression entirely.
+    index: Option<BlobIndex>,
 }
 
 /// Read the next raw blob frame from the reader.
@@ -543,8 +268,9 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> 
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
-    // Parse just type + datasize
-    let (blob_type, data_size) = parse_blob_header(&header_bytes)?;
+    // Parse type + datasize + optional indexdata
+    let (blob_type, data_size, raw_index) = parse_blob_header_with_index(&header_bytes)?;
+    let index = raw_index.and_then(|data| BlobIndex::deserialize(&data));
 
     // Read Blob bytes
     let mut blob_bytes = vec![0u8; data_size];
@@ -561,6 +287,7 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> MergeResult<Option<RawBlobFrame>> 
         frame_bytes,
         blob_type,
         blob_bytes,
+        index,
     }))
 }
 
@@ -783,13 +510,6 @@ fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
 // ---------------------------------------------------------------------------
 // Process an affected data block (has diff overlap — re-encode)
 // ---------------------------------------------------------------------------
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ElemKind {
-    Node,
-    Way,
-    Relation,
-}
 
 fn element_kind(element: &Element<'_>) -> ElemKind {
     match element {
@@ -1258,14 +978,26 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
                         &mut bb, &mut writer, &mut stats,
                     )?;
                     flush_block(&mut bb, &mut writer)?;
-                    writer.write_raw(&batch[i].frame_bytes)?;
+                    if batch[i].index.is_some() {
+                        // Already has indexdata — pass through as-is.
+                        writer.write_raw(&batch[i].frame_bytes)?;
+                        stats.blobs_index_hit += 1;
+                    } else {
+                        // No indexdata — re-frame with index for future merges.
+                        let indexdata = scan.serialize();
+                        let reframed = crate::write::writer::reframe_raw_with_index(
+                            &batch[i].blob_bytes,
+                            &indexdata,
+                        )?;
+                        writer.write_raw(&reframed)?;
+                        stats.blobs_scan_only += 1;
+                    }
                     match scan.kind {
                         ElemKind::Node => stats.base_nodes += scan.count,
                         ElemKind::Way => stats.base_ways += scan.count,
                         ElemKind::Relation => stats.base_relations += scan.count,
                     }
                     stats.blobs_passthrough += 1;
-                    stats.blobs_scan_only += 1;
                 }
                 BlobClassified::MayOverlap(raw) | BlobClassified::Fallback(raw) => {
                     let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
@@ -1319,9 +1051,10 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
 
             if blob_count.is_multiple_of(500) {
                 eprintln!(
-                    "  Blob {blob_count}: {} pass / {} rewrite / {} skip-decompress, {} elements",
-                    stats.blobs_passthrough, stats.blobs_rewritten,
-                    stats.blobs_skip_decompress, stats.total_elements(),
+                    "  Blob {blob_count}: {} pass ({} idx) / {} rewrite / {} skip, {} elements",
+                    stats.blobs_passthrough, stats.blobs_index_hit,
+                    stats.blobs_rewritten, stats.blobs_skip_decompress,
+                    stats.total_elements(),
                 );
             }
         }
@@ -1359,7 +1092,7 @@ const BATCH_SIZE: usize = 64;
 ///    only contains pure creates with IDs in the blob's range.
 enum BlobClassified {
     /// No overlap — passthrough the raw frame directly.
-    Passthrough(BlobScan),
+    Passthrough(BlobIndex),
     /// Coarse range overlaps diff — decompressed bytes ready for full parse.
     /// May still be passed through if the precise check finds no actual overlap.
     MayOverlap(Vec<u8>),
@@ -1367,12 +1100,13 @@ enum BlobClassified {
     Fallback(Vec<u8>),
 }
 
-/// Classify a blob in parallel: decompress + scan + range check.
+/// Classify a blob in parallel: check inline index or decompress + scan + range check.
 ///
-/// Uses a caller-provided `buf` for decompression buffer reuse. Passthrough
-/// blobs (~91% of total) leave the buffer intact for the next call. Only
-/// MayOverlap/Fallback blobs take ownership of the buffer contents via
-/// `mem::take`, causing a one-time reallocation on the next call.
+/// If the blob has inline index metadata (from BlobHeader indexdata), classification
+/// uses it directly — no decompression needed. Otherwise falls back to decompress +
+/// scan. Uses a caller-provided `buf` for decompression buffer reuse. Passthrough
+/// blobs leave the buffer intact for the next call. Only MayOverlap/Fallback blobs
+/// take ownership via `mem::take`, causing a one-time reallocation on the next call.
 ///
 /// Returns `Result<_, String>` instead of `MergeResult` so it's Send for rayon.
 fn classify_blob(
@@ -1380,9 +1114,17 @@ fn classify_blob(
     ranges: &DiffRanges,
     buf: &mut Vec<u8>,
 ) -> Result<BlobClassified, String> {
+    // Fast path: use inline index from BlobHeader indexdata (no decompression).
+    if let Some(ref idx) = frame.index
+        && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
+    {
+        return Ok(BlobClassified::Passthrough(idx.clone()));
+    }
+
+    // Slow path: decompress + lightweight scan.
     decompress_blob_data_into(&frame.blob_bytes, buf).map_err(|e| e.to_string())?;
 
-    if let Some(scan) = scan_block_ids(buf) {
+    if let Some(scan) = blob_index::scan_block_ids(buf) {
         if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
             return Ok(BlobClassified::Passthrough(scan));
         }

@@ -690,6 +690,23 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usi
     Ok((header.type_().to_string(), header.datasize() as usize))
 }
 
+/// Parse a BlobHeader and also extract the optional `indexdata` field.
+///
+/// Returns `(blob_type, data_size, optional_indexdata)`. The indexdata, when
+/// present, contains blob-level metadata (element type, ID range, count)
+/// that allows merge to classify blobs without decompression.
+pub fn parse_blob_header_with_index(
+    header_bytes: &[u8],
+) -> Result<(String, usize, Option<Vec<u8>>)> {
+    let header = fileformat::BlobHeader::parse_from_tokio_bytes(
+        &Bytes::copy_from_slice(header_bytes),
+    )
+    .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    let indexdata = header.indexdata.as_ref().map(|b| b.to_vec());
+    #[allow(clippy::cast_sign_loss)]
+    Ok((header.type_().to_string(), header.datasize() as usize, indexdata))
+}
+
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
 ///
 /// This variant accepts `&[u8]` for convenience but must copy the bytes

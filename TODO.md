@@ -19,9 +19,10 @@ optimized. The read path has decompression buffer pooling (`DecompressPool` +
 `Bytes::from_owner`) and a zero-copy wire-format parser (`wire.rs`), yielding
 **43-44% wall time improvement** across all single-threaded read modes. The
 merge write path has parallel compression via `PbfWriter::to_path_pipelined`,
-yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). The top
-remaining merge optimization is Finding 7 (skip decompression for passthrough
-blobs).
+yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). Finding 7
+(blob-level indexdata) embeds element type + ID range in BlobHeader so that
+subsequent merges can classify passthrough blobs without decompression — saving
+~8% on Denmark (3.07s → 2.81s) with larger gains expected at planet scale.
 
 Profiled with `hotpath-alloc` on two commands: `check-refs` and `tags-count`.
 Run with `scripts/run-hotpath-alloc.sh <command> <file>`. Use `--min-count` for
@@ -102,15 +103,22 @@ blobreader:  3215 ms
 
 ### Finding 7: merge decompresses all blobs for ID range scanning
 
-All 7,396 blobs are decompressed to scan ID ranges and decide passthrough vs
-rewrite. With parallel compression solved (Finding 6), this decompression +
-classification now dominates the remaining wall time. Buffer reuse via
-`decompress_blob_data_into` eliminates allocation churn. The wire parser makes
-actual block parsing for the 630 rewritten blobs very cheap (14ms, 17 MB alloc).
+**Fixed.** Blob-level indexdata (26 bytes: element type + min/max ID + count)
+is now embedded in every OSMData BlobHeader via the standard `indexdata` field.
+On merge, blobs with indexdata skip decompression entirely for classification.
+Passthrough blobs without indexdata are re-framed (new BlobHeader, no recompression)
+so that all pbfhogg output carries indexdata for subsequent operations.
 
-- [ ] **Skip decompression entirely for passthrough blobs in merge.** If blob
-  headers or a pre-scan index can determine ID ranges without decompression,
-  ~6,766 decompressions become unnecessary.
+First merge against external PBF (no indexdata): falls back to decompress + scan.
+Second+ merge against pbfhogg output: 6766/7396 index hits, 0 unnecessary
+decompressions. Denmark: 3.07s → 2.81s (~8%). Hotpath profiling overstated
+decompression cost (402µs/blob measured vs ~35µs actual) due to instrumentation
+overhead; the real bottleneck at Denmark scale is I/O. Savings scale linearly
+with blob count — expected ~20s at planet scale (~600K blobs).
+
+Implementation: `blob_index.rs` (shared scanner + serialization), `writer.rs`
+(embed on write + `reframe_raw_with_index`), `blob.rs`
+(`parse_blob_header_with_index`), `merge.rs` (fast path + stats).
 
 ## Performance: parallelism
 

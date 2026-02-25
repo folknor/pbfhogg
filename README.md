@@ -11,6 +11,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Write** valid `.osm.pbf` files with `PbfWriter` and `BlockBuilder` — dense node packing, delta encoding, zlib compression
 - **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
 - **Blob passthrough** (`write_raw`) for copying unmodified blobs during merge/diff operations
+- **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
 - **Configurable compression** — pure Rust zlib (default), system zlib, or zlib-ng
 
 ## Usage
@@ -78,7 +79,8 @@ Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
 
 | Tool | Time | Notes |
 |------|------|-------|
-| **pbfhogg** | **3.0s** | parallel compression + blob passthrough |
+| **pbfhogg** | **2.8s** | parallel compression + blob passthrough + blob indexdata |
+| **pbfhogg** | 3.1s | first merge (no indexdata in input, falls back to decompression) |
 | osmium 1.19 | 7.2s | `osmium apply-changes` |
 
 System: Linux 6.18, Ryzen 9 7950X.

@@ -43,7 +43,11 @@ impl RefCheckResult {
 /// If `check_relations` is true, also verifies that relation members
 /// (node, way, relation) point to existing elements.
 ///
-/// Relies on PBF sort order: nodes before ways before relations.
+/// Relies on PBF sort order: nodes before ways before relations. Reports
+/// unique missing IDs for nodes and ways (since they precede relations and
+/// are fully indexed before relation processing). Reports missing reference
+/// occurrences for relation-to-relation members (deferred to post-pass to
+/// handle forward references). Matches osmium check-refs semantics.
 ///
 /// # Why this is NOT an ID-only consumer
 ///
@@ -87,6 +91,20 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
     let mut way_ids = RoaringTreemap::new();
     let mut relation_ids = RoaringTreemap::new();
 
+    // Track unique missing IDs (not reference occurrences) to match osmium
+    // semantics: "441 nodes missing" means 441 distinct node IDs that don't
+    // exist, not 712 references that point to missing nodes.
+    let mut missing_node_refs_set = RoaringTreemap::new();
+    let mut missing_way_refs_set = RoaringTreemap::new();
+    let mut missing_node_members_set = RoaringTreemap::new();
+
+    // Deferred relation-to-relation references. Relations can reference other
+    // relations that appear later in the file (forward references), so we
+    // collect all relation member IDs during the pass and check them after
+    // reading completes, when the full relation_ids set is available. This
+    // matches osmium's two-pass approach for relation members.
+    let mut deferred_relation_refs: Vec<u64> = Vec::new();
+
     let mut result = RefCheckResult {
         node_count: 0,
         way_count: 0,
@@ -115,7 +133,7 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
                 result.way_count += 1;
                 for node_ref in w.refs() {
                     if !node_ids.contains(node_ref .cast_unsigned()) {
-                        result.missing_node_refs += 1;
+                        missing_node_refs_set.insert(node_ref .cast_unsigned());
                     }
                 }
             }
@@ -129,21 +147,16 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
                         match member.id {
                             MemberId::Node(id) => {
                                 if !node_ids.contains(id .cast_unsigned()) {
-                                    result.missing_node_members += 1;
+                                    missing_node_members_set.insert(id .cast_unsigned());
                                 }
                             }
                             MemberId::Way(id) => {
                                 if !way_ids.contains(id .cast_unsigned()) {
-                                    result.missing_way_refs += 1;
+                                    missing_way_refs_set.insert(id .cast_unsigned());
                                 }
                             }
                             MemberId::Relation(id) => {
-                                // Relations can reference other relations that
-                                // appear later in the file, so we can only check
-                                // relations seen so far. This matches osmium behavior.
-                                if !relation_ids.contains(id .cast_unsigned()) {
-                                    result.missing_relation_members += 1;
-                                }
+                                deferred_relation_refs.push(id .cast_unsigned());
                             }
                             // Unknown member types from newer PBF producers —
                             // skip for ref-checking since we don't know what
@@ -155,6 +168,20 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
             }
         }
     })?;
+
+    result.missing_node_refs = missing_node_refs_set.len();
+    result.missing_node_members = missing_node_members_set.len();
+    result.missing_way_refs = missing_way_refs_set.len();
+
+    // Resolve deferred relation refs against the complete relation_ids set.
+    // Count occurrences (not unique IDs) to match osmium semantics.
+    if check_relations {
+        for &id in &deferred_relation_refs {
+            if !relation_ids.contains(id) {
+                result.missing_relation_members += 1;
+            }
+        }
+    }
 
     Ok(result)
 }

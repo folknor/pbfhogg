@@ -318,9 +318,9 @@ command with pbfhogg and osmium on the same input, diff the outputs.
 - [x] `tags-filter` — identical for all 3 expressions with `-R` (`verify/tags-filter.sh`)
 - [x] `getid` / `removeid` — getid identical to osmium. removeid complement verified
   (getid + removeid = original counts). osmium has no removeid command. (`verify/getid-removeid.sh`)
-- [x] `check-refs` — ways-only check identical (0 missing node refs). Relation check:
-  pbfhogg counts reference occurrences, osmium counts unique missing IDs — different
-  metric, not a bug. (`verify/check-refs.sh`)
+- [x] `check-refs` — identical output for both ways-only and full relation checks.
+  Fixed: deferred relation-to-relation refs to post-pass (forward reference handling),
+  switched to unique missing IDs for nodes/ways. (`verify/check-refs.sh`)
 
 ## Nice to have
 

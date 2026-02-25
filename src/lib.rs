@@ -123,7 +123,7 @@ pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
 // Required by imports and doc links in commands/, read/, and write/ modules.
-pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
+pub use read::{blob, block, dense, elements, file_reader, indexed, mmap_blob, reader};
 pub use write::{block_builder, file_writer, writer};
 pub use commands::{
     add_locations_to_ways, cat, check_refs, derive_changes, diff, extract, fileinfo, getid, merge,

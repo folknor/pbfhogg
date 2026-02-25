@@ -34,7 +34,7 @@ fn identical_files_no_changes() {
     write_test_pbf(&old, &nodes, &ways, &[]);
     write_test_pbf(&new, &nodes, &ways, &[]);
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -63,7 +63,7 @@ fn create_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 2); // node 2 + way 10
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -92,7 +92,7 @@ fn delete_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 2); // node 2 + way 10
@@ -118,7 +118,7 @@ fn modify_node_coords() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 1);
     assert_eq!(stats.deletes, 0);
@@ -144,7 +144,7 @@ fn modify_node_tags() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -168,7 +168,7 @@ fn modify_way_refs() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -203,7 +203,7 @@ fn modify_relation_members() {
         }],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -236,7 +236,7 @@ fn mixed_create_modify_delete() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 1);  // node 4
     assert_eq!(stats.modifies, 2); // node 1 + way 10
     assert_eq!(stats.deletes, 1);  // node 3
@@ -277,7 +277,7 @@ fn roundtrip_with_merge() {
     );
 
     // Derive changes
-    let stats = derive_changes(&old, &new, &osc).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 1);  // node 5
     assert_eq!(stats.modifies, 2); // node 1 (tags) + way 10 (refs + tags)
     assert_eq!(stats.deletes, 1);  // node 3

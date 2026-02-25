@@ -1,11 +1,11 @@
 //! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
 
-use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::path::Path;
 
 use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
+use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
@@ -38,10 +38,15 @@ impl CatStats {
 /// only elements of matching types are included (requires full decode).
 /// Without a filter, blobs are passed through as raw bytes (zero decode).
 #[hotpath::measure]
-pub fn cat(files: &[&Path], output: &Path, type_filter: Option<&str>) -> Result<CatStats> {
+pub fn cat(
+    files: &[&Path],
+    output: &Path,
+    type_filter: Option<&str>,
+    direct_io: bool,
+) -> Result<CatStats> {
     match type_filter {
-        None => cat_passthrough(files, output),
-        Some(filter) => cat_filtered(files, output, filter),
+        None => cat_passthrough(files, output, direct_io),
+        Some(filter) => cat_filtered(files, output, filter, direct_io),
     }
 }
 
@@ -87,14 +92,13 @@ fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
     }))
 }
 
-fn cat_passthrough(files: &[&Path], output: &Path) -> Result<CatStats> {
+fn cat_passthrough(files: &[&Path], output: &Path, direct_io: bool) -> Result<CatStats> {
     let mut writer = PbfWriter::to_path(output, Compression::default())?;
     let mut header_written = false;
     let mut blobs: u64 = 0;
 
     for file in files {
-        let f = File::open(file)?;
-        let mut reader = BufReader::new(f);
+        let mut reader = FileReader::open(file, direct_io)?;
 
         while let Some(frame) = read_raw_frame(&mut reader)? {
             match frame.blob_type.as_str() {
@@ -127,7 +131,7 @@ fn cat_passthrough(files: &[&Path], output: &Path) -> Result<CatStats> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats> {
+fn cat_filtered(files: &[&Path], output: &Path, filter: &str, direct_io: bool) -> Result<CatStats> {
     let filter_node = filter.contains("node");
     let filter_way = filter.contains("way");
     let filter_relation = filter.contains("relation");
@@ -139,7 +143,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
     let mut elements: u64 = 0;
 
     for file in files {
-        let reader = BlobReader::from_path(file)?;
+        let reader = BlobReader::open(file, direct_io)?;
 
         for blob in reader {
             let blob = blob?;

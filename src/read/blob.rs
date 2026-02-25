@@ -5,6 +5,7 @@ use crate::error::{new_blob_error, new_error, new_protobuf_error, BlobError, Err
 use crate::proto::fileformat;
 use bytes::Bytes;
 use protobuf::Message;
+use super::file_reader::FileReader;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -353,7 +354,7 @@ impl<R: Read + Send> BlobReader<R> {
     }
 }
 
-impl BlobReader<BufReader<File>> {
+impl BlobReader<FileReader> {
     /// Tries to open the file at the given path and constructs a `BlobReader` from this.
     /// If there are no errors, each blob will have a valid ([`Some`]) offset.
     ///
@@ -371,23 +372,31 @@ impl BlobReader<BufReader<File>> {
     /// # foo().unwrap();
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let f = File::open(path)?;
-        // Use a 256KB BufReader instead of the default 8KB.
-        //
-        // PBF blobs are typically 16-32KB compressed, so the default 8KB buffer
-        // requires 2-4 read syscalls per blob. For an 80GB planet file (~2.5M blobs),
-        // that adds up to 5-10M unnecessary syscalls.
-        //
-        // 256KB comfortably fits several blobs per syscall, reducing overhead
-        // significantly on the sequential read path where we consume blobs in order.
-        //
-        // Note: this large buffer is appropriate here because BlobReader reads
-        // sequentially. IndexedReader, which does random seeks, intentionally does NOT
-        // use BufReader — a large read-ahead buffer would be wasted and
-        // counterproductive for seek-heavy access patterns. See IndexedReader::from_path
-        // in indexed.rs.
-        let reader = BufReader::with_capacity(256 * 1024, f);
+        let reader = FileReader::buffered(path.as_ref())?;
+        Ok(BlobReader {
+            reader,
+            offset: Some(ByteOffset(0)),
+            last_blob_ok: true,
+        })
+    }
 
+    /// Open a file for reading with O_DIRECT (bypasses page cache).
+    ///
+    /// Requires the `linux-direct-io` feature. Returns an error if the
+    /// filesystem does not support O_DIRECT (e.g. tmpfs).
+    #[cfg(feature = "linux-direct-io")]
+    pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let reader = FileReader::direct(path.as_ref())?;
+        Ok(BlobReader {
+            reader,
+            offset: Some(ByteOffset(0)),
+            last_blob_ok: true,
+        })
+    }
+
+    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
+        let reader = FileReader::open(path.as_ref(), direct)?;
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -471,7 +480,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     /// use pbfhogg::*;
     ///
     /// # fn foo() -> Result<()> {
-    /// let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
+    /// let mut reader = BlobReader::seekable_from_path("tests/test.osm.pbf")?;
     /// let first_blob = reader.next().unwrap()?;
     /// let second_blob = reader.next().unwrap()?;
     ///
@@ -499,7 +508,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     /// use pbfhogg::*;
     ///
     /// # fn foo() -> Result<()> {
-    /// let mut reader = BlobReader::from_path("tests/test.osm.pbf")?;
+    /// let mut reader = BlobReader::seekable_from_path("tests/test.osm.pbf")?;
     /// let first_blob = reader.next().unwrap()?;
     /// let second_blob = reader.next().unwrap()?;
     ///

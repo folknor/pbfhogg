@@ -285,7 +285,7 @@ fn blobreader_seek_to_start() {
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
-    let mut reader = BlobReader::from_path(&path).unwrap();
+    let mut reader = BlobReader::seekable_from_path(&path).unwrap();
     let first = reader.next().unwrap().unwrap();
     assert_eq!(first.get_type(), BlobType::OsmHeader);
     assert_eq!(first.offset(), Some(ByteOffset(0)));
@@ -305,7 +305,7 @@ fn blobreader_blob_from_offset() {
     write_test_pbf(&path);
 
     // First pass: collect all blob types (as strings) and offsets
-    let mut reader = BlobReader::from_path(&path).unwrap();
+    let mut reader = BlobReader::seekable_from_path(&path).unwrap();
     let mut blobs_info: Vec<(String, ByteOffset)> = Vec::new();
     for blob in reader.by_ref() {
         let blob = blob.unwrap();
@@ -330,7 +330,7 @@ fn blobreader_seek_raw() {
     let path = dir.path().join("test.osm.pbf");
     write_test_pbf(&path);
 
-    let mut reader = BlobReader::from_path(&path).unwrap();
+    let mut reader = BlobReader::seekable_from_path(&path).unwrap();
 
     // Read first blob
     let _ = reader.next().unwrap().unwrap();

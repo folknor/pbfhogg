@@ -33,8 +33,9 @@ pub fn tags_count(
     path: &Path,
     min_count: u64,
     type_filter: Option<&str>,
+    direct_io: bool,
 ) -> Result<Vec<TagCount>> {
-    let reader = ElementReader::from_path(path)?;
+    let reader = ElementReader::open(path, direct_io)?;
     let mut counts: FxHashMap<String, FxHashMap<String, u64>> = FxHashMap::default();
 
     let filter_node = type_filter.is_none() || type_filter == Some("node");

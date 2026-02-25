@@ -1,7 +1,10 @@
 pub mod blob;
 pub mod block;
 pub mod dense;
+#[cfg(feature = "linux-direct-io")]
+pub mod direct_reader;
 pub mod elements;
+pub mod file_reader;
 pub mod indexed;
 pub mod mmap_blob;
 pub mod reader;

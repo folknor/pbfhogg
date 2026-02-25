@@ -47,8 +47,8 @@ pub(crate) struct ReadResult {
     pub(crate) relations: Vec<OwnedRelation>,
 }
 
-pub(crate) fn read_elements(input: &Path) -> Result<ReadResult> {
-    let reader = BlobReader::from_path(input)?;
+pub(crate) fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult> {
+    let reader = BlobReader::open(input, direct_io)?;
     let mut nodes: Vec<OwnedNode> = Vec::new();
     let mut ways: Vec<OwnedWay> = Vec::new();
     let mut relations: Vec<OwnedRelation> = Vec::new();

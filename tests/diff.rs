@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 fn run_diff(old: &Path, new: &Path, options: &DiffOptions) -> (String, pbfhogg::diff::DiffStats) {
     let mut output = Vec::new();
-    let stats = diff(old, new, &mut output, options).expect("diff");
+    let stats = diff(old, new, &mut output, options, false).expect("diff");
     let text = String::from_utf8(output).expect("utf8");
     (text, stats)
 }

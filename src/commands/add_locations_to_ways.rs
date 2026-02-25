@@ -57,18 +57,19 @@ pub fn add_locations_to_ways(
     input: &Path,
     output: &Path,
     keep_untagged_nodes: bool,
+    direct_io: bool,
 ) -> Result<Stats> {
-    let index = build_node_index(input)?;
-    write_output(input, output, &index, keep_untagged_nodes)
+    let index = build_node_index(input, direct_io)?;
+    write_output(input, output, &index, keep_untagged_nodes, direct_io)
 }
 
 // ---------------------------------------------------------------------------
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
 
-fn build_node_index(input: &Path) -> Result<HashMap<i64, (i32, i32)>> {
+fn build_node_index(input: &Path, direct_io: bool) -> Result<HashMap<i64, (i32, i32)>> {
     let mut index: HashMap<i64, (i32, i32)> = HashMap::new();
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
 
     for blob in reader {
         let blob = blob?;
@@ -103,6 +104,7 @@ fn write_output(
     output: &Path,
     index: &HashMap<i64, (i32, i32)>,
     keep_untagged_nodes: bool,
+    direct_io: bool,
 ) -> Result<Stats> {
     let mut stats = Stats {
         nodes_read: 0,
@@ -117,7 +119,7 @@ fn write_output(
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {

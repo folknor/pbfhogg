@@ -194,11 +194,12 @@ and kernel-space copy.
   across all 7 command files, zero-cost when feature is off. Both sync (`to_path_direct`)
   and pipelined (`to_path_pipelined_direct`) constructors. CLI: `--direct-io` on merge.
 
-- [ ] **O_DIRECT for planet-scale reads (read path).** The write path is done; the
-  read side still uses standard `File`/`BufReader`/mmap which pollutes the page cache
-  with 80GB of input data. Same principle: the read pipeline manages its own buffers
-  (`DecompressPool` + `Bytes::from_owner`), so the page cache is pure overhead.
-  `BlobReader` and `MmapBlobReader` need aligned-read variants.
+- [x] **O_DIRECT for planet-scale reads (read path).** `DirectReader` uses
+  page-aligned buffer + `libc::read()`, wrapped in `FileReader` enum (mirrors
+  `FileWriter`). `BlobReader::open(path, direct_io)` and `ElementReader::open(path,
+  direct_io)` select at runtime. All commands accept `--direct-io` for both reads
+  and writes. Seekable/indexed paths stay on `BufReader<File>` (O_DIRECT + seek
+  requires complex alignment math, not on the planet-scale hot path).
 
 - [ ] **`copy_file_range` for blob passthrough in sort/merge.** Blobs can be copied
   between file descriptors entirely in kernel space via `copy_file_range(in_fd,
@@ -262,7 +263,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ### Implementation order
 
-1. ~~**O_DIRECT (Tier 1)** — write path done. Read path next.~~
+1. ~~**O_DIRECT (Tier 1)** — write + read paths done.~~
 2. **`copy_file_range` (Tier 1)** — orthogonal, change `write_raw` API. Kernel-space
    blob copy for merge/sort passthrough.
 3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already

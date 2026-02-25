@@ -2,10 +2,10 @@
 
 use super::blob::{Blob, BlobDecode, BlobReader, BlobType};
 use super::elements::Element;
+use super::file_reader::FileReader;
 use crate::error::Result;
 use rayon::prelude::*;
-use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::Read;
 use std::path::Path;
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
@@ -226,7 +226,7 @@ impl<R: Read + Send> ElementReader<R> {
     }
 }
 
-impl ElementReader<BufReader<File>> {
+impl ElementReader<FileReader> {
     /// Tries to open the file at the given path and constructs an `ElementReader` from this.
     ///
     /// # Errors
@@ -245,6 +245,21 @@ impl ElementReader<BufReader<File>> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         Ok(ElementReader {
             blob_iter: BlobReader::from_path(path)?,
+        })
+    }
+
+    /// Open a file for reading with O_DIRECT (bypasses page cache).
+    #[cfg(feature = "linux-direct-io")]
+    pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
+        Ok(ElementReader {
+            blob_iter: BlobReader::from_path_direct(path)?,
+        })
+    }
+
+    /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
+    pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
+        Ok(ElementReader {
+            blob_iter: BlobReader::open(path, direct)?,
         })
     }
 }

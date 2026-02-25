@@ -85,8 +85,8 @@ struct ReadResult {
 /// Reads the entire file into memory, sorts, and writes the output.
 /// Suitable for files that fit in RAM (typically up to ~1 GB PBF).
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path) -> Result<SortStats> {
-    let mut data = read_elements(input)?;
+pub fn sort(input: &Path, output: &Path, direct_io: bool) -> Result<SortStats> {
+    let mut data = read_elements(input, direct_io)?;
 
     // Sort each type by ID
     data.nodes.sort_by_key(|n| n.id);
@@ -107,8 +107,8 @@ pub fn sort(input: &Path, output: &Path) -> Result<SortStats> {
 // Phase 1: Read all elements into owned vectors
 // ---------------------------------------------------------------------------
 
-fn read_elements(input: &Path) -> Result<ReadResult> {
-    let reader = BlobReader::from_path(input)?;
+fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult> {
+    let reader = BlobReader::open(input, direct_io)?;
     let mut nodes: Vec<OwnedNode> = Vec::new();
     let mut ways: Vec<OwnedWay> = Vec::new();
     let mut relations: Vec<OwnedRelation> = Vec::new();

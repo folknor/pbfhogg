@@ -687,7 +687,9 @@ fn roundtrip_pipelined_direct_io() {
         let mut bb = BlockBuilder::new();
         for j in 0..100 {
             let id = i * 100 + j + 1;
-            bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
+            #[allow(clippy::cast_possible_truncation)]
+            let id32 = id as i32;
+            bb.add_node(id, id32 * 1_000_000, id32 * 2_000_000, &[], None);
         }
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(&bytes).unwrap();

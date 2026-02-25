@@ -50,9 +50,10 @@ pub fn derive_changes(
     old_path: &Path,
     new_path: &Path,
     output: &Path,
+    direct_io: bool,
 ) -> Result<DeriveChangesStats> {
-    let mut old = read_elements(old_path)?;
-    let mut new = read_elements(new_path)?;
+    let mut old = read_elements(old_path, direct_io)?;
+    let mut new = read_elements(new_path, direct_io)?;
 
     // Ensure sorted by ID
     old.nodes.sort_by_key(|n| n.id);

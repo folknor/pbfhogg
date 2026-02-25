@@ -345,11 +345,12 @@ pub fn extract(
     output: &Path,
     region: &Region,
     simple: bool,
+    direct_io: bool,
 ) -> Result<ExtractStats> {
     if simple {
-        extract_simple(input, output, region)
+        extract_simple(input, output, region, direct_io)
     } else {
-        extract_complete_ways(input, output, region)
+        extract_complete_ways(input, output, region, direct_io)
     }
 }
 
@@ -357,7 +358,7 @@ pub fn extract(
 // Simple strategy (single pass)
 // ---------------------------------------------------------------------------
 
-fn extract_simple(input: &Path, output: &Path, region: &Region) -> Result<ExtractStats> {
+fn extract_simple(input: &Path, output: &Path, region: &Region, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -404,7 +405,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region) -> Result<Extrac
     let mut node_ids_sorted = false;
     let mut way_ids_sorted = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {
@@ -483,7 +484,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region) -> Result<Extrac
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
-fn extract_complete_ways(input: &Path, output: &Path, region: &Region) -> Result<ExtractStats> {
+fn extract_complete_ways(input: &Path, output: &Path, region: &Region, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -532,7 +533,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region) -> Result
     let mut bbox_node_ids_sorted = false;
     let mut way_ids_sorted = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {
@@ -577,7 +578,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region) -> Result
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {

@@ -6,8 +6,7 @@
 // their max affected ID, remaining blobs skip decompression entirely.
 
 use std::collections::HashSet;
-use std::fs::File;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::path::Path;
 
 use rayon::prelude::*;
@@ -19,6 +18,7 @@ use crate::blob::{
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
 use crate::writer::{Compression, PbfWriter};
@@ -903,8 +903,7 @@ pub fn merge(
     );
 
     // Step 2: Open reader, read header, create pipelined writer
-    let file = File::open(base_pbf)?;
-    let mut reader = BufReader::new(file);
+    let mut reader = FileReader::open(base_pbf, direct_io)?;
 
     // Read the header blob first — needed to construct the pipelined writer.
     let header_bytes = loop {

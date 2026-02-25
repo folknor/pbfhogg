@@ -30,6 +30,9 @@ enum Command {
         /// Full scan: count blobs and elements
         #[arg(long)]
         extended: bool,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Validate referential integrity
     CheckRefs {
@@ -38,6 +41,9 @@ enum Command {
         /// Also check relation member references
         #[arg(long)]
         check_relations: bool,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Count tag key=value frequencies
     TagsCount {
@@ -49,6 +55,9 @@ enum Command {
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Concatenate PBF files with optional type filtering
     Cat {
@@ -61,6 +70,9 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Sort PBF into standard order (nodes → ways → relations, by ID)
     Sort {
@@ -69,6 +81,9 @@ enum Command {
         /// Output PBF file
         #[arg(short, long)]
         output: PathBuf,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Filter elements by tag expressions
     TagsFilter {
@@ -83,6 +98,9 @@ enum Command {
         /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
         #[arg(required = true)]
         expressions: Vec<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Compare two PBF files and show differences
     Diff {
@@ -99,6 +117,9 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Generate OSC diff from two PBF snapshots
     DeriveChanges {
@@ -109,6 +130,9 @@ enum Command {
         /// Output OSC file (.osc.gz)
         #[arg(short, long)]
         output: PathBuf,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Extract elements by ID
     Getid {
@@ -125,6 +149,9 @@ enum Command {
         id_file: Option<PathBuf>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Remove elements by ID
     Removeid {
@@ -138,6 +165,9 @@ enum Command {
         id_file: Option<PathBuf>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Extract elements within a geographic region (bbox or polygon)
     Extract {
@@ -155,6 +185,9 @@ enum Command {
         /// Simple strategy (single pass, may have dangling refs)
         #[arg(short = 's', long)]
         simple: bool,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Embed node coordinates in ways
     AddLocationsToWays {
@@ -166,6 +199,9 @@ enum Command {
         /// Keep untagged nodes in output (default: drop them)
         #[arg(long)]
         keep_untagged_nodes: bool,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Apply OSC diffs to a PBF file
     Merge {
@@ -190,65 +226,75 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Fileinfo { file, extended } => run_fileinfo(&file, extended),
+        Command::Fileinfo { file, extended, direct_io } => run_fileinfo(&file, extended, direct_io),
         Command::CheckRefs {
             file,
             check_relations,
-        } => run_check_refs(&file, check_relations),
+            direct_io,
+        } => run_check_refs(&file, check_relations, direct_io),
         Command::TagsCount {
             file,
             min_count,
             type_filter,
-        } => run_tags_count(&file, min_count, type_filter.as_deref()),
+            direct_io,
+        } => run_tags_count(&file, min_count, type_filter.as_deref(), direct_io),
         Command::Cat {
             files,
             output,
             type_filter,
-        } => run_cat(&files, &output, type_filter.as_deref()),
-        Command::Sort { file, output } => run_sort(&file, &output),
+            direct_io,
+        } => run_cat(&files, &output, type_filter.as_deref(), direct_io),
+        Command::Sort { file, output, direct_io } => run_sort(&file, &output, direct_io),
         Command::TagsFilter {
             file,
             output,
             omit_referenced,
             expressions,
-        } => run_tags_filter(&file, &output, &expressions, omit_referenced),
+            direct_io,
+        } => run_tags_filter(&file, &output, &expressions, omit_referenced, direct_io),
         Command::Diff {
             old,
             new,
             suppress_common,
             verbose,
             type_filter,
-        } => run_diff(&old, &new, suppress_common, verbose, type_filter.as_deref()),
+            direct_io,
+        } => run_diff(&old, &new, suppress_common, verbose, type_filter.as_deref(), direct_io),
         Command::DeriveChanges {
             old,
             new,
             output,
-        } => run_derive_changes(&old, &new, &output),
+            direct_io,
+        } => run_derive_changes(&old, &new, &output, direct_io),
         Command::Getid {
             file,
             output,
             add_referenced,
             id_file,
             ids,
-        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids),
+            direct_io,
+        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids, direct_io),
         Command::Removeid {
             file,
             output,
             id_file,
             ids,
-        } => run_removeid(&file, &output, id_file.as_deref(), &ids),
+            direct_io,
+        } => run_removeid(&file, &output, id_file.as_deref(), &ids, direct_io),
         Command::Extract {
             file,
             output,
             bbox,
             polygon,
             simple,
-        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple),
+            direct_io,
+        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple, direct_io),
         Command::AddLocationsToWays {
             file,
             output,
             keep_untagged_nodes,
-        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes),
+            direct_io,
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, direct_io),
         Command::Merge {
             base,
             changes,
@@ -263,8 +309,8 @@ fn main() {
     }
 }
 
-fn run_fileinfo(path: &std::path::Path, extended: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let info = pbfhogg::fileinfo::fileinfo(path, extended)?;
+fn run_fileinfo(path: &std::path::Path, extended: bool, direct_io: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let info = pbfhogg::fileinfo::fileinfo(path, extended, direct_io)?;
 
     if let Some((left, bottom, right, top)) = info.bbox {
         println!("Bounding box: ({left}, {bottom}) - ({right}, {top})");
@@ -310,8 +356,9 @@ fn run_fileinfo(path: &std::path::Path, extended: bool) -> Result<(), Box<dyn st
 fn run_check_refs(
     path: &std::path::Path,
     check_relations: bool,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = pbfhogg::check_refs::check_refs(path, check_relations)?;
+    let result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
 
     println!(
         "Elements: {} nodes, {} ways, {} relations",
@@ -359,8 +406,9 @@ fn run_tags_count(
     path: &std::path::Path,
     min_count: u64,
     type_filter: Option<&str>,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let results = pbfhogg::tags_count::tags_count(path, min_count, type_filter)?;
+    let results = pbfhogg::tags_count::tags_count(path, min_count, type_filter, direct_io)?;
 
     for entry in &results {
         println!("{}\t{}\t{}", entry.count, entry.key, entry.value);
@@ -374,9 +422,10 @@ fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
     type_filter: Option<&str>,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter)?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -384,8 +433,9 @@ fn run_cat(
 fn run_sort(
     file: &std::path::Path,
     output: &std::path::Path,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::sort::sort(file, output)?;
+    let stats = pbfhogg::sort::sort(file, output, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -395,8 +445,9 @@ fn run_tags_filter(
     output: &std::path::Path,
     expressions: &[String],
     omit_referenced: bool,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced)?;
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -417,6 +468,7 @@ fn run_diff(
     suppress_common: bool,
     verbose: bool,
     type_filter: Option<&str>,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
@@ -424,7 +476,7 @@ fn run_diff(
         type_filter: type_filter.map(String::from),
     };
     let mut stdout = std::io::stdout().lock();
-    let stats = pbfhogg::diff::diff(old, new, &mut stdout, &options)?;
+    let stats = pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?;
     stats.print_summary();
     if stats.has_differences() {
         process::exit(1);
@@ -436,8 +488,9 @@ fn run_derive_changes(
     old: &std::path::Path,
     new: &std::path::Path,
     output: &std::path::Path,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::derive_changes::derive_changes(old, new, output)?;
+    let stats = pbfhogg::derive_changes::derive_changes(old, new, output, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -448,9 +501,10 @@ fn run_getid(
     add_referenced: bool,
     id_file: Option<&std::path::Path>,
     ids: &[String],
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced)?;
+    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -460,9 +514,10 @@ fn run_removeid(
     output: &std::path::Path,
     id_file: Option<&std::path::Path>,
     ids: &[String],
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set)?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -473,6 +528,7 @@ fn run_extract(
     bbox_str: Option<&str>,
     polygon_path: Option<&std::path::Path>,
     simple: bool,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let region = match (bbox_str, polygon_path) {
         (Some(s), None) => {
@@ -483,7 +539,7 @@ fn run_extract(
         (None, None) => return Err("one of --bbox or --polygon is required".into()),
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
-    let stats = pbfhogg::extract::extract(file, output, &region, simple)?;
+    let stats = pbfhogg::extract::extract(file, output, &region, simple, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -492,9 +548,10 @@ fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats =
-        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes)?;
+        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes, direct_io)?;
     stats.print_summary();
     Ok(())
 }

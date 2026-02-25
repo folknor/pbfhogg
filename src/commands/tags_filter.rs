@@ -216,12 +216,13 @@ pub fn tags_filter(
     output: &Path,
     expression_strs: &[String],
     omit_referenced: bool,
+    direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let expressions = parse_expressions(expression_strs)?;
     if omit_referenced {
-        tags_filter_single_pass(input, output, &expressions)
+        tags_filter_single_pass(input, output, &expressions, direct_io)
     } else {
-        tags_filter_two_pass(input, output, &expressions)
+        tags_filter_two_pass(input, output, &expressions, direct_io)
     }
 }
 
@@ -234,6 +235,7 @@ fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let mut writer = PbfWriter::to_path(output, Compression::default())?;
     let mut bb = BlockBuilder::new();
@@ -245,7 +247,7 @@ fn tags_filter_single_pass(
         relations_matched: 0,
     };
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
 
     for blob in reader {
         let blob = blob?;
@@ -387,6 +389,7 @@ fn tags_filter_two_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -429,7 +432,7 @@ fn tags_filter_two_pass(
     let mut matched_relation_ids: Vec<i64> = Vec::new();
     let mut way_dep_node_ids: Vec<i64> = Vec::new();
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {
@@ -494,7 +497,7 @@ fn tags_filter_two_pass(
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {

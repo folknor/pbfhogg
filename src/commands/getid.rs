@@ -105,18 +105,19 @@ pub fn getid(
     output: &Path,
     ids: &IdSet,
     add_referenced: bool,
+    direct_io: bool,
 ) -> Result<GetidStats> {
     if add_referenced {
-        getid_with_refs(input, output, ids)
+        getid_with_refs(input, output, ids, direct_io)
     } else {
-        filter_by_id(input, output, ids, true)
+        filter_by_id(input, output, ids, true, direct_io)
     }
 }
 
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &IdSet) -> Result<GetidStats> {
-    filter_by_id(input, output, ids, false)
+pub fn removeid(input: &Path, output: &Path, ids: &IdSet, direct_io: bool) -> Result<GetidStats> {
+    filter_by_id(input, output, ids, false, direct_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -129,6 +130,7 @@ fn filter_by_id(
     output: &Path,
     ids: &IdSet,
     include: bool,
+    direct_io: bool,
 ) -> Result<GetidStats> {
     let mut writer = PbfWriter::to_path(output, Compression::default())?;
     let mut bb = BlockBuilder::new();
@@ -142,7 +144,7 @@ fn filter_by_id(
     // Fast path: if the ID set is empty, include mode writes nothing,
     // exclude mode writes everything (passthrough would be better but
     // we still need to rebuild the header).
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
 
     for blob in reader {
         let blob = blob?;
@@ -181,7 +183,7 @@ fn filter_by_id(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
-fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet) -> Result<GetidStats> {
+fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, direct_io: bool) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -192,7 +194,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet) -> Result<GetidStat
     let mut dep_node_ids: BTreeSet<i64> = BTreeSet::new();
 
     if !ids.way_ids.is_empty() {
-        let reader = BlobReader::from_path(input)?;
+        let reader = BlobReader::open(input, direct_io)?;
         for blob in reader {
             let blob = blob?;
             if let BlobDecode::OsmData(block) = blob.decode()? {
@@ -212,7 +214,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet) -> Result<GetidStat
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
 
-    let reader = BlobReader::from_path(input)?;
+    let reader = BlobReader::open(input, direct_io)?;
     for blob in reader {
         let blob = blob?;
         match blob.decode()? {

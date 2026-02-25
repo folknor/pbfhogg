@@ -80,8 +80,8 @@ impl RefCheckResult {
 /// supports `u32` (max ~4.3B), which cannot hold current node IDs exceeding
 /// 10 billion.
 #[hotpath::measure]
-pub fn check_refs(path: &Path, check_relations: bool) -> Result<RefCheckResult> {
-    let reader = ElementReader::from_path(path)?;
+pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result<RefCheckResult> {
+    let reader = ElementReader::open(path, direct_io)?;
 
     let mut node_ids = RoaringTreemap::new();
     let mut way_ids = RoaringTreemap::new();

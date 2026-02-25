@@ -19,6 +19,7 @@ use crate::blob::{
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
@@ -347,7 +348,7 @@ fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
 
 fn flush_block(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     if let Some(bytes) = bb.take()? {
         writer.write_primitive_block(&bytes)?;
@@ -357,7 +358,7 @@ fn flush_block(
 
 fn ensure_node_capacity(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
@@ -367,7 +368,7 @@ fn ensure_node_capacity(
 
 fn ensure_way_capacity(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     if !bb.can_add_way() {
         flush_block(bb, writer)?;
@@ -377,7 +378,7 @@ fn ensure_way_capacity(
 
 fn ensure_relation_capacity(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     if !bb.can_add_relation() {
         flush_block(bb, writer)?;
@@ -391,7 +392,7 @@ fn ensure_relation_capacity(
 
 fn write_osc_way(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     way: &OscWay,
 ) -> MergeResult<()> {
     ensure_way_capacity(bb, writer)?;
@@ -402,7 +403,7 @@ fn write_osc_way(
 
 fn write_osc_relation(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     rel: &OscRelation,
 ) -> MergeResult<()> {
     ensure_relation_capacity(bb, writer)?;
@@ -425,7 +426,7 @@ fn write_osc_relation(
 
 fn write_base_dense_node(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     dn: &crate::DenseNode<'_>,
 ) -> MergeResult<()> {
     ensure_node_capacity(bb, writer)?;
@@ -447,7 +448,7 @@ fn write_base_dense_node(
 
 fn write_base_way(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     way: &crate::Way<'_>,
 ) -> MergeResult<()> {
     ensure_way_capacity(bb, writer)?;
@@ -468,7 +469,7 @@ fn write_base_way(
 
 fn write_base_relation(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     rel: &crate::Relation<'_>,
 ) -> MergeResult<()> {
     ensure_relation_capacity(bb, writer)?;
@@ -535,7 +536,7 @@ fn rewrite_block(
     block: &PrimitiveBlock,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     for element in block.elements() {
         let kind = element_kind(&element);
@@ -568,7 +569,7 @@ fn rewrite_element(
     element: &Element<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     match element {
         Element::DenseNode(dn) => rewrite_dense_node(dn, ctx, bb, writer),
@@ -582,7 +583,7 @@ fn rewrite_dense_node(
     dn: &crate::DenseNode<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     let id = dn.id();
     if ctx.diff.deleted_nodes.contains(&id) {
@@ -607,7 +608,7 @@ fn rewrite_node(
     node: &crate::Node<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     let id = node.id();
     if ctx.diff.deleted_nodes.contains(&id) {
@@ -642,7 +643,7 @@ fn rewrite_way(
     way: &crate::Way<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     let id = way.id();
     if ctx.diff.deleted_ways.contains(&id) {
@@ -664,7 +665,7 @@ fn rewrite_relation(
     rel: &crate::Relation<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<std::io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
     let id = rel.id();
     if ctx.diff.deleted_relations.contains(&id) {
@@ -750,7 +751,7 @@ impl CreateEmitter {
         emitted_ways: &HashSet<i64>,
         emitted_relations: &HashSet<i64>,
         bb: &mut BlockBuilder,
-        writer: &mut PbfWriter<std::io::BufWriter<File>>,
+        writer: &mut PbfWriter<FileWriter>,
         stats: &mut MergeStats,
     ) -> MergeResult<()> {
         // Handle type transitions: flush remaining creates for previous types
@@ -829,7 +830,7 @@ impl CreateEmitter {
         emitted_ways: &HashSet<i64>,
         emitted_relations: &HashSet<i64>,
         bb: &mut BlockBuilder,
-        writer: &mut PbfWriter<std::io::BufWriter<File>>,
+        writer: &mut PbfWriter<FileWriter>,
         stats: &mut MergeStats,
     ) -> MergeResult<()> {
         // Use i64::MAX as min_id to flush everything remaining
@@ -850,7 +851,7 @@ impl CreateEmitter {
         emitted_ways: &HashSet<i64>,
         emitted_relations: &HashSet<i64>,
         bb: &mut BlockBuilder,
-        writer: &mut PbfWriter<std::io::BufWriter<File>>,
+        writer: &mut PbfWriter<FileWriter>,
         stats: &mut MergeStats,
     ) -> MergeResult<()> {
         self.flush_remaining_type(ElemKind::Node, diff, emitted_nodes, emitted_ways,
@@ -878,7 +879,12 @@ impl CreateEmitter {
 /// file cannot be written, or if any PBF parsing/encoding fails.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
-pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult<MergeStats> {
+pub fn merge(
+    base_pbf: &Path,
+    osc_file: &Path,
+    output_pbf: &Path,
+    direct_io: bool,
+) -> MergeResult<MergeStats> {
     // Step 1: Parse the diff
     eprintln!("Parsing OSC diff: {}", osc_file.display());
     let diff = parse_osc_file(osc_file)?;
@@ -913,8 +919,22 @@ pub fn merge(base_pbf: &Path, osc_file: &Path, output_pbf: &Path) -> MergeResult
             }
         }
     };
-    let mut writer =
-        PbfWriter::to_path_pipelined(output_pbf, Compression::default(), &header_bytes)?;
+    let mut writer = if direct_io {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            PbfWriter::to_path_pipelined_direct(
+                output_pbf,
+                Compression::default(),
+                &header_bytes,
+            )?
+        }
+        #[cfg(not(feature = "linux-direct-io"))]
+        {
+            return Err("--direct-io requires the linux-direct-io feature".into());
+        }
+    } else {
+        PbfWriter::to_path_pipelined(output_pbf, Compression::default(), &header_bytes)?
+    };
 
     let mut bb = BlockBuilder::new();
     let mut emitted_nodes: HashSet<i64> = HashSet::new();

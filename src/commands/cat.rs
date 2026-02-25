@@ -6,6 +6,7 @@ use std::path::Path;
 
 use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
+use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
 
@@ -299,7 +300,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str) -> Result<CatStats
 
 fn flush_block(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if let Some(bytes) = bb.take()? {
         writer.write_primitive_block(&bytes)?;
@@ -309,7 +310,7 @@ fn flush_block(
 
 fn rebuild_header(
     header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
     let header_bytes = build_header(

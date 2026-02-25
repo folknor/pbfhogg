@@ -35,7 +35,7 @@ fn main() {
     for _ in 0..runs {
         drop(std::fs::remove_file(&output));
         let start = Instant::now();
-        let stats = pbfhogg::merge::merge(base, diff, &output).expect("merge failed");
+        let stats = pbfhogg::merge::merge(base, diff, &output, false).expect("merge failed");
         #[allow(clippy::cast_possible_truncation)]
         let ms = start.elapsed().as_millis() as u64;
         if ms < best_ms {

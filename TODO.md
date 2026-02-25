@@ -183,18 +183,18 @@ The generic path is CPU-bound on zlib compression/decompression. io_uring adds
 negligible value here (~30ms syscall savings on 80GB). Focus on page cache hygiene
 and kernel-space copy.
 
-- [ ] **O_DIRECT for planet-scale cache hygiene.** Planet merge: 80GB read + 80GB
-  write = 160GB page cache churn that evicts useful data on the host. The read
-  pipeline already manages its own buffers (`DecompressPool` + `Bytes::from_owner`);
-  the page cache is pure overhead — we never re-read a blob. O_DIRECT bypasses it
-  entirely. Works with plain synchronous `write()` / `read()` — no io_uring needed.
-  Feature-gated (`linux-direct-io` or similar).
+- [x] **O_DIRECT for planet-scale writes (write path).** Feature-gated
+  `linux-direct-io`. `DirectWriter` uses page-aligned buffer (`AlignedBuffer` via
+  `std::alloc`), `O_DIRECT` + `libc::write`, and `ftruncate` for final partial page.
+  `FileWriter` enum wraps `BufWriter<File>` or `DirectWriter` — single concrete type
+  across all 7 command files, zero-cost when feature is off. Both sync (`to_path_direct`)
+  and pipelined (`to_path_pipelined_direct`) constructors. CLI: `--direct-io` on merge.
 
-  Implementation: `OpenOptionsExt::custom_flags(libc::O_DIRECT)` on both input and
-  output fds. Requires page-aligned buffers (4096) and sector-aligned I/O sizes (512).
-  `frame_blob()` output Vecs need to come from an aligned allocator or be copied into
-  aligned staging buffers. Final write needs `ftruncate` to actual file size since the
-  last blob is unlikely to be sector-aligned.
+- [ ] **O_DIRECT for planet-scale reads (read path).** The write path is done; the
+  read side still uses standard `File`/`BufReader`/mmap which pollutes the page cache
+  with 80GB of input data. Same principle: the read pipeline manages its own buffers
+  (`DecompressPool` + `Bytes::from_owner`), so the page cache is pure overhead.
+  `BlobReader` and `MmapBlobReader` need aligned-read variants.
 
 - [ ] **`copy_file_range` for blob passthrough in sort/merge.** Blobs can be copied
   between file descriptors entirely in kernel space via `copy_file_range(in_fd,
@@ -258,8 +258,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ### Implementation order
 
-1. **O_DIRECT (Tier 1)** — biggest real-world win (cache hygiene), minimal complexity,
-   benefits both tiers. Aligned buffer pool + `custom_flags(O_DIRECT)`. Feature-gated.
+1. ~~**O_DIRECT (Tier 1)** — write path done. Read path next.~~
 2. **`copy_file_range` (Tier 1)** — orthogonal, change `write_raw` API. Kernel-space
    blob copy for merge/sort passthrough.
 3. **`Compression::None` (Tier 2 prereq)** — CLI flag, trivial in PbfWriter (already

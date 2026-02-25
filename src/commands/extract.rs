@@ -1,10 +1,9 @@
 //! Extract elements within a geographic bounding box. Equivalent to `osmium extract`.
 
-use std::fs::File;
-use std::io;
 use std::path::Path;
 
 use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element, MemberId};
 
@@ -695,7 +694,7 @@ fn write_pass2_elements(
     matched_way_ids: &[i64],
     matched_relation_ids: &[i64],
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
     for element in block.elements() {
@@ -770,7 +769,7 @@ fn relation_has_matched_member(
 fn write_dense_node(
     dn: &crate::DenseNode,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
@@ -794,7 +793,7 @@ fn write_dense_node(
 fn write_node(
     n: &crate::Node,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
@@ -819,7 +818,7 @@ fn write_node(
 fn write_way(
     w: &crate::Way,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if !bb.can_add_way() {
         flush_block(bb, writer)?;
@@ -845,7 +844,7 @@ fn write_way(
 fn write_relation(
     r: &crate::Relation,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if !bb.can_add_relation() {
         flush_block(bb, writer)?;
@@ -880,7 +879,7 @@ fn write_relation(
 
 fn flush_block(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if let Some(bytes) = bb.take()? {
         writer.write_primitive_block(&bytes)?;
@@ -891,7 +890,7 @@ fn flush_block(
 fn write_extract_header(
     region: &Region,
     header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     let bbox = region.bbox();
     let header_bytes = build_header(

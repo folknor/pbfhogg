@@ -13,6 +13,7 @@
 
 use crate::blob_index;
 use crate::proto::fileformat;
+use crate::write::file_writer::FileWriter;
 use bytes::Bytes;
 use flate2::write::ZlibEncoder;
 use flate2::Compression as FlateCompression;
@@ -90,14 +91,25 @@ pub struct PbfWriter<W: Write> {
     pipeline: Option<WritePipeline>,
 }
 
-impl PbfWriter<io::BufWriter<std::fs::File>> {
+impl PbfWriter<FileWriter> {
     /// Create a `PbfWriter` that writes to a file at the given path.
     pub fn to_path(path: &Path, compression: Compression) -> io::Result<Self> {
-        let file = std::fs::File::create(path)?;
-        // 256KB BufWriter — PBF blobs are typically 16–64KB compressed, so the
-        // default 8KB buffer causes excessive write syscalls. 256KB comfortably
-        // holds several blobs before flushing.
-        let writer = io::BufWriter::with_capacity(256 * 1024, file);
+        let writer = FileWriter::buffered(path)?;
+        Ok(PbfWriter {
+            writer: Some(writer),
+            compression,
+            pipeline: None,
+        })
+    }
+
+    /// Create a `PbfWriter` with `O_DIRECT` for page-cache-free writes.
+    ///
+    /// All writes bypass the kernel page cache, preventing cache pollution
+    /// during planet-scale (80 GB+) PBF writes. Requires a filesystem that
+    /// supports `O_DIRECT` (not tmpfs).
+    #[cfg(feature = "linux-direct-io")]
+    pub fn to_path_direct(path: &Path, compression: Compression) -> io::Result<Self> {
+        let writer = FileWriter::direct(path)?;
         Ok(PbfWriter {
             writer: Some(writer),
             compression,
@@ -119,9 +131,27 @@ impl PbfWriter<io::BufWriter<std::fs::File>> {
         compression: Compression,
         header_block_bytes: &[u8],
     ) -> io::Result<Self> {
-        let file = std::fs::File::create(path)?;
-        let mut writer = io::BufWriter::with_capacity(256 * 1024, file);
+        let writer = FileWriter::buffered(path)?;
+        Self::start_pipeline(writer, compression, header_block_bytes)
+    }
 
+    /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
+    #[cfg(feature = "linux-direct-io")]
+    pub fn to_path_pipelined_direct(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+    ) -> io::Result<Self> {
+        let writer = FileWriter::direct(path)?;
+        Self::start_pipeline(writer, compression, header_block_bytes)
+    }
+
+    /// Shared pipelined setup: write header, spawn writer thread.
+    fn start_pipeline(
+        mut writer: FileWriter,
+        compression: Compression,
+        header_block_bytes: &[u8],
+    ) -> io::Result<Self> {
         // Write header synchronously before starting the pipeline.
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
         writer.write_all(&framed_header)?;

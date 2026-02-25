@@ -3,11 +3,10 @@
 //! Standard PBF order: all nodes sorted by ID, then all ways sorted by ID,
 //! then all relations sorted by ID.
 
-use std::fs::File;
-use std::io;
 use std::path::Path;
 
 use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element, MemberId};
 
@@ -359,7 +358,7 @@ fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
 
 fn flush_block(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<io::BufWriter<File>>,
+    writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if let Some(bytes) = bb.take()? {
         writer.write_primitive_block(&bytes)?;

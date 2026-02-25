@@ -83,7 +83,7 @@ fn merge_basic_create_modify_delete() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output).expect("merge");
+    let stats = merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes: 1 (unchanged), 2 (modified), 4 (created). Node 3 deleted.
@@ -143,7 +143,7 @@ fn merge_create_between_existing_ids() {
   </create>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // All 5 nodes present in output.
@@ -190,7 +190,7 @@ fn merge_create_beyond_max_id() {
   </create>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 2, 3, 100, 200]);
     assert_eq!(c.nodes[3].3, vec![("name".to_string(), "far".to_string())]);
@@ -255,7 +255,7 @@ fn merge_multi_block_partial_rewrite() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output).expect("merge");
+    let stats = merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Block 1 nodes passed through unchanged
@@ -314,7 +314,7 @@ fn merge_nodes_only_diff_ways_passthrough() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Node 2 modified
@@ -365,7 +365,7 @@ fn merge_ways_only_diff() {
   </delete>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes unchanged
@@ -420,7 +420,7 @@ fn merge_relations_only_diff() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes and ways unchanged
@@ -494,7 +494,7 @@ fn merge_all_types() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output).expect("merge");
+    merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
@@ -568,7 +568,7 @@ fn merge_delete_entire_block() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output).expect("merge");
+    let stats = merge(&base, &osc, &output, false).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes 1-3 all deleted, only 10-11 survive
@@ -625,7 +625,7 @@ fn merge_stats_accuracy() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output).expect("merge");
+    let stats = merge(&base, &osc, &output, false).expect("merge");
 
     assert_eq!(stats.base_nodes, 1, "node 1 passed through from base");
     assert_eq!(stats.diff_nodes, 2, "diff nodes emitted (modify node 2 + create node 4)");
@@ -814,7 +814,7 @@ fn merge_cross_validate_osmium() {
     let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
 
     eprintln!("Running pbfhogg merge...");
-    merge(&base_pbf, &osc, &pbfhogg_out).expect("pbfhogg merge");
+    merge(&base_pbf, &osc, &pbfhogg_out, false).expect("pbfhogg merge");
 
     eprintln!("Running osmium apply-changes...");
     let osmium_result = std::process::Command::new("osmium")

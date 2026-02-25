@@ -176,6 +176,9 @@ enum Command {
         /// Output PBF file
         #[arg(short, long)]
         output: PathBuf,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
 }
 
@@ -250,7 +253,8 @@ fn main() {
             base,
             changes,
             output,
-        } => run_merge(&base, &changes, &output),
+            direct_io,
+        } => run_merge(&base, &changes, &output, direct_io),
     };
 
     if let Err(e) = result {
@@ -499,8 +503,9 @@ fn run_merge(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,
+    direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::merge::merge(base, changes, output)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, direct_io)?;
     stats.print_summary();
     Ok(())
 }

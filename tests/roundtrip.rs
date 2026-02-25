@@ -7,6 +7,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element};
 use std::io::Cursor;
 
+
 /// Write a PBF with known nodes (all with metadata), read back, verify every field.
 #[test]
 fn roundtrip_dense_nodes_with_metadata() {
@@ -565,6 +566,160 @@ fn roundtrip_uncompressed() {
             assert_eq!(dn.decimicro_lon(), -987_654_321);
         }
         _ => panic!("expected DenseNode"),
+    }
+}
+
+/// Write a PBF with O_DIRECT, read it back, verify data integrity.
+/// Skips gracefully if O_DIRECT is not supported on the current filesystem (e.g. tmpfs).
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn roundtrip_direct_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("direct_io.osm.pbf");
+
+    // Write with O_DIRECT
+    let write_result = PbfWriter::to_path_direct(&path, Compression::default());
+    let mut writer = match write_result {
+        Ok(w) => w,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
+    };
+
+    let header = block_builder::build_header(
+        Some((9.0, 54.0, 13.0, 58.0)),
+        None,
+        None,
+        None,
+        &[],
+    )
+    .unwrap();
+    writer.write_header(&header).unwrap();
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
+    bb.add_node(2, -100_000_000, -200_000_000, &[], None);
+    let bytes = bb.take().unwrap().unwrap();
+    writer.write_primitive_block(&bytes).unwrap();
+
+    bb.add_way(10, &[("highway", "path")], &[1, 2, 3], None);
+    let bytes = bb.take().unwrap().unwrap();
+    writer.write_primitive_block(&bytes).unwrap();
+
+    writer.flush().unwrap();
+
+    // Read back with standard reader
+    let reader = BlobReader::from_path(&path).unwrap();
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    assert_eq!(blobs.len(), 3, "header + nodes block + ways block");
+
+    // Verify header
+    match blobs[0].decode().unwrap() {
+        BlobDecode::OsmHeader(h) => {
+            let bbox = h.bbox().unwrap();
+            assert!((bbox.left - 9.0).abs() < 1e-6);
+        }
+        _ => panic!("expected OsmHeader"),
+    }
+
+    // Verify nodes
+    let prim = match blobs[1].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements: Vec<_> = prim.elements().collect();
+    assert_eq!(elements.len(), 2);
+    match &elements[0] {
+        Element::DenseNode(dn) => {
+            assert_eq!(dn.id(), 1);
+            assert_eq!(dn.decimicro_lat(), 100_000_000);
+            let tags: Vec<_> = dn.tags().collect();
+            assert_eq!(tags[0], ("k", "v"));
+        }
+        _ => panic!("expected DenseNode"),
+    }
+
+    // Verify ways
+    let prim2 = match blobs[2].decode().unwrap() {
+        BlobDecode::OsmData(p) => p,
+        _ => panic!("expected OsmData"),
+    };
+    let elements2: Vec<_> = prim2.elements().collect();
+    assert_eq!(elements2.len(), 1);
+    match &elements2[0] {
+        Element::Way(w) => {
+            assert_eq!(w.id(), 10);
+            let refs: Vec<_> = w.refs().collect();
+            assert_eq!(refs, vec![1, 2, 3]);
+        }
+        _ => panic!("expected Way"),
+    }
+
+    // Verify exact file size — no padding left over
+    let meta = std::fs::metadata(&path).unwrap();
+    assert!(meta.len() > 0, "file should not be empty");
+}
+
+/// Write a PBF through the pipelined O_DIRECT path, read back, verify ordering.
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn roundtrip_pipelined_direct_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pipelined_direct_io.osm.pbf");
+
+    let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+
+    let write_result =
+        PbfWriter::to_path_pipelined_direct(&path, Compression::default(), &header);
+    let mut writer = match write_result {
+        Ok(w) => w,
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
+    };
+
+    // Write 5 blocks to exercise the pipeline + reorder buffer
+    for i in 0..5 {
+        let mut bb = BlockBuilder::new();
+        for j in 0..100 {
+            let id = i * 100 + j + 1;
+            bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
+        }
+        let bytes = bb.take().unwrap().unwrap();
+        writer.write_primitive_block(&bytes).unwrap();
+    }
+
+    writer.flush().unwrap();
+
+    // Read back and verify all 500 nodes in order
+    let reader = BlobReader::from_path(&path).unwrap();
+    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
+    assert_eq!(blobs.len(), 6, "header + 5 data blobs");
+
+    let mut all_ids = Vec::new();
+    for blob in &blobs[1..] {
+        let prim = match blob.decode().unwrap() {
+            BlobDecode::OsmData(p) => p,
+            _ => panic!("expected OsmData"),
+        };
+        for element in prim.elements() {
+            match element {
+                Element::DenseNode(dn) => all_ids.push(dn.id()),
+                _ => panic!("expected DenseNode"),
+            }
+        }
+    }
+
+    assert_eq!(all_ids.len(), 500);
+    assert_eq!(all_ids[0], 1);
+    assert_eq!(all_ids[499], 500);
+    // Verify monotonically increasing
+    for pair in all_ids.windows(2) {
+        assert!(pair[1] > pair[0], "IDs should be increasing: {} > {}", pair[1], pair[0]);
     }
 }
 

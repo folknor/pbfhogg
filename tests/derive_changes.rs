@@ -283,7 +283,7 @@ fn roundtrip_with_merge() {
     assert_eq!(stats.deletes, 1);  // node 3
 
     // Apply changes back to old → should produce equivalent of new
-    merge(&old, &osc, &result).expect("merge");
+    merge(&old, &osc, &result, false).expect("merge");
 
     let result_contents = read_all_elements(&result);
     let new_contents = read_all_elements(&new);

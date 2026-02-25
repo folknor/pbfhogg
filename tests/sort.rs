@@ -14,6 +14,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 /// Creates two node blobs with interleaving IDs (blob 1: odd, blob 2: even),
 /// followed by ways and relations. This forces the sort command to decode and
 /// re-encode the node blobs rather than passing them through.
+#[allow(clippy::cast_possible_truncation)]
 fn write_unsorted_overlapping_pbf(path: &Path) {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
     let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
@@ -60,6 +61,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 
 /// Write a PBF with mixed element types out of order: ways, then nodes, then
 /// relations. Each type is internally sorted but the type order is wrong.
+#[allow(clippy::cast_possible_truncation)]
 fn write_type_unsorted_pbf(path: &Path) {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
     let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
@@ -138,6 +140,7 @@ fn sort_overlapping_blobs() {
     assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
 
     // Node coordinates preserved
+    #[allow(clippy::cast_possible_truncation)]
     for (id, lat, lon, _) in &result.nodes {
         assert_eq!(*lat, *id as i32 * 1_000_000);
         assert_eq!(*lon, *id as i32 * 2_000_000);

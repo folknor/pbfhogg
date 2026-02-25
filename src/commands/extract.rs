@@ -308,25 +308,57 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
 // Stats
 // ---------------------------------------------------------------------------
 
+/// Extraction strategy determining how referential completeness is handled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExtractStrategy {
+    /// Single pass. Fast but ways may reference nodes outside the extract.
+    Simple,
+    /// Two passes. All nodes of matching ways are included.
+    CompleteWays,
+    /// Three passes. Like CompleteWays, but additionally pulls in all way
+    /// members (and their nodes) of matched multipolygon/boundary relations,
+    /// even if those ways are outside the extract region.
+    Smart,
+}
+
 pub struct ExtractStats {
     pub nodes_in_bbox: u64,
     pub nodes_from_ways: u64,
+    pub nodes_from_relations: u64,
     pub ways_written: u64,
+    pub ways_from_relations: u64,
     pub relations_written: u64,
     pub strategy: &'static str,
 }
 
 impl ExtractStats {
     pub fn print_summary(&self) {
-        eprintln!(
-            "Extract ({}): {} nodes ({} in bbox, {} from ways), {} ways, {} relations",
-            self.strategy,
-            self.nodes_in_bbox + self.nodes_from_ways,
-            self.nodes_in_bbox,
-            self.nodes_from_ways,
-            self.ways_written,
-            self.relations_written,
-        );
+        let total_nodes = self.nodes_in_bbox + self.nodes_from_ways + self.nodes_from_relations;
+        let total_ways = self.ways_written + self.ways_from_relations;
+        if self.nodes_from_relations > 0 || self.ways_from_relations > 0 {
+            eprintln!(
+                "Extract ({}): {} nodes ({} in bbox, {} from ways, {} from relations), \
+                 {} ways ({} from relations), {} relations",
+                self.strategy,
+                total_nodes,
+                self.nodes_in_bbox,
+                self.nodes_from_ways,
+                self.nodes_from_relations,
+                total_ways,
+                self.ways_from_relations,
+                self.relations_written,
+            );
+        } else {
+            eprintln!(
+                "Extract ({}): {} nodes ({} in bbox, {} from ways), {} ways, {} relations",
+                self.strategy,
+                total_nodes,
+                self.nodes_in_bbox,
+                self.nodes_from_ways,
+                total_ways,
+                self.relations_written,
+            );
+        }
     }
 }
 
@@ -335,23 +367,19 @@ impl ExtractStats {
 // ---------------------------------------------------------------------------
 
 /// Extract elements within `region` from `input` and write to `output`.
-///
-/// If `simple` is true, uses a single-pass strategy (fast but ways may reference
-/// nodes outside the extract). Otherwise uses `complete_ways` (two passes, all
-/// nodes of matching ways are included).
 #[hotpath::measure]
 pub fn extract(
     input: &Path,
     output: &Path,
     region: &Region,
-    simple: bool,
+    strategy: ExtractStrategy,
     compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
-    if simple {
-        extract_simple(input, output, region, compression, direct_io)
-    } else {
-        extract_complete_ways(input, output, region, compression, direct_io)
+    match strategy {
+        ExtractStrategy::Simple => extract_simple(input, output, region, compression, direct_io),
+        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, compression, direct_io),
+        ExtractStrategy::Smart => extract_smart(input, output, region, compression, direct_io),
     }
 }
 
@@ -363,7 +391,9 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_written: 0,
+        ways_from_relations: 0,
         relations_written: 0,
         strategy: "simple",
     };
@@ -489,7 +519,9 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_written: 0,
+        ways_from_relations: 0,
         relations_written: 0,
         strategy: "complete_ways",
     };
@@ -745,6 +777,272 @@ fn write_pass2_elements(
 }
 
 // ---------------------------------------------------------------------------
+// Smart strategy (three passes)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_lines)]
+fn extract_smart(
+    input: &Path,
+    output: &Path,
+    region: &Region,
+    compression: Compression,
+    direct_io: bool,
+) -> Result<ExtractStats> {
+    let mut stats = ExtractStats {
+        nodes_in_bbox: 0,
+        nodes_from_ways: 0,
+        nodes_from_relations: 0,
+        ways_written: 0,
+        ways_from_relations: 0,
+        relations_written: 0,
+        strategy: "smart",
+    };
+
+    // --- Pass 1: Collect matches + smart relation deps ---
+    let mut bbox_node_ids: Vec<i64> = Vec::new();
+    let mut matched_way_ids: Vec<i64> = Vec::new();
+    let mut all_way_node_ids: Vec<i64> = Vec::new();
+    let mut matched_relation_ids: Vec<i64> = Vec::new();
+    let mut extra_way_ids: Vec<i64> = Vec::new();
+    let mut extra_node_ids: Vec<i64> = Vec::new();
+    let mut bbox_node_ids_sorted = false;
+    let mut way_ids_sorted = false;
+
+    let reader = BlobReader::open(input, direct_io)?;
+    for blob in reader {
+        let blob = blob?;
+        match blob.decode()? {
+            BlobDecode::OsmHeader(_) => {}
+            BlobDecode::OsmData(block) => {
+                collect_pass1_smart(
+                    &block, region,
+                    &mut bbox_node_ids, &mut matched_way_ids,
+                    &mut all_way_node_ids, &mut matched_relation_ids,
+                    &mut extra_way_ids, &mut extra_node_ids,
+                    &mut bbox_node_ids_sorted, &mut way_ids_sorted,
+                );
+            }
+            BlobDecode::Unknown(_) => {}
+        }
+    }
+
+    // Sort + dedup all Vecs between pass 1 and pass 2.
+    bbox_node_ids.sort_unstable();
+    bbox_node_ids.dedup();
+    matched_way_ids.sort_unstable();
+    matched_way_ids.dedup();
+    all_way_node_ids.sort_unstable();
+    all_way_node_ids.dedup();
+    matched_relation_ids.sort_unstable();
+    matched_relation_ids.dedup();
+    extra_way_ids.sort_unstable();
+    extra_way_ids.dedup();
+
+    // --- Pass 2: Resolve extra way node deps ---
+    // For each way in extra_way_ids not already in matched_way_ids,
+    // collect all node refs into extra_node_ids.
+    let reader = BlobReader::open(input, direct_io)?;
+    for blob in reader {
+        let blob = blob?;
+        if let BlobDecode::OsmData(block) = blob.decode()? {
+            for element in block.elements() {
+                if let Element::Way(w) = &element {
+                    let wid = w.id();
+                    if extra_way_ids.binary_search(&wid).is_ok()
+                        && matched_way_ids.binary_search(&wid).is_err()
+                    {
+                        extra_node_ids.extend(w.refs());
+                    }
+                }
+            }
+        }
+    }
+
+    // Merge extra IDs into the main sets.
+    let extra_ways_count = extra_way_ids.len();
+    matched_way_ids.extend_from_slice(&extra_way_ids);
+    matched_way_ids.sort_unstable();
+    matched_way_ids.dedup();
+    stats.ways_from_relations = (matched_way_ids.len() - (matched_way_ids.len() - extra_ways_count).min(matched_way_ids.len())) as u64;
+
+    extra_node_ids.sort_unstable();
+    extra_node_ids.dedup();
+
+    // --- Pass 3: Write matching elements in file order ---
+    let mut writer = PbfWriter::to_path(output, compression)?;
+    let mut bb = BlockBuilder::new();
+    let mut header_written = false;
+
+    let reader = BlobReader::open(input, direct_io)?;
+    for blob in reader {
+        let blob = blob?;
+        match blob.decode()? {
+            BlobDecode::OsmHeader(header) => {
+                if !header_written {
+                    write_extract_header(region, &header, &mut writer)?;
+                    header_written = true;
+                }
+            }
+            BlobDecode::OsmData(block) => {
+                write_pass3_smart(
+                    &block,
+                    &bbox_node_ids,
+                    &all_way_node_ids,
+                    &extra_node_ids,
+                    &matched_way_ids,
+                    &matched_relation_ids,
+                    &mut bb,
+                    &mut writer,
+                    &mut stats,
+                )?;
+            }
+            BlobDecode::Unknown(_) => {}
+        }
+    }
+
+    flush_block(&mut bb, &mut writer)?;
+    writer.flush()?;
+    Ok(stats)
+}
+
+/// Collect matching element IDs during pass 1 of the smart strategy.
+///
+/// Same as `collect_pass1_matches` but additionally collects extra way and
+/// node IDs from matched multipolygon/boundary relations.
+#[allow(clippy::too_many_arguments)]
+fn collect_pass1_smart(
+    block: &crate::PrimitiveBlock,
+    region: &Region,
+    bbox_node_ids: &mut Vec<i64>,
+    matched_way_ids: &mut Vec<i64>,
+    all_way_node_ids: &mut Vec<i64>,
+    matched_relation_ids: &mut Vec<i64>,
+    extra_way_ids: &mut Vec<i64>,
+    extra_node_ids: &mut Vec<i64>,
+    bbox_node_ids_sorted: &mut bool,
+    way_ids_sorted: &mut bool,
+) {
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                if region.contains(dn.lat(), dn.lon()) {
+                    bbox_node_ids.push(dn.id());
+                }
+            }
+            Element::Node(n) => {
+                if region.contains(n.lat(), n.lon()) {
+                    bbox_node_ids.push(n.id());
+                }
+            }
+            Element::Way(w) => {
+                if !*bbox_node_ids_sorted {
+                    bbox_node_ids.sort_unstable();
+                    bbox_node_ids.dedup();
+                    *bbox_node_ids_sorted = true;
+                }
+                if w.refs().any(|r| bbox_node_ids.binary_search(&r).is_ok()) {
+                    matched_way_ids.push(w.id());
+                    all_way_node_ids.extend(w.refs());
+                }
+            }
+            Element::Relation(r) => {
+                if !*bbox_node_ids_sorted {
+                    bbox_node_ids.sort_unstable();
+                    bbox_node_ids.dedup();
+                    *bbox_node_ids_sorted = true;
+                }
+                if !*way_ids_sorted {
+                    matched_way_ids.sort_unstable();
+                    matched_way_ids.dedup();
+                    *way_ids_sorted = true;
+                }
+                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
+                    matched_relation_ids.push(r.id());
+                    // For multipolygon/boundary relations, collect all member
+                    // IDs so their ways and nodes are fully included.
+                    if is_smart_relation(r) {
+                        for m in r.members() {
+                            match m.id {
+                                MemberId::Way(id) => extra_way_ids.push(id),
+                                MemberId::Node(id) => extra_node_ids.push(id),
+                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Write matching elements during pass 3 of the smart strategy.
+///
+/// Like `write_pass2_elements` but with an additional `extra_node_ids` set
+/// for nodes pulled in via smart relation dependencies.
+#[allow(clippy::too_many_arguments)]
+fn write_pass3_smart(
+    block: &crate::PrimitiveBlock,
+    bbox_node_ids: &[i64],
+    all_way_node_ids: &[i64],
+    extra_node_ids: &[i64],
+    matched_way_ids: &[i64],
+    matched_relation_ids: &[i64],
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut ExtractStats,
+) -> Result<()> {
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                let id = dn.id();
+                let in_bbox = bbox_node_ids.binary_search(&id).is_ok();
+                let from_way = all_way_node_ids.binary_search(&id).is_ok();
+                let from_rel = extra_node_ids.binary_search(&id).is_ok();
+                if in_bbox || from_way || from_rel {
+                    write_dense_node(dn, bb, writer)?;
+                    if in_bbox {
+                        stats.nodes_in_bbox += 1;
+                    } else if from_way {
+                        stats.nodes_from_ways += 1;
+                    } else {
+                        stats.nodes_from_relations += 1;
+                    }
+                }
+            }
+            Element::Node(n) => {
+                let id = n.id();
+                let in_bbox = bbox_node_ids.binary_search(&id).is_ok();
+                let from_way = all_way_node_ids.binary_search(&id).is_ok();
+                let from_rel = extra_node_ids.binary_search(&id).is_ok();
+                if in_bbox || from_way || from_rel {
+                    write_node(n, bb, writer)?;
+                    if in_bbox {
+                        stats.nodes_in_bbox += 1;
+                    } else if from_way {
+                        stats.nodes_from_ways += 1;
+                    } else {
+                        stats.nodes_from_relations += 1;
+                    }
+                }
+            }
+            Element::Way(w) => {
+                if matched_way_ids.binary_search(&w.id()).is_ok() {
+                    write_way(w, bb, writer)?;
+                    stats.ways_written += 1;
+                }
+            }
+            Element::Relation(r) => {
+                if matched_relation_ids.binary_search(&r.id()).is_ok() {
+                    write_relation(r, bb, writer)?;
+                    stats.relations_written += 1;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Relation member matching
 // ---------------------------------------------------------------------------
 
@@ -762,6 +1060,14 @@ fn relation_has_matched_member(
         MemberId::Way(id) => way_ids.binary_search(&id).is_ok(),
         MemberId::Relation(_) | MemberId::Unknown(_, _) => false,
     })
+}
+
+/// Returns true if the relation has a `type=multipolygon` or `type=boundary` tag.
+///
+/// These are the relation types whose way members should be fully included
+/// in the smart extraction strategy, along with all nodes those ways reference.
+fn is_smart_relation(r: &crate::Relation) -> bool {
+    r.tags().any(|(k, v)| k == "type" && (v == "multipolygon" || v == "boundary"))
 }
 
 // ---------------------------------------------------------------------------

@@ -69,4 +69,29 @@ echo "=== Diff (complete-ways, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-complete.osm.pbf" "$OUTDIR/osmium-complete.osm.pbf" || true
 echo ""
 
+# --- Smart strategy ---
+echo "--- pbfhogg extract --smart ---"
+time "$PBFHOGG" extract "$INPUT" -o "$OUTDIR/pbfhogg-smart.osm.pbf" -b "$BBOX" --smart
+echo ""
+
+echo "--- osmium extract -s smart ---"
+time osmium extract "$INPUT" -o "$OUTDIR/osmium-smart.osm.pbf" -b "$BBOX" -s smart --overwrite
+echo ""
+
+echo "=== Element counts (smart) ==="
+for tool in pbfhogg osmium; do
+    f="$OUTDIR/$tool-smart.osm.pbf"
+    if [ -f "$f" ]; then
+        echo "--- $tool ---"
+        "$PBFHOGG" fileinfo --extended "$f"
+        echo ""
+    else
+        echo "--- $tool --- MISSING"
+    fi
+done
+
+echo "=== Diff (smart, suppress-common) ==="
+"$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-smart.osm.pbf" "$OUTDIR/osmium-smart.osm.pbf" || true
+echo ""
+
 echo "Done."

@@ -5,7 +5,7 @@ mod common;
 use std::path::Path;
 
 use common::{TestNode, TestWay};
-use pbfhogg::add_locations_to_ways::add_locations_to_ways;
+use pbfhogg::add_locations_to_ways::{add_locations_to_ways, IndexType};
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
@@ -131,7 +131,7 @@ fn basic_locations_added_to_ways() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false).expect("add locations");
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
     assert_eq!(stats.ways_written, 1);
     assert_eq!(stats.missing_locations, 0);
 
@@ -171,7 +171,7 @@ fn header_has_locations_on_ways_feature() {
     let output = dir.path().join("output.osm.pbf");
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
-    add_locations_to_ways(&input, &output, true, Compression::default(), false).expect("add locations");
+    add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
 
     let reader = BlobReader::from_path(&output).expect("open output");
     for blob in reader {
@@ -200,7 +200,7 @@ fn drop_untagged_nodes() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false).expect("add locations");
+    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, IndexType::Hash).expect("add locations");
 
     // Node 2 has no tags → dropped
     assert_eq!(stats.nodes_read, 3);
@@ -233,7 +233,7 @@ fn keep_untagged_nodes() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false).expect("add locations");
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
 
     assert_eq!(stats.nodes_read, 3);
     assert_eq!(stats.nodes_written, 3);
@@ -261,7 +261,7 @@ fn missing_node_refs_get_zero_coordinates() {
 
     write_test_pbf(&input, &nodes, &ways, &[]);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false).expect("add locations");
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
     assert_eq!(stats.missing_locations, 1);
 
     // Verify the missing ref got (0, 0)
@@ -298,7 +298,7 @@ fn relations_preserved() {
 
     write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
 
-    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false).expect("add locations");
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
     assert_eq!(stats.relations_written, 1);
 
     // Verify relation exists in output
@@ -315,4 +315,109 @@ fn relations_preserved() {
         }
     }
     panic!("relation not found in output");
+}
+
+// ---------------------------------------------------------------------------
+// Dense mmap backend tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dense_basic_locations_added_to_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Dense { capacity: 1000 }).expect("add locations");
+    assert_eq!(stats.ways_written, 1);
+    assert_eq!(stats.missing_locations, 0);
+
+    // Read output and verify way has locations
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut found_way = false;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    assert_eq!(w.id(), 10);
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(
+                        locs,
+                        vec![
+                            (550_000_000, 120_000_000),
+                            (551_000_000, 121_000_000),
+                            (552_000_000, 122_000_000),
+                        ]
+                    );
+                    found_way = true;
+                }
+            }
+        }
+    }
+    assert!(found_way, "way not found in output");
+}
+
+#[test]
+fn dense_missing_node_refs_get_zero_coordinates() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Way references node 99 which doesn't exist
+    let nodes = vec![TestNode {
+        id: 1,
+        lat: 550_000_000,
+        lon: 120_000_000,
+        tags: vec![],
+    }];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 99],
+        tags: vec![("highway", "primary")],
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Dense { capacity: 1000 }).expect("add locations");
+    assert_eq!(stats.missing_locations, 1);
+
+    // Verify the missing ref got (0, 0)
+    let reader = BlobReader::from_path(&output).expect("open output");
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(locs, vec![(550_000_000, 120_000_000), (0, 0)]);
+                    return;
+                }
+            }
+        }
+    }
+    panic!("way not found in output");
+}
+
+#[test]
+fn dense_drop_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, IndexType::Dense { capacity: 1000 }).expect("add locations");
+
+    // Node 2 has no tags → dropped
+    assert_eq!(stats.nodes_read, 3);
+    assert_eq!(stats.nodes_written, 2);
+    assert_eq!(stats.nodes_dropped, 1);
 }

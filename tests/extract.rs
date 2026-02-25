@@ -7,7 +7,7 @@ use common::{
     way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
     write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
 };
-use pbfhogg::extract::{extract, parse_bbox, parse_geojson, PolygonRings, Region};
+use pbfhogg::extract::{extract, parse_bbox, parse_geojson, ExtractStrategy, PolygonRings, Region};
 use pbfhogg::writer::Compression;
 use pbfhogg::MemberId;
 use tempfile::TempDir;
@@ -79,7 +79,7 @@ fn simple_filters_nodes_by_bbox() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -97,7 +97,7 @@ fn simple_includes_ways_with_nodes_in_bbox() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Ways 10 and 12 have at least one node in bbox; way 11 does not
@@ -115,7 +115,7 @@ fn simple_does_not_add_extra_nodes() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Simple mode: only nodes actually in bbox, not way dependencies
@@ -133,7 +133,7 @@ fn complete_ways_includes_all_way_nodes() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, false, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 refs [1, 2]: node 1 in bbox → way matches → node 2 pulled in
@@ -155,7 +155,7 @@ fn complete_ways_includes_relations() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, false, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Relation 100 has member node 1 (in bbox) → included
@@ -180,7 +180,7 @@ fn simple_includes_relations_with_matched_ways() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 matched → relation 200 should be included
@@ -199,7 +199,7 @@ fn empty_extract() {
     // Bbox far away from all test data
     let bbox = parse_bbox("0.0,0.0,1.0,1.0").expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, false, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     assert!(c.nodes.is_empty());
@@ -219,7 +219,7 @@ fn tags_preserved_in_extract() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    extract(&input, &output, &region, false, Compression::default(), false).expect("extract");
+    extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Check node 1 tags
@@ -277,7 +277,7 @@ fn polygon_simple_filters_nodes() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
     let region = test_polygon_region();
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Nodes 1 and 3 are inside the triangle; nodes 2 and 4 are outside
@@ -294,7 +294,7 @@ fn polygon_complete_ways_includes_all_way_nodes() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let region = test_polygon_region();
-    let stats = extract(&input, &output, &region, false, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 [1,2]: node 1 in polygon → way matches → node 2 pulled in
@@ -346,7 +346,7 @@ fn polygon_with_hole_excludes_interior() {
 
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     // Node 1 is inside the hole → excluded
@@ -379,9 +379,111 @@ fn polygon_from_geojson_file() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
     let region = parse_geojson(&geojson_path).expect("parse geojson");
-    let stats = extract(&input, &output, &region, true, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
     assert_eq!(stats.nodes_in_bbox, 2);
+}
+
+// ---------------------------------------------------------------------------
+// Smart strategy tests
+// ---------------------------------------------------------------------------
+//
+// Way 11 refs [2, 4]: no bbox nodes → NOT matched by simple/complete_ways.
+// But if a multipolygon relation includes way 11 as a member AND is itself
+// matched (via another member in the bbox), smart should pull in way 11 and
+// its nodes (2, 4).
+
+#[test]
+fn smart_includes_multipolygon_way_members() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Relation 300: type=multipolygon, members = way 10 (matched) + way 11 (not matched)
+    let relations = vec![TestRelation {
+        id: 300,
+        members: vec![
+            TestMember { id: MemberId::Way(10), role: "outer" },
+            TestMember { id: MemberId::Way(11), role: "inner" },
+        ],
+        tags: vec![("type", "multipolygon")],
+    }];
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let c = read_all_elements(&output);
+
+    // Way 10 matched (has bbox node 1). Way 11 pulled in via smart deps.
+    // Way 12 matched normally (both refs in bbox).
+    assert_eq!(way_ids(&c), vec![10, 11, 12]);
+    // Nodes 1, 3 in bbox. Node 2 from way deps. Node 4 from way 11 smart deps.
+    assert_eq!(node_ids(&c), vec![1, 2, 3, 4]);
+    assert_eq!(relation_ids(&c), vec![300]);
+    assert_eq!(stats.relations_written, 1);
+}
+
+#[test]
+fn smart_includes_boundary_node_members() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Relation 301: type=boundary, members = way 12 (matched) + node 4 (outside)
+    let relations = vec![TestRelation {
+        id: 301,
+        members: vec![
+            TestMember { id: MemberId::Way(12), role: "outer" },
+            TestMember { id: MemberId::Node(4), role: "admin_centre" },
+        ],
+        tags: vec![("type", "boundary"), ("boundary", "administrative")],
+    }];
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let c = read_all_elements(&output);
+
+    // Node 4 should be pulled in via smart boundary deps.
+    assert!(node_ids(&c).contains(&4), "node 4 (admin_centre) should be included");
+    assert_eq!(relation_ids(&c), vec![301]);
+    assert!(stats.nodes_from_relations > 0);
+}
+
+#[test]
+fn smart_ignores_non_qualifying_relations() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Relation 302: type=route (NOT multipolygon/boundary), members = way 10 + way 11
+    let relations = vec![TestRelation {
+        id: 302,
+        members: vec![
+            TestMember { id: MemberId::Way(10), role: "forward" },
+            TestMember { id: MemberId::Way(11), role: "backward" },
+        ],
+        tags: vec![("type", "route")],
+    }];
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &relations);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let c = read_all_elements(&output);
+
+    // type=route should NOT trigger smart behavior — way 11 stays excluded
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    // Relation 302 is still included (it has way 10 as member, which is matched)
+    assert_eq!(relation_ids(&c), vec![302]);
+    // Nodes: 1,3 in bbox + 2 from way 10 deps. Node 4 NOT included.
+    assert_eq!(node_ids(&c), vec![1, 2, 3]);
+    assert_eq!(stats.nodes_from_relations, 0);
 }

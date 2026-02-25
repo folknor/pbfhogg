@@ -199,8 +199,11 @@ enum Command {
         #[arg(short = 'p', long, group = "area")]
         polygon: Option<PathBuf>,
         /// Simple strategy (single pass, may have dangling refs)
-        #[arg(short = 's', long)]
+        #[arg(short = 's', long, conflicts_with = "smart")]
         simple: bool,
+        /// Smart strategy (three passes, complete multipolygon/boundary relations)
+        #[arg(long, conflicts_with = "simple")]
+        smart: bool,
         /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
         #[arg(long, default_value = "zlib")]
         compression: String,
@@ -218,6 +221,9 @@ enum Command {
         /// Keep untagged nodes in output (default: drop them)
         #[arg(long)]
         keep_untagged_nodes: bool,
+        /// Node location index type: hash (default), dense (mmap, for planet-scale)
+        #[arg(short = 'n', long, default_value = "hash")]
+        index_type: String,
         /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
         #[arg(long, default_value = "zlib")]
         compression: String,
@@ -319,16 +325,21 @@ fn main() {
             bbox,
             polygon,
             simple,
+            smart,
             compression,
             direct_io,
-        } => run_extract(&file, &output, bbox.as_deref(), polygon.as_deref(), simple, &compression, direct_io),
+        } => run_extract(
+            &file, &output, bbox.as_deref(), polygon.as_deref(),
+            extract_strategy(simple, smart), &compression, direct_io,
+        ),
         Command::AddLocationsToWays {
             file,
             output,
             keep_untagged_nodes,
+            index_type,
             compression,
             direct_io,
-        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &compression, direct_io),
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io),
         Command::Merge {
             base,
             changes,
@@ -588,12 +599,22 @@ fn run_removeid(
     Ok(())
 }
 
+fn extract_strategy(simple: bool, smart: bool) -> pbfhogg::extract::ExtractStrategy {
+    if simple {
+        pbfhogg::extract::ExtractStrategy::Simple
+    } else if smart {
+        pbfhogg::extract::ExtractStrategy::Smart
+    } else {
+        pbfhogg::extract::ExtractStrategy::CompleteWays
+    }
+}
+
 fn run_extract(
     file: &std::path::Path,
     output: &std::path::Path,
     bbox_str: Option<&str>,
     polygon_path: Option<&std::path::Path>,
-    simple: bool,
+    strategy: pbfhogg::extract::ExtractStrategy,
     compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -607,7 +628,7 @@ fn run_extract(
         (None, None) => return Err("one of --bbox or --polygon is required".into()),
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
-    let stats = pbfhogg::extract::extract(file, output, &region, simple, compression, direct_io)?;
+    let stats = pbfhogg::extract::extract(file, output, &region, strategy, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }
@@ -616,12 +637,21 @@ fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
+    index_type_str: &str,
     compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats =
-        pbfhogg::add_locations_to_ways::add_locations_to_ways(file, output, keep_untagged_nodes, compression, direct_io)?;
+    let index_type = match index_type_str {
+        "hash" => pbfhogg::add_locations_to_ways::IndexType::Hash,
+        "dense" => pbfhogg::add_locations_to_ways::IndexType::Dense {
+            capacity: pbfhogg::add_locations_to_ways::DENSE_INDEX_DEFAULT_CAPACITY,
+        },
+        other => return Err(format!("unknown index type: {other} (expected: hash, dense)").into()),
+    };
+    let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
+        file, output, keep_untagged_nodes, compression, direct_io, index_type,
+    )?;
     stats.print_summary();
     Ok(())
 }

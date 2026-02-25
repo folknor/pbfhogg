@@ -290,12 +290,16 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 
 ## Planned commands
 
-- [ ] `pbfhogg extract --smart` strategy — three passes, complete boundary/multipolygon
+- [x] `pbfhogg extract --smart` strategy — three passes, complete boundary/multipolygon
   relations (all member ways + their nodes included even if outside the extract region).
+  `ExtractStrategy` enum (Simple, CompleteWays, Smart). Smart collects extra way/node
+  IDs from relations with type=multipolygon|boundary in pass 1, resolves way→node deps
+  in pass 2, merges into output in pass 3.
 
-- [ ] `pbfhogg add-locations-to-ways` mmap index backends — currently in-memory only
-  (HashMap), which limits to country-scale PBFs. Add mmap dense and mmap sparse backends
-  for planet-scale processing.
+- [x] `pbfhogg add-locations-to-ways` dense mmap index — `--index-type dense` uses
+  anonymous mmap with direct indexing (8 bytes/slot, lazy page allocation). Planet:
+  ~68 GB physical vs HashMap's ~192 GB. `IndexType` enum (Hash, Dense{capacity}),
+  default capacity 16B entries (128 GB virtual). Configurable for testing.
 
 ## CLI cross-validation
 

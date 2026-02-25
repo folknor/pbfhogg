@@ -41,4 +41,13 @@ echo "=== Diff (suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/osmium.osm.pbf"
 echo ""
 
+# --- Dense index (verify output matches hash) ---
+echo "--- pbfhogg add-locations-to-ways --index-type dense ---"
+time "$PBFHOGG" add-locations-to-ways "$INPUT" -o "$OUTDIR/pbfhogg-dense.osm.pbf" --index-type dense
+echo ""
+
+echo "=== Diff (hash vs dense) ==="
+"$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/pbfhogg-dense.osm.pbf"
+echo ""
+
 echo "Done."

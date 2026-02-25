@@ -11,6 +11,144 @@ use crate::{BlobDecode, BlobReader, Element};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // ---------------------------------------------------------------------------
+// Index type
+// ---------------------------------------------------------------------------
+
+/// Node location index type for add-locations-to-ways.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IndexType {
+    /// HashMap-based index. ~24 bytes/node, good for country-scale.
+    Hash,
+    /// Dense mmap-based index. 8 bytes/slot with direct indexing by node ID.
+    /// Uses anonymous mmap with lazy page allocation — virtual memory is
+    /// allocated for the full ID range but physical memory is only committed
+    /// for pages actually written. Required for planet-scale (8.5B nodes →
+    /// ~68 GB physical vs HashMap's ~192 GB).
+    ///
+    /// The `capacity` field is the max number of entries (node IDs). For planet,
+    /// use [`DENSE_INDEX_DEFAULT_CAPACITY`] (16 billion). Smaller values work
+    /// for testing or country-scale files.
+    Dense { capacity: usize },
+}
+
+/// Default dense index capacity: 16 billion entries (128 GB virtual).
+/// Covers current OSM max node ID (~12.5B) with headroom for growth.
+///
+/// Requires `vm.overcommit_memory=1` or sufficient physical RAM + swap on
+/// the host. On systems with heuristic overcommit (the default), this
+/// allocation may be rejected. Use a smaller capacity or switch to
+/// `--index-type hash` in that case.
+pub const DENSE_INDEX_DEFAULT_CAPACITY: usize = 16_000_000_000;
+
+// ---------------------------------------------------------------------------
+// Node location index
+// ---------------------------------------------------------------------------
+
+/// Node location index abstraction supporting multiple backends.
+pub enum NodeLocationIndex {
+    Hash(HashMap<i64, (i32, i32)>),
+    Dense(DenseMmapIndex),
+}
+
+impl NodeLocationIndex {
+    fn insert(&mut self, node_id: i64, lat: i32, lon: i32) {
+        match self {
+            Self::Hash(map) => {
+                map.insert(node_id, (lat, lon));
+            }
+            Self::Dense(dense) => dense.insert(node_id, lat, lon),
+        }
+    }
+
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        match self {
+            Self::Hash(map) => map.get(&node_id).copied(),
+            Self::Dense(dense) => dense.get(node_id),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dense mmap index
+// ---------------------------------------------------------------------------
+
+/// Dense mmap-backed node location index.
+///
+/// Uses anonymous mmap with direct indexing: `mmap[node_id * 8 .. node_id * 8 + 8]`
+/// stores `(lat: i32, lon: i32)` packed as 8 bytes (little-endian).
+///
+/// Zero-initialized by the OS. Pages are lazily allocated (demand-paged): a
+/// 128 GB virtual mapping only consumes physical memory for pages actually
+/// written. For planet (~8.5B nodes, max ID ~12.5B), physical RSS is ~68 GB.
+///
+/// Sentinel: `(0, 0)` means unset. ~116 nodes at exactly null island (0°N, 0°E)
+/// will appear as missing — acceptable ambiguity for diagnostic counters.
+pub struct DenseMmapIndex {
+    mmap: memmap2::MmapMut,
+    capacity: usize,
+}
+
+/// 4 bytes lat + 4 bytes lon = 8 bytes per entry.
+const ENTRY_SIZE: usize = 8;
+
+// Require 64-bit platform for dense index (32-bit cannot address 128 GB).
+const _: () = assert!(std::mem::size_of::<usize>() >= 8);
+
+impl DenseMmapIndex {
+    fn new(capacity: usize) -> Result<Self> {
+        let byte_len = capacity
+            .checked_mul(ENTRY_SIZE)
+            .ok_or("dense index capacity overflow")?;
+        let mmap = memmap2::MmapMut::map_anon(byte_len).map_err(|e| {
+            format!(
+                "failed to create dense mmap index ({} GB virtual): {e}. \
+                 Try --index-type hash or increase vm.overcommit_ratio.",
+                byte_len / 1_000_000_000
+            )
+        })?;
+        Ok(Self { mmap, capacity })
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn insert(&mut self, node_id: i64, lat: i32, lon: i32) {
+        if node_id < 0 {
+            return;
+        }
+        let idx = node_id as usize;
+        if idx >= self.capacity {
+            return;
+        }
+        let offset = idx * ENTRY_SIZE;
+        self.mmap[offset..offset + 4].copy_from_slice(&lat.to_le_bytes());
+        self.mmap[offset + 4..offset + 8].copy_from_slice(&lon.to_le_bytes());
+    }
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        if node_id < 0 {
+            return None;
+        }
+        let idx = node_id as usize;
+        if idx >= self.capacity {
+            return None;
+        }
+        let offset = idx * ENTRY_SIZE;
+        let lat_bytes: [u8; 4] = self.mmap[offset..offset + 4]
+            .try_into()
+            .ok()?;
+        let lon_bytes: [u8; 4] = self.mmap[offset + 4..offset + 8]
+            .try_into()
+            .ok()?;
+        let lat = i32::from_le_bytes(lat_bytes);
+        let lon = i32::from_le_bytes(lon_bytes);
+        if lat == 0 && lon == 0 {
+            return None;
+        }
+        Some((lat, lon))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -59,8 +197,9 @@ pub fn add_locations_to_ways(
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
+    index_type: IndexType,
 ) -> Result<Stats> {
-    let index = build_node_index(input, direct_io)?;
+    let index = build_node_index(input, direct_io, index_type)?;
     write_output(input, output, &index, keep_untagged_nodes, compression, direct_io)
 }
 
@@ -68,8 +207,11 @@ pub fn add_locations_to_ways(
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
 
-fn build_node_index(input: &Path, direct_io: bool) -> Result<HashMap<i64, (i32, i32)>> {
-    let mut index: HashMap<i64, (i32, i32)> = HashMap::new();
+fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Result<NodeLocationIndex> {
+    let mut index = match index_type {
+        IndexType::Hash => NodeLocationIndex::Hash(HashMap::new()),
+        IndexType::Dense { capacity } => NodeLocationIndex::Dense(DenseMmapIndex::new(capacity)?),
+    };
     let reader = BlobReader::open(input, direct_io)?;
 
     for blob in reader {
@@ -80,10 +222,10 @@ fn build_node_index(input: &Path, direct_io: bool) -> Result<HashMap<i64, (i32, 
                 for element in block.elements() {
                     match &element {
                         Element::DenseNode(dn) => {
-                            index.insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
+                            index.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
                         }
                         Element::Node(n) => {
-                            index.insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
+                            index.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
                         }
                         Element::Way(_) | Element::Relation(_) => {}
                     }
@@ -103,7 +245,7 @@ fn build_node_index(input: &Path, direct_io: bool) -> Result<HashMap<i64, (i32, 
 fn write_output(
     input: &Path,
     output: &Path,
-    index: &HashMap<i64, (i32, i32)>,
+    index: &NodeLocationIndex,
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
@@ -208,8 +350,8 @@ fn write_output(
                             refs_buf.extend(w.refs());
                             locations_buf.clear();
                             locations_buf.extend(refs_buf.iter().map(|node_id| {
-                                match index.get(node_id) {
-                                    Some(&loc) => loc,
+                                match index.get(*node_id) {
+                                    Some(loc) => loc,
                                     None => {
                                         stats.missing_locations += 1;
                                         (0, 0)

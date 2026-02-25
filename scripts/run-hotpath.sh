@@ -4,10 +4,12 @@ cd "$(dirname "$0")/.."
 
 PBF="${1:-data/denmark-latest.osm.pbf}"
 OSC="${2:-}"
+COMPRESSION="${3:-zlib}"
 
 if [ ! -f "$PBF" ]; then
     echo "PBF not found: $PBF"
-    echo "Usage: scripts/run-hotpath.sh [pbf] [osc.gz]"
+    echo "Usage: scripts/run-hotpath.sh [pbf] [osc.gz] [compression]"
+    echo "  compression: none, zlib (default), zlib:9, zstd, zstd:19, etc."
     exit 1
 fi
 
@@ -30,8 +32,8 @@ grep -A 1000 '^\[hotpath\]' "$OUTFILE"
 #    cat with type filter forces decode of every element and rebuild through
 #    BlockBuilder, exercising the same write path as nidhogg output.
 echo ""
-echo "--- decode + write (cat --types) ---"
-HOTPATH_METRICS_SERVER_OFF=true "$BIN" cat "$PBF" --type node,way,relation -o /dev/null > "$OUTFILE"
+echo "--- decode + write (cat --type, compression=$COMPRESSION) ---"
+HOTPATH_METRICS_SERVER_OFF=true "$BIN" cat "$PBF" --type node,way,relation --compression "$COMPRESSION" -o /dev/null > "$OUTFILE"
 grep -A 1000 '^\[hotpath\]' "$OUTFILE"
 
 # 3. Merge — pbfhogg::merge::merge
@@ -43,7 +45,7 @@ if [ -n "$OSC" ]; then
         exit 1
     fi
     echo ""
-    echo "--- merge ---"
-    HOTPATH_METRICS_SERVER_OFF=true "$BIN" merge "$PBF" "$OSC" -o "$MERGED" > "$OUTFILE"
+    echo "--- merge (compression=$COMPRESSION) ---"
+    HOTPATH_METRICS_SERVER_OFF=true "$BIN" merge "$PBF" "$OSC" --compression "$COMPRESSION" -o "$MERGED" > "$OUTFILE"
     grep -A 1000 '^\[hotpath\]' "$OUTFILE"
 fi

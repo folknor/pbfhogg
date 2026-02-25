@@ -5,6 +5,7 @@
 //! Measures full decode + write throughput (the nidhogg/elivagar write path).
 //! Output goes to /dev/null so I/O cost is excluded.
 //! The --compression flag accepts a comma-separated list of modes to benchmark.
+//! Both sync and pipelined writer modes are benchmarked for each compression.
 
 use pbfhogg::{
     BlobDecode, BlobReader, Element,
@@ -59,22 +60,13 @@ fn parse_compression(s: &str) -> Option<(String, Compression)> {
     Some((label, comp))
 }
 
-#[allow(clippy::too_many_lines, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
+#[allow(clippy::too_many_lines)]
+fn decode_and_write<W: Write>(path: &Path, writer: &mut PbfWriter<W>) -> Counts {
     let file = std::fs::File::open(path).expect("open pbf");
     let reader = BlobReader::new(BufReader::new(file));
 
-    let mut writer = PbfWriter::to_path(Path::new("/dev/null"), compression)
-        .expect("open writer");
-
-    // Write a minimal header
-    let header_bytes = pbfhogg::block_builder::build_header(None, None, None, None, &[])
-        .expect("build header");
-    writer.write_header(&header_bytes).expect("write header");
-
     let mut bb = BlockBuilder::new();
     let mut counts = Counts::default();
-    let start = Instant::now();
 
     for blob_result in reader {
         let blob = blob_result.expect("read blob");
@@ -85,7 +77,7 @@ fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
                     match &element {
                         Element::DenseNode(dn) => {
                             if !bb.can_add_node() {
-                                flush(&mut bb, &mut writer);
+                                flush(&mut bb, writer);
                             }
                             let tags: Vec<(&str, &str)> = dn.tags().collect();
                             bb.add_node(
@@ -99,7 +91,7 @@ fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
                         }
                         Element::Node(n) => {
                             if !bb.can_add_node() {
-                                flush(&mut bb, &mut writer);
+                                flush(&mut bb, writer);
                             }
                             let tags: Vec<(&str, &str)> = n.tags().collect();
                             bb.add_node(
@@ -113,7 +105,7 @@ fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
                         }
                         Element::Way(w) => {
                             if !bb.can_add_way() {
-                                flush(&mut bb, &mut writer);
+                                flush(&mut bb, writer);
                             }
                             let tags: Vec<(&str, &str)> = w.tags().collect();
                             let refs: Vec<i64> = w.refs().collect();
@@ -122,7 +114,7 @@ fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
                         }
                         Element::Relation(r) => {
                             if !bb.can_add_relation() {
-                                flush(&mut bb, &mut writer);
+                                flush(&mut bb, writer);
                             }
                             let tags: Vec<(&str, &str)> = r.tags().collect();
                             let members: Vec<pbfhogg::block_builder::MemberData<'_>> = r
@@ -149,6 +141,38 @@ fn bench_decode_write(path: &Path, compression: Compression) -> (u64, Counts) {
         writer.write_primitive_block(&bytes).expect("write final block");
     }
 
+    counts
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn bench_sync(path: &Path, compression: Compression) -> (u64, Counts) {
+    let header_bytes = pbfhogg::block_builder::build_header(None, None, None, None, &[])
+        .expect("build header");
+
+    let mut writer = PbfWriter::to_path(Path::new("/dev/null"), compression)
+        .expect("open writer");
+    writer.write_header(&header_bytes).expect("write header");
+
+    let start = Instant::now();
+    let counts = decode_and_write(path, &mut writer);
+    (start.elapsed().as_millis() as u64, counts)
+}
+
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn bench_pipelined(path: &Path, compression: Compression) -> (u64, Counts) {
+    let header_bytes = pbfhogg::block_builder::build_header(None, None, None, None, &[])
+        .expect("build header");
+
+    let mut writer = PbfWriter::to_path_pipelined(
+        Path::new("/dev/null"),
+        compression,
+        &header_bytes,
+    )
+    .expect("open pipelined writer");
+
+    let start = Instant::now();
+    let counts = decode_and_write(path, &mut writer);
+    drop(writer); // flush + join writer thread
     (start.elapsed().as_millis() as u64, counts)
 }
 
@@ -206,19 +230,30 @@ fn main() {
     eprintln!();
 
     for (comp_label, comp) in &compressions {
+        // Sync writer
         let mode = format!("write-{comp_label}");
-
         let mut best_ms = u64::MAX;
         let mut best_counts = Counts::default();
-
         for _ in 0..runs {
-            let (ms, counts) = bench_decode_write(path, *comp);
+            let (ms, counts) = bench_sync(path, *comp);
             if ms < best_ms {
                 best_ms = ms;
                 best_counts = counts;
             }
         }
+        emit(&mode, best_ms, &best_counts, file_mb);
 
+        // Pipelined writer
+        let mode = format!("write-pipe-{comp_label}");
+        let mut best_ms = u64::MAX;
+        let mut best_counts = Counts::default();
+        for _ in 0..runs {
+            let (ms, counts) = bench_pipelined(path, *comp);
+            if ms < best_ms {
+                best_ms = ms;
+                best_counts = counts;
+            }
+        }
         emit(&mode, best_ms, &best_counts, file_mb);
     }
 }

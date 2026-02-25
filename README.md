@@ -83,11 +83,13 @@ Read throughput — count all 59M elements in Denmark extract (461 MB), best of 
 
 Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null`:
 
-| Compression | Time | Notes |
-|-------------|------|-------|
-| none | 9.0s | no compression overhead |
-| zstd:3 | 10.8s | zstd default level |
-| zlib:6 | 17.4s | zlib default level (osmium default) |
+| Compression | Sync | Pipelined | Notes |
+|-------------|------|-----------|-------|
+| none | 9.0s | 9.0s | decode + BlockBuilder floor |
+| zstd:3 | 11.0s | **9.1s** | pipelined hides compression cost |
+| zlib:6 | 17.5s | **9.1s** | 1.9x speedup from parallel compression |
+
+With pipelined writes, all compression modes converge to ~9s — the decode + `BlockBuilder` serialization floor. `Compression::None` on erofs is the target production config.
 
 CLI commands — Denmark extract (483 MB, 59M elements):
 

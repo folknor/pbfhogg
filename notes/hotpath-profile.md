@@ -141,12 +141,36 @@ decompressed to check if it contains affected IDs. With indexdata
 rewrite_block at 57% is the decode+re-encode cost for the 630 affected blocks.
 frame_blob (compression) at 163% is parallelized across rayon workers.
 
+## Write benchmark: sync vs pipelined (bench_write)
+
+Denmark 483 MB, best of 2, decode + write to /dev/null:
+
+| Compression | Sync   | Pipelined | Speedup |
+|-------------|--------|-----------|---------|
+| none        | 9.0s   | 9.0s      | 1.0x    |
+| zstd:3      | 11.0s  | 9.1s      | 1.2x    |
+| zlib:6      | 17.5s  | 9.1s      | 1.9x    |
+
+Pipelined writer parallelizes compression across rayon workers. All modes
+converge to ~9s — the decode + BlockBuilder serialization floor. With
+Compression::None (nidhogg production config on erofs), there's nothing
+to parallelize so sync = pipelined.
+
+The 9s floor breaks down as (from hotpath data):
+- block_builder::add_node: 2.3s (5.4%)
+- block_builder::add_way: 1.5s (3.5%)
+- block_builder::take: 3.5s (8.3%)
+- blob::decompress_blob: 2.0s (4.7%)
+- wire::parse + block::new: 0.1s
+Total: ~9.4s, matches observed floor.
+
 ## Optimization targets
 
-### Compression (57% of write time)
-- zstd:3 is ~2x faster than zlib:6 for writes (10.8s vs 17.4s on Denmark)
-- Pipelined writer (`to_path_pipelined`) would parallelize compression across cores
-- nidhogg already uses pipelined writer in production
+### Write floor (~9s, decode + BlockBuilder)
+- Compression is solved — pipelined writer hides it completely
+- Remaining cost is decode (4.7%) + BlockBuilder insertion (9%) + take serialization (8.3%)
+- block_builder::take buffer reuse (encode_to_vec -> reuse buf) would cut 4.6 GB alloc churn
+- With Compression::None the write path is I/O-bound at planet scale
 
 ### BlockBuilder alloc churn (24% of write alloc)
 - add_way allocates fresh tags + refs Vecs every call (4.1 GB total)

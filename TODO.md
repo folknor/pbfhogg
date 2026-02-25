@@ -14,6 +14,27 @@ or BlockBuilder/PbfWriter APIs):
 Raw data and analysis in `notes/hotpath-profile.md`.
 Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (timing + alloc).
 
+### Investigations
+
+- [ ] **Benchmark pipelined writer with Compression::None** — the sync write
+  benchmark (cat --type) shows frame_blob at 57% of wall time (zlib:6). The
+  pipelined writer parallelizes compression across rayon workers. With
+  Compression::None (nidhogg's production config on erofs), compression is
+  eliminated entirely. Need bench_write with pipelined mode + none to see what
+  the actual write throughput floor is.
+
+- [ ] **Re-generate test PBF through pbfhogg for indexdata** — our bench data
+  (denmark-seq4704) is osmium-generated and has no blob indexdata. Merge
+  classify_blob spends 3.26s (90%) decompressing every blob to check IDs.
+  With indexdata (pbfhogg-generated PBFs), this drops to ~600ms (TODO old
+  numbers). Re-merge through pbfhogg, save as the new test PBF, and re-profile
+  to get realistic merge numbers.
+
+- [ ] **`block_builder::take` buffer reuse** — take allocates 4.6 GB total
+  (8% of write wall time) from `encode_to_vec()` creating a fresh buffer
+  every flush. Reusing a `Vec<u8>` across calls with `encode_to_vec` →
+  `encode(&mut buf)` + `buf.clear()` would eliminate this churn.
+
 ### Merge: remaining optimization theories
 
 With indexdata, the merge bottleneck is `rewrite_block` (60%) + `block_builder::take`

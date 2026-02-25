@@ -34,3 +34,13 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	pipelined	1285	52489653	6616526	46103	483
 2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	mmap	2898	52489653	6616526	46103	483
 2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	blobreader	2908	52489653	6616526	46103	483
+2026-02-25	4a80384*	Add hotpath::measure to wire parsers and block builder methods	denmark-latest	sequential	2848	52489653	6616526	46103	483
+2026-02-25	4a80384*	Add hotpath::measure to wire parsers and block builder methods	denmark-latest	parallel	356	52489653	6616526	46103	483
+2026-02-25	4a80384*	Add hotpath::measure to wire parsers and block builder methods	denmark-latest	pipelined	1316	52489653	6616526	46103	483
+2026-02-25	4a80384*	Add hotpath::measure to wire parsers and block builder methods	denmark-latest	mmap	2880	52489653	6616526	46103	483
+2026-02-25	4a80384*	Add hotpath::measure to wire parsers and block builder methods	denmark-latest	blobreader	3046	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	sequential	2749	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	parallel	299	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	pipelined	1287	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	mmap	2886	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	blobreader	2883	52489653	6616526	46103	483

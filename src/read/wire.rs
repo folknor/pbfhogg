@@ -428,6 +428,7 @@ pub(crate) struct WireStringTable<'a> {
 }
 
 impl<'a> WireStringTable<'a> {
+    #[hotpath::measure]
     fn parse(data: &'a [u8], buffer: &'a [u8]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
         // Count not available before scanning — Vec::new() with amortized push is fine.
@@ -486,6 +487,7 @@ pub(crate) struct WireBlock<'a> {
 }
 
 impl<'a> WireBlock<'a> {
+    #[hotpath::measure]
     pub fn parse(buffer: &'a [u8]) -> Result<Self> {
         let mut cursor = Cursor::new(buffer);
         let mut stringtable_data: Option<&'a [u8]> = None;

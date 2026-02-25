@@ -332,6 +332,7 @@ impl BlockBuilder {
     ///
     /// Coordinates are in decimicrodegrees (10⁻⁷ degrees, i.e. 100 nanodegrees),
     /// matching the default PBF granularity of 100.
+    #[hotpath::measure]
     #[allow(clippy::cast_possible_wrap)]
     pub fn add_node(
         &mut self,
@@ -463,6 +464,7 @@ impl BlockBuilder {
     /// Add a way.
     ///
     /// `refs` are absolute node IDs (the builder handles delta encoding internally).
+    #[hotpath::measure]
     pub fn add_way(
         &mut self,
         id: i64,
@@ -505,6 +507,7 @@ impl BlockBuilder {
     ///
     /// `refs` are absolute node IDs, `locations` are `(decimicro_lat, decimicro_lon)` pairs.
     /// Both slices must have the same length.
+    #[hotpath::measure]
     #[allow(clippy::too_many_arguments)]
     pub fn add_way_with_locations(
         &mut self,
@@ -555,6 +558,7 @@ impl BlockBuilder {
     /// Add a relation.
     ///
     /// `members` are absolute member IDs (the builder handles delta encoding internally).
+    #[hotpath::measure]
     pub fn add_relation(
         &mut self,
         id: i64,

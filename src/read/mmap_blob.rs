@@ -258,6 +258,7 @@ impl MmapBlobReader {
 impl Iterator for MmapBlobReader {
     type Item = Result<MmapBlob>;
 
+    #[hotpath::measure]
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn next(&mut self) -> Option<Self::Item> {
         // ---- OPTIMIZATION: plain &[u8] sub-slicing instead of Bytes::slice() ----

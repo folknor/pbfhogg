@@ -1,9 +1,30 @@
 # Hotpath profiling notes
 
-Denmark 483 MB, 59.1M elements (52.5M nodes, 6.6M ways, 46K rels).
+Denmark seq4704 (483 MB, 59.1M elements) + seq4705 OSC (300 KB, 9K changes).
 Commit d5c8095, fat LTO, zlib-ng.
 
 Run with: `scripts/run-hotpath.sh` and `scripts/run-hotpath-alloc.sh`
+
+## Check-refs (pipelined read baseline)
+
+Lightweight pipelined read — directly comparable to TODO.md old numbers.
+
+### Timing
+
+| Function                    | Calls | Avg    | Total  | % Total |
+|-----------------------------|-------|--------|--------|---------|
+| pbfhogg::main               | 1     | 6.94s  | 6.94s  | 100%    |
+| check_refs::check_refs      | 1     | 6.94s  | 6.94s  | 100%    |
+| pipeline::run_pipeline      | 1     | 6.93s  | 6.93s  | 100%    |
+| reader::for_each_pipelined  | 1     | 6.93s  | 6.93s  | 100%    |
+| blob::decompress_blob       | 7396  | 337 us | 2.49s  | 36%     |
+| block::new                  | 7396  | 14 us  | 102 ms | 1.5%    |
+| wire::parse                 | 14792 | 4.1 us | 60 ms  | 0.9%    |
+
+RSS: 125 MB. Single-threaded (main thread 100% CPU, workers ~2% each).
+
+vs TODO.md old: wall 7.51s -> 6.94s (-8%), decompress_blob 2.55s -> 2.49s,
+RSS 143 MB -> 125 MB (-13%). Improvement from fat LTO + codegen-units=1.
 
 ## Pipelined read (tags-count)
 
@@ -86,6 +107,39 @@ The drain-reuse optimization (reuse Vec across calls) would cut this significant
 
 take allocates 4.6 GB — proto serialization buffers, rebuilt every flush.
 frame_blob allocates 4.0 GB — compression output buffers.
+
+## Merge (base PBF + 1 OSC diff)
+
+Same API path as nidhogg weekly planet refresh. Input PBF has no indexdata
+(osmium-generated), so classify_blob must decompress every blob.
+630 of 7396 blobs rewritten, rest passthrough.
+
+### Timing
+
+| Function                    | Calls     | Avg    | Total  | % Total |
+|-----------------------------|-----------|--------|--------|---------|
+| pbfhogg::main               | 1         | 3.50s  | 3.50s  | 100%    |
+| merge::merge                | 1         | 3.50s  | 3.50s  | 100%    |
+| writer::frame_blob          | 630       | 9.05ms | 5.70s  | 163%*   |
+| merge::classify_blob        | 7383      | 442 us | 3.26s  | 93%     |
+| merge::rewrite_block        | 630       | 3.16ms | 1.99s  | 57%     |
+| block_builder::add_way      | 2,408,901 | 286 ns | 690 ms | 20%     |
+| block_builder::take         | 7407      | 91 us  | 676 ms | 19%     |
+| block_builder::add_node     | 2,573,619 | 48 ns  | 126 ms | 3.6%    |
+| merge::read_raw_frame       | 7399      | 12 us  | 92 ms  | 2.6%    |
+| block_builder::add_relation | 46,108    | 566 ns | 26 ms  | 0.7%    |
+
+*>100% because frame_blob runs in parallel (pipelined writer).
+
+RSS: 95 MB. Multi-threaded (main 95%, 3 workers 68-79%).
+
+classify_blob at 93% is the no-indexdata penalty — every blob must be
+decompressed to check if it contains affected IDs. With indexdata
+(pbfhogg-generated PBFs), this drops to ~21% (see TODO.md old numbers:
+603ms vs 3.26s). The indexdata optimization saves ~2.6s on Denmark.
+
+rewrite_block at 57% is the decode+re-encode cost for the 630 affected blocks.
+frame_blob (compression) at 163% is parallelized across rayon workers.
 
 ## Optimization targets
 

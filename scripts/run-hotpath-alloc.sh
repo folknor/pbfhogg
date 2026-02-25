@@ -2,14 +2,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-PBF="${1:-data/denmark-latest.osm.pbf}"
-OSC="${2:-}"
-COMPRESSION="${3:-zlib}"
+# Fixed dataset for reproducible profiling.
+PBF="data/denmark-20260220-seq4704.osm.pbf"
+OSC="data/denmark-20260221-seq4705.osc.gz"
+COMPRESSION="zlib"
 
 if [ ! -f "$PBF" ]; then
     echo "PBF not found: $PBF"
-    echo "Usage: scripts/run-hotpath-alloc.sh [pbf] [osc.gz] [compression]"
-    echo "  compression: none, zlib (default), zlib:9, zstd, zstd:19, etc."
     exit 1
 fi
 
@@ -28,7 +27,14 @@ echo "--- pipelined read (tags-count) ---"
 HOTPATH_METRICS_SERVER_OFF=true "$BIN" tags-count "$PBF" > "$OUTFILE"
 grep -A 1000 '^\[hotpath\]' "$OUTFILE"
 
-# 2. Full decode + write — BlockBuilder + PbfWriter
+# 2. Check-refs — pipelined read, lightweight processing
+#    Comparable to TODO.md baseline numbers.
+echo ""
+echo "--- pipelined read (check-refs) ---"
+HOTPATH_METRICS_SERVER_OFF=true "$BIN" check-refs "$PBF" > "$OUTFILE" 2>&1
+grep -A 1000 '^\[hotpath\]' "$OUTFILE"
+
+# 3. Full decode + write — BlockBuilder + PbfWriter
 #    cat with type filter forces decode of every element and rebuild through
 #    BlockBuilder, exercising the same write path as nidhogg output.
 echo ""
@@ -36,16 +42,9 @@ echo "--- decode + write (cat --type, compression=$COMPRESSION) ---"
 HOTPATH_METRICS_SERVER_OFF=true "$BIN" cat "$PBF" --type node,way,relation --compression "$COMPRESSION" -o /dev/null > "$OUTFILE"
 grep -A 1000 '^\[hotpath\]' "$OUTFILE"
 
-# 3. Merge — pbfhogg::merge::merge
+# 4. Merge — pbfhogg::merge::merge
 #    Same API path as nidhogg weekly planet refresh (base PBF + OSC diffs).
-#    Only runs if an OSC file is provided.
-if [ -n "$OSC" ]; then
-    if [ ! -f "$OSC" ]; then
-        echo "OSC not found: $OSC"
-        exit 1
-    fi
-    echo ""
-    echo "--- merge (compression=$COMPRESSION) ---"
-    HOTPATH_METRICS_SERVER_OFF=true "$BIN" merge "$PBF" "$OSC" --compression "$COMPRESSION" -o "$MERGED" > "$OUTFILE"
-    grep -A 1000 '^\[hotpath\]' "$OUTFILE"
-fi
+echo ""
+echo "--- merge (compression=$COMPRESSION) ---"
+HOTPATH_METRICS_SERVER_OFF=true "$BIN" merge "$PBF" "$OSC" --compression "$COMPRESSION" -o "$MERGED" > "$OUTFILE"
+grep -A 1000 '^\[hotpath\]' "$OUTFILE"

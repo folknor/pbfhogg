@@ -20,8 +20,8 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 - `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks-self-write.tsv)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
-- `scripts/run-hotpath.sh [pbf] [osc.gz] [compression]` — hotpath profiling (pipelined read + decode/write + optional merge)
-- `scripts/run-hotpath-alloc.sh [pbf] [osc.gz] [compression]` — hotpath allocation profiling (same commands)
+- `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
+- `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
 
 Bench scripts build internally — no need to run `build.sh` first.
 If you need something these scripts don't cover, write a new script.

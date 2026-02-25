@@ -9,78 +9,10 @@ or BlockBuilder/PbfWriter APIs):
 
     scripts/test.sh -- --ignored
 
-## Performance: hotpath profiling results (Denmark 483 MB, Feb 2026)
+## Performance: hotpath profiling
 
-**Primary consumers:** Both elivagar and nidhogg use the same pattern:
-`ElementReader::from_path` -> `for_each_pipelined`. Nidhogg does 3 pipelined
-passes per ingest. Nidhogg also uses `pbfhogg::merge::merge()` for weekly
-planet updates. Both the read path and the merge write path are now heavily
-optimized. The read path has decompression buffer pooling (`DecompressPool` +
-`Bytes::from_owner`) and a zero-copy wire-format parser (`wire.rs`), yielding
-**43-44% wall time improvement** across all single-threaded read modes. The
-merge write path has parallel compression via `PbfWriter::to_path_pipelined`,
-yielding **62% wall time improvement** (8.06s → 3.03s on Denmark). Finding 7
-(blob-level indexdata) embeds element type + ID range in BlobHeader so that
-subsequent merges can classify passthrough blobs without decompression — saving
-~8% on Denmark (3.07s → 2.81s) with larger gains expected at planet scale.
-O_DIRECT writes (`--direct-io`) add no measurable overhead on Denmark (2821ms
-BufWriter vs 2876ms O_DIRECT, within noise) — the pipeline is CPU-bound on zlib
-compression at this scale. The real win is page cache hygiene at planet scale
-(80GB writes not evicting useful host data). `copy_file_range` for passthrough
-blobs saves ~3% on Denmark (2.81s → 2.73s) by eliminating userspace buffer copy
-for index-hit blobs — larger gains expected at planet scale where passthrough
-dominates.
-
-All command entry points, merge internals (`classify_blob`, `read_raw_frame`,
-`rewrite_block`), and pipeline (`run_pipeline`) are instrumented with
-`#[hotpath::measure]`. Run with `scripts/run-hotpath.sh` (timing only) or
-`scripts/run-hotpath-alloc.sh` (timing + allocation tracking).
-
-### Raw hotpath data (current, with wire parser + pool + blob indexdata)
-
-**check-refs (Denmark, 52M nodes, 6.6M ways, 46K relations):**
-```
-Wall: 7.51s, RSS: 143 MB (hotpath timing, no alloc tracking)
-check_refs:           1 call, 7.51s (100%)
-run_pipeline:         1 call, 7.50s (99.9%)
-for_each_pipelined:   1 call, 7.50s (99.9%)
-decompress_blob:      7396 calls, 2.55s (33.9%), avg 345µs, P50 198µs, P99 1.72ms
-block::new:           7396 calls, 97ms (1.3%), avg 13µs, P50 5µs, P99 166µs
-Main thread: 100% CPU. Workers: 1% CPU each (5 threads, vastly idle).
-```
-
-**merge without indexdata (Denmark base + 1 OSC, osmium input, prost):**
-```
-Wall: 2.78s, RSS: 97 MB (hotpath timing)
-frame_blob:           630 calls, 5.61s total (202%, parallel), avg 8.9ms
-classify_blob:        7385 calls, 3.23s (116%), avg 438µs, P50 263µs, P99 2.12ms
-rewrite_block:        630 calls, 1.49s (54%), avg 2.36ms, P50 2.83ms, P99 7.25ms
-block_builder::take:  7407 calls, 739ms (27%), avg 100µs, P50 10ns, P99 2.08ms
-read_raw_frame:       7399 calls, 82ms (3%), avg 11µs
-block::new:           630 calls, 14ms (0.5%), avg 21µs
-Clean (no hotpath): 2.61s best of 3.
-```
-
-**merge with indexdata (Denmark base + 1 OSC, pbfhogg input):**
-```
-Wall: 2.86s, RSS: 85 MB (hotpath timing)
-frame_blob:           549 calls, 5.40s total (189%, parallel), avg 9.8ms
-rewrite_block:        550 calls, 1.71s (59.7%), avg 3.11ms
-block_builder::take:  7408 calls, 673ms (23.5%), avg 91µs
-classify_blob:        7382 calls, 603ms (21.1%), avg 82µs, P50 150ns, P99 1.99ms
-read_raw_frame:       7400 calls, 90ms (3.2%), avg 12µs
-block::new:           631 calls, 14ms (0.5%), avg 23µs
-Clean (no hotpath): 2.81s best of 3.
-```
-
-**bench-self (Denmark, best of 3, no hotpath overhead):**
-```
-sequential:  3076 ms
-parallel:     302 ms
-pipelined:   1599 ms
-mmap:        3229 ms
-blobreader:  3215 ms
-```
+Raw data and analysis in `notes/hotpath-profile.md`.
+Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (timing + alloc).
 
 ### Merge: remaining optimization theories
 
@@ -115,10 +47,6 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   of the `rewrite_block` cost compared to tag string interning and metadata
   handling. Profile first to see if ref/memid decode+reencode is a significant
   slice of the 1.49s `rewrite_block` total.
-
-- [x] **Tag/ref Vec allocation churn** — hoisted reusable buffers in `rewrite_block`.
-
-- [x] **BlockBuilder Vec reuse across blocks** — `reset()` preserves capacity.
 
 - [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
   (slightly slower than old crate's 673ms). `take()` is 27% of wall time; further
@@ -160,14 +88,9 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   consumer is merge's `par_bridge` in `classify_blob`. The `thread_local::ThreadLocal` trick
   could replace merge's `map_init(Vec::new, ...)` pattern for per-thread buffer reuse.
 
-## Performance: memory / planet-scale
-
-- [x] `commands/sort.rs` — blob-level permutation sort. O(num_blobs) memory,
-  passthrough for non-overlapping blobs. Denmark: 3.0s, 100% passthrough.
-
 ## Performance: Linux kernel features for planet-scale I/O
 
-Research notes: `docs/linux-async-io.md`.
+Research notes: `notes/linux-async-io.md`.
 
 Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
 Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
@@ -222,13 +145,6 @@ buffers actually matter — the writer thread is the bottleneck, not compression
   - SQ polling (`setup_sqpoll`) — eliminates `io_uring_enter` syscalls, consumes a CPU core
   - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
   - `pread` directly into registered buffer instead of heap allocation
-
-## Dependencies
-
-- [x] CLI split into separate `pbfhogg-cli` crate (`cli/`). Library users no longer
-  need `clap`. `serde_json` and `roaring` are optional behind `commands` feature
-  (default-enabled). `quick-xml` stays as a library dep (needed by `osc.rs`/`merge`).
-- [x] ~~`protobuf` crate~~ — migrated to `prost` v0.14 + `protox` v0.9.
 
 ## Before crates.io publish
 
@@ -287,44 +203,6 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 ## Benchmarking
 
 - [ ] Track peak RSS during reads and merges at scale. Denmark for CI, planet for release validation.
-
-## Planned commands
-
-- [x] `pbfhogg extract --smart` strategy — three passes, complete boundary/multipolygon
-  relations (all member ways + their nodes included even if outside the extract region).
-  `ExtractStrategy` enum (Simple, CompleteWays, Smart). Smart collects extra way/node
-  IDs from relations with type=multipolygon|boundary in pass 1, resolves way→node deps
-  in pass 2, merges into output in pass 3.
-
-- [x] `pbfhogg add-locations-to-ways` dense mmap index — `--index-type dense` uses
-  anonymous mmap with direct indexing (8 bytes/slot, lazy page allocation). Planet:
-  ~68 GB physical vs HashMap's ~192 GB. `IndexType` enum (Hash, Dense{capacity}),
-  default capacity 16B entries (128 GB virtual). Configurable for testing.
-
-## CLI cross-validation
-
-Commands need cross-validation against osmium-tool (and where applicable osmosis/osmconvert)
-on real PBF data, like the merge cross-validation in `verify/merge.sh`. Run each
-command with pbfhogg and osmium on the same input, diff the outputs.
-
-- [x] `merge` — cross-validated against osmium, osmosis, osmconvert (commit a38c258)
-- [x] `sort` — cross-validated against osmium (`verify/sort.sh`, `tests/sort.rs`)
-- [x] `cat` — identical output for all 3 type filters (node/way/relation) (`verify/cat.sh`)
-- [x] `extract` — expected semantic differences in relation inclusion and boundary
-  precision. Simple: pbfhogg includes 127 more relations, osmium 2 more nodes + 1 way.
-  Complete-ways: osmium includes 133 more relations, 3 more nodes, 1 way. Node/way
-  counts 99.99% match. (`verify/extract.sh`)
-- [x] `derive-changes` — pbfhogg roundtrip is perfect (59.1M elements identical).
-  osmium roundtrip loses 1243 delete directives. (`verify/derive-changes.sh`)
-- [x] `diff` — 14-element discrepancy out of 59.1M (different comparison semantics
-  for version-only changes). (`verify/diff.sh`)
-- [x] `add-locations-to-ways` — identical output, 10.17M elements (`verify/add-locations-to-ways.sh`)
-- [x] `tags-filter` — identical for all 3 expressions with `-R` (`verify/tags-filter.sh`)
-- [x] `getid` / `removeid` — getid identical to osmium. removeid complement verified
-  (getid + removeid = original counts). osmium has no removeid command. (`verify/getid-removeid.sh`)
-- [x] `check-refs` — identical output for both ways-only and full relation checks.
-  Fixed: deferred relation-to-relation refs to post-pass (forward reference handling),
-  switched to unique missing IDs for nodes/ways. (`verify/check-refs.sh`)
 
 ## Nice to have
 

@@ -76,10 +76,19 @@ where
                 // If available_parallelism() is unsupported (e.g. some WASM runtimes),
                 // fall back to 4 threads as a reasonable default for most desktops.
                 .unwrap_or(4);
-            let decode_pool = rayon::ThreadPoolBuilder::new()
+            let decode_pool = match rayon::ThreadPoolBuilder::new()
                 .num_threads(decode_threads)
                 .build()
-                .expect("failed to build decode pool");
+            {
+                Ok(pool) => pool,
+                Err(e) => {
+                    let err = crate::error::new_error(crate::error::ErrorKind::Io(
+                        std::io::Error::other(format!("failed to build decode pool: {e}")),
+                    ));
+                    drop(dispatch_tx.send((0, Some(Err(err)))));
+                    return;
+                }
+            };
             let buffer_pool = DecompressPool::new();
             for (seq, blob_result) in raw_rx {
                 let tx = dispatch_tx.clone();

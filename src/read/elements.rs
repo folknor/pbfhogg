@@ -429,6 +429,11 @@ impl<'a> RelMember<'a> {
     /// Returns the role of a relation member.
     #[allow(clippy::cast_sign_loss)]
     pub fn role(&self) -> Result<&'a str> {
+        if self.role_sid < 0 {
+            return Err(crate::error::new_error(
+                crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 0 },
+            ));
+        }
         str_from_stringtable(self.block, self.role_sid as usize)
     }
 }
@@ -566,9 +571,14 @@ impl<'a> Info<'a> {
     /// Returns the user name.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Option<Result<&'a str>> {
-        self.info
-            .user_sid
-            .map(|sid| str_from_stringtable(self.block, sid as usize))
+        self.info.user_sid.map(|sid| {
+            if sid < 0 {
+                return Err(crate::error::new_error(
+                    crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 0 },
+                ));
+            }
+            str_from_stringtable(self.block, sid as usize)
+        })
     }
 
     /// Returns the visibility status of an element.

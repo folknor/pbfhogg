@@ -41,7 +41,7 @@ impl<'a> Cursor<'a> {
 
     #[inline]
     pub fn remaining(&self) -> usize {
-        self.data.len() - self.pos
+        self.data.len().saturating_sub(self.pos)
     }
 
     /// Read a varint (LEB128). Fast path for single-byte values.

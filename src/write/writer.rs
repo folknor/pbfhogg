@@ -572,13 +572,17 @@ pub(crate) fn frame_blob(
             );
             encoder.write_all(uncompressed)?;
             let compressed = encoder.finish()?;
-            blob.raw_size = Some(uncompressed.len() as i32);
+            blob.raw_size = Some(i32::try_from(uncompressed.len()).map_err(|_| {
+                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+            })?);
             blob.data = Some(proto::blob::Data::ZlibData(Bytes::from(compressed)));
         }
         Compression::Zstd(level) => {
             let compressed =
                 zstd::bulk::compress(uncompressed, *level).map_err(io::Error::other)?;
-            blob.raw_size = Some(uncompressed.len() as i32);
+            blob.raw_size = Some(i32::try_from(uncompressed.len()).map_err(|_| {
+                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+            })?);
             blob.data = Some(proto::blob::Data::ZstdData(Bytes::from(compressed)));
         }
     }
@@ -588,7 +592,9 @@ pub(crate) fn frame_blob(
     // Step 2: Build the BlobHeader
     let mut header = proto::BlobHeader::default();
     header.r#type = blob_type.to_string();
-    header.datasize = blob_bytes.len() as i32;
+    header.datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
+        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+    })?;
     if let Some(idx) = indexdata {
         header.indexdata = Some(Bytes::copy_from_slice(idx));
     }
@@ -614,14 +620,16 @@ pub(crate) fn frame_blob(
 ///
 /// This is used by merge to add blob-level index metadata to passthrough blobs
 /// so that subsequent merges can classify them without decompression.
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
 ) -> io::Result<Vec<u8>> {
     let mut header = proto::BlobHeader::default();
     header.r#type = "OSMData".to_string();
-    header.datasize = blob_bytes.len() as i32;
+    header.datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
+        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+    })?;
     header.indexdata = Some(Bytes::copy_from_slice(indexdata));
 
     let header_bytes = header.encode_to_vec();

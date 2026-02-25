@@ -270,29 +270,15 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 ## Warnings (from code quality review, Feb 2026)
 
 - [ ] **`block_builder.rs:169` — `MemberType::Unknown` silently mapped to
-  `Node`.** Silent data corruption on roundtrip. Same issue in
-  `derive_changes.rs:383` (Unknown → `"node"` in OSC XML). Should at minimum
-  log a warning or return an error.
+  `Node`.** Same in `derive_changes.rs:383` (Unknown → `"node"` in OSC XML).
+  Known accepted limitation: the PBF protobuf enum only defines NODE/WAY/RELATION
+  and has never been extended. Fixing would require `add_relation` to return
+  `Result`, changing 15+ call sites. The existing comment documents the behavior.
 
-- [ ] **`writer.rs:575,591` — `len() as i32` overflow for >2GB blobs.** The PBF
-  spec limits blobs to 32MB so this can't happen with well-formed data, but
-  there is no runtime check. Should use `i32::try_from()` with an error return.
-
-- [ ] **`dense.rs:242`, `elements.rs:571`, `elements.rs:432` — `user_sid as
-  usize` / `role_sid as usize` sign loss.** Negative delta-decoded string table
-  index wraps to huge `usize`. Caught by `str_from_stringtable` bounds check
-  (returns error, not panic), but the error message shows a huge index instead of
-  "negative string table index". Minor — cosmetic error message improvement.
-
-- [ ] **`pipeline.rs:81` — `expect()` panic in library code.** Thread pool
-  creation failure (e.g. OS thread limit) panics via `expect()`. Should propagate
-  an error. Since this runs inside `thread::scope`, the panic is caught, but the
-  error message is a panic backtrace rather than a clean error.
-
-- [ ] **`wire.rs:43` — `Cursor::remaining()` can underflow.** If `pos > len`
-  (shouldn't happen but `is_empty()` uses `>=` acknowledging the possibility),
-  the subtraction panics in debug or wraps in release. Fix:
-  `self.data.len().saturating_sub(self.pos)`.
+- [x] `writer.rs` — `len() as i32` overflow: fixed. Use `i32::try_from()` with clear error for `raw_size` and `datasize` in both `frame_blob` and `reframe_raw_with_index`.
+- [x] `dense.rs`, `elements.rs` — `user_sid`/`role_sid` sign loss: fixed. Guard negative values before `as usize` cast, return `StringtableIndexOutOfBounds` early.
+- [x] `pipeline.rs` — `expect()` panic: fixed. Send error through decode channel and return, instead of panicking.
+- [x] `wire.rs` — `Cursor::remaining()` underflow: fixed. Use `saturating_sub`.
 
 - [ ] **`derive_changes.rs`, `diff.rs` — loads entire PBF into owned Vecs.**
   Planet-scale (~80GB) would OOM. Known limitation, not on the critical path

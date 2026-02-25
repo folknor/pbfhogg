@@ -239,6 +239,11 @@ impl<'a> DenseNodeInfo<'a> {
     /// Returns the user name.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Result<&'a str> {
+        if self.user_sid < 0 {
+            return Err(crate::error::new_error(
+                crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 0 },
+            ));
+        }
         str_from_stringtable(self.block, self.user_sid as usize)
     }
 

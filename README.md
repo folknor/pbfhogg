@@ -79,13 +79,14 @@ Read throughput — count all 59M elements in Denmark extract (483 MB), best of 
 | Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |
 <!-- BENCH:END -->
 
-Merge — apply OSC diff (294 KB, ~4700 changesets) to Denmark PBF:
+CLI commands — Denmark extract (483 MB, 59M elements):
 
-| Tool | Time | Notes |
-|------|------|-------|
-| **pbfhogg** | **2.7s** | parallel compression + blob passthrough + blob indexdata + copy_file_range |
-| **pbfhogg** | 2.8s | first merge (no indexdata, falls back to decompression + userspace copy) |
-| osmium 1.19 | 7.2s | `osmium apply-changes` |
+| Tool | merge | sort | sort (unsorted) |
+|------|-------|------|-----------------|
+| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** |
+| osmium 1.19 | 7.2s | 11.6s | 21.3s |
+
+Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs).
 
 System: Linux 6.18, Ryzen 9 7950X.
 

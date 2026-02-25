@@ -282,7 +282,7 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 
 Merge is fully validated: 11 unit tests + 4-tool cross-validation (commit a38c258).
 pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semantics
-(version-based vs unconditional). See git log and `scripts/xval-merge.sh` for details.
+(version-based vs unconditional). See git log and `verify/merge.sh` for details.
 
 ## Benchmarking
 
@@ -300,11 +300,11 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 ## CLI cross-validation
 
 Commands need cross-validation against osmium-tool (and where applicable osmosis/osmconvert)
-on real PBF data, like the merge cross-validation in `scripts/xval-merge.sh`. Run each
+on real PBF data, like the merge cross-validation in `verify/merge.sh`. Run each
 command with pbfhogg and osmium on the same input, diff the outputs.
 
 - [x] `merge` — cross-validated against osmium, osmosis, osmconvert (commit a38c258)
-- [ ] `sort` — compare `pbfhogg sort` vs `osmium sort` output
+- [x] `sort` — cross-validated against osmium (`verify/sort.sh`, `tests/sort.rs`)
 - [ ] `cat` — compare `pbfhogg cat` vs `osmium cat` output (with and without type filters)
 - [ ] `extract` — compare bbox and polygon extract vs `osmium extract`
 - [ ] `derive-changes` — compare OSC output vs `osmium derive-changes`

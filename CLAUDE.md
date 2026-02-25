@@ -23,6 +23,12 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 Bench scripts build internally — no need to run `build.sh` first.
 If you need something these scripts don't cover, write a new script.
 
+## Verify scripts
+
+Cross-validation scripts live in `verify/`. Each compares pbfhogg output against osmium (and other tools where applicable) on real PBF data. They build pbfhogg internally.
+- `verify/merge.sh [base.pbf] [changes.osc.gz]` — merge vs osmium/osmosis/osmconvert
+- `verify/sort.sh [input.pbf]` — sort vs osmium sort
+
 ## Subagents
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.
 

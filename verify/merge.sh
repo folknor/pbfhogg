@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Cross-validate merge output from 4 tools: pbfhogg, osmium, osmosis, osmconvert
-# Usage: scripts/xval-merge.sh [base.osm.pbf] [changes.osc.gz]
+# Usage: verify/merge.sh [base.osm.pbf] [changes.osc.gz]
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 BASE="${1:-data/denmark-20260220-seq4704.osm.pbf}"
 OSC="${2:-data/denmark-20260221-seq4705.osc.gz}"
-OUTDIR="target/xval"
+OUTDIR="target/verify/merge"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 OSMOSIS_BIN="data/osmosis/osmosis-0.49.2/bin/osmosis"
 export JAVA_HOME="$(pwd)/data/jdk"

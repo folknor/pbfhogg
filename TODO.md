@@ -93,19 +93,28 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   encoding (dense nodes) make per-element raw byte splicing impossible without
   re-serialization that costs the same as full reencode.
 
-- [ ] **Pre-seed output StringTable from input block** — at the start of
-  `rewrite_block`, copy the input block's string table entries into the output
-  BlockBuilder's StringTable. Most `add()` calls would then hit the "already
-  exists" fast path (FxHashMap lookup) instead of hashing and inserting new
-  strings. Reduces per-element overhead for the ~99% unmodified elements that
-  reference the same tag keys/values as the input block.
+- [ ] **Pre-seed output StringTable from input block** — investigated: less
+  clear-cut than expected. `StringTable::add()` already allocates via
+  `entry(s.to_owned())` on every call (even for existing strings), so pre-seeding
+  doesn't save allocations — it just moves them earlier. The natural access
+  pattern already populates the table on the first few elements, and subsequent
+  elements hit the occupied path. The real win would be **avoiding the `add()`
+  call entirely** for unmodified elements by preserving input string table indices
+  in the output — but that requires a fundamentally different BlockBuilder mode
+  where raw string-table indices pass through without re-interning. Worth
+  prototyping to measure whether the FxHashMap lookup overhead on ~8000 elements
+  × ~4 tags is actually significant.
 
-- [ ] **Raw packed bytes for non-string integer fields** — way refs and relation
-  memids/types are delta-encoded within each element (not across elements) and
-  have no string table dependency. BlockBuilder could accept pre-encoded packed
-  bytes for these fields instead of requiring decoded `Vec<i64>` / `Vec<MemberData>`,
-  skipping the decode-then-reencode round-trip for the largest arrays in each
-  element.
+- [ ] **Raw packed bytes for non-string integer fields** — investigated: the
+  delta encoding is compatible (both input wire format and BlockBuilder delta-
+  encode refs/memids from 0 within each element), so raw byte passthrough is
+  valid. However, prost's generated `Way`/`Relation` types use `Vec<i64>` for
+  `refs`/`memids` — accepting raw packed bytes would require either bypassing
+  prost serialization for these fields (manual protobuf encoding) or a custom
+  message type. The complexity may not be justified: refs/memids are a fraction
+  of the `rewrite_block` cost compared to tag string interning and metadata
+  handling. Profile first to see if ref/memid decode+reencode is a significant
+  slice of the 1.49s `rewrite_block` total.
 
 - [x] **Tag/ref Vec allocation churn** — hoisted reusable buffers in `rewrite_block`.
 
@@ -117,8 +126,13 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
 
 ## Performance: parallelism
 
-- [ ] `pipeline.rs:13-16` — `READ_AHEAD` / `DECODE_AHEAD` constants should be configurable
-  or auto-tuned. Current `DECODE_AHEAD=32` means up to 64-256MB of decoded blocks in flight.
+- [ ] `pipeline.rs:13-16` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
+  Making them configurable would require a pipeline config struct on the public
+  `for_each_pipelined` API. Current values work well at both Denmark and planet
+  scale — hotpath shows the pipeline is balanced (I/O thread not stalling, rayon
+  workers barely loaded, main thread is the bottleneck). Memory cost is 32 blocks
+  × ~32KB-1MB = 32-256MB peak. Low priority — configure when someone reports a
+  problem on a memory-constrained system.
 
 - [ ] **Rayon alternatives for slice-based parallelism** — Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
@@ -241,10 +255,16 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ## Code TODOs
 
-- [ ] `src/indexed.rs:42` — use `relation_ids` field in `IdRanges` filtering.
-  Leave as-is until a concrete consumer exists. No current or planned command benefits.
-  Implementing `read_relations_and_deps` requires 3+ passes (relations→ways→nodes) and
-  recursive member resolution. See git log for full analysis (commit a38c258).
+- [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
+  unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →
+  fetch dependent nodes) and `for_each_node`. A `read_relations_and_deps` would
+  need 3+ passes: pass 1 filter relations → collect member way/node/relation IDs;
+  pass 2 fetch member ways → collect their node refs; pass 3 fetch all dependent
+  nodes. Recursive relation members (relations containing relations) add another
+  pass or fixpoint loop. The `relations_available()` method is already written
+  but commented out (line 80-89). The field and method are zero-cost as-is —
+  park until a concrete consumer exists (e.g. extract --smart, or a library user
+  doing relation-based filtering).
 
 ## Merge correctness
 

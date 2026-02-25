@@ -1,51 +1,13 @@
-[package]
-name = "pbfhogg"
+[workspace]
+members = ["cli"]
+
+[workspace.package]
 version = "0.2.0"
-description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
-license = "Apache-2.0"
 edition = "2024"
+license = "Apache-2.0"
 repository = "https://github.com/folknor/pbfhogg"
-keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
-categories = ["parser-implementations", "encoding", "science::geo"]
 
-[features]
-default = ["rust-zlib"]
-rust-zlib = ["flate2/rust_backend"]
-zlib = ["flate2/zlib"]
-zlib-ng = ["flate2/zlib-ng"]
-hotpath = ["hotpath/hotpath"]
-hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-jemalloc = ["dep:tikv-jemallocator"]
-mimalloc = ["dep:mimalloc-crate"]
-linux-direct-io = ["dep:libc"]
-linux-io-uring = ["dep:io-uring", "dep:libc"]
-
-[dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
-mimalloc-crate = { package = "mimalloc", version = "0.1", optional = true }
-bytes = "1"
-clap = { version = "4", features = ["derive"] }
-flate2 = { version = "1.0", default-features = false }
-memmap2 = "0.9"
-prost = "0.14"
-quick-xml = "0.39"
-rayon = "1.5"
-roaring = "0.11"
-rustc-hash = "2"
-serde_json = "1"
-zstd = "0.13"
-hotpath = "0.12"
-io-uring = { version = "0.7", optional = true }
-libc = { version = "0.2", optional = true }
-
-[build-dependencies]
-prost-build = "0.14"
-protox = "0.9"
-
-[dev-dependencies]
-tempfile = "3"
-
-[lints.clippy]
+[workspace.lints.clippy]
 uninlined_format_args = "deny"
 cloned_instead_of_copied = "deny"
 redundant_closure_for_method_calls = "deny"
@@ -78,3 +40,49 @@ cast_possible_truncation = "deny"
 cast_possible_wrap = "deny"
 unwrap_used = "deny"
 too_many_lines = "deny"
+
+[package]
+name = "pbfhogg"
+version.workspace = true
+description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
+license.workspace = true
+edition.workspace = true
+repository.workspace = true
+keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
+categories = ["parser-implementations", "encoding", "science::geo"]
+
+[features]
+default = ["rust-zlib", "commands"]
+rust-zlib = ["flate2/rust_backend"]
+zlib = ["flate2/zlib"]
+zlib-ng = ["flate2/zlib-ng"]
+commands = ["dep:serde_json", "dep:roaring"]
+hotpath = ["hotpath/hotpath"]
+hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
+linux-direct-io = ["dep:libc"]
+linux-io-uring = ["dep:io-uring", "dep:libc"]
+
+[dependencies]
+bytes = "1"
+flate2 = { version = "1.0", default-features = false }
+memmap2 = "0.9"
+prost = "0.14"
+rayon = "1.5"
+rustc-hash = "2"
+zstd = "0.13"
+hotpath = "0.12"
+quick-xml = "0.39"
+serde_json = { version = "1", optional = true }
+roaring = { version = "0.11", optional = true }
+io-uring = { version = "0.7", optional = true }
+libc = { version = "0.2", optional = true }
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

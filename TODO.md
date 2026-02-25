@@ -225,9 +225,9 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ## Dependencies
 
-- [ ] CLI-only dependencies (`clap`, `quick-xml`, `serde_json`, `roaring`) are
-  runtime deps of the library crate. Library-only users pay the compile cost.
-  Consider a `cli` feature gate or separate `pbfhogg-cli` binary crate.
+- [x] CLI split into separate `pbfhogg-cli` crate (`cli/`). Library users no longer
+  need `clap`. `serde_json` and `roaring` are optional behind `commands` feature
+  (default-enabled). `quick-xml` stays as a library dep (needed by `osc.rs`/`merge`).
 - [x] ~~`protobuf` crate~~ — migrated to `prost` v0.14 + `protox` v0.9.
 
 ## Before crates.io publish

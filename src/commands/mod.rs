@@ -1,8 +1,10 @@
 pub mod add_locations_to_ways;
 pub mod cat;
+#[cfg(feature = "commands")]
 pub mod check_refs;
 pub mod derive_changes;
 pub mod diff;
+#[cfg(feature = "commands")]
 pub mod extract;
 pub mod fileinfo;
 pub mod getid;

@@ -1,0 +1,31 @@
+[package]
+name = "pbfhogg-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Command-line OpenStreetMap PBF toolkit"
+
+[[bin]]
+name = "pbfhogg"
+path = "src/main.rs"
+
+[features]
+jemalloc = ["dep:tikv-jemallocator"]
+mimalloc = ["dep:mimalloc-crate"]
+hotpath = ["pbfhogg/hotpath"]
+hotpath-alloc = ["pbfhogg/hotpath-alloc"]
+linux-direct-io = ["pbfhogg/linux-direct-io"]
+linux-io-uring = ["pbfhogg/linux-io-uring"]
+zlib = ["pbfhogg/zlib"]
+zlib-ng = ["pbfhogg/zlib-ng"]
+
+[dependencies]
+pbfhogg = { path = "..", features = ["commands"] }
+clap = { version = "4", features = ["derive"] }
+hotpath = "0.12"
+tikv-jemallocator = { version = "0.6", optional = true }
+mimalloc-crate = { package = "mimalloc", version = "0.1", optional = true }
+
+[lints]
+workspace = true

@@ -2,4 +2,4 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-cargo build --release --features hotpath
+cargo build --release -p pbfhogg-cli --features hotpath

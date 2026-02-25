@@ -17,7 +17,7 @@ for ALLOC in default jemalloc mimalloc; do
     fi
 
     echo "--- Building with allocator: $ALLOC ---"
-    cargo build --release $FEATURES 2>&1
+    cargo build --release -p pbfhogg-cli $FEATURES 2>&1
 
     echo "--- Running $ALLOC ($RUNS runs) ---"
     for i in $(seq 1 "$RUNS"); do

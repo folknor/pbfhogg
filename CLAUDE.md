@@ -40,6 +40,14 @@ Cross-validation scripts live in `verify/`. Each compares pbfhogg output against
 ## Subagents
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.
 
+## Workspace
+
+The repo is a Cargo workspace with two packages:
+- **`pbfhogg`** (root) — library crate. Read/write API, commands, protobuf codegen.
+- **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary.
+
+Library users who only need read/write can depend on `pbfhogg` with `default-features = false, features = ["rust-zlib"]` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
+
 ## Architecture
 
 **Read path:** `BlobReader` (blob.rs) -> `PrimitiveBlock` (block.rs) -> `Element` (elements.rs)
@@ -57,17 +65,17 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 
 ## Conventions
 
-- Strict clippy lints enforced (see `[lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
+- Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - `pub(crate) mod proto` is `#[allow(clippy::all)]` (generated code)
 - Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind)
 - Tests live in `tests/` (roundtrip.rs, roundtrip_real.rs) and inline in blob.rs/indexed.rs
 
-## Features
+## Features (library crate)
 
 - `rust-zlib` (default): pure Rust zlib via flate2
 - `zlib`: system zlib
 - `zlib-ng`: zlib-ng (mutually exclusive with above)
-- `zstd`: zstandard compression support
+- `commands` (default): enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`)
 - `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)

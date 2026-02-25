@@ -81,6 +81,14 @@ Read throughput — count all 59M elements in Denmark extract (461 MB), best of 
 | Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |
 <!-- BENCH:END -->
 
+Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null`:
+
+| Compression | Time | Notes |
+|-------------|------|-------|
+| none | 9.0s | no compression overhead |
+| zstd:3 | 10.8s | zstd default level |
+| zlib:6 | 17.4s | zlib default level (osmium default) |
+
 CLI commands — Denmark extract (483 MB, 59M elements):
 
 | Tool | merge | sort | sort (unsorted) | diff | extract | add-locs |

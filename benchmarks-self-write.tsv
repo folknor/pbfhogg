@@ -1,0 +1,8 @@
+date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-none	9034	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zlib:6	17386	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:3	10816	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:19	112423	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-none	9166	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zlib:6	17449	52489653	6616526	46103	483
+2026-02-25	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:3	10925	52489653	6616526	46103	483

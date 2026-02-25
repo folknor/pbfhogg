@@ -45,16 +45,37 @@ git merge template/master --allow-unrelated-histories
 
 4. **Content** — replace the placeholder docs in `docs/guide/` and `docs/api/` with your actual documentation. Update the sidebar entries in `config.ts` to match.
 
-5. **README logo** — add your logo-text SVGs to the project root for the GitHub README. Use `<picture>` for light/dark mode:
+5. **README** — `raw/` contains ready-made README drafts for each project (`nidhogg-README.md`, `elivagar-README.md`, `pbfhogg-README.md`) with logos, badges, and light/dark mode already wired up. To use one as a starting point, copy it to your project root as `README.md` and adjust paths.
+
+   Each README header uses a `<picture>` tag so GitHub shows the right logo for light/dark mode:
    ```html
    <p align="center">
      <picture>
        <source media="(prefers-color-scheme: dark)" srcset="my-logo-text-dark.svg">
        <img src="my-logo-text.svg" width="300" alt="MyProject">
      </picture>
+     <br>
+     <em>Project tagline here</em>
    </p>
    ```
-   The dark variant should use your theme's dark-mode brand color. See `raw/*-logo-text-dark.svg` for examples.
+
+   **Creating logo SVGs:** Export your logo-text from Inkscape with text converted to paths. For the dark variant, replace the dark fills with your theme's dark-mode brand-1 color:
+
+   | Theme | Light fill | Dark fill |
+   |---|---|---|
+   | Nidhogg | `#043927` | `#22d974` |
+   | Elivagar | `#1a2a3a` | `#33d4f0` |
+   | Pbfhogg | `#1b2e21` | `#cc3030` |
+
+   These colors come from `--vp-c-brand-1` in the `.dark` block of each `colors-*.css` file.
+
+   **Badges** use [shields.io](https://shields.io). Common ones for Rust projects:
+   ```html
+   <a href="https://crates.io/crates/mycrate"><img src="https://img.shields.io/crates/v/mycrate" alt="crates.io"></a>
+   <a href="https://docs.rs/mycrate"><img src="https://img.shields.io/docsrs/mycrate" alt="docs.rs"></a>
+   <img src="https://img.shields.io/badge/rust-stable-orange?logo=rust" alt="Rust">
+   <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License">
+   ```
 
 ### Pulling template updates
 
@@ -135,4 +156,9 @@ docs/
   guide/                     # guide pages
   api/                       # API reference pages
   index.md                   # home page
+raw/
+  *-logo.svg                 # icon-only logos
+  *-logo-text.svg            # logo + project name (light mode)
+  *-logo-text-dark.svg       # logo + project name (dark mode)
+  *-README.md                # ready-made README drafts with logos and badges
 ```

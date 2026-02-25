@@ -76,9 +76,9 @@ impl TypeFilter {
 
 fn parse_type_filter(s: &str) -> TypeFilter {
     TypeFilter {
-        nodes: s.contains("node"),
-        ways: s.contains("way"),
-        relations: s.contains("relation"),
+        nodes: s.split(',').any(|t| t.trim() == "node"),
+        ways: s.split(',').any(|t| t.trim() == "way"),
+        relations: s.split(',').any(|t| t.trim() == "relation"),
     }
 }
 

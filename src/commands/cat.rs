@@ -157,9 +157,9 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 
 #[allow(clippy::too_many_lines)]
 fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool) -> Result<CatStats> {
-    let filter_node = filter.contains("node");
-    let filter_way = filter.contains("way");
-    let filter_relation = filter.contains("relation");
+    let filter_node = filter.split(',').any(|t| t.trim() == "node");
+    let filter_way = filter.split(',').any(|t| t.trim() == "way");
+    let filter_relation = filter.split(',').any(|t| t.trim() == "relation");
 
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();

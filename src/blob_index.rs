@@ -189,10 +189,8 @@ fn scan_dense_node_ids(raw: &[u8], mut cursor: usize, end: usize) -> Option<Blob
                 // Zigzag decode: sint64
                 let delta = ((raw_val >> 1) as i64) ^ -((raw_val & 1) as i64);
                 current_id += delta;
-                if count == 0 {
-                    min_id = current_id;
-                }
-                max_id = current_id;
+                min_id = min_id.min(current_id);
+                max_id = max_id.max(current_id);
                 count += 1;
             }
 

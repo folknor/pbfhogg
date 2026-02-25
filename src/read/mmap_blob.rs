@@ -339,6 +339,12 @@ impl Iterator for MmapBlobReader {
             }
         };
 
+        if header.datasize < 0 {
+            self.last_blob_ok = false;
+            return Some(Err(new_blob_error(BlobError::InvalidDataSize {
+                size: header.datasize,
+            })));
+        }
         let data_size = header.datasize as usize;
         let chunk_size = 4 + header_size + data_size;
 

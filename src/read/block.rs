@@ -318,30 +318,30 @@ impl<'a> BlockElementsIter<'a> {
                 }
             },
             ElementsIterState::Node => {
-                if let Some(data) = self.nodes.next()
-                    && let Ok(wire_node) = WireNode::parse(data)
-                {
-                    return Some(Some(Element::Node(Node::new(self.block, wire_node))));
+                while let Some(data) = self.nodes.next() {
+                    if let Ok(wire_node) = WireNode::parse(data) {
+                        return Some(Some(Element::Node(Node::new(self.block, wire_node))));
+                    }
                 }
                 self.state = ElementsIterState::Way;
                 None
             }
             ElementsIterState::Way => {
-                if let Some(data) = self.ways.next()
-                    && let Ok(wire_way) = WireWay::parse(data)
-                {
-                    return Some(Some(Element::Way(Way::new(self.block, wire_way))));
+                while let Some(data) = self.ways.next() {
+                    if let Ok(wire_way) = WireWay::parse(data) {
+                        return Some(Some(Element::Way(Way::new(self.block, wire_way))));
+                    }
                 }
                 self.state = ElementsIterState::Relation;
                 None
             }
             ElementsIterState::Relation => {
-                if let Some(data) = self.relations.next()
-                    && let Ok(wire_rel) = WireRelation::parse(data)
-                {
-                    return Some(Some(Element::Relation(Relation::new(
-                        self.block, wire_rel,
-                    ))));
+                while let Some(data) = self.relations.next() {
+                    if let Ok(wire_rel) = WireRelation::parse(data) {
+                        return Some(Some(Element::Relation(Relation::new(
+                            self.block, wire_rel,
+                        ))));
+                    }
                 }
                 self.state = ElementsIterState::Group;
                 None

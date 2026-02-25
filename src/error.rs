@@ -80,6 +80,11 @@ pub enum BlobError {
     },
     /// The blob is empty because the `raw` and `zlib-data` fields are missing.
     Empty,
+    /// Blob header declares a negative `datasize`.
+    InvalidDataSize {
+        /// The negative datasize value.
+        size: i32,
+    },
 }
 
 impl From<io::Error> for Error {
@@ -136,6 +141,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::Blob(BlobError::Empty) => {
                 write!(f, "blob is missing fields 'raw' and 'zlib_data'")
+            }
+            ErrorKind::Blob(BlobError::InvalidDataSize { size }) => {
+                write!(f, "blob header has negative datasize: {size}")
             }
             ErrorKind::WireFormat { msg } => {
                 write!(f, "wire format error: {msg}")

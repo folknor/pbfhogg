@@ -206,7 +206,9 @@ impl UringState {
         )
         .offset(self.write_offset)
         .build()
-        .user_data(buf_idx as u64);
+        // Pack buf_idx (low 16 bits) and expected length (upper 48 bits) into user_data
+        // so reap_cqes can detect short writes.
+        .user_data((aligned_len as u64) << 16 | buf_idx as u64);
 
         // Safety: the SQE references a registered buffer (buf_idx) and a
         // registered fd (index 0). The buffer will not be touched until the
@@ -258,11 +260,18 @@ impl UringState {
                 })?;
         }
         for cqe in self.ring.completion() {
-            let buf_idx = cqe.user_data() as u16;
+            let ud = cqe.user_data();
+            let buf_idx = ud as u16;
+            let expected_len = (ud >> 16) as u32;
             let result = cqe.result();
             self.in_flight -= 1;
             if result < 0 {
                 return Err(io::Error::from_raw_os_error(-result));
+            }
+            if (result as u32) != expected_len {
+                return Err(io::Error::other(format!(
+                    "io_uring short write: expected {expected_len} bytes, got {result}"
+                )));
             }
             self.pool.release(buf_idx);
         }

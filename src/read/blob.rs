@@ -345,6 +345,12 @@ impl<R: Read + Send> BlobReader<R> {
             }
         };
 
+        if header.datasize < 0 {
+            return self.handle_error(new_blob_error(BlobError::InvalidDataSize {
+                size: header.datasize,
+            }));
+        }
+
         self.offset = self.offset.map(|x| ByteOffset(x.0 + header_size));
 
         Some(Ok(header))
@@ -692,6 +698,11 @@ pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(String, usize)> {
 pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usize)> {
     let header = proto::BlobHeader::decode(header_bytes.clone())
         .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    if header.datasize < 0 {
+        return Err(new_blob_error(BlobError::InvalidDataSize {
+            size: header.datasize,
+        }));
+    }
     #[allow(clippy::cast_sign_loss)]
     Ok((header.r#type.clone(), header.datasize as usize))
 }
@@ -706,6 +717,11 @@ pub fn parse_blob_header_with_index(
 ) -> Result<(String, usize, Option<Vec<u8>>)> {
     let header = proto::BlobHeader::decode(Bytes::copy_from_slice(header_bytes))
         .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    if header.datasize < 0 {
+        return Err(new_blob_error(BlobError::InvalidDataSize {
+            size: header.datasize,
+        }));
+    }
     let indexdata = header.indexdata.as_ref().map(|b| b.to_vec());
     #[allow(clippy::cast_sign_loss)]
     Ok((header.r#type.clone(), header.datasize as usize, indexdata))

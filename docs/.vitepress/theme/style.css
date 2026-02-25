@@ -104,6 +104,10 @@ body {
   max-width: calc(var(--vp-layout-max-width) - 64px);
 }
 
+.VPHome .vp-doc.container {
+  max-width: calc(var(--vp-layout-max-width) - 64px) !important;
+}
+
 /* ── Rem-ify VitePress px values ───────────────────────────────────────── *
  * VitePress hardcodes px in scoped component styles throughout. We
  * override to rem so everything scales with the fluid root font-size.
@@ -385,10 +389,40 @@ body {
   height: 2.5rem;
 }
 
-.VPSocialLink.VPSocialLink > :deep(svg),
-.VPSocialLink.VPSocialLink > :deep(img) {
-  width: 1.375rem;
+.VPSocialLink svg,
+.VPSocialLink [class^="vpi-social-"] {
+  width: 1.375rem !important;
+  height: 1.375rem !important;
+}
+
+/* ── Light/dark toggle ────────────────────────────────────────────────── */
+
+.VPSwitch.VPSwitch {
+  width: 2.5rem;
   height: 1.375rem;
+  border-radius: 0.6875rem;
+}
+
+.VPSwitch.VPSwitch .check {
+  width: 1.125rem !important;
+  height: 1.125rem !important;
+  top: calc((1.375rem - 1.125rem) / 2 - 1px) !important;
+}
+
+.VPSwitch.VPSwitch .icon {
+  width: 1.125rem !important;
+  height: 1.125rem !important;
+}
+
+.VPSwitch .icon [class^='vpi-'] {
+  width: 0.75rem !important;
+  height: 0.75rem !important;
+  top: 0.1875rem !important;
+  left: 0.1875rem !important;
+}
+
+.dark .VPSwitchAppearance .check {
+  transform: translateX(calc(2.5rem - 1.125rem - 4px)) !important;
 }
 
 /* ── Flyout menus ──────────────────────────────────────────────────────── */

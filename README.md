@@ -64,18 +64,18 @@ All write commands accept `--compression` to control blob compression: `none`, `
 
 ## Performance
 
-Read throughput — count all 59M elements in Denmark extract (483 MB), best of 3 runs, `zlib-ng`:
+Read throughput — count all 59M elements in Denmark extract (461 MB), best of 3 runs, `zlib-ng`, fat LTO:
 
 <!-- BENCH:START -->
 | Tool | Mode | Time | Notes |
 |------|------|------|-------|
-| **pbfhogg** | parallel | **0.30s** | `par_map_reduce` on all cores |
+| **pbfhogg** | parallel | **0.31s** | `par_map_reduce` on all cores |
 | osmpbf 0.3 | parallel | 0.53s | upstream crate, same API |
-| **pbfhogg** | pipelined | **1.6s** | `for_each_pipelined`, preserves file order |
+| **pbfhogg** | pipelined | **1.3s** | `for_each_pipelined`, preserves file order |
 | Planetiler 0.10 | parallel | 2.0s | Java, `OsmInputFile` + thread pool |
-| **pbfhogg** | sequential | 3.1s | `for_each` |
-| **pbfhogg** | blobreader | 3.2s | `BlobReader` sequential decode |
-| **pbfhogg** | mmap | 3.2s | `MmapBlobReader` sequential decode |
+| **pbfhogg** | sequential | 2.8s | `for_each` |
+| **pbfhogg** | mmap | 2.9s | `MmapBlobReader` sequential decode |
+| **pbfhogg** | blobreader | 2.9s | `BlobReader` sequential decode |
 | osmpbf 0.3 | sequential | 5.6s | upstream `for_each` |
 | osmium 1.19 | cat → opl | 5.7s | `osmium cat -f opl -o /dev/null` |
 | Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |

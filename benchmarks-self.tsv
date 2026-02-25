@@ -29,3 +29,8 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	pipelined	1599	52489653	6616526	46103	483
 2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	mmap	3229	52489653	6616526	46103	483
 2026-02-25	588a737*	Pool decompression buffers in decode_blob via Bytes::from_owner	denmark-20260220-seq4704	blobreader	3215	52489653	6616526	46103	483
+2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	sequential	2755	52489653	6616526	46103	483
+2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	parallel	314	52489653	6616526	46103	483
+2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	pipelined	1285	52489653	6616526	46103	483
+2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	mmap	2898	52489653	6616526	46103	483
+2026-02-25	01f36c1	Review batch 3: release profile, extend batch, document wontfix sites	denmark-latest	blobreader	2908	52489653	6616526	46103	483

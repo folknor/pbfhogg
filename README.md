@@ -14,6 +14,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
 - **Configurable compression** — zlib (default), zstd, or none; pure Rust zlib, system zlib, or zlib-ng via feature flags
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
+- **io_uring writes** — optional `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and registered buffers for maximum throughput when I/O-bound
 
 ## Usage
 
@@ -125,6 +126,31 @@ let writer = PbfWriter::to_path_pipelined_direct(path, compression, &header_byte
 ```
 
 O_DIRECT requires a real filesystem (not tmpfs). Wall time is unchanged at country scale (CPU-bound on zlib compression) — the benefit is cache hygiene at planet scale.
+
+## io_uring I/O
+
+With `Compression::None` on fast storage (e.g. erofs), the write pipeline becomes I/O-bound. The `linux-io-uring` feature replaces the synchronous writer thread with an io_uring submission loop using `WriteFixed` and pre-registered page-aligned buffers.
+
+```toml
+[dependencies]
+pbfhogg = { version = "0.1", features = ["linux-io-uring"] }
+```
+
+CLI usage:
+
+```
+pbfhogg merge base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
+```
+
+Library usage:
+
+```rust
+use pbfhogg::writer::{PbfWriter, Compression};
+
+let writer = PbfWriter::to_path_pipelined_uring(path, Compression::None, &header_bytes)?;
+```
+
+Requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK` (16 MB for the default 64-buffer pool). If the limit is too low, the error message will suggest `ulimit -l unlimited`.
 
 ## Compression
 

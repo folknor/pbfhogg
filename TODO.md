@@ -225,33 +225,19 @@ buffers actually matter — the writer thread is the bottleneck, not compression
   but for a local pipeline where you control storage this is the single biggest
   throughput win.
 
-- [ ] **io_uring writer thread.** Replace the synchronous `BufWriter` + `write_all`
-  writer thread with an io_uring submission loop. Register the output fd
-  (`register_files`) + a pool of page-aligned buffers (`register_buffers`) once at
-  startup. Compression/framing threads fill registered buffers, send
-  `(buf_index, len)` to the I/O thread, which pushes `WriteFixed` SQEs and reaps
-  CQEs to recycle buffer indices via a free-list. No async runtime — the `io-uring`
-  crate (v0.7.x, tokio-rs org) works synchronously in a dedicated thread.
+- [x] **io_uring writer thread.** `--io-uring` on merge uses `O_DIRECT` + io_uring
+  `WriteFixed` with 64 pre-registered page-aligned 256KB buffers (16MB total,
+  charged against `RLIMIT_MEMLOCK`). `io-uring` crate v0.7 (tokio-rs, synchronous,
+  no async runtime). Data accumulated into registered buffers (same strategy as
+  `DirectWriter`), submitted as `WriteFixed` SQEs with explicit file offsets, CQEs
+  reaped to recycle buffer indices via free-list. CopyRange passthrough blobs handled
+  via `pread` into the ring write path (no `copy_file_range` — incompatible with
+  io_uring-managed O_DIRECT fd). Feature-gated: `linux-io-uring`.
 
-  Key constraints discovered in research:
-  - `WRITEV` does NOT support registered buffers — each buffer needs its own
-    `WriteFixed` SQE (no scatter-gather with fixed buffers)
-  - Registered buffers are pinned in kernel memory, charged against `RLIMIT_MEMLOCK`
-    — must raise the limit
-  - Buffer ownership: kernel owns the buffer from SQE submission to CQE completion;
-    userspace must not touch it during that window
-  - `tokio-uring` is not production-ready and not needed; `io-uring` 0.7.x is the
-    right crate (synchronous, no async runtime, 1.6K stars, 17K dependents)
-  - SQ polling (`setup_sqpoll`) eliminates `io_uring_enter` syscalls entirely but
-    consumes a CPU core — worth benchmarking for the Compression::None case
-
-  This combines naturally with the O_DIRECT item from Tier 1: open the output fd
-  with `O_DIRECT` and all writes through registered (page-aligned) buffers bypass
-  the page cache automatically.
-
-  For blob passthrough: `copy_file_range(2)` called synchronously between SQE
-  batches (no io_uring opcode exists), or read into a registered buffer then
-  `WriteFixed` — the latter integrates more cleanly with the ring loop.
+  **Future optimizations:**
+  - SQ polling (`setup_sqpoll`) — eliminates `io_uring_enter` syscalls, consumes a CPU core
+  - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
+  - `pread` directly into registered buffer instead of heap allocation
 
 ### Implementation order
 
@@ -260,8 +246,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 3. ~~**`Compression::None` (Tier 2 prereq)** — `--compression` flag added to all 8
    PBF-writing commands (none/zlib/zlib:LEVEL/zstd/zstd:LEVEL). Pipeline is now
    I/O-bound with `--compression none`.~~
-4. **io_uring writer thread (Tier 2)** — only after Compression::None makes writes the
-   bottleneck. Registered buffers + WriteFixed + free-list pattern.
+4. ~~**io_uring writer thread (Tier 2)** — registered buffers + WriteFixed + free-list.~~
 
 ## Dependencies
 

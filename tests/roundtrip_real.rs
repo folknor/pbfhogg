@@ -43,6 +43,7 @@ fn count_elements(path: &Path) -> Counts {
                     Element::DenseNode(_) | Element::Node(_) => counts.nodes += 1,
                     Element::Way(_) => counts.ways += 1,
                     Element::Relation(_) => counts.relations += 1,
+                    _ => {}
                 }
             }
         }
@@ -168,6 +169,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                     });
                     bb.add_relation(r.id(), &tags, &members, meta.as_ref());
                 }
+                _ => {}
             }
         }
     }

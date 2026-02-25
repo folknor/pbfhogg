@@ -28,7 +28,8 @@ use std::thread::JoinHandle;
 pub(crate) const WRITE_AHEAD: usize = 32;
 
 /// Compression algorithm for PBF output blobs.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Compression {
     /// No compression (raw bytes).
     None,

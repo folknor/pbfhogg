@@ -7,7 +7,8 @@ use crate::{BlobDecode, BlobReader, Element, MemberId};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // ---------------------------------------------------------------------------
-// Owned element types
+// Owned element types — Vec fields are not converted to Box<[T]> because these
+// are low-volume types (derive_changes/diff output), not hot-path allocations.
 // ---------------------------------------------------------------------------
 
 pub(crate) struct OwnedNode {
@@ -164,13 +165,15 @@ pub(crate) fn from_decimicro(d: i32) -> f64 {
 // ---------------------------------------------------------------------------
 
 /// Format a coordinate, stripping unnecessary trailing zeros.
-pub(crate) fn format_coord(deg: f64) -> String {
+/// Writes directly into a provided buffer to avoid intermediate allocations.
+pub(crate) fn format_coord(buf: &mut String, deg: f64) {
+    use std::fmt::Write;
+    buf.clear();
     // Use 7 decimal places (matches decimicrodegree precision)
-    let s = format!("{deg:.7}");
-    // Strip trailing zeros after decimal point, but keep at least one decimal
-    let s = s.trim_end_matches('0');
-    let s = s.trim_end_matches('.');
-    s.to_string()
+    // write! to String is infallible (String::write_str never fails)
+    write!(buf, "{deg:.7}").ok();
+    let trimmed = buf.trim_end_matches('0').trim_end_matches('.');
+    buf.truncate(trimmed.len());
 }
 
 // ---------------------------------------------------------------------------

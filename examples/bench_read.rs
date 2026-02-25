@@ -31,6 +31,7 @@ fn bench_sequential(path: &Path) -> (u64, Counts) {
             Element::Node(_) | Element::DenseNode(_) => counts.nodes += 1,
             Element::Way(_) => counts.ways += 1,
             Element::Relation(_) => counts.relations += 1,
+            _ => {}
         })
         .expect("read pbf");
 
@@ -48,6 +49,7 @@ fn bench_parallel(path: &Path) -> (u64, Counts) {
                 Element::Node(_) | Element::DenseNode(_) => (1u64, 0u64, 0u64),
                 Element::Way(_) => (0, 1, 0),
                 Element::Relation(_) => (0, 0, 1),
+                _ => (0, 0, 0),
             },
             || (0, 0, 0),
             |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
@@ -75,6 +77,7 @@ fn bench_pipelined(path: &Path) -> (u64, Counts) {
             Element::Node(_) | Element::DenseNode(_) => counts.nodes += 1,
             Element::Way(_) => counts.ways += 1,
             Element::Relation(_) => counts.relations += 1,
+            _ => {}
         })
         .expect("read pbf");
 
@@ -96,6 +99,7 @@ fn bench_mmap(path: &Path) -> (u64, Counts) {
                     Element::Node(_) | Element::DenseNode(_) => counts.nodes += 1,
                     Element::Way(_) => counts.ways += 1,
                     Element::Relation(_) => counts.relations += 1,
+                    _ => {}
                 }
             }
         }
@@ -119,6 +123,7 @@ fn bench_mmap_blobread(path: &Path) -> (u64, Counts) {
                     Element::Node(_) | Element::DenseNode(_) => counts.nodes += 1,
                     Element::Way(_) => counts.ways += 1,
                     Element::Relation(_) => counts.relations += 1,
+                    _ => {}
                 }
             }
         }

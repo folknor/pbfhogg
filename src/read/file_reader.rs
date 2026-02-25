@@ -14,6 +14,7 @@ use std::path::Path;
 use super::direct_reader::DirectReader;
 
 /// A file reader that selects between buffered and O_DIRECT I/O at runtime.
+// Not #[non_exhaustive] — variants are construction-controlled (users don't match on this).
 pub enum FileReader {
     /// Standard buffered reader (256 KB buffer).
     Buffered(BufReader<File>),

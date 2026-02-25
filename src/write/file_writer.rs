@@ -14,6 +14,7 @@ use super::direct_writer::DirectWriter;
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
 /// Implements [`Write`] by delegating to the active variant.
+// Not #[non_exhaustive] — variants are construction-controlled (users don't match on this).
 pub enum FileWriter {
     /// Standard 256 KB `BufWriter<File>`.
     Buffered(BufWriter<File>),

@@ -109,6 +109,7 @@ pub const MAX_BLOB_MESSAGE_SIZE: u64 = 32 * 1024 * 1024;
 
 /// The content type of a blob.
 #[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum BlobType<'a> {
     /// Blob contains a [`HeaderBlock`].
     OsmHeader,
@@ -120,6 +121,7 @@ pub enum BlobType<'a> {
 }
 
 impl<'a> BlobType<'a> {
+    #[inline]
     pub const fn as_str(&self) -> &'a str {
         match self {
             Self::OsmHeader => "OSMHeader",
@@ -134,6 +136,7 @@ impl<'a> BlobType<'a> {
 /// Does not implement `Clone` because `OsmData` contains a `PrimitiveBlock`, which is
 /// intentionally not `Clone` (see `PrimitiveBlock` docs for rationale).
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum BlobDecode<'a> {
     /// Blob contains a [`HeaderBlock`].
     OsmHeader(Box<HeaderBlock>),
@@ -189,6 +192,7 @@ impl Blob {
     }
 
     /// Returns the type of a blob without decoding its content.
+    #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
         match self.header.r#type.as_str() {
             x if x == BlobType::OsmHeader.as_str() => BlobType::OsmHeader,
@@ -199,6 +203,7 @@ impl Blob {
 
     /// Returns the byte offset of the blob from the start of its source stream.
     /// This might be [`None`] if the source stream does not implement [`Seek`].
+    #[inline]
     pub fn offset(&self) -> Option<ByteOffset> {
         self.offset
     }
@@ -239,6 +244,7 @@ impl BlobHeader {
     }
 
     /// Returns the type of the following blob.
+    #[inline]
     pub fn blob_type(&self) -> BlobType<'_> {
         match self.header.r#type.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
@@ -248,6 +254,7 @@ impl BlobHeader {
     }
 
     /// Returns the size of the following blob in bytes.
+    #[inline]
     pub fn get_blob_size(&self) -> i32 {
         self.header.datasize
     }

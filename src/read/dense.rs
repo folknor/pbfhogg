@@ -26,21 +26,25 @@ pub struct DenseNode<'a> {
 
 impl<'a> DenseNode<'a> {
     /// Returns the node id.
+    #[inline]
     pub fn id(&self) -> i64 {
         self.id
     }
 
     /// return optional metadata about the node
+    #[inline]
     pub fn info(&'a self) -> Option<&'a DenseNodeInfo<'a>> {
         self.info.as_ref()
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
+    #[inline]
     pub fn nano_lat(&self) -> i64 {
         self.lat_offset + self.granularity * self.lat
     }
 
     /// Returns the longitude in nanodegrees (10^-9).
+    #[inline]
     pub fn nano_lon(&self) -> i64 {
         self.lon_offset + self.granularity * self.lon
     }
@@ -222,16 +226,19 @@ pub struct DenseNodeInfo<'a> {
 
 impl<'a> DenseNodeInfo<'a> {
     /// Returns the version of this element.
+    #[inline]
     pub fn version(&self) -> i32 {
         self.version
     }
 
     /// Returns the changeset id.
+    #[inline]
     pub fn changeset(&self) -> i64 {
         self.changeset
     }
 
     /// Returns the user id.
+    #[inline]
     pub fn uid(&self) -> i32 {
         self.uid
     }
@@ -248,16 +255,19 @@ impl<'a> DenseNodeInfo<'a> {
     }
 
     /// Returns the time stamp in milliseconds since the epoch.
+    #[inline]
     pub fn milli_timestamp(&self) -> i64 {
         self.timestamp * self.date_granularity
     }
 
     /// Returns the visibility status of an element.
+    #[inline]
     pub fn visible(&self) -> bool {
         self.visible
     }
 
     /// Returns true if the element was deleted.
+    #[inline]
     pub fn deleted(&self) -> bool {
         !self.visible
     }
@@ -341,6 +351,7 @@ pub struct DenseTagIter<'a> {
 impl<'a> Iterator for DenseTagIter<'a> {
     type Item = (&'a str, &'a str);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor.is_empty() {
             return None;
@@ -360,6 +371,7 @@ pub struct DenseRawTagIter<'a> {
 impl Iterator for DenseRawTagIter<'_> {
     type Item = (i32, i32);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.cursor.is_empty() {
             return None;

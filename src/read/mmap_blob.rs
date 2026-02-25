@@ -100,6 +100,7 @@ impl MmapBlob {
     }
 
     /// Returns the type of a blob without decoding its content.
+    #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
         match self.header.r#type.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
@@ -109,6 +110,7 @@ impl MmapBlob {
     }
 
     /// Returns the byte offset of the blob from the start of its memory map.
+    #[inline]
     pub fn offset(&self) -> ByteOffset {
         self.offset
     }

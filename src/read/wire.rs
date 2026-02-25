@@ -424,12 +424,13 @@ impl Iterator for PackedBoolIter<'_> {
 #[derive(Clone, Debug)]
 pub(crate) struct WireStringTable<'a> {
     buffer: &'a [u8],
-    entries: Vec<(u32, u32)>, // (offset, length) relative to buffer start
+    entries: Box<[(u32, u32)]>, // (offset, length) relative to buffer start
 }
 
 impl<'a> WireStringTable<'a> {
     fn parse(data: &'a [u8], buffer: &'a [u8]) -> Result<Self> {
         let mut cursor = Cursor::new(data);
+        // Count not available before scanning — Vec::new() with amortized push is fine.
         let mut entries = Vec::new();
         while let Some((field, wire_type)) = cursor.read_tag()? {
             if field == 1 && wire_type == WIRE_LEN {
@@ -442,7 +443,10 @@ impl<'a> WireStringTable<'a> {
                 cursor.skip_field(wire_type)?;
             }
         }
-        Ok(Self { buffer, entries })
+        Ok(Self {
+            buffer,
+            entries: entries.into_boxed_slice(),
+        })
     }
 
     #[inline]
@@ -474,7 +478,7 @@ impl<'a> WireStringTable<'a> {
 pub(crate) struct WireBlock<'a> {
     buffer: &'a [u8],
     pub stringtable: WireStringTable<'a>,
-    pub group_ranges: Vec<(u32, u32)>, // (offset, length) relative to buffer start
+    pub group_ranges: Box<[(u32, u32)]>, // (offset, length) relative to buffer start
     pub granularity: i32,
     pub lat_offset: i64,
     pub lon_offset: i64,
@@ -485,6 +489,7 @@ impl<'a> WireBlock<'a> {
     pub fn parse(buffer: &'a [u8]) -> Result<Self> {
         let mut cursor = Cursor::new(buffer);
         let mut stringtable_data: Option<&'a [u8]> = None;
+        // Count not available before scanning — Vec::new() with amortized push is fine.
         let mut group_ranges = Vec::new();
         let mut granularity: i32 = 100;
         let mut lat_offset: i64 = 0;
@@ -537,7 +542,7 @@ impl<'a> WireBlock<'a> {
         Ok(Self {
             buffer,
             stringtable,
-            group_ranges,
+            group_ranges: group_ranges.into_boxed_slice(),
             granularity,
             lat_offset,
             lon_offset,

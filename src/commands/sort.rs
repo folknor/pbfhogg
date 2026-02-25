@@ -59,7 +59,9 @@ struct BlobEntry {
 }
 
 // ---------------------------------------------------------------------------
-// Owned element types (needed for overlap-run decode + re-encode)
+// Owned element types (needed for overlap-run decode + re-encode).
+// Vec fields are not converted to Box<[T]> — these are transient (decoded,
+// sorted, re-encoded per overlap run), not long-lived allocations.
 // ---------------------------------------------------------------------------
 
 struct OwnedMetadata {

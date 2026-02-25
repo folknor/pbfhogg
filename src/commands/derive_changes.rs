@@ -322,11 +322,13 @@ fn write_osc(
 fn write_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode) -> Result<()> {
     let mut elem = BytesStart::new("node");
     let id_str = node.id.to_string();
-    let lat_str = format_coord(from_decimicro(node.decimicro_lat));
-    let lon_str = format_coord(from_decimicro(node.decimicro_lon));
+    let mut coord_buf = String::new();
+    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
+    let lat_str = coord_buf.clone();
+    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", lon_str.as_str()));
+    elem.push_attribute(("lon", coord_buf.as_str()));
     if let Some(v) = node.version {
         let v_str = v.to_string();
         elem.push_attribute(("version", v_str.as_str()));

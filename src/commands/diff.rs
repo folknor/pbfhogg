@@ -372,13 +372,17 @@ fn write_node_details(
     new: &OwnedNode,
 ) -> Result<()> {
     if old.decimicro_lat != new.decimicro_lat || old.decimicro_lon != new.decimicro_lon {
+        let mut buf = String::new();
+        format_coord(&mut buf, from_decimicro(old.decimicro_lat));
+        let old_lat = buf.clone();
+        format_coord(&mut buf, from_decimicro(old.decimicro_lon));
+        let old_lon = buf.clone();
+        format_coord(&mut buf, from_decimicro(new.decimicro_lat));
+        let new_lat = buf.clone();
+        format_coord(&mut buf, from_decimicro(new.decimicro_lon));
         writeln!(
             output,
-            "  coordinates: ({}, {}) -> ({}, {})",
-            format_coord(from_decimicro(old.decimicro_lat)),
-            format_coord(from_decimicro(old.decimicro_lon)),
-            format_coord(from_decimicro(new.decimicro_lat)),
-            format_coord(from_decimicro(new.decimicro_lon)),
+            "  coordinates: ({old_lat}, {old_lon}) -> ({new_lat}, {buf})",
         )?;
     }
     write_tag_diff(output, &old.tags, &new.tags)?;
@@ -490,15 +494,6 @@ fn member_type_str(mt: MemberType) -> &'static str {
     }
 }
 
-fn format_member(m: &OwnedMember) -> String {
-    format!(
-        "{}/{} \"{}\"",
-        member_type_str(m.id.member_type()),
-        m.id.id(),
-        m.role,
-    )
-}
-
 fn member_matches(a: &OwnedMember, b: &OwnedMember) -> bool {
     a.id == b.id && a.role == b.role
 }
@@ -511,13 +506,25 @@ fn write_member_diff(
     // Removed members (in old but not in new)
     for old_m in old_members {
         if !new_members.iter().any(|nm| member_matches(old_m, nm)) {
-            writeln!(output, "  -member {}", format_member(old_m))?;
+            writeln!(
+                output,
+                "  -member {}/{} \"{}\"",
+                member_type_str(old_m.id.member_type()),
+                old_m.id.id(),
+                old_m.role,
+            )?;
         }
     }
     // Added members (in new but not in old)
     for new_m in new_members {
         if !old_members.iter().any(|om| member_matches(om, new_m)) {
-            writeln!(output, "  +member {}", format_member(new_m))?;
+            writeln!(
+                output,
+                "  +member {}/{} \"{}\"",
+                member_type_str(new_m.id.member_type()),
+                new_m.id.id(),
+                new_m.role,
+            )?;
         }
     }
     Ok(())

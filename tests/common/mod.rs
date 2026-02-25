@@ -213,6 +213,7 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
                                     pbfhogg::MemberType::Way => "way",
                                     pbfhogg::MemberType::Relation => "relation",
                                     pbfhogg::MemberType::Unknown(_) => "unknown",
+                                    _ => "unknown",
                                 };
                                 (
                                     m.id.id(),
@@ -223,6 +224,7 @@ pub fn read_all_elements_with_coords(path: &Path) -> PbfContentsWithCoords {
                             .collect();
                         contents.relations.push((r.id(), members, tags));
                     }
+                    _ => {}
                 }
             }
         }
@@ -307,6 +309,7 @@ pub fn read_all_elements_id_only(path: &Path) -> PbfContentsIdOnly {
                             r.tags().map(|(k, v)| (k.to_string(), v.to_string())).collect();
                         contents.relations.push((r.id(), tags));
                     }
+                    _ => {}
                 }
             }
         }

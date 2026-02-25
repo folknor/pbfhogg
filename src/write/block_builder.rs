@@ -136,6 +136,7 @@ enum BlockType {
 }
 
 /// Optional metadata for an element.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Metadata<'a> {
     /// Element version (starts at 1, incremented on each edit).
     pub version: i32,
@@ -154,6 +155,7 @@ pub struct Metadata<'a> {
 use crate::elements::{MemberId, MemberType};
 
 /// A relation member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MemberData<'a> {
     /// The typed member reference (element type + ID).
     pub id: MemberId,
@@ -290,11 +292,13 @@ impl BlockBuilder {
     }
 
     /// Returns `true` if the block contains no elements.
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
 
     /// Returns `true` if the block has reached the entity limit (8000).
+    #[inline]
     pub fn should_flush(&self) -> bool {
         self.count >= MAX_ENTITIES_PER_BLOCK
     }
@@ -530,12 +534,12 @@ impl BlockBuilder {
         let mut last_ref: i64 = 0;
         let mut last_lat: i64 = 0;
         let mut last_lon: i64 = 0;
-        for (i, &r) in refs.iter().enumerate() {
+        for (&r, &(loc_lat, loc_lon)) in refs.iter().zip(locations.iter()) {
             way.refs.push(r - last_ref);
             last_ref = r;
 
-            let lat = i64::from(locations[i].0);
-            let lon = i64::from(locations[i].1);
+            let lat = i64::from(loc_lat);
+            let lon = i64::from(loc_lon);
             way.lat.push(lat - last_lat);
             way.lon.push(lon - last_lon);
             last_lat = lat;
@@ -728,6 +732,8 @@ impl BlockBuilder {
 ///
 /// This is the first block in every PBF file. It declares required features,
 /// optionally includes a bounding box, and carries replication metadata.
+// Takes 5 params — a HeaderBuilder pattern was considered but this function has
+// only 4 internal call sites, so a builder would add complexity for no benefit.
 #[allow(clippy::cast_possible_truncation)]
 pub fn build_header(
     bbox: Option<(f64, f64, f64, f64)>,

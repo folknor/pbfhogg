@@ -67,6 +67,7 @@ fn element_id(element: &Element<'_>) -> (char, i64) {
         Element::DenseNode(dn) => ('n', dn.id()),
         Element::Way(w) => ('w', w.id()),
         Element::Relation(r) => ('r', r.id()),
+        _ => ('?', 0),
     }
 }
 
@@ -237,6 +238,7 @@ fn par_map_reduce_count() {
                 Element::Node(_) | Element::DenseNode(_) => (1u64, 0u64, 0u64),
                 Element::Way(_) => (0, 1, 0),
                 Element::Relation(_) => (0, 0, 1),
+                _ => (0, 0, 0),
             },
             || (0, 0, 0),
             |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),

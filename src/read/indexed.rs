@@ -271,7 +271,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
     ///             Element::Way(way) => ways += 1,
     ///             Element::Node(node) => nodes += 1,
     ///             Element::DenseNode(dense_node) => nodes += 1,
-    ///             Element::Relation(_) => (), // should not occur
+    ///             Element::Relation(_) | _ => (), // should not occur
     ///         }
     ///     },
     /// )?;

@@ -834,6 +834,7 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                                     MemberType::Way => "way",
                                     MemberType::Relation => "relation",
                                     MemberType::Unknown(_) => "unknown",
+                                    _ => "unknown",
                                 };
                                 (
                                     m.id.id(),
@@ -849,6 +850,7 @@ fn read_all_for_comparison(path: &Path) -> CmpContents {
                             .relations
                             .insert(r.id(), CmpRelation { members, tags });
                     }
+                    _ => {}
                 }
             }
         }

@@ -34,24 +34,28 @@ use crate::error::Result;
 macro_rules! impl_coordinate_conversions {
     () => {
         /// Returns the latitude coordinate in degrees.
+        #[inline]
         #[allow(clippy::cast_precision_loss)]
         pub fn lat(&self) -> f64 {
             1e-9 * self.nano_lat() as f64
         }
 
         /// Returns the longitude coordinate in degrees.
+        #[inline]
         #[allow(clippy::cast_precision_loss)]
         pub fn lon(&self) -> f64 {
             1e-9 * self.nano_lon() as f64
         }
 
         /// Returns the latitude coordinate in decimicrodegrees (10^-7).
+        #[inline]
         #[allow(clippy::cast_possible_truncation)]
         pub fn decimicro_lat(&self) -> i32 {
             (self.nano_lat() / 100) as i32
         }
 
         /// Returns the longitude coordinate in decimicrodegrees (10^-7).
+        #[inline]
         #[allow(clippy::cast_possible_truncation)]
         pub fn decimicro_lon(&self) -> i32 {
             (self.nano_lon() / 100) as i32
@@ -61,6 +65,7 @@ macro_rules! impl_coordinate_conversions {
 
 /// An enum with the OSM core elements: nodes, ways and relations.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum Element<'a> {
     /// A node. Also, see [`DenseNode`](Self::DenseNode).
     Node(Node<'a>),
@@ -99,6 +104,7 @@ impl<'a> Node<'a> {
     }
 
     /// Returns the node id.
+    #[inline]
     pub fn id(&self) -> i64 {
         self.node.id
     }
@@ -123,11 +129,13 @@ impl<'a> Node<'a> {
     }
 
     /// Returns the latitude coordinate in nanodegrees (10^-9).
+    #[inline]
     pub fn nano_lat(&self) -> i64 {
         self.lat_offset + self.granularity * self.node.lat
     }
 
     /// Returns the longitude in nanodegrees (10^-9).
+    #[inline]
     pub fn nano_lon(&self) -> i64 {
         self.lon_offset + self.granularity * self.node.lon
     }
@@ -168,6 +176,7 @@ impl<'a> Way<'a> {
     }
 
     /// Returns the way id.
+    #[inline]
     pub fn id(&self) -> i64 {
         self.way.id
     }
@@ -242,6 +251,7 @@ impl<'a> Relation<'a> {
     }
 
     /// Returns the relation id.
+    #[inline]
     pub fn id(&self) -> i64 {
         self.rel.id
     }
@@ -291,6 +301,7 @@ pub struct WayRefIter<'a> {
 impl Iterator for WayRefIter<'_> {
     type Item = i64;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.deltas.next().map(|d| {
             self.current += d;
@@ -303,6 +314,7 @@ impl Iterator for WayRefIter<'_> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WayNodeLocation {
     lat: i64,
     lon: i64,
@@ -310,10 +322,12 @@ pub struct WayNodeLocation {
 
 /// A node location that contains latitude and longitude coordinates.
 impl WayNodeLocation {
+    #[inline]
     pub fn nano_lat(&self) -> i64 {
         self.lat
     }
 
+    #[inline]
     pub fn nano_lon(&self) -> i64 {
         self.lon
     }
@@ -336,6 +350,7 @@ pub struct WayNodeLocationsIter<'a> {
 impl Iterator for WayNodeLocationsIter<'_> {
     type Item = WayNodeLocation;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match (self.dlats.next(), self.dlons.next()) {
             (Some(dlat), Some(dlon)) => {
@@ -357,6 +372,7 @@ impl Iterator for WayNodeLocationsIter<'_> {
 
 /// The element type of a relation member.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MemberType {
     Node,
     Way,
@@ -366,6 +382,7 @@ pub enum MemberType {
 }
 
 impl From<i32> for MemberType {
+    #[inline]
     fn from(v: i32) -> MemberType {
         match v {
             0 => MemberType::Node,
@@ -378,6 +395,7 @@ impl From<i32> for MemberType {
 
 /// A typed relation member reference combining element type and ID.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum MemberId {
     Node(i64),
     Way(i64),
@@ -387,6 +405,7 @@ pub enum MemberId {
 
 impl MemberId {
     /// Returns the raw element ID regardless of type.
+    #[inline]
     pub fn id(self) -> i64 {
         match self {
             MemberId::Node(id)
@@ -397,6 +416,7 @@ impl MemberId {
     }
 
     /// Returns the element type of this member reference.
+    #[inline]
     pub fn member_type(self) -> MemberType {
         match self {
             MemberId::Node(_) => MemberType::Node,
@@ -407,6 +427,7 @@ impl MemberId {
     }
 
     /// Construct a MemberId from a raw id and type.
+    #[inline]
     pub fn from_id_and_type(id: i64, member_type: MemberType) -> Self {
         match member_type {
             MemberType::Node => MemberId::Node(id),
@@ -463,6 +484,7 @@ impl<'a> RelMemberIter<'a> {
 impl<'a> Iterator for RelMemberIter<'a> {
     type Item = RelMember<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match (
             self.role_sids.next(),
@@ -499,6 +521,7 @@ pub struct TagIter<'a> {
 impl<'a> Iterator for TagIter<'a> {
     type Item = (&'a str, &'a str);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         get_stringtable_key_value(
             self.block,
@@ -522,6 +545,7 @@ pub struct RawTagIter<'a> {
 impl Iterator for RawTagIter<'_> {
     type Item = (u32, u32);
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match (self.key_indices.next(), self.val_indices.next()) {
             (Some(key_index), Some(val_index)) => Some((key_index, val_index)),
@@ -547,11 +571,13 @@ impl<'a> Info<'a> {
     }
 
     /// Returns the version of this element.
+    #[inline]
     pub fn version(&self) -> Option<i32> {
         self.info.version
     }
 
     /// Returns the time stamp in milliseconds since the epoch.
+    #[inline]
     pub fn milli_timestamp(&self) -> Option<i64> {
         self.info
             .timestamp
@@ -559,11 +585,13 @@ impl<'a> Info<'a> {
     }
 
     /// Returns the changeset id.
+    #[inline]
     pub fn changeset(&self) -> Option<i64> {
         self.info.changeset
     }
 
     /// Returns the user id.
+    #[inline]
     pub fn uid(&self) -> Option<i32> {
         self.info.uid
     }
@@ -582,11 +610,13 @@ impl<'a> Info<'a> {
     }
 
     /// Returns the visibility status of an element.
+    #[inline]
     pub fn visible(&self) -> bool {
         self.info.visible.unwrap_or(true)
     }
 
     /// Returns true if the element was deleted.
+    #[inline]
     pub fn deleted(&self) -> bool {
         !self.visible()
     }

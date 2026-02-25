@@ -78,7 +78,8 @@ pub fn tags_count(
         }
     })?;
 
-    let mut results: Vec<TagCount> = Vec::new();
+    let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
+    let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
     for (key, inner) in counts {
         for (value, count) in inner {
             if count >= min_count {

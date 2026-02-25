@@ -11,14 +11,17 @@ use prost::DecodeError;
 // Manual Display/StdError impls are intentional — avoids a thiserror dependency
 // for a small, stable enum that rarely changes.
 
+#[cold]
 pub(crate) fn new_error(kind: ErrorKind) -> Error {
     Error(Box::new(kind))
 }
 
+#[cold]
 pub(crate) fn new_blob_error(kind: BlobError) -> Error {
     Error(Box::new(ErrorKind::Blob(kind)))
 }
 
+#[cold]
 pub(crate) fn new_protobuf_error(err: DecodeError, location: &'static str) -> Error {
     Error(Box::new(ErrorKind::Protobuf { err, location }))
 }
@@ -32,11 +35,13 @@ pub struct Error(Box<ErrorKind>);
 
 impl Error {
     /// Return the specific type of this error.
+    #[inline]
     pub fn kind(&self) -> &ErrorKind {
         &self.0
     }
 
     /// Unwrap this error into its underlying type.
+    #[inline]
     pub fn into_kind(self) -> ErrorKind {
         *self.0
     }
@@ -154,6 +159,7 @@ impl fmt::Display for Error {
     }
 }
 
+#[cold]
 pub(crate) fn new_wire_error(msg: &'static str) -> Error {
     new_error(ErrorKind::WireFormat { msg })
 }

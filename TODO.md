@@ -257,71 +257,28 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
 
-## Bugs (from code quality review, Feb 2026)
+## Refactoring: duplicated code across commands
 
-- [x] `block_builder.rs` — mixed metadata in dense node block: fixed. Push default metadata when `None` + `has_dense_metadata`, backfill when first `Some` arrives after `None` nodes. Tests: `roundtrip_mixed_metadata`, `roundtrip_backfill_metadata`.
+Three patterns are copy-pasted across commands:
 
-- [x] `cat.rs`, `diff.rs` — type filter substring matching: fixed. Split on comma, match exact tokens.
-- [x] `block.rs` — `BlockElementsIter` skip-all on parse error: fixed. Use `while let` loop to skip individual parse errors, matching `GroupNodeIter`/`GroupWayIter`/`GroupRelationIter` pattern.
-- [x] `blob.rs`, `mmap_blob.rs` — negative `datasize` OOM: fixed. Added `BlobError::InvalidDataSize` check after every `BlobHeader::decode` (BlobReader, MmapBlobReader, and both standalone parse functions).
-- [x] `uring_writer.rs` — io_uring short write not detected: fixed. Pack expected length into CQE user_data, verify `result == expected_len` in `reap_cqes`.
-- [x] `blob_index.rs` — `scan_dense_node_ids` min_id: fixed. Use `min_id.min(current_id)` on every iteration, matching `scan_repeated_element_ids`.
+**`flush_block`** (7 copies): merge.rs:359, cat.rs:330, sort.rs:646,
+extract.rs:882, getid.rs:372, add_locations_to_ways.rs:328,
+tags_filter.rs:654. All identical: `bb.take()? → writer.write_primitive_block`.
+Extract to a shared helper in `write/` or a `commands/common.rs`.
 
-## Warnings (from code quality review, Feb 2026)
+**`rebuild_header`** (3 copies): cat.rs:340, tags_filter.rs:664,
+getid.rs:382. All identical: read HeaderBlock → `build_header` → write.
+merge.rs has its own `build_header_bytes` variant. Extract to shared helper.
 
-- [ ] **`block_builder.rs:169` — `MemberType::Unknown` silently mapped to
-  `Node`.** Same in `derive_changes.rs:383` (Unknown → `"node"` in OSC XML).
-  Known accepted limitation: the PBF protobuf enum only defines NODE/WAY/RELATION
-  and has never been extended. Fixing would require `add_relation` to return
-  `Result`, changing 15+ call sites. The existing comment documents the behavior.
-
-- [x] `writer.rs` — `len() as i32` overflow: fixed. Use `i32::try_from()` with clear error for `raw_size` and `datasize` in both `frame_blob` and `reframe_raw_with_index`.
-- [x] `dense.rs`, `elements.rs` — `user_sid`/`role_sid` sign loss: fixed. Guard negative values before `as usize` cast, return `StringtableIndexOutOfBounds` early.
-- [x] `pipeline.rs` — `expect()` panic: fixed. Send error through decode channel and return, instead of panicking.
-- [x] `wire.rs` — `Cursor::remaining()` underflow: fixed. Use `saturating_sub`.
-
-- [ ] **`derive_changes.rs`, `diff.rs` — loads entire PBF into owned Vecs.**
-  Planet-scale (~80GB) would OOM. Known limitation, not on the critical path
-  for nidhogg (which uses merge, not diff/derive-changes).
-
-- [ ] **Duplicated code across commands.** Three patterns are copy-pasted:
-
-  **`flush_block`** (7 copies): merge.rs:359, cat.rs:330, sort.rs:646,
-  extract.rs:882, getid.rs:372, add_locations_to_ways.rs:328,
-  tags_filter.rs:654. All identical: `bb.take()? → writer.write_primitive_block`.
-  Extract to a shared helper in `write/` or a `commands/common.rs`.
-
-  **`rebuild_header`** (3 copies): cat.rs:340, tags_filter.rs:664,
-  getid.rs:382. All identical: read HeaderBlock → `build_header` → write.
-  merge.rs has its own `build_header_bytes` variant. Extract to shared helper.
-
-  **DenseNode metadata extraction** (8 copies): merge.rs:446, cat.rs:211,
-  extract.rs:780, sort.rs:539, getid.rs:274, add_locations_to_ways.rs:166,
-  tags_filter.rs:272,527. All use `dn.info().and_then(|info| { info.user()
-  .ok()?; Some(Metadata{...}) })`. **Inconsistency:** if `user()` fails
-  (string table error), DenseNode path drops ALL metadata (`and_then` returns
-  None), while Node/Way/Relation path keeps metadata with empty user
-  (`info.user().and_then(Result::ok).unwrap_or("")`). Should pick one
-  strategy and share a single `dense_node_metadata()` /
-  `element_metadata()` helper.
-
-## Test coverage gaps (from code quality review, Feb 2026)
-
-- [x] No merge tests with metadata — added `merge_metadata_preservation` test
-  that builds a base PBF with version/timestamp/changeset/uid/user, applies an
-  OSC diff, and verifies unchanged nodes keep their metadata while OSC
-  replacements get default metadata (version 0, uid 0).
-
-- [x] `roundtrip_real.rs` skips non-dense nodes — this is by design.
-  `BlockBuilder` only produces dense nodes (there is no `add_node_non_dense()`).
-  Non-dense `Element::Node` from other PBF producers is read correctly but
-  converted to dense on write. The roundtrip_real test comment already documents
-  this. Not a test gap.
-
-- [x] No test for `BlockBuilder` mixed-type assertion — added
-  `block_builder_mixed_type_panics` test with `#[should_panic]` that verifies
-  `add_way()` after `add_node()` without `take()` panics with the expected
-  message.
+**DenseNode metadata extraction** (8 copies): merge.rs:446, cat.rs:211,
+extract.rs:780, sort.rs:539, getid.rs:274, add_locations_to_ways.rs:166,
+tags_filter.rs:272,527. All use `dn.info().and_then(|info| { info.user()
+.ok()?; Some(Metadata{...}) })`. **Inconsistency:** if `user()` fails
+(string table error), DenseNode path drops ALL metadata (`and_then` returns
+None), while Node/Way/Relation path keeps metadata with empty user
+(`info.user().and_then(Result::ok).unwrap_or("")`). Should pick one
+strategy and share a single `dense_node_metadata()` /
+`element_metadata()` helper.
 
 ## Code TODOs
 

@@ -26,6 +26,10 @@ export default defineConfig({
       { text: 'API Docs', link: '/api/' },
     ],
 
+    search: {
+      provider: 'local',
+    },
+
     socialLinks: [
       { icon: 'github', link: githubUrl },
     ],

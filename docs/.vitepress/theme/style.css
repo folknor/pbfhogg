@@ -55,7 +55,7 @@
   --vp-c-bg: #0e1210;
   --vp-c-bg-alt: #0b0e0c;
   --vp-c-bg-elv: #151a17;
-  --vp-c-bg-soft: #151a17;
+  --vp-c-bg-soft: #1e2a22;
 
   /* pale text */
   --vp-c-text-1: rgba(230, 240, 234, 0.92);
@@ -549,6 +549,19 @@ body {
     background-color: var(--vp-sidebar-bg-color) !important;
   }
 
+  .VPNavBar .content-body {
+    flex-direction: row !important;
+  }
+
+  .VPNavBar .content-body .menu { order: 1; }
+  .VPNavBar .content-body .search { order: 2; }
+  .VPNavBar .content-body .appearance { order: 3; }
+  .VPNavBar .content-body .social-links { order: 4; }
+
+  .VPNavBar.has-sidebar .content {
+    padding-left: 0 !important;
+  }
+
   /* No padding-top needed — the sticky nav is in the document flow now */
   .VPContent.has-sidebar {
     padding-top: 0 !important;
@@ -815,17 +828,10 @@ body {
 
 /* ── Nav search ────────────────────────────────────────────────────────── */
 
-@media (min-width: 768px) {
-  .VPNavBarSearch.VPNavBarSearch {
-    gap: 0.5rem;
-    padding-left: 1.5rem;
-  }
-}
-
-@media (min-width: 960px) {
-  .VPNavBarSearch.VPNavBarSearch {
-    padding-left: 2rem;
-  }
+.VPNavBarSearch.VPNavBarSearch {
+  flex-grow: 0 !important;
+  padding-left: 0.75rem !important;
+  padding-right: 0.75rem !important;
 }
 
 /* ── Typography ─────────────────────────────────────────────────────────── */
@@ -1147,6 +1153,25 @@ body {
 .terminal-demo {
   margin: 2rem auto;
   max-width: 720px;
+}
+
+/* ── Search ───────────────────────────────────────────────────────────── */
+
+.VPNavBarSearchButton.VPNavBarSearchButton {
+  color: var(--vp-c-text-2);
+  border: 1px solid var(--vp-c-divider);
+  background: var(--vp-c-bg-soft);
+}
+
+
+.VPLocalSearchBox {
+  --vp-local-search-bg: var(--vp-c-bg);
+  --vp-local-search-result-bg: var(--vp-c-bg-soft);
+  --vp-local-search-result-border: var(--vp-c-divider);
+  --vp-local-search-result-selected-bg: var(--vp-c-bg-mute);
+  --vp-local-search-result-selected-border: var(--vp-c-brand-1);
+  --vp-local-search-highlight-bg: var(--vp-c-brand-soft);
+  --vp-local-search-highlight-text: var(--vp-c-brand-1);
 }
 
 /* ── Feature card hover lift ──────────────────────────────────────────── */

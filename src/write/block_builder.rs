@@ -116,9 +116,7 @@ impl StringTable {
 
     fn into_proto(self) -> proto::StringTable {
         let mut st = proto::StringTable::default();
-        for s in self.strings {
-            st.s.push(Bytes::from(s.into_bytes()));
-        }
+        st.s.extend(self.strings.into_iter().map(|s| Bytes::from(s.into_bytes())));
         st
     }
 }

@@ -1074,6 +1074,8 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
 
 // ---------------------------------------------------------------------------
 // Element writers
+// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per call.
+// Hoisting buffers per cat.rs pattern would avoid allocations at planet scale.
 // ---------------------------------------------------------------------------
 
 fn write_dense_node(

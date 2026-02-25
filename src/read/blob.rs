@@ -37,6 +37,8 @@ impl DecompressPool {
     }
 
     /// Pop a buffer from the pool, or return an empty Vec if the pool is empty.
+    // wontfix(type-result-fallible): .ok() on Mutex::lock() — poisoning means another
+    // thread panicked; falling back to a fresh Vec is the correct recovery here.
     pub fn get(&self) -> Vec<u8> {
         self.buffers
             .lock()
@@ -192,6 +194,7 @@ impl Blob {
     }
 
     /// Returns the type of a blob without decoding its content.
+    // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
         match self.header.r#type.as_str() {
@@ -254,6 +257,7 @@ impl BlobHeader {
     }
 
     /// Returns the size of the following blob in bytes.
+    // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_blob_size(&self) -> i32 {
         self.header.datasize
@@ -261,6 +265,7 @@ impl BlobHeader {
 }
 
 /// A reader for PBF files that allows iterating over [`Blob`]s.
+// wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 #[derive(Clone, Debug)]
 pub struct BlobReader<R: Read + Send> {
     reader: R,

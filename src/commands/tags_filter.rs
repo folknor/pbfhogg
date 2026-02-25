@@ -229,6 +229,9 @@ pub fn tags_filter(
 
 // ---------------------------------------------------------------------------
 // Single-pass filter (-R mode)
+// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per element here
+// and in the two-pass path below. Hoisting buffers per cat.rs pattern would avoid
+// allocations at planet scale but requires refactoring the write helpers.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]

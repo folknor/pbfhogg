@@ -113,6 +113,7 @@ impl BlobInfo {
 /// Allows filtering elements and iterating over their dependencies.
 /// It chooses an efficient method for navigating the PBF structure to achieve this in reasonable
 /// time and with reasonable memory.
+// wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 pub struct IndexedReader<R: Read + Seek + Send> {
     reader: BlobReader<R>,
     index: Vec<BlobInfo>,

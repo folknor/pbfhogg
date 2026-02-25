@@ -259,6 +259,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
 // ---------------------------------------------------------------------------
 // Helpers
+// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per element.
+// Hoisting buffers per cat.rs pattern would avoid allocations at planet scale.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]

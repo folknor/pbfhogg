@@ -261,12 +261,14 @@ impl<'a> DenseNodeInfo<'a> {
     }
 
     /// Returns the visibility status of an element.
+    // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]
     pub fn visible(&self) -> bool {
         self.visible
     }
 
     /// Returns true if the element was deleted.
+    // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]
     pub fn deleted(&self) -> bool {
         !self.visible
@@ -356,6 +358,8 @@ impl<'a> Iterator for DenseTagIter<'a> {
         if self.cursor.is_empty() {
             return None;
         }
+        // wontfix(type-result-fallible): Iterator trait constrains return type;
+        // .ok() stops iteration on corrupt data rather than propagating errors.
         let key = self.cursor.read_varint().ok()? as usize;
         let val = self.cursor.read_varint().ok()? as usize;
         get_stringtable_key_value(self.block, Some(key), Some(val))
@@ -376,6 +380,7 @@ impl Iterator for DenseRawTagIter<'_> {
         if self.cursor.is_empty() {
             return None;
         }
+        // wontfix(type-result-fallible): same as DenseTagIter — Iterator constrains return type
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let key = self.cursor.read_varint().ok()? as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

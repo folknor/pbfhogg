@@ -67,6 +67,7 @@ impl Mmap {
     }
 
     /// Returns an iterator over the blobs in this memory map.
+    // wontfix(name-iter-convention): inherited from osmpbf public API
     pub fn blob_iter(self) -> MmapBlobReader {
         MmapBlobReader::new(self)
     }
@@ -100,6 +101,7 @@ impl MmapBlob {
     }
 
     /// Returns the type of a blob without decoding its content.
+    // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
         match self.header.r#type.as_str() {

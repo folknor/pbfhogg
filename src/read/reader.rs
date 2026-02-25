@@ -9,6 +9,7 @@ use std::io::Read;
 use std::path::Path;
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
+// wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 #[derive(Clone, Debug)]
 pub struct ElementReader<R: Read + Send> {
     blob_iter: BlobReader<R>,

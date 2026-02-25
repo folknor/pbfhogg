@@ -99,6 +99,7 @@ struct WritePipeline {
 /// The header is written eagerly in the constructor; subsequent
 /// `write_primitive_block` calls dispatch compression to the rayon pool,
 /// and a dedicated writer thread reorders and writes results in sequence.
+// wontfix(type-generic-bounds): bound on struct documents intent; removing is breaking
 pub struct PbfWriter<W: Write> {
     writer: Option<W>,
     compression: Compression,
@@ -376,6 +377,8 @@ impl<W: Write> PbfWriter<W> {
             .expect("writer consumed by pipeline — call flush() first")
     }
 
+    // wontfix(type-no-stringly): blob_type is &str matching protobuf wire format;
+    // only 2 constants ("OSMHeader"/"OSMData"), no real typo risk.
     #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
         let framed = frame_blob(blob_type, uncompressed, &self.compression, None)?;

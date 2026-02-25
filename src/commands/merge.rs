@@ -215,6 +215,7 @@ impl SkipState {
         }
     }
 
+    // wontfix(name-is-has-bool): private, reads naturally as "if progress.all_done()"
     fn all_done(&self) -> bool {
         self.node_done && self.way_done && self.rel_done
     }
@@ -576,6 +577,8 @@ fn rewrite_element<'a>(
     }
 }
 
+// wontfix(perf-drain-reuse): OSC replacement paths collect tags fresh per element;
+// base element paths already use hoisted tags_buf. Marginal gain to fix the OSC path.
 fn rewrite_dense_node<'a>(
     dn: &crate::DenseNode<'a>,
     ctx: &mut RewriteContext<'_>,

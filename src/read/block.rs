@@ -168,6 +168,8 @@ impl PrimitiveBlock {
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`.
+    // wontfix(name-iter-convention): elements() is more descriptive than iter() here;
+    // BlockElementsIter name matches established osmpbf public API.
     pub fn elements(&self) -> BlockElementsIter<'_> {
         BlockElementsIter::new(&self.block)
     }

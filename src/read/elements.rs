@@ -610,12 +610,14 @@ impl<'a> Info<'a> {
     }
 
     /// Returns the visibility status of an element.
+    // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]
     pub fn visible(&self) -> bool {
         self.info.visible.unwrap_or(true)
     }
 
     /// Returns true if the element was deleted.
+    // wontfix(name-is-has-bool): inherited from osmpbf public API
     #[inline]
     pub fn deleted(&self) -> bool {
         !self.visible()

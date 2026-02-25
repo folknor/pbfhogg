@@ -46,6 +46,12 @@ impl DeriveChangesStats {
 /// Reads both files into memory, performs a merge-join by (type, id),
 /// and writes differences as gzipped OsmChange XML.
 #[hotpath::measure]
+/// Generate an OSC diff from two PBF snapshots.
+///
+/// **Note:** Both PBFs are loaded entirely into memory as owned Vecs.
+/// This works for country-scale extracts but will OOM on planet-scale
+/// (~80 GB) files. A streaming approach would require sorted inputs
+/// and a merge-join algorithm.
 pub fn derive_changes(
     old_path: &Path,
     new_path: &Path,
@@ -380,7 +386,10 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
                 MemberType::Node => "node",
                 MemberType::Way => "way",
                 MemberType::Relation => "relation",
-                MemberType::Unknown(_) => "node", // fallback for unrecognized types
+                // Unknown member types from newer PBF producers — write as "node"
+                // since OSC XML has no "unknown" type value. The protobuf enum
+                // only defines NODE/WAY/RELATION and has never been extended.
+                MemberType::Unknown(_) => "node",
             };
             let id_str = m.id.id().to_string();
             member.push_attribute(("type", type_str));

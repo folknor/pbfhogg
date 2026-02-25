@@ -87,6 +87,10 @@ fn parse_type_filter(s: &str) -> TypeFilter {
 // ---------------------------------------------------------------------------
 
 /// Compare two sorted PBF files and write human-readable differences.
+///
+/// **Note:** Both PBFs are loaded entirely into memory as owned Vecs.
+/// This works for country-scale extracts but will OOM on planet-scale
+/// (~80 GB) files.
 #[hotpath::measure]
 pub fn diff(
     old_path: &Path,

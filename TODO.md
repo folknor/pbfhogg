@@ -284,11 +284,26 @@ buffers actually matter — the writer thread is the bottleneck, not compression
   Planet-scale (~80GB) would OOM. Known limitation, not on the critical path
   for nidhogg (which uses merge, not diff/derive-changes).
 
-- [ ] **Duplicated code across commands.** `flush_block`, `rebuild_header`, and
-  metadata extraction (DenseNode vs Node pattern) are copy-pasted across 7+
-  command files. The DenseNode and Node metadata paths also handle errors
-  inconsistently (DenseNode drops all metadata on user decode failure; Node
-  keeps partial metadata with empty user). Extract into shared helpers.
+- [ ] **Duplicated code across commands.** Three patterns are copy-pasted:
+
+  **`flush_block`** (7 copies): merge.rs:359, cat.rs:330, sort.rs:646,
+  extract.rs:882, getid.rs:372, add_locations_to_ways.rs:328,
+  tags_filter.rs:654. All identical: `bb.take()? → writer.write_primitive_block`.
+  Extract to a shared helper in `write/` or a `commands/common.rs`.
+
+  **`rebuild_header`** (3 copies): cat.rs:340, tags_filter.rs:664,
+  getid.rs:382. All identical: read HeaderBlock → `build_header` → write.
+  merge.rs has its own `build_header_bytes` variant. Extract to shared helper.
+
+  **DenseNode metadata extraction** (8 copies): merge.rs:446, cat.rs:211,
+  extract.rs:780, sort.rs:539, getid.rs:274, add_locations_to_ways.rs:166,
+  tags_filter.rs:272,527. All use `dn.info().and_then(|info| { info.user()
+  .ok()?; Some(Metadata{...}) })`. **Inconsistency:** if `user()` fails
+  (string table error), DenseNode path drops ALL metadata (`and_then` returns
+  None), while Node/Way/Relation path keeps metadata with empty user
+  (`info.user().and_then(Result::ok).unwrap_or("")`). Should pick one
+  strategy and share a single `dense_node_metadata()` /
+  `element_metadata()` helper.
 
 ## Test coverage gaps (from code quality review, Feb 2026)
 

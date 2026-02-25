@@ -643,12 +643,4 @@ fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
     })
 }
 
-fn flush_block(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if let Some(bytes) = bb.take()? {
-        writer.write_primitive_block(&bytes)?;
-    }
-    Ok(())
-}
+use super::flush_block;

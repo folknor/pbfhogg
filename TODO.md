@@ -257,18 +257,7 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
 
-## Refactoring: duplicated code across commands
-
-Three patterns are copy-pasted across commands:
-
-**`flush_block`** (7 copies): merge.rs:359, cat.rs:330, sort.rs:646,
-extract.rs:882, getid.rs:372, add_locations_to_ways.rs:328,
-tags_filter.rs:654. All identical: `bb.take()? → writer.write_primitive_block`.
-Extract to a shared helper in `write/` or a `commands/common.rs`.
-
-**`rebuild_header`** (3 copies): cat.rs:340, tags_filter.rs:664,
-getid.rs:382. All identical: read HeaderBlock → `build_header` → write.
-merge.rs has its own `build_header_bytes` variant. Extract to shared helper.
+## Refactoring: duplicated DenseNode metadata extraction
 
 **DenseNode metadata extraction** (8 copies): merge.rs:446, cat.rs:211,
 extract.rs:780, sort.rs:539, getid.rs:274, add_locations_to_ways.rs:166,
@@ -279,6 +268,8 @@ None), while Node/Way/Relation path keeps metadata with empty user
 (`info.user().and_then(Result::ok).unwrap_or("")`). Should pick one
 strategy and share a single `dense_node_metadata()` /
 `element_metadata()` helper.
+
+(`flush_block` and `rebuild_header` were extracted to `commands/mod.rs`.)
 
 ## Code TODOs
 

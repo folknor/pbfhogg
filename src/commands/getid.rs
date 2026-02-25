@@ -3,7 +3,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use super::{flush_block, rebuild_header};
+use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
@@ -369,31 +370,6 @@ fn write_element(
     Ok(())
 }
 
-fn flush_block(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if let Some(bytes) = bb.take()? {
-        writer.write_primitive_block(&bytes)?;
-    }
-    Ok(())
-}
-
-fn rebuild_header(
-    header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    let header_bytes = build_header(
-        bbox,
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        &[],
-    )?;
-    writer.write_header(&header_bytes)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests

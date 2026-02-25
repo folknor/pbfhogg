@@ -352,19 +352,11 @@ fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
     false
 }
 
+use super::flush_block;
+
 // ---------------------------------------------------------------------------
 // Block flushing helpers
 // ---------------------------------------------------------------------------
-
-fn flush_block(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> MergeResult<()> {
-    if let Some(bytes) = bb.take()? {
-        writer.write_primitive_block(&bytes)?;
-    }
-    Ok(())
-}
 
 fn ensure_node_capacity(
     bb: &mut BlockBuilder,

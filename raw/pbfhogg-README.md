@@ -1,7 +1,9 @@
 <p align="center">
-  <img src="pbfhogg-logo.svg" width="120" alt="pbfhogg">
-  <br><br>
-  <strong style="font-size:1.4em;">pbfhogg</strong><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="pbfhogg-logo-text-dark.svg">
+    <img src="pbfhogg-logo-text.svg" width="300" alt="pbfhogg">
+  </picture>
+  <br>
   <em>Fast OpenStreetMap PBF reader and writer for Rust</em>
 </p>
 

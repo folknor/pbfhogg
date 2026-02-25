@@ -45,6 +45,17 @@ git merge template/master --allow-unrelated-histories
 
 4. **Content** — replace the placeholder docs in `docs/guide/` and `docs/api/` with your actual documentation. Update the sidebar entries in `config.ts` to match.
 
+5. **README logo** — add your logo-text SVGs to the project root for the GitHub README. Use `<picture>` for light/dark mode:
+   ```html
+   <p align="center">
+     <picture>
+       <source media="(prefers-color-scheme: dark)" srcset="my-logo-text-dark.svg">
+       <img src="my-logo-text.svg" width="300" alt="MyProject">
+     </picture>
+   </p>
+   ```
+   The dark variant should use your theme's dark-mode brand color. See `raw/*-logo-text-dark.svg` for examples.
+
 ### Pulling template updates
 
 When the template gets improvements (layout fixes, font tweaks, new features):

@@ -1,7 +1,9 @@
 <p align="center">
-  <img src="elivagar-logo.svg" width="120" alt="Elivagar">
-  <br><br>
-  <strong style="font-size:1.4em;">Elivagar</strong><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="elivagar-logo-text-dark.svg">
+    <img src="elivagar-logo-text.svg" width="300" alt="Elivagar">
+  </picture>
+  <br>
   <em>Shortbread vector tile generator</em>
 </p>
 

@@ -1,7 +1,9 @@
 <p align="center">
-  <img src="nidhogg-logo.svg" width="120" alt="Nidhogg">
-  <br><br>
-  <strong style="font-size:1.4em;">Nidhogg</strong><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="nidhogg-logo-text-dark.svg">
+    <img src="nidhogg-logo-text.svg" width="300" alt="Nidhogg">
+  </picture>
+  <br>
   <em>A self-hosted OpenStreetMap stack in Rust</em>
 </p>
 

@@ -60,7 +60,8 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - `pipeline.rs`: 3-stage pipelined decoder (IO thread -> rayon pool -> reorder buffer)
 
 **Write path:** `BlockBuilder` (block_builder.rs) -> `PbfWriter` (writer.rs)
-- `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block.
+- `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block. Dense nodes use prost; ways/relations use direct wire-format encoding via reusable scratch buffers (`wire.rs` primitives).
+- `wire.rs`: write-side protobuf encoding primitives (varint, zigzag, field encoders, packed repeated fields). Mirrors the read-side `src/read/wire.rs` decoding primitives.
 - `PbfWriter`: blob framing, compression (zlib/zstd/none), raw passthrough for merges. Sync mode (`to_path`) or pipelined mode (`to_path_pipelined`) with parallel compression via rayon + reorder buffer. O_DIRECT variants (`to_path_direct`, `to_path_pipelined_direct`) bypass page cache. io_uring variant (`to_path_pipelined_uring`) uses registered buffers + WriteFixed for I/O-bound workloads.
 - `uring_writer.rs`: io_uring writer thread — `AlignedBufferPool` (64×256KB registered buffers), `UringState` (buffered accumulation + WriteFixed submission + CQE reaping)
 

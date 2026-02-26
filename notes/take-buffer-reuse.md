@@ -192,6 +192,7 @@ These are separate optimizations, noted here for completeness:
 
 - **`frame_blob` encode_to_vec (4.0 GB, `writer.rs:603/615`):** Runs in rayon tasks
   for pipelined mode. Would need per-thread buffers via `thread_local::ThreadLocal`.
-- **`add_way` Vec allocation (4.1 GB):** API-level change (tags/refs as iterators
-  instead of slices). Marked wontfix in `notes/hotpath-profile.md`.
+- ~~**`add_way` Vec allocation (4.1 GB):**~~ Resolved by direct wire-format
+  encoding. Ways/relations now encode directly to protobuf bytes using reusable
+  scratch buffers — no `proto::Way`/`proto::Relation` Vec allocations.
 - **Dense Vec re-allocation (3.3 GB):** Already optimal, see section 1 above.

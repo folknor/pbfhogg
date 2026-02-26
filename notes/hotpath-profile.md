@@ -309,7 +309,17 @@ rewrite_block FIRST, then Compression::None becomes the clear winner.
 
 ## Write benchmark: sync vs pipelined (bench_write)
 
-Denmark 483 MB, best of 2, decode + write to /dev/null:
+Denmark 483 MB, best of 3, decode + write to /dev/null:
+
+**Current (direct wire encoding):**
+
+| Compression | Sync   | Pipelined | Speedup |
+|-------------|--------|-----------|---------|
+| none        | 7.1s   | 7.1s      | 1.0x    |
+| zstd:3      | 9.1s   | 7.0s      | 1.3x    |
+| zlib:6      | 15.5s  | 7.1s      | 2.2x    |
+
+**Previous (prost-based proto::Way/Relation):**
 
 | Compression | Sync   | Pipelined | Speedup |
 |-------------|--------|-----------|---------|
@@ -317,31 +327,39 @@ Denmark 483 MB, best of 2, decode + write to /dev/null:
 | zstd:3      | 11.0s  | 9.1s      | 1.2x    |
 | zlib:6      | 17.5s  | 9.1s      | 1.9x    |
 
+Direct wire encoding reduced the pipelined floor from ~9s to ~7s (**22% faster**).
+Ways and relations are encoded directly to protobuf wire format using 4 reusable
+`Vec<u8>` scratch buffers, eliminating per-element `proto::Way`/`proto::Relation`
+allocation (~580 bytes/call). Dense nodes stay on prost (already optimized with
+pre-allocated Vecs).
+
 Pipelined writer parallelizes compression across rayon workers. All modes
-converge to ~9s — the decode + BlockBuilder serialization floor. With
+converge to ~7s — the decode + wire-format serialization floor. With
 Compression::None (nidhogg production config on erofs), there's nothing
 to parallelize so sync = pipelined.
 
-The 9s floor breaks down as (from hotpath data):
+The previous 9s floor broke down as (from hotpath data, pre-wire-encoding):
 - block_builder::add_node: 2.3s (5.4%)
 - block_builder::add_way: 1.5s (3.5%)
 - block_builder::take: 3.5s (8.3%)
 - blob::decompress_blob: 2.0s (4.7%)
 - wire::parse + block::new: 0.1s
-Total: ~9.4s, matches observed floor.
+Total: ~9.4s. Direct wire encoding eliminated the add_way/add_relation
+allocation overhead and take's prost two-pass encode (encoded_len + encode_raw).
 
 ## Optimization targets
 
-### Write floor (~9s, decode + BlockBuilder)
+### Write floor (~7s, decode + wire-format serialization)
 - Compression is solved — pipelined writer hides it completely
-- Remaining cost is decode (4.7%) + BlockBuilder insertion (9%) + take serialization (8.3%)
-- block_builder::take buffer reuse (encode_to_vec -> reuse buf) would cut 4.6 GB alloc churn
+- Direct wire encoding reduced floor from ~9s to ~7s (22% faster)
+- Remaining cost is decode (4.7%) + BlockBuilder insertion + wire-format serialization
 - With Compression::None the write path is I/O-bound at planet scale
 
-### BlockBuilder alloc churn (24% of write alloc)
-- add_way allocates fresh tags + refs Vecs every call (4.1 GB total)
-- Could reuse Vecs across calls with drain pattern
-- Marked wontfix for now — would require API change or internal buffer reuse
+### ~~BlockBuilder alloc churn (24% of write alloc)~~ — RESOLVED
+- ~~add_way allocates fresh tags + refs Vecs every call (4.1 GB total)~~
+- Direct wire encoding eliminated all per-element Vec allocations for ways/relations.
+  4 reusable `Vec<u8>` scratch buffers replace `Vec<proto::Way>` / `Vec<proto::Relation>`.
+  `StringTable::clear()` reuses HashMap/Vec capacity across blocks.
 
 ### decompress_blob buffer reuse (33% of read time)
 - DecompressPool already exists for pipelined path

@@ -14,6 +14,11 @@ use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::io;
 
+use super::wire::{
+    encode_bytes_field, encode_bytes_field_always, encode_int64_field, encode_packed_uint32,
+    encode_varint, zigzag_encode_64,
+};
+
 /// Maximum number of entities in a single `PrimitiveBlock`.
 /// Matches osmium's hardcoded limit.
 const MAX_ENTITIES_PER_BLOCK: usize = 8000;
@@ -117,6 +122,12 @@ impl StringTable {
                 self.add(s);
             }
         }
+    }
+
+    fn clear(&mut self) {
+        self.strings.clear();
+        self.index.clear();
+        self.strings.push(String::new());
     }
 
     fn into_proto(self) -> proto::StringTable {
@@ -234,11 +245,11 @@ pub struct BlockBuilder {
     last_dense_uid: i32,
     last_dense_user_sid: i32,
 
-    // Ways
-    ways: Vec<proto::Way>,
-
-    // Relations
-    relations: Vec<proto::Relation>,
+    // Wire-format accumulators for ways and relations
+    group_buf: Vec<u8>,       // per-block: all serialized way/relation messages
+    elem_scratch: Vec<u8>,    // per-element body (cleared each add_way/add_relation call)
+    packed_scratch: Vec<u8>,  // per-field packed content
+    info_scratch: Vec<u8>,    // Info sub-message body
 
     // Reusable encode buffer for take() — avoids allocating a fresh Vec<u8> per block.
     encode_buf: Vec<u8>,
@@ -271,11 +282,10 @@ impl BlockBuilder {
     /// are tagless (especially in dense areas), so 16000 is a pragmatic middle
     /// ground that avoids most reallocations without over-allocating.
     ///
-    /// `ways` and `relations` are left at zero capacity because each block is
-    /// single-type: if the block is a dense-nodes block, these Vecs are never
-    /// used at all, and allocating them would waste memory. Way/relation blocks
-    /// also tend to have fewer entities than the 8000 limit (ways are larger
-    /// per-entity due to node refs), so the default doubling strategy is fine.
+    /// Wire-format scratch buffers (`group_buf`, `elem_scratch`, etc.) are left
+    /// at zero capacity because each block is single-type: if the block is a
+    /// dense-nodes block, these buffers are never used at all. Way/relation
+    /// blocks grow as needed via the standard doubling strategy.
     pub fn new() -> Self {
         BlockBuilder {
             string_table: StringTable::new(),
@@ -309,9 +319,13 @@ impl BlockBuilder {
             last_dense_uid: 0,
             last_dense_user_sid: 0,
 
-            // Left at zero capacity — see doc comment above.
-            ways: Vec::new(),
-            relations: Vec::new(),
+            // Wire-format scratch buffers — left at zero capacity since
+            // way/relation blocks will grow as needed, and dense-node blocks
+            // never use them.
+            group_buf: Vec::new(),
+            elem_scratch: Vec::new(),
+            packed_scratch: Vec::new(),
+            info_scratch: Vec::new(),
 
             encode_buf: Vec::new(),
 
@@ -517,29 +531,17 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-
-        let mut way = proto::Way::default();
-        way.id = id;
-
-        // Tags — plain string table indices (not delta-encoded)
-        for &(key, val) in tags {
-            way.keys.push(self.string_table.add(key));
-            way.vals.push(self.string_table.add(val));
-        }
-
-        // Node refs — delta-encoded within this way
-        let mut last_ref: i64 = 0;
-        for &r in refs {
-            way.refs.push(r - last_ref);
-            last_ref = r;
-        }
-
-        // Metadata
-        if let Some(meta) = metadata {
-            way.info = Some(self.build_info(meta));
-        }
-
-        self.ways.push(way);
+        encode_way(
+            &mut self.string_table,
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.info_scratch,
+            id,
+            tags,
+            refs,
+            metadata,
+        );
         self.count += 1;
     }
 
@@ -563,35 +565,18 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-
-        let mut way = proto::Way::default();
-        way.id = id;
-
-        for &(key, val) in tags {
-            way.keys.push(self.string_table.add(key));
-            way.vals.push(self.string_table.add(val));
-        }
-
-        let mut last_ref: i64 = 0;
-        let mut last_lat: i64 = 0;
-        let mut last_lon: i64 = 0;
-        for (&r, &(loc_lat, loc_lon)) in refs.iter().zip(locations.iter()) {
-            way.refs.push(r - last_ref);
-            last_ref = r;
-
-            let lat = i64::from(loc_lat);
-            let lon = i64::from(loc_lon);
-            way.lat.push(lat - last_lat);
-            way.lon.push(lon - last_lon);
-            last_lat = lat;
-            last_lon = lon;
-        }
-
-        if let Some(meta) = metadata {
-            way.info = Some(self.build_info(meta));
-        }
-
-        self.ways.push(way);
+        encode_way_with_locations(
+            &mut self.string_table,
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.info_scratch,
+            id,
+            tags,
+            refs,
+            locations,
+            metadata,
+        );
         self.count += 1;
     }
 
@@ -611,34 +596,17 @@ impl BlockBuilder {
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
-
-        let mut rel = proto::Relation::default();
-        rel.id = id;
-
-        // Tags
-        for &(key, val) in tags {
-            rel.keys.push(self.string_table.add(key));
-            rel.vals.push(self.string_table.add(val));
-        }
-
-        // Members — three parallel arrays: roles_sid, memids (delta), types
-        let mut last_memid: i64 = 0;
-        for m in members {
-            #[allow(clippy::cast_possible_wrap)]
-            rel.roles_sid
-                .push(self.string_table.add(m.role) as i32);
-            rel.memids.push(m.id.id() - last_memid);
-            last_memid = m.id.id();
-            rel.types
-                .push(member_type_to_proto(m.id.member_type()) as i32);
-        }
-
-        // Metadata
-        if let Some(meta) = metadata {
-            rel.info = Some(self.build_info(meta));
-        }
-
-        self.relations.push(rel);
+        encode_relation(
+            &mut self.string_table,
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.info_scratch,
+            id,
+            tags,
+            members,
+            metadata,
+        );
         self.count += 1;
     }
 
@@ -722,24 +690,17 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-
-        let mut way = proto::Way::default();
-        way.id = id;
-
-        way.keys.extend_from_slice(raw_tag_keys);
-        way.vals.extend_from_slice(raw_tag_vals);
-
-        let mut last_ref: i64 = 0;
-        for &r in refs {
-            way.refs.push(r - last_ref);
-            last_ref = r;
-        }
-
-        if let Some(meta) = metadata {
-            way.info = Some(self.build_info_raw(meta));
-        }
-
-        self.ways.push(way);
+        encode_way_raw(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.info_scratch,
+            id,
+            raw_tag_keys,
+            raw_tag_vals,
+            refs,
+            metadata,
+        );
         self.count += 1;
     }
 
@@ -747,7 +708,6 @@ impl BlockBuilder {
     ///
     /// `raw_tag_keys`, `raw_tag_vals` from [`Relation::raw_tags()`].
     /// `members` contains `(MemberId, raw_role_sid)` pairs.
-    #[allow(clippy::cast_possible_wrap)]
     pub(crate) fn add_relation_raw(
         &mut self,
         id: i64,
@@ -761,27 +721,17 @@ impl BlockBuilder {
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
-
-        let mut rel = proto::Relation::default();
-        rel.id = id;
-
-        rel.keys.extend_from_slice(raw_tag_keys);
-        rel.vals.extend_from_slice(raw_tag_vals);
-
-        let mut last_memid: i64 = 0;
-        for &(mid, role_sid) in members {
-            rel.roles_sid.push(role_sid);
-            rel.memids.push(mid.id() - last_memid);
-            last_memid = mid.id();
-            rel.types
-                .push(member_type_to_proto(mid.member_type()) as i32);
-        }
-
-        if let Some(meta) = metadata {
-            rel.info = Some(self.build_info_raw(meta));
-        }
-
-        self.relations.push(rel);
+        encode_relation_raw(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            &mut self.packed_scratch,
+            &mut self.info_scratch,
+            id,
+            raw_tag_keys,
+            raw_tag_vals,
+            members,
+            metadata,
+        );
         self.count += 1;
     }
 
@@ -803,20 +753,6 @@ impl BlockBuilder {
         self.dense_visibles.push(meta.visible);
     }
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn build_info_raw(&self, meta: &RawMetadata) -> proto::Info {
-        let mut info = proto::Info::default();
-        info.version = Some(meta.version);
-        info.timestamp = Some(meta.timestamp);
-        info.changeset = Some(meta.changeset);
-        info.uid = Some(meta.uid);
-        info.user_sid = Some(meta.user_sid as u32);
-        if !meta.visible {
-            info.visible = Some(false);
-        }
-        info
-    }
-
     /// Serialize the current block to `PrimitiveBlock` bytes and reset.
     ///
     /// Returns `None` if the block is empty. The returned slice borrows from
@@ -829,27 +765,45 @@ impl BlockBuilder {
             None => return Ok(None),
         };
 
-        let mut block = proto::PrimitiveBlock::default();
+        match block_type {
+            BlockType::DenseNodes => {
+                // DenseNodes: use prost encoding (unchanged)
+                let mut block = proto::PrimitiveBlock::default();
 
-        // String table
-        let string_table = std::mem::replace(&mut self.string_table, StringTable::new());
-        block.stringtable = string_table.into_proto();
+                let string_table =
+                    std::mem::replace(&mut self.string_table, StringTable::new());
+                block.stringtable = string_table.into_proto();
 
-        // Note: we do NOT set granularity, lat_offset, lon_offset, or date_granularity.
-        // Omitting them uses the protobuf defaults (granularity=100, offsets=0, date_gran=1000).
+                // Note: we do NOT set granularity, lat_offset, lon_offset, or
+                // date_granularity. Omitting them uses the protobuf defaults
+                // (granularity=100, offsets=0, date_gran=1000).
 
-        // Build the PrimitiveGroup
-        let group = match block_type {
-            BlockType::DenseNodes => self.take_dense_nodes_group(),
-            BlockType::Ways => self.take_ways_group(),
-            BlockType::Relations => self.take_relations_group(),
-        };
-        block.primitivegroup.push(group);
+                let group = self.take_dense_nodes_group();
+                block.primitivegroup.push(group);
 
-        self.encode_buf.clear();
-        block
-            .encode(&mut self.encode_buf)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                self.encode_buf.clear();
+                block
+                    .encode(&mut self.encode_buf)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            }
+            BlockType::Ways | BlockType::Relations => {
+                // Ways/Relations: direct wire-format encoding (no prost intermediary)
+                self.encode_buf.clear();
+
+                // PrimitiveBlock field 1: StringTable submessage
+                // Encode the StringTable body into elem_scratch, then wrap it.
+                self.elem_scratch.clear();
+                for s in &self.string_table.strings {
+                    encode_bytes_field_always(&mut self.elem_scratch, 1, s.as_bytes());
+                }
+                encode_bytes_field(&mut self.encode_buf, 1, &self.elem_scratch);
+
+                // PrimitiveBlock field 2: PrimitiveGroup submessage
+                // group_buf already contains the Way/Relation field entries
+                // that form the body of the PrimitiveGroup.
+                encode_bytes_field(&mut self.encode_buf, 2, &self.group_buf);
+            }
+        }
 
         self.reset();
         Ok(Some(&self.encode_buf))
@@ -890,32 +844,6 @@ impl BlockBuilder {
         group
     }
 
-    fn take_ways_group(&mut self) -> proto::PrimitiveGroup {
-        let mut group = proto::PrimitiveGroup::default();
-        group.ways = std::mem::take(&mut self.ways);
-        group
-    }
-
-    fn take_relations_group(&mut self) -> proto::PrimitiveGroup {
-        let mut group = proto::PrimitiveGroup::default();
-        group.relations = std::mem::take(&mut self.relations);
-        group
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    fn build_info(&mut self, meta: &Metadata<'_>) -> proto::Info {
-        let mut info = proto::Info::default();
-        info.version = Some(meta.version);
-        info.timestamp = Some(meta.timestamp);
-        info.changeset = Some(meta.changeset);
-        info.uid = Some(meta.uid);
-        info.user_sid = Some(self.string_table.add(meta.user));
-        if !meta.visible {
-            info.visible = Some(false);
-        }
-        info
-    }
-
     fn reset(&mut self) {
         self.block_type = None;
         self.count = 0;
@@ -929,6 +857,9 @@ impl BlockBuilder {
         self.last_dense_changeset = 0;
         self.last_dense_uid = 0;
         self.last_dense_user_sid = 0;
+
+        // Clear wire-format accumulators for ways/relations.
+        self.group_buf.clear();
 
         // Re-allocate dense Vecs that were consumed by take_dense_nodes_group().
         // mem::take() leaves zero capacity; this restores the pre-allocation from new().
@@ -944,7 +875,383 @@ impl BlockBuilder {
             self.dense_user_sids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
             self.dense_visibles = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
         }
+
+        // Reset string table (reuse allocation, clear content).
+        self.string_table.clear();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format encoding free functions
+//
+// These are free functions (not methods on BlockBuilder) to avoid borrow-checker
+// issues: they need `&mut string_table` + `&mut` multiple scratch buffers
+// simultaneously, which is impossible with `&mut self`.
+// ---------------------------------------------------------------------------
+
+/// Encode an `int32` field unconditionally (even when value is 0).
+///
+/// Matches prost's encoding of `Option<i32>::Some(0)` which writes the
+/// field tag + varint(0) even for the zero value. This differs from
+/// `encode_int32_field` which skips zero values (matching non-optional fields).
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn encode_optional_int32(buf: &mut Vec<u8>, field: u32, value: i32) {
+    buf.push((field << 3) as u8); // wire type 0 (varint)
+    encode_varint(buf, value as i64 as u64);
+}
+
+/// Encode an `int64` field unconditionally (even when value is 0).
+///
+/// Matches prost's encoding of `Option<i64>::Some(0)`.
+#[inline]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn encode_optional_int64(buf: &mut Vec<u8>, field: u32, value: i64) {
+    buf.push((field << 3) as u8);
+    encode_varint(buf, value as u64);
+}
+
+/// Encode a `uint32` field unconditionally (even when value is 0).
+///
+/// Matches prost's encoding of `Option<u32>::Some(0)`.
+#[inline]
+#[allow(clippy::cast_possible_truncation)]
+fn encode_optional_uint32(buf: &mut Vec<u8>, field: u32, value: u32) {
+    buf.push((field << 3) as u8);
+    encode_varint(buf, u64::from(value));
+}
+
+/// Encode an `Info` submessage from high-level [`Metadata`].
+///
+/// Uses unconditional field writers (matching prost's `Option<T>::Some(v)` encoding)
+/// to produce bit-identical output with the previous prost-based `build_info`.
+fn encode_info_to(
+    info: &mut Vec<u8>,
+    string_table: &mut StringTable,
+    meta: &Metadata<'_>,
+) {
+    info.clear();
+    // Field 1: version (optional int32) — always present
+    encode_optional_int32(info, 1, meta.version);
+    // Field 2: timestamp (optional int64) — always present
+    encode_optional_int64(info, 2, meta.timestamp);
+    // Field 3: changeset (optional int64) — always present
+    encode_optional_int64(info, 3, meta.changeset);
+    // Field 4: uid (optional int32) — always present
+    encode_optional_int32(info, 4, meta.uid);
+    // Field 5: user_sid (optional uint32) — always present
+    encode_optional_uint32(info, 5, string_table.add(meta.user));
+    // Field 6: visible (optional bool) — only emit when false
+    // When visible=true, the current code leaves info.visible as None (prost skips it).
+    // When visible=false, it sets Some(false), and prost writes tag + varint(0).
+    if !meta.visible {
+        info.push(6 << 3); // tag for field 6, wire type 0
+        info.push(0x00); // false = varint(0)
+    }
+}
+
+/// Encode an `Info` submessage from raw [`RawMetadata`] (pre-seeded string table).
+#[allow(clippy::cast_sign_loss)]
+fn encode_info_raw_to(info: &mut Vec<u8>, meta: &RawMetadata) {
+    info.clear();
+    encode_optional_int32(info, 1, meta.version);
+    encode_optional_int64(info, 2, meta.timestamp);
+    encode_optional_int64(info, 3, meta.changeset);
+    encode_optional_int32(info, 4, meta.uid);
+    encode_optional_uint32(info, 5, meta.user_sid as u32);
+    if !meta.visible {
+        info.push(6 << 3); // tag for field 6, wire type 0
+        info.push(0x00);
+    }
+}
+
+/// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
+#[allow(clippy::too_many_arguments)]
+fn encode_way(
+    string_table: &mut StringTable,
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    id: i64,
+    tags: &[(&str, &str)],
+    refs: &[i64],
+    metadata: Option<&Metadata<'_>>,
+) {
+    elem.clear();
+
+    // Field 1: id (int64)
+    encode_int64_field(elem, 1, id);
+
+    // Fields 2+3: keys/vals (packed uint32)
+    if !tags.is_empty() {
+        packed.clear();
+        for &(key, _) in tags {
+            encode_varint(packed, u64::from(string_table.add(key)));
+        }
+        encode_bytes_field(elem, 2, packed);
+
+        packed.clear();
+        for &(_, val) in tags {
+            encode_varint(packed, u64::from(string_table.add(val)));
+        }
+        encode_bytes_field(elem, 3, packed);
+    }
+
+    // Field 4: info (submessage)
+    if let Some(meta) = metadata {
+        encode_info_to(info_buf, string_table, meta);
+        encode_bytes_field(elem, 4, info_buf);
+    }
+
+    // Field 8: refs (packed sint64, delta-encoded)
+    if !refs.is_empty() {
+        packed.clear();
+        let mut last_ref: i64 = 0;
+        for &r in refs {
+            encode_varint(packed, zigzag_encode_64(r - last_ref));
+            last_ref = r;
+        }
+        encode_bytes_field(elem, 8, packed);
+    }
+
+    // Wrap as PrimitiveGroup field 3 (Way submessage)
+    encode_bytes_field(group_buf, 3, elem);
+}
+
+/// Encode a Way with embedded node locations (fields 9/10: lat/lon).
+#[allow(clippy::too_many_arguments)]
+fn encode_way_with_locations(
+    string_table: &mut StringTable,
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    id: i64,
+    tags: &[(&str, &str)],
+    refs: &[i64],
+    locations: &[(i32, i32)],
+    metadata: Option<&Metadata<'_>>,
+) {
+    elem.clear();
+    encode_int64_field(elem, 1, id);
+
+    if !tags.is_empty() {
+        packed.clear();
+        for &(key, _) in tags {
+            encode_varint(packed, u64::from(string_table.add(key)));
+        }
+        encode_bytes_field(elem, 2, packed);
+
+        packed.clear();
+        for &(_, val) in tags {
+            encode_varint(packed, u64::from(string_table.add(val)));
+        }
+        encode_bytes_field(elem, 3, packed);
+    }
+
+    if let Some(meta) = metadata {
+        encode_info_to(info_buf, string_table, meta);
+        encode_bytes_field(elem, 4, info_buf);
+    }
+
+    // Fields 8, 9, 10: refs + lat + lon (all delta-encoded)
+    if !refs.is_empty() {
+        let mut last_ref: i64 = 0;
+        let mut last_lat: i64 = 0;
+        let mut last_lon: i64 = 0;
+
+        // Field 8: refs (packed sint64)
+        packed.clear();
+        for &r in refs {
+            encode_varint(packed, zigzag_encode_64(r - last_ref));
+            last_ref = r;
+        }
+        encode_bytes_field(elem, 8, packed);
+
+        // Field 9: lat (packed sint64)
+        packed.clear();
+        for &(loc_lat, _) in locations {
+            let lat = i64::from(loc_lat);
+            encode_varint(packed, zigzag_encode_64(lat - last_lat));
+            last_lat = lat;
+        }
+        encode_bytes_field(elem, 9, packed);
+
+        // Field 10: lon (packed sint64)
+        packed.clear();
+        for &(_, loc_lon) in locations {
+            let lon = i64::from(loc_lon);
+            encode_varint(packed, zigzag_encode_64(lon - last_lon));
+            last_lon = lon;
+        }
+        encode_bytes_field(elem, 10, packed);
+    }
+
+    encode_bytes_field(group_buf, 3, elem);
+}
+
+/// Encode a Way with raw (pre-seeded) string table indices.
+#[allow(clippy::too_many_arguments)]
+fn encode_way_raw(
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    id: i64,
+    raw_tag_keys: &[u32],
+    raw_tag_vals: &[u32],
+    refs: &[i64],
+    metadata: Option<&RawMetadata>,
+) {
+    elem.clear();
+    encode_int64_field(elem, 1, id);
+
+    // Field 2: keys (packed uint32, raw indices)
+    encode_packed_uint32(elem, packed, 2, raw_tag_keys);
+    // Field 3: vals (packed uint32, raw indices)
+    encode_packed_uint32(elem, packed, 3, raw_tag_vals);
+
+    // Field 4: info
+    if let Some(meta) = metadata {
+        encode_info_raw_to(info_buf, meta);
+        encode_bytes_field(elem, 4, info_buf);
+    }
+
+    // Field 8: refs (packed sint64, delta-encoded)
+    if !refs.is_empty() {
+        packed.clear();
+        let mut last_ref: i64 = 0;
+        for &r in refs {
+            encode_varint(packed, zigzag_encode_64(r - last_ref));
+            last_ref = r;
+        }
+        encode_bytes_field(elem, 8, packed);
+    }
+
+    encode_bytes_field(group_buf, 3, elem);
+}
+
+/// Encode a Relation and append it as `PrimitiveGroup.relations` (field 4) to `group_buf`.
+#[allow(clippy::too_many_arguments)]
+fn encode_relation(
+    string_table: &mut StringTable,
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    id: i64,
+    tags: &[(&str, &str)],
+    members: &[MemberData<'_>],
+    metadata: Option<&Metadata<'_>>,
+) {
+    elem.clear();
+    encode_int64_field(elem, 1, id);
+
+    if !tags.is_empty() {
+        packed.clear();
+        for &(key, _) in tags {
+            encode_varint(packed, u64::from(string_table.add(key)));
+        }
+        encode_bytes_field(elem, 2, packed);
+
+        packed.clear();
+        for &(_, val) in tags {
+            encode_varint(packed, u64::from(string_table.add(val)));
+        }
+        encode_bytes_field(elem, 3, packed);
+    }
+
+    if let Some(meta) = metadata {
+        encode_info_to(info_buf, string_table, meta);
+        encode_bytes_field(elem, 4, info_buf);
+    }
+
+    // Members: three parallel packed arrays
+    if !members.is_empty() {
+        // Field 8: roles_sid (packed int32)
+        packed.clear();
+        #[allow(clippy::cast_possible_wrap, clippy::cast_sign_loss)]
+        for m in members {
+            let role_sid = string_table.add(m.role) as i32;
+            encode_varint(packed, role_sid as i64 as u64);
+        }
+        encode_bytes_field(elem, 8, packed);
+
+        // Field 9: memids (packed sint64, delta-encoded)
+        packed.clear();
+        let mut last_memid: i64 = 0;
+        for m in members {
+            encode_varint(packed, zigzag_encode_64(m.id.id() - last_memid));
+            last_memid = m.id.id();
+        }
+        encode_bytes_field(elem, 9, packed);
+
+        // Field 10: types (packed int32)
+        packed.clear();
+        #[allow(clippy::cast_sign_loss)]
+        for m in members {
+            encode_varint(packed, member_type_to_proto(m.id.member_type()) as i32 as i64 as u64);
+        }
+        encode_bytes_field(elem, 10, packed);
+    }
+
+    // PrimitiveGroup field 4 = Relation
+    encode_bytes_field(group_buf, 4, elem);
+}
+
+/// Encode a Relation with raw (pre-seeded) string table indices.
+#[allow(clippy::too_many_arguments)]
+fn encode_relation_raw(
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    packed: &mut Vec<u8>,
+    info_buf: &mut Vec<u8>,
+    id: i64,
+    raw_tag_keys: &[u32],
+    raw_tag_vals: &[u32],
+    members: &[(MemberId, i32)],
+    metadata: Option<&RawMetadata>,
+) {
+    elem.clear();
+    encode_int64_field(elem, 1, id);
+
+    encode_packed_uint32(elem, packed, 2, raw_tag_keys);
+    encode_packed_uint32(elem, packed, 3, raw_tag_vals);
+
+    if let Some(meta) = metadata {
+        encode_info_raw_to(info_buf, meta);
+        encode_bytes_field(elem, 4, info_buf);
+    }
+
+    if !members.is_empty() {
+        // Field 8: roles_sid (packed int32)
+        packed.clear();
+        #[allow(clippy::cast_sign_loss)]
+        for &(_, role_sid) in members {
+            encode_varint(packed, role_sid as i64 as u64);
+        }
+        encode_bytes_field(elem, 8, packed);
+
+        // Field 9: memids (packed sint64, delta-encoded)
+        packed.clear();
+        let mut last_memid: i64 = 0;
+        for &(mid, _) in members {
+            encode_varint(packed, zigzag_encode_64(mid.id() - last_memid));
+            last_memid = mid.id();
+        }
+        encode_bytes_field(elem, 9, packed);
+
+        // Field 10: types (packed int32)
+        packed.clear();
+        #[allow(clippy::cast_sign_loss)]
+        for &(mid, _) in members {
+            encode_varint(packed, member_type_to_proto(mid.member_type()) as i32 as i64 as u64);
+        }
+        encode_bytes_field(elem, 10, packed);
+    }
+
+    encode_bytes_field(group_buf, 4, elem);
 }
 
 // ---------------------------------------------------------------------------

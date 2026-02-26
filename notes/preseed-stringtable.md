@@ -482,6 +482,9 @@ creates a parallel code path that must be kept in sync with the standard
 methods. Using `pub(crate)` visibility limits the maintenance burden.
 
 If implemented, the next profiling target becomes the non-string costs in
-`add_way` (delta encoding, Vec pushes, proto construction) at ~90ns/call,
-and `take()` serialization at ~91µs/block. These are harder to optimize
-and have diminishing returns.
+`add_way` (delta encoding, wire-format encoding) and `take()` serialization.
+
+> **Update:** Direct wire-format encoding is now implemented. `add_way` no longer
+> creates `proto::Way` objects — it encodes directly to protobuf bytes using
+> reusable scratch buffers. The Vec pushes and proto construction costs mentioned
+> above are eliminated.

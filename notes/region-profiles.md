@@ -195,6 +195,13 @@ complexity varies by region (tag density, ref counts, member counts).
 
 ## Decode + write allocations (cat --type)
 
+> **Note (post direct wire encoding):** The `add_way` and `add_relation` columns
+> below reflect the old prost-based encoding which allocated fresh `proto::Way`/
+> `proto::Relation` objects per element. Direct wire encoding eliminated these
+> allocations entirely — ways/relations now encode into reusable scratch buffers.
+> The `take` column is also reduced (no prost two-pass encode). These numbers
+> are preserved as the pre-optimization baseline.
+
 | Region | Total | take | add_way | frame_blob | add_node | decompress | add_relation |
 |--------|-------|------|---------|------------|----------|------------|--------------|
 | Denmark | 16.8 GB | 4.6 GB | 4.1 GB | 4.0 GB | 1.8 GB | 1.6 GB | 52 MB |

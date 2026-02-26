@@ -22,3 +22,9 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-26	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-pipe-none	9627	52489653	6616526	46103	483
 2026-02-26	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-zlib:6	18916	52489653	6616526	46103	483
 2026-02-26	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-pipe-zlib:6	9223	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-none	7067	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-none	7064	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-zlib:6	15540	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-zlib:6	7126	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-zstd:3	9061	52489653	6616526	46103	483
+2026-02-26	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-zstd:3	7036	52489653	6616526	46103	483

@@ -134,11 +134,11 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 | Compression | Sync | Pipelined | Notes |
 |-------------|------|-----------|-------|
-| none | 9.0s | 9.0s | decode + BlockBuilder floor |
-| zstd:3 | 11.0s | **9.1s** | pipelined hides compression cost |
-| zlib:6 | 17.5s | **9.1s** | 1.9x speedup from parallel compression |
+| none | 7.1s | 7.1s | decode + wire-format serialization floor |
+| zstd:3 | 9.1s | **7.0s** | pipelined hides compression cost |
+| zlib:6 | 15.5s | **7.1s** | 2.2x speedup from parallel compression |
 
-With pipelined writes, all compression modes converge to ~9s — the decode + `BlockBuilder` serialization floor. `Compression::None` on erofs is the target production config.
+With pipelined writes, all compression modes converge to ~7s — the decode + wire-format serialization floor. Ways and relations are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation). `Compression::None` on erofs is the target production config.
 
 CLI commands — Denmark extract (483 MB, 59M elements):
 

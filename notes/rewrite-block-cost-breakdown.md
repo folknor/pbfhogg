@@ -257,20 +257,27 @@ For add_relation, member delta encoding:
 
 ### What raw passthrough would require
 
-1. Bypass prost's generated `Way`/`Relation` types (which use `Vec<i64>`)
-2. Write raw packed bytes directly into the protobuf output
-3. Either: manual protobuf field encoding for refs/memids fields, or a custom
-   prost message type with `Bytes` for these fields
+> **Update:** Direct wire-format encoding is now implemented. `add_way_raw` and
+> `add_relation_raw` use manual protobuf field encoding via `src/write/wire.rs`.
+> Raw packed bytes passthrough for refs/memids is now straightforward — just write
+> the raw bytes directly to `packed_scratch` instead of delta-encoding from
+> decoded `i64` values. See TODO.md for the unblocked item.
+
+~~1. Bypass prost's generated `Way`/`Relation` types (which use `Vec<i64>`)~~
+~~2. Write raw packed bytes directly into the protobuf output~~
+~~3. Either: manual protobuf field encoding for refs/memids fields, or a custom
+   prost message type with `Bytes` for these fields~~
 
 The read side already has the raw bytes available (`WireWay.refs_data: &[u8]` in
-`wire.rs`). The difficulty is getting raw bytes into the write side, which uses
-prost's generated types that expect `Vec<i64>`.
+`wire.rs`). ~~The difficulty is getting raw bytes into the write side, which uses
+prost's generated types that expect `Vec<i64>`.~~ No longer blocked — write side
+now uses direct wire encoding.
 
 ### Verdict
 
-**Not worth the complexity.** The savings are ~72ms (3.6% of rewrite_block) for
-ways and ~2ms for relations. Combined ~74ms, or **3.7% of rewrite_block time**.
-The TODO already suspected this: "The complexity may not be justified."
+**Small but essentially free** now that direct encoding is in place. The savings
+are ~72ms (3.6% of rewrite_block) for ways and ~2ms for relations. Combined
+~74ms, or **3.7% of rewrite_block time**. Low priority but no longer complex.
 
 Compared to StringTable optimization (~674ms, 34%), this is 9× less impactful.
 The manual protobuf encoding adds fragile, hard-to-maintain code for a marginal

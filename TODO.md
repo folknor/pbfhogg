@@ -125,20 +125,140 @@ Compression::None as the faster path. Full analysis: `notes/hotpath-profile.md`.
 - [ ] **Raw packed bytes for non-string integer fields** — investigated: the
   delta encoding is compatible (both input wire format and BlockBuilder delta-
   encode refs/memids from 0 within each element), so raw byte passthrough is
-  valid. However, prost's generated `Way`/`Relation` types use `Vec<i64>` for
-  `refs`/`memids` — accepting raw packed bytes would require either bypassing
-  prost serialization for these fields (manual protobuf encoding) or a custom
-  message type. The complexity may not be justified: refs/memids are a fraction
-  of the `rewrite_block` cost compared to tag string interning and metadata
-  handling. Profile first to see if ref/memid decode+reencode is a significant
-  slice of the 1.49s `rewrite_block` total.
-  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`. Bottom-up
-  modeling estimates refs/memids delta encoding at ~74ms (3.7% of rewrite_block)
-  — 9× less impactful than StringTable. **Likely not worth the complexity.**
+  valid. Previously blocked by prost's `Vec<i64>` types requiring decode+reencode.
+  **Direct wire encoding (see BlockBuilder section) removes this blocker** — with
+  manual protobuf emission, `add_way_raw` can accept raw packed bytes for refs
+  and write them directly to `packed_scratch` without decoding. Same for relation
+  memids/roles_sid/types. Bottom-up estimate: ~74ms (3.7% of rewrite_block) —
+  small but essentially free once direct encoding is in place.
+  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`.
 
 - [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
   (slightly slower than old crate's 673ms). Buffer reuse now implemented (see
   above) — `encode_to_vec()` replaced with `encode(&mut buf)` + reused buffer.
+
+### Merge: passthrough blob I/O optimization
+
+Investigation of the uninstrumented time gap in merge (Japan: 10s instrumented,
+24.4s wall = 14s gap; Norway: 1.5s instrumented, 9.1s wall = 7.6s gap).
+
+**Root cause:** Every passthrough blob gets **4 copies** in userspace:
+1. Disk → `blob_bytes` Vec (~55 KB) — `read_raw_frame` reads blob data
+2. `blob_bytes` → `frame_bytes` Vec (~55 KB) — assembled in `read_raw_frame`
+3. `frame_bytes` → `.to_vec()` (~55 KB) — `write_raw` copies for writer channel
+4. Channel Vec → BufWriter → disk
+
+Copies 2 and 3 are unnecessary. For Japan (43K blobs), `read_raw_frame` allocates
+~4.5 GB (2.3 GB `blob_bytes` + 2.2 GB `frame_bytes`), and `write_raw` adds ~2.1 GB
+from `.to_vec()`. The `batch.clear()` / alloc cycle (64 frames per batch, dropped
+and re-allocated every iteration) adds further overhead.
+
+- [ ] **Eliminate `frame_bytes` duplication in `RawBlobFrame`** — store only one
+  buffer, derive `blob_bytes` as a slice into `frame_bytes[4+header_len..]`.
+  Eliminates one ~55 KB alloc per blob. Estimated: -2.3 GB alloc, -1-2s for Japan.
+
+- [ ] **`write_raw_owned()` — move Vec into channel instead of `.to_vec()`** — add
+  a `write_raw_owned(Vec<u8>)` method to `PbfWriter` that sends the Vec directly
+  to the writer thread channel without copying. Merge passthrough path uses
+  `std::mem::take(&mut frame.frame_bytes)` to move ownership. Estimated: -2.1 GB
+  alloc, -1-2s for Japan.
+
+- [ ] ~~**Buffer pool for `RawBlobFrame` across batches**~~ — **conflicts with
+  `write_raw_owned`**: once the Vec is moved into the writer channel, the pool never
+  gets it back. The pool only helps the 2-8% rewritten blobs (where `frame_bytes` is
+  not consumed). A backward channel (writer returns buffers via Mutex) adds cross-
+  thread sync for marginal gain. Mmap zero-copy also rejected: `copy_file_range`
+  already handles zero-copy on Linux, and mmap is incompatible with O_DIRECT.
+  **Recommendation: drop this, optimizations 1+2 are sufficient** (~4.4 GB saved,
+  67% reduction). The remaining ~2.2 GB (one `frame_bytes` alloc per blob) is a
+  tight alloc/free pattern that modern allocators handle efficiently.
+
+- [ ] **Avoid `Bytes::copy_from_slice` in `decompress_blob_data_into`** —
+  `classify_blob` calls `decompress_blob_data_into(&frame.blob_bytes, buf)` which
+  internally does `Bytes::copy_from_slice` on the entire compressed blob just to
+  parse the Blob protobuf envelope. Since `prost::Message::decode` accepts
+  `impl Buf` and `&[u8]` implements `Buf`, the copy is unnecessary.
+
+- [ ] **Avoid `Bytes::copy_from_slice` in `parse_blob_header_with_index`** —
+  `blob.rs:733` copies header bytes (~50 bytes) into a `Bytes` just to call prost
+  decode. Same fix: decode directly from `&[u8]`. Tiny per-blob but 43K unnecessary
+  copies for Japan.
+
+**Combined impact (optimizations 1+2 only):** Save ~4.4 GB from `read_raw_frame`
++ ~2.1 GB from `write_raw` (67% passthrough alloc reduction). Uninstrumented gap
+shrinks from ~14s to ~5-7s (actual disk I/O floor) for Japan. For Norway, gap
+shrinks from ~7.6s to ~3-4s. Only merge.rs needs changes — sort.rs and cat.rs
+use sync mode (no `.to_vec()` copy), so `write_raw_owned` is not needed there.
+Cat.rs has the same `RawBlobFrame` duplication (optimization 1 applicable for
+consistency, but not urgent).
+
+### BlockBuilder: direct wire-format encoding for ways/relations
+
+Investigation of per-element allocation costs in `add_way`. Cross-region data:
+Japan 588 bytes/call (42.9M ways, 25.2 GB total), Norway 900 bytes/call
+(coastline refs), London 325ns/call (highest time, dense urban tagging).
+
+**Root cause:** `add_way` creates a fresh `proto::Way` with 5 zero-capacity Vecs
+per call, grows each from zero through multiple doublings. Contrast: `add_node`
+pushes into pre-allocated reused arrays (explains 21ns vs 205ns — 10× difference).
+
+Per-call allocation breakdown (typical way, 6 tags, 8 refs):
+- `way.refs` Vec growth (0→1→2→...→next_pow2): ~120 bytes alloc traffic (biggest)
+- `way.keys`/`way.vals` Vec growth: ~48 bytes each
+- `self.ways` Vec growth (amortized): ~335 bytes/call in traffic
+- Norway coastlines (100+ refs): pushes to 900 bytes/call
+
+**Decision: direct wire-format encoding.** The read path already bypasses prost
+with ~900 lines of custom wire-format code in `src/read/wire.rs` (Cursor,
+PackedIter, varint decode, zigzag encode/decode). Direct encoding on the write
+side is the natural complement. It subsumes all incremental prost-based fixes
+(pre-allocate Vecs, column-oriented storage, way.lat/lon waste, add_way_raw
+growth) and also unlocks raw packed bytes passthrough for merge.
+
+- [x] **Direct protobuf serialization (bypass `proto::Way` entirely)** — instead
+  of building `proto::Way` objects and encoding them via prost, accumulate raw
+  protobuf bytes directly during `add_way`. Eliminates nearly all per-call
+  allocation (~580 bytes/call saved) and prost's two-pass encode (encoded_len +
+  encode_raw). ~+315 net lines. **Result: pipelined write floor 9.0s → 7.0s
+  (22% faster). Sync none 9.0→7.1s, zstd 11.0→9.1s, zlib 17.5→15.5s.**
+
+  **Design (investigated):** Replace `ways: Vec<proto::Way>` and `relations:
+  Vec<proto::Relation>` with 4 reusable `Vec<u8>` scratch buffers:
+  - `group_buf` — per-block accumulator for all serialized way/relation submessages
+  - `elem_scratch` — per-element body (cleared per call, capacity reused)
+  - `packed_scratch` — per-field packed content (keys, vals, refs as varints)
+  - `info_scratch` — Info sub-message body
+
+  Encoding flow per `add_way`: encode field tags + varints into `elem_scratch`,
+  packed fields go through `packed_scratch` (encode content → measure length →
+  write tag+length+content to `elem_scratch`), then wrap with PrimitiveGroup
+  field 3 tag + length prefix → append to `group_buf`. String table indices
+  collected via `string_table.add()` as today. `group_buf.clear()` in `reset()`
+  keeps capacity for next block (unlike old `mem::take` which zeroed it).
+
+  `take()` branches: dense nodes stay on prost (already optimized), ways/relations
+  use manual encoding — `StringTable::encode_to()` + `group_buf` concatenation
+  into `encode_buf`. Borrow-checker handled by extracting `encode_way` /
+  `encode_relation` as free functions taking individual `&mut` field refs.
+
+  Covers all variants: `add_way` (string tags via string_table.add), `add_way_raw`
+  (raw u32 indices, no string_table.add), `add_way_with_locations` (fields 9/10
+  lat/lon), `add_relation` and `add_relation_raw` (fields 8/9/10 = roles_sid/
+  memids/types). All field tags ≤ 15, so single-byte tag encoding. Negative
+  int32 values sign-extend to 10-byte varints (matches prost). Output must be
+  bit-identical to current prost encoding — verified by roundtrip tests + verify
+  scripts. Design details: `notes/direct-wire-encoding.md` (to be written).
+
+- [x] **StringTable `clear()` instead of `replace()`** — implemented as part of
+  direct wire encoding. `StringTable::clear()` reuses existing Vec/HashMap
+  allocations. Called in `reset()` for all block types.
+
+**Superseded items** (all addressed by direct wire encoding):
+- ~~Pre-allocate refs/keys/vals from known lengths~~ — no proto::Way Vecs to reserve.
+- ~~Pre-allocate `self.ways` Vec to 8000~~ — replaced by `group_buf` with `clear()`.
+- ~~Column-oriented way storage~~ — direct encoding is strictly more powerful.
+- ~~`add_way_raw` Vec growth~~ — covered by `encode_way_raw` free function.
+- ~~`way.lat`/`way.lon` unused~~ — no `proto::Way` created at all.
 
 ## Performance: parallelism
 

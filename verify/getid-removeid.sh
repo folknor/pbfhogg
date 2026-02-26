@@ -12,6 +12,7 @@ PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 # IDs to extract (known to exist in Denmark extract)
 IDS="n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation getid / removeid ==="
@@ -45,6 +46,10 @@ done
 
 echo "=== Diff (getid, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-getid.osm.pbf" "$OUTDIR/osmium-getid.osm.pbf"
+echo ""
+
+echo "=== Sort.Type_then_ID check (getid) ==="
+compare_sort_feature "$OUTDIR/pbfhogg-getid.osm.pbf" "$OUTDIR/osmium-getid.osm.pbf"
 echo ""
 
 # --- removeid: complement test ---

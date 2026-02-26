@@ -3,8 +3,8 @@ mod common;
 use std::path::Path;
 
 use common::{
-    read_all_elements_with_coords, write_test_pbf, PbfContentsWithCoords, TestNode, TestRelation,
-    TestWay,
+    read_all_elements_with_coords, read_header, write_test_pbf, PbfContentsWithCoords, TestNode,
+    TestRelation, TestWay,
 };
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
@@ -135,6 +135,9 @@ fn sort_overlapping_blobs() {
     // Correctly sorted
     assert_sorted(&result);
 
+    // Header declares Sort.Type_then_ID
+    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+
     // Node IDs are 1..=10
     let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
     assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
@@ -164,6 +167,9 @@ fn sort_wrong_type_order() {
     assert_eq!(result.ways.len(), 2);
     assert_eq!(result.relations.len(), 1);
     assert_sorted(&result);
+
+    // Header declares Sort.Type_then_ID
+    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
 
     // Tags preserved on ways
     let way_tags: Vec<&str> = result
@@ -207,6 +213,9 @@ fn sort_already_sorted() {
     assert_eq!(before.nodes.len(), after.nodes.len());
     assert_eq!(before.ways.len(), after.ways.len());
     assert_eq!(before.relations.len(), after.relations.len());
+
+    // Header declares Sort.Type_then_ID
+    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
 
     // Element data preserved exactly
     for (a, b) in before.nodes.iter().zip(after.nodes.iter()) {

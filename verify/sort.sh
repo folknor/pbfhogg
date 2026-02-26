@@ -8,6 +8,7 @@ INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/sort"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation sort ==="
@@ -42,5 +43,10 @@ done
 # --- Diff ---
 echo "=== pbfhogg diff (suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/osmium.osm.pbf"
+echo ""
+
+# --- Header features ---
+echo "=== Sort.Type_then_ID check ==="
+assert_sorted "$OUTDIR/pbfhogg.osm.pbf" "pbfhogg sort"
 echo ""
 echo "Done."

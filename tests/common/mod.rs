@@ -143,6 +143,22 @@ pub fn write_test_pbf(
 }
 
 // ---------------------------------------------------------------------------
+// PBF header reading
+// ---------------------------------------------------------------------------
+
+/// Read the header from a PBF file.
+pub fn read_header(path: &Path) -> pbfhogg::HeaderBlock {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmHeader(header) = blob.decode().expect("decode blob") {
+            return *header;
+        }
+    }
+    panic!("no header found in PBF file");
+}
+
+// ---------------------------------------------------------------------------
 // PBF reading helpers — "with coords" variant
 // ---------------------------------------------------------------------------
 

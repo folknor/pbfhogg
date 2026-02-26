@@ -411,12 +411,17 @@ fn write_header(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
+    let features: &[&str] = if header.is_sorted() {
+        &["LocationsOnWays", crate::HeaderBlock::SORT_TYPE_THEN_ID]
+    } else {
+        &["LocationsOnWays"]
+    };
     let header_bytes = build_header(
         bbox,
         header.osmosis_replication_timestamp(),
         header.osmosis_replication_sequence_number(),
         header.osmosis_replication_base_url(),
-        &["LocationsOnWays"],
+        features,
     )?;
     writer.write_header(&header_bytes)?;
     Ok(())

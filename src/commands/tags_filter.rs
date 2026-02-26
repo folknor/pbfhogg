@@ -259,7 +259,12 @@ fn tags_filter_single_pass(
         match blob.decode()? {
             BlobDecode::OsmHeader(header) => {
                 if !header_written {
-                    rebuild_header(&header, &mut writer)?;
+                    let features: &[&str] = if header.is_sorted() {
+                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
+                    } else {
+                        &[]
+                    };
+                    rebuild_header(&header, &mut writer, features)?;
                     header_written = true;
                 }
             }
@@ -466,7 +471,12 @@ fn tags_filter_two_pass(
         match blob.decode()? {
             BlobDecode::OsmHeader(header) => {
                 if !header_written {
-                    rebuild_header(&header, &mut writer)?;
+                    let features: &[&str] = if header.is_sorted() {
+                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
+                    } else {
+                        &[]
+                    };
+                    rebuild_header(&header, &mut writer, features)?;
                     header_written = true;
                 }
             }

@@ -11,6 +11,7 @@ PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 OSMOSIS_BIN="data/osmosis/osmosis-0.49.2/bin/osmosis"
 export JAVA_HOME="$(pwd)/data/jdk"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation merge ==="
@@ -54,3 +55,8 @@ for tool in pbfhogg osmium osmosis osmconvert; do
         echo "--- $tool --- MISSING"
     fi
 done
+
+# --- Header features ---
+echo "=== Sort.Type_then_ID check ==="
+assert_sorted "$OUTDIR/pbfhogg.osm.pbf" "pbfhogg merge"
+echo ""

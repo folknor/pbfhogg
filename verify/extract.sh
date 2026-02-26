@@ -9,6 +9,7 @@ OUTDIR="target/verify/extract"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 BBOX="12.4,55.6,12.7,55.8"  # Copenhagen area
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation extract ==="
@@ -44,6 +45,10 @@ echo "=== Diff (simple, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-simple.osm.pbf" "$OUTDIR/osmium-simple.osm.pbf" || true
 echo ""
 
+echo "=== Sort.Type_then_ID check (simple) ==="
+assert_sorted "$OUTDIR/pbfhogg-simple.osm.pbf" "pbfhogg extract --simple"
+echo ""
+
 # --- Complete-ways strategy ---
 echo "--- pbfhogg extract (complete-ways) ---"
 time "$PBFHOGG" extract "$INPUT" -o "$OUTDIR/pbfhogg-complete.osm.pbf" -b "$BBOX"
@@ -69,6 +74,10 @@ echo "=== Diff (complete-ways, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-complete.osm.pbf" "$OUTDIR/osmium-complete.osm.pbf" || true
 echo ""
 
+echo "=== Sort.Type_then_ID check (complete-ways) ==="
+assert_sorted "$OUTDIR/pbfhogg-complete.osm.pbf" "pbfhogg extract complete-ways"
+echo ""
+
 # --- Smart strategy ---
 echo "--- pbfhogg extract --smart ---"
 time "$PBFHOGG" extract "$INPUT" -o "$OUTDIR/pbfhogg-smart.osm.pbf" -b "$BBOX" --smart
@@ -92,6 +101,10 @@ done
 
 echo "=== Diff (smart, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-smart.osm.pbf" "$OUTDIR/osmium-smart.osm.pbf" || true
+echo ""
+
+echo "=== Sort.Type_then_ID check (smart) ==="
+assert_sorted "$OUTDIR/pbfhogg-smart.osm.pbf" "pbfhogg extract --smart"
 echo ""
 
 echo "Done."

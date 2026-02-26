@@ -8,6 +8,7 @@ INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/cat"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation cat ==="
@@ -40,6 +41,10 @@ for TYPE in node way relation; do
 
     echo "=== Diff ($TYPE, suppress-common) ==="
     "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-$TYPE.osm.pbf" "$OUTDIR/osmium-$TYPE.osm.pbf"
+    echo ""
+
+    echo "=== Sort.Type_then_ID check ($TYPE) ==="
+    compare_sort_feature "$OUTDIR/pbfhogg-$TYPE.osm.pbf" "$OUTDIR/osmium-$TYPE.osm.pbf"
     echo ""
 done
 

@@ -11,6 +11,7 @@ OSC="${2:-data/denmark-20260221-seq4705.osc.gz}"
 OUTDIR="target/verify/derive-changes"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation derive-changes ==="
@@ -72,6 +73,11 @@ echo ""
 
 echo "=== Diff: pbfhogg vs osmium roundtrips ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/roundtrip-pbfhogg.osm.pbf" "$OUTDIR/roundtrip-osmium.osm.pbf" || true
+echo ""
+
+echo "=== Sort.Type_then_ID check ==="
+assert_sorted "$OUTDIR/new.osm.pbf" "pbfhogg merge (new)"
+assert_sorted "$OUTDIR/roundtrip-pbfhogg.osm.pbf" "pbfhogg merge (roundtrip)"
 echo ""
 
 echo "Done."

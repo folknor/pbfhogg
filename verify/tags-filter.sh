@@ -8,6 +8,7 @@ INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/tags-filter"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation tags-filter ==="
@@ -42,6 +43,10 @@ echo "=== Diff (highway=primary -R, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-highway-R.osm.pbf" "$OUTDIR/osmium-highway-R.osm.pbf"
 echo ""
 
+echo "=== Sort.Type_then_ID check (highway=primary -R) ==="
+compare_sort_feature "$OUTDIR/pbfhogg-highway-R.osm.pbf" "$OUTDIR/osmium-highway-R.osm.pbf"
+echo ""
+
 # --- Test 2: amenity=restaurant with omit-referenced ---
 echo "--- pbfhogg tags-filter amenity=restaurant -R ---"
 time "$PBFHOGG" tags-filter "$INPUT" -o "$OUTDIR/pbfhogg-amenity-R.osm.pbf" -R "amenity=restaurant"
@@ -67,6 +72,10 @@ echo "=== Diff (amenity=restaurant -R, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-amenity-R.osm.pbf" "$OUTDIR/osmium-amenity-R.osm.pbf"
 echo ""
 
+echo "=== Sort.Type_then_ID check (amenity=restaurant -R) ==="
+compare_sort_feature "$OUTDIR/pbfhogg-amenity-R.osm.pbf" "$OUTDIR/osmium-amenity-R.osm.pbf"
+echo ""
+
 # --- Test 3: w/highway=primary (type-prefixed, ways only) with omit-referenced ---
 echo "--- pbfhogg tags-filter w/highway=primary -R ---"
 time "$PBFHOGG" tags-filter "$INPUT" -o "$OUTDIR/pbfhogg-w-highway-R.osm.pbf" -R "w/highway=primary"
@@ -90,6 +99,10 @@ done
 
 echo "=== Diff (w/highway=primary -R, suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg-w-highway-R.osm.pbf" "$OUTDIR/osmium-w-highway-R.osm.pbf"
+echo ""
+
+echo "=== Sort.Type_then_ID check (w/highway=primary -R) ==="
+compare_sort_feature "$OUTDIR/pbfhogg-w-highway-R.osm.pbf" "$OUTDIR/osmium-w-highway-R.osm.pbf"
 echo ""
 
 echo "Done."

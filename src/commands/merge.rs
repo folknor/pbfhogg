@@ -489,7 +489,7 @@ fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
         header.osmosis_replication_timestamp(),
         header.osmosis_replication_sequence_number(),
         header.osmosis_replication_base_url(),
-        &[],
+        &[crate::HeaderBlock::SORT_TYPE_THEN_ID],
     )?)
 }
 

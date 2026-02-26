@@ -8,6 +8,7 @@ INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/add-locations-to-ways"
 PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation add-locations-to-ways ==="
@@ -39,6 +40,10 @@ done
 
 echo "=== Diff (suppress-common) ==="
 "$PBFHOGG" diff --suppress-common "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/osmium.osm.pbf"
+echo ""
+
+echo "=== Sort.Type_then_ID check ==="
+compare_sort_feature "$OUTDIR/pbfhogg.osm.pbf" "$OUTDIR/osmium.osm.pbf"
 echo ""
 
 # --- Dense index (verify output matches hash) ---

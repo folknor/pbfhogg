@@ -44,6 +44,7 @@ pub(crate) fn flush_block(
 pub(crate) fn rebuild_header(
     header: &crate::HeaderBlock,
     writer: &mut PbfWriter<FileWriter>,
+    optional_features: &[&str],
 ) -> Result<()> {
     let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
     let header_bytes = build_header(
@@ -51,7 +52,7 @@ pub(crate) fn rebuild_header(
         header.osmosis_replication_timestamp(),
         header.osmosis_replication_sequence_number(),
         header.osmosis_replication_base_url(),
-        &[],
+        optional_features,
     )?;
     writer.write_header(&header_bytes)?;
     Ok(())

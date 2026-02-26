@@ -107,6 +107,7 @@ fn read_raw_frame<R: Read>(
 fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool) -> Result<CatStats> {
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut header_written = false;
+    let single_file = files.len() == 1;
     let mut blobs: u64 = 0;
 
     for file in files {
@@ -120,12 +121,19 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             match frame.blob_type.as_str() {
-                "OSMHeader" => {
-                    if !header_written {
-                        let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
-                        rebuild_header(&header, &mut writer)?;
-                        header_written = true;
-                    }
+                "OSMHeader"
+                    if !header_written =>
+                {
+                    let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                    // Single file: propagate Sort from input. Multi-file: concatenation
+                    // can break sort order, so never claim sorted.
+                    let features: &[&str] = if single_file && header.is_sorted() {
+                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
+                    } else {
+                        &[]
+                    };
+                    rebuild_header(&header, &mut writer, features)?;
+                    header_written = true;
                 }
                 "OSMData" => {
                     #[cfg(feature = "linux-direct-io")]
@@ -164,6 +172,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
     let mut header_written = false;
+    let single_file = files.len() == 1;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
@@ -175,7 +184,12 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
             match blob.decode()? {
                 BlobDecode::OsmHeader(header) => {
                     if !header_written {
-                        rebuild_header(&header, &mut writer)?;
+                        let features: &[&str] = if single_file && header.is_sorted() {
+                            &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
+                        } else {
+                            &[]
+                        };
+                        rebuild_header(&header, &mut writer, features)?;
                         header_written = true;
                     }
                 }

@@ -68,6 +68,17 @@ impl HeaderBlock {
     pub fn osmosis_replication_base_url(&self) -> Option<&str> {
         self.header.osmosis_replication_base_url.as_deref()
     }
+
+    /// PBF optional feature string indicating entities are sorted by type then ID.
+    pub const SORT_TYPE_THEN_ID: &str = "Sort.Type_then_ID";
+
+    /// Returns `true` if the header declares `Sort.Type_then_ID`.
+    pub fn is_sorted(&self) -> bool {
+        self.header
+            .optional_features
+            .iter()
+            .any(|f| f == Self::SORT_TYPE_THEN_ID)
+    }
 }
 
 /// A bounding box that is usually included in a [`HeaderBlock`].

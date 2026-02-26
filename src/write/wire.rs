@@ -38,7 +38,8 @@ pub(crate) fn zigzag_encode_64(v: i64) -> u64 {
 
 /// Zigzag-encode a signed 32-bit integer for `sint32` fields.
 #[inline]
-#[allow(dead_code, clippy::cast_sign_loss)]
+#[cfg(test)]
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn zigzag_encode_32(v: i32) -> u64 {
     ((v << 1) ^ (v >> 31)) as u64
 }
@@ -54,6 +55,7 @@ pub(crate) fn zigzag_encode_32(v: i32) -> u64 {
 ///
 /// For proto `int64`, `uint64`, `uint32` field types.
 #[inline]
+#[cfg(test)]
 #[allow(dead_code, clippy::cast_possible_truncation)]
 pub(crate) fn encode_varint_field(buf: &mut Vec<u8>, field: u32, value: u64) {
     if value != 0 {
@@ -80,7 +82,8 @@ pub(crate) fn encode_int64_field(buf: &mut Vec<u8>, field: u32, value: i64) {
 /// Negative `i32` sign-extends to `i64` before varint encoding, producing
 /// 10-byte varints. This matches prost's behavior for `int32` fields.
 #[inline]
-#[allow(dead_code, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 pub(crate) fn encode_int32_field(buf: &mut Vec<u8>, field: u32, value: i32) {
     if value != 0 {
         buf.push((field << 3 | WIRE_VARINT) as u8);
@@ -91,7 +94,8 @@ pub(crate) fn encode_int32_field(buf: &mut Vec<u8>, field: u32, value: i32) {
 
 /// Encode a `uint32` field. Skips if `value == 0`.
 #[inline]
-#[allow(dead_code, clippy::cast_possible_truncation)]
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn encode_uint32_field(buf: &mut Vec<u8>, field: u32, value: u32) {
     if value != 0 {
         buf.push((field << 3 | WIRE_VARINT) as u8);
@@ -101,7 +105,8 @@ pub(crate) fn encode_uint32_field(buf: &mut Vec<u8>, field: u32, value: u32) {
 
 /// Encode a `bool` field. Skips if `value == false`.
 #[inline]
-#[allow(dead_code, clippy::cast_possible_truncation)]
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn encode_bool_field(buf: &mut Vec<u8>, field: u32, value: bool) {
     if value {
         buf.push((field << 3 | WIRE_VARINT) as u8);
@@ -141,7 +146,7 @@ pub(crate) fn encode_bytes_field_always(buf: &mut Vec<u8>, field: u32, data: &[u
 ///
 /// Clears `scratch`, encodes all values as varints into it, then writes
 /// the packed field (tag + length + content) to `buf`. Skips if empty.
-#[allow(dead_code)]
+#[cfg(test)]
 pub(crate) fn encode_packed_uint32(
     buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,
@@ -161,7 +166,8 @@ pub(crate) fn encode_packed_uint32(
 /// Encode a packed repeated `int32` field.
 ///
 /// Negative values sign-extend to 10-byte varints (matching prost).
-#[allow(dead_code, clippy::cast_sign_loss)]
+#[cfg(test)]
+#[allow(clippy::cast_sign_loss)]
 pub(crate) fn encode_packed_int32(
     buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,

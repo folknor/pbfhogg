@@ -14,70 +14,7 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-## Performance: merge passthrough I/O
-
-Investigation of the uninstrumented time gap in merge (Japan: 10s instrumented,
-24.4s wall = 14s gap; Norway: 1.5s instrumented, 9.1s wall = 7.6s gap).
-
-**Root cause:** Every passthrough blob gets **4 copies** in userspace:
-1. Disk → `blob_bytes` Vec (~55 KB) — `read_raw_frame` reads blob data
-2. `blob_bytes` → `frame_bytes` Vec (~55 KB) — assembled in `read_raw_frame`
-3. `frame_bytes` → `.to_vec()` (~55 KB) — `write_raw` copies for writer channel
-4. Channel Vec → BufWriter → disk
-
-Copies 2 and 3 are unnecessary. For Japan (43K blobs), `read_raw_frame` allocates
-~4.5 GB (2.3 GB `blob_bytes` + 2.2 GB `frame_bytes`), and `write_raw` adds ~2.1 GB
-from `.to_vec()`. The `batch.clear()` / alloc cycle (64 frames per batch, dropped
-and re-allocated every iteration) adds further overhead.
-
-- [x] **Eliminate `frame_bytes` duplication in `RawBlobFrame`** — `RawBlobFrame`
-  now stores `blob_offset: usize` instead of `blob_bytes: Vec<u8>`. `read_raw_frame`
-  reads blob data directly into `frame_bytes`. Avg alloc per blob: 110 KB → 64 KB.
-
-- [x] **`write_raw_owned()` — move Vec into channel instead of `.to_vec()`** —
-  `PbfWriter::write_raw_owned(Vec<u8>)` moves the Vec into the pipeline channel.
-  `write_passthrough` takes `&mut RawBlobFrame` and uses `std::mem::take`.
-
-- ~~**Buffer pool for `RawBlobFrame` across batches**~~ — dropped (conflicts with
-  `write_raw_owned`).
-
-- [x] **Avoid `Bytes::copy_from_slice` in `decompress_blob_data_into`** — decodes
-  directly from `&[u8]` via prost's `impl Buf`. Extracted `decompress_parsed_blob_into`
-  helper shared with `_from_bytes` variant. Also fixed `decompress_blob_data`.
-
-- [x] **Avoid `Bytes::copy_from_slice` in `parse_blob_header_with_index`** — decodes
-  directly from `&[u8]`.
-
-**Measured impact (Denmark, indexdata + zlib):** Merge 5.16s → 3.36s (**-35%**).
-`read_raw_frame` alloc: 465 MB (was ~795 MB). Total merge alloc: 931 MB.
-No regression on read paths (tags-count, check-refs, cat --type unchanged).
-
 ## Performance: parallelism
-
-- [x] **Parallel merge rewrite_block** — 4-phase batch-parallel pipeline:
-  1. **Parallel classify** (`classify_only` via rayon): decompress + scan +
-     parse overlapping blobs, returning `ClassifyResult` with parsed block
-  2. **Sequential pre-compute**: collect modification IDs into emitted sets
-     via `collect_modifications`, assign creates per blob via
-     `CreateEmitter::creates_in_range` (binary search on sorted diff IDs)
-  3. **Parallel rewrite** (`rewrite_block_parallel` via rayon): per-thread
-     `BlockBuilder`, interleaves pre-assigned creates at sorted positions,
-     serializes to `Vec<Vec<u8>>`
-  4. **Sequential output**: write passthrough frames + pre-serialized blocks,
-     `CreateEmitter` handles between-blob creates
-
-  Solved the create-interleaving challenge with a two-pass approach: Phase 2
-  pre-computes which creates belong to each rewrite blob (creates in
-  `[first_id, last_id]` not in emitted set), Phase 3 interleaves them at
-  exact sorted positions. Output is identical to sequential rewrite.
-
-  **Measured impact:**
-  - Denmark (8.5% rewrite): 3.36s → 3.31s (no change — too few rewrite blobs)
-  - Germany (18.4% rewrite): indexdata+zlib 49.9s → 35.1s (**-30%**),
-    indexdata+none 52.3s → 46.4s (**-11%**)
-  - Germany thread utilization: 5 workers at 80% CPU (zlib), 29-78% (none)
-  - Planet extrapolation: ~27 min → ~5 min at 8 cores (rewrite is now
-    embarrassingly parallel, no cross-blob data dependencies)
 
 - [ ] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
   `READ_AHEAD` bounds the `sync_channel` between the I/O thread (Stage 1) and
@@ -238,12 +175,6 @@ with owned `String` instead of borrowed `Metadata<'a>`).
   but commented out (line 80-89). The field and method are zero-cost as-is —
   park until a concrete consumer exists (e.g. extract --smart, or a library user
   doing relation-based filtering).
-
-## Merge correctness
-
-Merge is fully validated: 11 unit tests + 4-tool cross-validation (commit a38c258).
-pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semantics
-(version-based vs unconditional). See git log and `verify/merge.sh` for details.
 
 ## Benchmarking
 

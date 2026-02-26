@@ -114,14 +114,14 @@ impl<R: Read + Send> ElementReader<R> {
             match blob?.decode() {
                 Ok(BlobDecode::OsmData(block)) => {
                     block.for_each_element(|element| {
-                        if is_sorted {
-                            if let Some(id) = node_id(&element) {
-                                debug_assert!(
-                                    id > last_node_id,
-                                    "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
-                                );
-                                last_node_id = id;
-                            }
+                        if is_sorted
+                            && let Some(id) = node_id(&element)
+                        {
+                            debug_assert!(
+                                id > last_node_id,
+                                "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                            );
+                            last_node_id = id;
                         }
                         f(element);
                     });
@@ -150,14 +150,14 @@ impl<R: Read + Send> ElementReader<R> {
 
         self.for_each_block_pipelined(|block| {
             block.for_each_element(|element| {
-                if is_sorted {
-                    if let Some(id) = node_id(&element) {
-                        debug_assert!(
-                            id > last_node_id,
-                            "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
-                        );
-                        last_node_id = id;
-                    }
+                if is_sorted
+                    && let Some(id) = node_id(&element)
+                {
+                    debug_assert!(
+                        id > last_node_id,
+                        "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                    );
+                    last_node_id = id;
                 }
                 f(element);
             });

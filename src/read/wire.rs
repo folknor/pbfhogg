@@ -5,7 +5,6 @@
 //! packed repeated fields. The write path and blob envelope parsing stay
 //! on the `protobuf` crate unchanged.
 
-#![allow(dead_code)]
 
 use crate::error::{new_wire_error, Result};
 
@@ -97,6 +96,7 @@ impl<'a> Cursor<'a> {
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness — symmetric with read_sint64
     pub fn read_sint32(&mut self) -> Result<i32> {
         let v = self.read_varint()?;
         Ok(zigzag_decode_32(v))
@@ -203,11 +203,13 @@ impl<'a> PackedIter<'a> {
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn is_empty(&self) -> bool {
         self.cursor.is_empty()
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn remaining_bytes(&self) -> usize {
         self.cursor.remaining()
     }
@@ -297,6 +299,7 @@ pub(crate) struct PackedInt64Iter<'a>(PackedIter<'a>);
 
 impl<'a> PackedInt64Iter<'a> {
     #[inline]
+    #[allow(dead_code)] // API completeness — symmetric with PackedSint64Iter::new
     pub fn new(data: &'a [u8]) -> Self {
         Self(PackedIter::new(data))
     }
@@ -327,16 +330,19 @@ impl<'a> PackedInt32Iter<'a> {
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn empty() -> Self {
         Self(PackedIter::empty())
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn remaining_bytes(&self) -> usize {
         self.0.remaining_bytes()
     }
@@ -367,6 +373,7 @@ impl<'a> PackedUint32Iter<'a> {
     }
 
     #[inline]
+    #[allow(dead_code)] // API completeness
     pub fn empty() -> Self {
         Self(PackedIter::empty())
     }

@@ -772,7 +772,6 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 /// internally to parse the Blob protobuf envelope. If you already have a
 /// `Vec<u8>` or `Bytes`, prefer [`decompress_blob_data_from_bytes`] to
 /// avoid the copy.
-#[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
     let blob = proto::Blob::decode(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
@@ -785,7 +784,6 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
 /// allocating a new `Vec` each time. For loops that decompress many blobs,
 /// this avoids repeated large allocations — the buffer grows to high-water
 /// mark and stays there.
-#[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     let blob = proto::Blob::decode(blob_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
@@ -795,7 +793,6 @@ pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result
 /// Zero-copy variant of [`decompress_blob_data_into`].
 ///
 /// Accepts a `Bytes` value directly, avoiding the envelope copy.
-#[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data_into_from_bytes(blob_bytes: &Bytes, buf: &mut Vec<u8>) -> Result<()> {
     let blob = proto::Blob::decode(blob_bytes.clone())
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;

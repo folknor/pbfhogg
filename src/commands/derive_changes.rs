@@ -246,7 +246,6 @@ fn merge_join_relations(
 // OSC XML writer
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn write_osc(
     output: &Path,
     creates: &Changes,

@@ -128,7 +128,6 @@ pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compressi
 // Single-pass filter (shared by getid without refs and removeid)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn filter_by_id(
     input: &Path,
     output: &Path,
@@ -176,7 +175,6 @@ fn filter_by_id(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
@@ -240,7 +238,6 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 // Hoisting buffers per cat.rs pattern would avoid allocations at planet scale.
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
 fn write_element(
     element: &Element<'_>,
     bb: &mut BlockBuilder,

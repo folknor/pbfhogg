@@ -9,7 +9,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let file_descriptors = protox::compile(proto_files, ["src/proto/"])?;
     let mut config = prost_build::Config::new();
-    config.bytes(&["."]);
+    config.bytes(["."]);
     config.out_dir(&out_dir);
     config.compile_fds(file_descriptors)?;
 

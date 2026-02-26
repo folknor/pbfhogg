@@ -355,7 +355,7 @@ pub struct DenseTagIter<'a> {
     cursor: Cursor<'a>,
 }
 
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation)]
 impl<'a> Iterator for DenseTagIter<'a> {
     type Item = (&'a str, &'a str);
 

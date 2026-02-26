@@ -567,7 +567,6 @@ pub struct TagIter<'a> {
     val_indices: PackedUint32Iter<'a>,
 }
 
-#[allow(clippy::cast_sign_loss)]
 impl<'a> Iterator for TagIter<'a> {
     type Item = (&'a str, &'a str);
 

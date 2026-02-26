@@ -437,7 +437,7 @@ impl<'a> BlockElementsIter<'a> {
                 }
             },
             ElementsIterState::Node => {
-                while let Some(data) = self.nodes.next() {
+                for data in self.nodes.by_ref() {
                     if let Ok(wire_node) = WireNode::parse(data) {
                         return Some(Some(Element::Node(Node::new(self.block, wire_node))));
                     }
@@ -446,7 +446,7 @@ impl<'a> BlockElementsIter<'a> {
                 None
             }
             ElementsIterState::Way => {
-                while let Some(data) = self.ways.next() {
+                for data in self.ways.by_ref() {
                     if let Ok(wire_way) = WireWay::parse(data) {
                         return Some(Some(Element::Way(Way::new(self.block, wire_way))));
                     }
@@ -455,7 +455,7 @@ impl<'a> BlockElementsIter<'a> {
                 None
             }
             ElementsIterState::Relation => {
-                while let Some(data) = self.relations.next() {
+                for data in self.relations.by_ref() {
                     if let Ok(wire_rel) = WireRelation::parse(data) {
                         return Some(Some(Element::Relation(Relation::new(
                             self.block, wire_rel,

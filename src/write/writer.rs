@@ -581,7 +581,6 @@ fn copy_range(
 ///
 /// This is a pure function with no I/O or shared state, suitable for calling
 /// from any thread (e.g. rayon tasks for parallel compression).
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 #[hotpath::measure]
 pub(crate) fn frame_blob(
     blob_type: &str,
@@ -626,19 +625,19 @@ pub(crate) fn frame_blob(
     let blob_bytes = blob.encode_to_vec();
 
     // Step 2: Build the BlobHeader
-    let mut header = proto::BlobHeader::default();
-    header.r#type = blob_type.to_string();
-    header.datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
-    })?;
-    if let Some(idx) = indexdata {
-        header.indexdata = Some(Bytes::copy_from_slice(idx));
-    }
+    let header = proto::BlobHeader {
+        r#type: blob_type.to_string(),
+        datasize: i32::try_from(blob_bytes.len()).map_err(|_| {
+            io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+        })?,
+        indexdata: indexdata.map(Bytes::copy_from_slice),
+    };
 
     let header_bytes = header.encode_to_vec();
 
     // Step 3: Assemble [4-byte BE header_len][BlobHeader][Blob]
-    let header_len = header_bytes.len() as u32;
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;
     let total_len = 4 + header_bytes.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
@@ -656,21 +655,22 @@ pub(crate) fn frame_blob(
 ///
 /// This is used by merge to add blob-level index metadata to passthrough blobs
 /// so that subsequent merges can classify them without decompression.
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let mut header = proto::BlobHeader::default();
-    header.r#type = "OSMData".to_string();
-    header.datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
-        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
-    })?;
-    header.indexdata = Some(Bytes::copy_from_slice(indexdata));
+    let header = proto::BlobHeader {
+        r#type: "OSMData".to_string(),
+        datasize: i32::try_from(blob_bytes.len()).map_err(|_| {
+            io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+        })?,
+        indexdata: Some(Bytes::copy_from_slice(indexdata)),
+    };
 
     let header_bytes = header.encode_to_vec();
 
-    let header_len = header_bytes.len() as u32;
+    let header_len = u32::try_from(header_bytes.len())
+        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;
     let total_len = 4 + header_bytes.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());

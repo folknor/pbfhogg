@@ -826,23 +826,26 @@ impl BlockBuilder {
     /// `new()`.
     fn take_dense_nodes_group(&mut self) -> proto::PrimitiveGroup {
         let mut group = proto::PrimitiveGroup::default();
-        let mut dense = proto::DenseNodes::default();
+        let denseinfo = if self.has_dense_metadata {
+            Some(proto::DenseInfo {
+                version: std::mem::take(&mut self.dense_versions),
+                timestamp: std::mem::take(&mut self.dense_timestamps),
+                changeset: std::mem::take(&mut self.dense_changesets),
+                uid: std::mem::take(&mut self.dense_uids),
+                user_sid: std::mem::take(&mut self.dense_user_sids),
+                visible: std::mem::take(&mut self.dense_visibles),
+            })
+        } else {
+            None
+        };
 
-        dense.id = std::mem::take(&mut self.dense_ids);
-        dense.lat = std::mem::take(&mut self.dense_lats);
-        dense.lon = std::mem::take(&mut self.dense_lons);
-        dense.keys_vals = std::mem::take(&mut self.dense_keys_vals);
-
-        if self.has_dense_metadata {
-            let mut info = proto::DenseInfo::default();
-            info.version = std::mem::take(&mut self.dense_versions);
-            info.timestamp = std::mem::take(&mut self.dense_timestamps);
-            info.changeset = std::mem::take(&mut self.dense_changesets);
-            info.uid = std::mem::take(&mut self.dense_uids);
-            info.user_sid = std::mem::take(&mut self.dense_user_sids);
-            info.visible = std::mem::take(&mut self.dense_visibles);
-            dense.denseinfo = Some(info);
-        }
+        let dense = proto::DenseNodes {
+            id: std::mem::take(&mut self.dense_ids),
+            lat: std::mem::take(&mut self.dense_lats),
+            lon: std::mem::take(&mut self.dense_lons),
+            keys_vals: std::mem::take(&mut self.dense_keys_vals),
+            denseinfo,
+        };
 
         group.dense = Some(dense);
         group
@@ -1161,9 +1164,12 @@ fn encode_relation(
 
         // Field 10: types (packed int32)
         packed.clear();
-        #[allow(clippy::cast_sign_loss)]
         for m in members {
-            encode_varint(packed, member_type_to_proto(m.id.member_type()) as i32 as i64 as u64);
+            // Protobuf int32 wire encoding: sign-extend i32 → i64 → u64.
+            // MemberType enum values are 0/1/2 so no actual sign extension occurs.
+            let mt = member_type_to_proto(m.id.member_type()) as i32;
+            #[allow(clippy::cast_sign_loss)]
+            encode_varint(packed, mt as u64);
         }
         encode_bytes_field(elem, 10, packed);
     }
@@ -1363,10 +1369,10 @@ impl<'a> HeaderBuilder<'a> {
         // Bounding box (nanodegrees)
         if let Some((left, bottom, right, top)) = self.bbox {
             header.bbox = Some(proto::HeaderBBox {
-                left: (left * 1e9) as i64,
-                right: (right * 1e9) as i64,
-                top: (top * 1e9) as i64,
-                bottom: (bottom * 1e9) as i64,
+                left: (left * 1e9).round() as i64,
+                right: (right * 1e9).round() as i64,
+                top: (top * 1e9).round() as i64,
+                bottom: (bottom * 1e9).round() as i64,
             });
         }
 

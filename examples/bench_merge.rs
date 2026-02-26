@@ -19,8 +19,7 @@ fn main() {
     let runs: usize = args
         .iter()
         .skip(3)
-        .filter(|a| !a.starts_with('-'))
-        .next()
+        .find(|a| !a.starts_with('-'))
         .and_then(|s| s.parse().ok())
         .unwrap_or(3);
 

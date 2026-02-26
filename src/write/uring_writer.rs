@@ -130,13 +130,13 @@ struct UringState {
     in_flight: u32,
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 impl UringState {
     /// Append `data` to the output.
     ///
     /// Accumulates into the current registered buffer. When the buffer fills,
     /// submits a `WriteFixed` SQE. Handles any data size by splitting across
     /// multiple buffer fills.
+    #[allow(clippy::cast_possible_truncation)] // data.len() as u64: usize fits u64
     fn write(&mut self, data: &[u8]) -> io::Result<()> {
         self.logical_size += data.len() as u64;
         let mut offset = 0;
@@ -175,6 +175,7 @@ impl UringState {
     }
 
     /// Submit the current buffer as a `WriteFixed` SQE.
+    #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by BUF_SIZE/NUM_BUFS
     fn submit_current(&mut self) -> io::Result<()> {
         let buf_idx = match self.current_buf.take() {
             Some(idx) => idx,
@@ -247,6 +248,7 @@ impl UringState {
     /// Reap completed CQEs and recycle buffer indices.
     ///
     /// If `wait` is true, blocks until at least one CQE is available.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // ud as u16, result as u32: io_uring CQE fields
     fn reap_cqes(&mut self, wait: bool) -> io::Result<()> {
         if self.in_flight == 0 {
             return Ok(());

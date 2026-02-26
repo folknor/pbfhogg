@@ -215,6 +215,42 @@ fn pipelined_matches_sequential() {
     assert_eq!(sequential, pipelined);
 }
 
+/// into_blocks_pipelined yields the same elements as for_each_pipelined.
+#[test]
+fn block_iterator_matches_pipelined() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.osm.pbf");
+    write_test_pbf(&path);
+
+    let sequential = collect_sequential(&path);
+
+    let mut from_iter = Vec::new();
+    let reader = ElementReader::from_path(&path).unwrap();
+    for block_result in reader.into_blocks_pipelined() {
+        let block = block_result.unwrap();
+        for element in block.elements() {
+            from_iter.push(element_id(&element));
+        }
+    }
+
+    assert_eq!(sequential, from_iter);
+}
+
+/// into_blocks_pipelined handles early drop without hanging.
+#[test]
+fn block_iterator_early_drop() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.osm.pbf");
+    write_test_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    let mut blocks = reader.into_blocks_pipelined();
+    // Take just the first block and drop the iterator
+    let _first = blocks.next();
+    drop(blocks);
+    // If we get here without hanging, the test passes.
+}
+
 // ---------------------------------------------------------------------------
 // par_map_reduce tests
 // ---------------------------------------------------------------------------

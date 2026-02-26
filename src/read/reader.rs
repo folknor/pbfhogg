@@ -8,6 +8,11 @@ use crate::error::{new_error, ErrorKind, Result};
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::Path;
+use std::sync::mpsc::{Receiver, sync_channel};
+use std::thread::JoinHandle;
+
+/// Number of decoded blocks buffered between the pipeline and the consumer iterator.
+const BLOCK_QUEUE: usize = 8;
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
 ///
@@ -161,6 +166,45 @@ impl<R: Read + Send> ElementReader<R> {
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
         super::pipeline::run_pipeline(self.blob_iter, f)
+    }
+
+    /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
+    ///
+    /// The 3-stage pipeline (I/O → decode → reorder) runs in a background thread.
+    /// Blocks arrive in file order via a bounded channel. The consumer controls
+    /// the iteration pace; backpressure propagates naturally when the channel fills.
+    ///
+    /// This is the iterator equivalent of [`for_each_block_pipelined`](Self::for_each_block_pipelined).
+    /// Use it when you need loop control (early exit, zipping two files, interleaving work).
+    ///
+    /// Requires `R: 'static` because the pipeline runs in a background thread.
+    /// [`ElementReader<FileReader>`] satisfies this (the common case).
+    pub fn into_blocks_pipelined(self) -> PipelinedBlocks
+    where
+        R: 'static,
+    {
+        let (tx, rx) = sync_channel(BLOCK_QUEUE);
+        let blob_iter = self.blob_iter;
+
+        let handle = std::thread::spawn(move || {
+            let result = super::pipeline::run_pipeline(blob_iter, |block| {
+                tx.send(Ok(block)).map_err(|_| {
+                    new_error(ErrorKind::Io(std::io::Error::other(
+                        "pipeline consumer dropped",
+                    )))
+                })
+            });
+            if let Err(e) = result {
+                // Deliver the error as the last iterator item.
+                // Ignore send failure — consumer may have already dropped.
+                drop(tx.send(Err(e)));
+            }
+        });
+
+        PipelinedBlocks {
+            rx: Some(rx),
+            handle: Some(handle),
+        }
     }
 
     /// Parallel map/reduce. Decodes the PBF structure in parallel, calls the closure `map_op` on
@@ -378,4 +422,37 @@ fn collect_osm_data_blobs<R: Read + Send>(blob_iter: BlobReader<R>) -> Result<Ve
         }
     }
     Ok(blobs)
+}
+
+// ---------------------------------------------------------------------------
+// PipelinedBlocks iterator
+// ---------------------------------------------------------------------------
+
+/// Iterator over decoded [`PrimitiveBlock`]s from a pipelined PBF reader.
+///
+/// Created by [`ElementReader::into_blocks_pipelined`]. The 3-stage pipeline
+/// runs in a background thread; blocks are delivered in file order via a bounded
+/// channel. Dropping this iterator signals the pipeline to shut down.
+pub struct PipelinedBlocks {
+    rx: Option<Receiver<Result<PrimitiveBlock>>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Iterator for PipelinedBlocks {
+    type Item = Result<PrimitiveBlock>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.rx.as_ref()?.recv().ok()
+    }
+}
+
+impl Drop for PipelinedBlocks {
+    fn drop(&mut self) {
+        // Close the channel first — signals the pipeline to shut down.
+        drop(self.rx.take());
+        // Join the background thread (waits for pipeline cleanup).
+        if let Some(h) = self.handle.take() {
+            drop(h.join());
+        }
+    }
 }

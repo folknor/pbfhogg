@@ -6,8 +6,8 @@ cd "$(dirname "$0")/.."
 
 INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/check-refs"
-PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
+source "$(dirname "$0")/lib.sh"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation check-refs ==="

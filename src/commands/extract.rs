@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element, MemberId};
+use crate::{Element, ElementReader, MemberId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -402,7 +402,6 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
 
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
     // OPTIMIZATION: Use sorted Vec<i64> instead of BTreeSet<i64> for matched element IDs.
     //
@@ -438,73 +437,64 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let mut node_ids_sorted = false;
     let mut way_ids_sorted = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    write_extract_header(region, &header, &mut writer)?;
-                    header_written = true;
+    let reader = ElementReader::open(input, direct_io)?;
+    write_extract_header(region, reader.header(), &mut writer)?;
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    if region.contains(dn.lat(), dn.lon()) {
+                        matched_node_ids.push(dn.id());
+                        write_dense_node(dn, &mut bb, &mut writer)?;
+                        stats.nodes_in_bbox += 1;
+                    }
                 }
-            }
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            if region.contains(dn.lat(), dn.lon()) {
-                                matched_node_ids.push(dn.id());
-                                write_dense_node(dn, &mut bb, &mut writer)?;
-                                stats.nodes_in_bbox += 1;
-                            }
-                        }
-                        Element::Node(n) => {
-                            if region.contains(n.lat(), n.lon()) {
-                                matched_node_ids.push(n.id());
-                                write_node(n, &mut bb, &mut writer)?;
-                                stats.nodes_in_bbox += 1;
-                            }
-                        }
-                        Element::Way(w) => {
-                            // Sort+dedup node IDs on first way encounter. All nodes
-                            // precede ways in OSM PBF file order, so the Vec is
-                            // complete by the time we reach the first way.
-                            if !node_ids_sorted {
-                                matched_node_ids.sort_unstable();
-                                matched_node_ids.dedup();
-                                node_ids_sorted = true;
-                            }
-                            if w.refs().any(|r| matched_node_ids.binary_search(&r).is_ok()) {
-                                matched_way_ids.push(w.id());
-                                write_way(w, &mut bb, &mut writer)?;
-                                stats.ways_written += 1;
-                            }
-                        }
-                        Element::Relation(r) => {
-                            // Sort+dedup way IDs on first relation encounter. All ways
-                            // precede relations in OSM PBF file order, so the Vec is
-                            // complete by the time we reach the first relation.
-                            // Also ensure node IDs are sorted (in case the file
-                            // contained no ways, the sort would not have triggered yet).
-                            if !node_ids_sorted {
-                                matched_node_ids.sort_unstable();
-                                matched_node_ids.dedup();
-                                node_ids_sorted = true;
-                            }
-                            if !way_ids_sorted {
-                                matched_way_ids.sort_unstable();
-                                matched_way_ids.dedup();
-                                way_ids_sorted = true;
-                            }
-                            if relation_has_matched_member(r, &matched_node_ids, &matched_way_ids) {
-                                write_relation(r, &mut bb, &mut writer)?;
-                                stats.relations_written += 1;
-                            }
-                        }
+                Element::Node(n) => {
+                    if region.contains(n.lat(), n.lon()) {
+                        matched_node_ids.push(n.id());
+                        write_node(n, &mut bb, &mut writer)?;
+                        stats.nodes_in_bbox += 1;
+                    }
+                }
+                Element::Way(w) => {
+                    // Sort+dedup node IDs on first way encounter. All nodes
+                    // precede ways in OSM PBF file order, so the Vec is
+                    // complete by the time we reach the first way.
+                    if !node_ids_sorted {
+                        matched_node_ids.sort_unstable();
+                        matched_node_ids.dedup();
+                        node_ids_sorted = true;
+                    }
+                    if w.refs().any(|r| matched_node_ids.binary_search(&r).is_ok()) {
+                        matched_way_ids.push(w.id());
+                        write_way(w, &mut bb, &mut writer)?;
+                        stats.ways_written += 1;
+                    }
+                }
+                Element::Relation(r) => {
+                    // Sort+dedup way IDs on first relation encounter. All ways
+                    // precede relations in OSM PBF file order, so the Vec is
+                    // complete by the time we reach the first relation.
+                    // Also ensure node IDs are sorted (in case the file
+                    // contained no ways, the sort would not have triggered yet).
+                    if !node_ids_sorted {
+                        matched_node_ids.sort_unstable();
+                        matched_node_ids.dedup();
+                        node_ids_sorted = true;
+                    }
+                    if !way_ids_sorted {
+                        matched_way_ids.sort_unstable();
+                        matched_way_ids.dedup();
+                        way_ids_sorted = true;
+                    }
+                    if relation_has_matched_member(r, &matched_node_ids, &matched_way_ids) {
+                        write_relation(r, &mut bb, &mut writer)?;
+                        stats.relations_written += 1;
                     }
                 }
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 
@@ -568,25 +558,19 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     let mut bbox_node_ids_sorted = false;
     let mut way_ids_sorted = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) => {}
-            BlobDecode::OsmData(block) => {
-                collect_pass1_matches(
-                    &block,
-                    region,
-                    &mut bbox_node_ids,
-                    &mut matched_way_ids,
-                    &mut all_way_node_ids,
-                    &mut matched_relation_ids,
-                    &mut bbox_node_ids_sorted,
-                    &mut way_ids_sorted,
-                );
-            }
-            BlobDecode::Unknown(_) => {}
-        }
+    let reader = ElementReader::open(input, direct_io)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        collect_pass1_matches(
+            &block,
+            region,
+            &mut bbox_node_ids,
+            &mut matched_way_ids,
+            &mut all_way_node_ids,
+            &mut matched_relation_ids,
+            &mut bbox_node_ids_sorted,
+            &mut way_ids_sorted,
+        );
     }
 
     // Sort and deduplicate all ID Vecs between pass 1 and pass 2. This is the key
@@ -611,32 +595,22 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     // --- Pass 2: Write matching elements in file order ---
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    write_extract_header(region, &header, &mut writer)?;
-                    header_written = true;
-                }
-            }
-            BlobDecode::OsmData(block) => {
-                write_pass2_elements(
-                    &block,
-                    &bbox_node_ids,
-                    &all_way_node_ids,
-                    &matched_way_ids,
-                    &matched_relation_ids,
-                    &mut bb,
-                    &mut writer,
-                    &mut stats,
-                )?;
-            }
-            BlobDecode::Unknown(_) => {}
-        }
+    let reader = ElementReader::open(input, direct_io)?;
+    write_extract_header(region, reader.header(), &mut writer)?;
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        write_pass2_elements(
+            &block,
+            &bbox_node_ids,
+            &all_way_node_ids,
+            &matched_way_ids,
+            &matched_relation_ids,
+            &mut bb,
+            &mut writer,
+            &mut stats,
+        )?;
     }
 
     flush_block(&mut bb, &mut writer)?;
@@ -810,22 +784,16 @@ fn extract_smart(
     let mut bbox_node_ids_sorted = false;
     let mut way_ids_sorted = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) => {}
-            BlobDecode::OsmData(block) => {
-                collect_pass1_smart(
-                    &block, region,
-                    &mut bbox_node_ids, &mut matched_way_ids,
-                    &mut all_way_node_ids, &mut matched_relation_ids,
-                    &mut extra_way_ids, &mut extra_node_ids,
-                    &mut bbox_node_ids_sorted, &mut way_ids_sorted,
-                );
-            }
-            BlobDecode::Unknown(_) => {}
-        }
+    let reader = ElementReader::open(input, direct_io)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        collect_pass1_smart(
+            &block, region,
+            &mut bbox_node_ids, &mut matched_way_ids,
+            &mut all_way_node_ids, &mut matched_relation_ids,
+            &mut extra_way_ids, &mut extra_node_ids,
+            &mut bbox_node_ids_sorted, &mut way_ids_sorted,
+        );
     }
 
     // Sort + dedup all Vecs between pass 1 and pass 2.
@@ -843,18 +811,16 @@ fn extract_smart(
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        if let BlobDecode::OsmData(block) = blob.decode()? {
-            for element in block.elements() {
-                if let Element::Way(w) = &element {
-                    let wid = w.id();
-                    if extra_way_ids.binary_search(&wid).is_ok()
-                        && matched_way_ids.binary_search(&wid).is_err()
-                    {
-                        extra_node_ids.extend(w.refs());
-                    }
+    let reader = ElementReader::open(input, direct_io)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            if let Element::Way(w) = &element {
+                let wid = w.id();
+                if extra_way_ids.binary_search(&wid).is_ok()
+                    && matched_way_ids.binary_search(&wid).is_err()
+                {
+                    extra_node_ids.extend(w.refs());
                 }
             }
         }
@@ -873,33 +839,23 @@ fn extract_smart(
     // --- Pass 3: Write matching elements in file order ---
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    write_extract_header(region, &header, &mut writer)?;
-                    header_written = true;
-                }
-            }
-            BlobDecode::OsmData(block) => {
-                write_pass3_smart(
-                    &block,
-                    &bbox_node_ids,
-                    &all_way_node_ids,
-                    &extra_node_ids,
-                    &matched_way_ids,
-                    &matched_relation_ids,
-                    &mut bb,
-                    &mut writer,
-                    &mut stats,
-                )?;
-            }
-            BlobDecode::Unknown(_) => {}
-        }
+    let reader = ElementReader::open(input, direct_io)?;
+    write_extract_header(region, reader.header(), &mut writer)?;
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        write_pass3_smart(
+            &block,
+            &bbox_node_ids,
+            &all_way_node_ids,
+            &extra_node_ids,
+            &matched_way_ids,
+            &matched_relation_ids,
+            &mut bb,
+            &mut writer,
+            &mut stats,
+        )?;
     }
 
     flush_block(&mut bb, &mut writer)?;

@@ -7,7 +7,7 @@ use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element};
+use crate::{Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -139,7 +139,6 @@ fn filter_by_id(
 ) -> Result<GetidStats> {
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -149,32 +148,22 @@ fn filter_by_id(
     // Fast path: if the ID set is empty, include mode writes nothing,
     // exclude mode writes everything (passthrough would be better but
     // we still need to rebuild the header).
-    let reader = BlobReader::open(input, direct_io)?;
+    let reader = ElementReader::open(input, direct_io)?;
+    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
 
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    rebuild_header(&header, &mut writer, header.is_sorted())?;
-                    header_written = true;
-                }
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            let dominated = match &element {
+                Element::DenseNode(dn) => ids.node_ids.contains(&dn.id()),
+                Element::Node(n) => ids.node_ids.contains(&n.id()),
+                Element::Way(w) => ids.way_ids.contains(&w.id()),
+                Element::Relation(r) => ids.relation_ids.contains(&r.id()),
+            };
+            let write = if include { dominated } else { !dominated };
+            if write {
+                write_element(&element, &mut bb, &mut writer, &mut stats)?;
             }
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    let dominated = match &element {
-                        Element::DenseNode(dn) => ids.node_ids.contains(&dn.id()),
-                        Element::Node(n) => ids.node_ids.contains(&n.id()),
-                        Element::Way(w) => ids.way_ids.contains(&w.id()),
-                        Element::Relation(r) => ids.relation_ids.contains(&r.id()),
-                    };
-                    let write = if include { dominated } else { !dominated };
-                    if write {
-                        write_element(&element, &mut bb, &mut writer, &mut stats)?;
-                    }
-                }
-            }
-            BlobDecode::Unknown(_) => {}
         }
     }
 
@@ -199,16 +188,14 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
     let mut dep_node_ids: BTreeSet<i64> = BTreeSet::new();
 
     if !ids.way_ids.is_empty() {
-        let reader = BlobReader::open(input, direct_io)?;
-        for blob in reader {
-            let blob = blob?;
-            if let BlobDecode::OsmData(block) = blob.decode()? {
-                for element in block.elements() {
-                    if let Element::Way(w) = &element
-                        && ids.way_ids.contains(&w.id())
-                    {
-                        dep_node_ids.extend(w.refs());
-                    }
+        let reader = ElementReader::open(input, direct_io)?;
+        for block in reader.into_blocks_pipelined() {
+            let block = block?;
+            for element in block.elements() {
+                if let Element::Way(w) = &element
+                    && ids.way_ids.contains(&w.id())
+                {
+                    dep_node_ids.extend(w.refs());
                 }
             }
         }
@@ -217,38 +204,28 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
     // Pass 2: Write matching elements + dependent nodes.
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    rebuild_header(&header, &mut writer, header.is_sorted())?;
-                    header_written = true;
+    let reader = ElementReader::open(input, direct_io)?;
+    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            let write = match &element {
+                Element::DenseNode(dn) => {
+                    ids.node_ids.contains(&dn.id())
+                        || dep_node_ids.contains(&dn.id())
                 }
-            }
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    let write = match &element {
-                        Element::DenseNode(dn) => {
-                            ids.node_ids.contains(&dn.id())
-                                || dep_node_ids.contains(&dn.id())
-                        }
-                        Element::Node(n) => {
-                            ids.node_ids.contains(&n.id())
-                                || dep_node_ids.contains(&n.id())
-                        }
-                        Element::Way(w) => ids.way_ids.contains(&w.id()),
-                        Element::Relation(r) => ids.relation_ids.contains(&r.id()),
-                    };
-                    if write {
-                        write_element(&element, &mut bb, &mut writer, &mut stats)?;
-                    }
+                Element::Node(n) => {
+                    ids.node_ids.contains(&n.id())
+                        || dep_node_ids.contains(&n.id())
                 }
+                Element::Way(w) => ids.way_ids.contains(&w.id()),
+                Element::Relation(r) => ids.relation_ids.contains(&r.id()),
+            };
+            if write {
+                write_element(&element, &mut bb, &mut writer, &mut stats)?;
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 

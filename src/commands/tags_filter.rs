@@ -5,7 +5,7 @@ use std::path::Path;
 use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element};
+use crate::{Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -244,7 +244,6 @@ fn tags_filter_single_pass(
 ) -> Result<TagsFilterStats> {
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -252,88 +251,78 @@ fn tags_filter_single_pass(
         relations_matched: 0,
     };
 
-    let reader = BlobReader::open(input, direct_io)?;
+    let reader = ElementReader::open(input, direct_io)?;
+    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
 
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    rebuild_header(&header, &mut writer, header.is_sorted())?;
-                    header_written = true;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    let tags: Vec<(&str, &str)> = dn.tags().collect();
+                    if element_matches(expressions, &tags, true, false, false) {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
+                        }
+                        let meta = dense_node_metadata(dn);
+                        bb.add_node(
+                            dn.id(),
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                            &tags,
+                            meta.as_ref(),
+                        );
+                        stats.nodes_matched += 1;
+                    }
                 }
-            }
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            let tags: Vec<(&str, &str)> = dn.tags().collect();
-                            if element_matches(expressions, &tags, true, false, false) {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let meta = dense_node_metadata(dn);
-                                bb.add_node(
-                                    dn.id(),
-                                    dn.decimicro_lat(),
-                                    dn.decimicro_lon(),
-                                    &tags,
-                                    meta.as_ref(),
-                                );
-                                stats.nodes_matched += 1;
-                            }
+                Element::Node(n) => {
+                    let tags: Vec<(&str, &str)> = n.tags().collect();
+                    if element_matches(expressions, &tags, true, false, false) {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
                         }
-                        Element::Node(n) => {
-                            let tags: Vec<(&str, &str)> = n.tags().collect();
-                            if element_matches(expressions, &tags, true, false, false) {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let meta = element_metadata(&n.info());
-                                bb.add_node(
-                                    n.id(),
-                                    n.decimicro_lat(),
-                                    n.decimicro_lon(),
-                                    &tags,
-                                    meta.as_ref(),
-                                );
-                                stats.nodes_matched += 1;
-                            }
+                        let meta = element_metadata(&n.info());
+                        bb.add_node(
+                            n.id(),
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                            &tags,
+                            meta.as_ref(),
+                        );
+                        stats.nodes_matched += 1;
+                    }
+                }
+                Element::Way(w) => {
+                    let tags: Vec<(&str, &str)> = w.tags().collect();
+                    if element_matches(expressions, &tags, false, true, false) {
+                        if !bb.can_add_way() {
+                            flush_block(&mut bb, &mut writer)?;
                         }
-                        Element::Way(w) => {
-                            let tags: Vec<(&str, &str)> = w.tags().collect();
-                            if element_matches(expressions, &tags, false, true, false) {
-                                if !bb.can_add_way() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let refs: Vec<i64> = w.refs().collect();
-                                let meta = element_metadata(&w.info());
-                                bb.add_way(w.id(), &tags, &refs, meta.as_ref());
-                                stats.ways_matched += 1;
-                            }
+                        let refs: Vec<i64> = w.refs().collect();
+                        let meta = element_metadata(&w.info());
+                        bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                        stats.ways_matched += 1;
+                    }
+                }
+                Element::Relation(r) => {
+                    let tags: Vec<(&str, &str)> = r.tags().collect();
+                    if element_matches(expressions, &tags, false, false, true) {
+                        if !bb.can_add_relation() {
+                            flush_block(&mut bb, &mut writer)?;
                         }
-                        Element::Relation(r) => {
-                            let tags: Vec<(&str, &str)> = r.tags().collect();
-                            if element_matches(expressions, &tags, false, false, true) {
-                                if !bb.can_add_relation() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let members: Vec<MemberData<'_>> = r
-                                    .members()
-                                    .map(|m| MemberData {
-                                        id: m.id,
-                                        role: m.role().unwrap_or(""),
-                                    })
-                                    .collect();
-                                let meta = element_metadata(&r.info());
-                                bb.add_relation(r.id(), &tags, &members, meta.as_ref());
-                                stats.relations_matched += 1;
-                            }
-                        }
+                        let members: Vec<MemberData<'_>> = r
+                            .members()
+                            .map(|m| MemberData {
+                                id: m.id,
+                                role: m.role().unwrap_or(""),
+                            })
+                            .collect();
+                        let meta = element_metadata(&r.info());
+                        bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                        stats.relations_matched += 1;
                     }
                 }
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 
@@ -395,43 +384,37 @@ fn tags_filter_two_pass(
     let mut matched_relation_ids: Vec<i64> = Vec::new();
     let mut way_dep_node_ids: Vec<i64> = Vec::new();
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) => {}
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            let tags: Vec<(&str, &str)> = dn.tags().collect();
-                            if element_matches(expressions, &tags, true, false, false) {
-                                matched_node_ids.push(dn.id());
-                            }
-                        }
-                        Element::Node(n) => {
-                            let tags: Vec<(&str, &str)> = n.tags().collect();
-                            if element_matches(expressions, &tags, true, false, false) {
-                                matched_node_ids.push(n.id());
-                            }
-                        }
-                        Element::Way(w) => {
-                            let tags: Vec<(&str, &str)> = w.tags().collect();
-                            if element_matches(expressions, &tags, false, true, false) {
-                                matched_way_ids.push(w.id());
-                                way_dep_node_ids.extend(w.refs());
-                            }
-                        }
-                        Element::Relation(r) => {
-                            let tags: Vec<(&str, &str)> = r.tags().collect();
-                            if element_matches(expressions, &tags, false, false, true) {
-                                matched_relation_ids.push(r.id());
-                            }
-                        }
+    let reader = ElementReader::open(input, direct_io)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    let tags: Vec<(&str, &str)> = dn.tags().collect();
+                    if element_matches(expressions, &tags, true, false, false) {
+                        matched_node_ids.push(dn.id());
+                    }
+                }
+                Element::Node(n) => {
+                    let tags: Vec<(&str, &str)> = n.tags().collect();
+                    if element_matches(expressions, &tags, true, false, false) {
+                        matched_node_ids.push(n.id());
+                    }
+                }
+                Element::Way(w) => {
+                    let tags: Vec<(&str, &str)> = w.tags().collect();
+                    if element_matches(expressions, &tags, false, true, false) {
+                        matched_way_ids.push(w.id());
+                        way_dep_node_ids.extend(w.refs());
+                    }
+                }
+                Element::Relation(r) => {
+                    let tags: Vec<(&str, &str)> = r.tags().collect();
+                    if element_matches(expressions, &tags, false, false, true) {
+                        matched_relation_ids.push(r.id());
                     }
                 }
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 
@@ -458,104 +441,94 @@ fn tags_filter_two_pass(
     // --- Pass 2: Write matching elements in file order ---
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    rebuild_header(&header, &mut writer, header.is_sorted())?;
-                    header_written = true;
-                }
-            }
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            // binary_search on sorted slices: O(log n) lookup, same
-                            // as BTreeSet but with contiguous memory for better cache
-                            // performance.
-                            let direct = matched_node_ids.binary_search(&dn.id()).is_ok();
-                            let from_way = way_dep_node_ids.binary_search(&dn.id()).is_ok();
-                            if direct || from_way {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let tags: Vec<(&str, &str)> = dn.tags().collect();
-                                let meta = dense_node_metadata(dn);
-                                bb.add_node(
-                                    dn.id(),
-                                    dn.decimicro_lat(),
-                                    dn.decimicro_lon(),
-                                    &tags,
-                                    meta.as_ref(),
-                                );
-                                if direct {
-                                    stats.nodes_matched += 1;
-                                } else {
-                                    stats.nodes_from_ways += 1;
-                                }
-                            }
+    let reader = ElementReader::open(input, direct_io)?;
+    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    // binary_search on sorted slices: O(log n) lookup, same
+                    // as BTreeSet but with contiguous memory for better cache
+                    // performance.
+                    let direct = matched_node_ids.binary_search(&dn.id()).is_ok();
+                    let from_way = way_dep_node_ids.binary_search(&dn.id()).is_ok();
+                    if direct || from_way {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
                         }
-                        Element::Node(n) => {
-                            let direct = matched_node_ids.binary_search(&n.id()).is_ok();
-                            let from_way = way_dep_node_ids.binary_search(&n.id()).is_ok();
-                            if direct || from_way {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let tags: Vec<(&str, &str)> = n.tags().collect();
-                                let meta = element_metadata(&n.info());
-                                bb.add_node(
-                                    n.id(),
-                                    n.decimicro_lat(),
-                                    n.decimicro_lon(),
-                                    &tags,
-                                    meta.as_ref(),
-                                );
-                                if direct {
-                                    stats.nodes_matched += 1;
-                                } else {
-                                    stats.nodes_from_ways += 1;
-                                }
-                            }
-                        }
-                        Element::Way(w) => {
-                            if matched_way_ids.binary_search(&w.id()).is_ok() {
-                                if !bb.can_add_way() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let tags: Vec<(&str, &str)> = w.tags().collect();
-                                let refs: Vec<i64> = w.refs().collect();
-                                let meta = element_metadata(&w.info());
-                                bb.add_way(w.id(), &tags, &refs, meta.as_ref());
-                                stats.ways_matched += 1;
-                            }
-                        }
-                        Element::Relation(r) => {
-                            if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                                if !bb.can_add_relation() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                let tags: Vec<(&str, &str)> = r.tags().collect();
-                                let members: Vec<MemberData<'_>> = r
-                                    .members()
-                                    .map(|m| MemberData {
-                                        id: m.id,
-                                        role: m.role().unwrap_or(""),
-                                    })
-                                    .collect();
-                                let meta = element_metadata(&r.info());
-                                bb.add_relation(r.id(), &tags, &members, meta.as_ref());
-                                stats.relations_matched += 1;
-                            }
+                        let tags: Vec<(&str, &str)> = dn.tags().collect();
+                        let meta = dense_node_metadata(dn);
+                        bb.add_node(
+                            dn.id(),
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                            &tags,
+                            meta.as_ref(),
+                        );
+                        if direct {
+                            stats.nodes_matched += 1;
+                        } else {
+                            stats.nodes_from_ways += 1;
                         }
                     }
                 }
+                Element::Node(n) => {
+                    let direct = matched_node_ids.binary_search(&n.id()).is_ok();
+                    let from_way = way_dep_node_ids.binary_search(&n.id()).is_ok();
+                    if direct || from_way {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
+                        }
+                        let tags: Vec<(&str, &str)> = n.tags().collect();
+                        let meta = element_metadata(&n.info());
+                        bb.add_node(
+                            n.id(),
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                            &tags,
+                            meta.as_ref(),
+                        );
+                        if direct {
+                            stats.nodes_matched += 1;
+                        } else {
+                            stats.nodes_from_ways += 1;
+                        }
+                    }
+                }
+                Element::Way(w) => {
+                    if matched_way_ids.binary_search(&w.id()).is_ok() {
+                        if !bb.can_add_way() {
+                            flush_block(&mut bb, &mut writer)?;
+                        }
+                        let tags: Vec<(&str, &str)> = w.tags().collect();
+                        let refs: Vec<i64> = w.refs().collect();
+                        let meta = element_metadata(&w.info());
+                        bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                        stats.ways_matched += 1;
+                    }
+                }
+                Element::Relation(r) => {
+                    if matched_relation_ids.binary_search(&r.id()).is_ok() {
+                        if !bb.can_add_relation() {
+                            flush_block(&mut bb, &mut writer)?;
+                        }
+                        let tags: Vec<(&str, &str)> = r.tags().collect();
+                        let members: Vec<MemberData<'_>> = r
+                            .members()
+                            .map(|m| MemberData {
+                                id: m.id,
+                                role: m.role().unwrap_or(""),
+                            })
+                            .collect();
+                        let meta = element_metadata(&r.info());
+                        bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                        stats.relations_matched += 1;
+                    }
+                }
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 

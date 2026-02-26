@@ -6,7 +6,6 @@ cd "$(dirname "$0")/.."
 
 INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/extract"
-PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 BBOX="12.4,55.6,12.7,55.8"  # Copenhagen area
 
 source "$(dirname "$0")/lib.sh"

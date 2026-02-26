@@ -7,7 +7,6 @@ cd "$(dirname "$0")/.."
 
 INPUT="${1:-data/denmark-latest.osm.pbf}"
 OUTDIR="target/verify/getid-removeid"
-PBFHOGG="/media/folk/Hekkan/cargo/release/pbfhogg"
 
 # IDs to extract (known to exist in Denmark extract)
 IDS="n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339"

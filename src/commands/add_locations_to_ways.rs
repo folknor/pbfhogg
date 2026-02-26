@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element};
+use crate::{Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -214,24 +214,18 @@ fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Res
         IndexType::Hash => NodeLocationIndex::Hash(HashMap::new()),
         IndexType::Dense { capacity } => NodeLocationIndex::Dense(DenseMmapIndex::new(capacity)?),
     };
-    let reader = BlobReader::open(input, direct_io)?;
-
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) | BlobDecode::Unknown(_) => {}
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            index.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
-                        }
-                        Element::Node(n) => {
-                            index.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
-                        }
-                        Element::Way(_) | Element::Relation(_) => {}
-                    }
+    let reader = ElementReader::open(input, direct_io)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    index.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
                 }
+                Element::Node(n) => {
+                    index.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
+                }
+                Element::Way(_) | Element::Relation(_) => {}
             }
         }
     }
@@ -263,137 +257,126 @@ fn write_output(
 
     let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
-    let mut header_written = false;
 
-    let reader = BlobReader::open(input, direct_io)?;
-    for blob in reader {
-        let blob = blob?;
-        match blob.decode()? {
-            BlobDecode::OsmHeader(header) => {
-                if !header_written {
-                    write_header(&header, &mut writer)?;
-                    header_written = true;
-                }
-            }
-            BlobDecode::OsmData(block) => {
-                // Reusable buffers for element data, hoisted outside the element loop.
-                //
-                // WHY: Without hoisting, each element allocates fresh Vecs via .collect(),
-                // producing N allocations where N = number of elements. For Denmark (~50M
-                // elements), that is ~150M alloc/dealloc pairs across the 3 buffer types
-                // (tags + refs + members), plus ~8M more for the locations buffer on ways.
-                //
-                // HOW: Vec::clear() sets len to 0 but keeps the underlying heap allocation.
-                // The subsequent extend() refills the buffer without reallocating once the
-                // capacity is warm (i.e. after the first few elements in each block).
-                //
-                // These buffers grow to the size of the largest element in the block and
-                // stabilize — there is no unbounded growth because PBF blocks have a max
-                // of 8000 entities. They are scoped to the OsmData arm so that the borrowed
-                // string references (which point into `block`) do not outlive the block.
-                let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-                let mut refs_buf: Vec<i64> = Vec::new();
-                let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-                let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+    let reader = ElementReader::open(input, direct_io)?;
+    write_header(reader.header(), &mut writer)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        // Reusable buffers for element data, hoisted outside the element loop.
+        //
+        // WHY: Without hoisting, each element allocates fresh Vecs via .collect(),
+        // producing N allocations where N = number of elements. For Denmark (~50M
+        // elements), that is ~150M alloc/dealloc pairs across the 3 buffer types
+        // (tags + refs + members), plus ~8M more for the locations buffer on ways.
+        //
+        // HOW: Vec::clear() sets len to 0 but keeps the underlying heap allocation.
+        // The subsequent extend() refills the buffer without reallocating once the
+        // capacity is warm (i.e. after the first few elements in each block).
+        //
+        // These buffers grow to the size of the largest element in the block and
+        // stabilize — there is no unbounded growth because PBF blocks have a max
+        // of 8000 entities. They are scoped to the OsmData arm so that the borrowed
+        // string references (which point into `block`) do not outlive the block.
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+        let mut locations_buf: Vec<(i32, i32)> = Vec::new();
 
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            stats.nodes_read += 1;
-                            let has_tags = dn.tags().next().is_some();
-                            if keep_untagged_nodes || has_tags {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                tags_buf.clear();
-                                tags_buf.extend(dn.tags());
-                                let meta = dense_node_metadata(dn);
-                                bb.add_node(
-                                    dn.id(),
-                                    dn.decimicro_lat(),
-                                    dn.decimicro_lon(),
-                                    &tags_buf,
-                                    meta.as_ref(),
-                                );
-                                stats.nodes_written += 1;
-                            } else {
-                                stats.nodes_dropped += 1;
-                            }
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    stats.nodes_read += 1;
+                    let has_tags = dn.tags().next().is_some();
+                    if keep_untagged_nodes || has_tags {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
                         }
-                        Element::Node(n) => {
-                            stats.nodes_read += 1;
-                            let has_tags = n.tags().next().is_some();
-                            if keep_untagged_nodes || has_tags {
-                                if !bb.can_add_node() {
-                                    flush_block(&mut bb, &mut writer)?;
-                                }
-                                tags_buf.clear();
-                                tags_buf.extend(n.tags());
-                                let meta = element_metadata(&n.info());
-                                bb.add_node(
-                                    n.id(),
-                                    n.decimicro_lat(),
-                                    n.decimicro_lon(),
-                                    &tags_buf,
-                                    meta.as_ref(),
-                                );
-                                stats.nodes_written += 1;
-                            } else {
-                                stats.nodes_dropped += 1;
-                            }
-                        }
-                        Element::Way(w) => {
-                            if !bb.can_add_way() {
-                                flush_block(&mut bb, &mut writer)?;
-                            }
-                            tags_buf.clear();
-                            tags_buf.extend(w.tags());
-                            refs_buf.clear();
-                            refs_buf.extend(w.refs());
-                            locations_buf.clear();
-                            locations_buf.extend(refs_buf.iter().map(|node_id| {
-                                match index.get(*node_id) {
-                                    Some(loc) => loc,
-                                    None => {
-                                        stats.missing_locations += 1;
-                                        (0, 0)
-                                    }
-                                }
-                            }));
-                            let meta = element_metadata(&w.info());
-                            bb.add_way_with_locations(
-                                w.id(),
-                                &tags_buf,
-                                &refs_buf,
-                                &locations_buf,
-                                meta.as_ref(),
-                            );
-                            stats.ways_written += 1;
-                        }
-                        Element::Relation(r) => {
-                            if !bb.can_add_relation() {
-                                flush_block(&mut bb, &mut writer)?;
-                            }
-                            tags_buf.clear();
-                            tags_buf.extend(r.tags());
-                            members_buf.clear();
-                            members_buf.extend(r.members().map(|m| MemberData {
-                                id: m.id,
-                                role: m.role().unwrap_or(""),
-                            }));
-                            let meta = element_metadata(&r.info());
-                            bb.add_relation(
-                                r.id(),
-                                &tags_buf,
-                                &members_buf,
-                                meta.as_ref(),
-                            );
-                            stats.relations_written += 1;
-                        }
+                        tags_buf.clear();
+                        tags_buf.extend(dn.tags());
+                        let meta = dense_node_metadata(dn);
+                        bb.add_node(
+                            dn.id(),
+                            dn.decimicro_lat(),
+                            dn.decimicro_lon(),
+                            &tags_buf,
+                            meta.as_ref(),
+                        );
+                        stats.nodes_written += 1;
+                    } else {
+                        stats.nodes_dropped += 1;
                     }
                 }
+                Element::Node(n) => {
+                    stats.nodes_read += 1;
+                    let has_tags = n.tags().next().is_some();
+                    if keep_untagged_nodes || has_tags {
+                        if !bb.can_add_node() {
+                            flush_block(&mut bb, &mut writer)?;
+                        }
+                        tags_buf.clear();
+                        tags_buf.extend(n.tags());
+                        let meta = element_metadata(&n.info());
+                        bb.add_node(
+                            n.id(),
+                            n.decimicro_lat(),
+                            n.decimicro_lon(),
+                            &tags_buf,
+                            meta.as_ref(),
+                        );
+                        stats.nodes_written += 1;
+                    } else {
+                        stats.nodes_dropped += 1;
+                    }
+                }
+                Element::Way(w) => {
+                    if !bb.can_add_way() {
+                        flush_block(&mut bb, &mut writer)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    locations_buf.clear();
+                    locations_buf.extend(refs_buf.iter().map(|node_id| {
+                        match index.get(*node_id) {
+                            Some(loc) => loc,
+                            None => {
+                                stats.missing_locations += 1;
+                                (0, 0)
+                            }
+                        }
+                    }));
+                    let meta = element_metadata(&w.info());
+                    bb.add_way_with_locations(
+                        w.id(),
+                        &tags_buf,
+                        &refs_buf,
+                        &locations_buf,
+                        meta.as_ref(),
+                    );
+                    stats.ways_written += 1;
+                }
+                Element::Relation(r) => {
+                    if !bb.can_add_relation() {
+                        flush_block(&mut bb, &mut writer)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(
+                        r.id(),
+                        &tags_buf,
+                        &members_buf,
+                        meta.as_ref(),
+                    );
+                    stats.relations_written += 1;
+                }
             }
-            BlobDecode::Unknown(_) => {}
         }
     }
 

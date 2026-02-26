@@ -1,8 +1,31 @@
 #!/usr/bin/env bash
 # Shared helpers for verify scripts.
 # Source this file: source "$(dirname "$0")/lib.sh"
-#
-# Requires $PBFHOGG to be set before sourcing.
+
+# ---------------------------------------------------------------------------
+# Required tools
+# ---------------------------------------------------------------------------
+
+require_cmd() {
+    if ! command -v "$1" &>/dev/null; then
+        echo "ERROR: $1 is not installed."
+        if [[ -n "${2:-}" ]]; then echo "  $2"; fi
+        exit 1
+    fi
+}
+
+require_cmd cargo "Install Rust toolchain: https://rustup.rs"
+require_cmd python3 "sudo apt install python3  OR  brew install python3"
+require_cmd osmium "sudo apt install osmium-tool  OR  brew install osmium-tool"
+
+# ---------------------------------------------------------------------------
+# Resolve PBFHOGG binary path dynamically from cargo metadata.
+# Works regardless of custom target-dir settings in .cargo/config.toml.
+# ---------------------------------------------------------------------------
+
+CARGO_TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])")
+PBFHOGG="${CARGO_TARGET_DIR}/release/pbfhogg"
 
 # Assert that a PBF file's header contains Sort.Type_then_ID.
 # Usage: assert_sorted FILE LABEL

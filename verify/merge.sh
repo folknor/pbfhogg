@@ -4,13 +4,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+source "$(dirname "$0")/lib.sh"
+
 BASE="${1:-data/denmark-20260220-seq4704.osm.pbf}"
 OSC="${2:-data/denmark-20260221-seq4705.osc.gz}"
-OUTDIR="target/verify/merge"
+OUTDIR="$CARGO_TARGET_DIR/verify/merge"
 OSMOSIS_BIN="data/osmosis/osmosis-0.49.2/bin/osmosis"
 export JAVA_HOME="$(pwd)/data/jdk"
-
-source "$(dirname "$0")/lib.sh"
 require_cmd osmconvert "sudo apt install osmctools  OR  brew install osmctools"
 if [[ ! -x "$OSMOSIS_BIN" ]]; then
     echo "ERROR: osmosis not found at $OSMOSIS_BIN"

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib.sh"
 
 # Fixed dataset for reproducible profiling.
 PBF="data/denmark-20260220-seq4704.osm.pbf"
@@ -16,10 +17,10 @@ cargo build --release -p pbfhogg-cli --features hotpath
 
 # hotpath metrics go to stdout; capture to tempfile so command output
 # doesn't bury them. stderr (summaries) flows through normally.
-OUTFILE=$(mktemp .hotpath_out.XXXXXX)
-MERGED=$(mktemp .hotpath_merged.XXXXXX.osm.pbf)
+OUTFILE=$(mktemp "$CARGO_TARGET_DIR/.hotpath_out.XXXXXX")
+MERGED=$(mktemp "$CARGO_TARGET_DIR/.hotpath_merged.XXXXXX.osm.pbf")
 trap 'rm -f "$OUTFILE" "$MERGED"' EXIT
-BIN=./target/release/pbfhogg
+BIN="$PBFHOGG"
 
 # 1. Pipelined read — ElementReader::for_each_pipelined
 #    Same API path as elivagar and nidhogg ingest.

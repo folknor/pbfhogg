@@ -5,13 +5,12 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-INPUT="${1:-data/denmark-latest.osm.pbf}"
-OUTDIR="target/verify/getid-removeid"
+source "$(dirname "$0")/lib.sh"
 
+INPUT="${1:-data/denmark-latest.osm.pbf}"
 # IDs to extract (known to exist in Denmark extract)
 IDS="n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339"
-
-source "$(dirname "$0")/lib.sh"
+OUTDIR="$CARGO_TARGET_DIR/verify/getid-removeid"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation getid / removeid ==="

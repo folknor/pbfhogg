@@ -4,10 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-INPUT="${1:-data/denmark-latest.osm.pbf}"
-OUTDIR="target/verify/check-refs"
-
 source "$(dirname "$0")/lib.sh"
+
+INPUT="${1:-data/denmark-latest.osm.pbf}"
+OUTDIR="$CARGO_TARGET_DIR/verify/check-refs"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation check-refs ==="

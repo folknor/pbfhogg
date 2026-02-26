@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib.sh"
 
 PBF="${1:-data/denmark-latest.osm.pbf}"
 RUNS="${2:-3}"
@@ -15,7 +16,7 @@ if [ ! -f "$PBF" ]; then
 fi
 
 NAME="$(basename "${PBF%.osm.pbf}")"
-FILE_MB=$(( $(stat -Lc%s "$PBF") / 1000000 ))
+FILE_MB=$(file_size_mb "$PBF")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
 DIRTY=""
 if ! git diff --quiet HEAD 2>/dev/null; then
@@ -34,7 +35,7 @@ echo ""
 echo "Building (release, zlib-ng)..."
 cargo build --release --examples --no-default-features --features zlib-ng 2>&1 | tail -1
 BENCH_BIN=$(cargo build --release --example bench_write --no-default-features --features zlib-ng --message-format=json 2>/dev/null \
-    | grep '"executable"' | grep -oP '"executable":"\K[^"]+')
+    | cargo_bin_path)
 echo ""
 
 # Create TSV header if needed
@@ -42,7 +43,7 @@ if [ ! -f "$LOG" ]; then
     printf "date\tcommit\tsubject\tpbf\tmode\telapsed_ms\tnodes\tways\trelations\tfile_mb\n" > "$LOG"
 fi
 
-STDERR_FILE=$(mktemp .bench_self_write_stderr.XXXXXX)
+STDERR_FILE=$(mktemp "$CARGO_TARGET_DIR/.bench_self_write_stderr.XXXXXX")
 trap 'rm -f "$STDERR_FILE"' EXIT
 
 "$BENCH_BIN" "$PBF" "$RUNS" --compression "$COMPRESSION" 2> "$STDERR_FILE"

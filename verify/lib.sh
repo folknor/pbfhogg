@@ -24,7 +24,12 @@ require_cmd osmium "sudo apt install osmium-tool  OR  brew install osmium-tool"
 # ---------------------------------------------------------------------------
 
 CARGO_TARGET_DIR=$(cargo metadata --format-version 1 --no-deps 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])")
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['target_directory'])") || {
+    echo "ERROR: Failed to resolve cargo target directory."
+    echo "  Ensure you are in a Cargo workspace."
+    exit 1
+}
+
 PBFHOGG="${CARGO_TARGET_DIR}/release/pbfhogg"
 
 # Assert that a PBF file's header contains Sort.Type_then_ID.

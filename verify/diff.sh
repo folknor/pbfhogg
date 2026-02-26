@@ -5,11 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+source "$(dirname "$0")/lib.sh"
+
 OLD="${1:-data/denmark-20260220-seq4704.osm.pbf}"
 OSC="${2:-data/denmark-20260221-seq4705.osc.gz}"
-OUTDIR="target/verify/diff"
-
-source "$(dirname "$0")/lib.sh"
+OUTDIR="$CARGO_TARGET_DIR/verify/diff"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation diff ==="

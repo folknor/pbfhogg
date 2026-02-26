@@ -4,11 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-INPUT="${1:-data/denmark-latest.osm.pbf}"
-OUTDIR="target/verify/extract"
-BBOX="12.4,55.6,12.7,55.8"  # Copenhagen area
-
 source "$(dirname "$0")/lib.sh"
+
+INPUT="${1:-data/denmark-latest.osm.pbf}"
+BBOX="12.4,55.6,12.7,55.8"  # Copenhagen area
+OUTDIR="$CARGO_TARGET_DIR/verify/extract"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation extract ==="

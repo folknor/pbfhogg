@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib.sh"
 
 PBF="${1:-data/denmark-latest.osm.pbf}"
 RUNS="${2:-3}"
@@ -19,7 +20,7 @@ for cmd in jq curl; do
     fi
 done
 
-FILE_MB=$(( $(stat -Lc%s "$PBF") / 1000000 ))
+FILE_MB=$(file_size_mb "$PBF")
 
 # --- Temurin JRE setup ---
 # We need a JDK (not JRE) for javac to compile our benchmark
@@ -29,9 +30,24 @@ JDK_VERSION_FILE="data/.jdk-version"
 JAVA="$JDK_DIR/bin/java"
 JAVAC="$JDK_DIR/bin/javac"
 
+# Detect architecture
+case "$(uname -m)" in
+    x86_64)  JDK_ARCH="x64" ;;
+    aarch64) JDK_ARCH="aarch64" ;;
+    arm64)   JDK_ARCH="aarch64" ;;  # macOS reports arm64
+    *)       echo "ERROR: Unsupported architecture: $(uname -m)"; exit 1 ;;
+esac
+
+# Detect OS
+case "$(uname -s)" in
+    Linux)  JDK_OS="linux" ;;
+    Darwin) JDK_OS="mac" ;;
+    *)      echo "ERROR: Unsupported OS: $(uname -s)"; exit 1 ;;
+esac
+
 ensure_jdk() {
     echo "Checking Temurin JDK ${JDK_MAJOR}..."
-    local api_url="https://api.adoptium.net/v3/assets/latest/${JDK_MAJOR}/hotspot?architecture=x64&image_type=jdk&os=linux&vendor=eclipse"
+    local api_url="https://api.adoptium.net/v3/assets/latest/${JDK_MAJOR}/hotspot?architecture=${JDK_ARCH}&image_type=jdk&os=${JDK_OS}&vendor=eclipse"
     local api_json
     api_json=$(curl -sfL "$api_url") || { echo "Error: failed to query Adoptium API"; exit 1; }
 
@@ -115,7 +131,7 @@ echo ""
 
 # Run benchmark, capturing stderr for summary while passing it through.
 # BenchPbfRead outputs --- delimited key=value blocks to stderr.
-BENCH_STDERR=$(mktemp)
+BENCH_STDERR=$(mktemp "$CARGO_TARGET_DIR/.bench_planetiler_stderr.XXXXXX")
 trap 'rm -f "$BENCH_STDERR"' EXIT
 
 "$JAVA" "-Xmx${HEAP_MB}m" \

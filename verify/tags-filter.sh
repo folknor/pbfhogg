@@ -4,10 +4,10 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-INPUT="${1:-data/denmark-latest.osm.pbf}"
-OUTDIR="target/verify/tags-filter"
-
 source "$(dirname "$0")/lib.sh"
+
+INPUT="${1:-data/denmark-latest.osm.pbf}"
+OUTDIR="$CARGO_TARGET_DIR/verify/tags-filter"
 mkdir -p "$OUTDIR"
 
 echo "=== Cross-validation tags-filter ==="

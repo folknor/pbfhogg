@@ -30,44 +30,27 @@ Copies 2 and 3 are unnecessary. For Japan (43K blobs), `read_raw_frame` allocate
 from `.to_vec()`. The `batch.clear()` / alloc cycle (64 frames per batch, dropped
 and re-allocated every iteration) adds further overhead.
 
-- [ ] **Eliminate `frame_bytes` duplication in `RawBlobFrame`** — store only one
-  buffer, derive `blob_bytes` as a slice into `frame_bytes[4+header_len..]`.
-  Eliminates one ~55 KB alloc per blob. Estimated: -2.3 GB alloc, -1-2s for Japan.
+- [x] **Eliminate `frame_bytes` duplication in `RawBlobFrame`** — `RawBlobFrame`
+  now stores `blob_offset: usize` instead of `blob_bytes: Vec<u8>`. `read_raw_frame`
+  reads blob data directly into `frame_bytes`. Avg alloc per blob: 110 KB → 64 KB.
 
-- [ ] **`write_raw_owned()` — move Vec into channel instead of `.to_vec()`** — add
-  a `write_raw_owned(Vec<u8>)` method to `PbfWriter` that sends the Vec directly
-  to the writer thread channel without copying. Merge passthrough path uses
-  `std::mem::take(&mut frame.frame_bytes)` to move ownership. Estimated: -2.1 GB
-  alloc, -1-2s for Japan.
+- [x] **`write_raw_owned()` — move Vec into channel instead of `.to_vec()`** —
+  `PbfWriter::write_raw_owned(Vec<u8>)` moves the Vec into the pipeline channel.
+  `write_passthrough` takes `&mut RawBlobFrame` and uses `std::mem::take`.
 
-- [ ] ~~**Buffer pool for `RawBlobFrame` across batches**~~ — **conflicts with
-  `write_raw_owned`**: once the Vec is moved into the writer channel, the pool never
-  gets it back. The pool only helps the 2-8% rewritten blobs (where `frame_bytes` is
-  not consumed). A backward channel (writer returns buffers via Mutex) adds cross-
-  thread sync for marginal gain. Mmap zero-copy also rejected: `copy_file_range`
-  already handles zero-copy on Linux, and mmap is incompatible with O_DIRECT.
-  **Recommendation: drop this, optimizations 1+2 are sufficient** (~4.4 GB saved,
-  67% reduction). The remaining ~2.2 GB (one `frame_bytes` alloc per blob) is a
-  tight alloc/free pattern that modern allocators handle efficiently.
+- ~~**Buffer pool for `RawBlobFrame` across batches**~~ — dropped (conflicts with
+  `write_raw_owned`).
 
-- [ ] **Avoid `Bytes::copy_from_slice` in `decompress_blob_data_into`** —
-  `classify_blob` calls `decompress_blob_data_into(&frame.blob_bytes, buf)` which
-  internally does `Bytes::copy_from_slice` on the entire compressed blob just to
-  parse the Blob protobuf envelope. Since `prost::Message::decode` accepts
-  `impl Buf` and `&[u8]` implements `Buf`, the copy is unnecessary.
+- [x] **Avoid `Bytes::copy_from_slice` in `decompress_blob_data_into`** — decodes
+  directly from `&[u8]` via prost's `impl Buf`. Extracted `decompress_parsed_blob_into`
+  helper shared with `_from_bytes` variant. Also fixed `decompress_blob_data`.
 
-- [ ] **Avoid `Bytes::copy_from_slice` in `parse_blob_header_with_index`** —
-  `blob.rs:733` copies header bytes (~50 bytes) into a `Bytes` just to call prost
-  decode. Same fix: decode directly from `&[u8]`. Tiny per-blob but 43K unnecessary
-  copies for Japan.
+- [x] **Avoid `Bytes::copy_from_slice` in `parse_blob_header_with_index`** — decodes
+  directly from `&[u8]`.
 
-**Combined impact (optimizations 1+2 only):** Save ~4.4 GB from `read_raw_frame`
-+ ~2.1 GB from `write_raw` (67% passthrough alloc reduction). Uninstrumented gap
-shrinks from ~14s to ~5-7s (actual disk I/O floor) for Japan. For Norway, gap
-shrinks from ~7.6s to ~3-4s. Only merge.rs needs changes — sort.rs and cat.rs
-use sync mode (no `.to_vec()` copy), so `write_raw_owned` is not needed there.
-Cat.rs has the same `RawBlobFrame` duplication (optimization 1 applicable for
-consistency, but not urgent).
+**Measured impact (Denmark, indexdata + zlib):** Merge 5.16s → 3.36s (**-35%**).
+`read_raw_frame` alloc: 465 MB (was ~795 MB). Total merge alloc: 931 MB.
+No regression on read paths (tags-count, check-refs, cat --type unchanged).
 
 ## Performance: parallelism
 

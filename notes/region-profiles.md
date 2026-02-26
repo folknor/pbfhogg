@@ -161,9 +161,15 @@ complexity varies by region (tag density, ref counts, member counts).
 
 ## Merge: indexdata + zlib
 
+† Denmark re-measured on same host (Ryzen 9 5900X) after passthrough I/O
+optimizations (eliminated blob_bytes duplication, write_raw_owned, direct
+&[u8] decode). Improved from 5.16s to 3.36s (-35%). Other regions were
+profiled before these optimizations; expect similar improvements on
+passthrough-dominated regions (Norway, Japan).
+
 | Region | Wall | rewrite_block | classify_blob | frame_blob | RSS |
 |--------|------|---------------|---------------|------------|-----|
-| Denmark | 5.16s | 989ms (19%) | 630ms (12%) | 5.67s (110%) | 90 MB |
+| Denmark† | 3.36s | 592ms (18%) | 607ms (18%) | 6.19s (184%) | 74 MB |
 | Germany | 49.9s | 17.7s (36%) | 11.7s (23%) | 109.8s (220%) | 374 MB |
 | Malta | 58ms | 17ms (30%) | — | 13ms (23%) | 34 MB |
 | Gr. London | 1.54s | 473ms (31%) | 321ms (21%) | 2.77s (181%) | 94 MB |
@@ -228,6 +234,11 @@ complexity varies by region (tag density, ref counts, member counts).
 
 ## Merge allocations (indexdata + none)
 
+Measured before passthrough I/O optimizations. read_raw_frame alloc is now
+~42% lower (blob_bytes duplication eliminated), and write_raw .to_vec()
+copies are eliminated entirely. Denmark post-optimization: read_raw_frame
+465 MB (was ~795 MB), total merge 931 MB.
+
 | Region | Total | rewrite_block | read_raw_frame | take | classify_blob |
 |--------|-------|---------------|----------------|------|---------------|
 | Malta | 67 MB | 32 MB (48%) | 16 MB (25%) | 5 MB (7%) | — |
@@ -240,10 +251,12 @@ complexity varies by region (tag density, ref counts, member counts).
 - **Norway alloc pattern is unique:** read_raw_frame dominates at 48% (2.6 GB)
   because 27K blobs need I/O buffers even for passthrough. rewrite_block is only
   24% because only 354 blobs get rewritten. This inverts the pattern seen in all
-  other regions where rewrite_block dominates.
+  other regions where rewrite_block dominates. Post-optimization, Norway's
+  read_raw_frame would drop to ~1.3 GB (~25%), shifting the balance.
 - **Japan splits the difference:** rewrite_block at 44% (6.7 GB) because it
   rewrites 3544 blobs (10x Norway). read_raw_frame at 29% (4.5 GB) for 39K+
-  passthrough blobs. Japan is the closest proxy to planet-scale merge behavior.
+  passthrough blobs. Post-optimization, ~2.3 GB → total ~13 GB.
+  Japan is the closest proxy to planet-scale merge behavior.
 
 ## Status
 

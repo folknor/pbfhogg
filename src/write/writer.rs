@@ -334,6 +334,29 @@ impl<W: Write> PbfWriter<W> {
         }
     }
 
+    /// Write pre-framed raw blob bytes, taking ownership of the Vec.
+    ///
+    /// Like [`write_raw`](Self::write_raw) but moves the Vec into the
+    /// pipeline channel instead of copying. Use when the caller already
+    /// owns the bytes and won't need them afterwards (e.g. merge passthrough
+    /// with `std::mem::take`).
+    pub fn write_raw_owned(&mut self, raw_framed_bytes: Vec<u8>) -> io::Result<()> {
+        if let Some(ref mut pipeline) = self.pipeline {
+            let seq = pipeline.seq;
+            pipeline.seq += 1;
+            pipeline
+                .tx
+                .send(PipelineItem {
+                    seq,
+                    data: PipelinePayload::Bytes(Ok(raw_framed_bytes)),
+                })
+                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            Ok(())
+        } else {
+            self.writer_mut().write_all(&raw_framed_bytes)
+        }
+    }
+
     /// Flush the underlying writer.
     ///
     /// In pipelined mode, this joins the writer thread and propagates any

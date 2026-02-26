@@ -220,13 +220,42 @@ The three remaining bottlenecks are nearly equal:
 - classify_blob: 609ms (32%) — decompress + scan the 630 overlapping blobs
 - block_builder::take: 597ms (31%) — protobuf serialization of rewritten blocks
 
+### With passthrough I/O optimizations (indexdata + zlib, same host)
+
+Eliminated unnecessary copies in the merge passthrough path:
+1. `RawBlobFrame` stores `blob_offset` instead of duplicate `blob_bytes` Vec
+2. `write_raw_owned(Vec<u8>)` moves Vec into channel (no `.to_vec()` copy)
+3. `decompress_blob_data_into` decodes directly from `&[u8]` (no `Bytes::copy_from_slice`)
+4. `parse_blob_header_with_index` decodes directly from `&[u8]`
+
+| Function                    | Calls     | Avg      | Total     | % Total |
+|-----------------------------|-----------|----------|-----------|---------|
+| writer::frame_blob          | 628       | 9.85ms   | 6.19s     | 184%*   |
+| pbfhogg::main               | 1         | 3.36s    | 3.36s     | 100%    |
+| merge::merge                | 1         | 3.36s    | 3.36s     | 100%    |
+| merge::classify_blob        | 7361      | 83 us    | 607ms     | 18%     |
+| merge::rewrite_block        | 630       | 940 us   | 592ms     | 18%     |
+| block_builder::take         | 7407      | 19 us    | 143ms     | 4.3%    |
+| merge::read_raw_frame       | 7399      | 10 us    | 74ms      | 2.2%    |
+
+*>100% because frame_blob runs in parallel (pipelined writer).
+
+RSS: 74 MB. Alloc: read_raw_frame 465 MB (was ~795 MB), total merge 931 MB.
+
 ### Summary: merge progression
 
 | Configuration                        | Wall time | Bottleneck              |
 |--------------------------------------|-----------|-------------------------|
 | No indexdata, zlib (old baseline)    | 3.50s     | classify_blob (93%)     |
-| Indexdata, zlib                      | 5.16s     | frame_blob/zlib (110%)  |
+| Indexdata, zlib (pre-passthrough-IO) | 5.16s     | frame_blob/zlib (110%)  |
+| **Indexdata, zlib (passthrough-IO)** | **3.36s** | **frame_blob/zlib (184%)** |
 | **Indexdata, none (nidhogg prod)**   | **1.90s** | **rewrite_block (49%)** |
+
+The passthrough I/O optimizations recovered the indexdata+zlib regression:
+5.16s → 3.36s (-35%). The main-thread alloc reduction (~330 MB less in
+read_raw_frame, ~360 MB less in write_raw) freed CPU cycles that were
+previously spent in allocator overhead, allowing the main thread to feed
+the compression pipeline faster.
 
 The nidhogg production path (indexdata + Compression::None) is **1.84× faster**
 than the old baseline. With compression eliminated and classification mostly

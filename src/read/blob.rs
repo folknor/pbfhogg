@@ -730,7 +730,7 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usi
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(String, usize, Option<Vec<u8>>)> {
-    let header = proto::BlobHeader::decode(Bytes::copy_from_slice(header_bytes))
+    let header = proto::BlobHeader::decode(header_bytes)
         .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -774,7 +774,9 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 /// avoid the copy.
 #[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
-    decompress_blob_data_from_bytes(&Bytes::copy_from_slice(blob_bytes))
+    let blob = proto::Blob::decode(blob_bytes)
+        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    decompress_blob(&blob, None).map(|b| b.to_vec())
 }
 
 /// Decompress a blob's data into a caller-provided buffer for reuse.
@@ -785,7 +787,9 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
 /// mark and stays there.
 #[allow(clippy::cast_sign_loss)]
 pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
-    decompress_blob_data_into_from_bytes(&Bytes::copy_from_slice(blob_bytes), buf)
+    let blob = proto::Blob::decode(blob_bytes)
+        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    decompress_parsed_blob_into(&blob, buf)
 }
 
 /// Zero-copy variant of [`decompress_blob_data_into`].
@@ -795,6 +799,12 @@ pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result
 pub fn decompress_blob_data_into_from_bytes(blob_bytes: &Bytes, buf: &mut Vec<u8>) -> Result<()> {
     let blob = proto::Blob::decode(blob_bytes.clone())
         .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    decompress_parsed_blob_into(&blob, buf)
+}
+
+/// Decompress a parsed Blob protobuf into a caller-provided buffer.
+#[allow(clippy::cast_sign_loss)]
+fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<()> {
     buf.clear();
     match &blob.data {
         Some(proto::blob::Data::Raw(bytes)) => {

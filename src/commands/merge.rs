@@ -241,20 +241,30 @@ impl SkipState {
 // ---------------------------------------------------------------------------
 
 /// A raw blob frame: the complete `[4-byte len][BlobHeader][Blob]` bytes,
-/// plus the parsed header type string and the raw Blob protobuf bytes.
+/// plus the parsed header type string.
+///
+/// The Blob protobuf bytes are a suffix of `frame_bytes` starting at
+/// `blob_offset`, eliminating a separate ~55 KB allocation per blob.
 struct RawBlobFrame {
     /// Complete framed bytes suitable for write_raw().
     frame_bytes: Vec<u8>,
     /// Blob type: "OSMHeader", "OSMData", etc.
     blob_type: String,
-    /// The raw Blob protobuf message bytes (for selective decoding).
-    blob_bytes: Vec<u8>,
+    /// Byte offset within `frame_bytes` where the Blob protobuf starts.
+    blob_offset: usize,
     /// Blob-level index from BlobHeader indexdata, if present.
     /// When available, classify_blob can skip decompression entirely.
     index: Option<BlobIndex>,
     /// Byte offset of this frame in the input file (for copy_file_range).
     #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
     file_offset: u64,
+}
+
+impl RawBlobFrame {
+    /// The raw Blob protobuf message bytes (for selective decoding).
+    fn blob_bytes(&self) -> &[u8] {
+        &self.frame_bytes[self.blob_offset..]
+    }
 }
 
 /// Read the next raw blob frame from the reader.
@@ -283,22 +293,20 @@ fn read_raw_frame<R: Read>(
     let (blob_type, data_size, raw_index) = parse_blob_header_with_index(&header_bytes)?;
     let index = raw_index.and_then(|data| BlobIndex::deserialize(&data));
 
-    // Read Blob bytes
-    let mut blob_bytes = vec![0u8; data_size];
-    reader.read_exact(&mut blob_bytes)?;
-
-    // Assemble the complete frame
-    let frame_len = 4 + header_len + data_size;
+    // Assemble the complete frame, reading blob data directly into it.
+    // This avoids a separate ~55 KB blob_bytes allocation per blob.
+    let blob_offset = 4 + header_len;
+    let frame_len = blob_offset + data_size;
     *file_offset += frame_len as u64;
-    let mut frame_bytes = Vec::with_capacity(frame_len);
-    frame_bytes.extend_from_slice(&len_buf);
-    frame_bytes.extend_from_slice(&header_bytes);
-    frame_bytes.extend_from_slice(&blob_bytes);
+    let mut frame_bytes = vec![0u8; frame_len];
+    frame_bytes[..4].copy_from_slice(&len_buf);
+    frame_bytes[4..blob_offset].copy_from_slice(&header_bytes);
+    reader.read_exact(&mut frame_bytes[blob_offset..])?;
 
     Ok(Some(RawBlobFrame {
         frame_bytes,
         blob_type,
-        blob_bytes,
+        blob_offset,
         index,
         file_offset: frame_start,
     }))
@@ -885,10 +893,13 @@ impl CreateEmitter {
 // ---------------------------------------------------------------------------
 
 /// Write a passthrough blob, using `copy_file_range` when available.
+///
+/// Takes ownership of the frame's `frame_bytes` to move them into the
+/// pipeline channel without copying (~55 KB saved per blob).
 #[allow(unused_variables)]
 fn write_passthrough(
     writer: &mut PbfWriter<FileWriter>,
-    frame: &RawBlobFrame,
+    frame: &mut RawBlobFrame,
     input_fd: i32,
     use_copy_range: bool,
 ) -> io::Result<()> {
@@ -896,7 +907,7 @@ fn write_passthrough(
     if use_copy_range {
         return writer.write_raw_copy(input_fd, frame.file_offset, frame.frame_bytes.len() as u64);
     }
-    writer.write_raw(&frame.frame_bytes)
+    writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))
 }
 
 // ---------------------------------------------------------------------------
@@ -946,7 +957,7 @@ pub fn merge(
     let header_bytes = loop {
         match read_raw_frame(&mut reader, &mut file_offset)? {
             Some(frame) if frame.blob_type == "OSMHeader" => {
-                let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
                 break build_header_bytes(&header)?;
             }
             Some(_) => {} // skip unknown blob types before header
@@ -1022,7 +1033,7 @@ pub fn merge(
         // If all element types are past their max affected ID, passthrough entire batch
         if skip_state.all_done() {
             flush_block(&mut bb, &mut writer)?;
-            for frame in &batch {
+            for frame in &mut batch {
                 write_passthrough(&mut writer, frame, input_fd, use_copy_range)?;
                 stats.blobs_skip_decompress += 1;
             }
@@ -1057,13 +1068,13 @@ pub fn merge(
                     flush_block(&mut bb, &mut writer)?;
                     if batch[i].index.is_some() {
                         // Already has indexdata — pass through as-is.
-                        write_passthrough(&mut writer, &batch[i], input_fd, use_copy_range)?;
+                        write_passthrough(&mut writer, &mut batch[i], input_fd, use_copy_range)?;
                         stats.blobs_index_hit += 1;
                     } else {
                         // No indexdata — re-frame with index for future merges.
                         let indexdata = scan.serialize();
                         let reframed = crate::write::writer::reframe_raw_with_index(
-                            &batch[i].blob_bytes,
+                            batch[i].blob_bytes(),
                             &indexdata,
                         )?;
                         writer.write_raw(&reframed)?;
@@ -1119,7 +1130,7 @@ pub fn merge(
                         // will be emitted by CreateEmitter when the next blob
                         // arrives or during flush_all at EOF.
                         flush_block(&mut bb, &mut writer)?;
-                        write_passthrough(&mut writer, &batch[i], input_fd, use_copy_range)?;
+                        write_passthrough(&mut writer, &mut batch[i], input_fd, use_copy_range)?;
                         count_block_elements(&block, &mut stats);
                         stats.blobs_passthrough += 1;
                     }
@@ -1200,7 +1211,7 @@ fn classify_blob(
     }
 
     // Slow path: decompress + lightweight scan.
-    decompress_blob_data_into(&frame.blob_bytes, buf).map_err(|e| e.to_string())?;
+    decompress_blob_data_into(frame.blob_bytes(), buf).map_err(|e| e.to_string())?;
 
     if let Some(scan) = blob_index::scan_block_ids(buf) {
         if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {

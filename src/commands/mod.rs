@@ -9,6 +9,7 @@ pub mod extract;
 pub mod fileinfo;
 pub mod getid;
 pub mod merge;
+pub mod node_stats;
 pub(crate) mod owned_elements;
 pub mod sort;
 pub mod tags_count;

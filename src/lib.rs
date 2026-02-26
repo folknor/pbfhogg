@@ -127,7 +127,7 @@ pub use read::{blob, block, dense, elements, file_reader, indexed, mmap_blob, re
 pub use write::{block_builder, file_writer, writer};
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, fileinfo, getid, merge,
-    sort, tags_count, tags_filter,
+    node_stats, sort, tags_count, tags_filter,
 };
 #[cfg(feature = "commands")]
 pub use commands::{check_refs, extract};

@@ -103,11 +103,14 @@ pbfhogg tags-count <file>                 Count tag key=value frequencies
 pbfhogg tags-filter <file> -o <out> <exp> Filter elements by tag expressions
 pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456 r789)
 pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
+pbfhogg node-stats <file>                 Analyze node coordinate statistics for FOR compression sizing
 ```
 
 Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
 
 Add-locations-to-ways supports `--index-type hash` (default, HashMap) and `--index-type dense` (anonymous mmap, 8 bytes/slot, for planet-scale — ~68 GB physical for 8.5B nodes vs HashMap's ~192 GB).
+
+Node-stats streams all nodes and reports coordinate value ranges, FOR (Frame of Reference) block bit-width distributions, and estimated compressed size. Designed to evaluate whether FOR compression (128-value blocks, per-block min + bitpacked offsets) is viable for in-RAM sorted node stores at planet scale. Runs in constant memory using the pipelined reader.
 
 All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 

@@ -231,6 +231,14 @@ enum Command {
         #[arg(long)]
         direct_io: bool,
     },
+    /// Analyze node coordinate statistics for FOR compression sizing
+    NodeStats {
+        /// Input PBF file
+        file: PathBuf,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
+    },
     /// Apply OSC diffs to a PBF file
     Merge {
         /// Base PBF file
@@ -340,6 +348,7 @@ fn main() {
             compression,
             direct_io,
         } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io),
+        Command::NodeStats { file, direct_io } => run_node_stats(&file, direct_io),
         Command::Merge {
             base,
             changes,
@@ -653,6 +662,15 @@ fn run_add_locations_to_ways(
         file, output, keep_untagged_nodes, compression, direct_io, index_type,
     )?;
     stats.print_summary();
+    Ok(())
+}
+
+fn run_node_stats(
+    path: &std::path::Path,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = pbfhogg::node_stats::node_stats(path, direct_io)?;
+    report.print_report();
     Ok(())
 }
 

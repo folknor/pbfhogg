@@ -59,12 +59,16 @@ Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (ti
   or reducing per-element serialization cost (raw passthrough, cheaper protobuf
   encoding).
 
-- [ ] **Re-generate test PBF through pbfhogg for indexdata** — our bench data
-  (denmark-seq4704) is osmium-generated and has no blob indexdata. Merge
-  classify_blob spends 3.26s (90%) decompressing every blob to check IDs.
-  With indexdata (pbfhogg-generated PBFs), this drops to ~600ms (TODO old
-  numbers). Re-merge through pbfhogg, save as the new test PBF, and re-profile
-  to get realistic merge numbers.
+- [x] **Re-generate test PBF through pbfhogg for indexdata** — re-generated
+  denmark-seq4704 through `cat --type node,way,relation` producing
+  `data/denmark-20260220-seq4704-with-indexdata.osm.pbf` (465 MB, indexdata
+  in all 7396 blobs). Hotpath script updated to use this file.
+
+  **Results:** classify_blob 3.26s → 609ms (5.4×). With indexdata + zlib,
+  wall time is 5.16s (compression-bound). With indexdata + Compression::None
+  (nidhogg production path), wall time is **1.90s** — 1.84× faster than
+  the old 3.50s baseline. New bottleneck is rewrite_block at 49%.
+  Full data: `notes/hotpath-profile.md`.
 
 - [x] **`block_builder::take` buffer reuse** — take allocated 4.6 GB total
   from `encode_to_vec()` creating a fresh buffer every flush. Fixed by
@@ -75,9 +79,27 @@ Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (ti
 
 ### Merge: remaining optimization theories
 
-With indexdata, the merge bottleneck is `rewrite_block` (60%) + `block_builder::take`
-(24%) — the actual decode/re-encode work on the ~550 rewritten blocks. These
-process ~4.4M elements (most unaffected by the diff) at Denmark scale.
+With indexdata + Compression::None (nidhogg production path), merge takes
+1.90s on Denmark. The bottleneck is `rewrite_block` (49%) + `classify_blob`
+(32%) + `block_builder::take` (31%) — the decode/re-encode work on the ~630
+rewritten blocks. These process ~4.4M elements at Denmark scale.
+
+**Germany scale (4.5 GB, measured):** Rewrite fraction jumps to 18.4%
+(11,480 / 62,461 blobs). With indexdata + Compression::None, wall time is
+**52.3s** — paradoxically *slower* than indexdata + zlib (49.9s). Without
+parallel compression work, there's nothing to overlap main-thread serial
+work with. The zlib path hides ~30s of main-thread work behind 110s of
+parallel compression. **Compression::None only wins when rewrite_block is
+also parallelized.** Thread utilization confirms: zlib workers 83-92% busy,
+none workers idle.
+
+**Planet-scale extrapolation (75 GB):** Rewrite fraction rises to ~92%.
+Merge degrades to near-full-rewrite performance: ~27 min for single-threaded
+`rewrite_block` (~1.1M blobs × 1.49ms each). The per-blob micro-
+optimizations below each save <10% of rewrite_block's per-call cost — at
+planet scale they shave ~1-3 min off a 27-min bottleneck. The structural
+optimization is **parallelizing rewrite_block itself**, which also unlocks
+Compression::None as the faster path. Full analysis: `notes/hotpath-profile.md`.
 
 - [x] **Element-level raw passthrough in rewrite_block** — investigated, not
   feasible. String table index coupling (all types) and cross-element delta
@@ -119,6 +141,32 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   above) — `encode_to_vec()` replaced with `encode(&mut buf)` + reused buffer.
 
 ## Performance: parallelism
+
+- [ ] **Parallel merge rewrite_block** — at planet scale with daily diffs,
+  `rewrite_block` is single-threaded and takes ~27 min (~1.1M blobs × 1.49ms
+  each). This is the dominant merge bottleneck. The current merge loop is
+  sequential: read batch → parallel classify → sequential rewrite/passthrough.
+  A pipelined merge architecture could parallelize the rewrite work:
+  - **Stage 1** (I/O thread): `read_raw_frame` — sequential disk reads
+  - **Stage 2** (rayon pool): `classify_blob` + `rewrite_block` — decompress,
+    classify, and rewrite overlapping blocks in parallel
+  - **Stage 3** (writer thread): ordered output via reorder buffer (like the
+    existing pipelined writer)
+
+  Challenge: `CreateEmitter` interleaves new elements between blocks at their
+  sorted position. This requires cross-block coordination — a block's rewrite
+  depends on knowing which creates go before it. Possible approaches:
+  - Two-pass: first pass determines create insertion points, second pass
+    rewrites blocks in parallel with known create boundaries
+  - Batch-level: parallelize within batches (current 64-blob batches), keep
+    cross-batch ordering sequential
+  - Approximate: rewrite blocks in parallel, append creates at block boundaries
+    (relaxing strict sorted order within block gaps — OSM consumers tolerate
+    this)
+
+  At 8 cores, parallel rewrite could reduce planet merge from ~27 min to
+  ~3-4 min. Combined with indexdata + Compression::None, this would make
+  daily planet refresh a ~5-min operation.
 
 - [ ] `pipeline.rs:13-16` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
   Making them configurable would require a pipeline config struct on the public

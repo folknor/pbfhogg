@@ -1,9 +1,20 @@
 # Hotpath profiling notes
 
-Denmark seq4704 (483 MB, 59.1M elements) + seq4705 OSC (300 KB, 9K changes).
-Commit d5c8095, fat LTO, zlib-ng.
+## Host
 
-Run with: `scripts/run-hotpath.sh` and `scripts/run-hotpath-alloc.sh`
+- **CPU:** AMD Ryzen 9 5900X 12-core / 24-thread, 3.7 GHz base / 4.95 GHz boost
+- **RAM:** 30 GB DDR4
+- **Storage:** Samsung 970 EVO Plus 1TB NVMe (project + data)
+- **Kernel:** Linux 6.18.0-9-generic (x86_64)
+
+## Datasets
+
+- **Denmark:** seq4704 (465 MB, 59.1M elements) + seq4705 OSC (300 KB, 9K changes)
+- **Germany:** seq4704 (4.5 GB, 500M elements) + seq4705 OSC (5.9 MB, 146K changes)
+
+Indexdata variants generated via `pbfhogg cat --type node,way,relation`.
+Build: fat LTO, zlib-ng. Run with: `scripts/run-hotpath.sh`,
+`scripts/run-hotpath-alloc.sh`, `scripts/run-hotpath-germany.sh`
 
 ## Check-refs (pipelined read baseline)
 
@@ -110,11 +121,12 @@ frame_blob allocates 4.0 GB — compression output buffers.
 
 ## Merge (base PBF + 1 OSC diff)
 
-Same API path as nidhogg weekly planet refresh. Input PBF has no indexdata
-(osmium-generated), so classify_blob must decompress every blob.
+Same API path as nidhogg weekly planet refresh.
 630 of 7396 blobs rewritten, rest passthrough.
 
-### Timing
+### Without indexdata (osmium-generated PBF, commit d5c8095)
+
+Input PBF has no indexdata, so classify_blob must decompress every blob.
 
 | Function                    | Calls     | Avg    | Total  | % Total |
 |-----------------------------|-----------|--------|--------|---------|
@@ -133,13 +145,167 @@ Same API path as nidhogg weekly planet refresh. Input PBF has no indexdata
 
 RSS: 95 MB. Multi-threaded (main 95%, 3 workers 68-79%).
 
-classify_blob at 93% is the no-indexdata penalty — every blob must be
-decompressed to check if it contains affected IDs. With indexdata
-(pbfhogg-generated PBFs), this drops to ~21% (see TODO.md old numbers:
-603ms vs 3.26s). The indexdata optimization saves ~2.6s on Denmark.
+### With indexdata (pbfhogg-generated PBF, commit 2a1bfff)
 
-rewrite_block at 57% is the decode+re-encode cost for the 630 affected blocks.
-frame_blob (compression) at 163% is parallelized across rayon workers.
+Input PBF has 26-byte indexdata in every BlobHeader. classify_blob uses the
+fast path (binary search, no decompression) for non-overlapping blobs.
+6766 of 7396 blobs passthrough via index hit, 0 scan-only, 0 skip-decompress.
+
+| Function                    | Calls     | Avg      | Total     | % Total |
+|-----------------------------|-----------|----------|-----------|---------|
+| pbfhogg::main               | 1         | 5.16s    | 5.16s     | 100%    |
+| merge::merge                | 1         | 5.16s    | 5.16s     | 100%    |
+| writer::frame_blob          | 631       | 8.99ms   | 5.67s     | 110%*   |
+| merge::rewrite_block        | 630       | 1.57ms   | 989ms     | 19%     |
+| merge::classify_blob        | 7389      | 85 us    | 630ms     | 12%     |
+| block_builder::take         | 7407      | 83 us    | 618ms     | 12%     |
+| merge::read_raw_frame       | 7399      | 10 us    | 76ms      | 1.5%    |
+| block::new                  | 630       | 23 us    | 14ms      | 0.3%    |
+| wire::parse                 | 1260      | 4.2 us   | 5.3ms     | 0.1%    |
+| block_builder::add_way      | 1667      | 499 ns   | 833 us    | 0.01%   |
+
+*>100% because frame_blob runs in parallel (pipelined writer).
+
+RSS: 90 MB. Multi-threaded (main peaks 94%, 4 workers 65-85%).
+
+### Analysis
+
+classify_blob improved exactly as predicted: 3.26s → 630ms (5.2×). With
+indexdata, the 6766 non-overlapping blobs skip decompression entirely via
+binary search on the 26-byte index record. The 630ms residual is the 630
+overlapping blobs that still need decompression + scan + full parse.
+
+rewrite_block improved from 1.99s to 989ms (2.0×). This reflects the
+StringTable fast-path and pre-seed optimizations added between commits
+d5c8095 and 2a1bfff.
+
+**However, wall time went UP: 3.50s → 5.16s (+47%).** The new bottleneck
+is `frame_blob` (zlib compression) at 5.67s. In the old profile, the
+main thread spent 3.26s on classify_blob, which gave the rayon workers
+time to drain the compression pipeline in parallel. With indexdata, the
+main thread finishes classification near-instantly and races ahead to
+produce all 630 rewrite blobs faster than the workers can compress them.
+The main thread then blocks waiting for the compression pipeline to drain.
+
+This reveals that for the zlib path, classify_blob was "useful" overhead:
+it throttled main-thread throughput to match the compression pipeline's
+drain rate. With indexdata, the compression pipeline becomes the
+wallclock bottleneck.
+
+### With indexdata + Compression::None (nidhogg production path, commit 2a1bfff)
+
+Same PBF as above, but `--compression none` (nidhogg's erofs config).
+Eliminates the compression bottleneck entirely.
+
+| Function                    | Calls     | Avg      | Total     | % Total |
+|-----------------------------|-----------|----------|-----------|---------|
+| pbfhogg::main               | 1         | 1.90s    | 1.90s     | 100%    |
+| merge::merge                | 1         | 1.90s    | 1.90s     | 100%    |
+| merge::rewrite_block        | 630       | 1.49ms   | 936ms     | 49%     |
+| merge::classify_blob        | 7384      | 83 us    | 609ms     | 32%     |
+| block_builder::take         | 7407      | 81 us    | 597ms     | 31%     |
+| merge::read_raw_frame       | 7399      | 11 us    | 85ms      | 4.4%    |
+| writer::frame_blob          | 627       | 39 us    | 25ms      | 1.3%    |
+| block::new                  | 630       | 22 us    | 14ms      | 0.7%    |
+| wire::parse                 | 1260      | 4.2 us   | 5.3ms     | 0.3%    |
+| block_builder::add_way      | 1667      | 494 ns   | 824 us    | 0.04%   |
+
+RSS: 85 MB. Effectively single-threaded (main 93%, one worker for I/O at 0%).
+
+frame_blob drops from 5.67s to 25ms — Compression::None eliminates zlib
+entirely, turning frame_blob into pure protobuf framing (39μs/blob).
+
+The three remaining bottlenecks are nearly equal:
+- rewrite_block: 936ms (49%) — decode + re-encode the 630 affected blocks
+- classify_blob: 609ms (32%) — decompress + scan the 630 overlapping blobs
+- block_builder::take: 597ms (31%) — protobuf serialization of rewritten blocks
+
+### Summary: merge progression
+
+| Configuration                        | Wall time | Bottleneck              |
+|--------------------------------------|-----------|-------------------------|
+| No indexdata, zlib (old baseline)    | 3.50s     | classify_blob (93%)     |
+| Indexdata, zlib                      | 5.16s     | frame_blob/zlib (110%)  |
+| **Indexdata, none (nidhogg prod)**   | **1.90s** | **rewrite_block (49%)** |
+
+The nidhogg production path (indexdata + Compression::None) is **1.84× faster**
+than the old baseline. With compression eliminated and classification mostly
+free, the irreducible cost is rewrite_block for the ~630 blocks that overlap
+the diff (~4.4M elements decoded + re-encoded).
+
+### Planet-scale extrapolation (75 GB, daily diff)
+
+Denmark has 8.5% blob rewrite ratio (630 / 7396). At planet scale (~1.19M
+blobs) with a daily diff (~4M changes), the rewrite fraction explodes.
+With ~3M changed node IDs across ~1.06M node blobs (~8000 nodes each):
+
+    P(blob overlaps diff) = 1 - (1 - 3M/9B)^8000 ≈ 1 - e^(-2.67) ≈ 93%
+
+Ways: ~99.8%. Relations: ~100%. Overall: **~92% of blobs need rewriting.**
+
+Extrapolated merge time (indexdata + Compression::None, daily planet diff):
+
+| Component        | Denmark    | Planet (92% rewrite) | Notes                     |
+|------------------|------------|----------------------|---------------------------|
+| read_raw_frame   | 85ms       | ~14s                 | 161× (I/O, sequential)    |
+| classify_blob    | 609ms      | ~2 min               | 1.1M slow-path, ÷8 cores |
+| rewrite_block    | 936ms      | **~27 min**          | 1.1M × 1.49ms, sequential |
+| take             | 597ms      | ~1.5 min             | 1.1M rewritten blocks     |
+| frame_blob (none)| 25ms       | ~43s                 | 1.1M × 39μs, parallel    |
+| **Wall time**    | **1.90s**  | **~30 min**          | near-full-rewrite         |
+
+For comparison, a full `cat` (decode + rewrite everything) at planet scale
+with Compression::None is ~24 min. At 92% rewrite, merge has no advantage.
+
+**Key insight:** The indexdata and per-blob micro-optimizations (StringTable
+fast path, pre-seed, raw packed bytes) each save <10% of rewrite_block's
+per-call cost — at planet scale they shave ~1-3 min off a 27-min bottleneck.
+The structural optimization is **parallelizing rewrite_block**. At 8 cores,
+this could reduce planet merge from ~30 min to ~5 min.
+
+Allocation at planet scale: ~3.2 TB churn (alloc+dealloc), RSS bounded at
+~200-500 MB (dominated by DiffRanges ~32 MB + working buffers).
+
+## Germany merge (4.5 GB, 500M elements, 62K blobs, daily diff 146K changes)
+
+Scale test: ~10× Denmark. Rewrite fraction: 18.4% (11,480 / 62,461).
+
+### Summary table
+
+| Config                    | Wall  | classify_blob | rewrite_block | frame_blob    | RSS    |
+|---------------------------|-------|---------------|---------------|---------------|--------|
+| No indexdata, zlib        | 50.0s | 33.8s (67%)   | 17.6s (35%)   | 109.9s (220%) | 364 MB |
+| Indexdata, zlib           | 49.9s | 11.7s (23%)   | 17.7s (36%)   | 109.8s (220%) | 374 MB |
+| Indexdata, none           | 52.3s | 11.7s (22%)   | 16.4s (31%)   | 415ms (0.8%)  | 338 MB |
+
+### Key findings
+
+**Rewrite fraction scaling:** Denmark 8.5% → Germany 18.4%. Germany has 16×
+more daily changes for 10× more data, so higher change density per blob.
+Validates the planet extrapolation model (92% rewrite at planet scale).
+
+**Indexdata benefit hidden by compression:** classify_blob improved 2.9×
+(33.8s → 11.7s), saving 22s. But wall time barely changed (50.0s → 49.9s)
+because the zlib compression pipeline (110s on rayon workers) is the true
+bottleneck. Main thread classify_blob work is completely overlapped by
+worker compression time.
+
+**Compression::None is SLOWER:** 52.3s vs 49.9s for zlib. Without parallel
+compression work, there's nothing to overlap main-thread work with.
+rewrite_block + classify_blob + take run purely sequentially on the main
+thread (16.4 + 11.7 + 10.8 = 38.9s), and the total wall time reflects this.
+The zlib path effectively hides ~30s of main-thread work behind 110s of
+parallel compression.
+
+**Thread utilization contrast:**
+- Zlib: main 98%, 4 workers 83-92% — full utilization, compression-bound
+- None: main 98%, workers idle (0-11%) — single-threaded, main-thread-bound
+
+**Implication:** At moderate rewrite fractions (>10%), Compression::None only
+wins when rewrite_block is also parallelized. Without parallel rewrite, the
+zlib path accidentally provides better wall time by overlapping main-thread
+serial work with compression. The optimization order matters: parallelize
+rewrite_block FIRST, then Compression::None becomes the clear winner.
 
 ## Write benchmark: sync vs pipelined (bench_write)
 

@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 source "$(dirname "$0")/lib.sh"
 
 # Fixed dataset for reproducible profiling.
-PBF="data/denmark-20260220-seq4704.osm.pbf"
+PBF="data/denmark-20260220-seq4704-with-indexdata.osm.pbf"
 OSC="data/denmark-20260221-seq4705.osc.gz"
 COMPRESSION="zlib"
 

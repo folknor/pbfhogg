@@ -21,12 +21,43 @@ Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (ti
 
 ### Investigations
 
-- [ ] **Benchmark pipelined writer with Compression::None** — the sync write
+- [x] **Benchmark pipelined writer with Compression::None** — the sync write
   benchmark (cat --type) shows frame_blob at 57% of wall time (zlib:6). The
   pipelined writer parallelizes compression across rayon workers. With
   Compression::None (nidhogg's production config on erofs), compression is
-  eliminated entirely. Need bench_write with pipelined mode + none to see what
-  the actual write throughput floor is.
+  eliminated entirely.
+
+  **Results** (Denmark 483MB, ~59M elements, best of 3, commit 3383873,
+  `examples/bench_write.rs` writing to `/dev/null`):
+
+  | Mode              | Time (ms) | Elem/s |
+  |-------------------|-----------|--------|
+  | write-none (sync) |      9646 |  6.1M  |
+  | write-pipe-none   |      9627 |  6.1M  |
+  | write-zlib:6 (sync) |  18916 |  3.1M  |
+  | write-pipe-zlib:6 |      9223 |  6.4M  |
+
+  **Analysis:**
+  - Pipelined zlib:6 is the big win: 2.05× faster than sync zlib:6 (9.2s vs
+    18.9s). Parallel compression on rayon workers fully hides the zlib cost.
+  - With Compression::None, pipelined adds zero benefit (9627 vs 9646 ms).
+    There is no compression work to overlap — the pipeline has nothing to
+    parallelize.
+  - The write throughput floor is ~9.2–9.6s for Denmark. Both write-pipe-none
+    and write-pipe-zlib:6 converge there, confirming the bottleneck is the
+    single-threaded decode → BlockBuilder → protobuf serialize loop, not I/O
+    or compression.
+  - Pipelined zlib:6 is marginally faster than pipelined none (9223 vs 9627).
+    With `/dev/null` as output, I/O is free either way; compressed blocks are
+    smaller, meaning less memory traffic and smaller `write()` syscall payloads.
+
+  **Implication for nidhogg:** on erofs with Compression::None, the pipelined
+  writer provides no throughput advantage over sync. The optimization target
+  for nidhogg's write path is the sequential decode + BlockBuilder + serialize
+  loop (~9.2s at Denmark scale). Further write speedup requires either
+  parallelizing the decode/serialize work itself (multi-threaded BlockBuilder)
+  or reducing per-element serialization cost (raw passthrough, cheaper protobuf
+  encoding).
 
 - [ ] **Re-generate test PBF through pbfhogg for indexdata** — our bench data
   (denmark-seq4704) is osmium-generated and has no blob indexdata. Merge

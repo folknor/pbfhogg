@@ -175,6 +175,19 @@ buffers actually matter — the writer thread is the bottleneck, not compression
   - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
   - `pread` directly into registered buffer instead of heap allocation
 
+## Library API: Sort.Type_then_ID ergonomics
+
+The CLI commands now correctly set/propagate `Sort.Type_then_ID`, but
+library users calling `build_header()` directly must know to pass
+`&[HeaderBlock::SORT_TYPE_THEN_ID]` themselves. The library can't
+set it automatically because `BlockBuilder` accepts elements in any
+order — it doesn't know whether the caller is writing sorted data.
+
+- [ ] Consider a `PbfWriter::write_sorted_header()` convenience method
+  that wraps `build_header` with `Sort.Type_then_ID` pre-included
+- [ ] Document the Sort.Type_then_ID requirement in `build_header()` rustdoc
+- [ ] Add a library-level example showing sorted write with the feature flag
+
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)

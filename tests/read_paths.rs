@@ -251,6 +251,34 @@ fn block_iterator_early_drop() {
     // If we get here without hanging, the test passes.
 }
 
+/// block_type() correctly classifies each block in a sorted PBF.
+#[test]
+fn block_type_classification() {
+    use pbfhogg::BlockType;
+
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.osm.pbf");
+    write_test_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    let mut types = Vec::new();
+    for block_result in reader.into_blocks_pipelined() {
+        let block = block_result.unwrap();
+        types.push(block.block_type());
+    }
+
+    // write_test_pbf creates 3 blocks: dense nodes, ways, relations
+    assert_eq!(types, vec![BlockType::DenseNodes, BlockType::Ways, BlockType::Relations]);
+
+    // Convenience methods
+    assert!(BlockType::DenseNodes.is_nodes());
+    assert!(BlockType::Nodes.is_nodes());
+    assert!(!BlockType::Ways.is_nodes());
+    assert!(BlockType::Ways.is_ways());
+    assert!(BlockType::Relations.is_relations());
+    assert!(!BlockType::Mixed.is_nodes());
+}
+
 // ---------------------------------------------------------------------------
 // par_map_reduce tests
 // ---------------------------------------------------------------------------

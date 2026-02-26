@@ -183,21 +183,21 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ## Library API: PrimitiveBlock ergonomics
 
-- [ ] **`PrimitiveBlock::block_type()`** — quick classification returning
-  `DenseNodes | Ways | Relations | Mixed` without iterating to the first
-  element. Useful for consumers of `for_each_block_pipelined` /
-  `into_blocks_pipelined` that route blocks by type (e.g. elivagar's
-  node-then-way pattern). Low priority — consumers can check the first
-  element themselves. Investigation: `notes/pipelined-consumer-api.md`.
+- [x] **`PrimitiveBlock::block_type()`** — public `BlockType` enum
+  (`DenseNodes`, `Nodes`, `Ways`, `Relations`, `Mixed`, `Empty`) with
+  convenience methods (`is_nodes()`, `is_ways()`, `is_relations()`).
+  Classification reads one byte per group (first wire tag) — zero element
+  decoding. Useful for consumers of `for_each_block_pipelined` /
+  `into_blocks_pipelined` that route blocks by type.
 
-- [ ] **Sorted monotonicity assertion for block-level APIs** —
-  `for_each_block_pipelined` and `into_blocks_pipelined` bypass the
-  debug assertion that `for_each` / `for_each_pipelined` perform on
-  node ID ordering. Could add `PrimitiveBlock::assert_sorted()` or
-  move the assertion into `run_pipeline` itself. The assertion is
-  debug-only and consumer-facing — current placement in
-  `for_each_pipelined` may be fine since block-level consumers opt
-  into lower-level control. Investigation: `notes/pipelined-consumer-api.md`.
+- [x] **Sorted monotonicity assertion for block-level APIs** — resolved
+  by documenting the gap. `for_each_block_pipelined` and
+  `into_blocks_pipelined` rustdoc now notes that the debug assertion is
+  not applied at this level, directing users to `for_each_pipelined` or
+  manual checking. Moving the assertion into `run_pipeline` was rejected:
+  it would add latency to the critical path for block-level consumers
+  (who route blocks to other threads), and couples the transport layer
+  to header-level PBF semantics.
 
 ## Library API: Sort.Type_then_ID ergonomics
 

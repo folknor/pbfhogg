@@ -95,6 +95,70 @@ pub struct HeaderBBox {
     pub bottom: f64,
 }
 
+/// The element type(s) contained in a [`PrimitiveBlock`].
+///
+/// In well-formed sorted PBFs ([`Sort.Type_then_ID`](HeaderBlock::is_sorted)),
+/// each block contains exactly one type. Unsorted or hand-crafted PBFs may
+/// produce [`Mixed`](BlockType::Mixed).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum BlockType {
+    /// Block contains dense-encoded nodes (the common node encoding).
+    DenseNodes,
+    /// Block contains individually-encoded nodes (rare legacy format).
+    Nodes,
+    /// Block contains ways.
+    Ways,
+    /// Block contains relations.
+    Relations,
+    /// Block contains multiple element types across its groups.
+    Mixed,
+    /// Block contains no groups (empty block).
+    Empty,
+}
+
+impl BlockType {
+    /// Returns `true` if this block contains nodes (dense or non-dense).
+    pub fn is_nodes(&self) -> bool {
+        matches!(self, Self::DenseNodes | Self::Nodes)
+    }
+
+    /// Returns `true` if this block contains ways.
+    pub fn is_ways(&self) -> bool {
+        matches!(self, Self::Ways)
+    }
+
+    /// Returns `true` if this block contains relations.
+    pub fn is_relations(&self) -> bool {
+        matches!(self, Self::Relations)
+    }
+}
+
+/// Classify a `PrimitiveGroup` by reading its first wire tag byte.
+///
+/// PrimitiveGroup field tags (all LEN-delimited, wire type 2):
+///   field 1 = Node (0x0A), field 2 = DenseNodes (0x12),
+///   field 3 = Way (0x1A), field 4 = Relation (0x22).
+///
+/// Cost: one byte read per group. No element parsing.
+fn classify_group(data: &[u8]) -> BlockType {
+    if data.is_empty() {
+        return BlockType::Empty;
+    }
+    let tag_byte = data[0];
+    let field = tag_byte >> 3;
+    let wire_type = tag_byte & 0x07;
+    if wire_type != 2 {
+        return BlockType::Mixed; // unexpected wire type
+    }
+    match field {
+        1 => BlockType::Nodes,
+        2 => BlockType::DenseNodes,
+        3 => BlockType::Ways,
+        4 => BlockType::Relations,
+        _ => BlockType::Mixed, // changeset (5) or unknown
+    }
+}
+
 /// A `PrimitiveBlock`. It contains a sequence of groups.
 ///
 /// # Zero-copy wire-format parsing
@@ -176,6 +240,30 @@ impl PrimitiveBlock {
             unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
 
         Ok(PrimitiveBlock { buffer, block })
+    }
+
+    /// Returns the element type contained in this block.
+    ///
+    /// Inspects only the first protobuf field tag of each group — typically a
+    /// single byte read per group. No elements are decoded.
+    ///
+    /// In sorted PBFs, each block is single-type, so this returns one of
+    /// [`DenseNodes`](BlockType::DenseNodes), [`Nodes`](BlockType::Nodes),
+    /// [`Ways`](BlockType::Ways), or [`Relations`](BlockType::Relations).
+    /// For unsorted files where groups contain different types, returns
+    /// [`Mixed`](BlockType::Mixed).
+    pub fn block_type(&self) -> BlockType {
+        let mut result: Option<BlockType> = None;
+        for i in 0..self.block.group_ranges.len() {
+            let group_data = self.block.group(i);
+            let group_type = classify_group(group_data);
+            match result {
+                None => result = Some(group_type),
+                Some(prev) if prev == group_type => {} // same type, continue
+                Some(_) => return BlockType::Mixed,
+            }
+        }
+        result.unwrap_or(BlockType::Empty)
     }
 
     /// Returns an iterator over the elements in this `PrimitiveBlock`.

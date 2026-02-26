@@ -159,6 +159,10 @@ impl<R: Read + Send> ElementReader<R> {
     /// to other threads for parallel processing, enabling overlapped I/O + decode +
     /// consumer parallelism without blocking the pipeline.
     ///
+    /// **Note:** The debug monotonicity assertion for [`Sort.Type_then_ID`](HeaderBlock::is_sorted)
+    /// is not applied at this level. Use [`for_each_pipelined`](Self::for_each_pipelined) if you
+    /// need it, or check node ID ordering in your consumer closure.
+    ///
     /// # Errors
     /// Returns the first error encountered while parsing the PBF structure.
     pub fn for_each_block_pipelined<F>(self, f: F) -> Result<()>
@@ -176,6 +180,10 @@ impl<R: Read + Send> ElementReader<R> {
     ///
     /// This is the iterator equivalent of [`for_each_block_pipelined`](Self::for_each_block_pipelined).
     /// Use it when you need loop control (early exit, zipping two files, interleaving work).
+    ///
+    /// **Note:** The debug monotonicity assertion for [`Sort.Type_then_ID`](HeaderBlock::is_sorted)
+    /// is not applied at this level. Use [`for_each_pipelined`](Self::for_each_pipelined) if you
+    /// need it, or check node ID ordering in your consumer code.
     ///
     /// Requires `R: 'static` because the pipeline runs in a background thread.
     /// [`ElementReader<FileReader>`] satisfies this (the common case).

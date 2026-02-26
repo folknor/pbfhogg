@@ -181,6 +181,24 @@ buffers actually matter — the writer thread is the bottleneck, not compression
   - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
   - `pread` directly into registered buffer instead of heap allocation
 
+## Library API: PrimitiveBlock ergonomics
+
+- [ ] **`PrimitiveBlock::block_type()`** — quick classification returning
+  `DenseNodes | Ways | Relations | Mixed` without iterating to the first
+  element. Useful for consumers of `for_each_block_pipelined` /
+  `into_blocks_pipelined` that route blocks by type (e.g. elivagar's
+  node-then-way pattern). Low priority — consumers can check the first
+  element themselves. Investigation: `notes/pipelined-consumer-api.md`.
+
+- [ ] **Sorted monotonicity assertion for block-level APIs** —
+  `for_each_block_pipelined` and `into_blocks_pipelined` bypass the
+  debug assertion that `for_each` / `for_each_pipelined` perform on
+  node ID ordering. Could add `PrimitiveBlock::assert_sorted()` or
+  move the assertion into `run_pipeline` itself. The assertion is
+  debug-only and consumer-facing — current placement in
+  `for_each_pipelined` may be fine since block-level consumers opt
+  into lower-level control. Investigation: `notes/pipelined-consumer-api.md`.
+
 ## Library API: Sort.Type_then_ID ergonomics
 
 **Read side (done):** `ElementReader` now parses the PBF header eagerly at

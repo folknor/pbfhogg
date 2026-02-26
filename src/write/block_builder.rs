@@ -7,6 +7,7 @@
 //! and block size limits (8000 entities per block, matching osmium).
 
 use crate::proto;
+use crate::PrimitiveBlock;
 use bytes::Bytes;
 use prost::Message;
 use rustc_hash::FxHashMap;
@@ -105,6 +106,19 @@ impl StringTable {
         }
     }
 
+    /// Pre-seed from an input block's string table, populating the index map.
+    ///
+    /// After pre-seeding, input index N maps to output index N (identity).
+    /// Index 0 (empty string) is already present from `new()` and is skipped.
+    fn pre_seed(&mut self, block: &PrimitiveBlock) {
+        let len = block.string_table_len();
+        for i in 1..len {
+            if let Some(s) = block.string_table_entry(i) {
+                self.add(s);
+            }
+        }
+    }
+
     fn into_proto(self) -> proto::StringTable {
         let mut st = proto::StringTable::default();
         st.s.extend(self.strings.into_iter().map(|s| Bytes::from(s.into_bytes())));
@@ -150,6 +164,20 @@ pub struct MemberData<'a> {
     pub id: MemberId,
     /// The member's role string.
     pub role: &'a str,
+}
+
+/// Metadata with a raw string table index for the user name.
+///
+/// Used by the raw-index `add_*_raw` methods where user strings are passed
+/// through as pre-seeded indices rather than re-interned via [`StringTable::add`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RawMetadata {
+    pub version: i32,
+    pub timestamp: i64,
+    pub changeset: i64,
+    pub uid: i32,
+    pub user_sid: i32,
+    pub visible: bool,
 }
 
 fn member_type_to_proto(mt: MemberType) -> proto::relation::MemberType {
@@ -214,6 +242,10 @@ pub struct BlockBuilder {
 
     // Reusable encode buffer for take() — avoids allocating a fresh Vec<u8> per block.
     encode_buf: Vec<u8>,
+
+    // True when the string table has been pre-seeded from an input block (merge only).
+    // Reset to false by take()/reset(). Checked by merge to re-seed after mid-block flushes.
+    pre_seeded: bool,
 }
 
 impl Default for BlockBuilder {
@@ -282,6 +314,8 @@ impl BlockBuilder {
             relations: Vec::new(),
 
             encode_buf: Vec::new(),
+
+            pre_seeded: false,
         }
     }
 
@@ -289,6 +323,16 @@ impl BlockBuilder {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Returns `true` if the string table has been pre-seeded from an input block.
+    ///
+    /// Reset to `false` by `take()`. Used by merge to detect when raw string
+    /// table indices are valid (pre-seeded) vs when re-seeding is needed after
+    /// a mid-block flush.
+    #[inline]
+    pub(crate) fn is_pre_seeded(&self) -> bool {
+        self.pre_seeded
     }
 
     /// Returns `true` if the block has reached the entity limit (8000).
@@ -598,6 +642,181 @@ impl BlockBuilder {
         self.count += 1;
     }
 
+    // -----------------------------------------------------------------------
+    // Raw-index methods for pre-seeded string table passthrough (merge only)
+    // -----------------------------------------------------------------------
+
+    /// Pre-seed the string table from an input block for index passthrough.
+    ///
+    /// After calling this, raw string table indices from the input block can be
+    /// written directly via the `add_*_raw` methods. Indices from the input block
+    /// map to the same indices in the output block (identity mapping).
+    ///
+    /// Must be called on an empty `BlockBuilder` (after `new()` or `take()`).
+    pub(crate) fn pre_seed_string_table(&mut self, block: &PrimitiveBlock) {
+        debug_assert!(self.is_empty(), "pre_seed must be called on empty builder");
+        self.string_table.pre_seed(block);
+        self.pre_seeded = true;
+    }
+
+    /// Add a dense node using pre-seeded string table indices.
+    ///
+    /// `raw_tags` are `(key_sid, val_sid)` pairs from [`DenseNode::raw_tags()`].
+    /// The string table must have been pre-seeded from the same input block.
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn add_node_raw(
+        &mut self,
+        id: i64,
+        decimicro_lat: i32,
+        decimicro_lon: i32,
+        raw_tags: impl Iterator<Item = (i32, i32)>,
+        metadata: Option<&RawMetadata>,
+    ) {
+        assert!(
+            self.can_add_node(),
+            "cannot add node: block full or wrong type"
+        );
+        self.block_type = Some(BlockType::DenseNodes);
+
+        let lat = i64::from(decimicro_lat);
+        let lon = i64::from(decimicro_lon);
+        self.dense_ids.push(id - self.last_dense_id);
+        self.dense_lats.push(lat - self.last_dense_lat);
+        self.dense_lons.push(lon - self.last_dense_lon);
+        self.last_dense_id = id;
+        self.last_dense_lat = lat;
+        self.last_dense_lon = lon;
+
+        // Tags: write raw indices directly — no StringTable::add()
+        for (key_sid, val_sid) in raw_tags {
+            self.dense_keys_vals.push(key_sid);
+            self.dense_keys_vals.push(val_sid);
+        }
+        self.dense_keys_vals.push(0); // delimiter
+
+        if let Some(meta) = metadata {
+            if !self.has_dense_metadata && self.count > 0 {
+                self.backfill_default_dense_metadata();
+            }
+            self.add_dense_metadata_raw(meta);
+        } else if self.has_dense_metadata {
+            self.push_default_dense_metadata();
+        }
+
+        self.count += 1;
+    }
+
+    /// Add a way using pre-seeded string table indices.
+    ///
+    /// `raw_tag_keys` and `raw_tag_vals` are parallel slices from [`Way::raw_tags()`].
+    pub(crate) fn add_way_raw(
+        &mut self,
+        id: i64,
+        raw_tag_keys: &[u32],
+        raw_tag_vals: &[u32],
+        refs: &[i64],
+        metadata: Option<&RawMetadata>,
+    ) {
+        assert!(
+            self.can_add_way(),
+            "cannot add way: block full or wrong type"
+        );
+        self.block_type = Some(BlockType::Ways);
+
+        let mut way = proto::Way::default();
+        way.id = id;
+
+        way.keys.extend_from_slice(raw_tag_keys);
+        way.vals.extend_from_slice(raw_tag_vals);
+
+        let mut last_ref: i64 = 0;
+        for &r in refs {
+            way.refs.push(r - last_ref);
+            last_ref = r;
+        }
+
+        if let Some(meta) = metadata {
+            way.info = Some(self.build_info_raw(meta));
+        }
+
+        self.ways.push(way);
+        self.count += 1;
+    }
+
+    /// Add a relation using pre-seeded string table indices.
+    ///
+    /// `raw_tag_keys`, `raw_tag_vals` from [`Relation::raw_tags()`].
+    /// `members` contains `(MemberId, raw_role_sid)` pairs.
+    #[allow(clippy::cast_possible_wrap)]
+    pub(crate) fn add_relation_raw(
+        &mut self,
+        id: i64,
+        raw_tag_keys: &[u32],
+        raw_tag_vals: &[u32],
+        members: &[(MemberId, i32)],
+        metadata: Option<&RawMetadata>,
+    ) {
+        assert!(
+            self.can_add_relation(),
+            "cannot add relation: block full or wrong type"
+        );
+        self.block_type = Some(BlockType::Relations);
+
+        let mut rel = proto::Relation::default();
+        rel.id = id;
+
+        rel.keys.extend_from_slice(raw_tag_keys);
+        rel.vals.extend_from_slice(raw_tag_vals);
+
+        let mut last_memid: i64 = 0;
+        for &(mid, role_sid) in members {
+            rel.roles_sid.push(role_sid);
+            rel.memids.push(mid.id() - last_memid);
+            last_memid = mid.id();
+            rel.types
+                .push(member_type_to_proto(mid.member_type()) as i32);
+        }
+
+        if let Some(meta) = metadata {
+            rel.info = Some(self.build_info_raw(meta));
+        }
+
+        self.relations.push(rel);
+        self.count += 1;
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn add_dense_metadata_raw(&mut self, meta: &RawMetadata) {
+        self.has_dense_metadata = true;
+        self.dense_versions.push(meta.version);
+        self.dense_timestamps
+            .push(meta.timestamp - self.last_dense_timestamp);
+        self.last_dense_timestamp = meta.timestamp;
+        self.dense_changesets
+            .push(meta.changeset - self.last_dense_changeset);
+        self.last_dense_changeset = meta.changeset;
+        self.dense_uids.push(meta.uid - self.last_dense_uid);
+        self.last_dense_uid = meta.uid;
+        self.dense_user_sids
+            .push(meta.user_sid - self.last_dense_user_sid);
+        self.last_dense_user_sid = meta.user_sid;
+        self.dense_visibles.push(meta.visible);
+    }
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    fn build_info_raw(&self, meta: &RawMetadata) -> proto::Info {
+        let mut info = proto::Info::default();
+        info.version = Some(meta.version);
+        info.timestamp = Some(meta.timestamp);
+        info.changeset = Some(meta.changeset);
+        info.uid = Some(meta.uid);
+        info.user_sid = Some(meta.user_sid as u32);
+        if !meta.visible {
+            info.visible = Some(false);
+        }
+        info
+    }
+
     /// Serialize the current block to `PrimitiveBlock` bytes and reset.
     ///
     /// Returns `None` if the block is empty. The returned slice borrows from
@@ -701,6 +920,7 @@ impl BlockBuilder {
         self.block_type = None;
         self.count = 0;
         self.has_dense_metadata = false;
+        self.pre_seeded = false;
 
         self.last_dense_id = 0;
         self.last_dense_lat = 0;

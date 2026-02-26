@@ -18,6 +18,7 @@ use crate::blob::{
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData};
+use crate::elements::MemberId;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
@@ -353,7 +354,7 @@ fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
     false
 }
 
-use super::{dense_node_metadata, element_metadata, flush_block};
+use super::{dense_node_raw_metadata, element_raw_metadata, flush_block};
 
 // ---------------------------------------------------------------------------
 // Block flushing helpers
@@ -427,54 +428,81 @@ fn write_osc_relation(
 // Writing base elements (with metadata passthrough)
 // ---------------------------------------------------------------------------
 
-fn write_base_dense_node<'a>(
+fn write_base_dense_node(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    dn: &crate::DenseNode<'a>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    dn: &crate::DenseNode<'_>,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     ensure_node_capacity(bb, writer)?;
-    tags_buf.clear();
-    tags_buf.extend(dn.tags());
-    let meta = dense_node_metadata(dn);
-    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags_buf, meta.as_ref());
+    if !bb.is_pre_seeded() {
+        // String table was reset by a mid-block flush (ensure_*_capacity or
+        // emit_before). Flush any non-pre-seeded content, then re-seed.
+        flush_block(bb, writer)?;
+        bb.pre_seed_string_table(block);
+    }
+    let meta = dense_node_raw_metadata(dn);
+    bb.add_node_raw(
+        dn.id(),
+        dn.decimicro_lat(),
+        dn.decimicro_lon(),
+        dn.raw_tags(),
+        meta.as_ref(),
+    );
     Ok(())
 }
 
-fn write_base_way<'a>(
+fn write_base_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    way: &crate::Way<'a>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    way: &crate::Way<'_>,
+    raw_tag_keys: &mut Vec<u32>,
+    raw_tag_vals: &mut Vec<u32>,
     refs_buf: &mut Vec<i64>,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     ensure_way_capacity(bb, writer)?;
-    tags_buf.clear();
-    tags_buf.extend(way.tags());
+    if !bb.is_pre_seeded() {
+        flush_block(bb, writer)?;
+        bb.pre_seed_string_table(block);
+    }
+    raw_tag_keys.clear();
+    raw_tag_vals.clear();
+    for (k, v) in way.raw_tags() {
+        raw_tag_keys.push(k);
+        raw_tag_vals.push(v);
+    }
     refs_buf.clear();
     refs_buf.extend(way.refs());
-    let meta = element_metadata(&way.info());
-    bb.add_way(way.id(), tags_buf, refs_buf, meta.as_ref());
+    let meta = element_raw_metadata(&way.info());
+    bb.add_way_raw(way.id(), raw_tag_keys, raw_tag_vals, refs_buf, meta.as_ref());
     Ok(())
 }
 
-fn write_base_relation<'a>(
+fn write_base_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    rel: &crate::Relation<'a>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    members_buf: &mut Vec<MemberData<'a>>,
+    rel: &crate::Relation<'_>,
+    raw_tag_keys: &mut Vec<u32>,
+    raw_tag_vals: &mut Vec<u32>,
+    raw_members_buf: &mut Vec<(MemberId, i32)>,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     ensure_relation_capacity(bb, writer)?;
-    tags_buf.clear();
-    tags_buf.extend(rel.tags());
-    members_buf.clear();
-    members_buf.extend(rel.members().map(|m| MemberData {
-        id: m.id,
-        role: m.role().unwrap_or(""),
-    }));
-    let meta = element_metadata(&rel.info());
-    bb.add_relation(rel.id(), tags_buf, members_buf, meta.as_ref());
+    if !bb.is_pre_seeded() {
+        flush_block(bb, writer)?;
+        bb.pre_seed_string_table(block);
+    }
+    raw_tag_keys.clear();
+    raw_tag_vals.clear();
+    for (k, v) in rel.raw_tags() {
+        raw_tag_keys.push(k);
+        raw_tag_vals.push(v);
+    }
+    raw_members_buf.clear();
+    raw_members_buf.extend(rel.members().map(|m| (m.id, m.role_sid)));
+    let meta = element_raw_metadata(&rel.info());
+    bb.add_relation_raw(rel.id(), raw_tag_keys, raw_tag_vals, raw_members_buf, meta.as_ref());
     Ok(())
 }
 
@@ -515,6 +543,14 @@ struct RewriteContext<'a> {
     create_emitter: &'a mut CreateEmitter,
 }
 
+/// Reusable buffers for raw-index element data, hoisted outside the element loop.
+struct RewriteBuffers {
+    raw_tag_keys: Vec<u32>,
+    raw_tag_vals: Vec<u32>,
+    refs_buf: Vec<i64>,
+    raw_members_buf: Vec<(MemberId, i32)>,
+}
+
 #[hotpath::measure]
 fn rewrite_block(
     block: &PrimitiveBlock,
@@ -522,13 +558,17 @@ fn rewrite_block(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> MergeResult<()> {
-    // Reusable buffers for element data, hoisted outside the element loop.
-    // Vec::clear() keeps the heap allocation; subsequent extend() refills without
-    // reallocating once the capacity is warm. This eliminates ~3 alloc/dealloc pairs
-    // per element (tags + refs/members) — ~4.4M allocations for Denmark.
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    // Pre-seed the output string table from the input block. After this, raw
+    // string table indices from the input are valid in the output (identity mapping).
+    // Diff elements extend the table normally via add().
+    bb.pre_seed_string_table(block);
+
+    let mut bufs = RewriteBuffers {
+        raw_tag_keys: Vec::new(),
+        raw_tag_vals: Vec::new(),
+        refs_buf: Vec::new(),
+        raw_members_buf: Vec::new(),
+    };
 
     for element in block.elements() {
         let kind = element_kind(&element);
@@ -539,7 +579,10 @@ fn rewrite_block(
         }
         *ctx.current_kind = Some(kind);
 
-        // Emit any new creates that sort before this element (sorted output)
+        // Emit any new creates that sort before this element (sorted output).
+        // emit_before may flush the block (capacity overflow from diff creates),
+        // which resets the string table. write_base_* detects this via
+        // bb.is_pre_seeded() and re-seeds before using raw indices.
         let elem_id = match &element {
             Element::DenseNode(dn) => dn.id(),
             Element::Node(n) => n.id(),
@@ -552,39 +595,39 @@ fn rewrite_block(
             bb, writer, ctx.stats,
         )?;
 
-        rewrite_element(
-            &element, ctx, bb, writer,
-            &mut tags_buf, &mut refs_buf, &mut members_buf,
-        )?;
+        rewrite_element(&element, ctx, bb, writer, &mut bufs, block)?;
     }
     Ok(())
 }
 
-fn rewrite_element<'a>(
-    element: &Element<'a>,
+fn rewrite_element(
+    element: &Element<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    refs_buf: &mut Vec<i64>,
-    members_buf: &mut Vec<MemberData<'a>>,
+    bufs: &mut RewriteBuffers,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     match element {
-        Element::DenseNode(dn) => rewrite_dense_node(dn, ctx, bb, writer, tags_buf),
-        Element::Node(n) => rewrite_node(n, ctx, bb, writer, tags_buf),
-        Element::Way(w) => rewrite_way(w, ctx, bb, writer, tags_buf, refs_buf),
-        Element::Relation(r) => rewrite_relation(r, ctx, bb, writer, tags_buf, members_buf),
+        Element::DenseNode(dn) => rewrite_dense_node(dn, ctx, bb, writer, block),
+        Element::Node(n) => rewrite_node(n, ctx, bb, writer, block),
+        Element::Way(w) => {
+            rewrite_way(w, ctx, bb, writer, bufs, block)
+        }
+        Element::Relation(r) => {
+            rewrite_relation(r, ctx, bb, writer, bufs, block)
+        }
     }
 }
 
 // wontfix(perf-drain-reuse): OSC replacement paths collect tags fresh per element;
-// base element paths already use hoisted tags_buf. Marginal gain to fix the OSC path.
-fn rewrite_dense_node<'a>(
-    dn: &crate::DenseNode<'a>,
+// base element paths use raw index passthrough. Marginal gain to fix the OSC path.
+fn rewrite_dense_node(
+    dn: &crate::DenseNode<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = dn.id();
     if ctx.diff.deleted_nodes.contains(&id) {
@@ -599,19 +642,19 @@ fn rewrite_dense_node<'a>(
         ctx.emitted_nodes.insert(id);
         ctx.stats.diff_nodes += 1;
     } else {
-        write_base_dense_node(bb, writer, dn, tags_buf)?;
+        write_base_dense_node(bb, writer, dn, block)?;
         ctx.stats.base_nodes += 1;
     }
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-fn rewrite_node<'a>(
-    node: &crate::Node<'a>,
+#[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
+fn rewrite_node(
+    node: &crate::Node<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = node.id();
     if ctx.diff.deleted_nodes.contains(&id) {
@@ -627,22 +670,30 @@ fn rewrite_node<'a>(
         ctx.stats.diff_nodes += 1;
     } else {
         ensure_node_capacity(bb, writer)?;
-        tags_buf.clear();
-        tags_buf.extend(node.tags());
-        let meta = element_metadata(&node.info());
-        bb.add_node(node.id(), node.decimicro_lat(), node.decimicro_lon(), tags_buf, meta.as_ref());
+        if !bb.is_pre_seeded() {
+            flush_block(bb, writer)?;
+            bb.pre_seed_string_table(block);
+        }
+        let meta = element_raw_metadata(&node.info());
+        bb.add_node_raw(
+            node.id(),
+            node.decimicro_lat(),
+            node.decimicro_lon(),
+            node.raw_tags().map(|(k, v)| (k as i32, v as i32)),
+            meta.as_ref(),
+        );
         ctx.stats.base_nodes += 1;
     }
     Ok(())
 }
 
-fn rewrite_way<'a>(
-    way: &crate::Way<'a>,
+fn rewrite_way(
+    way: &crate::Way<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    refs_buf: &mut Vec<i64>,
+    bufs: &mut RewriteBuffers,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = way.id();
     if ctx.diff.deleted_ways.contains(&id) {
@@ -654,19 +705,19 @@ fn rewrite_way<'a>(
         ctx.emitted_ways.insert(id);
         ctx.stats.diff_ways += 1;
     } else {
-        write_base_way(bb, writer, way, tags_buf, refs_buf)?;
+        write_base_way(bb, writer, way, &mut bufs.raw_tag_keys, &mut bufs.raw_tag_vals, &mut bufs.refs_buf, block)?;
         ctx.stats.base_ways += 1;
     }
     Ok(())
 }
 
-fn rewrite_relation<'a>(
-    rel: &crate::Relation<'a>,
+fn rewrite_relation(
+    rel: &crate::Relation<'_>,
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    members_buf: &mut Vec<MemberData<'a>>,
+    bufs: &mut RewriteBuffers,
+    block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = rel.id();
     if ctx.diff.deleted_relations.contains(&id) {
@@ -678,7 +729,7 @@ fn rewrite_relation<'a>(
         ctx.emitted_relations.insert(id);
         ctx.stats.diff_relations += 1;
     } else {
-        write_base_relation(bb, writer, rel, tags_buf, members_buf)?;
+        write_base_relation(bb, writer, rel, &mut bufs.raw_tag_keys, &mut bufs.raw_tag_vals, &mut bufs.raw_members_buf, block)?;
         ctx.stats.base_relations += 1;
     }
     Ok(())

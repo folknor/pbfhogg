@@ -243,6 +243,12 @@ impl<'a> DenseNodeInfo<'a> {
         self.uid
     }
 
+    /// Returns the raw string table index for the user name.
+    #[inline]
+    pub fn raw_user_sid(&self) -> i32 {
+        self.user_sid
+    }
+
     /// Returns the user name.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Result<&'a str> {

@@ -596,6 +596,12 @@ impl<'a> Info<'a> {
         self.info.uid
     }
 
+    /// Returns the raw string table index for the user name, if present.
+    #[inline]
+    pub fn raw_user_sid(&self) -> Option<i32> {
+        self.info.user_sid
+    }
+
     /// Returns the user name.
     #[allow(clippy::cast_sign_loss)]
     pub fn user(&self) -> Option<Result<&'a str>> {

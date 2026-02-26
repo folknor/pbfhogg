@@ -14,7 +14,7 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 
-use crate::block_builder::{build_header, BlockBuilder, Metadata};
+use crate::block_builder::{build_header, BlockBuilder, Metadata, RawMetadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -85,6 +85,32 @@ pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Me
         changeset: info.changeset(),
         uid: info.uid(),
         user: info.user().unwrap_or(""),
+        visible: info.visible(),
+    })
+}
+
+/// Extract [`RawMetadata`] from an [`Info`](crate::Info), preserving the raw
+/// string table index for the user name.
+pub(crate) fn element_raw_metadata(info: &crate::Info<'_>) -> Option<RawMetadata> {
+    info.version().map(|v| RawMetadata {
+        version: v,
+        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+        changeset: info.changeset().unwrap_or(0),
+        uid: info.uid().unwrap_or(0),
+        user_sid: info.raw_user_sid().unwrap_or(0),
+        visible: info.visible(),
+    })
+}
+
+/// Extract [`RawMetadata`] from a [`DenseNode`](crate::DenseNode), preserving
+/// the raw string table index for the user name.
+pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMetadata> {
+    dn.info().map(|info| RawMetadata {
+        version: info.version(),
+        timestamp: info.milli_timestamp() / 1000,
+        changeset: info.changeset(),
+        uid: info.uid(),
+        user_sid: info.raw_user_sid(),
         visible: info.visible(),
     })
 }

@@ -185,6 +185,24 @@ impl PrimitiveBlock {
         BlockElementsIter::new(&self.block)
     }
 
+    /// Returns the number of entries in this block's string table.
+    pub fn string_table_len(&self) -> usize {
+        self.block.stringtable.len()
+    }
+
+    /// Returns the string at the given string table index, or `None` if out of bounds.
+    ///
+    /// Index 0 is always the empty string. Entries were validated as UTF-8 at
+    /// construction time.
+    pub fn string_table_entry(&self, index: usize) -> Option<&str> {
+        self.block.stringtable.get(index).map(|bytes| {
+            // SAFETY: All stringtable entries were validated as UTF-8 in
+            // PrimitiveBlock::new(). The PrimitiveBlock struct does not expose any
+            // mutable access to the underlying buffer.
+            unsafe { std::str::from_utf8_unchecked(bytes) }
+        })
+    }
+
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
         GroupIter::new(&self.block)

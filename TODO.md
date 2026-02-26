@@ -55,13 +55,14 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   add_node 55→41ns (25%), add_way 255→219ns (14%), add_relation 691→491ns (29%),
   merge rewrite_block 2.17→2.03s (6.5%). Investigation: `notes/rewrite-block-cost-breakdown.md`.
 
-- [ ] **Pre-seed output StringTable / index passthrough for merge** — the get()
-  fast-path above captured the easy wins. Remaining opportunity: for unmodified
-  elements in merge's rewrite_block, preserve input string table indices in the
-  output without re-interning. Requires a dual-mode BlockBuilder (raw indices
-  vs string references). Estimated additional savings: ~400ms on Denmark
-  (~20% of rewrite_block). Higher complexity — needs a new API surface on
-  BlockBuilder.
+- [x] **Pre-seed output StringTable / index passthrough for merge** — at block
+  start, pre-seed the output StringTable from the input block (identity mapping).
+  Base elements (~99.9%) use `raw_tags()` + `add_*_raw()` methods — no hash, no
+  probe, no string decode. Diff elements (~0.1%) use normal `add(&str)`. A
+  `pre_seeded` flag on BlockBuilder tracks validity across mid-block flushes
+  (emit_before can flush + add diff elements, invalidating the pre-seed; the
+  next `write_base_*` detects this via `is_pre_seeded()`, flushes the
+  non-pre-seeded content, and re-seeds). Investigation: `notes/preseed-stringtable.md`.
 
 - [ ] **Raw packed bytes for non-string integer fields** — investigated: the
   delta encoding is compatible (both input wire format and BlockBuilder delta-
@@ -217,8 +218,9 @@ order — it doesn't know whether the caller is writing sorted data.
 
 ## Refactoring: duplicated metadata extraction
 
-`dense_node_metadata()`, `element_metadata()`, `flush_block()`, and
-`rebuild_header()` are shared helpers in `commands/mod.rs`.
+`dense_node_metadata()`, `element_metadata()`, `dense_node_raw_metadata()`,
+`element_raw_metadata()`, `flush_block()`, and `rebuild_header()` are shared
+helpers in `commands/mod.rs`.
 
 sort.rs still has its own inline metadata extraction (uses `OwnedMetadata`
 with owned `String` instead of borrowed `Metadata<'a>`).

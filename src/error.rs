@@ -67,6 +67,8 @@ pub enum ErrorKind {
     Blob(BlobError),
     /// An error that occurs when decoding protobuf wire format.
     WireFormat { msg: &'static str },
+    /// The first blob in the PBF file is not an `OsmHeader` blob.
+    MissingHeader,
 }
 
 /// An error that occurs when decoding a blob.
@@ -120,6 +122,7 @@ impl StdError for Error {
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
             ErrorKind::Blob(_) => None,
             ErrorKind::WireFormat { .. } => None,
+            ErrorKind::MissingHeader => None,
         }
     }
 }
@@ -154,6 +157,9 @@ impl fmt::Display for Error {
             }
             ErrorKind::WireFormat { msg } => {
                 write!(f, "wire format error: {msg}")
+            }
+            ErrorKind::MissingHeader => {
+                write!(f, "PBF file does not start with an OsmHeader blob")
             }
         }
     }

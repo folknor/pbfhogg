@@ -27,6 +27,12 @@ pbfhogg = "0.1"
 use pbfhogg::{ElementReader, Element};
 
 let reader = ElementReader::from_path("input.osm.pbf")?;
+
+// Check if the PBF declares sorted elements
+if reader.header().is_sorted() {
+    println!("PBF is sorted by type then ID");
+}
+
 reader.for_each(|element| {
     if let Element::Way(way) = element {
         // process way

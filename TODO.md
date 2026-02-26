@@ -9,6 +9,11 @@ or BlockBuilder/PbfWriter APIs):
 
     scripts/test.sh -- --ignored
 
+`sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` — it
+verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
+is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
+(2026-02-25) has a regression where `debug_assertions` is off in test builds.
+
 ## Performance: hotpath profiling
 
 Raw data and analysis in `notes/hotpath-profile.md`.
@@ -178,11 +183,16 @@ buffers actually matter — the writer thread is the bottleneck, not compression
 
 ## Library API: Sort.Type_then_ID ergonomics
 
-The CLI commands now correctly set/propagate `Sort.Type_then_ID`, but
-library users calling `build_header()` directly must know to pass
-`&[HeaderBlock::SORT_TYPE_THEN_ID]` themselves. The library can't
-set it automatically because `BlockBuilder` accepts elements in any
-order — it doesn't know whether the caller is writing sorted data.
+**Read side (done):** `ElementReader` now parses the PBF header eagerly at
+construction. `reader.header().is_sorted()` tells callers whether the PBF
+declares `Sort.Type_then_ID`. In debug builds, `for_each` and
+`for_each_pipelined` assert that node IDs arrive in ascending order when
+the flag is set.
+
+**Write side:** Library users calling `build_header()` directly must know
+to pass `&[HeaderBlock::SORT_TYPE_THEN_ID]` themselves. The library can't
+set it automatically because `BlockBuilder` accepts elements in any order
+— it doesn't know whether the caller is writing sorted data.
 
 - [ ] Consider a `PbfWriter::write_sorted_header()` convenience method
   that wraps `build_header` with `Sort.Type_then_ID` pre-included

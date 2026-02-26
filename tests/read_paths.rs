@@ -378,3 +378,149 @@ fn blobreader_next_header_skip_blob() {
         assert_eq!(e.1, a.1, "offsets must match");
     }
 }
+
+// ---------------------------------------------------------------------------
+// Header accessor tests
+// ---------------------------------------------------------------------------
+
+/// Write a PBF with Sort.Type_then_ID and verify header().is_sorted().
+fn write_sorted_pbf(path: &Path) {
+    let file = std::fs::File::create(path).unwrap();
+    let mut writer = PbfWriter::new(file, Compression::default());
+
+    let header = block_builder::build_header(
+        Some((9.0, 54.0, 13.0, 58.0)),
+        None,
+        None,
+        None,
+        &["Sort.Type_then_ID"],
+    )
+    .unwrap();
+    writer.write_header(&header).unwrap();
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(1, 550_000_000, 120_000_000, &[], None);
+    bb.add_node(2, 560_000_000, 130_000_000, &[], None);
+    bb.add_node(3, 570_000_000, 140_000_000, &[], None);
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    writer.flush().unwrap();
+}
+
+/// ElementReader exposes the parsed header via header().
+#[test]
+fn header_accessor() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.osm.pbf");
+    write_test_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    let header = reader.header();
+
+    // write_test_pbf sets bbox to (9.0, 54.0, 13.0, 58.0)
+    let bbox = header.bbox().unwrap();
+    assert!((bbox.left - 9.0).abs() < 1e-6);
+    assert!((bbox.bottom - 54.0).abs() < 1e-6);
+
+    // writing_program is "pbfhogg"
+    assert_eq!(header.writing_program(), Some("pbfhogg"));
+}
+
+/// header().is_sorted() returns true when Sort.Type_then_ID is set.
+#[test]
+fn header_is_sorted_true() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("sorted.osm.pbf");
+    write_sorted_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    assert!(reader.header().is_sorted());
+}
+
+/// header().is_sorted() returns false when Sort.Type_then_ID is absent.
+#[test]
+fn header_is_sorted_false() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("unsorted.osm.pbf");
+    write_test_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    assert!(!reader.header().is_sorted());
+}
+
+/// Elements are still delivered correctly after header is consumed at construction.
+#[test]
+fn header_consumed_elements_still_work() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("test.osm.pbf");
+    write_sorted_pbf(&path);
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    assert!(reader.header().is_sorted());
+
+    let mut count = 0u64;
+    reader
+        .for_each(|_element| {
+            count += 1;
+        })
+        .unwrap();
+
+    assert_eq!(count, 3); // 3 nodes from write_sorted_pbf
+}
+
+/// Sorted PBF iterates without assertion failure (nodes in ascending ID order).
+#[test]
+fn sorted_pbf_no_assertion_failure() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("sorted.osm.pbf");
+    write_sorted_pbf(&path);
+
+    // for_each path
+    let reader = ElementReader::from_path(&path).unwrap();
+    reader.for_each(|_| {}).unwrap();
+
+    // for_each_pipelined path
+    let reader = ElementReader::from_path(&path).unwrap();
+    reader.for_each_pipelined(|_| {}).unwrap();
+}
+
+/// Debug assertion fires on unsorted nodes when Sort.Type_then_ID is declared.
+///
+/// Requires `debug_assertions` to be enabled in the test profile.
+/// Nightly 1.95 (2026-02-25) has a regression where `debug_assertions` is off
+/// in test builds, so this test is ignored until the regression is fixed.
+#[test]
+#[ignore]
+#[should_panic(expected = "Sort.Type_then_ID violated")]
+fn sorted_flag_but_unsorted_nodes_panics() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("liar.osm.pbf");
+
+    // Write a PBF that declares Sort.Type_then_ID but has nodes out of order
+    let file = std::fs::File::create(&path).unwrap();
+    let mut writer = PbfWriter::new(file, Compression::default());
+
+    let header = block_builder::build_header(
+        None,
+        None,
+        None,
+        None,
+        &["Sort.Type_then_ID"],
+    )
+    .unwrap();
+    writer.write_header(&header).unwrap();
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(100, 550_000_000, 120_000_000, &[], None);
+    bb.add_node(50, 560_000_000, 130_000_000, &[], None); // out of order!
+    writer
+        .write_primitive_block(bb.take().unwrap().unwrap())
+        .unwrap();
+
+    writer.flush().unwrap();
+
+    let reader = ElementReader::from_path(&path).unwrap();
+    reader.for_each(|_| {}).unwrap();
+}

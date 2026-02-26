@@ -54,7 +54,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 ## Architecture
 
 **Read path:** `BlobReader` (blob.rs) -> `PrimitiveBlock` (block.rs) -> `Element` (elements.rs)
-- `ElementReader` (reader.rs): high-level sequential/parallel/pipelined iteration
+- `ElementReader` (reader.rs): high-level sequential/parallel/pipelined iteration. Parses the PBF header eagerly at construction — `header()` returns `&HeaderBlock` with metadata including `is_sorted()` (Sort.Type_then_ID). Debug builds assert monotonic node IDs when sorted.
 - `MmapBlobReader` (mmap_blob.rs): zero-copy memory-mapped reading
 - `IndexedReader` (indexed.rs): seekable reader with blob-level index for filtered queries
 - `pipeline.rs`: 3-stage pipelined decoder (IO thread -> rayon pool -> reorder buffer)
@@ -71,7 +71,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - `pub(crate) mod proto` is `#[allow(clippy::all)]` (generated code)
-- Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind)
+- Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind). `MissingHeader` error if a PBF doesn't start with an OsmHeader blob.
 - Tests live in `tests/` (roundtrip.rs, roundtrip_real.rs) and inline in blob.rs/indexed.rs
 
 ## Features (library crate)

@@ -1,22 +1,29 @@
 //! High level reader interface
 
 use super::blob::{Blob, BlobDecode, BlobReader, BlobType};
+use super::block::HeaderBlock;
 use super::elements::Element;
 use super::file_reader::FileReader;
-use crate::error::Result;
+use crate::error::{new_error, ErrorKind, Result};
 use rayon::prelude::*;
 use std::io::Read;
 use std::path::Path;
 
 /// A reader for PBF files that gives access to the stored elements: nodes, ways and relations.
+///
+/// The PBF header is parsed eagerly at construction time and is accessible via [`header()`](Self::header).
 // wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 #[derive(Clone, Debug)]
 pub struct ElementReader<R: Read + Send> {
     blob_iter: BlobReader<R>,
+    header: HeaderBlock,
 }
 
 impl<R: Read + Send> ElementReader<R> {
     /// Creates a new `ElementReader`.
+    ///
+    /// Reads and parses the PBF header from the first blob. Returns an error if the
+    /// first blob is not an `OsmHeader` blob.
     ///
     /// # Example
     /// ```
@@ -26,16 +33,25 @@ impl<R: Read + Send> ElementReader<R> {
     /// let f = std::fs::File::open("tests/test.osm.pbf")?;
     /// let buf_reader = std::io::BufReader::new(f);
     ///
-    /// let reader = ElementReader::new(buf_reader);
+    /// let reader = ElementReader::new(buf_reader)?;
     ///
     /// # Ok(())
     /// # }
     /// # foo().unwrap();
     /// ```
-    pub fn new(reader: R) -> ElementReader<R> {
-        ElementReader {
-            blob_iter: BlobReader::new(reader),
-        }
+    pub fn new(reader: R) -> Result<ElementReader<R>> {
+        let mut blob_iter = BlobReader::new(reader);
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(ElementReader { blob_iter, header })
+    }
+
+    /// Returns the PBF file header.
+    ///
+    /// Contains metadata including bounding box, required/optional features,
+    /// writing program, and replication information. Use [`HeaderBlock::is_sorted()`]
+    /// to check whether elements are sorted by type then ID.
+    pub fn header(&self) -> &HeaderBlock {
+        &self.header
     }
 
     /// Decodes the PBF structure sequentially and calls the given closure on each element.
@@ -70,12 +86,27 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        for blob in self.blob_iter {
+        let Self { blob_iter, header } = self;
+        let is_sorted = header.is_sorted();
+        let mut last_node_id: i64 = i64::MIN;
+
+        for blob in blob_iter {
             match blob?.decode() {
-                Ok(BlobDecode::OsmHeader(_)) | Ok(BlobDecode::Unknown(_)) => {}
                 Ok(BlobDecode::OsmData(block)) => {
-                    block.for_each_element(&mut f);
+                    block.for_each_element(|element| {
+                        if is_sorted {
+                            if let Some(id) = node_id(&element) {
+                                debug_assert!(
+                                    id > last_node_id,
+                                    "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                                );
+                                last_node_id = id;
+                            }
+                        }
+                        f(element);
+                    });
                 }
+                Ok(_) => {} // Unknown blobs — header already consumed at construction
                 Err(e) => return Err(e),
             }
         }
@@ -91,8 +122,23 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        super::pipeline::run_pipeline(self.blob_iter, |block| {
-            block.for_each_element(&mut f);
+        let Self { blob_iter, header } = self;
+        let is_sorted = header.is_sorted();
+        let mut last_node_id: i64 = i64::MIN;
+
+        super::pipeline::run_pipeline(blob_iter, |block| {
+            block.for_each_element(|element| {
+                if is_sorted {
+                    if let Some(id) = node_id(&element) {
+                        debug_assert!(
+                            id > last_node_id,
+                            "Sort.Type_then_ID violated: node {id} <= previous {last_node_id}"
+                        );
+                        last_node_id = id;
+                    }
+                }
+                f(element);
+            });
             Ok(())
         })
     }
@@ -203,8 +249,8 @@ impl<R: Read + Send> ElementReader<R> {
     {
         // Phase 1: Sequentially collect all OsmData blobs into a Vec.
         // Blobs are still compressed at this stage (~16-64KB each), so the Vec
-        // holds only the compressed data. Header and Unknown blobs are skipped
-        // since they don't contain map-reducible elements.
+        // holds only the compressed data. The header blob was already consumed
+        // at construction time, so only data and unknown blobs remain.
         let blobs = collect_osm_data_blobs(self.blob_iter)?;
 
         // Phase 2: Parallel decode + map + reduce with zero lock contention.
@@ -230,8 +276,8 @@ impl<R: Read + Send> ElementReader<R> {
 impl ElementReader<FileReader> {
     /// Tries to open the file at the given path and constructs an `ElementReader` from this.
     ///
-    /// # Errors
-    /// Returns the same errors that `std::fs::File::open` returns.
+    /// Reads and parses the PBF header from the first blob. Returns an error if the file
+    /// cannot be opened or the first blob is not an `OsmHeader` blob.
     ///
     /// # Example
     /// ```
@@ -244,31 +290,55 @@ impl ElementReader<FileReader> {
     /// # foo().unwrap();
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(ElementReader {
-            blob_iter: BlobReader::from_path(path)?,
-        })
+        let mut blob_iter = BlobReader::from_path(path)?;
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(ElementReader { blob_iter, header })
     }
 
     /// Open a file for reading with O_DIRECT (bypasses page cache).
     #[cfg(feature = "linux-direct-io")]
     pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
-        Ok(ElementReader {
-            blob_iter: BlobReader::from_path_direct(path)?,
-        })
+        let mut blob_iter = BlobReader::from_path_direct(path)?;
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(ElementReader { blob_iter, header })
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
-        Ok(ElementReader {
-            blob_iter: BlobReader::open(path, direct)?,
-        })
+        let mut blob_iter = BlobReader::open(path, direct)?;
+        let header = read_header_blob(&mut blob_iter)?;
+        Ok(ElementReader { blob_iter, header })
+    }
+}
+
+/// Read and parse the header blob from a `BlobReader`.
+///
+/// Consumes the first blob from the reader. Returns an error if there are no blobs
+/// or the first blob is not an `OsmHeader`.
+fn read_header_blob<R: Read + Send>(blob_iter: &mut BlobReader<R>) -> Result<HeaderBlock> {
+    match blob_iter.next() {
+        Some(Ok(blob)) => match blob.decode()? {
+            BlobDecode::OsmHeader(header) => Ok(*header),
+            _ => Err(new_error(ErrorKind::MissingHeader)),
+        },
+        Some(Err(e)) => Err(e),
+        None => Err(new_error(ErrorKind::MissingHeader)),
+    }
+}
+
+/// Extract the node ID from an element, if it is a node.
+fn node_id(element: &Element<'_>) -> Option<i64> {
+    match element {
+        Element::Node(n) => Some(n.id()),
+        Element::DenseNode(n) => Some(n.id()),
+        _ => None,
     }
 }
 
 /// Sequentially iterate a `BlobReader`, collecting all OsmData blobs into a Vec.
 ///
-/// Skips header blobs and unknown blob types since they contain no OSM elements.
-/// Returns early on the first I/O or parse error from the blob reader.
+/// Skips unknown blob types since they contain no OSM elements. The header blob
+/// has already been consumed at `ElementReader` construction time.
 ///
 /// This is used by `par_map_reduce` to separate the sequential I/O phase from
 /// the parallel decode phase. See the comments on `par_map_reduce` for the full

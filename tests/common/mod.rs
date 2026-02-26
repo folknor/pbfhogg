@@ -19,7 +19,7 @@ use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobDecode, BlobReader, Element, MemberId};
+use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 
 // ---------------------------------------------------------------------------
 // Test element structs — lightweight descriptions of OSM elements for building
@@ -148,14 +148,8 @@ pub fn write_test_pbf(
 
 /// Read the header from a PBF file.
 pub fn read_header(path: &Path) -> pbfhogg::HeaderBlock {
-    let reader = BlobReader::from_path(path).expect("open pbf");
-    for blob in reader {
-        let blob = blob.expect("read blob");
-        if let BlobDecode::OsmHeader(header) = blob.decode().expect("decode blob") {
-            return *header;
-        }
-    }
-    panic!("no header found in PBF file");
+    let reader = ElementReader::from_path(path).expect("open pbf");
+    reader.header().clone()
 }
 
 // ---------------------------------------------------------------------------

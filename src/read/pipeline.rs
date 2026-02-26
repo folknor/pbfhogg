@@ -30,7 +30,7 @@ const DECODE_AHEAD: usize = 32;
 pub(crate) fn run_pipeline<R, F>(blob_reader: BlobReader<R>, mut block_fn: F) -> Result<()>
 where
     R: Read + Send,
-    F: FnMut(&PrimitiveBlock) -> Result<()>,
+    F: FnMut(PrimitiveBlock) -> Result<()>,
 {
     type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
     type DecodedItem = (usize, Option<crate::error::Result<PrimitiveBlock>>);
@@ -173,7 +173,7 @@ where
                 let item = pending.pop_front().unwrap().unwrap();
                 next_seq += 1;
                 match item {
-                    Some(Ok(ref block)) => block_fn(block)?,
+                    Some(Ok(block)) => block_fn(block)?,
                     Some(Err(e)) => return Err(e),
                     None => {} // header or unknown blob — skip
                 }

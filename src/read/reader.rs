@@ -1,7 +1,7 @@
 //! High level reader interface
 
 use super::blob::{Blob, BlobDecode, BlobReader, BlobType};
-use super::block::HeaderBlock;
+use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
 use crate::error::{new_error, ErrorKind, Result};
@@ -127,11 +127,10 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        let Self { blob_iter, header } = self;
-        let is_sorted = header.is_sorted();
+        let is_sorted = self.header.is_sorted();
         let mut last_node_id: i64 = i64::MIN;
 
-        super::pipeline::run_pipeline(blob_iter, |block| {
+        self.for_each_block_pipelined(|block| {
             block.for_each_element(|element| {
                 if is_sorted {
                     if let Some(id) = node_id(&element) {
@@ -146,6 +145,22 @@ impl<R: Read + Send> ElementReader<R> {
             });
             Ok(())
         })
+    }
+
+    /// Block-level pipelined iteration. Like [`for_each_pipelined`](Self::for_each_pipelined)
+    /// but delivers entire [`PrimitiveBlock`]s (owned) instead of individual elements.
+    ///
+    /// Blocks arrive in file order. The consumer receives ownership and can send blocks
+    /// to other threads for parallel processing, enabling overlapped I/O + decode +
+    /// consumer parallelism without blocking the pipeline.
+    ///
+    /// # Errors
+    /// Returns the first error encountered while parsing the PBF structure.
+    pub fn for_each_block_pipelined<F>(self, f: F) -> Result<()>
+    where
+        F: FnMut(PrimitiveBlock) -> Result<()>,
+    {
+        super::pipeline::run_pipeline(self.blob_iter, f)
     }
 
     /// Parallel map/reduce. Decodes the PBF structure in parallel, calls the closure `map_op` on

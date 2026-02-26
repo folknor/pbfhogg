@@ -14,129 +14,7 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-## Performance: hotpath profiling
-
-Raw data and analysis in `notes/hotpath-profile.md`.
-Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (timing + alloc).
-
-### Investigations
-
-- [x] **Benchmark pipelined writer with Compression::None** — the sync write
-  benchmark (cat --type) shows frame_blob at 57% of wall time (zlib:6). The
-  pipelined writer parallelizes compression across rayon workers. With
-  Compression::None (nidhogg's production config on erofs), compression is
-  eliminated entirely.
-
-  **Results** (Denmark 483MB, ~59M elements, best of 3, commit 3383873,
-  `examples/bench_write.rs` writing to `/dev/null`):
-
-  | Mode              | Time (ms) | Elem/s |
-  |-------------------|-----------|--------|
-  | write-none (sync) |      9646 |  6.1M  |
-  | write-pipe-none   |      9627 |  6.1M  |
-  | write-zlib:6 (sync) |  18916 |  3.1M  |
-  | write-pipe-zlib:6 |      9223 |  6.4M  |
-
-  **Analysis:**
-  - Pipelined zlib:6 is the big win: 2.05× faster than sync zlib:6 (9.2s vs
-    18.9s). Parallel compression on rayon workers fully hides the zlib cost.
-  - With Compression::None, pipelined adds zero benefit (9627 vs 9646 ms).
-    There is no compression work to overlap — the pipeline has nothing to
-    parallelize.
-  - The write throughput floor is ~9.2–9.6s for Denmark. Both write-pipe-none
-    and write-pipe-zlib:6 converge there, confirming the bottleneck is the
-    single-threaded decode → BlockBuilder → protobuf serialize loop, not I/O
-    or compression.
-  - Pipelined zlib:6 is marginally faster than pipelined none (9223 vs 9627).
-    With `/dev/null` as output, I/O is free either way; compressed blocks are
-    smaller, meaning less memory traffic and smaller `write()` syscall payloads.
-
-  **Implication for nidhogg:** on erofs with Compression::None, the pipelined
-  writer provides no throughput advantage over sync. The optimization target
-  for nidhogg's write path is the sequential decode + BlockBuilder + serialize
-  loop (~9.2s at Denmark scale). Further write speedup requires either
-  parallelizing the decode/serialize work itself (multi-threaded BlockBuilder)
-  or reducing per-element serialization cost (raw passthrough, cheaper protobuf
-  encoding).
-
-- [x] **Re-generate test PBF through pbfhogg for indexdata** — re-generated
-  denmark-seq4704 through `cat --type node,way,relation` producing
-  `data/denmark-20260220-seq4704-with-indexdata.osm.pbf` (465 MB, indexdata
-  in all 7396 blobs). Hotpath script updated to use this file.
-
-  **Results:** classify_blob 3.26s → 609ms (5.4×). With indexdata + zlib,
-  wall time is 5.16s (compression-bound). With indexdata + Compression::None
-  (nidhogg production path), wall time is **1.90s** — 1.84× faster than
-  the old 3.50s baseline. New bottleneck is rewrite_block at 49%.
-  Full data: `notes/hotpath-profile.md`.
-
-- [x] **`block_builder::take` buffer reuse** — take allocated 4.6 GB total
-  from `encode_to_vec()` creating a fresh buffer every flush. Fixed by
-  storing a `Vec<u8>` in BlockBuilder and using `encode(&mut buf)` +
-  `buf.clear()`. Return type changed from `Vec<u8>` to `&[u8]`.
-  Eliminates ~960 MB encode churn per Denmark run.
-  Investigation: `notes/take-buffer-reuse.md`.
-
-### Merge: remaining optimization theories
-
-With indexdata + Compression::None (nidhogg production path), merge takes
-1.90s on Denmark. The bottleneck is `rewrite_block` (49%) + `classify_blob`
-(32%) + `block_builder::take` (31%) — the decode/re-encode work on the ~630
-rewritten blocks. These process ~4.4M elements at Denmark scale.
-
-**Germany scale (4.5 GB, measured):** Rewrite fraction jumps to 18.4%
-(11,480 / 62,461 blobs). With indexdata + Compression::None, wall time is
-**52.3s** — paradoxically *slower* than indexdata + zlib (49.9s). Without
-parallel compression work, there's nothing to overlap main-thread serial
-work with. The zlib path hides ~30s of main-thread work behind 110s of
-parallel compression. **Compression::None only wins when rewrite_block is
-also parallelized.** Thread utilization confirms: zlib workers 83-92% busy,
-none workers idle.
-
-**Planet-scale extrapolation (75 GB):** Rewrite fraction rises to ~92%.
-Merge degrades to near-full-rewrite performance: ~27 min for single-threaded
-`rewrite_block` (~1.1M blobs × 1.49ms each). The per-blob micro-
-optimizations below each save <10% of rewrite_block's per-call cost — at
-planet scale they shave ~1-3 min off a 27-min bottleneck. The structural
-optimization is **parallelizing rewrite_block itself**, which also unlocks
-Compression::None as the faster path. Full analysis: `notes/hotpath-profile.md`.
-
-- [x] **Element-level raw passthrough in rewrite_block** — investigated, not
-  feasible. String table index coupling (all types) and cross-element delta
-  encoding (dense nodes) make per-element raw byte splicing impossible without
-  re-serialization that costs the same as full reencode.
-
-- [x] **StringTable::add allocation-free fast path** — `add()` called
-  `entry(s.to_owned())` on every invocation, allocating a String even on cache
-  hits (~99% of calls). Fixed by trying `self.index.get(s)` first (zero-alloc
-  Borrow trait lookup), falling through to `entry()` only on miss. Results:
-  add_node 55→41ns (25%), add_way 255→219ns (14%), add_relation 691→491ns (29%),
-  merge rewrite_block 2.17→2.03s (6.5%). Investigation: `notes/rewrite-block-cost-breakdown.md`.
-
-- [x] **Pre-seed output StringTable / index passthrough for merge** — at block
-  start, pre-seed the output StringTable from the input block (identity mapping).
-  Base elements (~99.9%) use `raw_tags()` + `add_*_raw()` methods — no hash, no
-  probe, no string decode. Diff elements (~0.1%) use normal `add(&str)`. A
-  `pre_seeded` flag on BlockBuilder tracks validity across mid-block flushes
-  (emit_before can flush + add diff elements, invalidating the pre-seed; the
-  next `write_base_*` detects this via `is_pre_seeded()`, flushes the
-  non-pre-seeded content, and re-seeds). Investigation: `notes/preseed-stringtable.md`.
-
-- [x] **Raw packed bytes for non-string integer fields** — implemented as
-  `add_way_raw_bytes` / `add_relation_raw_bytes` which accept raw `&[u8]` byte
-  slices for all packed fields (keys, vals, refs, memids, roles_sid, types) and
-  info submessage. Zero decode/reencode — just field tag + length + raw data.
-  Also passes raw tag keys/vals and info submessage bytes (not just integer
-  fields). Merge `write_base_way`/`write_base_relation` simplified to single
-  calls with raw byte slices from `Way`/`Relation` accessors. `RewriteBuffers`
-  struct eliminated entirely.
-  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`.
-
-- [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
-  (slightly slower than old crate's 673ms). Buffer reuse now implemented (see
-  above) — `encode_to_vec()` replaced with `encode(&mut buf)` + reused buffer.
-
-### Merge: passthrough blob I/O optimization
+## Performance: merge passthrough I/O
 
 Investigation of the uninstrumented time gap in merge (Japan: 10s instrumented,
 24.4s wall = 14s gap; Norway: 1.5s instrumented, 9.1s wall = 7.6s gap).
@@ -190,74 +68,6 @@ shrinks from ~7.6s to ~3-4s. Only merge.rs needs changes — sort.rs and cat.rs
 use sync mode (no `.to_vec()` copy), so `write_raw_owned` is not needed there.
 Cat.rs has the same `RawBlobFrame` duplication (optimization 1 applicable for
 consistency, but not urgent).
-
-### BlockBuilder: direct wire-format encoding for ways/relations
-
-Investigation of per-element allocation costs in `add_way`. Cross-region data:
-Japan 588 bytes/call (42.9M ways, 25.2 GB total), Norway 900 bytes/call
-(coastline refs), London 325ns/call (highest time, dense urban tagging).
-
-**Root cause:** `add_way` creates a fresh `proto::Way` with 5 zero-capacity Vecs
-per call, grows each from zero through multiple doublings. Contrast: `add_node`
-pushes into pre-allocated reused arrays (explains 21ns vs 205ns — 10× difference).
-
-Per-call allocation breakdown (typical way, 6 tags, 8 refs):
-- `way.refs` Vec growth (0→1→2→...→next_pow2): ~120 bytes alloc traffic (biggest)
-- `way.keys`/`way.vals` Vec growth: ~48 bytes each
-- `self.ways` Vec growth (amortized): ~335 bytes/call in traffic
-- Norway coastlines (100+ refs): pushes to 900 bytes/call
-
-**Decision: direct wire-format encoding.** The read path already bypasses prost
-with ~900 lines of custom wire-format code in `src/read/wire.rs` (Cursor,
-PackedIter, varint decode, zigzag encode/decode). Direct encoding on the write
-side is the natural complement. It subsumes all incremental prost-based fixes
-(pre-allocate Vecs, column-oriented storage, way.lat/lon waste, add_way_raw
-growth) and also unlocks raw packed bytes passthrough for merge.
-
-- [x] **Direct protobuf serialization (bypass `proto::Way` entirely)** — instead
-  of building `proto::Way` objects and encoding them via prost, accumulate raw
-  protobuf bytes directly during `add_way`. Eliminates nearly all per-call
-  allocation (~580 bytes/call saved) and prost's two-pass encode (encoded_len +
-  encode_raw). ~+315 net lines. **Result: pipelined write floor 9.0s → 7.0s
-  (22% faster). Sync none 9.0→7.1s, zstd 11.0→9.1s, zlib 17.5→15.5s.**
-
-  **Design (investigated):** Replace `ways: Vec<proto::Way>` and `relations:
-  Vec<proto::Relation>` with 4 reusable `Vec<u8>` scratch buffers:
-  - `group_buf` — per-block accumulator for all serialized way/relation submessages
-  - `elem_scratch` — per-element body (cleared per call, capacity reused)
-  - `packed_scratch` — per-field packed content (keys, vals, refs as varints)
-  - `info_scratch` — Info sub-message body
-
-  Encoding flow per `add_way`: encode field tags + varints into `elem_scratch`,
-  packed fields go through `packed_scratch` (encode content → measure length →
-  write tag+length+content to `elem_scratch`), then wrap with PrimitiveGroup
-  field 3 tag + length prefix → append to `group_buf`. String table indices
-  collected via `string_table.add()` as today. `group_buf.clear()` in `reset()`
-  keeps capacity for next block (unlike old `mem::take` which zeroed it).
-
-  `take()` branches: dense nodes stay on prost (already optimized), ways/relations
-  use manual encoding — `StringTable::encode_to()` + `group_buf` concatenation
-  into `encode_buf`. Borrow-checker handled by extracting `encode_way` /
-  `encode_relation` as free functions taking individual `&mut` field refs.
-
-  Covers all variants: `add_way` (string tags via string_table.add), `add_way_raw`
-  (raw u32 indices, no string_table.add), `add_way_with_locations` (fields 9/10
-  lat/lon), `add_relation` and `add_relation_raw` (fields 8/9/10 = roles_sid/
-  memids/types). All field tags ≤ 15, so single-byte tag encoding. Negative
-  int32 values sign-extend to 10-byte varints (matches prost). Output must be
-  bit-identical to current prost encoding — verified by roundtrip tests + verify
-  scripts. Design details: `notes/direct-wire-encoding.md` (to be written).
-
-- [x] **StringTable `clear()` instead of `replace()`** — implemented as part of
-  direct wire encoding. `StringTable::clear()` reuses existing Vec/HashMap
-  allocations. Called in `reset()` for all block types.
-
-**Superseded items** (all addressed by direct wire encoding):
-- ~~Pre-allocate refs/keys/vals from known lengths~~ — no proto::Way Vecs to reserve.
-- ~~Pre-allocate `self.ways` Vec to 8000~~ — replaced by `group_buf` with `clear()`.
-- ~~Column-oriented way storage~~ — direct encoding is strictly more powerful.
-- ~~`add_way_raw` Vec growth~~ — covered by `encode_way_raw` free function.
-- ~~`way.lat`/`way.lon` unused~~ — no `proto::Way` created at all.
 
 ## Performance: parallelism
 
@@ -333,17 +143,6 @@ zlib-compressed PBFs, any filesystem, any Linux 5.x+), so there are two tiers.
 
 ### Tier 1: Generic path (any Linux, zlib PBFs, any filesystem)
 
-The generic path is CPU-bound on zlib compression/decompression. io_uring adds
-negligible value here (~30ms syscall savings on 80GB). Focus on page cache hygiene
-and kernel-space copy.
-
-- [x] **O_DIRECT writes + reads.** Feature-gated `linux-direct-io`. `DirectWriter`/
-  `DirectReader` with page-aligned buffers, wrapped in `FileWriter`/`FileReader` enums.
-  All commands accept `--direct-io`.
-
-- [x] **`copy_file_range` for blob passthrough.** Kernel-space copy in merge/cat/sort.
-  ~3% improvement on Denmark (2.73s vs 2.81s), larger gains at planet scale.
-
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
   (4KB pages) to ~40K entries (2MB folios). Combined with `MADV_POPULATE_READ`
@@ -368,64 +167,20 @@ kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
 pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
-- [x] **erofs + uncompressed PBFs.** `--compression` flag on all write commands,
-  `Compression` enum public API. On erofs: single lz4 decompression layer.
+- [ ] **SQ polling (`setup_sqpoll`)** — eliminates `io_uring_enter` syscalls,
+  consumes a CPU core. Follow-up to the existing io_uring writer thread.
 
-- [x] **io_uring writer thread.** `--io-uring` on merge. O_DIRECT + WriteFixed with
-  64 registered 256KB buffers (16MB). Feature-gated `linux-io-uring`.
+- [ ] **`ReadFixed` + linked `WriteFixed` for CopyRange** — avoids userspace read
+  buffer for passthrough blobs. Follow-up to the existing io_uring writer thread.
 
-  **Future optimizations:**
-  - SQ polling (`setup_sqpoll`) — eliminates `io_uring_enter` syscalls, consumes a CPU core
-  - `ReadFixed` + linked `WriteFixed` for CopyRange — avoids userspace read buffer
-  - `pread` directly into registered buffer instead of heap allocation
-
-## Library API: PrimitiveBlock ergonomics
-
-- [x] **`PrimitiveBlock::block_type()`** — public `BlockType` enum
-  (`DenseNodes`, `Nodes`, `Ways`, `Relations`, `Mixed`, `Empty`) with
-  convenience methods (`is_nodes()`, `is_ways()`, `is_relations()`).
-  Classification reads one byte per group (first wire tag) — zero element
-  decoding. Useful for consumers of `for_each_block_pipelined` /
-  `into_blocks_pipelined` that route blocks by type.
-
-- [x] **Sorted monotonicity assertion for block-level APIs** — resolved
-  by documenting the gap. `for_each_block_pipelined` and
-  `into_blocks_pipelined` rustdoc now notes that the debug assertion is
-  not applied at this level, directing users to `for_each_pipelined` or
-  manual checking. Moving the assertion into `run_pipeline` was rejected:
-  it would add latency to the critical path for block-level consumers
-  (who route blocks to other threads), and couples the transport layer
-  to header-level PBF semantics.
-
-## Library API: Sort.Type_then_ID ergonomics
-
-**Read side (done):** `ElementReader` now parses the PBF header eagerly at
-construction. `reader.header().is_sorted()` tells callers whether the PBF
-declares `Sort.Type_then_ID`. In debug builds, `for_each` and
-`for_each_pipelined` assert that node IDs arrive in ascending order when
-the flag is set.
-
-**Write side (done):** `HeaderBuilder` replaces the old `build_header()`
-function with a type-safe builder pattern. `.sorted()` sets the flag without
-string manipulation. `HeaderBuilder::from_header(&header)` copies bbox and
-replication metadata from an existing header. The builder's rustdoc includes
-a usage example showing sorted writes.
-
-- [x] ~~Consider a `PbfWriter::write_sorted_header()` convenience method~~
-  Replaced by `HeaderBuilder::new().sorted().build()` — builder pattern is
-  more general than a single convenience method.
-- [x] ~~Document the Sort.Type_then_ID requirement in `build_header()` rustdoc~~
-  `HeaderBuilder` rustdoc documents the `.sorted()` method and includes examples.
-- [x] ~~Add a library-level example showing sorted write with the feature flag~~
-  `HeaderBuilder` doc example shows `HeaderBuilder::new().bbox(...).sorted().build()`.
+- [ ] **`pread` directly into registered buffer** — instead of heap allocation.
+  Follow-up to the existing io_uring writer thread.
 
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Verify edition 2024 is intentional — most published crates use 2021 for broader compatibility
 - [ ] Add `tests/test.osm.pbf` to version control (generated by `cargo run --example gen_test_pbf`)
-- [x] ~~Make writing program configurable in `build_header()` instead of hardcoded "pbfhogg"~~
-  `HeaderBuilder::new().writing_program("my-tool")` overrides the default.
 - [ ] Fix crate-level doc example: says `pbfhogg = "0.1"` but Cargo.toml is 0.2.0
 - [ ] Add doc comments to `writer.rs` public API (PbfWriter, Compression)
 - [ ] Add doc comments to `block_builder.rs` public API (BlockBuilder, Metadata, MemberData)

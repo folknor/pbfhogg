@@ -22,6 +22,7 @@ const BLOCK_QUEUE: usize = 8;
 pub struct ElementReader<R: Read + Send> {
     blob_iter: BlobReader<R>,
     header: HeaderBlock,
+    decode_threads: Option<usize>,
 }
 
 impl<R: Read + Send> ElementReader<R> {
@@ -47,7 +48,19 @@ impl<R: Read + Send> ElementReader<R> {
     pub fn new(reader: R) -> Result<ElementReader<R>> {
         let mut blob_iter = BlobReader::new(reader);
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header })
+        Ok(ElementReader { blob_iter, header, decode_threads: None })
+    }
+
+    /// Sets the number of threads in the decode pool used by
+    /// [`for_each_pipelined`](Self::for_each_pipelined),
+    /// [`for_each_block_pipelined`](Self::for_each_block_pipelined), and
+    /// [`into_blocks_pipelined`](Self::into_blocks_pipelined).
+    ///
+    /// When not set, defaults to `available_parallelism() - 2` (reserving threads
+    /// for the I/O reader and the consumer). The minimum is clamped to 1.
+    pub fn decode_threads(mut self, n: usize) -> Self {
+        self.decode_threads = Some(n.max(1));
+        self
     }
 
     /// Returns the PBF file header.
@@ -93,7 +106,7 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: for<'a> FnMut(Element<'a>),
     {
-        let Self { blob_iter, header } = self;
+        let Self { blob_iter, header, .. } = self;
         let is_sorted = header.is_sorted();
         let mut last_node_id: i64 = i64::MIN;
 
@@ -169,7 +182,7 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        super::pipeline::run_pipeline(self.blob_iter, f)
+        super::pipeline::run_pipeline(self.blob_iter, self.decode_threads, f)
     }
 
     /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
@@ -193,9 +206,10 @@ impl<R: Read + Send> ElementReader<R> {
     {
         let (tx, rx) = sync_channel(BLOCK_QUEUE);
         let blob_iter = self.blob_iter;
+        let decode_threads = self.decode_threads;
 
         let handle = std::thread::spawn(move || {
-            let result = super::pipeline::run_pipeline(blob_iter, |block| {
+            let result = super::pipeline::run_pipeline(blob_iter, decode_threads, |block| {
                 tx.send(Ok(block)).map_err(|_| {
                     new_error(ErrorKind::Io(std::io::Error::other(
                         "pipeline consumer dropped",
@@ -369,7 +383,7 @@ impl ElementReader<FileReader> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut blob_iter = BlobReader::from_path(path)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header })
+        Ok(ElementReader { blob_iter, header, decode_threads: None })
     }
 
     /// Open a file for reading with O_DIRECT (bypasses page cache).
@@ -377,14 +391,14 @@ impl ElementReader<FileReader> {
     pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut blob_iter = BlobReader::from_path_direct(path)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header })
+        Ok(ElementReader { blob_iter, header, decode_threads: None })
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let mut blob_iter = BlobReader::open(path, direct)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header })
+        Ok(ElementReader { blob_iter, header, decode_threads: None })
     }
 }
 

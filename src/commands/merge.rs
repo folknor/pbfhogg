@@ -73,6 +73,16 @@ impl MergeStats {
             + self.diff_relations
     }
 
+    fn merge_from(&mut self, other: &MergeStats) {
+        self.base_nodes += other.base_nodes;
+        self.base_ways += other.base_ways;
+        self.base_relations += other.base_relations;
+        self.diff_nodes += other.diff_nodes;
+        self.diff_ways += other.diff_ways;
+        self.diff_relations += other.diff_relations;
+        self.deleted += other.deleted;
+    }
+
     pub fn print_summary(&self) {
         let total_blobs =
             self.blobs_passthrough + self.blobs_rewritten + self.blobs_skip_decompress;
@@ -398,6 +408,47 @@ fn ensure_relation_capacity(
 }
 
 // ---------------------------------------------------------------------------
+// Local flush helpers for parallel rewrite (no PbfWriter)
+// ---------------------------------------------------------------------------
+
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> MergeResult<()> {
+    if let Some(bytes) = bb.take()? {
+        output.push(bytes.to_vec());
+    }
+    Ok(())
+}
+
+fn ensure_node_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+) -> MergeResult<()> {
+    if !bb.can_add_node() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
+fn ensure_way_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+) -> MergeResult<()> {
+    if !bb.can_add_way() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
+fn ensure_relation_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+) -> MergeResult<()> {
+    if !bb.can_add_relation() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, no metadata)
 // ---------------------------------------------------------------------------
 
@@ -432,20 +483,18 @@ fn write_osc_relation(
 }
 
 // ---------------------------------------------------------------------------
-// Writing base elements (with metadata passthrough)
+// Writing base elements for parallel rewrite (local flush, no PbfWriter)
 // ---------------------------------------------------------------------------
 
-fn write_base_dense_node(
+fn write_base_dense_node_local(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+    output: &mut Vec<Vec<u8>>,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
-    ensure_node_capacity(bb, writer)?;
+    ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
-        // String table was reset by a mid-block flush (ensure_*_capacity or
-        // emit_before). Flush any non-pre-seeded content, then re-seed.
-        flush_block(bb, writer)?;
+        flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
     let meta = dense_node_raw_metadata(dn);
@@ -459,15 +508,37 @@ fn write_base_dense_node(
     Ok(())
 }
 
-fn write_base_way(
+fn write_base_node_local(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+    output: &mut Vec<Vec<u8>>,
+    node: &crate::Node<'_>,
+    block: &PrimitiveBlock,
+) -> MergeResult<()> {
+    ensure_node_capacity_local(bb, output)?;
+    if !bb.is_pre_seeded() {
+        flush_local(bb, output)?;
+        bb.pre_seed_string_table(block);
+    }
+    let meta = element_raw_metadata(&node.info());
+    bb.add_node_raw(
+        node.id(),
+        node.decimicro_lat(),
+        node.decimicro_lon(),
+        node.raw_tags().map(|(k, v)| (k.cast_signed(), v.cast_signed())),
+        meta.as_ref(),
+    );
+    Ok(())
+}
+
+fn write_base_way_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
-    ensure_way_capacity(bb, writer)?;
+    ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
-        flush_block(bb, writer)?;
+        flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
     bb.add_way_raw_bytes(
@@ -480,15 +551,15 @@ fn write_base_way(
     Ok(())
 }
 
-fn write_base_relation(
+fn write_base_relation_local(
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+    output: &mut Vec<Vec<u8>>,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
-    ensure_relation_capacity(bb, writer)?;
+    ensure_relation_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
-        flush_block(bb, writer)?;
+        flush_local(bb, output)?;
         bb.pre_seed_string_table(block);
     }
     bb.add_relation_raw_bytes(
@@ -525,185 +596,200 @@ fn element_kind(element: &Element<'_>) -> ElemKind {
     }
 }
 
-struct RewriteContext<'a> {
-    diff: &'a DiffOverlay,
-    emitted_nodes: &'a mut HashSet<i64>,
-    emitted_ways: &'a mut HashSet<i64>,
-    emitted_relations: &'a mut HashSet<i64>,
-    stats: &'a mut MergeStats,
-    current_kind: &'a mut Option<ElemKind>,
-    create_emitter: &'a mut CreateEmitter,
+// ---------------------------------------------------------------------------
+// Parallel rewrite: rewrite a block without PbfWriter or CreateEmitter
+// ---------------------------------------------------------------------------
+
+/// Output from `rewrite_block_parallel`: serialized blocks + local stats.
+struct RewriteOutput {
+    blocks: Vec<Vec<u8>>,
+    stats: MergeStats,
 }
 
-
-#[hotpath::measure]
-fn rewrite_block(
-    block: &PrimitiveBlock,
-    ctx: &mut RewriteContext<'_>,
+/// Emit a single create element into the local BlockBuilder.
+fn emit_create_local(
+    id: i64,
+    kind: ElemKind,
+    diff: &DiffOverlay,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
+    output: &mut Vec<Vec<u8>>,
+    stats: &mut MergeStats,
 ) -> MergeResult<()> {
-    // Pre-seed the output string table from the input block. After this, raw
-    // string table indices from the input are valid in the output (identity mapping).
-    // Diff elements extend the table normally via add().
+    match kind {
+        ElemKind::Node => {
+            if let Some(osc) = diff.nodes.get(&id) {
+                ensure_node_capacity_local(bb, output)?;
+                let tags: Vec<(&str, &str)> =
+                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                bb.add_node(osc.id, to_decimicro(osc.lat), to_decimicro(osc.lon), &tags, None);
+                stats.diff_nodes += 1;
+            }
+        }
+        ElemKind::Way => {
+            if let Some(osc) = diff.ways.get(&id) {
+                ensure_way_capacity_local(bb, output)?;
+                let tags: Vec<(&str, &str)> =
+                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                bb.add_way(osc.id, &tags, &osc.node_refs, None);
+                stats.diff_ways += 1;
+            }
+        }
+        ElemKind::Relation => {
+            if let Some(osc) = diff.relations.get(&id) {
+                ensure_relation_capacity_local(bb, output)?;
+                let tags: Vec<(&str, &str)> =
+                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let members: Vec<MemberData<'_>> = osc
+                    .members
+                    .iter()
+                    .map(|m: &OscRelMember| MemberData {
+                        id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
+                        role: &m.role,
+                    })
+                    .collect();
+                bb.add_relation(osc.id, &tags, &members, None);
+                stats.diff_relations += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Rewrite a block in parallel: same element-by-element logic as `rewrite_block`,
+/// but flushes to local `Vec<Vec<u8>>` instead of `PbfWriter`. Interleaves
+/// pre-assigned creates at their sorted positions within the block.
+#[allow(clippy::too_many_lines)]
+#[hotpath::measure]
+fn rewrite_block_parallel(
+    block: &PrimitiveBlock,
+    diff: &DiffOverlay,
+    bb: &mut BlockBuilder,
+    create_ids: &[i64],
+    kind: ElemKind,
+) -> MergeResult<RewriteOutput> {
+    let mut output: Vec<Vec<u8>> = Vec::new();
+    let mut stats = MergeStats::new();
+    let mut create_cursor: usize = 0;
+
     bb.pre_seed_string_table(block);
 
     for element in block.elements() {
-        let kind = element_kind(&element);
-        if let Some(prev) = *ctx.current_kind
-            && prev != kind
-        {
-            flush_block(bb, writer)?;
-        }
-        *ctx.current_kind = Some(kind);
-
-        // Emit any new creates that sort before this element (sorted output).
-        // emit_before may flush the block (capacity overflow from diff creates),
-        // which resets the string table. write_base_* detects this via
-        // bb.is_pre_seeded() and re-seeds before using raw indices.
         let elem_id = match &element {
             Element::DenseNode(dn) => dn.id(),
             Element::Node(n) => n.id(),
             Element::Way(w) => w.id(),
             Element::Relation(r) => r.id(),
         };
-        ctx.create_emitter.emit_before(
-            kind, elem_id, ctx.diff,
-            ctx.emitted_nodes, ctx.emitted_ways, ctx.emitted_relations,
-            bb, writer, ctx.stats,
-        )?;
 
-        rewrite_element(&element, ctx, bb, writer, block)?;
-    }
-    Ok(())
-}
-
-fn rewrite_element(
-    element: &Element<'_>,
-    ctx: &mut RewriteContext<'_>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    block: &PrimitiveBlock,
-) -> MergeResult<()> {
-    match element {
-        Element::DenseNode(dn) => rewrite_dense_node(dn, ctx, bb, writer, block),
-        Element::Node(n) => rewrite_node(n, ctx, bb, writer, block),
-        Element::Way(w) => rewrite_way(w, ctx, bb, writer, block),
-        Element::Relation(r) => rewrite_relation(r, ctx, bb, writer, block),
-    }
-}
-
-// wontfix(perf-drain-reuse): OSC replacement paths collect tags fresh per element;
-// base element paths use raw index passthrough. Marginal gain to fix the OSC path.
-fn rewrite_dense_node(
-    dn: &crate::DenseNode<'_>,
-    ctx: &mut RewriteContext<'_>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    block: &PrimitiveBlock,
-) -> MergeResult<()> {
-    let id = dn.id();
-    if ctx.diff.deleted_nodes.contains(&id) {
-        ctx.stats.deleted += 1;
-        return Ok(());
-    }
-    if let Some(osc) = ctx.diff.nodes.get(&id) {
-        ensure_node_capacity(bb, writer)?;
-        let tags: Vec<(&str, &str)> =
-            osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        bb.add_node(osc.id, to_decimicro(osc.lat), to_decimicro(osc.lon), &tags, None);
-        ctx.emitted_nodes.insert(id);
-        ctx.stats.diff_nodes += 1;
-    } else {
-        write_base_dense_node(bb, writer, dn, block)?;
-        ctx.stats.base_nodes += 1;
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_lines, clippy::cast_possible_wrap)]
-fn rewrite_node(
-    node: &crate::Node<'_>,
-    ctx: &mut RewriteContext<'_>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    block: &PrimitiveBlock,
-) -> MergeResult<()> {
-    let id = node.id();
-    if ctx.diff.deleted_nodes.contains(&id) {
-        ctx.stats.deleted += 1;
-        return Ok(());
-    }
-    if let Some(osc) = ctx.diff.nodes.get(&id) {
-        ensure_node_capacity(bb, writer)?;
-        let tags: Vec<(&str, &str)> =
-            osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        bb.add_node(osc.id, to_decimicro(osc.lat), to_decimicro(osc.lon), &tags, None);
-        ctx.emitted_nodes.insert(id);
-        ctx.stats.diff_nodes += 1;
-    } else {
-        ensure_node_capacity(bb, writer)?;
-        if !bb.is_pre_seeded() {
-            flush_block(bb, writer)?;
-            bb.pre_seed_string_table(block);
+        // Emit pre-assigned creates with ID < this element's ID
+        while create_cursor < create_ids.len() && create_ids[create_cursor] < elem_id {
+            let cid = create_ids[create_cursor];
+            create_cursor += 1;
+            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats)?;
         }
-        let meta = element_raw_metadata(&node.info());
-        bb.add_node_raw(
-            node.id(),
-            node.decimicro_lat(),
-            node.decimicro_lon(),
-            node.raw_tags().map(|(k, v)| (k as i32, v as i32)),
-            meta.as_ref(),
-        );
-        ctx.stats.base_nodes += 1;
-    }
-    Ok(())
-}
 
-fn rewrite_way(
-    way: &crate::Way<'_>,
-    ctx: &mut RewriteContext<'_>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    block: &PrimitiveBlock,
-) -> MergeResult<()> {
-    let id = way.id();
-    if ctx.diff.deleted_ways.contains(&id) {
-        ctx.stats.deleted += 1;
-        return Ok(());
-    }
-    if let Some(osc) = ctx.diff.ways.get(&id) {
-        write_osc_way(bb, writer, osc)?;
-        ctx.emitted_ways.insert(id);
-        ctx.stats.diff_ways += 1;
-    } else {
-        write_base_way(bb, writer, way, block)?;
-        ctx.stats.base_ways += 1;
-    }
-    Ok(())
-}
+        match &element {
+            Element::DenseNode(dn) => {
+                let id = dn.id();
+                if diff.deleted_nodes.contains(&id) {
+                    stats.deleted += 1;
+                } else if let Some(osc) = diff.nodes.get(&id) {
+                    ensure_node_capacity_local(bb, &mut output)?;
+                    let tags: Vec<(&str, &str)> =
+                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    bb.add_node(
+                        osc.id,
+                        to_decimicro(osc.lat),
+                        to_decimicro(osc.lon),
+                        &tags,
+                        None,
+                    );
 
-fn rewrite_relation(
-    rel: &crate::Relation<'_>,
-    ctx: &mut RewriteContext<'_>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    block: &PrimitiveBlock,
-) -> MergeResult<()> {
-    let id = rel.id();
-    if ctx.diff.deleted_relations.contains(&id) {
-        ctx.stats.deleted += 1;
-        return Ok(());
+                    stats.diff_nodes += 1;
+                } else {
+                    write_base_dense_node_local(bb, &mut output, dn, block)?;
+                    stats.base_nodes += 1;
+                }
+            }
+            Element::Node(n) => {
+                let id = n.id();
+                if diff.deleted_nodes.contains(&id) {
+                    stats.deleted += 1;
+                } else if let Some(osc) = diff.nodes.get(&id) {
+                    ensure_node_capacity_local(bb, &mut output)?;
+                    let tags: Vec<(&str, &str)> =
+                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    bb.add_node(
+                        osc.id,
+                        to_decimicro(osc.lat),
+                        to_decimicro(osc.lon),
+                        &tags,
+                        None,
+                    );
+
+                    stats.diff_nodes += 1;
+                } else {
+                    write_base_node_local(bb, &mut output, n, block)?;
+                    stats.base_nodes += 1;
+                }
+            }
+            Element::Way(w) => {
+                let id = w.id();
+                if diff.deleted_ways.contains(&id) {
+                    stats.deleted += 1;
+                } else if let Some(osc) = diff.ways.get(&id) {
+                    ensure_way_capacity_local(bb, &mut output)?;
+                    let tags: Vec<(&str, &str)> =
+                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    bb.add_way(osc.id, &tags, &osc.node_refs, None);
+
+                    stats.diff_ways += 1;
+                } else {
+                    write_base_way_local(bb, &mut output, w, block)?;
+                    stats.base_ways += 1;
+                }
+            }
+            Element::Relation(r) => {
+                let id = r.id();
+                if diff.deleted_relations.contains(&id) {
+                    stats.deleted += 1;
+                } else if let Some(osc) = diff.relations.get(&id) {
+                    ensure_relation_capacity_local(bb, &mut output)?;
+                    let tags: Vec<(&str, &str)> =
+                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let members: Vec<MemberData<'_>> = osc
+                        .members
+                        .iter()
+                        .map(|m: &OscRelMember| MemberData {
+                            id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
+                            role: &m.role,
+                        })
+                        .collect();
+                    bb.add_relation(osc.id, &tags, &members, None);
+
+                    stats.diff_relations += 1;
+                } else {
+                    write_base_relation_local(bb, &mut output, r, block)?;
+                    stats.base_relations += 1;
+                }
+            }
+        }
     }
-    if let Some(osc) = ctx.diff.relations.get(&id) {
-        write_osc_relation(bb, writer, osc)?;
-        ctx.emitted_relations.insert(id);
-        ctx.stats.diff_relations += 1;
-    } else {
-        write_base_relation(bb, writer, rel, block)?;
-        ctx.stats.base_relations += 1;
+
+    // Emit remaining pre-assigned creates after the last element
+    while create_cursor < create_ids.len() {
+        let cid = create_ids[create_cursor];
+        create_cursor += 1;
+        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats)?;
     }
-    Ok(())
+
+    // Flush remaining elements in the BlockBuilder
+    flush_local(bb, &mut output)?;
+
+    Ok(RewriteOutput {
+        blocks: output,
+        stats,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +971,30 @@ impl CreateEmitter {
             emitted_relations, bb, writer, stats)?;
         Ok(())
     }
+
+    /// Get sorted diff IDs in `[first_id, last_id]` for the given kind,
+    /// excluding IDs in the emitted set (which are modifications already
+    /// written during rewrite). The returned IDs are creates to interleave.
+    fn creates_in_range(
+        &self,
+        kind: ElemKind,
+        first_id: i64,
+        last_id: i64,
+        emitted: &HashSet<i64>,
+    ) -> Vec<i64> {
+        let ids = match kind {
+            ElemKind::Node => &self.node_ids,
+            ElemKind::Way => &self.way_ids,
+            ElemKind::Relation => &self.rel_ids,
+        };
+        let start = ids.partition_point(|&id| id < first_id);
+        let end = ids.partition_point(|&id| id <= last_id);
+        ids[start..end]
+            .iter()
+            .copied()
+            .filter(|id| !emitted.contains(id))
+            .collect()
+    }
 }
 
 
@@ -1005,7 +1115,6 @@ pub fn merge(
     let mut emitted_ways: HashSet<i64> = HashSet::new();
     let mut emitted_relations: HashSet<i64> = HashSet::new();
     let mut stats = MergeStats::new();
-    let mut current_kind: Option<ElemKind> = None;
     let mut blob_count: u64 = 0;
     let mut create_emitter = CreateEmitter::from_diff(&diff);
 
@@ -1041,24 +1150,96 @@ pub fn merge(
             continue;
         }
 
-        // Parallel decompress + classify (reusable per-thread buffer via map_init)
-        let classified: Vec<Result<BlobClassified, String>> = batch
+        // Phase 1: Parallel classify — decompress + scan + parse overlapping blobs
+        let classify_results: Vec<Result<ClassifyResult, String>> = batch
             .par_iter()
-            .map_init(Vec::new, |buf, frame| classify_blob(frame, &ranges, buf))
+            .map_init(
+                Vec::new,
+                |buf, frame| classify_only(frame, &ranges, &diff, buf),
+            )
             .collect();
 
-        // Sequential processing: write passthrough frames, rewrite overlapping blocks
-        for (i, result) in classified.into_iter().enumerate() {
-            // classify_blob returns String error (Send for rayon); convert to Box<dyn Error>.
-            let class = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        // Phase 2: Sequential pre-compute — collect modifications, assign creates
+        let mut slots: Vec<BatchSlot> = Vec::with_capacity(classify_results.len());
+        let mut rewrite_jobs: Vec<(&PrimitiveBlock, ElemKind, Vec<i64>)> = Vec::new();
+
+        for result in &classify_results {
+            let cr = result.as_ref().map_err(|e| -> Box<dyn std::error::Error> {
+                e.clone().into()
+            })?;
+            match cr {
+                ClassifyResult::Passthrough(idx) => {
+                    slots.push(BatchSlot::Passthrough(*idx));
+                }
+                ClassifyResult::FalsePositive(idx) => {
+                    slots.push(BatchSlot::FalsePositive(*idx));
+                }
+                ClassifyResult::NeedsRewrite { block, kind, first_id, last_id } => {
+                    // Collect modification IDs into emitted sets
+                    collect_modifications(
+                        block, &diff,
+                        &mut emitted_nodes, &mut emitted_ways, &mut emitted_relations,
+                    );
+
+                    // Compute create IDs for this blob's range (not in emitted set)
+                    let emitted = match kind {
+                        ElemKind::Node => &emitted_nodes,
+                        ElemKind::Way => &emitted_ways,
+                        ElemKind::Relation => &emitted_relations,
+                    };
+                    let creates = create_emitter.creates_in_range(
+                        *kind, *first_id, *last_id, emitted,
+                    );
+
+                    // Add creates to emitted set to prevent double-emission
+                    let emitted_mut = match kind {
+                        ElemKind::Node => &mut emitted_nodes,
+                        ElemKind::Way => &mut emitted_ways,
+                        ElemKind::Relation => &mut emitted_relations,
+                    };
+                    for &id in &creates {
+                        emitted_mut.insert(id);
+                    }
+
+                    let job_idx = rewrite_jobs.len();
+                    rewrite_jobs.push((block, *kind, creates));
+                    slots.push(BatchSlot::Rewrite {
+                        job_index: job_idx,
+                        kind: *kind,
+                        first_id: *first_id,
+                        last_id: *last_id,
+                    });
+                }
+            }
+        }
+
+        // Phase 3: Parallel rewrite — rewrite overlapping blobs with pre-assigned creates
+        let rewrite_results: Vec<Result<RewriteOutput, String>> = rewrite_jobs
+            .par_iter()
+            .map_init(
+                BlockBuilder::new,
+                |thread_bb, (block, kind, creates)| {
+                    rewrite_block_parallel(block, &diff, thread_bb, creates, *kind)
+                        .map_err(|e| e.to_string())
+                },
+            )
+            .collect();
+
+        // Propagate errors and unwrap results
+        let mut rewrite_outputs: Vec<Option<RewriteOutput>> =
+            Vec::with_capacity(rewrite_results.len());
+        for result in rewrite_results {
+            rewrite_outputs.push(Some(
+                result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+            ));
+        }
+
+        // Phase 4: Sequential output — emit creates + write pre-serialized blocks
+        for (i, slot) in slots.into_iter().enumerate() {
             blob_count += 1;
 
-            match class {
-                BlobClassified::Passthrough(scan) => {
-                    // Coarse check found no diff IDs in this blob's range.
-                    // Safe to write the raw compressed frame without any parsing.
-                    // Creates with ID < min_id are emitted first; creates with
-                    // IDs *within* this blob's range are deferred to later.
+            match slot {
+                BatchSlot::Passthrough(scan) => {
                     skip_state.update(scan.kind, scan.max_id, &ranges);
                     create_emitter.emit_before(
                         scan.kind, scan.min_id, &diff,
@@ -1067,11 +1248,11 @@ pub fn merge(
                     )?;
                     flush_block(&mut bb, &mut writer)?;
                     if batch[i].index.is_some() {
-                        // Already has indexdata — pass through as-is.
-                        write_passthrough(&mut writer, &mut batch[i], input_fd, use_copy_range)?;
+                        write_passthrough(
+                            &mut writer, &mut batch[i], input_fd, use_copy_range,
+                        )?;
                         stats.blobs_index_hit += 1;
                     } else {
-                        // No indexdata — re-frame with index for future merges.
                         let indexdata = scan.serialize();
                         let reframed = crate::write::writer::reframe_raw_with_index(
                             batch[i].blob_bytes(),
@@ -1087,53 +1268,40 @@ pub fn merge(
                     }
                     stats.blobs_passthrough += 1;
                 }
-                BlobClassified::MayOverlap(raw) | BlobClassified::Fallback(raw) => {
-                    let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
-
-                    // Emit new creates that sort before this block's first element
-                    if let Some(first) = block.elements().next() {
-                        let kind = element_kind(&first);
-                        let first_id = match &first {
-                            Element::DenseNode(dn) => dn.id(),
-                            Element::Node(n) => n.id(),
-                            Element::Way(w) => w.id(),
-                            Element::Relation(r) => r.id(),
-                        };
-                        create_emitter.emit_before(
-                            kind, first_id, &diff,
-                            &emitted_nodes, &emitted_ways, &emitted_relations,
-                            &mut bb, &mut writer, &mut stats,
-                        )?;
+                BatchSlot::FalsePositive(scan) => {
+                    skip_state.update(scan.kind, scan.max_id, &ranges);
+                    create_emitter.emit_before(
+                        scan.kind, scan.min_id, &diff,
+                        &emitted_nodes, &emitted_ways, &emitted_relations,
+                        &mut bb, &mut writer, &mut stats,
+                    )?;
+                    flush_block(&mut bb, &mut writer)?;
+                    write_passthrough(
+                        &mut writer, &mut batch[i], input_fd, use_copy_range,
+                    )?;
+                    match scan.kind {
+                        ElemKind::Node => stats.base_nodes += scan.count,
+                        ElemKind::Way => stats.base_ways += scan.count,
+                        ElemKind::Relation => stats.base_relations += scan.count,
                     }
-
-                    if block_overlaps_diff(&block, &diff) {
-                        // Precise check: at least one element in this block
-                        // has a matching diff ID. Rewrite element-by-element.
-                        flush_block(&mut bb, &mut writer)?;
-                        let mut ctx = RewriteContext {
-                            diff: &diff,
-                            emitted_nodes: &mut emitted_nodes,
-                            emitted_ways: &mut emitted_ways,
-                            emitted_relations: &mut emitted_relations,
-                            stats: &mut stats,
-                            current_kind: &mut current_kind,
-                            create_emitter: &mut create_emitter,
-                        };
-                        rewrite_block(&block, &mut ctx, &mut bb, &mut writer)?;
-                        stats.blobs_rewritten += 1;
-                    } else {
-                        // Precise check: no element in this block is affected.
-                        // The coarse range check was a false positive — e.g.
-                        // the diff only has pure creates with IDs within this
-                        // blob's range, but no modifies or deletes of existing
-                        // elements. Pass through the raw frame. The creates
-                        // will be emitted by CreateEmitter when the next blob
-                        // arrives or during flush_all at EOF.
-                        flush_block(&mut bb, &mut writer)?;
-                        write_passthrough(&mut writer, &mut batch[i], input_fd, use_copy_range)?;
-                        count_block_elements(&block, &mut stats);
-                        stats.blobs_passthrough += 1;
+                    stats.blobs_passthrough += 1;
+                }
+                BatchSlot::Rewrite { job_index, kind, first_id, last_id } => {
+                    skip_state.update(kind, last_id, &ranges);
+                    create_emitter.emit_before(
+                        kind, first_id, &diff,
+                        &emitted_nodes, &emitted_ways, &emitted_relations,
+                        &mut bb, &mut writer, &mut stats,
+                    )?;
+                    flush_block(&mut bb, &mut writer)?;
+                    let output = rewrite_outputs[job_index]
+                        .take()
+                        .expect("rewrite result already consumed");
+                    for block_bytes in &output.blocks {
+                        writer.write_primitive_block(block_bytes)?;
                     }
+                    stats.merge_from(&output.stats);
+                    stats.blobs_rewritten += 1;
                 }
             }
 
@@ -1165,72 +1333,153 @@ pub fn merge(
 /// Batch size for parallel blob processing.
 const BATCH_SIZE: usize = 64;
 
-/// Result of parallel blob classification.
-///
-/// The classification pipeline has two stages:
-///
-/// 1. **Coarse** (`classify_blob`): decompress, scan element type + ID range,
-///    check `DiffRanges::range_overlaps`. Fast — no full protobuf parse.
-///    Produces `Passthrough` or `MayOverlap`.
-///
-/// 2. **Precise** (main loop): for `MayOverlap` blobs, do a full parse and
-///    check `block_overlaps_diff` — tests each actual element ID against the
-///    diff. If no actual element is affected, the blob is passed through raw
-///    (even though the coarse check flagged it). This happens when the diff
-///    only contains pure creates with IDs in the blob's range.
-enum BlobClassified {
-    /// No overlap — passthrough the raw frame directly.
+/// Result of parallel classification: parsed block for overlapping blobs,
+/// or a scan index for passthrough blobs.
+enum ClassifyResult {
+    /// No overlap — passthrough raw frame.
     Passthrough(BlobIndex),
-    /// Coarse range overlaps diff — decompressed bytes ready for full parse.
-    /// May still be passed through if the precise check finds no actual overlap.
-    MayOverlap(Vec<u8>),
-    /// Decompression or scan failed — decompressed bytes for fallback.
-    Fallback(Vec<u8>),
+    /// Coarse overlap but no actual affected elements — passthrough raw frame.
+    FalsePositive(BlobIndex),
+    /// Block overlaps diff — parsed and ready for parallel rewrite.
+    NeedsRewrite {
+        block: PrimitiveBlock,
+        kind: ElemKind,
+        first_id: i64,
+        last_id: i64,
+    },
 }
 
-/// Classify a blob in parallel: check inline index or decompress + scan + range check.
-///
-/// If the blob has inline index metadata (from BlobHeader indexdata), classification
-/// uses it directly — no decompression needed. Otherwise falls back to decompress +
-/// scan. Uses a caller-provided `buf` for decompression buffer reuse. Passthrough
-/// blobs leave the buffer intact for the next call. Only MayOverlap/Fallback blobs
-/// take ownership via `mem::take`, causing a one-time reallocation on the next call.
-///
-/// Returns `Result<_, String>` instead of `MergeResult` so it's Send for rayon.
-#[hotpath::measure]
-fn classify_blob(
+/// Parallel classify: decompress + scan + overlap check + parse overlapping blobs.
+/// Returns `ClassifyResult` with parsed block for overlap blobs, ready for the
+/// sequential pre-computation step that assigns creates before parallel rewrite.
+#[allow(clippy::too_many_lines)]
+fn classify_only(
     frame: &RawBlobFrame,
     ranges: &DiffRanges,
+    diff: &DiffOverlay,
     buf: &mut Vec<u8>,
-) -> Result<BlobClassified, String> {
+) -> Result<ClassifyResult, String> {
     // Fast path: use inline index from BlobHeader indexdata (no decompression).
     if let Some(ref idx) = frame.index
         && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
     {
-        return Ok(BlobClassified::Passthrough(*idx));
+        return Ok(ClassifyResult::Passthrough(*idx));
     }
 
     // Slow path: decompress + lightweight scan.
     decompress_blob_data_into(frame.blob_bytes(), buf).map_err(|e| e.to_string())?;
 
-    if let Some(scan) = blob_index::scan_block_ids(buf) {
+    let scan = if let Some(scan) = blob_index::scan_block_ids(buf) {
         if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
-            return Ok(BlobClassified::Passthrough(scan));
+            return Ok(ClassifyResult::Passthrough(scan));
         }
-        // Range might overlap — need full parse. Take buffer contents.
-        Ok(BlobClassified::MayOverlap(std::mem::take(buf)))
+        Some(scan)
     } else {
-        Ok(BlobClassified::Fallback(std::mem::take(buf)))
+        None
+    };
+
+    // Range overlaps — full parse + precise check.
+    let raw = std::mem::take(buf);
+    let block =
+        parse_primitive_block_from_bytes_owned(&Bytes::from(raw)).map_err(|e| e.to_string())?;
+
+    if !block_overlaps_diff(&block, diff) {
+        let idx = scan.unwrap_or_else(|| {
+            BlobIndex {
+                kind: element_kind(&block.elements().next().expect("empty block in merge")),
+                min_id: 0,
+                max_id: 0,
+                count: 0,
+            }
+        });
+        return Ok(ClassifyResult::FalsePositive(idx));
+    }
+
+    // Precise overlap confirmed — extract kind and ID range for pre-computation.
+    let mut first_id = i64::MAX;
+    let mut last_id = i64::MIN;
+    let mut kind = ElemKind::Node;
+    for element in block.elements() {
+        let id = match &element {
+            Element::DenseNode(dn) => dn.id(),
+            Element::Node(n) => n.id(),
+            Element::Way(w) => w.id(),
+            Element::Relation(r) => r.id(),
+        };
+        if id < first_id {
+            first_id = id;
+            kind = element_kind(&element);
+        }
+        if id > last_id {
+            last_id = id;
+        }
+    }
+    if first_id == i64::MAX {
+        // Empty block — treat as false positive.
+        return Ok(ClassifyResult::FalsePositive(scan.unwrap_or(BlobIndex {
+            kind: ElemKind::Node,
+            min_id: 0,
+            max_id: 0,
+            count: 0,
+        })));
+    }
+
+    Ok(ClassifyResult::NeedsRewrite { block, kind, first_id, last_id })
+}
+
+/// Collect modification IDs from a NeedsRewrite block into the emitted sets.
+/// A modification is a base element whose ID exists in the diff overlay
+/// (the diff version replaces the base version during rewrite). These IDs
+/// must be in the emitted sets so `CreateEmitter` doesn't re-emit them.
+fn collect_modifications(
+    block: &PrimitiveBlock,
+    diff: &DiffOverlay,
+    emitted_nodes: &mut HashSet<i64>,
+    emitted_ways: &mut HashSet<i64>,
+    emitted_relations: &mut HashSet<i64>,
+) {
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                let id = dn.id();
+                if diff.nodes.contains_key(&id) {
+                    emitted_nodes.insert(id);
+                }
+            }
+            Element::Node(n) => {
+                let id = n.id();
+                if diff.nodes.contains_key(&id) {
+                    emitted_nodes.insert(id);
+                }
+            }
+            Element::Way(w) => {
+                let id = w.id();
+                if diff.ways.contains_key(&id) {
+                    emitted_ways.insert(id);
+                }
+            }
+            Element::Relation(r) => {
+                let id = r.id();
+                if diff.relations.contains_key(&id) {
+                    emitted_relations.insert(id);
+                }
+            }
+        }
     }
 }
 
-/// Count elements in a block for stats without doing any processing.
-fn count_block_elements(block: &PrimitiveBlock, stats: &mut MergeStats) {
-    for element in block.elements() {
-        match element {
-            Element::DenseNode(_) | Element::Node(_) => stats.base_nodes += 1,
-            Element::Way(_) => stats.base_ways += 1,
-            Element::Relation(_) => stats.base_relations += 1,
-        }
-    }
+/// Batch processing slot — tracks per-blob state for the 4-phase parallel
+/// merge pipeline. Each slot maps to a blob in the batch by position.
+enum BatchSlot {
+    /// No overlap — passthrough raw frame.
+    Passthrough(BlobIndex),
+    /// Coarse overlap but no actual affected elements — passthrough raw frame.
+    FalsePositive(BlobIndex),
+    /// Block overlaps diff — parallel rewrite completed, output ready.
+    Rewrite {
+        job_index: usize,
+        kind: ElemKind,
+        first_id: i64,
+        last_id: i64,
+    },
 }

@@ -250,6 +250,7 @@ RSS: 74 MB. Alloc: read_raw_frame 465 MB (was ~795 MB), total merge 931 MB.
 | Indexdata, zlib (pre-passthrough-IO) | 5.16s     | frame_blob/zlib (110%)  |
 | **Indexdata, zlib (passthrough-IO)** | **3.36s** | **frame_blob/zlib (184%)** |
 | **Indexdata, none (nidhogg prod)**   | **1.90s** | **rewrite_block (49%)** |
+| **Indexdata, zlib (parallel rewrite)** | **3.31s** | **frame_blob/zlib (217%)** |
 
 The passthrough I/O optimizations recovered the indexdata+zlib regression:
 5.16s → 3.36s (-35%). The main-thread alloc reduction (~330 MB less in
@@ -295,11 +296,39 @@ this could reduce planet merge from ~30 min to ~5 min.
 Allocation at planet scale: ~3.2 TB churn (alloc+dealloc), RSS bounded at
 ~200-500 MB (dominated by DiffRanges ~32 MB + working buffers).
 
+### With parallel rewrite_block (indexdata + zlib, same host)
+
+rewrite_block now runs on rayon workers instead of the main thread. The main
+thread handles classify_blob + read_raw_frame only, dispatching rewrite work
+to the same rayon pool that handles compression.
+
+| Function                    | Calls     | Avg      | Total     | % Total |
+|-----------------------------|-----------|----------|-----------|---------|
+| writer::frame_blob          | 615       | 11.66ms  | 7.17s     | 217%*   |
+| pbfhogg::main               | 1         | 3.31s    | 3.31s     | 100%    |
+| merge::merge                | 1         | 3.31s    | 3.31s     | 100%    |
+| merge::rewrite_block_parallel | 614     | 1.67ms   | 1.02s     | 31%     |
+| block_builder::take         | 8019      | 29 us    | 233ms     | 7%      |
+| merge::read_raw_frame       | 7399      | 10 us    | 77ms      | 2.3%    |
+
+*>100% because frame_blob runs in parallel (pipelined writer).
+
+RSS: 132 MB. Main thread CPU: 0.38s total. 5 threads visible, workers sleeping.
+
+The main thread is no longer the bottleneck. At 0.38s CPU, it finishes
+classify_blob + read_raw_frame and dispatches all rewrite work before the
+rayon pool has finished compressing. Wall time improvement is marginal
+(3.36s -> 3.31s, -1.5%) because Denmark's 8.5% rewrite fraction means
+rewrite_block was never the bottleneck — frame_blob/zlib was already dominant.
+
+The real payoff is at higher rewrite fractions (Germany, planet) where
+rewrite_block's sequential cost was a significant wall-time contributor.
+
 ## Germany merge (4.5 GB, 500M elements, 62K blobs, daily diff 146K changes)
 
 Scale test: ~10× Denmark. Rewrite fraction: 18.4% (11,480 / 62,461).
 
-### Summary table
+### Summary table (sequential rewrite)
 
 | Config                    | Wall  | classify_blob | rewrite_block | frame_blob    | RSS    |
 |---------------------------|-------|---------------|---------------|---------------|--------|
@@ -307,34 +336,63 @@ Scale test: ~10× Denmark. Rewrite fraction: 18.4% (11,480 / 62,461).
 | Indexdata, zlib           | 49.9s | 11.7s (23%)   | 17.7s (36%)   | 109.8s (220%) | 374 MB |
 | Indexdata, none           | 52.3s | 11.7s (22%)   | 16.4s (31%)   | 415ms (0.8%)  | 338 MB |
 
+### Summary table (parallel rewrite)
+
+| Config                    | Wall  | rewrite_block_parallel | frame_blob     | read_raw_frame | RSS    |
+|---------------------------|-------|------------------------|----------------|----------------|--------|
+| No indexdata, zlib (par.) | 36.4s | —                      | —              | —              | —      |
+| Indexdata, zlib (par.)    | 35.1s | 22.47s (64%)           | 146.29s (417%) | 4.70s (13%)    | 353 MB |
+| Indexdata, none (par.)    | 46.4s | 22.84s (49%)           | 898ms (2%)     | 805ms (2%)     | 346 MB |
+
 ### Key findings
 
 **Rewrite fraction scaling:** Denmark 8.5% → Germany 18.4%. Germany has 16×
 more daily changes for 10× more data, so higher change density per blob.
 Validates the planet extrapolation model (92% rewrite at planet scale).
 
-**Indexdata benefit hidden by compression:** classify_blob improved 2.9×
-(33.8s → 11.7s), saving 22s. But wall time barely changed (50.0s → 49.9s)
-because the zlib compression pipeline (110s on rayon workers) is the true
-bottleneck. Main thread classify_blob work is completely overlapped by
-worker compression time.
+**Indexdata benefit hidden by compression (sequential):** classify_blob
+improved 2.9× (33.8s → 11.7s), saving 22s. But wall time barely changed
+(50.0s → 49.9s) because the zlib compression pipeline (110s on rayon workers)
+is the true bottleneck. Main thread classify_blob work is completely overlapped
+by worker compression time.
 
-**Compression::None is SLOWER:** 52.3s vs 49.9s for zlib. Without parallel
-compression work, there's nothing to overlap main-thread work with.
-rewrite_block + classify_blob + take run purely sequentially on the main
-thread (16.4 + 11.7 + 10.8 = 38.9s), and the total wall time reflects this.
-The zlib path effectively hides ~30s of main-thread work behind 110s of
-parallel compression.
+**Compression::None was SLOWER with sequential rewrite:** 52.3s vs 49.9s for
+zlib. Without parallel compression work, there was nothing to overlap
+main-thread work with. rewrite_block + classify_blob + take ran purely
+sequentially on the main thread (16.4 + 11.7 + 10.8 = 38.9s). The zlib path
+effectively hid ~30s of main-thread work behind 110s of parallel compression.
 
-**Thread utilization contrast:**
-- Zlib: main 98%, 4 workers 83-92% — full utilization, compression-bound
-- None: main 98%, workers idle (0-11%) — single-threaded, main-thread-bound
+**Parallel rewrite transforms the picture:**
+- No indexdata, zlib: 50.0s → 36.4s (-27%). Without indexdata, parallel
+  rewrite still helps because rewrite_block was 35% of wall time.
+- Indexdata, zlib: 49.9s → 35.1s (-30%). The largest absolute improvement.
+  rewrite_block_parallel total is 22.47s across 5 workers (~4.5s wall),
+  while frame_blob at 146.29s across workers (~29s wall) remains dominant.
+- Indexdata, none: 52.3s → 46.4s (-11%). Smallest improvement because
+  without compression to overlap, the wall time is still dominated by
+  sequential main-thread work (classify + I/O) plus parallel rewrite.
 
-**Implication:** At moderate rewrite fractions (>10%), Compression::None only
-wins when rewrite_block is also parallelized. Without parallel rewrite, the
-zlib path accidentally provides better wall time by overlapping main-thread
-serial work with compression. The optimization order matters: parallelize
-rewrite_block FIRST, then Compression::None becomes the clear winner.
+**Thread utilization with parallel rewrite (indexdata + zlib):**
+- 5 workers each 9-10s CPU (~80% utilization)
+- Workers handle both rewrite_block_parallel and frame_blob concurrently
+- Main thread freed from rewrite work, feeds pipeline faster
+
+**Thread utilization with parallel rewrite (indexdata + none):**
+- Workers 29-78% max CPU (lower utilization)
+- No compression work to overlap, so workers mostly idle between rewrites
+- Confirms Compression::None only wins at low rewrite fractions
+
+**Compression::None still slower at 18.4% rewrite:** 46.4s vs 35.1s for zlib.
+Even with parallel rewrite, the zlib path wins because the compression pipeline
+provides enough parallel work to hide all other costs. At Germany's rewrite
+fraction, the crossover point has not yet been reached.
+
+**Implication for planet scale:** At 92% rewrite, parallel rewrite_block is
+transformative. Germany shows -30% wall time at 18.4% rewrite; at planet scale
+the effect is much larger because rewrite_block dominates. The original
+extrapolation of ~30 min (sequential) → ~5 min (8 cores) remains valid.
+Germany's 35.1s (parallel, zlib) extrapolates to ~10 min at planet scale
+with parallel rewrite + zlib compression overlap.
 
 ## Write benchmark: sync vs pipelined (bench_write)
 

@@ -152,6 +152,15 @@ CLI commands — Denmark extract (483 MB, 59M elements):
 
 Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways / smart strategy. Add-locs is add-locations-to-ways (10.2M output elements, byte-identical output). osmium uses multi-threaded compression; pbfhogg extract and add-locations-to-ways are single-threaded.
 
+Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten):
+
+| Config | before | after | change |
+|--------|--------|-------|--------|
+| indexdata + zlib | 49.9s | **35.1s** | -30% |
+| indexdata + none | 52.3s | **46.4s** | -11% |
+
+The improvement comes from parallel `rewrite_block` — rewriting touched blobs on the rayon pool instead of the main thread. Denmark's 8.5% rewrite fraction is too small to show the effect; at Germany's 18.4% (and planet's ~92%) the main-thread rewrite bottleneck dominates.
+
 All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
 System: Linux 6.18, Ryzen 9 7950X.

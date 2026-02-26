@@ -54,39 +54,54 @@ No regression on read paths (tags-count, check-refs, cat --type unchanged).
 
 ## Performance: parallelism
 
-- [ ] **Parallel merge rewrite_block** — at planet scale with daily diffs,
-  `rewrite_block` is single-threaded and takes ~27 min (~1.1M blobs × 1.49ms
-  each). This is the dominant merge bottleneck. The current merge loop is
-  sequential: read batch → parallel classify → sequential rewrite/passthrough.
-  A pipelined merge architecture could parallelize the rewrite work:
-  - **Stage 1** (I/O thread): `read_raw_frame` — sequential disk reads
-  - **Stage 2** (rayon pool): `classify_blob` + `rewrite_block` — decompress,
-    classify, and rewrite overlapping blocks in parallel
-  - **Stage 3** (writer thread): ordered output via reorder buffer (like the
-    existing pipelined writer)
+- [x] **Parallel merge rewrite_block** — 4-phase batch-parallel pipeline:
+  1. **Parallel classify** (`classify_only` via rayon): decompress + scan +
+     parse overlapping blobs, returning `ClassifyResult` with parsed block
+  2. **Sequential pre-compute**: collect modification IDs into emitted sets
+     via `collect_modifications`, assign creates per blob via
+     `CreateEmitter::creates_in_range` (binary search on sorted diff IDs)
+  3. **Parallel rewrite** (`rewrite_block_parallel` via rayon): per-thread
+     `BlockBuilder`, interleaves pre-assigned creates at sorted positions,
+     serializes to `Vec<Vec<u8>>`
+  4. **Sequential output**: write passthrough frames + pre-serialized blocks,
+     `CreateEmitter` handles between-blob creates
 
-  Challenge: `CreateEmitter` interleaves new elements between blocks at their
-  sorted position. This requires cross-block coordination — a block's rewrite
-  depends on knowing which creates go before it. Possible approaches:
-  - Two-pass: first pass determines create insertion points, second pass
-    rewrites blocks in parallel with known create boundaries
-  - Batch-level: parallelize within batches (current 64-blob batches), keep
-    cross-batch ordering sequential
-  - Approximate: rewrite blocks in parallel, append creates at block boundaries
-    (relaxing strict sorted order within block gaps — OSM consumers tolerate
-    this)
+  Solved the create-interleaving challenge with a two-pass approach: Phase 2
+  pre-computes which creates belong to each rewrite blob (creates in
+  `[first_id, last_id]` not in emitted set), Phase 3 interleaves them at
+  exact sorted positions. Output is identical to sequential rewrite.
 
-  At 8 cores, parallel rewrite could reduce planet merge from ~27 min to
-  ~3-4 min. Combined with indexdata + Compression::None, this would make
-  daily planet refresh a ~5-min operation.
+  **Measured impact:**
+  - Denmark (8.5% rewrite): 3.36s → 3.31s (no change — too few rewrite blobs)
+  - Germany (18.4% rewrite): indexdata+zlib 49.9s → 35.1s (**-30%**),
+    indexdata+none 52.3s → 46.4s (**-11%**)
+  - Germany thread utilization: 5 workers at 80% CPU (zlib), 29-78% (none)
+  - Planet extrapolation: ~27 min → ~5 min at 8 cores (rewrite is now
+    embarrassingly parallel, no cross-blob data dependencies)
 
-- [ ] `pipeline.rs:13-16` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
-  Making them configurable would require a pipeline config struct on the public
-  `for_each_pipelined` API. Current values work well at both Denmark and planet
-  scale — hotpath shows the pipeline is balanced (I/O thread not stalling, rayon
-  workers barely loaded, main thread is the bottleneck). Memory cost is 32 blocks
-  × ~32KB-1MB = 32-256MB peak. Low priority — configure when someone reports a
-  problem on a memory-constrained system.
+- [ ] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
+  `READ_AHEAD` bounds the `sync_channel` between the I/O thread (Stage 1) and
+  the rayon decode pool (Stage 2) — the I/O thread blocks when 16 compressed
+  blobs are buffered. `DECODE_AHEAD` bounds the channel between the decode pool
+  and the main-thread reorder buffer (Stage 3) — decode threads block when 32
+  decoded blocks are pending. `DECODE_AHEAD` is 2× `READ_AHEAD` because decode
+  results arrive out-of-order and the reorder `VecDeque` needs headroom to
+  reconstruct file order without stalling Stage 1.
+
+  Backpressure is automatic via bounded `sync_channel`: if the main thread's
+  `block_fn` is slow, the decode channel fills → decode threads block on send →
+  raw channel fills → I/O thread blocks on send. No manual tuning needed.
+
+  Memory cost: ~16 × 32KB (compressed) + 32 × 1.4MB (decoded) ≈ **51 MB** peak
+  pipeline overhead, independent of file size. The `DecompressPool` recycles
+  decode buffers so cumulative alloc is near-zero (vs 10.2 GB naive for Denmark,
+  ~1.7 TB for planet).
+
+  Making these configurable would require a pipeline config struct on the public
+  `for_each_pipelined` API. Hotpath profiling (Denmark through Japan) shows the
+  pipeline is balanced at all tested scales — I/O thread doesn't stall, rayon
+  workers are barely loaded, main thread is the bottleneck. **Low priority** —
+  configure when someone reports a problem on a memory-constrained system.
 
 - [ ] **Rayon alternatives for slice-based parallelism** — Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
@@ -108,11 +123,28 @@ No regression on read paths (tags-count, check-refs, cat --type unchanged).
   `thread_local::ThreadLocal` and `.get_or()` inside rayon closures to guarantee one init per
   thread. Simple and works today without switching libraries.
 
-  **Relevance to pbfhogg:** `par_map_reduce` uses rayon's `par_bridge` which has known overhead
-  for ordered iteration. `for_each_pipelined` uses a custom 3-stage pipeline that doesn't depend
-  on rayon's par_iter at all (it uses `rayon::spawn` for the decode pool). The main rayon
-  consumer is merge's `par_bridge` in `classify_blob`. The `thread_local::ThreadLocal` trick
-  could replace merge's `map_init(Vec::new, ...)` pattern for per-thread buffer reuse.
+  **Current rayon usage (3 sites, all working well):**
+
+  | Site | Pattern | Pool | Purpose |
+  |------|---------|------|---------|
+  | `pipeline.rs:85-104` | `ThreadPoolBuilder` + `spawn` | Dedicated | Decode pool (Stage 2) |
+  | `writer.rs:289` | `rayon::spawn()` | Global | Parallel compression |
+  | `merge.rs:1045` | `par_iter().map_init()` | Global | Batch classify |
+  | `reader.rs:350` | `into_par_iter().try_fold().try_reduce()` | Global | `par_map_reduce` |
+
+  The pipeline decode pool uses a dedicated `ThreadPoolBuilder` with `available_parallelism() - 2`
+  threads (reserving 2 for I/O + consumer) and raw `rayon::spawn` — it doesn't use par_iter at
+  all. The writer uses global-pool `rayon::spawn` for parallel compression. `par_map_reduce` batch-
+  collects all blobs then uses lock-free `into_par_iter` (replaced an earlier `par_bridge` +
+  Mutex approach that had contention at 8+ cores). Merge uses `par_iter().map_init(Vec::new, ...)`
+  for per-thread decompression buffer reuse during classify.
+
+  The `thread_local::ThreadLocal` trick could replace merge's `map_init(Vec::new, ...)`, but the
+  practical gain is zero — `Vec::new()` is stack-only (no heap allocation until first push), so
+  rayon re-initing it under work-stealing costs nothing. Switching to paralight would add a
+  dependency for marginal benefit on a path that already works well. **Low priority** — revisit
+  only if rayon becomes a proven bottleneck (e.g. if parallel `rewrite_block` exposes contention
+  in the global pool).
 
 ## Performance: Linux kernel features for planet-scale I/O
 

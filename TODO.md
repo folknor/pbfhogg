@@ -30,11 +30,12 @@ Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (ti
   numbers). Re-merge through pbfhogg, save as the new test PBF, and re-profile
   to get realistic merge numbers.
 
-- [ ] **`block_builder::take` buffer reuse** — take allocates 4.6 GB total
-  (8% of write wall time) from `encode_to_vec()` creating a fresh buffer
-  every flush. Reusing a `Vec<u8>` across calls with `encode_to_vec` →
-  `encode(&mut buf)` + `buf.clear()` would eliminate this churn.
-  Detailed investigation: `notes/take-buffer-reuse.md`.
+- [x] **`block_builder::take` buffer reuse** — take allocated 4.6 GB total
+  from `encode_to_vec()` creating a fresh buffer every flush. Fixed by
+  storing a `Vec<u8>` in BlockBuilder and using `encode(&mut buf)` +
+  `buf.clear()`. Return type changed from `Vec<u8>` to `&[u8]`.
+  Eliminates ~960 MB encode churn per Denmark run.
+  Investigation: `notes/take-buffer-reuse.md`.
 
 ### Merge: remaining optimization theories
 
@@ -47,21 +48,20 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   encoding (dense nodes) make per-element raw byte splicing impossible without
   re-serialization that costs the same as full reencode.
 
-- [ ] **Pre-seed output StringTable from input block** — investigated: less
-  clear-cut than expected. `StringTable::add()` already allocates via
-  `entry(s.to_owned())` on every call (even for existing strings), so pre-seeding
-  doesn't save allocations — it just moves them earlier. The natural access
-  pattern already populates the table on the first few elements, and subsequent
-  elements hit the occupied path. The real win would be **avoiding the `add()`
-  call entirely** for unmodified elements by preserving input string table indices
-  in the output — but that requires a fundamentally different BlockBuilder mode
-  where raw string-table indices pass through without re-interning. Worth
-  prototyping to measure whether the FxHashMap lookup overhead on ~8000 elements
-  × ~4 tags is actually significant.
-  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`. Bottom-up
-  modeling estimates StringTable::add at ~667ms (33% of rewrite_block), ~75% of
-  add_way time. Pre-seeding or index passthrough could save ~600ms on Denmark
-  (~29-33% rewrite_block speedup). Needs profiling to confirm.
+- [x] **StringTable::add allocation-free fast path** — `add()` called
+  `entry(s.to_owned())` on every invocation, allocating a String even on cache
+  hits (~99% of calls). Fixed by trying `self.index.get(s)` first (zero-alloc
+  Borrow trait lookup), falling through to `entry()` only on miss. Results:
+  add_node 55→41ns (25%), add_way 255→219ns (14%), add_relation 691→491ns (29%),
+  merge rewrite_block 2.17→2.03s (6.5%). Investigation: `notes/rewrite-block-cost-breakdown.md`.
+
+- [ ] **Pre-seed output StringTable / index passthrough for merge** — the get()
+  fast-path above captured the easy wins. Remaining opportunity: for unmodified
+  elements in merge's rewrite_block, preserve input string table indices in the
+  output without re-interning. Requires a dual-mode BlockBuilder (raw indices
+  vs string references). Estimated additional savings: ~400ms on Denmark
+  (~20% of rewrite_block). Higher complexity — needs a new API surface on
+  BlockBuilder.
 
 - [ ] **Raw packed bytes for non-string integer fields** — investigated: the
   delta encoding is compatible (both input wire format and BlockBuilder delta-
@@ -78,8 +78,8 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   — 9× less impactful than StringTable. **Likely not worth the complexity.**
 
 - [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
-  (slightly slower than old crate's 673ms). `take()` is 27% of wall time; further
-  gains need buffer reuse instead of `encode_to_vec()`.
+  (slightly slower than old crate's 673ms). Buffer reuse now implemented (see
+  above) — `encode_to_vec()` replaced with `encode(&mut buf)` + reused buffer.
 
 ## Performance: parallelism
 

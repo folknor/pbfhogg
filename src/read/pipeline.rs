@@ -27,7 +27,11 @@ const DECODE_AHEAD: usize = 32;
 /// PBF ordering (nodes → ways → relations) is preserved.
 #[allow(clippy::needless_pass_by_value)]
 #[hotpath::measure]
-pub(crate) fn run_pipeline<R, F>(blob_reader: BlobReader<R>, mut block_fn: F) -> Result<()>
+pub(crate) fn run_pipeline<R, F>(
+    blob_reader: BlobReader<R>,
+    decode_thread_count: Option<usize>,
+    mut block_fn: F,
+) -> Result<()>
 where
     R: Read + Send,
     F: FnMut(PrimitiveBlock) -> Result<()>,
@@ -71,11 +75,13 @@ where
         //   reduces wall-clock time for large files.
         let dispatch_tx = decoded_tx.clone();
         scope.spawn(move || {
-            let decode_threads = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                // If available_parallelism() is unsupported (e.g. some WASM runtimes),
-                // fall back to 4 threads as a reasonable default for most desktops.
-                .unwrap_or(4);
+            let decode_threads = decode_thread_count.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get().saturating_sub(2).max(1))
+                    // If available_parallelism() is unsupported (e.g. some WASM runtimes),
+                    // fall back to 4 threads as a reasonable default for most desktops.
+                    .unwrap_or(4)
+            });
             let decode_pool = match rayon::ThreadPoolBuilder::new()
                 .num_threads(decode_threads)
                 .build()

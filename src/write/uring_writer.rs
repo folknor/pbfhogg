@@ -23,6 +23,31 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, SyncSender};
 
+/// Registered file descriptor index for the output file.
+const OUT_FD_IDX: u32 = 0;
+/// Registered file descriptor index for the input file (CopyRange passthrough).
+#[cfg(feature = "linux-direct-io")]
+const IN_FD_IDX: u32 = 1;
+
+/// User data flag: bit 15 set means this CQE is from a ReadFixed SQE.
+/// Since `NUM_BUFS` is 64 (uses bits 0-5), bit 15 is always free.
+const READ_FLAG: u64 = 1 << 15;
+
+/// Extract the buffer index from user_data (bits 0-5, masking out READ_FLAG).
+const fn ud_buf_idx(ud: u64) -> u16 {
+    (ud & 0x3F) as u16
+}
+
+/// Extract the expected length from user_data (bits 16+).
+const fn ud_expected_len(ud: u64) -> u32 {
+    (ud >> 16) as u32
+}
+
+/// Check whether this CQE is from a ReadFixed SQE.
+const fn ud_is_read(ud: u64) -> bool {
+    ud & READ_FLAG != 0
+}
+
 /// Page size for O_DIRECT alignment.
 const PAGE_SIZE: usize = 4096;
 
@@ -128,6 +153,9 @@ struct UringState {
     logical_size: u64,
     /// Number of submitted but not yet completed SQEs.
     in_flight: u32,
+    /// Whether the input fd has been registered at `IN_FD_IDX` (one-time, on first CopyRange).
+    #[cfg(feature = "linux-direct-io")]
+    input_fd_registered: bool,
 }
 
 impl UringState {
@@ -174,33 +202,44 @@ impl UringState {
         Ok(())
     }
 
-    /// Submit the current buffer as a `WriteFixed` SQE.
-    #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by BUF_SIZE/NUM_BUFS
+    /// Submit the current accumulation buffer as a `WriteFixed` SQE.
     fn submit_current(&mut self) -> io::Result<()> {
         let buf_idx = match self.current_buf.take() {
             Some(idx) => idx,
             None => return Ok(()),
         };
-        if self.current_len == 0 {
+        let len = self.current_len;
+        self.current_len = 0;
+        self.submit_buffer(buf_idx, len)
+    }
+
+    /// Submit a registered buffer as a `WriteFixed` SQE.
+    ///
+    /// Handles O_DIRECT page-alignment padding, advances `write_offset` and
+    /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
+    /// Does **not** update `logical_size` — the caller is responsible.
+    #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by BUF_SIZE/NUM_BUFS
+    fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> io::Result<()> {
+        if data_len == 0 {
             self.pool.release(buf_idx);
             return Ok(());
         }
 
         // Pad to page boundary for O_DIRECT. Zero-fill the padding region
         // (buffer memory may have stale data from a previous use).
-        let aligned_len = round_up_to_page(self.current_len);
-        if aligned_len > self.current_len {
+        let aligned_len = round_up_to_page(data_len);
+        if aligned_len > data_len {
             // Safety: buf_idx is valid and not in-flight, padding is within
             // the buffer allocation (aligned_len <= buf_size).
             unsafe {
-                let dst = self.pool.buf_ptr(buf_idx).add(self.current_len);
-                std::ptr::write_bytes(dst, 0, aligned_len - self.current_len);
+                let dst = self.pool.buf_ptr(buf_idx).add(data_len);
+                std::ptr::write_bytes(dst, 0, aligned_len - data_len);
             }
         }
 
         let ptr = self.pool.buf_ptr(buf_idx).cast_const();
         let sqe = opcode::WriteFixed::new(
-            Fixed(0), // registered fd index 0
+            Fixed(OUT_FD_IDX),
             ptr,
             aligned_len as u32,
             buf_idx,
@@ -212,7 +251,7 @@ impl UringState {
         .user_data((aligned_len as u64) << 16 | buf_idx as u64);
 
         // Safety: the SQE references a registered buffer (buf_idx) and a
-        // registered fd (index 0). The buffer will not be touched until the
+        // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
         unsafe {
             self.ring
@@ -227,27 +266,125 @@ impl UringState {
 
         self.write_offset += aligned_len as u64;
         self.in_flight += 1;
-        self.current_len = 0;
+
+        Ok(())
+    }
+
+    /// Register the input file descriptor at `IN_FD_IDX` for `ReadFixed` CopyRange.
+    ///
+    /// Only registers on the first call; subsequent calls are no-ops.
+    #[cfg(feature = "linux-direct-io")]
+    fn register_input_fd(&mut self, in_fd: std::os::unix::io::RawFd) -> io::Result<()> {
+        if self.input_fd_registered {
+            return Ok(());
+        }
+        self.ring
+            .submitter()
+            .register_files_update(IN_FD_IDX, &[in_fd])
+            .map_err(|e| io::Error::new(e.kind(), format!("register_files_update failed: {e}")))?;
+        self.input_fd_registered = true;
+        Ok(())
+    }
+
+    /// Submit a linked `ReadFixed` → `WriteFixed` pair for zero-copy CopyRange.
+    ///
+    /// Reads `len` bytes from the registered input fd at `src_offset` into
+    /// registered buffer `buf_idx`, then writes from that buffer to the output.
+    /// The two SQEs are linked: if the read fails, the write is canceled.
+    #[cfg(feature = "linux-direct-io")]
+    #[allow(clippy::cast_possible_truncation)]
+    fn submit_copy_chain(
+        &mut self,
+        src_offset: u64,
+        buf_idx: u16,
+        len: usize,
+    ) -> io::Result<()> {
+        let aligned_len = round_up_to_page(len);
+        let buf_ptr = self.pool.buf_ptr(buf_idx);
+
+        // Pre-zero the O_DIRECT padding region. ReadFixed writes [0..len);
+        // the trailing [len..aligned_len) must be zero for the WriteFixed.
+        if aligned_len > len {
+            unsafe {
+                std::ptr::write_bytes(buf_ptr.add(len), 0, aligned_len - len);
+            }
+        }
+
+        // ReadFixed SQE — linked to the next SQE via IO_LINK.
+        let read_sqe = opcode::ReadFixed::new(
+            Fixed(IN_FD_IDX),
+            buf_ptr,
+            len as u32,
+            buf_idx,
+        )
+        .offset(src_offset)
+        .build()
+        .flags(io_uring::squeue::Flags::IO_LINK)
+        .user_data((len as u64) << 16 | buf_idx as u64 | READ_FLAG);
+
+        // WriteFixed SQE — executed only if the read succeeds.
+        let write_sqe = opcode::WriteFixed::new(
+            Fixed(OUT_FD_IDX),
+            buf_ptr.cast_const(),
+            aligned_len as u32,
+            buf_idx,
+        )
+        .offset(self.write_offset)
+        .build()
+        .user_data((aligned_len as u64) << 16 | buf_idx as u64);
+
+        // Safety: both SQEs reference registered buffers and registered fds.
+        // The buffer will not be touched until both CQEs are reaped.
+        unsafe {
+            let mut sq = self.ring.submission();
+            sq.push(&read_sqe)
+                .map_err(|_| io::Error::other("io_uring SQ full (read)"))?;
+            sq.push(&write_sqe)
+                .map_err(|_| io::Error::other("io_uring SQ full (write)"))?;
+        }
+        self.ring
+            .submitter()
+            .submit()
+            .map_err(|e| io::Error::new(e.kind(), format!("io_uring submit failed: {e}")))?;
+
+        self.write_offset += aligned_len as u64;
+        self.in_flight += 2; // Both SQEs produce CQEs
 
         Ok(())
     }
 
     /// Acquire a free buffer, reaping CQEs if necessary.
+    ///
+    /// With linked ReadFixed+WriteFixed chains, a single `reap_cqes` call may
+    /// only return the ReadFixed CQE (which doesn't release the buffer). We
+    /// loop until a WriteFixed CQE releases one.
     fn acquire_buffer(&mut self) -> io::Result<u16> {
         // Fast path: free buffer available.
         if let Some(idx) = self.pool.acquire() {
             return Ok(idx);
         }
-        // Slow path: all buffers in-flight, wait for at least one completion.
-        self.reap_cqes(true)?;
-        self.pool
-            .acquire()
-            .ok_or_else(|| io::Error::other("no free buffers after reap"))
+        // Slow path: all buffers in-flight, wait until a buffer is freed.
+        loop {
+            if self.in_flight == 0 {
+                return Err(io::Error::other("no free buffers and nothing in-flight"));
+            }
+            self.reap_cqes(true)?;
+            if let Some(idx) = self.pool.acquire() {
+                return Ok(idx);
+            }
+        }
     }
 
     /// Reap completed CQEs and recycle buffer indices.
     ///
     /// If `wait` is true, blocks until at least one CQE is available.
+    ///
+    /// Handles both write-only CQEs and linked ReadFixed+WriteFixed pairs:
+    /// - Write CQEs (bit 15 clear): validate result and release the buffer.
+    /// - Read CQEs (bit 15 set): validate result but do NOT release — the
+    ///   linked WriteFixed still references the buffer.
+    /// - Canceled write CQEs (`-ECANCELED`): the linked read already failed
+    ///   and released the buffer; skip without double-releasing.
     #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)] // ud as u16, result as u32: io_uring CQE fields
     fn reap_cqes(&mut self, wait: bool) -> io::Result<()> {
         if self.in_flight == 0 {
@@ -263,19 +400,43 @@ impl UringState {
         }
         for cqe in self.ring.completion() {
             let ud = cqe.user_data();
-            let buf_idx = ud as u16;
-            let expected_len = (ud >> 16) as u32;
+            let buf_idx = ud_buf_idx(ud);
+            let expected_len = ud_expected_len(ud);
             let result = cqe.result();
             self.in_flight -= 1;
-            if result < 0 {
-                return Err(io::Error::from_raw_os_error(-result));
+
+            if ud_is_read(ud) {
+                // Read CQE from a linked ReadFixed+WriteFixed chain.
+                // Don't release — the linked WriteFixed still needs this buffer.
+                if result < 0 {
+                    // Read failed. Release buffer here; the linked write CQE
+                    // will arrive as -ECANCELED and skip release.
+                    self.pool.release(buf_idx);
+                    return Err(io::Error::from_raw_os_error(-result));
+                }
+                if (result as u32) != expected_len {
+                    self.pool.release(buf_idx);
+                    return Err(io::Error::other(format!(
+                        "io_uring short read: expected {expected_len}, got {result}"
+                    )));
+                }
+            } else {
+                // Write CQE — either standalone WriteFixed or from a linked chain.
+                if result == -(libc::ECANCELED as i32) {
+                    // Write was canceled because the linked read failed.
+                    // Buffer was already released in the read CQE error path.
+                    continue;
+                }
+                if result < 0 {
+                    return Err(io::Error::from_raw_os_error(-result));
+                }
+                if (result as u32) != expected_len {
+                    return Err(io::Error::other(format!(
+                        "io_uring short write: expected {expected_len} bytes, got {result}"
+                    )));
+                }
+                self.pool.release(buf_idx);
             }
-            if (result as u32) != expected_len {
-                return Err(io::Error::other(format!(
-                    "io_uring short write: expected {expected_len} bytes, got {result}"
-                )));
-            }
-            self.pool.release(buf_idx);
         }
         Ok(())
     }
@@ -308,13 +469,11 @@ const fn round_up_to_page(n: usize) -> usize {
 // CopyRange handling
 // ---------------------------------------------------------------------------
 
-/// Handle a `CopyRange` payload by reading from the input fd and writing
-/// through the ring.
+/// Handle a `CopyRange` payload using linked `ReadFixed` → `WriteFixed` SQEs.
 ///
-/// Reads via `pread(2)` into a heap buffer, then writes through
-/// [`UringState::write`]. This replaces `copy_file_range` for the io_uring path
-/// — the output fd is `O_DIRECT` and managed by io_uring, so `copy_file_range`
-/// cannot be used.
+/// Registers the input fd on first use, then submits linked SQE pairs that
+/// read from the input file directly into registered buffers and write them
+/// to the output — fully async, no syscalls in userspace beyond `io_uring_enter`.
 #[cfg(feature = "linux-direct-io")]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn handle_copy_range_uring(
@@ -323,52 +482,22 @@ fn handle_copy_range_uring(
     mut src_offset: u64,
     mut remaining: u64,
 ) -> io::Result<()> {
-    let chunk_size = state.pool.buf_size.min(remaining as usize);
-    let mut read_buf = vec![0u8; chunk_size];
+    // Register the input fd if this is the first CopyRange.
+    state.register_input_fd(in_fd)?;
+    // Flush the accumulation buffer to maintain byte ordering.
+    state.submit_current()?;
+    // Track logical size upfront since we bypass write() which normally does it.
+    state.logical_size += remaining;
+
     while remaining > 0 {
-        let to_read = read_buf.len().min(remaining as usize);
-        let n = pread_full(in_fd, &mut read_buf[..to_read], src_offset)?;
-        if n == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "pread returned 0 during copy_range",
-            ));
-        }
-        state.write(&read_buf[..n])?;
-        src_offset += n as u64;
-        remaining -= n as u64;
+        let chunk_len = state.pool.buf_size.min(remaining as usize);
+        let buf_idx = state.acquire_buffer()?;
+
+        state.submit_copy_chain(src_offset, buf_idx, chunk_len)?;
+        src_offset += chunk_len as u64;
+        remaining -= chunk_len as u64;
     }
     Ok(())
-}
-
-/// `pread(2)` wrapper that handles partial reads.
-#[cfg(feature = "linux-direct-io")]
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn pread_full(
-    fd: std::os::unix::io::RawFd,
-    buf: &mut [u8],
-    offset: u64,
-) -> io::Result<usize> {
-    let mut total = 0;
-    while total < buf.len() {
-        // Safety: fd is valid and open, buf is a valid mutable slice.
-        let n = unsafe {
-            libc::pread(
-                fd,
-                buf.as_mut_ptr().add(total).cast::<libc::c_void>(),
-                buf.len() - total,
-                offset as i64 + total as i64,
-            )
-        };
-        if n < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if n == 0 {
-            break; // EOF
-        }
-        total += n.cast_unsigned();
-    }
-    Ok(total)
 }
 
 // ---------------------------------------------------------------------------
@@ -387,8 +516,9 @@ pub(crate) fn uring_writer_thread(
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
+    sqpoll: bool,
 ) -> io::Result<()> {
-    uring_init_and_run(&rx, &path, &framed_header, &init_tx)
+    uring_init_and_run(&rx, &path, &framed_header, &init_tx, sqpoll)
 }
 
 /// Initialize the io_uring ring and run the writer loop.
@@ -401,15 +531,26 @@ fn uring_init_and_run(
     path: &std::path::Path,
     framed_header: &[u8],
     init_tx: &SyncSender<io::Result<()>>,
+    sqpoll: bool,
 ) -> io::Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, BUF_SIZE)?;
     let iovecs = pool.iovecs();
 
     // Step 2: Create io_uring ring.
-    let ring = IoUring::builder()
-        .setup_clamp()
-        .build(u32::from(NUM_BUFS))
+    // SQ polling (`setup_sqpoll`) creates a kernel thread that polls the SQ,
+    // eliminating `io_uring_enter` syscalls. The thread sleeps after idle_ms
+    // of inactivity. Requires Linux 5.12+ for unprivileged use.
+    let mut builder = IoUring::builder();
+    builder.setup_clamp();
+    if sqpoll {
+        const SQPOLL_IDLE_MS: u32 = 2000;
+        builder.setup_sqpoll(SQPOLL_IDLE_MS);
+    }
+    // Ring depth: 2× buffer count to accommodate linked ReadFixed+WriteFixed pairs.
+    let ring_depth = u32::from(NUM_BUFS) * 2;
+    let ring = builder
+        .build(ring_depth)
         .map_err(|e| io::Error::new(e.kind(), format!("io_uring creation failed: {e}")))?;
 
     // Step 3: Open file with O_DIRECT.
@@ -420,9 +561,10 @@ fn uring_init_and_run(
         .custom_flags(libc::O_DIRECT)
         .open(path)?;
 
-    // Step 4: Register fd.
+    // Step 4: Register fds — 2 slots: [0]=output, [1]=placeholder for input (CopyRange).
+    // Slot 1 is filled lazily via register_files_update on first CopyRange.
     ring.submitter()
-        .register_files(&[file.as_raw_fd()])
+        .register_files(&[file.as_raw_fd(), -1])
         .map_err(|e| io::Error::new(e.kind(), format!("register_files failed: {e}")))?;
 
     // Step 5: Register buffers (this is where RLIMIT_MEMLOCK bites).
@@ -457,6 +599,8 @@ fn uring_init_and_run(
         write_offset: 0,
         logical_size: 0,
         in_flight: 0,
+        #[cfg(feature = "linux-direct-io")]
+        input_fd_registered: false,
     };
 
     // Step 7: Write header.
@@ -549,5 +693,29 @@ mod tests {
         assert_eq!(round_up_to_page(1), PAGE_SIZE);
         assert_eq!(round_up_to_page(PAGE_SIZE), PAGE_SIZE);
         assert_eq!(round_up_to_page(PAGE_SIZE + 1), PAGE_SIZE * 2);
+    }
+
+    #[test]
+    fn user_data_encoding() {
+        // Write CQE: buf_idx=42, aligned_len=256KB
+        let write_ud = (262_144u64 << 16) | 42u64;
+        assert!(!ud_is_read(write_ud));
+        assert_eq!(ud_buf_idx(write_ud), 42);
+        assert_eq!(ud_expected_len(write_ud), 262_144);
+
+        // Read CQE: buf_idx=7, len=55000
+        let read_ud = (55_000u64 << 16) | 7u64 | READ_FLAG;
+        assert!(ud_is_read(read_ud));
+        assert_eq!(ud_buf_idx(read_ud), 7);
+        assert_eq!(ud_expected_len(read_ud), 55_000);
+
+        // Edge case: buf_idx=63 (max with NUM_BUFS=64)
+        let max_ud = (4096u64 << 16) | 63u64;
+        assert_eq!(ud_buf_idx(max_ud), 63);
+        assert!(!ud_is_read(max_ud));
+
+        let max_read_ud = (4096u64 << 16) | 63u64 | READ_FLAG;
+        assert_eq!(ud_buf_idx(max_read_ud), 63);
+        assert!(ud_is_read(max_read_ud));
     }
 }

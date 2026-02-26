@@ -119,14 +119,18 @@ kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
 pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
-- [ ] **SQ polling (`setup_sqpoll`)** — eliminates `io_uring_enter` syscalls,
-  consumes a CPU core. Follow-up to the existing io_uring writer thread.
+- [x] **SQ polling (`setup_sqpoll`)** — implemented (`--sqpoll` flag), but crashes
+  mid-stream on North America (18.8 GB) after ~4000 blobs. Needs debugging.
+  Works at Denmark scale. Likely a CQE reaping timing issue with the kernel
+  polling thread.
 
-- [ ] **`ReadFixed` + linked `WriteFixed` for CopyRange** — avoids userspace read
-  buffer for passthrough blobs. Follow-up to the existing io_uring writer thread.
+- [x] **`ReadFixed` + linked `WriteFixed` for CopyRange** — implemented. Linked
+  SQE pairs eliminate pread syscalls for passthrough blobs. North America results:
+  **-32%** (zlib), **-42%** (none) vs buffered. No improvement at Denmark/Japan
+  scale (page cache absorbs everything).
 
-- [ ] **`pread` directly into registered buffer** — instead of heap allocation.
-  Follow-up to the existing io_uring writer thread.
+- [x] **`pread` directly into registered buffer** — implemented as part of the
+  linked ReadFixed+WriteFixed chain. No separate pread path needed.
 
 ## Before crates.io publish
 
@@ -184,6 +188,19 @@ with owned `String` instead of borrowed `Metadata<'a>`).
   decode+write (cat --type), and allocations. Run:
   `scripts/profile-region.sh germany data/germany-20260224-seq4704.osm.pbf data/germany-20260225-seq4705.osc.gz`
   Then update `notes/region-profiles.md` with the results.
+
+## CLI: verify all commands use pipelined writer
+
+- [ ] Audit every CLI command that writes PBF output to verify it uses `to_path_pipelined`
+  (not `to_path` sync). `cat` was observed running single-threaded on a 17.4 GB file
+  (Threads: 1, ~11 MB RSS) — suggesting it uses the sync writer path. At planet scale,
+  single-threaded zlib compression is the bottleneck. Commands to check:
+  - `cat` — confirmed single-threaded, needs pipelined writer
+  - `sort`
+  - `extract`
+  - `add-locations-to-ways`
+  - `tags-filter`
+  - `getid` / `removeid`
 
 ## Nice to have
 

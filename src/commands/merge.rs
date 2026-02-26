@@ -1041,6 +1041,7 @@ pub fn merge(
     compression: Compression,
     direct_io: bool,
     io_uring: bool,
+    sqpoll: bool,
 ) -> MergeResult<MergeStats> {
     // Step 1: Parse the diff
     eprintln!("Parsing OSC diff: {}", osc_file.display());
@@ -1079,10 +1080,11 @@ pub fn merge(
     let mut writer = if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            PbfWriter::to_path_pipelined_uring(output_pbf, compression, &header_bytes)?
+            PbfWriter::to_path_pipelined_uring(output_pbf, compression, &header_bytes, sqpoll)?
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
+            let _ = sqpoll;
             return Err("--io-uring requires the linux-io-uring feature".into());
         }
     } else if direct_io {

@@ -3,8 +3,8 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
-use crate::block_builder::{BlockBuilder, MemberData};
+use super::{dense_node_metadata, element_metadata, flush_block};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader};
@@ -136,19 +136,22 @@ fn filter_by_id(
     compression: Compression,
     direct_io: bool,
 ) -> Result<GetidStats> {
-    let mut writer = PbfWriter::to_path(output, compression)?;
+    // Fast path: if the ID set is empty, include mode writes nothing,
+    // exclude mode writes everything (passthrough would be better but
+    // we still need to rebuild the header).
+    let reader = ElementReader::open(input, direct_io)?;
+    let mut hb = HeaderBuilder::from_header(reader.header());
+    if reader.header().is_sorted() {
+        hb = hb.sorted();
+    }
+    let header_bytes = hb.build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
     let mut bb = BlockBuilder::new();
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
     };
-
-    // Fast path: if the ID set is empty, include mode writes nothing,
-    // exclude mode writes everything (passthrough would be better but
-    // we still need to rebuild the header).
-    let reader = ElementReader::open(input, direct_io)?;
-    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -200,11 +203,14 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
     }
 
     // Pass 2: Write matching elements + dependent nodes.
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-
     let reader = ElementReader::open(input, direct_io)?;
-    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
+    let mut hb = HeaderBuilder::from_header(reader.header());
+    if reader.header().is_sorted() {
+        hb = hb.sorted();
+    }
+    let header_bytes = hb.build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;

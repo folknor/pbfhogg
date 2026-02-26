@@ -129,11 +129,8 @@ pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bo
 
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing sorted output...");
-    let mut writer = PbfWriter::to_path(output, compression)?;
-
-    // Write header
     let header_bytes = HeaderBuilder::from_header(&header).sorted().build()?;
-    writer.write_header(&header_bytes)?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
 
     // Open input for random-access reads
     let mut input_file = File::open(input)?;

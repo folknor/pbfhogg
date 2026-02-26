@@ -26,6 +26,14 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 Bench scripts build internally — no need to run `build.sh` first.
 If you need something these scripts don't cover, write a new script.
 
+## Indexdata PBFs
+
+To generate a PBF with blob-level indexdata (required for fast passthrough merges), use `cat`:
+```
+scripts/run.sh cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
+```
+There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
+
 ## Verify scripts
 
 Cross-validation scripts live in `verify/`. Each compares pbfhogg output against osmium (and other tools where applicable) on real PBF data. They build pbfhogg internally.

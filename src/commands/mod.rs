@@ -15,7 +15,7 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 
-use crate::block_builder::{HeaderBuilder, BlockBuilder, Metadata, RawMetadata};
+use crate::block_builder::{BlockBuilder, Metadata, RawMetadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -35,23 +35,6 @@ pub(crate) fn flush_block(
     if let Some(bytes) = bb.take()? {
         writer.write_primitive_block(bytes)?;
     }
-    Ok(())
-}
-
-/// Re-encode a [`HeaderBlock`](crate::HeaderBlock) and write it to a [`PbfWriter`].
-///
-/// Preserves bbox, replication timestamp/sequence/URL from the input header.
-/// Used by commands that copy a PBF while transforming its data blocks.
-pub(crate) fn rebuild_header(
-    header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<FileWriter>,
-    sorted: bool,
-) -> Result<()> {
-    let mut hb = HeaderBuilder::from_header(header);
-    if sorted {
-        hb = hb.sorted();
-    }
-    writer.write_header(&hb.build()?)?;
     Ok(())
 }
 

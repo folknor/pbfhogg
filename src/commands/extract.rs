@@ -400,7 +400,6 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         strategy: "simple",
     };
 
-    let mut writer = PbfWriter::to_path(output, compression)?;
     let mut bb = BlockBuilder::new();
 
     // OPTIMIZATION: Use sorted Vec<i64> instead of BTreeSet<i64> for matched element IDs.
@@ -438,7 +437,12 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let mut way_ids_sorted = false;
 
     let reader = ElementReader::open(input, direct_io)?;
-    write_extract_header(region, reader.header(), &mut writer)?;
+    let bbox = region.bbox();
+    let header_bytes = HeaderBuilder::from_header(reader.header())
+        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        .sorted()
+        .build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -593,11 +597,14 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     matched_relation_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-
     let reader = ElementReader::open(input, direct_io)?;
-    write_extract_header(region, reader.header(), &mut writer)?;
+    let bbox = region.bbox();
+    let header_bytes = HeaderBuilder::from_header(reader.header())
+        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        .sorted()
+        .build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -837,11 +844,14 @@ fn extract_smart(
     extra_node_ids.dedup();
 
     // --- Pass 3: Write matching elements in file order ---
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-
     let reader = ElementReader::open(input, direct_io)?;
-    write_extract_header(region, reader.header(), &mut writer)?;
+    let bbox = region.bbox();
+    let header_bytes = HeaderBuilder::from_header(reader.header())
+        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        .sorted()
+        .build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -1104,19 +1114,6 @@ fn write_relation(
 
 use super::{dense_node_metadata, element_metadata, flush_block};
 
-fn write_extract_header(
-    region: &Region,
-    header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    let bbox = region.bbox();
-    let header_bytes = HeaderBuilder::from_header(header)
-        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        .sorted()
-        .build()?;
-    writer.write_header(&header_bytes)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests

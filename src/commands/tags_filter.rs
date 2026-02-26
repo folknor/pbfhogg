@@ -2,8 +2,8 @@
 
 use std::path::Path;
 
-use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
-use crate::block_builder::{BlockBuilder, MemberData};
+use super::{dense_node_metadata, element_metadata, flush_block};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader};
 
@@ -242,7 +242,13 @@ fn tags_filter_single_pass(
     compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
-    let mut writer = PbfWriter::to_path(output, compression)?;
+    let reader = ElementReader::open(input, direct_io)?;
+    let mut hb = HeaderBuilder::from_header(reader.header());
+    if reader.header().is_sorted() {
+        hb = hb.sorted();
+    }
+    let header_bytes = hb.build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
     let mut bb = BlockBuilder::new();
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -250,9 +256,6 @@ fn tags_filter_single_pass(
         ways_matched: 0,
         relations_matched: 0,
     };
-
-    let reader = ElementReader::open(input, direct_io)?;
-    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -439,11 +442,14 @@ fn tags_filter_two_pass(
     way_dep_node_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-
     let reader = ElementReader::open(input, direct_io)?;
-    rebuild_header(reader.header(), &mut writer, reader.header().is_sorted())?;
+    let mut hb = HeaderBuilder::from_header(reader.header());
+    if reader.header().is_sorted() {
+        hb = hb.sorted();
+    }
+    let header_bytes = hb.build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;

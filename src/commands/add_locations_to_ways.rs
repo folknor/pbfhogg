@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
-use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader};
 
@@ -255,11 +254,14 @@ fn write_output(
         missing_locations: 0,
     };
 
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-
     let reader = ElementReader::open(input, direct_io)?;
-    write_header(reader.header(), &mut writer)?;
+    let mut hb = HeaderBuilder::from_header(reader.header()).optional_feature("LocationsOnWays");
+    if reader.header().is_sorted() {
+        hb = hb.sorted();
+    }
+    let header_bytes = hb.build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         // Reusable buffers for element data, hoisted outside the element loop.
@@ -385,22 +387,6 @@ fn write_output(
     Ok(stats)
 }
 
-// ---------------------------------------------------------------------------
-// Header
-// ---------------------------------------------------------------------------
-
-fn write_header(
-    header: &crate::HeaderBlock,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    let mut hb = HeaderBuilder::from_header(header)
-        .optional_feature("LocationsOnWays");
-    if header.is_sorted() {
-        hb = hb.sorted();
-    }
-    writer.write_header(&hb.build()?)?;
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Helpers

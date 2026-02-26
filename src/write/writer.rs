@@ -173,6 +173,7 @@ impl PbfWriter<FileWriter> {
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
+        sqpoll: bool,
     ) -> io::Result<Self> {
         use crate::write::uring_writer;
 
@@ -184,7 +185,7 @@ impl PbfWriter<FileWriter> {
         let (tx, rx) = sync_channel(WRITE_AHEAD);
         let path_owned = path.to_path_buf();
         let handle = std::thread::spawn(move || {
-            uring_writer::uring_writer_thread(rx, path_owned, framed_header, init_tx)
+            uring_writer::uring_writer_thread(rx, path_owned, framed_header, init_tx, sqpoll)
         });
 
         // Wait for the writer thread to complete initialization.

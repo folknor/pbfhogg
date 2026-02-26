@@ -257,6 +257,9 @@ enum Command {
         /// Use io_uring for output I/O (requires linux-io-uring feature)
         #[arg(long)]
         io_uring: bool,
+        /// Use SQ polling for io_uring (eliminates io_uring_enter syscalls, requires --io-uring)
+        #[arg(long, requires = "io_uring")]
+        sqpoll: bool,
     },
 }
 
@@ -356,7 +359,8 @@ fn main() {
             compression,
             direct_io,
             io_uring,
-        } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring),
+            sqpoll,
+        } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring, sqpoll),
     };
 
     if let Err(e) = result {
@@ -681,9 +685,10 @@ fn run_merge(
     compression: &str,
     direct_io: bool,
     io_uring: bool,
+    sqpoll: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring, sqpoll)?;
     stats.print_summary();
     Ok(())
 }

@@ -3,8 +3,8 @@
 use std::io::{self, Read};
 use std::path::Path;
 
-use super::{dense_node_metadata, element_metadata, flush_block, rebuild_header};
-use crate::block_builder::{BlockBuilder, MemberData};
+use super::{dense_node_metadata, element_metadata, flush_block};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
@@ -105,31 +105,39 @@ fn read_raw_frame<R: Read>(
 }
 
 fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool) -> Result<CatStats> {
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut header_written = false;
     let single_file = files.len() == 1;
+
+    let header_bytes = {
+        let mut reader = FileReader::open(files[0], direct_io)?;
+        let mut file_offset: u64 = 0;
+        let mut hdr_bytes = None;
+        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+            if frame.blob_type == "OSMHeader" {
+                let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                let mut hb = HeaderBuilder::from_header(&header);
+                if single_file && header.is_sorted() {
+                    hb = hb.sorted();
+                }
+                hdr_bytes = Some(hb.build()?);
+                break;
+            }
+        }
+        hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
+    };
+
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
     let mut blobs: u64 = 0;
 
     for file in files {
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        // copy_file_range: writer is always buffered in cat, so always safe.
-        // O_DIRECT input + copy_file_range works (explicit offset, kernel reads).
         #[cfg(feature = "linux-direct-io")]
         let input_fd = reader.raw_fd();
 
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             match frame.blob_type.as_str() {
-                "OSMHeader"
-                    if !header_written =>
-                {
-                    let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
-                    // Single file: propagate Sort from input. Multi-file: concatenation
-                    // can break sort order, so never claim sorted.
-                    rebuild_header(&header, &mut writer, single_file && header.is_sorted())?;
-                    header_written = true;
-                }
+                "OSMHeader" => {}
                 "OSMData" => {
                     #[cfg(feature = "linux-direct-io")]
                     writer.write_raw_copy(
@@ -164,10 +172,27 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     let filter_way = filter.split(',').any(|t| t.trim() == "way");
     let filter_relation = filter.split(',').any(|t| t.trim() == "relation");
 
-    let mut writer = PbfWriter::to_path(output, compression)?;
-    let mut bb = BlockBuilder::new();
-    let mut header_written = false;
     let single_file = files.len() == 1;
+
+    let header_bytes = {
+        let reader = BlobReader::open(files[0], direct_io)?;
+        let mut hdr_bytes = None;
+        for blob in reader {
+            let blob = blob?;
+            if let BlobDecode::OsmHeader(header) = blob.decode()? {
+                let mut hb = HeaderBuilder::from_header(&header);
+                if single_file && header.is_sorted() {
+                    hb = hb.sorted();
+                }
+                hdr_bytes = Some(hb.build()?);
+                break;
+            }
+        }
+        hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
+    };
+
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut bb = BlockBuilder::new();
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
@@ -177,12 +202,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
         for blob in reader {
             let blob = blob?;
             match blob.decode()? {
-                BlobDecode::OsmHeader(header) => {
-                    if !header_written {
-                        rebuild_header(&header, &mut writer, single_file && header.is_sorted())?;
-                        header_written = true;
-                    }
-                }
+                BlobDecode::OsmHeader(_) => {}
                 BlobDecode::OsmData(block) => {
                     blobs_decoded += 1;
 

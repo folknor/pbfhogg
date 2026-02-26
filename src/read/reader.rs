@@ -55,6 +55,8 @@ impl<R: Read + Send> ElementReader<R> {
     }
 
     /// Decodes the PBF structure sequentially and calls the given closure on each element.
+    /// Elements are delivered in file order. If [`header().is_sorted()`](HeaderBlock::is_sorted)
+    /// returns `true`, nodes are guaranteed to arrive in ascending ID order.
     /// Consider using `par_map_reduce` instead if you need better performance.
     ///
     /// # Errors
@@ -117,6 +119,9 @@ impl<R: Read + Send> ElementReader<R> {
     /// Decodes the PBF structure using a pipelined approach and calls the given closure on each
     /// element, preserving file order. Overlaps I/O with parallel decompression and protobuf
     /// parsing while delivering elements to an `FnMut` closure on the calling thread.
+    ///
+    /// Elements are delivered in file order. If [`header().is_sorted()`](HeaderBlock::is_sorted)
+    /// returns `true`, nodes are guaranteed to arrive in ascending ID order.
     #[hotpath::measure]
     pub fn for_each_pipelined<F>(self, mut f: F) -> Result<()>
     where
@@ -149,6 +154,11 @@ impl<R: Read + Send> ElementReader<R> {
     /// `identity` closure should produce an identity value that is inserted into `reduce_op` when
     /// necessary. The number of times that this identity value is inserted should not alter the
     /// result.
+    ///
+    /// **Note:** Elements are delivered in arbitrary order across rayon worker threads.
+    /// The [`Sort.Type_then_ID`](HeaderBlock::is_sorted) ordering guarantee does **not**
+    /// apply to this method. Use [`for_each`](Self::for_each) or
+    /// [`for_each_pipelined`](Self::for_each_pipelined) if you need sorted element order.
     ///
     /// # Errors
     /// Returns the first Error encountered while parsing the PBF structure.

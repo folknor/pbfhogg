@@ -41,6 +41,18 @@ reader.for_each(|element| {
 # Ok::<(), std::io::Error>(())
 ```
 
+## Read modes
+
+| Method | Order | Sorted guarantee | Use case |
+|--------|-------|-----------------|----------|
+| `for_each` | File order | Yes — nodes arrive in ascending ID order when `header().is_sorted()` is `true` | Sequential processing, order-dependent consumers |
+| `for_each_pipelined` | File order | Yes — same guarantee, with parallel decompression overlapping I/O | Fastest ordered read (production hot path) |
+| `par_map_reduce` | Arbitrary | No — elements are distributed across rayon workers in unspecified order | Aggregation (counts, statistics) where order doesn't matter |
+
+In debug builds, `for_each` and `for_each_pipelined` assert that node IDs are monotonically increasing when the sorted flag is set.
+
+These methods are the `ElementReader` API for library consumers. The CLI commands mostly use `BlobReader` directly for blob-level operations (raw passthrough, file seeking, multi-pass scanning) where element-level decoding is unnecessary.
+
 ## CLI
 
 pbfhogg includes a command-line toolkit for common OSM PBF operations:

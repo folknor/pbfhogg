@@ -34,6 +34,7 @@ Run with `scripts/run-hotpath.sh` (timing) or `scripts/run-hotpath-alloc.sh` (ti
   (8% of write wall time) from `encode_to_vec()` creating a fresh buffer
   every flush. Reusing a `Vec<u8>` across calls with `encode_to_vec` →
   `encode(&mut buf)` + `buf.clear()` would eliminate this churn.
+  Detailed investigation: `notes/take-buffer-reuse.md`.
 
 ### Merge: remaining optimization theories
 
@@ -57,6 +58,10 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   where raw string-table indices pass through without re-interning. Worth
   prototyping to measure whether the FxHashMap lookup overhead on ~8000 elements
   × ~4 tags is actually significant.
+  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`. Bottom-up
+  modeling estimates StringTable::add at ~667ms (33% of rewrite_block), ~75% of
+  add_way time. Pre-seeding or index passthrough could save ~600ms on Denmark
+  (~29-33% rewrite_block speedup). Needs profiling to confirm.
 
 - [ ] **Raw packed bytes for non-string integer fields** — investigated: the
   delta encoding is compatible (both input wire format and BlockBuilder delta-
@@ -68,6 +73,9 @@ process ~4.4M elements (most unaffected by the diff) at Denmark scale.
   of the `rewrite_block` cost compared to tag string interning and metadata
   handling. Profile first to see if ref/memid decode+reencode is a significant
   slice of the 1.49s `rewrite_block` total.
+  Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`. Bottom-up
+  modeling estimates refs/memids delta encoding at ~74ms (3.7% of rewrite_block)
+  — 9× less impactful than StringTable. **Likely not worth the complexity.**
 
 - [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms
   (slightly slower than old crate's 673ms). `take()` is 27% of wall time; further

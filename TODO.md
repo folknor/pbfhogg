@@ -359,6 +359,11 @@ pbfhogg matches osmosis and osmconvert exactly; osmium diverges on delete semant
 ## Benchmarking
 
 - [ ] Track peak RSS during reads and merges at scale. Denmark for CI, planet for release validation.
+- [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
+  merge timing exists — missing read baselines (tags-count, check-refs),
+  decode+write (cat --type), and allocations. Run:
+  `scripts/profile-region.sh germany data/germany-20260224-seq4704.osm.pbf data/germany-20260225-seq4705.osc.gz`
+  Then update `notes/region-profiles.md` with the results.
 
 ## Nice to have
 

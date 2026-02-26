@@ -511,14 +511,9 @@ fn write_base_relation(
 // ---------------------------------------------------------------------------
 
 fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
-    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    Ok(crate::block_builder::build_header(
-        bbox,
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        &[crate::HeaderBlock::SORT_TYPE_THEN_ID],
-    )?)
+    Ok(crate::block_builder::HeaderBuilder::from_header(header)
+        .sorted()
+        .build()?)
 }
 
 // ---------------------------------------------------------------------------

@@ -10,7 +10,7 @@ fn main() {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
 
     let header =
-        block_builder::build_header(Some((9.0, 54.0, 13.0, 58.0)), None, None, None, &[])
+        block_builder::HeaderBuilder::new().bbox(9.0, 54.0, 13.0, 58.0).build()
             .expect("build header");
     writer.write_header(&header).expect("write header");
 

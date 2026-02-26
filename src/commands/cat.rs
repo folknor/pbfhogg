@@ -127,12 +127,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
                     let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
                     // Single file: propagate Sort from input. Multi-file: concatenation
                     // can break sort order, so never claim sorted.
-                    let features: &[&str] = if single_file && header.is_sorted() {
-                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
-                    } else {
-                        &[]
-                    };
-                    rebuild_header(&header, &mut writer, features)?;
+                    rebuild_header(&header, &mut writer, single_file && header.is_sorted())?;
                     header_written = true;
                 }
                 "OSMData" => {
@@ -184,12 +179,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
             match blob.decode()? {
                 BlobDecode::OsmHeader(header) => {
                     if !header_written {
-                        let features: &[&str] = if single_file && header.is_sorted() {
-                            &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
-                        } else {
-                            &[]
-                        };
-                        rebuild_header(&header, &mut writer, features)?;
+                        rebuild_header(&header, &mut writer, single_file && header.is_sorted())?;
                         header_written = true;
                     }
                 }

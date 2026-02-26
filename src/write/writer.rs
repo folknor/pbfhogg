@@ -267,7 +267,7 @@ impl<W: Write> PbfWriter<W> {
     /// which writes the header in the constructor.
     ///
     /// `header_block_bytes` is a serialized `HeaderBlock` protobuf message,
-    /// typically produced by [`build_header`](crate::block_builder::build_header).
+    /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).
     pub fn write_header(&mut self, header_block_bytes: &[u8]) -> io::Result<()> {
         self.write_blob("OSMHeader", header_block_bytes)
     }

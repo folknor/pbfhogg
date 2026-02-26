@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element};
@@ -410,20 +410,12 @@ fn write_header(
     header: &crate::HeaderBlock,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    let features: &[&str] = if header.is_sorted() {
-        &["LocationsOnWays", crate::HeaderBlock::SORT_TYPE_THEN_ID]
-    } else {
-        &["LocationsOnWays"]
-    };
-    let header_bytes = build_header(
-        bbox,
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        features,
-    )?;
-    writer.write_header(&header_bytes)?;
+    let mut hb = HeaderBuilder::from_header(header)
+        .optional_feature("LocationsOnWays");
+    if header.is_sorted() {
+        hb = hb.sorted();
+    }
+    writer.write_header(&hb.build()?)?;
     Ok(())
 }
 

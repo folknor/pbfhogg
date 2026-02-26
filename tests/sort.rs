@@ -17,7 +17,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 #[allow(clippy::cast_possible_truncation)]
 fn write_unsorted_overlapping_pbf(path: &Path) {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
-    let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -64,7 +64,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 #[allow(clippy::cast_possible_truncation)]
 fn write_type_unsorted_pbf(path: &Path) {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
-    let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();

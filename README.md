@@ -8,7 +8,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 ## Features
 
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder
-- **Write** valid `.osm.pbf` files with `PbfWriter` and `BlockBuilder` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
+- **Write** valid `.osm.pbf` files with `HeaderBuilder`, `BlockBuilder`, and `PbfWriter` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
 - **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
 - **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
 - **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
@@ -40,6 +40,33 @@ reader.for_each(|element| {
 })?;
 # Ok::<(), std::io::Error>(())
 ```
+
+### Writing
+
+```rust
+use pbfhogg::block_builder::{HeaderBuilder, BlockBuilder};
+use pbfhogg::writer::{PbfWriter, Compression};
+
+let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default())?;
+
+// Build a sorted header with bounding box
+let header_bytes = HeaderBuilder::new()
+    .bbox(9.0, 54.0, 13.0, 58.0)
+    .sorted()
+    .build()?;
+writer.write_header(&header_bytes)?;
+
+// Add elements via BlockBuilder
+let mut bb = BlockBuilder::new();
+bb.add_dense_node(1, 100_000_000, 200_000_000, &[("name", "Test")], None);
+if let Some(bytes) = bb.take()? {
+    writer.write_primitive_block(bytes)?;
+}
+writer.flush()?;
+# Ok::<(), std::io::Error>(())
+```
+
+`HeaderBuilder::from_header(&existing_header)` copies bbox and replication metadata from an existing PBF header — useful for commands that transform data while preserving metadata.
 
 ## Read modes
 

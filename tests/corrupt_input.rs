@@ -21,7 +21,7 @@ fn write_header_only_pbf() -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
         writer.flush().unwrap();
     }
@@ -33,7 +33,7 @@ fn write_one_block_pbf() -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();

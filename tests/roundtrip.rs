@@ -17,14 +17,13 @@ fn roundtrip_dense_nodes_with_metadata() {
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
 
-        let header_bytes = block_builder::build_header(
-            Some((9.0, 54.0, 13.0, 58.0)),
-            Some(1_700_000_000),
-            Some(42),
-            Some("https://example.com/replication"),
-            &[],
-        )
-        .unwrap();
+        let header_bytes = block_builder::HeaderBuilder::new()
+            .bbox(9.0, 54.0, 13.0, 58.0)
+            .replication_timestamp(1_700_000_000)
+            .replication_sequence_number(42)
+            .replication_base_url("https://example.com/replication")
+            .build()
+            .unwrap();
         writer.write_header(&header_bytes).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -179,7 +178,7 @@ fn roundtrip_dense_nodes_no_metadata() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -230,7 +229,7 @@ fn roundtrip_ways() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::Zlib(6));
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -307,7 +306,7 @@ fn roundtrip_relations() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::None);
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -414,7 +413,7 @@ fn roundtrip_multi_block() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         // Block 1: nodes
@@ -471,7 +470,7 @@ fn roundtrip_way_with_locations() {
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
         let header =
-            block_builder::build_header(None, None, None, None, &["LocationsOnWays"]).unwrap();
+            block_builder::HeaderBuilder::new().optional_feature("LocationsOnWays").build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -539,7 +538,7 @@ fn roundtrip_uncompressed() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::None);
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -588,14 +587,10 @@ fn roundtrip_direct_io() {
         Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
     };
 
-    let header = block_builder::build_header(
-        Some((9.0, 54.0, 13.0, 58.0)),
-        None,
-        None,
-        None,
-        &[],
-    )
-    .unwrap();
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .unwrap();
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
@@ -669,7 +664,7 @@ fn roundtrip_pipelined_direct_io() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("pipelined_direct_io.osm.pbf");
 
-    let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+    let header = block_builder::HeaderBuilder::new().build().unwrap();
 
     let write_result =
         PbfWriter::to_path_pipelined_direct(&path, Compression::default(), &header);
@@ -731,7 +726,7 @@ fn roundtrip_zstd() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::Zstd(3));
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -803,7 +798,7 @@ fn roundtrip_mixed_metadata() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
@@ -903,7 +898,7 @@ fn roundtrip_backfill_metadata() {
     let mut buf = Vec::new();
     {
         let mut writer = PbfWriter::new(&mut buf, Compression::default());
-        let header = block_builder::build_header(None, None, None, None, &[]).unwrap();
+        let header = block_builder::HeaderBuilder::new().build().unwrap();
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();

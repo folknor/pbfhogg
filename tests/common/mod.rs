@@ -81,7 +81,7 @@ pub fn write_test_pbf(
     relations: &[TestRelation],
 ) {
     let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
-    let header = block_builder::build_header(None, None, None, None, &[]).expect("build header");
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();

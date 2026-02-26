@@ -59,7 +59,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
     let mut writer = PbfWriter::to_path(output, Compression::default()).expect("create output");
 
     // Write a minimal header
-    let header_bytes = block_builder::build_header(None, None, None, None, &[]).expect("build header");
+    let header_bytes = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header_bytes).expect("write header");
 
     let mut bb = BlockBuilder::new();

@@ -14,7 +14,7 @@ use crate::blob::{
     parse_blob_header_with_index,
 };
 use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
-use crate::block_builder::{build_header, BlockBuilder, MemberData, Metadata};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, Metadata};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
@@ -132,14 +132,7 @@ pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bo
     let mut writer = PbfWriter::to_path(output, compression)?;
 
     // Write header
-    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    let header_bytes = build_header(
-        bbox,
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        &[crate::HeaderBlock::SORT_TYPE_THEN_ID],
-    )?;
+    let header_bytes = HeaderBuilder::from_header(&header).sorted().build()?;
     writer.write_header(&header_bytes)?;
 
     // Open input for random-access reads

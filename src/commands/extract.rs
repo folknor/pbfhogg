@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::block_builder::{build_header, BlockBuilder, MemberData};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobDecode, BlobReader, Element, MemberId};
@@ -1154,13 +1154,10 @@ fn write_extract_header(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     let bbox = region.bbox();
-    let header_bytes = build_header(
-        Some((bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)),
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        &[crate::HeaderBlock::SORT_TYPE_THEN_ID],
-    )?;
+    let header_bytes = HeaderBuilder::from_header(header)
+        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        .sorted()
+        .build()?;
     writer.write_header(&header_bytes)?;
     Ok(())
 }

@@ -146,7 +146,7 @@ fn decode_and_write<W: Write>(path: &Path, writer: &mut PbfWriter<W>) -> Counts 
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn bench_sync(path: &Path, compression: Compression) -> (u64, Counts) {
-    let header_bytes = pbfhogg::block_builder::build_header(None, None, None, None, &[])
+    let header_bytes = pbfhogg::block_builder::HeaderBuilder::new().build()
         .expect("build header");
 
     let mut writer = PbfWriter::to_path(Path::new("/dev/null"), compression)
@@ -160,7 +160,7 @@ fn bench_sync(path: &Path, compression: Compression) -> (u64, Counts) {
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn bench_pipelined(path: &Path, compression: Compression) -> (u64, Counts) {
-    let header_bytes = pbfhogg::block_builder::build_header(None, None, None, None, &[])
+    let header_bytes = pbfhogg::block_builder::HeaderBuilder::new().build()
         .expect("build header");
 
     let mut writer = PbfWriter::to_path_pipelined(

@@ -14,7 +14,7 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 
-use crate::block_builder::{build_header, BlockBuilder, Metadata, RawMetadata};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, Metadata, RawMetadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -44,17 +44,13 @@ pub(crate) fn flush_block(
 pub(crate) fn rebuild_header(
     header: &crate::HeaderBlock,
     writer: &mut PbfWriter<FileWriter>,
-    optional_features: &[&str],
+    sorted: bool,
 ) -> Result<()> {
-    let bbox = header.bbox().map(|b| (b.left, b.bottom, b.right, b.top));
-    let header_bytes = build_header(
-        bbox,
-        header.osmosis_replication_timestamp(),
-        header.osmosis_replication_sequence_number(),
-        header.osmosis_replication_base_url(),
-        optional_features,
-    )?;
-    writer.write_header(&header_bytes)?;
+    let mut hb = HeaderBuilder::from_header(header);
+    if sorted {
+        hb = hb.sorted();
+    }
+    writer.write_header(&hb.build()?)?;
     Ok(())
 }
 

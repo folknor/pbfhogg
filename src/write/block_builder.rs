@@ -951,60 +951,182 @@ impl BlockBuilder {
 // Header builder
 // ---------------------------------------------------------------------------
 
-/// Build a serialized `HeaderBlock` protobuf message.
+/// Builder for constructing the `OSMHeader` blob that starts every PBF file.
 ///
-/// This is the first block in every PBF file. It declares required features,
-/// optionally includes a bounding box, and carries replication metadata.
-// Takes 5 params — a HeaderBuilder pattern was considered but this function has
-// only 4 internal call sites, so a builder would add complexity for no benefit.
-#[allow(clippy::cast_possible_truncation)]
-pub fn build_header(
+/// Use [`new`](Self::new) for a blank header, or [`from_header`](Self::from_header)
+/// to copy bbox and replication metadata from an existing [`HeaderBlock`].
+///
+/// # Examples
+///
+/// ```rust
+/// use pbfhogg::block_builder::HeaderBuilder;
+///
+/// // Minimal header (tests, quick scripts)
+/// let bytes = HeaderBuilder::new().build()?;
+///
+/// // Sorted PBF with bounding box
+/// let bytes = HeaderBuilder::new()
+///     .bbox(9.0, 54.0, 13.0, 58.0)
+///     .sorted()
+///     .build()?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub struct HeaderBuilder<'a> {
     bbox: Option<(f64, f64, f64, f64)>,
     replication_timestamp: Option<i64>,
     replication_sequence_number: Option<i64>,
-    replication_base_url: Option<&str>,
-    optional_features: &[&str],
-) -> io::Result<Vec<u8>> {
-    let mut header = proto::HeaderBlock::default();
+    replication_base_url: Option<&'a str>,
+    optional_features: Vec<&'a str>,
+    sorted: bool,
+    writing_program: &'a str,
+}
 
-    // Required features — every PBF reader must support these
-    header
-        .required_features
-        .push("OsmSchema-V0.6".to_string());
-    header
-        .required_features
-        .push("DenseNodes".to_string());
+impl Default for HeaderBuilder<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
-    // Optional features
-    for feature in optional_features {
+impl<'a> HeaderBuilder<'a> {
+    /// Create a blank header builder.
+    ///
+    /// The writing program defaults to `"pbfhogg"`. Required features
+    /// (`OsmSchema-V0.6`, `DenseNodes`) are always included.
+    #[must_use]
+    pub fn new() -> Self {
+        HeaderBuilder {
+            bbox: None,
+            replication_timestamp: None,
+            replication_sequence_number: None,
+            replication_base_url: None,
+            optional_features: Vec::new(),
+            sorted: false,
+            writing_program: "pbfhogg",
+        }
+    }
+
+    /// Create a header builder pre-populated with bbox and replication metadata
+    /// from an existing [`HeaderBlock`].
+    ///
+    /// Optional features (including `Sort.Type_then_ID`) are **not** copied —
+    /// call [`.sorted()`](Self::sorted) explicitly if the output should declare
+    /// sorted order.
+    #[must_use]
+    pub fn from_header(header: &'a crate::HeaderBlock) -> Self {
+        let mut hb = Self::new();
+        if let Some(b) = header.bbox() {
+            hb.bbox = Some((b.left, b.bottom, b.right, b.top));
+        }
+        hb.replication_timestamp = header.osmosis_replication_timestamp();
+        hb.replication_sequence_number = header.osmosis_replication_sequence_number();
+        hb.replication_base_url = header.osmosis_replication_base_url();
+        hb
+    }
+
+    /// Set the bounding box (left/bottom/right/top in degrees).
+    #[must_use]
+    pub fn bbox(mut self, left: f64, bottom: f64, right: f64, top: f64) -> Self {
+        self.bbox = Some((left, bottom, right, top));
+        self
+    }
+
+    /// Set the replication timestamp (seconds since UNIX epoch).
+    #[must_use]
+    pub fn replication_timestamp(mut self, ts: i64) -> Self {
+        self.replication_timestamp = Some(ts);
+        self
+    }
+
+    /// Set the replication sequence number.
+    #[must_use]
+    pub fn replication_sequence_number(mut self, seq: i64) -> Self {
+        self.replication_sequence_number = Some(seq);
+        self
+    }
+
+    /// Set the replication base URL.
+    #[must_use]
+    pub fn replication_base_url(mut self, url: &'a str) -> Self {
+        self.replication_base_url = Some(url);
+        self
+    }
+
+    /// Declare `Sort.Type_then_ID` — elements are sorted by type then by ID.
+    #[must_use]
+    pub fn sorted(mut self) -> Self {
+        self.sorted = true;
+        self
+    }
+
+    /// Add an arbitrary optional feature string (e.g. `"LocationsOnWays"`).
+    ///
+    /// For `Sort.Type_then_ID`, prefer the type-safe [`.sorted()`](Self::sorted)
+    /// method instead.
+    #[must_use]
+    pub fn optional_feature(mut self, feature: &'a str) -> Self {
+        self.optional_features.push(feature);
+        self
+    }
+
+    /// Override the writing program name (default: `"pbfhogg"`).
+    #[must_use]
+    pub fn writing_program(mut self, program: &'a str) -> Self {
+        self.writing_program = program;
+        self
+    }
+
+    /// Serialize the header into protobuf bytes suitable for
+    /// [`PbfWriter::write_header`](crate::writer::PbfWriter::write_header).
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn build(self) -> io::Result<Vec<u8>> {
+        let mut header = proto::HeaderBlock::default();
+
+        // Required features — every PBF reader must support these
         header
-            .optional_features
-            .push((*feature).to_string());
-    }
+            .required_features
+            .push("OsmSchema-V0.6".to_string());
+        header
+            .required_features
+            .push("DenseNodes".to_string());
 
-    // Writing program
-    header.writingprogram = Some("pbfhogg".to_string());
+        // Sort flag
+        if self.sorted {
+            header
+                .optional_features
+                .push(crate::HeaderBlock::SORT_TYPE_THEN_ID.to_string());
+        }
 
-    // Bounding box (nanodegrees)
-    if let Some((left, bottom, right, top)) = bbox {
-        header.bbox = Some(proto::HeaderBBox {
-            left: (left * 1e9) as i64,
-            right: (right * 1e9) as i64,
-            top: (top * 1e9) as i64,
-            bottom: (bottom * 1e9) as i64,
-        });
-    }
+        // Other optional features
+        for feature in &self.optional_features {
+            header
+                .optional_features
+                .push((*feature).to_string());
+        }
 
-    // Replication metadata
-    if let Some(ts) = replication_timestamp {
-        header.osmosis_replication_timestamp = Some(ts);
-    }
-    if let Some(seq) = replication_sequence_number {
-        header.osmosis_replication_sequence_number = Some(seq);
-    }
-    if let Some(url) = replication_base_url {
-        header.osmosis_replication_base_url = Some(url.to_string());
-    }
+        // Writing program
+        header.writingprogram = Some(self.writing_program.to_string());
 
-    Ok(header.encode_to_vec())
+        // Bounding box (nanodegrees)
+        if let Some((left, bottom, right, top)) = self.bbox {
+            header.bbox = Some(proto::HeaderBBox {
+                left: (left * 1e9) as i64,
+                right: (right * 1e9) as i64,
+                top: (top * 1e9) as i64,
+                bottom: (bottom * 1e9) as i64,
+            });
+        }
+
+        // Replication metadata
+        if let Some(ts) = self.replication_timestamp {
+            header.osmosis_replication_timestamp = Some(ts);
+        }
+        if let Some(seq) = self.replication_sequence_number {
+            header.osmosis_replication_sequence_number = Some(seq);
+        }
+        if let Some(url) = self.replication_base_url {
+            header.osmosis_replication_base_url = Some(url.to_string());
+        }
+
+        Ok(header.encode_to_vec())
+    }
 }

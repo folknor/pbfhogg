@@ -211,7 +211,7 @@ fn merge_multi_block_partial_rewrite() {
         let mut writer =
             PbfWriter::to_path(&base, Compression::default()).expect("create writer");
         let header =
-            block_builder::build_header(None, None, None, None, &[]).expect("build header");
+            block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -530,7 +530,7 @@ fn merge_delete_entire_block() {
         let mut writer =
             PbfWriter::to_path(&base, Compression::default()).expect("create writer");
         let header =
-            block_builder::build_header(None, None, None, None, &[]).expect("build header");
+            block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 
@@ -650,7 +650,7 @@ fn merge_metadata_preservation() {
         let mut writer =
             PbfWriter::to_path(&base, Compression::default()).expect("create writer");
         let header =
-            block_builder::build_header(None, None, None, None, &[]).expect("build header");
+            block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");
         let mut bb = BlockBuilder::new();
 

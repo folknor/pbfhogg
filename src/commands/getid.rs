@@ -156,12 +156,7 @@ fn filter_by_id(
         match blob.decode()? {
             BlobDecode::OsmHeader(header) => {
                 if !header_written {
-                    let features: &[&str] = if header.is_sorted() {
-                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
-                    } else {
-                        &[]
-                    };
-                    rebuild_header(&header, &mut writer, features)?;
+                    rebuild_header(&header, &mut writer, header.is_sorted())?;
                     header_written = true;
                 }
             }
@@ -230,12 +225,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         match blob.decode()? {
             BlobDecode::OsmHeader(header) => {
                 if !header_written {
-                    let features: &[&str] = if header.is_sorted() {
-                        &[crate::HeaderBlock::SORT_TYPE_THEN_ID]
-                    } else {
-                        &[]
-                    };
-                    rebuild_header(&header, &mut writer, features)?;
+                    rebuild_header(&header, &mut writer, header.is_sorted())?;
                     header_written = true;
                 }
             }

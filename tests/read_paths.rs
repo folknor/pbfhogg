@@ -22,7 +22,7 @@ fn write_test_pbf(path: &Path) {
     let mut writer = PbfWriter::new(file, Compression::default());
 
     let header =
-        block_builder::build_header(Some((9.0, 54.0, 13.0, 58.0)), None, None, None, &[])
+        block_builder::HeaderBuilder::new().bbox(9.0, 54.0, 13.0, 58.0).build()
             .unwrap();
     writer.write_header(&header).unwrap();
 
@@ -452,14 +452,11 @@ fn write_sorted_pbf(path: &Path) {
     let file = std::fs::File::create(path).unwrap();
     let mut writer = PbfWriter::new(file, Compression::default());
 
-    let header = block_builder::build_header(
-        Some((9.0, 54.0, 13.0, 58.0)),
-        None,
-        None,
-        None,
-        &["Sort.Type_then_ID"],
-    )
-    .unwrap();
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .sorted()
+        .build()
+        .unwrap();
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
@@ -566,14 +563,10 @@ fn sorted_flag_but_unsorted_nodes_panics() {
     let file = std::fs::File::create(&path).unwrap();
     let mut writer = PbfWriter::new(file, Compression::default());
 
-    let header = block_builder::build_header(
-        None,
-        None,
-        None,
-        None,
-        &["Sort.Type_then_ID"],
-    )
-    .unwrap();
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .build()
+        .unwrap();
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();

@@ -15,7 +15,7 @@ use std::collections::hash_map::Entry;
 use std::io;
 
 use super::wire::{
-    encode_bytes_field, encode_bytes_field_always, encode_int64_field, encode_packed_uint32,
+    encode_bytes_field, encode_bytes_field_always, encode_int64_field,
     encode_varint, zigzag_encode_64,
 };
 
@@ -674,63 +674,67 @@ impl BlockBuilder {
         self.count += 1;
     }
 
-    /// Add a way using pre-seeded string table indices.
+    /// Add a way using raw wire-format bytes from the input PBF.
     ///
-    /// `raw_tag_keys` and `raw_tag_vals` are parallel slices from [`Way::raw_tags()`].
-    pub(crate) fn add_way_raw(
+    /// All byte slices are raw protobuf packed field content from the source
+    /// `WireWay`, passed through without decode or re-encode. Requires a
+    /// pre-seeded string table (identity mapping of indices).
+    pub(crate) fn add_way_raw_bytes(
         &mut self,
         id: i64,
-        raw_tag_keys: &[u32],
-        raw_tag_vals: &[u32],
-        refs: &[i64],
-        metadata: Option<&RawMetadata>,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        refs_data: &[u8],
+        info_data: Option<&[u8]>,
     ) {
         assert!(
             self.can_add_way(),
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-        encode_way_raw(
+        encode_way_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
-            &mut self.packed_scratch,
-            &mut self.info_scratch,
             id,
-            raw_tag_keys,
-            raw_tag_vals,
-            refs,
-            metadata,
+            keys_data,
+            vals_data,
+            refs_data,
+            info_data,
         );
         self.count += 1;
     }
 
-    /// Add a relation using pre-seeded string table indices.
+    /// Add a relation using raw wire-format bytes from the input PBF.
     ///
-    /// `raw_tag_keys`, `raw_tag_vals` from [`Relation::raw_tags()`].
-    /// `members` contains `(MemberId, raw_role_sid)` pairs.
-    pub(crate) fn add_relation_raw(
+    /// All byte slices are raw protobuf packed field content from the source
+    /// `WireRelation`, passed through without decode or re-encode. Requires a
+    /// pre-seeded string table (identity mapping of indices).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_relation_raw_bytes(
         &mut self,
         id: i64,
-        raw_tag_keys: &[u32],
-        raw_tag_vals: &[u32],
-        members: &[(MemberId, i32)],
-        metadata: Option<&RawMetadata>,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        roles_sid_data: &[u8],
+        memids_data: &[u8],
+        types_data: &[u8],
+        info_data: Option<&[u8]>,
     ) {
         assert!(
             self.can_add_relation(),
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
-        encode_relation_raw(
+        encode_relation_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
-            &mut self.packed_scratch,
-            &mut self.info_scratch,
             id,
-            raw_tag_keys,
-            raw_tag_vals,
-            members,
-            metadata,
+            keys_data,
+            vals_data,
+            roles_sid_data,
+            memids_data,
+            types_data,
+            info_data,
         );
         self.count += 1;
     }
@@ -950,21 +954,6 @@ fn encode_info_to(
     }
 }
 
-/// Encode an `Info` submessage from raw [`RawMetadata`] (pre-seeded string table).
-#[allow(clippy::cast_sign_loss)]
-fn encode_info_raw_to(info: &mut Vec<u8>, meta: &RawMetadata) {
-    info.clear();
-    encode_optional_int32(info, 1, meta.version);
-    encode_optional_int64(info, 2, meta.timestamp);
-    encode_optional_int64(info, 3, meta.changeset);
-    encode_optional_int32(info, 4, meta.uid);
-    encode_optional_uint32(info, 5, meta.user_sid as u32);
-    if !meta.visible {
-        info.push(6 << 3); // tag for field 6, wire type 0
-        info.push(0x00);
-    }
-}
-
 /// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
 fn encode_way(
@@ -1091,44 +1080,27 @@ fn encode_way_with_locations(
     encode_bytes_field(group_buf, 3, elem);
 }
 
-/// Encode a Way with raw (pre-seeded) string table indices.
-#[allow(clippy::too_many_arguments)]
-fn encode_way_raw(
+/// Encode a Way from raw wire-format bytes (zero decode/reencode passthrough).
+///
+/// All byte slices are raw protobuf packed field content from `WireWay`,
+/// written directly with field tag + length prefix.
+fn encode_way_raw_bytes(
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
-    packed: &mut Vec<u8>,
-    info_buf: &mut Vec<u8>,
     id: i64,
-    raw_tag_keys: &[u32],
-    raw_tag_vals: &[u32],
-    refs: &[i64],
-    metadata: Option<&RawMetadata>,
+    keys_data: &[u8],
+    vals_data: &[u8],
+    refs_data: &[u8],
+    info_data: Option<&[u8]>,
 ) {
     elem.clear();
     encode_int64_field(elem, 1, id);
-
-    // Field 2: keys (packed uint32, raw indices)
-    encode_packed_uint32(elem, packed, 2, raw_tag_keys);
-    // Field 3: vals (packed uint32, raw indices)
-    encode_packed_uint32(elem, packed, 3, raw_tag_vals);
-
-    // Field 4: info
-    if let Some(meta) = metadata {
-        encode_info_raw_to(info_buf, meta);
-        encode_bytes_field(elem, 4, info_buf);
+    encode_bytes_field(elem, 2, keys_data);
+    encode_bytes_field(elem, 3, vals_data);
+    if let Some(info) = info_data {
+        encode_bytes_field(elem, 4, info);
     }
-
-    // Field 8: refs (packed sint64, delta-encoded)
-    if !refs.is_empty() {
-        packed.clear();
-        let mut last_ref: i64 = 0;
-        for &r in refs {
-            encode_varint(packed, zigzag_encode_64(r - last_ref));
-            last_ref = r;
-        }
-        encode_bytes_field(elem, 8, packed);
-    }
-
+    encode_bytes_field(elem, 8, refs_data);
     encode_bytes_field(group_buf, 3, elem);
 }
 
@@ -1200,57 +1172,32 @@ fn encode_relation(
     encode_bytes_field(group_buf, 4, elem);
 }
 
-/// Encode a Relation with raw (pre-seeded) string table indices.
+/// Encode a Relation from raw wire-format bytes (zero decode/reencode passthrough).
+///
+/// All byte slices are raw protobuf packed field content from `WireRelation`,
+/// written directly with field tag + length prefix.
 #[allow(clippy::too_many_arguments)]
-fn encode_relation_raw(
+fn encode_relation_raw_bytes(
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
-    packed: &mut Vec<u8>,
-    info_buf: &mut Vec<u8>,
     id: i64,
-    raw_tag_keys: &[u32],
-    raw_tag_vals: &[u32],
-    members: &[(MemberId, i32)],
-    metadata: Option<&RawMetadata>,
+    keys_data: &[u8],
+    vals_data: &[u8],
+    roles_sid_data: &[u8],
+    memids_data: &[u8],
+    types_data: &[u8],
+    info_data: Option<&[u8]>,
 ) {
     elem.clear();
     encode_int64_field(elem, 1, id);
-
-    encode_packed_uint32(elem, packed, 2, raw_tag_keys);
-    encode_packed_uint32(elem, packed, 3, raw_tag_vals);
-
-    if let Some(meta) = metadata {
-        encode_info_raw_to(info_buf, meta);
-        encode_bytes_field(elem, 4, info_buf);
+    encode_bytes_field(elem, 2, keys_data);
+    encode_bytes_field(elem, 3, vals_data);
+    if let Some(info) = info_data {
+        encode_bytes_field(elem, 4, info);
     }
-
-    if !members.is_empty() {
-        // Field 8: roles_sid (packed int32)
-        packed.clear();
-        #[allow(clippy::cast_sign_loss)]
-        for &(_, role_sid) in members {
-            encode_varint(packed, role_sid as i64 as u64);
-        }
-        encode_bytes_field(elem, 8, packed);
-
-        // Field 9: memids (packed sint64, delta-encoded)
-        packed.clear();
-        let mut last_memid: i64 = 0;
-        for &(mid, _) in members {
-            encode_varint(packed, zigzag_encode_64(mid.id() - last_memid));
-            last_memid = mid.id();
-        }
-        encode_bytes_field(elem, 9, packed);
-
-        // Field 10: types (packed int32)
-        packed.clear();
-        #[allow(clippy::cast_sign_loss)]
-        for &(mid, _) in members {
-            encode_varint(packed, member_type_to_proto(mid.member_type()) as i32 as i64 as u64);
-        }
-        encode_bytes_field(elem, 10, packed);
-    }
-
+    encode_bytes_field(elem, 8, roles_sid_data);
+    encode_bytes_field(elem, 9, memids_data);
+    encode_bytes_field(elem, 10, types_data);
     encode_bytes_field(group_buf, 4, elem);
 }
 

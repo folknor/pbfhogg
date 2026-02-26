@@ -141,6 +141,7 @@ pub(crate) fn encode_bytes_field_always(buf: &mut Vec<u8>, field: u32, data: &[u
 ///
 /// Clears `scratch`, encodes all values as varints into it, then writes
 /// the packed field (tag + length + content) to `buf`. Skips if empty.
+#[allow(dead_code)]
 pub(crate) fn encode_packed_uint32(
     buf: &mut Vec<u8>,
     scratch: &mut Vec<u8>,

@@ -18,7 +18,6 @@ use crate::blob::{
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData};
-use crate::elements::MemberId;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
@@ -456,9 +455,6 @@ fn write_base_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     way: &crate::Way<'_>,
-    raw_tag_keys: &mut Vec<u32>,
-    raw_tag_vals: &mut Vec<u32>,
-    refs_buf: &mut Vec<i64>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     ensure_way_capacity(bb, writer)?;
@@ -466,16 +462,13 @@ fn write_base_way(
         flush_block(bb, writer)?;
         bb.pre_seed_string_table(block);
     }
-    raw_tag_keys.clear();
-    raw_tag_vals.clear();
-    for (k, v) in way.raw_tags() {
-        raw_tag_keys.push(k);
-        raw_tag_vals.push(v);
-    }
-    refs_buf.clear();
-    refs_buf.extend(way.refs());
-    let meta = element_raw_metadata(&way.info());
-    bb.add_way_raw(way.id(), raw_tag_keys, raw_tag_vals, refs_buf, meta.as_ref());
+    bb.add_way_raw_bytes(
+        way.id(),
+        way.keys_data(),
+        way.vals_data(),
+        way.refs_data(),
+        way.info_data(),
+    );
     Ok(())
 }
 
@@ -483,9 +476,6 @@ fn write_base_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     rel: &crate::Relation<'_>,
-    raw_tag_keys: &mut Vec<u32>,
-    raw_tag_vals: &mut Vec<u32>,
-    raw_members_buf: &mut Vec<(MemberId, i32)>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     ensure_relation_capacity(bb, writer)?;
@@ -493,16 +483,15 @@ fn write_base_relation(
         flush_block(bb, writer)?;
         bb.pre_seed_string_table(block);
     }
-    raw_tag_keys.clear();
-    raw_tag_vals.clear();
-    for (k, v) in rel.raw_tags() {
-        raw_tag_keys.push(k);
-        raw_tag_vals.push(v);
-    }
-    raw_members_buf.clear();
-    raw_members_buf.extend(rel.members().map(|m| (m.id, m.role_sid)));
-    let meta = element_raw_metadata(&rel.info());
-    bb.add_relation_raw(rel.id(), raw_tag_keys, raw_tag_vals, raw_members_buf, meta.as_ref());
+    bb.add_relation_raw_bytes(
+        rel.id(),
+        rel.keys_data(),
+        rel.vals_data(),
+        rel.roles_sid_data(),
+        rel.memids_data(),
+        rel.types_data(),
+        rel.info_data(),
+    );
     Ok(())
 }
 
@@ -538,13 +527,6 @@ struct RewriteContext<'a> {
     create_emitter: &'a mut CreateEmitter,
 }
 
-/// Reusable buffers for raw-index element data, hoisted outside the element loop.
-struct RewriteBuffers {
-    raw_tag_keys: Vec<u32>,
-    raw_tag_vals: Vec<u32>,
-    refs_buf: Vec<i64>,
-    raw_members_buf: Vec<(MemberId, i32)>,
-}
 
 #[hotpath::measure]
 fn rewrite_block(
@@ -557,13 +539,6 @@ fn rewrite_block(
     // string table indices from the input are valid in the output (identity mapping).
     // Diff elements extend the table normally via add().
     bb.pre_seed_string_table(block);
-
-    let mut bufs = RewriteBuffers {
-        raw_tag_keys: Vec::new(),
-        raw_tag_vals: Vec::new(),
-        refs_buf: Vec::new(),
-        raw_members_buf: Vec::new(),
-    };
 
     for element in block.elements() {
         let kind = element_kind(&element);
@@ -590,7 +565,7 @@ fn rewrite_block(
             bb, writer, ctx.stats,
         )?;
 
-        rewrite_element(&element, ctx, bb, writer, &mut bufs, block)?;
+        rewrite_element(&element, ctx, bb, writer, block)?;
     }
     Ok(())
 }
@@ -600,18 +575,13 @@ fn rewrite_element(
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    bufs: &mut RewriteBuffers,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     match element {
         Element::DenseNode(dn) => rewrite_dense_node(dn, ctx, bb, writer, block),
         Element::Node(n) => rewrite_node(n, ctx, bb, writer, block),
-        Element::Way(w) => {
-            rewrite_way(w, ctx, bb, writer, bufs, block)
-        }
-        Element::Relation(r) => {
-            rewrite_relation(r, ctx, bb, writer, bufs, block)
-        }
+        Element::Way(w) => rewrite_way(w, ctx, bb, writer, block),
+        Element::Relation(r) => rewrite_relation(r, ctx, bb, writer, block),
     }
 }
 
@@ -687,7 +657,6 @@ fn rewrite_way(
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    bufs: &mut RewriteBuffers,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = way.id();
@@ -700,7 +669,7 @@ fn rewrite_way(
         ctx.emitted_ways.insert(id);
         ctx.stats.diff_ways += 1;
     } else {
-        write_base_way(bb, writer, way, &mut bufs.raw_tag_keys, &mut bufs.raw_tag_vals, &mut bufs.refs_buf, block)?;
+        write_base_way(bb, writer, way, block)?;
         ctx.stats.base_ways += 1;
     }
     Ok(())
@@ -711,7 +680,6 @@ fn rewrite_relation(
     ctx: &mut RewriteContext<'_>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    bufs: &mut RewriteBuffers,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
     let id = rel.id();
@@ -724,7 +692,7 @@ fn rewrite_relation(
         ctx.emitted_relations.insert(id);
         ctx.stats.diff_relations += 1;
     } else {
-        write_base_relation(bb, writer, rel, &mut bufs.raw_tag_keys, &mut bufs.raw_tag_vals, &mut bufs.raw_members_buf, block)?;
+        write_base_relation(bb, writer, rel, block)?;
         ctx.stats.base_relations += 1;
     }
     Ok(())

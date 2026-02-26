@@ -231,6 +231,26 @@ impl<'a> Way<'a> {
             val_indices: PackedUint32Iter::new(self.way.vals_data),
         }
     }
+
+    /// Raw packed uint32 bytes for tag key string table indices.
+    pub(crate) fn keys_data(&self) -> &[u8] {
+        self.way.keys_data
+    }
+
+    /// Raw packed uint32 bytes for tag value string table indices.
+    pub(crate) fn vals_data(&self) -> &[u8] {
+        self.way.vals_data
+    }
+
+    /// Raw packed sint64 delta-encoded bytes for node refs.
+    pub(crate) fn refs_data(&self) -> &[u8] {
+        self.way.refs_data
+    }
+
+    /// Raw Info submessage bytes (if present).
+    pub(crate) fn info_data(&self) -> Option<&[u8]> {
+        self.way.info_data
+    }
 }
 
 /// An OpenStreetMap relation element (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Relation)).
@@ -286,6 +306,36 @@ impl<'a> Relation<'a> {
             key_indices: PackedUint32Iter::new(self.rel.keys_data),
             val_indices: PackedUint32Iter::new(self.rel.vals_data),
         }
+    }
+
+    /// Raw packed uint32 bytes for tag key string table indices.
+    pub(crate) fn keys_data(&self) -> &[u8] {
+        self.rel.keys_data
+    }
+
+    /// Raw packed uint32 bytes for tag value string table indices.
+    pub(crate) fn vals_data(&self) -> &[u8] {
+        self.rel.vals_data
+    }
+
+    /// Raw packed int32 bytes for member role string table indices.
+    pub(crate) fn roles_sid_data(&self) -> &[u8] {
+        self.rel.roles_sid_data
+    }
+
+    /// Raw packed sint64 delta-encoded bytes for member IDs.
+    pub(crate) fn memids_data(&self) -> &[u8] {
+        self.rel.memids_data
+    }
+
+    /// Raw packed int32 bytes for member types.
+    pub(crate) fn types_data(&self) -> &[u8] {
+        self.rel.types_data
+    }
+
+    /// Raw Info submessage bytes (if present).
+    pub(crate) fn info_data(&self) -> Option<&[u8]> {
+        self.rel.info_data
     }
 }
 

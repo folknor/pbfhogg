@@ -122,15 +122,14 @@ Compression::None as the faster path. Full analysis: `notes/hotpath-profile.md`.
   next `write_base_*` detects this via `is_pre_seeded()`, flushes the
   non-pre-seeded content, and re-seeds). Investigation: `notes/preseed-stringtable.md`.
 
-- [ ] **Raw packed bytes for non-string integer fields** — investigated: the
-  delta encoding is compatible (both input wire format and BlockBuilder delta-
-  encode refs/memids from 0 within each element), so raw byte passthrough is
-  valid. Previously blocked by prost's `Vec<i64>` types requiring decode+reencode.
-  **Direct wire encoding (see BlockBuilder section) removes this blocker** — with
-  manual protobuf emission, `add_way_raw` can accept raw packed bytes for refs
-  and write them directly to `packed_scratch` without decoding. Same for relation
-  memids/roles_sid/types. Bottom-up estimate: ~74ms (3.7% of rewrite_block) —
-  small but essentially free once direct encoding is in place.
+- [x] **Raw packed bytes for non-string integer fields** — implemented as
+  `add_way_raw_bytes` / `add_relation_raw_bytes` which accept raw `&[u8]` byte
+  slices for all packed fields (keys, vals, refs, memids, roles_sid, types) and
+  info submessage. Zero decode/reencode — just field tag + length + raw data.
+  Also passes raw tag keys/vals and info submessage bytes (not just integer
+  fields). Merge `write_base_way`/`write_base_relation` simplified to single
+  calls with raw byte slices from `Way`/`Relation` accessors. `RewriteBuffers`
+  struct eliminated entirely.
   Detailed cost analysis: `notes/rewrite-block-cost-breakdown.md`.
 
 - [x] **Protobuf serialization in `take`** — re-benchmarked with prost: 739ms

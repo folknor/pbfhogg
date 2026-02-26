@@ -18,7 +18,7 @@ use std::time::Instant;
 
 fn flush<W: Write>(bb: &mut BlockBuilder, writer: &mut PbfWriter<W>) {
     if let Some(bytes) = bb.take().expect("take block") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 }
 
@@ -138,7 +138,7 @@ fn decode_and_write<W: Write>(path: &Path, writer: &mut PbfWriter<W>) -> Counts 
 
     // Flush remaining
     if let Some(bytes) = bb.take().expect("take final block") {
-        writer.write_primitive_block(&bytes).expect("write final block");
+        writer.write_primitive_block(bytes).expect("write final block");
     }
 
     counts

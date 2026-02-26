@@ -28,7 +28,7 @@ fn main() {
     bb.add_node(2, 556_001_000, 125_601_000, &[], Some(&meta));
     bb.add_node(3, 556_002_000, 125_602_000, &[], Some(&meta));
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write nodes");
+        writer.write_primitive_block(bytes).expect("write nodes");
     }
 
     // One way with building=yes (expected by indexed.rs read_ways_and_deps doc test)
@@ -47,7 +47,7 @@ fn main() {
         }),
     );
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write ways");
+        writer.write_primitive_block(bytes).expect("write ways");
     }
 
     // One relation
@@ -70,7 +70,7 @@ fn main() {
     );
     if let Some(bytes) = bb.take().expect("take") {
         writer
-            .write_primitive_block(&bytes)
+            .write_primitive_block(bytes)
             .expect("write relations");
     }
 

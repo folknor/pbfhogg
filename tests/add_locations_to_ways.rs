@@ -38,35 +38,35 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
         if !bb.can_add_node()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     for w in ways {
         if !bb.can_add_way()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         bb.add_way(w.id, &w.tags, &w.refs, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     for r in relations {
         if !bb.can_add_relation()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         let members: Vec<MemberData<'_>> = r
             .members
@@ -78,7 +78,7 @@ fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: 
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     writer.flush().expect("flush");

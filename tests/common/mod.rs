@@ -91,14 +91,14 @@ pub fn write_test_pbf(
         if !bb.can_add_node()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Ways
@@ -106,14 +106,14 @@ pub fn write_test_pbf(
         if !bb.can_add_way()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         bb.add_way(w.id, &w.tags, &w.refs, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Relations
@@ -121,7 +121,7 @@ pub fn write_test_pbf(
         if !bb.can_add_relation()
             && let Some(bytes) = bb.take().expect("take")
         {
-            writer.write_primitive_block(&bytes).expect("write block");
+            writer.write_primitive_block(bytes).expect("write block");
         }
         let members: Vec<MemberData<'_>> = r
             .members
@@ -136,7 +136,7 @@ pub fn write_test_pbf(
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
     {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     writer.flush().expect("flush");

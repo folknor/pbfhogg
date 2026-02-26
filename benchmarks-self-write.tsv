@@ -12,3 +12,9 @@ date	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-25	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-pipe-zlib:6	9133	52489653	6616526	46103	483
 2026-02-25	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-zstd:3	11024	52489653	6616526	46103	483
 2026-02-25	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-pipe-zstd:3	9067	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-none	10654	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-none	10521	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-zlib:6	20105	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-zlib:6	10657	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-zstd:3	12880	52489653	6616526	46103	483
+2026-02-26	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-zstd:3	10735	52489653	6616526	46103	483

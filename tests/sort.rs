@@ -27,7 +27,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
         bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
     }
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Blob 2: even node IDs (overlapping range with blob 1)
@@ -35,14 +35,14 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
         bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
     }
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Ways (already sorted)
     bb.add_way(100, &[("highway", "residential")], &[1, 2, 3], None);
     bb.add_way(200, &[("highway", "primary")], &[4, 5, 6], None);
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Relation
@@ -53,7 +53,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
         None,
     );
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     writer.flush().expect("flush");
@@ -73,7 +73,7 @@ fn write_type_unsorted_pbf(path: &Path) {
     bb.add_way(100, &[("highway", "residential")], &[1, 2, 3], None);
     bb.add_way(200, &[("highway", "primary")], &[4, 5, 6], None);
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Then nodes
@@ -81,7 +81,7 @@ fn write_type_unsorted_pbf(path: &Path) {
         bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
     }
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Then relations
@@ -92,7 +92,7 @@ fn write_type_unsorted_pbf(path: &Path) {
         None,
     );
     if let Some(bytes) = bb.take().expect("take") {
-        writer.write_primitive_block(&bytes).expect("write block");
+        writer.write_primitive_block(bytes).expect("write block");
     }
 
     writer.flush().expect("flush");

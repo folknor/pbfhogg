@@ -32,7 +32,7 @@ pub(crate) fn flush_block(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     if let Some(bytes) = bb.take()? {
-        writer.write_primitive_block(&bytes)?;
+        writer.write_primitive_block(bytes)?;
     }
     Ok(())
 }

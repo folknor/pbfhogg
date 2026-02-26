@@ -33,14 +33,14 @@ fn write_test_pbf(path: &Path) {
     bb.add_node(200, 560_000_000, 130_000_000, &[("name", "B")], None);
     bb.add_node(300, -330_000_000, -580_000_000, &[], None);
     writer
-        .write_primitive_block(&bb.take().unwrap().unwrap())
+        .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
 
     // Block 2: 2 ways
     bb.add_way(1000, &[("highway", "primary")], &[100, 200, 300], None);
     bb.add_way(2000, &[("building", "yes")], &[200, 300, 200], None);
     writer
-        .write_primitive_block(&bb.take().unwrap().unwrap())
+        .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
 
     // Block 3: 1 relation
@@ -54,7 +54,7 @@ fn write_test_pbf(path: &Path) {
         None,
     );
     writer
-        .write_primitive_block(&bb.take().unwrap().unwrap())
+        .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
 
     writer.flush().unwrap();

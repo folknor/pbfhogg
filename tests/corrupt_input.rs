@@ -39,7 +39,7 @@ fn write_one_block_pbf() -> Vec<u8> {
         let mut bb = BlockBuilder::new();
         bb.add_node(1, 0, 0, &[], None);
         writer
-            .write_primitive_block(&bb.take().unwrap().unwrap())
+            .write_primitive_block(bb.take().unwrap().unwrap())
             .unwrap();
         writer.flush().unwrap();
     }

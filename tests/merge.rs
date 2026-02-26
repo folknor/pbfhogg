@@ -220,7 +220,7 @@ fn merge_multi_block_partial_rewrite() {
         bb.add_node(2, 200_000_000, 200_000_000, &[], None);
         bb.add_node(3, 300_000_000, 300_000_000, &[], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 2: nodes 10-12 (these will be affected by the diff)
@@ -228,7 +228,7 @@ fn merge_multi_block_partial_rewrite() {
         bb.add_node(11, 110_000_000, 110_000_000, &[], None);
         bb.add_node(12, 120_000_000, 120_000_000, &[], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 3: nodes 20-22 (past max affected ID, should skip-decompress)
@@ -236,7 +236,7 @@ fn merge_multi_block_partial_rewrite() {
         bb.add_node(21, 210_000_000, 210_000_000, &[], None);
         bb.add_node(22, 220_000_000, 220_000_000, &[], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         writer.flush().expect("flush");
@@ -539,20 +539,20 @@ fn merge_delete_entire_block() {
         bb.add_node(2, 200_000_000, 200_000_000, &[], None);
         bb.add_node(3, 300_000_000, 300_000_000, &[], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 2: nodes 10-11 (survive)
         bb.add_node(10, 100_000_000, 100_000_000, &[("survivor", "yes")], None);
         bb.add_node(11, 110_000_000, 110_000_000, &[], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 3: ways (survive)
         bb.add_way(100, &[("highway", "path")], &[10, 11], None);
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         writer.flush().expect("flush");
@@ -691,7 +691,7 @@ fn merge_metadata_preservation() {
             }),
         );
         writer
-            .write_primitive_block(&bb.take().expect("take").expect("bytes"))
+            .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
         writer.flush().expect("flush");
     }

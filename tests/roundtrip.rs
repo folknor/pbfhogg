@@ -78,7 +78,7 @@ fn roundtrip_dense_nodes_with_metadata() {
         );
 
         let block_bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&block_bytes).unwrap();
+        writer.write_primitive_block(block_bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -186,7 +186,7 @@ fn roundtrip_dense_nodes_no_metadata() {
         bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
         bb.add_node(2, -100_000_000, -200_000_000, &[], None);
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -255,7 +255,7 @@ fn roundtrip_ways() {
         );
 
         let block_bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&block_bytes).unwrap();
+        writer.write_primitive_block(block_bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -339,7 +339,7 @@ fn roundtrip_relations() {
         );
 
         let block_bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&block_bytes).unwrap();
+        writer.write_primitive_block(block_bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -421,12 +421,12 @@ fn roundtrip_multi_block() {
         let mut bb = BlockBuilder::new();
         bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
 
         // Block 2: ways
         bb.add_way(10, &[("highway", "path")], &[1, 2, 3], None);
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
 
         writer.flush().unwrap();
     }
@@ -483,7 +483,7 @@ fn roundtrip_way_with_locations() {
             None,
         );
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -545,7 +545,7 @@ fn roundtrip_uncompressed() {
         let mut bb = BlockBuilder::new();
         bb.add_node(42, 123_456_789, -987_654_321, &[("foo", "bar")], None);
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -602,11 +602,11 @@ fn roundtrip_direct_io() {
     bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
     bb.add_node(2, -100_000_000, -200_000_000, &[], None);
     let bytes = bb.take().unwrap().unwrap();
-    writer.write_primitive_block(&bytes).unwrap();
+    writer.write_primitive_block(bytes).unwrap();
 
     bb.add_way(10, &[("highway", "path")], &[1, 2, 3], None);
     let bytes = bb.take().unwrap().unwrap();
-    writer.write_primitive_block(&bytes).unwrap();
+    writer.write_primitive_block(bytes).unwrap();
 
     writer.flush().unwrap();
 
@@ -692,7 +692,7 @@ fn roundtrip_pipelined_direct_io() {
             bb.add_node(id, id32 * 1_000_000, id32 * 2_000_000, &[], None);
         }
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
     }
 
     writer.flush().unwrap();
@@ -738,12 +738,12 @@ fn roundtrip_zstd() {
         bb.add_node(100, 556_789_000, 126_543_000, &[("name", "ZstdNode")], None);
         bb.add_node(200, -335_000_000, -580_000_000, &[("natural", "tree")], None);
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
 
         let mut bb2 = BlockBuilder::new();
         bb2.add_way(300, &[("highway", "residential")], &[100, 200], None);
         let bytes2 = bb2.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes2).unwrap();
+        writer.write_primitive_block(bytes2).unwrap();
         writer.flush().unwrap();
     }
 
@@ -840,7 +840,7 @@ fn roundtrip_mixed_metadata() {
         );
 
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
     }
 
@@ -929,7 +929,7 @@ fn roundtrip_backfill_metadata() {
         );
 
         let bytes = bb.take().unwrap().unwrap();
-        writer.write_primitive_block(&bytes).unwrap();
+        writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
     }
 

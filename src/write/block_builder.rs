@@ -220,6 +220,9 @@ pub struct BlockBuilder {
 
     // Relations
     relations: Vec<proto::Relation>,
+
+    // Reusable encode buffer for take() — avoids allocating a fresh Vec<u8> per block.
+    encode_buf: Vec<u8>,
 }
 
 impl Default for BlockBuilder {
@@ -286,6 +289,8 @@ impl BlockBuilder {
             // Left at zero capacity — see doc comment above.
             ways: Vec::new(),
             relations: Vec::new(),
+
+            encode_buf: Vec::new(),
         }
     }
 
@@ -604,9 +609,11 @@ impl BlockBuilder {
 
     /// Serialize the current block to `PrimitiveBlock` bytes and reset.
     ///
-    /// Returns `None` if the block is empty.
+    /// Returns `None` if the block is empty. The returned slice borrows from
+    /// an internal encode buffer that is reused across calls, eliminating
+    /// per-block allocation after the first `take()`.
     #[hotpath::measure]
-    pub fn take(&mut self) -> io::Result<Option<Vec<u8>>> {
+    pub fn take(&mut self) -> io::Result<Option<&[u8]>> {
         let block_type = match self.block_type {
             Some(t) => t,
             None => return Ok(None),
@@ -629,10 +636,13 @@ impl BlockBuilder {
         };
         block.primitivegroup.push(group);
 
-        let bytes = block.encode_to_vec();
+        self.encode_buf.clear();
+        block
+            .encode(&mut self.encode_buf)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
         self.reset();
-        Ok(Some(bytes))
+        Ok(Some(&self.encode_buf))
     }
 
     /// Move the dense node data into a `PrimitiveGroup`.

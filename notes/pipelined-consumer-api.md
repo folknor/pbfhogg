@@ -219,17 +219,20 @@ Orthogonal to the pipeline API — could be added separately.
 
 ## Recommendation
 
-**Do Option A first, Option B later.**
+**Both Option A and Option B are implemented.**
 
-Option A (owned block callback) is the minimum viable change:
-- 1 modified function (run_pipeline)
-- 1 new public method (for_each_block_pipelined)
-- Existing for_each_pipelined becomes a wrapper (no behavior change)
+Option A (`for_each_block_pipelined`) — commit `59fe13d`:
+- 1 modified function (run_pipeline: `&PrimitiveBlock` → owned `PrimitiveBlock`)
+- 1 new public method (`for_each_block_pipelined`)
+- Existing `for_each_pipelined` becomes a wrapper (no behavior change)
 - Unblocks elivagar's double-buffer pattern immediately
 
-Option B (iterator) is the clean long-term API but has the `'static` bound and
-lifecycle complexity. It can be added later as a separate method without breaking
-Option A.
+Option B (`into_blocks_pipelined`) — commit `7a884dc`:
+- `PipelinedBlocks` struct implementing `Iterator<Item = Result<PrimitiveBlock>>`
+- Pipeline runs in background thread, blocks delivered via `sync_channel(8)`
+- Requires `R: 'static` (`ElementReader<FileReader>` satisfies this)
+- Enables loop control: early exit, zipping two PBF iterators, interleaving work
+- Clean Drop: closes channel first (signals shutdown), then joins background thread
 
 ## Elivagar impact estimate
 
@@ -334,10 +337,9 @@ implement this themselves.
 
 ## Open questions
 
-1. **Should run_pipeline always pass owned blocks?** Currently it borrows. Changing
-   to owned makes for_each_pipelined a wrapper. The block is dropped at end of
-   callback anyway, so no cost. But it's a breaking change to run_pipeline's
-   internal API (pub(crate)). Seems fine.
+1. ~~**Should run_pipeline always pass owned blocks?**~~ **Yes — done.** Changed
+   `run_pipeline` to pass owned blocks. `for_each_pipelined` is now a wrapper.
+   No cost — block was dropped at end of callback anyway.
 
 2. **Should we expose PrimitiveBlock's block type?** Quick classification (nodes
    vs ways vs relations) avoids iterating to the first element. Useful but not

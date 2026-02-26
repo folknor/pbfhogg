@@ -253,12 +253,10 @@ impl UringState {
         // Safety: the SQE references a registered buffer (buf_idx) and a
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
-        unsafe {
-            self.ring
-                .submission()
-                .push(&sqe)
-                .map_err(|_| io::Error::other("io_uring submission queue full"))?;
-        }
+        //
+        // With sqpoll, submit() returns without a syscall, so SQ entries
+        // accumulate. If the SQ is full, wait for the kernel to drain it.
+        self.push_sqe(&sqe)?;
         self.ring
             .submitter()
             .submit()
@@ -273,11 +271,14 @@ impl UringState {
     /// Register the input file descriptor at `IN_FD_IDX` for `ReadFixed` CopyRange.
     ///
     /// Only registers on the first call; subsequent calls are no-ops.
+    /// Drains all in-flight SQEs first — with sqpoll, the kernel polling thread
+    /// may hold references to the file table during I/O processing.
     #[cfg(feature = "linux-direct-io")]
     fn register_input_fd(&mut self, in_fd: std::os::unix::io::RawFd) -> io::Result<()> {
         if self.input_fd_registered {
             return Ok(());
         }
+        self.drain()?;
         self.ring
             .submitter()
             .register_files_update(IN_FD_IDX, &[in_fd])
@@ -335,13 +336,11 @@ impl UringState {
 
         // Safety: both SQEs reference registered buffers and registered fds.
         // The buffer will not be touched until both CQEs are reaped.
-        unsafe {
-            let mut sq = self.ring.submission();
-            sq.push(&read_sqe)
-                .map_err(|_| io::Error::other("io_uring SQ full (read)"))?;
-            sq.push(&write_sqe)
-                .map_err(|_| io::Error::other("io_uring SQ full (write)"))?;
-        }
+        //
+        // With sqpoll, submit() returns without a syscall when the kernel thread
+        // is active, so SQ entries accumulate faster than the kernel drains them.
+        // If the SQ is full, wait for the kernel to consume entries before pushing.
+        self.push_sqe_pair(&read_sqe, &write_sqe)?;
         self.ring
             .submitter()
             .submit()
@@ -373,6 +372,69 @@ impl UringState {
                 return Ok(idx);
             }
         }
+    }
+
+    /// Push a single SQE to the submission queue, waiting for SQ space if full.
+    ///
+    /// With sqpoll, the kernel polling thread drains the SQ asynchronously.
+    /// If we push faster than it drains, the SQ fills up. Instead of failing,
+    /// call `squeue_wait()` to block until the kernel frees SQ entries.
+    fn push_sqe(&mut self, sqe: &io_uring::squeue::Entry) -> io::Result<()> {
+        // Safety: SQE references registered buffers/fds, validated by callers.
+        unsafe {
+            if self.ring.submission().push(sqe).is_ok() {
+                return Ok(());
+            }
+        }
+        // SQ full — wait for the kernel to drain entries, then retry.
+        self.ring
+            .submitter()
+            .squeue_wait()
+            .map_err(|e| io::Error::new(e.kind(), format!("squeue_wait failed: {e}")))?;
+        unsafe {
+            self.ring
+                .submission()
+                .push(sqe)
+                .map_err(|_| io::Error::other("io_uring SQ still full after squeue_wait"))?;
+        }
+        Ok(())
+    }
+
+    /// Push a linked SQE pair (ReadFixed + WriteFixed) to the submission queue.
+    ///
+    /// Both SQEs must be pushed in the same `SubmissionQueue` scope to ensure
+    /// the IO_LINK chain is visible to the kernel atomically. If we dropped the
+    /// queue between pushes, the kernel polling thread could see a broken link
+    /// (first SQE with IO_LINK but no linked successor).
+    fn push_sqe_pair(
+        &mut self,
+        first: &io_uring::squeue::Entry,
+        second: &io_uring::squeue::Entry,
+    ) -> io::Result<()> {
+        // Ensure at least 2 SQ slots are free before pushing either SQE.
+        loop {
+            {
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() >= 2 {
+                    break;
+                }
+                // Drop without pushing — publishes unchanged tail (no-op).
+            }
+            self.ring
+                .submitter()
+                .squeue_wait()
+                .map_err(|e| io::Error::new(e.kind(), format!("squeue_wait failed: {e}")))?;
+        }
+        // Safety: SQEs reference registered buffers/fds, validated by callers.
+        // Space was verified above; only this thread pushes, so it can't shrink.
+        unsafe {
+            let mut sq = self.ring.submission();
+            sq.push(first)
+                .map_err(|_| io::Error::other("io_uring SQ full (read)"))?;
+            sq.push(second)
+                .map_err(|_| io::Error::other("io_uring SQ full (write)"))?;
+        }
+        Ok(())
     }
 
     /// Reap completed CQEs and recycle buffer indices.
@@ -518,7 +580,11 @@ pub(crate) fn uring_writer_thread(
     init_tx: SyncSender<io::Result<()>>,
     sqpoll: bool,
 ) -> io::Result<()> {
-    uring_init_and_run(&rx, &path, &framed_header, &init_tx, sqpoll)
+    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx, sqpoll);
+    if let Err(ref e) = result {
+        eprintln!("[uring_writer] error: {e}");
+    }
+    result
 }
 
 /// Initialize the io_uring ring and run the writer loop.
@@ -547,8 +613,11 @@ fn uring_init_and_run(
         const SQPOLL_IDLE_MS: u32 = 2000;
         builder.setup_sqpoll(SQPOLL_IDLE_MS);
     }
-    // Ring depth: 2× buffer count to accommodate linked ReadFixed+WriteFixed pairs.
-    let ring_depth = u32::from(NUM_BUFS) * 2;
+    // Ring depth: 2× buffer count for linked ReadFixed+WriteFixed pairs, plus
+    // headroom for standalone writes. With sqpoll, submit() returns without a
+    // syscall so SQ entries accumulate — the extra headroom prevents SQ full
+    // stalls on burst CopyRange sequences.
+    let ring_depth = u32::from(NUM_BUFS) * 4;
     let ring = builder
         .build(ring_depth)
         .map_err(|e| io::Error::new(e.kind(), format!("io_uring creation failed: {e}")))?;

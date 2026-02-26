@@ -119,10 +119,12 @@ kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
 pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
 buffers actually matter — the writer thread is the bottleneck, not compression.
 
-- [x] **SQ polling (`setup_sqpoll`)** — implemented (`--sqpoll` flag), but crashes
-  mid-stream on North America (18.8 GB) after ~4000 blobs. Needs debugging.
-  Works at Denmark scale. Likely a CQE reaping timing issue with the kernel
-  polling thread.
+- [x] **SQ polling (`setup_sqpoll`)** — implemented (`--sqpoll` flag). Fixed crash
+  on North America: SQ overflow under sqpoll (submit() returns without syscall,
+  SQ entries accumulate). Fix: `push_sqe`/`push_sqe_pair` with `squeue_wait()`,
+  increased ring depth (256), drain before `register_files_update`. Result:
+  sqpoll adds no improvement over regular uring (<1% difference at NA scale).
+  Tested on Linux 6.18.0-9-generic.
 
 - [x] **`ReadFixed` + linked `WriteFixed` for CopyRange** — implemented. Linked
   SQE pairs eliminate pread syscalls for passthrough blobs. North America results:

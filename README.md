@@ -161,14 +161,14 @@ Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes,
 
 The improvement comes from parallel `rewrite_block` — rewriting touched blobs on the rayon pool instead of the main thread. Denmark's 8.5% rewrite fraction is too small to show the effect; at Germany's 18.4% (and planet's ~92%) the main-thread rewrite bottleneck dominates.
 
-Merge with io_uring — North America (18.8 GB, 645K element diff, ~87% blobs passthrough):
+Merge with io_uring — North America (18.8 GB, 645K element diff, ~87% blobs passthrough, Linux 6.18):
 
 | Config | Buffered | io_uring | Change |
 |--------|----------|----------|--------|
-| zlib | 49.4s | **33.6s** | **-32%** |
-| none | 43.5s | **25.2s** | **-42%** |
+| zlib | 43.2s | **32.6s** | **-25%** |
+| none | 36.4s | **25.5s** | **-30%** |
 
-At this scale the file exceeds page cache (30 GB RAM), so O_DIRECT + io_uring's linked `ReadFixed` → `WriteFixed` SQE chains for passthrough blobs eliminate both page cache thrashing and per-blob `pread` syscalls. At Denmark and Japan scale (≤2.3 GB), io_uring adds 3-5% overhead since page cache absorbs everything.
+At this scale the file exceeds page cache (30 GB RAM), so O_DIRECT + io_uring's linked `ReadFixed` → `WriteFixed` SQE chains for passthrough blobs eliminate both page cache thrashing and per-blob `pread` syscalls. SQ polling (`--sqpoll`) adds no improvement (<1%) — the syscall elimination from the kernel polling thread doesn't matter at this throughput. At Denmark and Japan scale (≤2.3 GB), io_uring adds 3-5% overhead since page cache absorbs everything.
 
 All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 

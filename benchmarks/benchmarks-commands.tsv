@@ -47,3 +47,9 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-complete	2.76	483
 2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-smart	4.23	483
 2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-smart	3.23	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	pbfhogg	extract-simple	2.81	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	osmium	extract-simple	1.66	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	pbfhogg	extract-complete	2.69	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	osmium	extract-complete	2.83	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	pbfhogg	extract-smart	4.21	483
+2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	osmium	extract-smart	3.26	483

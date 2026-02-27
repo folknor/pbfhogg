@@ -85,6 +85,35 @@ impl Bbox {
     }
 }
 
+/// Precomputed integer bounding box in decimicrodegrees (10^-7) for fast containment testing.
+///
+/// Avoids the i64→f64 conversion and float comparison that `Bbox::contains` requires
+/// on every node. The integer bbox is computed once from the f64 Bbox at startup.
+struct BboxInt {
+    min_lon: i32,
+    min_lat: i32,
+    max_lon: i32,
+    max_lat: i32,
+}
+
+impl BboxInt {
+    /// Convert a float Bbox to integer decimicrodegrees.
+    #[allow(clippy::cast_possible_truncation)]
+    fn from_bbox(bbox: &Bbox) -> Self {
+        Self {
+            min_lon: (bbox.min_lon * 1e7).floor() as i32,
+            min_lat: (bbox.min_lat * 1e7).floor() as i32,
+            max_lon: (bbox.max_lon * 1e7).ceil() as i32,
+            max_lat: (bbox.max_lat * 1e7).ceil() as i32,
+        }
+    }
+
+    /// Returns `true` if the point (lat, lon) in decimicrodegrees falls within this bbox.
+    fn contains(&self, lat: i32, lon: i32) -> bool {
+        lat >= self.min_lat && lat <= self.max_lat && lon >= self.min_lon && lon <= self.max_lon
+    }
+}
+
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
 // String errors are intentional for CLI arg parsing — the bad input value is more
 // useful to users than the underlying ParseFloatError ("invalid float literal").
@@ -162,6 +191,28 @@ impl Region {
                     return false;
                 }
                 polygon_contains(polygons, lon, lat)
+            }
+        }
+    }
+
+    /// Fast containment test using decimicrodegree integer coordinates.
+    ///
+    /// For bbox regions, uses pure integer comparison (4 i32 compares) — avoids
+    /// the i64→f64 conversion that `contains()` requires per node. For polygon
+    /// regions, the bbox fast-rejection uses integers; only points passing the
+    /// bbox test fall through to the f64 polygon ray-casting (with i32→f64
+    /// conversion done only for those points).
+    #[allow(clippy::cast_lossless)]
+    fn contains_decimicro(&self, bbox_int: &BboxInt, lat: i32, lon: i32) -> bool {
+        match self {
+            Region::Bbox(_) => bbox_int.contains(lat, lon),
+            Region::Polygon { polygons, .. } => {
+                if !bbox_int.contains(lat, lon) {
+                    return false;
+                }
+                let lat_f64 = lat as f64 * 1e-7;
+                let lon_f64 = lon as f64 * 1e-7;
+                polygon_contains(polygons, lon_f64, lat_f64)
             }
         }
     }
@@ -486,6 +537,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
 
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
+    let bbox_int = BboxInt::from_bbox(bbox);
     let header_bytes = HeaderBuilder::from_header(reader.header())
         .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         .sorted()
@@ -500,14 +552,14 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
-                    if region.contains(dn.lat(), dn.lon()) {
+                    if region.contains_decimicro(&bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
                         matched_node_ids.set(dn.id());
                         write_dense_node(dn, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
                     }
                 }
                 Element::Node(n) => {
-                    if region.contains(n.lat(), n.lon()) {
+                    if region.contains_decimicro(&bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
                         matched_node_ids.set(n.id());
                         write_node(n, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
@@ -556,12 +608,14 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     let mut all_way_node_ids = IdSetDense::new();
     let mut matched_relation_ids = IdSetDense::new();
 
+    let bbox_int = BboxInt::from_bbox(region.bbox());
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         collect_pass1_matches(
             &block,
             region,
+            &bbox_int,
             &mut bbox_node_ids,
             &mut matched_way_ids,
             &mut all_way_node_ids,
@@ -612,6 +666,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
 fn collect_pass1_matches(
     block: &crate::PrimitiveBlock,
     region: &Region,
+    bbox_int: &BboxInt,
     bbox_node_ids: &mut IdSetDense,
     matched_way_ids: &mut IdSetDense,
     all_way_node_ids: &mut IdSetDense,
@@ -620,12 +675,12 @@ fn collect_pass1_matches(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                if region.contains(dn.lat(), dn.lon()) {
+                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
                     bbox_node_ids.set(dn.id());
                 }
             }
             Element::Node(n) => {
-                if region.contains(n.lat(), n.lon()) {
+                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
                     bbox_node_ids.set(n.id());
                 }
             }
@@ -814,11 +869,12 @@ fn extract_smart(
     let mut extra_way_ids = IdSetDense::new();
     let mut extra_node_ids = IdSetDense::new();
 
+    let bbox_int = BboxInt::from_bbox(region.bbox());
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         collect_pass1_smart(
-            &block, region,
+            &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids,
             &mut all_way_node_ids, &mut matched_relation_ids,
             &mut extra_way_ids, &mut extra_node_ids,
@@ -885,6 +941,7 @@ fn extract_smart(
 fn collect_pass1_smart(
     block: &crate::PrimitiveBlock,
     region: &Region,
+    bbox_int: &BboxInt,
     bbox_node_ids: &mut IdSetDense,
     matched_way_ids: &mut IdSetDense,
     all_way_node_ids: &mut IdSetDense,
@@ -895,12 +952,12 @@ fn collect_pass1_smart(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                if region.contains(dn.lat(), dn.lon()) {
+                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
                     bbox_node_ids.set(dn.id());
                 }
             }
             Element::Node(n) => {
-                if region.contains(n.lat(), n.lon()) {
+                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
                     bbox_node_ids.set(n.id());
                 }
             }

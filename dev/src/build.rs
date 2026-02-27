@@ -10,7 +10,7 @@ use crate::output;
 
 pub struct BuildConfig {
     pub package: &'static str,
-    pub features: &'static [&'static str],
+    pub features: Vec<String>,
     pub default_features: bool,
     pub profile: &'static str,
 }
@@ -19,7 +19,16 @@ impl BuildConfig {
     pub fn release_cli() -> Self {
         Self {
             package: "pbfhogg-cli",
-            features: &[],
+            features: Vec::new(),
+            default_features: true,
+            profile: "release",
+        }
+    }
+
+    pub fn release_cli_with_features(features: &[&str]) -> Self {
+        Self {
+            package: "pbfhogg-cli",
+            features: features.iter().map(|s| (*s).to_owned()).collect(),
             default_features: true,
             profile: "release",
         }
@@ -151,7 +160,7 @@ fn build_args(config: &BuildConfig) -> Vec<String> {
 }
 
 /// Scan JSON lines from cargo output to find the last `"executable"` path.
-fn find_executable(stdout: &[u8]) -> Result<PathBuf, DevError> {
+pub fn find_executable(stdout: &[u8]) -> Result<PathBuf, DevError> {
     let text = String::from_utf8_lossy(stdout);
     let mut last_exe: Option<PathBuf> = None;
 

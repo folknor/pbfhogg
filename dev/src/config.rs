@@ -19,7 +19,9 @@ pub struct DevConfig {
 #[allow(dead_code)]
 pub struct Dataset {
     pub pbf: String,
+    pub pbf_raw: Option<String>,
     pub osc: Option<String>,
+    pub bbox: Option<String>,
     pub sha256_pbf: Option<String>,
     pub sha256_osc: Option<String>,
     pub origin: Option<String>,

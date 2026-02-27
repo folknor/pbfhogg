@@ -20,20 +20,27 @@ The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoke
 - `cargo dev bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
 - `cargo dev bench merge [--dataset name] [--pbf path] [--osc path] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite.
 - `cargo dev bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (14 commands, external timing). Use `all` for full suite. Results stored in SQLite.
+- `cargo dev bench extract [--dataset name] [--pbf path] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan.
+- `cargo dev bench allocator [--dataset name] [--pbf path] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs.
+- `cargo dev bench blob-filter [--dataset name] [--pbf-indexed path] [--pbf-raw path] [--runs N]` — indexdata vs non-indexdata performance comparison.
+- `cargo dev bench planetiler [--dataset name] [--pbf path] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR.
+- `cargo dev bench all [--dataset name] [--pbf path] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines.
 - `cargo dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
 
 The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmark results stored in `dev/results.db` (SQLite, committed in git).
 
 ## Scripts
 
-Remaining bench/hotpath scripts (being migrated to `dev` in later phases):
-- `scripts/build.sh` — build release binary (still used by bench/verify scripts)
-- `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
-- `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
+Remaining scripts:
+- `scripts/build.sh` — build release binary (still used by verify scripts)
 - `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
 - `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
+- `scripts/run-hotpath-germany.sh` — Germany scale hotpath profiling
+- `scripts/profile-region.sh` — cross-region profiling suite
+- `scripts/download-regions.sh` — region dataset downloader
+- `scripts/build-hotpath.sh` — hotpath build wrapper
 
-Bench scripts build internally — no need to run `build.sh` first.
+Hotpath/profiling scripts build internally — no need to run `build.sh` first.
 If you need something these scripts don't cover, write a new script.
 
 ## Indexdata PBFs

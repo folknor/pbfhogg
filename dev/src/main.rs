@@ -1,5 +1,10 @@
+mod bench_all;
+mod bench_allocator;
+mod bench_blob_filter;
 mod bench_commands;
+mod bench_extract;
 mod bench_merge;
+mod bench_planetiler;
 mod bench_read;
 mod bench_write;
 mod build;
@@ -13,6 +18,7 @@ mod lockfile;
 mod output;
 #[allow(dead_code)]
 mod preflight;
+mod tools;
 
 use std::path::PathBuf;
 use std::process;
@@ -143,6 +149,88 @@ enum BenchCommand {
         #[arg(default_value = "all")]
         command: String,
 
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+    },
+    /// Benchmark extract strategies (simple/complete/smart)
+    Extract {
+        /// Dataset name from dev.toml (default: japan)
+        #[arg(long, default_value = "japan")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Bounding box (left,bottom,right,top)
+        #[arg(long)]
+        bbox: Option<String>,
+
+        /// Comma-separated strategies (default: simple,complete,smart)
+        #[arg(long, default_value = "simple,complete,smart")]
+        strategies: String,
+    },
+    /// Benchmark allocators (default/jemalloc/mimalloc) via check-refs
+    Allocator {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+    },
+    /// Benchmark indexed vs non-indexed PBF performance
+    BlobFilter {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit indexed PBF path (overrides --dataset)
+        #[arg(long)]
+        pbf_indexed: Option<String>,
+
+        /// Explicit non-indexed PBF path (overrides --dataset)
+        #[arg(long)]
+        pbf_raw: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+    },
+    /// Benchmark Planetiler Java PBF read performance
+    Planetiler {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+    },
+    /// Run full benchmark suite (read + write + merge + commands + baselines)
+    All {
         /// Dataset name from dev.toml (default: denmark)
         #[arg(long, default_value = "denmark")]
         dataset: String,
@@ -313,6 +401,34 @@ fn cmd_bench(bench: BenchCommand) -> Result<(), DevError> {
             pbf,
             runs,
         } => cmd_bench_commands(command, dataset, pbf, runs),
+        BenchCommand::Extract {
+            dataset,
+            pbf,
+            runs,
+            bbox,
+            strategies,
+        } => cmd_bench_extract(dataset, pbf, runs, bbox, strategies),
+        BenchCommand::Allocator {
+            dataset,
+            pbf,
+            runs,
+        } => cmd_bench_allocator(dataset, pbf, runs),
+        BenchCommand::BlobFilter {
+            dataset,
+            pbf_indexed,
+            pbf_raw,
+            runs,
+        } => cmd_bench_blob_filter(dataset, pbf_indexed, pbf_raw, runs),
+        BenchCommand::Planetiler {
+            dataset,
+            pbf,
+            runs,
+        } => cmd_bench_planetiler(dataset, pbf, runs),
+        BenchCommand::All {
+            dataset,
+            pbf,
+            runs,
+        } => cmd_bench_all(dataset, pbf, runs),
     }
 }
 
@@ -446,6 +562,165 @@ fn cmd_bench_commands(
     )
 }
 
+fn cmd_bench_extract(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+    bbox: Option<String>,
+    strategies_str: String,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let bbox = resolve_bbox(&bbox, &dataset, &dev_config)?;
+    let strategies = bench_extract::parse_strategies(&strategies_str)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let binary = build::cargo_build(
+        &build::BuildConfig::release_cli(),
+        &ws.workspace_root,
+    )?;
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_extract::run(
+        &harness,
+        &binary,
+        &pbf_path,
+        file_mb,
+        runs,
+        &bbox,
+        &strategies,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_bench_allocator(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_allocator::run(&harness, &pbf_path, file_mb, runs, &ws.workspace_root)
+}
+
+fn cmd_bench_blob_filter(
+    dataset: String,
+    pbf_indexed: Option<String>,
+    pbf_raw: Option<String>,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let indexed_path = resolve_pbf_path(&pbf_indexed, &dataset, &dev_config, &paths)?;
+    let raw_path = resolve_raw_pbf_path(&pbf_raw, &dataset, &dev_config, &paths)?;
+    let file_mb = file_size_mb(&indexed_path);
+
+    let binary = build::cargo_build(
+        &build::BuildConfig::release_cli(),
+        &ws.workspace_root,
+    )?;
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_blob_filter::run(
+        &harness,
+        &binary,
+        &indexed_path,
+        &raw_path,
+        file_mb,
+        runs,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_bench_planetiler(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_planetiler::run(
+        &harness,
+        &pbf_path,
+        file_mb,
+        runs,
+        &paths.data_dir,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_bench_all(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_all::run(
+        &harness,
+        &dev_config,
+        &paths,
+        &ws.workspace_root,
+        &pbf_path,
+        file_mb,
+        runs,
+        &dataset,
+    )
+}
+
 /// Resolve the PBF path from --pbf or --dataset.
 fn resolve_pbf_path(
     pbf: &Option<String>,
@@ -498,6 +773,59 @@ fn resolve_osc_path(
     if !path.exists() {
         return Err(DevError::Config(format!(
             "OSC file not found: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+/// Resolve the bbox from --bbox or dataset config.
+fn resolve_bbox(
+    bbox: &Option<String>,
+    dataset: &str,
+    config: &config::DevConfig,
+) -> Result<String, DevError> {
+    if let Some(b) = bbox {
+        return Ok(b.clone());
+    }
+
+    let ds = config.datasets.get(dataset).ok_or_else(|| {
+        DevError::Config(format!("unknown dataset: {dataset}"))
+    })?;
+
+    ds.bbox.clone().ok_or_else(|| {
+        DevError::Config(format!(
+            "dataset '{dataset}' has no bbox configured (use --bbox)"
+        ))
+    })
+}
+
+/// Resolve the non-indexed (raw) PBF path from --pbf-raw or dataset config.
+fn resolve_raw_pbf_path(
+    pbf_raw: &Option<String>,
+    dataset: &str,
+    config: &config::DevConfig,
+    paths: &config::ResolvedPaths,
+) -> Result<PathBuf, DevError> {
+    let path = match pbf_raw {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let ds = config.datasets.get(dataset).ok_or_else(|| {
+                DevError::Config(format!("unknown dataset: {dataset}"))
+            })?;
+            let raw_file = ds.pbf_raw.as_ref().ok_or_else(|| {
+                DevError::Config(format!(
+                    "dataset '{dataset}' has no pbf_raw configured (use --pbf-raw)"
+                ))
+            })?;
+            paths.data_dir.join(raw_file)
+        }
+    };
+
+    if !path.exists() {
+        return Err(DevError::Config(format!(
+            "raw PBF file not found: {}",
             path.display()
         )));
     }

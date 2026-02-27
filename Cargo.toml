@@ -1,5 +1,6 @@
 [workspace]
 members = ["cli", "dev"]
+exclude = ["bench/osmpbf-baseline"]
 
 [workspace.package]
 version = "0.2.0"

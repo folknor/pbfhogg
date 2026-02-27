@@ -6,7 +6,9 @@
 
 [datasets.denmark]
 pbf = "denmark-20260220-seq4704-with-indexdata.osm.pbf"
+pbf_raw = "denmark-20260220-seq4704.osm.pbf"
 osc = "denmark-20260221-seq4705.osc.gz"
+bbox = "12.4,55.6,12.7,55.8"
 origin = "Geofabrik 2026-02-20 seq 4704, indexdata via pbfhogg cat"
 
 [datasets.germany]
@@ -16,7 +18,9 @@ origin = "Geofabrik 2026-02-24 seq 4704, indexdata via pbfhogg cat"
 
 [datasets.japan]
 pbf = "japan-20260225-seq4706-with-indexdata.osm.pbf"
+pbf_raw = "japan-20260225-seq4706.osm.pbf"
 osc = "japan-20260225-seq4706.osc.gz"
+bbox = "139.5,35.5,140.0,36.0"
 origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
 
 [datasets.north-america]

@@ -145,7 +145,7 @@ rayon thread overhead; actual per-call alloc reduced by encode buffer reuse.
 - **frame_blob: 4.0 GB → 2.9 GB (-28%)** — FrameScratch reuses blob_buf,
   header_buf, compress_buf via thread_local. Remaining 2.9 GB: ~1.0 GB `out` Vec
   (owned for rayon channel) + ~1.9 GB ZlibEncoder internal deflate state (allocated
-  per call, ~260 KB each).
+  per call, ~312 KB each — hash tables, Huffman state, dictionary buffers).
 - **add_node: 1.8 GB → 1.4 GB (-22%)** — encode_dense_nodes_group reads Vecs in
   place, reset() clears without re-allocation.
 - **add_relation: 52 MB → 22 MB (-58%)** — same wire-format encoding as ways.
@@ -363,7 +363,7 @@ FrameScratch buffer reuse in frame_blob_into (thread_local for pipelined path).
 Main thread alloc: 702 MB. Thread totals: 2.7 GB alloc, 2.7 GB dealloc.
 Previous (commit b750e60, before FrameScratch): total merge 931 MB (main thread).
 frame_blob_into avg 545 KB/call — remaining per-call cost is the `out` Vec
-(~135 KB compressed blob) + ZlibEncoder internal state (~260 KB).
+(~135 KB compressed blob) + ZlibEncoder internal state (~312 KB).
 
 The main thread is no longer the bottleneck. At 0.38s CPU, it finishes
 classify_blob + read_raw_frame and dispatches all rewrite work before the
@@ -520,8 +520,8 @@ proto construction.
   Sync path: `write_framed_blob` writes directly to writer (zero alloc after warmup).
   Pipelined: `thread_local!` scratch buffers (7400 allocs → ~12, one per rayon thread).
 - Remaining 2.9 GB: `out` Vec for rayon channel (~1.0 GB) + ZlibEncoder internal
-  deflate state (~1.9 GB, ~260 KB per call). Encoder state reuse would require
-  libdeflater or persistent zlib stream reset.
+  deflate state (~1.9 GB, ~312 KB per call). Fix: `flate2::Compress::reset()` —
+  reuses encoder state in-place without reallocation. See TODO.md.
 
 ### decompress_blob buffer reuse (33% of read time)
 - DecompressPool already exists for pipelined path

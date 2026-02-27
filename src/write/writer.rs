@@ -14,8 +14,10 @@
 use crate::blob_index;
 use crate::write::file_writer::FileWriter;
 use crate::write::wire::{encode_bytes_field, encode_int32_field};
-use flate2::write::ZlibEncoder;
+use flate2::Compress;
 use flate2::Compression as FlateCompression;
+use flate2::FlushCompress;
+use flate2::Status;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -84,7 +86,9 @@ struct WritePipeline {
 /// Reusable scratch buffers for blob framing, avoiding per-call allocation.
 ///
 /// After the first blob, all three buffers have sufficient capacity and
-/// subsequent calls reuse them without allocating.
+/// subsequent calls reuse them without allocating. The zlib compressor is
+/// lazy-initialized on the first zlib blob and reused via `reset()` —
+/// avoiding ~312 KB of deflate state allocation per blob.
 struct FrameScratch {
     /// Blob protobuf body (raw/compressed data fields).
     blob_buf: Vec<u8>,
@@ -92,6 +96,8 @@ struct FrameScratch {
     header_buf: Vec<u8>,
     /// Intermediate compression output (zlib/zstd only).
     compress_buf: Vec<u8>,
+    /// Reusable zlib compressor (lazy-initialized on first zlib blob).
+    zlib_compressor: Option<Compress>,
 }
 
 thread_local! {
@@ -100,6 +106,7 @@ thread_local! {
         blob_buf: Vec::new(),
         header_buf: Vec::new(),
         compress_buf: Vec::new(),
+        zlib_compressor: None,
     }) };
 }
 
@@ -137,7 +144,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
         })
     }
 
@@ -153,7 +160,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
         })
     }
 
@@ -242,7 +249,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
         })
     }
 
@@ -268,7 +275,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
         })
     }
 }
@@ -286,7 +293,7 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
         }
     }
 
@@ -450,8 +457,7 @@ impl<W: Write> PbfWriter<W> {
         encode_blob_body(
             uncompressed,
             &self.compression,
-            &mut self.scratch.blob_buf,
-            &mut self.scratch.compress_buf,
+            &mut self.scratch,
         )?;
         let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
             io::Error::other(format!(
@@ -653,6 +659,7 @@ pub(crate) fn frame_blob(
         blob_buf: Vec::new(),
         header_buf: Vec::new(),
         compress_buf: Vec::new(),
+        zlib_compressor: None,
     };
     frame_blob_into(blob_type, uncompressed, compression, indexdata, &mut scratch)
 }
@@ -670,7 +677,7 @@ fn frame_blob_into(
     indexdata: Option<&[u8]>,
     scratch: &mut FrameScratch,
 ) -> io::Result<Vec<u8>> {
-    encode_blob_body(uncompressed, compression, &mut scratch.blob_buf, &mut scratch.compress_buf)?;
+    encode_blob_body(uncompressed, compression, scratch)?;
 
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", scratch.blob_buf.len()))
@@ -688,48 +695,56 @@ fn frame_blob_into(
     Ok(out)
 }
 
-/// Encode the Blob protobuf body (optionally compressed) into `blob_buf`.
+/// Encode the Blob protobuf body (optionally compressed) into scratch buffers.
 ///
 /// Uses `compress_buf` as an intermediate for zlib/zstd compression output.
-/// Both buffers are cleared before use and retain their capacity for reuse.
+/// The zlib compressor is lazy-initialized and reused via `reset()` to avoid
+/// ~312 KB of deflate state allocation per blob.
 fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
-    blob_buf: &mut Vec<u8>,
-    compress_buf: &mut Vec<u8>,
+    scratch: &mut FrameScratch,
 ) -> io::Result<()> {
-    blob_buf.clear();
+    scratch.blob_buf.clear();
     match compression {
         Compression::None => {
             // Blob field 1: raw (bytes, len-delimited)
-            encode_bytes_field(blob_buf, 1, uncompressed);
+            encode_bytes_field(&mut scratch.blob_buf, 1, uncompressed);
         }
         Compression::Zlib(level) => {
-            compress_buf.clear();
-            let mut encoder =
-                ZlibEncoder::new(&mut *compress_buf, FlateCompression::new(*level));
-            encoder.write_all(uncompressed)?;
-            encoder.finish()?;
+            let compressor = scratch.zlib_compressor.get_or_insert_with(|| {
+                Compress::new(FlateCompression::new(*level), true)
+            });
+            scratch.compress_buf.clear();
+            // Zlib worst-case bound: input + ~0.1% + header/trailer.
+            scratch.compress_buf.reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
+            let status = compressor
+                .compress_vec(uncompressed, &mut scratch.compress_buf, FlushCompress::Finish)
+                .map_err(|e| io::Error::other(format!("zlib compress error: {e}")))?;
+            if !matches!(status, Status::StreamEnd) {
+                return Err(io::Error::other("zlib compress did not complete in one call"));
+            }
+            compressor.reset();
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
             })?;
             // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(blob_buf, 2, raw_size);
+            encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
             // Blob field 3: zlib_data (bytes, len-delimited)
-            encode_bytes_field(blob_buf, 3, compress_buf);
+            encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
         }
         Compression::Zstd(level) => {
-            compress_buf.clear();
-            let mut encoder = zstd::stream::write::Encoder::new(&mut *compress_buf, *level)?;
+            scratch.compress_buf.clear();
+            let mut encoder = zstd::stream::write::Encoder::new(&mut scratch.compress_buf, *level)?;
             encoder.write_all(uncompressed)?;
             encoder.finish()?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
             })?;
             // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(blob_buf, 2, raw_size);
+            encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
             // Blob field 7: zstd_data (bytes, len-delimited)
-            encode_bytes_field(blob_buf, 7, compress_buf);
+            encode_bytes_field(&mut scratch.blob_buf, 7, &scratch.compress_buf);
         }
     }
     Ok(())

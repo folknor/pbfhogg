@@ -841,7 +841,7 @@ impl BlockBuilder {
             // DenseInfo field 5: user_sid (packed sint32)
             encode_packed_sint32(&mut self.elem_scratch, &mut self.packed_scratch, 5, &self.dense_user_sids);
             // DenseInfo field 6: visible (packed bool)
-            encode_packed_bool(&mut self.elem_scratch, &mut self.packed_scratch, 6, &self.dense_visibles);
+            encode_packed_bool(&mut self.elem_scratch, 6, &self.dense_visibles);
 
             encode_bytes_field(&mut self.group_buf, 5, &self.elem_scratch);
         }

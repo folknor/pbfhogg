@@ -3,13 +3,18 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
-use super::{dense_node_metadata, element_metadata, flush_block};
+use rayon::prelude::*;
+
+use super::{dense_node_metadata, element_metadata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader};
+use crate::{Element, ElementReader, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
+const BATCH_SIZE: usize = 64;
 
 // ---------------------------------------------------------------------------
 // ID parsing
@@ -136,9 +141,6 @@ fn filter_by_id(
     compression: Compression,
     direct_io: bool,
 ) -> Result<GetidStats> {
-    // Fast path: if the ID set is empty, include mode writes nothing,
-    // exclude mode writes everything (passthrough would be better but
-    // we still need to rebuild the header).
     let reader = ElementReader::open(input, direct_io)?;
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
@@ -146,34 +148,38 @@ fn filter_by_id(
     }
     let header_bytes = hb.build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
     };
 
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        for element in block.elements() {
-            let dominated = match &element {
-                Element::DenseNode(dn) => ids.node_ids.contains(&dn.id()),
-                Element::Node(n) => ids.node_ids.contains(&n.id()),
-                Element::Way(w) => ids.way_ids.contains(&w.id()),
-                Element::Relation(r) => ids.relation_ids.contains(&r.id()),
-            };
-            let write = if include { dominated } else { !dominated };
-            if write {
-                write_element_reuse(&element, &mut bb, &mut writer, &mut stats,
-                    &mut tags_buf, &mut refs_buf, &mut members_buf)?;
-            }
+        batch.push(block);
+
+        if batch.len() >= BATCH_SIZE {
+            let (nodes, ways, relations) = process_filter_batch(
+                &batch, &mut writer, ids, include, None,
+            )?;
+            stats.nodes_written += nodes;
+            stats.ways_written += ways;
+            stats.relations_written += relations;
+            batch.clear();
         }
     }
 
-    flush_block(&mut bb, &mut writer)?;
+    if !batch.is_empty() {
+        let (nodes, ways, relations) = process_filter_batch(
+            &batch, &mut writer, ids, include, None,
+        )?;
+        stats.nodes_written += nodes;
+        stats.ways_written += ways;
+        stats.relations_written += relations;
+    }
+
     writer.flush()?;
     Ok(stats)
 }
@@ -189,7 +195,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         relations_written: 0,
     };
 
-    // Pass 1: Collect ref node IDs from matching ways.
+    // Pass 1: Collect ref node IDs from matching ways (sequential — collecting
+    // into a BTreeSet which would need merge, and the way_ids set is usually small).
     let mut dep_node_ids: BTreeSet<i64> = BTreeSet::new();
 
     if !ids.way_ids.is_empty() {
@@ -206,7 +213,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         }
     }
 
-    // Pass 2: Write matching elements + dependent nodes.
+    // Pass 2: Write matching elements + dependent nodes (parallel batches).
     let reader = ElementReader::open(input, direct_io)?;
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
@@ -214,115 +221,194 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
     }
     let header_bytes = hb.build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
+
+    let dep_ref = if dep_node_ids.is_empty() { None } else { Some(&dep_node_ids) };
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        for element in block.elements() {
-            let write = match &element {
-                Element::DenseNode(dn) => {
-                    ids.node_ids.contains(&dn.id())
-                        || dep_node_ids.contains(&dn.id())
-                }
-                Element::Node(n) => {
-                    ids.node_ids.contains(&n.id())
-                        || dep_node_ids.contains(&n.id())
-                }
-                Element::Way(w) => ids.way_ids.contains(&w.id()),
-                Element::Relation(r) => ids.relation_ids.contains(&r.id()),
-            };
-            if write {
-                write_element_reuse(&element, &mut bb, &mut writer, &mut stats,
-                    &mut tags_buf, &mut refs_buf, &mut members_buf)?;
-            }
+        batch.push(block);
+
+        if batch.len() >= BATCH_SIZE {
+            let (nodes, ways, relations) = process_filter_batch(
+                &batch, &mut writer, ids, true, dep_ref,
+            )?;
+            stats.nodes_written += nodes;
+            stats.ways_written += ways;
+            stats.relations_written += relations;
+            batch.clear();
         }
     }
 
-    flush_block(&mut bb, &mut writer)?;
+    if !batch.is_empty() {
+        let (nodes, ways, relations) = process_filter_batch(
+            &batch, &mut writer, ids, true, dep_ref,
+        )?;
+        stats.nodes_written += nodes;
+        stats.ways_written += ways;
+        stats.relations_written += relations;
+    }
+
     writer.flush()?;
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Parallel batch processing
 // ---------------------------------------------------------------------------
 
-fn write_element_reuse<'a>(
-    element: &Element<'a>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut GetidStats,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    refs_buf: &mut Vec<i64>,
-    members_buf: &mut Vec<MemberData<'a>>,
-) -> Result<()> {
-    match element {
-        Element::DenseNode(dn) => {
-            if !bb.can_add_node() {
-                flush_block(bb, writer)?;
-            }
-            tags_buf.clear();
-            tags_buf.extend(dn.tags());
-            let meta = dense_node_metadata(dn);
-            bb.add_node(
-                dn.id(),
-                dn.decimicro_lat(),
-                dn.decimicro_lon(),
-                tags_buf,
-                meta.as_ref(),
-            );
-            stats.nodes_written += 1;
-        }
-        Element::Node(n) => {
-            if !bb.can_add_node() {
-                flush_block(bb, writer)?;
-            }
-            tags_buf.clear();
-            tags_buf.extend(n.tags());
-            let meta = element_metadata(&n.info());
-            bb.add_node(
-                n.id(),
-                n.decimicro_lat(),
-                n.decimicro_lon(),
-                tags_buf,
-                meta.as_ref(),
-            );
-            stats.nodes_written += 1;
-        }
-        Element::Way(w) => {
-            if !bb.can_add_way() {
-                flush_block(bb, writer)?;
-            }
-            tags_buf.clear();
-            tags_buf.extend(w.tags());
-            refs_buf.clear();
-            refs_buf.extend(w.refs());
-            let meta = element_metadata(&w.info());
-            bb.add_way(w.id(), tags_buf, refs_buf, meta.as_ref());
-            stats.ways_written += 1;
-        }
-        Element::Relation(r) => {
-            if !bb.can_add_relation() {
-                flush_block(bb, writer)?;
-            }
-            tags_buf.clear();
-            tags_buf.extend(r.tags());
-            members_buf.clear();
-            members_buf.extend(r.members().map(|m| MemberData {
-                id: m.id,
-                role: m.role().unwrap_or(""),
-            }));
-            let meta = element_metadata(&r.info());
-            bb.add_relation(r.id(), tags_buf, members_buf, meta.as_ref());
-            stats.relations_written += 1;
-        }
+/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
+///
+/// Like `flush_block` but writes to a `Vec<Vec<u8>>` instead of a `PbfWriter`,
+/// so it can be called from rayon worker threads without requiring `&mut PbfWriter`.
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Some(bytes) = bb.take()? {
+        output.push(bytes.to_vec());
     }
     Ok(())
 }
 
+/// Process a single `PrimitiveBlock` through the ID filter, writing matching
+/// elements into the thread-local `BlockBuilder` and flushing complete blocks
+/// into `output`. Returns `(nodes, ways, relations)` counts.
+///
+/// Called from rayon worker threads via `map_init`.
+fn process_block(
+    block: &PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+    ids: &IdSet,
+    include: bool,
+    dep_node_ids: Option<&BTreeSet<i64>>,
+) -> std::result::Result<(u64, u64, u64), String> {
+    let mut nodes: u64 = 0;
+    let mut ways: u64 = 0;
+    let mut relations: u64 = 0;
+
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
+    for element in block.elements() {
+        let dominated = match &element {
+            Element::DenseNode(dn) => {
+                ids.node_ids.contains(&dn.id())
+                    || dep_node_ids.is_some_and(|deps| deps.contains(&dn.id()))
+            }
+            Element::Node(n) => {
+                ids.node_ids.contains(&n.id())
+                    || dep_node_ids.is_some_and(|deps| deps.contains(&n.id()))
+            }
+            Element::Way(w) => ids.way_ids.contains(&w.id()),
+            Element::Relation(r) => ids.relation_ids.contains(&r.id()),
+        };
+        let emit = if include { dominated } else { !dominated };
+        if !emit {
+            continue;
+        }
+
+        match &element {
+            Element::DenseNode(dn) => {
+                if !bb.can_add_node() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(dn.tags());
+                let meta = dense_node_metadata(dn);
+                bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                nodes += 1;
+            }
+            Element::Node(n) => {
+                if !bb.can_add_node() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(n.tags());
+                let meta = element_metadata(&n.info());
+                bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                nodes += 1;
+            }
+            Element::Way(w) => {
+                if !bb.can_add_way() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(w.tags());
+                refs_buf.clear();
+                refs_buf.extend(w.refs());
+                let meta = element_metadata(&w.info());
+                bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                ways += 1;
+            }
+            Element::Relation(r) => {
+                if !bb.can_add_relation() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(r.tags());
+                members_buf.clear();
+                members_buf.extend(r.members().map(|m| MemberData {
+                    id: m.id,
+                    role: m.role().unwrap_or(""),
+                }));
+                let meta = element_metadata(&r.info());
+                bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                relations += 1;
+            }
+        }
+    }
+
+    Ok((nodes, ways, relations))
+}
+
+/// Process a batch of `PrimitiveBlock`s in parallel via rayon.
+///
+/// Each rayon worker thread owns a `BlockBuilder` (via `map_init`) and
+/// processes one block at a time, flushing serialized output to a local
+/// `Vec<Vec<u8>>`. After parallel processing, the serialized blocks are
+/// written sequentially to the `PbfWriter` in batch order.
+///
+/// Returns `(nodes_written, ways_written, relations_written)`.
+fn process_filter_batch(
+    batch: &[PrimitiveBlock],
+    writer: &mut PbfWriter<FileWriter>,
+    ids: &IdSet,
+    include: bool,
+    dep_node_ids: Option<&BTreeSet<i64>>,
+) -> Result<(u64, u64, u64)> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, u64, u64, u64), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let (nodes, ways, relations) = process_block(
+                    block, bb, &mut output, ids, include, dep_node_ids,
+                )?;
+                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                Ok((output, nodes, ways, relations))
+            },
+        )
+        .collect();
+
+    let mut total_nodes: u64 = 0;
+    let mut total_ways: u64 = 0;
+    let mut total_relations: u64 = 0;
+
+    for result in results {
+        let (blocks, nodes, ways, relations) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        total_nodes += nodes;
+        total_ways += ways;
+        total_relations += relations;
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
+        }
+    }
+
+    Ok((total_nodes, total_ways, total_relations))
+}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -102,25 +102,22 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
 - [ ] **CLI command performance vs osmium.** Current numbers on Denmark 465 MB
   (commit `3944a3f`, plantasjen, solo runs via `verify/*.sh`):
 
-  | Command | pbfhogg | osmium | ratio |
-  |---------|---------|--------|-------|
-  | extract --simple | 4.1s | 1.7s | 2.4x |
-  | extract (complete-ways) | 8.6s | 2.8s | 3.1x |
-  | extract --smart | 11.2s | 3.5s | 3.2x |
-  | add-locations-to-ways | 23.4s → 16.2s | 13.1s | 1.24x |
-  | tags-filter highway=primary -R | 2.8s | 1.4s | 2.0x |
-  | tags-filter amenity=restaurant -R | 2.8s | 1.2s | 2.3x |
-  | tags-filter w/highway=primary -R | 2.8s | 0.6s | 4.7x |
-  | getid (9 elements) | 1.8s | 0.8s | 2.1x |
-  | removeid (59M elements) | 11.1s | — | — |
+  | Command | pbfhogg | osmium | ratio | notes |
+  |---------|---------|--------|-------|-------|
+  | cat --type way | **1.23s** | 2.27s | **0.54x** | parallel + blob-skip (indexdata) |
+  | tags-filter w/highway=primary -R | **0.46s** | 0.55s | **0.84x** | parallel + blob-skip |
+  | tags-filter amenity=restaurant -R | **0.47s** | 1.23s | **0.38x** | parallel + blob-skip |
+  | tags-count --type way | **0.35s** | 0.60s | **0.58x** | fold+reduce + blob-skip (indexdata) |
+  | getid (9 elements) | **0.42s** | 0.84s | **0.50x** | parallel |
+  | add-locations-to-ways | 11.3s | 10.3s | 1.10x | Pass 1 hash build is bottleneck |
+  | extract --simple | 4.1s | 1.7s | 2.4x | not yet parallelized |
+  | extract (complete-ways) | 8.6s | 2.8s | 3.1x | not yet parallelized |
+  | extract --smart | 11.2s | 3.5s | 3.2x | not yet parallelized |
 
-  All commands already use pipelined reader + pipelined writer (verified Feb 27).
-  Buffer reuse (clear+extend pattern) applied to all commands — shaves 5-31%
-  but doesn't close the fundamental gap. The remaining ~2x gap across commands
-  is architectural: pbfhogg parallelizes decompression only, while osmium
-  parallelizes element processing across cores. Evidence: osmium wall/user
-  ratios show ~7x parallelism (e.g. tags-filter: 1.7s/12.5s) vs pbfhogg's
-  ~2x (3.3s/6.3s). The main thread is the bottleneck.
+  All commands use pipelined reader + pipelined writer. Most now also use
+  parallel element processing via rayon batches (64 blocks per dispatch).
+  Blob-type skipping via indexdata provides additional gains for type-filtered
+  commands. Ratios below 1.0 = pbfhogg is faster.
 
   Done:
 
@@ -182,83 +179,37 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     transition is detected without decompressing the boundary blob.
 
   - [ ] **Parallel element processing.** Process decoded blocks in parallel
-    with ordered output, not just parallel decompression. Would close the
-    ~2x wall-time gap by using ~7 cores instead of ~2.
+    with ordered output, not just parallel decompression.
 
-    **The problem:** The pipelined reader parallelizes decompression (Stage 2)
-    but delivers blocks to a single consumer thread (Stage 3) which does all
-    element processing sequentially. Evidence from wall/user ratios: osmium
-    achieves ~7x parallelism (tags-filter: 1.7s wall / 12.5s user) vs
-    pbfhogg's ~2x (3.3s wall / 6.3s user).
+    **Pattern:** Collect decoded `PrimitiveBlock`s into batches of 64, then
+    `batch.par_iter().map_init(BlockBuilder::new, ...)` processes blocks in
+    parallel. Each rayon thread owns a `BlockBuilder`, flushes serialized
+    blocks to `Vec<Vec<u8>>` via `flush_local()`. Sequential phase writes
+    results in order. Stats are per-thread, merged after `collect()`.
 
-    **Existing precedent — merge Phase 3→4:** The merge command already does
-    parallel element processing with ordered output:
-    ```
-    rewrite_jobs.par_iter().map_init(BlockBuilder::new, |bb, job| {
-        rewrite_block_parallel(block, &diff, bb, creates, kind)
-    }).collect()  // → Vec<RewriteOutput { blocks: Vec<Vec<u8>>, stats }>
-    ```
-    Then writes results sequentially in Phase 4. Each rayon thread owns its
-    own `BlockBuilder` (it's `Send`). Output is serialized `Vec<u8>` block
-    bytes, not borrowed data — so it can cross thread boundaries.
+    **Per-command status:**
 
-    **Architecture for filter/write commands:**
-    ```
-    Stage 1: I/O + decode (existing pipeline, unchanged)
-        → delivers Vec<(seq, PrimitiveBlock)> in batches
+    | Command | Status | Notes |
+    |---------|--------|-------|
+    | `merge` | DONE | `rewrite_block_parallel` (original precedent) |
+    | `cat --type` | DONE | `process_batch` + `process_block`, 2.63s → 1.23s |
+    | `tags-filter -R` (single-pass) | DONE | `process_filter_batch`, 2.8s → 0.46s |
+    | `tags-count` | DONE | `par_iter().fold().reduce()` merge pattern, 0.81s → 0.35s |
+    | `getid` / `removeid` | DONE | `process_filter_batch`, getid 2x faster than osmium |
+    | `add-locs-to-ways` Pass 2 | DONE | `process_batch` with `&NodeLocationIndex` shared across threads |
+    | `tags-filter` (two-pass) | TODO | Pass 2 write path not yet parallelized |
+    | `extract` simple | TODO | Per-phase (nodes→ways→rels), `matched_node_ids` grows |
+    | `extract` complete/smart | TODO | Multi-pass state, each pass separately |
+    | `sort` | N/A | Already specialized (blob-level permutation) |
 
-    Stage 2: Parallel element processing (NEW)
-        batch.par_iter().map_init(BlockBuilder::new, |bb, (seq, block)| {
-            for element in block.elements() {
-                if filter(&element) { bb.add_*(...) }
-            }
-            (seq, bb.drain_blocks())  // Vec<Vec<u8>>
-        }).collect()
-
-    Stage 3: Reorder + sequential write
-        Reorder buffer restores block order.
-        writer.write_primitive_block(&block_bytes) for each.
-        Writer's internal rayon pool parallelizes compression.
-    ```
-
-    **Which commands parallelize:**
-
-    | Command | Cross-block state? | Parallelizable? |
-    |---------|-------------------|-----------------|
-    | `cat --type` | None | Yes, per block |
-    | `tags-filter -R` (single-pass) | None | Yes, per block |
-    | `tags-filter` (two-pass) | Pass 1 collects IDs | Each pass separately |
-    | `getid` / `removeid` | None (IdSet is read-only) | Yes, per block |
-    | `add-locs` pass 2 | None (index is read-only) | Yes, per block |
-    | `extract` simple | matched_node_ids grows | Per-phase (nodes→ways→rels) |
-    | `extract` complete/smart | Multi-pass state | Each pass separately |
-    | `tags-count` | Accumulates HashMap | Par + merge-reduce |
-    | `sort` | Global ordering | No (already specialized) |
-    | `merge` | Already parallel | Already done |
-
-    **Key details:**
-    - `BlockBuilder` is `Send` (all `Vec`/`FxHashMap`/primitives). Each rayon
-      thread owns one via `map_init(BlockBuilder::new, ...)`.
-    - `BlockBuilder` produces one-type-per-block. Each task may produce
-      multiple output blocks from a single input block. Use
-      `Vec<Vec<u8>>` to collect (same as merge's `RewriteOutput.blocks`).
-    - Need `BlockBuilder::drain_blocks() -> Vec<Vec<u8>>` or similar to
-      extract all pending blocks as owned bytes.
-    - `PbfWriter` takes `&mut self` — must submit blocks sequentially.
-      The writer's internal reorder buffer handles compression parallelism.
-    - Stats are per-thread counters, summed after `collect()`.
-    - Batching (e.g. 64 blocks per rayon dispatch, as merge does) amortizes
-      scheduling overhead. Denmark ~7K blocks → ~110 dispatches. Planet
-      ~2.5M blocks → ~39K dispatches.
-
-    **Implementation order:**
-    1. Add `BlockBuilder::drain_blocks() -> Vec<Vec<u8>>`
-    2. Build a `parallel_filter_write()` helper (pipeline → par process →
-       reorder → write) that commands can call with a filter closure
-    3. Convert `cat --type` first (simplest, no cross-block state)
-    4. Convert `tags-filter -R`, `getid`/`removeid`
-    5. Convert two-pass commands (tags-filter default, extract, add-locs)
-    6. Convert `tags-count` (par + merge-reduce, read-only)
+    **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
+    Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is
+    sequential and dominates wall time. Denmark: ~11.3s total vs osmium ~10.3s.
+    The hash index build is ~6-7s (52.5M node inserts into FxHashMap). Options:
+    - Parallel hash map build: partition nodes by ID range across threads, each
+      builds a sub-map, then merge. Or use a concurrent map (dashmap/flurry).
+    - The Dense mmap index variant avoids this entirely (direct indexing, no
+      hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
 
 - [ ] **Remove prost dependency.** Replace prost-generated code with hand-rolled
   wire-format encoding/decoding for all remaining protobuf messages. Eliminates

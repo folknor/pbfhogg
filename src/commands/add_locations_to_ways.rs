@@ -2,11 +2,12 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -243,10 +244,12 @@ fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Res
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Write output with locations on ways
+// Pass 2: Write output with locations on ways (parallel batches)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
+/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
+const BATCH_SIZE: usize = 64;
+
 fn write_output(
     input: &Path,
     output: &Path,
@@ -271,135 +274,194 @@ fn write_output(
     }
     let header_bytes = hb.build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        // Reusable buffers for element data, hoisted outside the element loop.
-        //
-        // WHY: Without hoisting, each element allocates fresh Vecs via .collect(),
-        // producing N allocations where N = number of elements. For Denmark (~50M
-        // elements), that is ~150M alloc/dealloc pairs across the 3 buffer types
-        // (tags + refs + members), plus ~8M more for the locations buffer on ways.
-        //
-        // HOW: Vec::clear() sets len to 0 but keeps the underlying heap allocation.
-        // The subsequent extend() refills the buffer without reallocating once the
-        // capacity is warm (i.e. after the first few elements in each block).
-        //
-        // These buffers grow to the size of the largest element in the block and
-        // stabilize — there is no unbounded growth because PBF blocks have a max
-        // of 8000 entities. They are scoped to the OsmData arm so that the borrowed
-        // string references (which point into `block`) do not outlive the block.
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        let mut locations_buf: Vec<(i32, i32)> = Vec::new();
 
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    stats.nodes_read += 1;
-                    let has_tags = dn.tags().next().is_some();
-                    if keep_untagged_nodes || has_tags {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(dn.tags());
-                        let meta = dense_node_metadata(dn);
-                        bb.add_node(
-                            dn.id(),
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        stats.nodes_written += 1;
-                    } else {
-                        stats.nodes_dropped += 1;
-                    }
-                }
-                Element::Node(n) => {
-                    stats.nodes_read += 1;
-                    let has_tags = n.tags().next().is_some();
-                    if keep_untagged_nodes || has_tags {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(n.tags());
-                        let meta = element_metadata(&n.info());
-                        bb.add_node(
-                            n.id(),
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        stats.nodes_written += 1;
-                    } else {
-                        stats.nodes_dropped += 1;
-                    }
-                }
-                Element::Way(w) => {
-                    if !bb.can_add_way() {
-                        flush_block(&mut bb, &mut writer)?;
-                    }
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
-                    locations_buf.clear();
-                    locations_buf.extend(refs_buf.iter().map(|node_id| {
-                        match index.get(*node_id) {
-                            Some(loc) => loc,
-                            None => {
-                                stats.missing_locations += 1;
-                                (0, 0)
-                            }
-                        }
-                    }));
-                    let meta = element_metadata(&w.info());
-                    bb.add_way_with_locations(
-                        w.id(),
-                        &tags_buf,
-                        &refs_buf,
-                        &locations_buf,
-                        meta.as_ref(),
-                    );
-                    stats.ways_written += 1;
-                }
-                Element::Relation(r) => {
-                    if !bb.can_add_relation() {
-                        flush_block(&mut bb, &mut writer)?;
-                    }
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| MemberData {
-                        id: m.id,
-                        role: m.role().unwrap_or(""),
-                    }));
-                    let meta = element_metadata(&r.info());
-                    bb.add_relation(
-                        r.id(),
-                        &tags_buf,
-                        &members_buf,
-                        meta.as_ref(),
-                    );
-                    stats.relations_written += 1;
-                }
-            }
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+
+    for block in reader.into_blocks_pipelined() {
+        batch.push(block?);
+
+        if batch.len() >= BATCH_SIZE {
+            let batch_stats = process_batch(
+                &batch, &mut writer, index, keep_untagged_nodes,
+            )?;
+            merge_stats(&mut stats, &batch_stats);
+            batch.clear();
         }
     }
 
-    flush_block(&mut bb, &mut writer)?;
+    if !batch.is_empty() {
+        let batch_stats = process_batch(
+            &batch, &mut writer, index, keep_untagged_nodes,
+        )?;
+        merge_stats(&mut stats, &batch_stats);
+    }
+
     writer.flush()?;
     Ok(stats)
 }
 
-
 // ---------------------------------------------------------------------------
-// Helpers
+// Parallel batch processing
 // ---------------------------------------------------------------------------
 
-use super::{dense_node_metadata, element_metadata, flush_block};
+use super::{dense_node_metadata, element_metadata};
+
+/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Some(bytes) = bb.take()? {
+        output.push(bytes.to_vec());
+    }
+    Ok(())
+}
+
+fn merge_stats(dst: &mut Stats, src: &Stats) {
+    dst.nodes_read += src.nodes_read;
+    dst.nodes_written += src.nodes_written;
+    dst.nodes_dropped += src.nodes_dropped;
+    dst.ways_written += src.ways_written;
+    dst.relations_written += src.relations_written;
+    dst.missing_locations += src.missing_locations;
+}
+
+/// Process a single `PrimitiveBlock`, writing elements into the thread-local
+/// `BlockBuilder` and flushing complete blocks into `output`.
+fn process_block(
+    block: &PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+    index: &NodeLocationIndex,
+    keep_untagged_nodes: bool,
+) -> std::result::Result<Stats, String> {
+    let mut stats = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+    };
+
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                stats.nodes_read += 1;
+                let has_tags = dn.tags().next().is_some();
+                if keep_untagged_nodes || has_tags {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            Element::Node(n) => {
+                stats.nodes_read += 1;
+                let has_tags = n.tags().next().is_some();
+                if keep_untagged_nodes || has_tags {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            Element::Way(w) => {
+                if !bb.can_add_way() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(w.tags());
+                refs_buf.clear();
+                refs_buf.extend(w.refs());
+                locations_buf.clear();
+                for node_id in &refs_buf {
+                    match index.get(*node_id) {
+                        Some(loc) => locations_buf.push(loc),
+                        None => {
+                            stats.missing_locations += 1;
+                            locations_buf.push((0, 0));
+                        }
+                    }
+                }
+                let meta = element_metadata(&w.info());
+                bb.add_way_with_locations(w.id(), &tags_buf, &refs_buf, &locations_buf, meta.as_ref());
+                stats.ways_written += 1;
+            }
+            Element::Relation(r) => {
+                if !bb.can_add_relation() {
+                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                }
+                tags_buf.clear();
+                tags_buf.extend(r.tags());
+                members_buf.clear();
+                members_buf.extend(r.members().map(|m| MemberData {
+                    id: m.id,
+                    role: m.role().unwrap_or(""),
+                }));
+                let meta = element_metadata(&r.info());
+                bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                stats.relations_written += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Process a batch of `PrimitiveBlock`s in parallel via rayon.
+fn process_batch(
+    batch: &[PrimitiveBlock],
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    index: &NodeLocationIndex,
+    keep_untagged_nodes: bool,
+) -> Result<Stats> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, Stats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let block_stats = process_block(
+                    block, bb, &mut output, index, keep_untagged_nodes,
+                )?;
+                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    let mut total = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+    };
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge_stats(&mut total, &block_stats);
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
+        }
+    }
+
+    Ok(total)
+}

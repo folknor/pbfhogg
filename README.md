@@ -169,29 +169,23 @@ Extract — Japan (2.3 GB, 344M elements, Tokyo bbox, commit `1b62e2c`):
 
 Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium; simple's gap is structural (two passes vs osmium's single pass — the extra file read costs ~5s at this scale).
 
-Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten). Before = sequential rewrite (commit `d79f673`), after = parallel rewrite (commit `14034c1`):
+Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `d6a9b55`):
 
-| Config | before | after | change |
-|--------|--------|-------|--------|
-| indexdata + zlib | 49.9s | **35.1s** | -30% |
-| indexdata + none | 52.3s | **46.4s** | -11% |
+| Dataset | Config | Time | vs osmium |
+|---------|--------|------|-----------|
+| Japan (2.4 GB, 43K diff) | indexdata + zlib | **3.0s** | **15x** faster |
+| Germany (4.5 GB, 146K diff) | indexdata + zlib | **10.1s** | — |
+| Germany (4.5 GB, 146K diff) | indexdata + none | **5.9s** | — |
+| N. America (18.8 GB, 645K diff) | indexdata + zlib | **24.4s** | — |
+| N. America (18.8 GB, 645K diff) | indexdata + none | **13.3s** | — |
 
-The improvement comes from parallel `rewrite_block` — rewriting touched blobs on the rayon pool instead of the main thread. Denmark's 8.5% rewrite fraction is too small to show the effect; at Germany's 18.4% (and planet's ~92%) the main-thread rewrite bottleneck dominates.
-
-Merge with io_uring — North America (18.8 GB, 645K element diff, ~87% blobs passthrough, Linux 6.18, commit `7b65ab7`):
-
-| Config | Buffered | io_uring | Change |
-|--------|----------|----------|--------|
-| zlib | 43.2s | **32.6s** | **-25%** |
-| none | 36.4s | **25.5s** | **-30%** |
-
-At this scale the file exceeds page cache (30 GB RAM), so O_DIRECT + io_uring's linked `ReadFixed` → `WriteFixed` SQE chains for passthrough blobs eliminate both page cache thrashing and per-blob `pread` syscalls. SQ polling (`--sqpoll`) adds no improvement (<1%) — the syscall elimination from the kernel polling thread doesn't matter at this throughput. At Denmark and Japan scale (≤2.3 GB), io_uring adds 3-5% overhead since page cache absorbs everything.
+At Japan scale, osmium takes 36.6s for the same operation (9-15x slower) because it decodes and re-encodes every element. pbfhogg passes ~92% of blobs through as raw bytes without decompression, using blob-level indexdata for O(1) classification. The single-pass pipeline overlaps reader I/O, parallel classification, parallel rewrite of touched blobs, and pipelined writes — passthrough blobs are coalesced into large buffers and moved into the writer channel with zero copy.
 
 All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
-System: plantasjen — AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18.
+System: plantasjen — AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD (input/output) + HDD (build artifacts), Linux 6.18.
 
-Measured with `scripts/bench.sh`. Cross-validated with `verify/*.sh`.
+Measured with `scripts/bench-*.sh`. Cross-validated with `verify/*.sh`.
 
 ## O_DIRECT I/O
 
@@ -231,7 +225,7 @@ O_DIRECT requires a real filesystem (not tmpfs). Wall time is unchanged at count
 
 ## io_uring I/O
 
-With `Compression::None` on fast storage (e.g. erofs), the write pipeline becomes I/O-bound. The `linux-io-uring` feature replaces the synchronous writer thread with an io_uring submission loop using `WriteFixed` and pre-registered page-aligned buffers. Passthrough blobs use linked `ReadFixed` → `WriteFixed` SQE chains — fully async file-to-file copy through the ring with no userspace syscalls beyond `io_uring_enter`.
+The `linux-io-uring` feature replaces the synchronous writer thread with an io_uring submission loop using `WriteFixed` and pre-registered page-aligned buffers.
 
 ```toml
 [dependencies]
@@ -253,6 +247,8 @@ let writer = PbfWriter::to_path_pipelined_uring(path, Compression::None, &header
 ```
 
 Requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK` (16 MB for the default 64-buffer pool). If the limit is too low, the error message will suggest `ulimit -l unlimited`.
+
+Note: with the current single-pass merge pipeline (reader thread + passthrough coalescing), the buffered writer keeps up with io_uring at all tested scales. io_uring may still help at planet scale (75 GB+) where the file far exceeds page cache.
 
 ## Compression
 

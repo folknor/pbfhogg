@@ -1,7 +1,8 @@
 # Cross-region profiling
 
-Host: AMD Ryzen 9 5900X 12c/24t, 30 GB DDR4, Samsung 970 EVO Plus NVMe.
+Host: plantasjen — AMD Ryzen 9 5900X 12c/24t, 32 GB DDR4 (30 GB available), Samsung 970 EVO Plus NVMe.
 Build: fat LTO, zlib-ng, `--features hotpath` / `--features hotpath-alloc`.
+Baseline commit for all region data (except where noted): `aed93e0`.
 Script: `scripts/profile-region.sh <name> <pbf> <osc>`
 
 ## Region rationale
@@ -136,7 +137,7 @@ complexity varies by region (tag density, ref counts, member counts).
   (777K) — they're predominantly small/simple. Japan 564ns is mid-range,
   similar to Denmark.
 
-## Merge: indexdata + Compression::None (nidhogg production path)
+## Merge: indexdata + Compression::None (nidhogg production path, commit aed93e0)
 
 | Region | Wall | rewrite_block | classify_blob | take | read_raw_frame | RSS |
 |--------|------|---------------|---------------|------|----------------|-----|
@@ -159,13 +160,13 @@ complexity varies by region (tag density, ref counts, member counts).
   dominance pattern seen in Norway — any dataset with 30K+ passthrough blobs will
   spend significant time in uninstrumented I/O.
 
-## Merge: indexdata + zlib
+## Merge: indexdata + zlib (commit aed93e0, Denmark† at b750e60)
 
-† Denmark re-measured on same host (Ryzen 9 5900X) after passthrough I/O
+† Denmark re-measured at commit `b750e60` after passthrough I/O
 optimizations (eliminated blob_bytes duplication, write_raw_owned, direct
 &[u8] decode). Improved from 5.16s to 3.36s (-35%). Other regions were
-profiled before these optimizations; expect similar improvements on
-passthrough-dominated regions (Norway, Japan).
+profiled at commit `aed93e0` (before these optimizations); expect similar
+improvements on passthrough-dominated regions (Norway, Japan).
 
 | Region | Wall | rewrite_block | classify_blob | frame_blob | RSS |
 |--------|------|---------------|---------------|------------|-----|
@@ -177,7 +178,7 @@ passthrough-dominated regions (Norway, Japan).
 | Norway | 8.68s | 694ms (8%) | 397ms (5%) | 4.29s (49%) | 90 MB |
 | Japan | 26.1s | 4.85s (19%) | 2.60s (10%) | 23.4s (90%) | 244 MB |
 
-## Merge: no indexdata + zlib (baseline)
+## Merge: no indexdata + zlib (baseline, commit aed93e0)
 
 | Region | Wall | classify_blob | rewrite_block | frame_blob | RSS |
 |--------|------|---------------|---------------|------------|-----|
@@ -201,12 +202,13 @@ passthrough-dominated regions (Norway, Japan).
 
 ## Decode + write allocations (cat --type)
 
-> **Note (post direct wire encoding):** The `add_way` and `add_relation` columns
-> below reflect the old prost-based encoding which allocated fresh `proto::Way`/
-> `proto::Relation` objects per element. Direct wire encoding eliminated these
-> allocations entirely — ways/relations now encode into reusable scratch buffers.
-> The `take` column is also reduced (no prost two-pass encode). These numbers
-> are preserved as the pre-optimization baseline.
+> **Note (post direct wire encoding, commit `ee966cd`):** The `add_way` and
+> `add_relation` columns below reflect the old prost-based encoding (commit
+> `aed93e0`) which allocated fresh `proto::Way`/`proto::Relation` objects per
+> element. Direct wire encoding eliminated these allocations entirely —
+> ways/relations now encode into reusable scratch buffers. The `take` column
+> is also reduced (no prost two-pass encode). These numbers are preserved as
+> the pre-optimization baseline.
 
 | Region | Total | take | add_way | frame_blob | add_node | decompress | add_relation |
 |--------|-------|------|---------|------------|----------|------------|--------------|
@@ -232,9 +234,9 @@ passthrough-dominated regions (Norway, Japan).
 - **Japan total alloc is 79 GB** — 1.8x Norway despite 1.6x elements. The
   take + frame_blob overhead scales roughly linearly with blob count.
 
-## Merge allocations (indexdata + none)
+## Merge allocations (indexdata + none, commit aed93e0)
 
-Measured before passthrough I/O optimizations. read_raw_frame alloc is now
+Measured before passthrough I/O optimizations (commit `b750e60`). read_raw_frame alloc is now
 ~42% lower (blob_bytes duplication eliminated), and write_raw .to_vec()
 copies are eliminated entirely. Denmark post-optimization: read_raw_frame
 465 MB (was ~795 MB), total merge 931 MB.

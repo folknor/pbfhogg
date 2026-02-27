@@ -116,7 +116,7 @@ All write commands accept `--compression` to control blob compression: `none`, `
 
 ## Performance
 
-Read throughput — count all 59M elements in Denmark extract (461 MB), best of 3 runs, `zlib-ng`, fat LTO:
+Read throughput — count all 59M elements in Denmark extract (461 MB), best of 3 runs, `zlib-ng`, fat LTO (commit `90df51f`):
 
 <!-- BENCH:START -->
 | Tool | Mode | Time | Notes |
@@ -133,7 +133,7 @@ Read throughput — count all 59M elements in Denmark extract (461 MB), best of 
 | Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |
 <!-- BENCH:END -->
 
-Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null`:
+Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null` (commit `ee966cd`):
 
 | Compression | Sync | Pipelined | Notes |
 |-------------|------|-----------|-------|
@@ -143,7 +143,7 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~7s — the decode + wire-format serialization floor. Ways and relations are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark extract (483 MB, 59M elements):
+CLI commands — Denmark extract (483 MB, 59M elements, commits `f817b66`–`4259ba7`):
 
 | Tool | merge | sort | sort (unsorted) | diff | extract | add-locs |
 |------|-------|------|-----------------|------|---------|----------|
@@ -152,7 +152,7 @@ CLI commands — Denmark extract (483 MB, 59M elements):
 
 Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways / smart strategy. Add-locs is add-locations-to-ways (10.2M output elements, byte-identical output). osmium uses multi-threaded compression; pbfhogg extract and add-locations-to-ways are single-threaded.
 
-Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten):
+Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten). Before = sequential rewrite (commit `d79f673`), after = parallel rewrite (commit `14034c1`):
 
 | Config | before | after | change |
 |--------|--------|-------|--------|
@@ -161,7 +161,7 @@ Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes,
 
 The improvement comes from parallel `rewrite_block` — rewriting touched blobs on the rayon pool instead of the main thread. Denmark's 8.5% rewrite fraction is too small to show the effect; at Germany's 18.4% (and planet's ~92%) the main-thread rewrite bottleneck dominates.
 
-Merge with io_uring — North America (18.8 GB, 645K element diff, ~87% blobs passthrough, Linux 6.18):
+Merge with io_uring — North America (18.8 GB, 645K element diff, ~87% blobs passthrough, Linux 6.18, commit `7b65ab7`):
 
 | Config | Buffered | io_uring | Change |
 |--------|----------|----------|--------|
@@ -172,7 +172,7 @@ At this scale the file exceeds page cache (30 GB RAM), so O_DIRECT + io_uring's 
 
 All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
-System: Linux 6.18, Ryzen 9 7950X.
+System: plantasjen — AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18.
 
 Measured with `scripts/bench.sh`. Cross-validated with `verify/*.sh`.
 

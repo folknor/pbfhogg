@@ -2,8 +2,9 @@
 
 ## Host
 
+- **Hostname:** plantasjen
 - **CPU:** AMD Ryzen 9 5900X 12-core / 24-thread, 3.7 GHz base / 4.95 GHz boost
-- **RAM:** 30 GB DDR4
+- **RAM:** 32 GB DDR4 (30 GB available)
 - **Storage:** Samsung 970 EVO Plus 1TB NVMe (project + data)
 - **Kernel:** Linux 6.18.0-9-generic (x86_64)
 
@@ -16,7 +17,7 @@ Indexdata variants generated via `pbfhogg cat --type node,way,relation`.
 Build: fat LTO, zlib-ng. Run with: `scripts/run-hotpath.sh`,
 `scripts/run-hotpath-alloc.sh`, `scripts/run-hotpath-germany.sh`
 
-## Check-refs (pipelined read baseline)
+## Check-refs (pipelined read baseline, commit d5c8095)
 
 Lightweight pipelined read — directly comparable to TODO.md old numbers.
 
@@ -37,7 +38,7 @@ RSS: 125 MB. Single-threaded (main thread 100% CPU, workers ~2% each).
 vs TODO.md old: wall 7.51s -> 6.94s (-8%), decompress_blob 2.55s -> 2.49s,
 RSS 143 MB -> 125 MB (-13%). Improvement from fat LTO + codegen-units=1.
 
-## Pipelined read (tags-count)
+## Pipelined read (tags-count, commit d5c8095)
 
 Exercises `ElementReader::for_each_pipelined` — same path as elivagar/nidhogg ingest.
 
@@ -72,7 +73,7 @@ Total alloc: 745 MB. Net RSS diff: 125 MB (most alloc/dealloc churn).
 decompress_blob dominates because it allocates the decompression output buffer every call.
 wire::parse allocates WireStringTable's Vec<(u32,u32)> offsets per block.
 
-## Decode + write (cat --type node,way,relation)
+## Decode + write (cat --type node,way,relation, commit d5c8095)
 
 Full decode of every element, rebuild through BlockBuilder + PbfWriter.
 Same write path as nidhogg output. Compression: zlib (default).
@@ -220,7 +221,7 @@ The three remaining bottlenecks are nearly equal:
 - classify_blob: 609ms (32%) — decompress + scan the 630 overlapping blobs
 - block_builder::take: 597ms (31%) — protobuf serialization of rewritten blocks
 
-### With passthrough I/O optimizations (indexdata + zlib, same host)
+### With passthrough I/O optimizations (indexdata + zlib, commit b750e60)
 
 Eliminated unnecessary copies in the merge passthrough path:
 1. `RawBlobFrame` stores `blob_offset` instead of duplicate `blob_bytes` Vec
@@ -296,7 +297,7 @@ this could reduce planet merge from ~30 min to ~5 min.
 Allocation at planet scale: ~3.2 TB churn (alloc+dealloc), RSS bounded at
 ~200-500 MB (dominated by DiffRanges ~32 MB + working buffers).
 
-### With parallel rewrite_block (indexdata + zlib, same host)
+### With parallel rewrite_block (indexdata + zlib, commit 14034c1)
 
 rewrite_block now runs on rayon workers instead of the main thread. The main
 thread handles classify_blob + read_raw_frame only, dispatching rewrite work
@@ -327,6 +328,7 @@ rewrite_block's sequential cost was a significant wall-time contributor.
 ## Germany merge (4.5 GB, 500M elements, 62K blobs, daily diff 146K changes)
 
 Scale test: ~10× Denmark. Rewrite fraction: 18.4% (11,480 / 62,461).
+Sequential rewrite: commit d79f673. Parallel rewrite: commit 14034c1.
 
 ### Summary table (sequential rewrite)
 
@@ -396,7 +398,8 @@ with parallel rewrite + zlib compression overlap.
 
 ## Write benchmark: sync vs pipelined (bench_write)
 
-Denmark 483 MB, best of 3, decode + write to /dev/null:
+Denmark 483 MB, best of 3, decode + write to /dev/null.
+Current (direct wire): commit ee966cd. Previous (prost): commit d5c8095.
 
 **Current (direct wire encoding):**
 

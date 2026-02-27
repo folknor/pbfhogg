@@ -14,9 +14,13 @@
 use crate::blob_index;
 use crate::write::file_writer::FileWriter;
 use crate::write::wire::{encode_bytes_field, encode_int32_field};
+#[cfg(not(feature = "libdeflater"))]
 use flate2::Compress;
+#[cfg(not(feature = "libdeflater"))]
 use flate2::Compression as FlateCompression;
+#[cfg(not(feature = "libdeflater"))]
 use flate2::FlushCompress;
+#[cfg(not(feature = "libdeflater"))]
 use flate2::Status;
 use std::cell::RefCell;
 use std::collections::VecDeque;
@@ -97,7 +101,10 @@ struct FrameScratch {
     /// Intermediate compression output (zlib/zstd only).
     compress_buf: Vec<u8>,
     /// Reusable zlib compressor (lazy-initialized on first zlib blob).
+    #[cfg(not(feature = "libdeflater"))]
     zlib_compressor: Option<Compress>,
+    #[cfg(feature = "libdeflater")]
+    zlib_compressor: Option<libdeflater::Compressor>,
 }
 
 thread_local! {
@@ -712,26 +719,7 @@ fn encode_blob_body(
             encode_bytes_field(&mut scratch.blob_buf, 1, uncompressed);
         }
         Compression::Zlib(level) => {
-            let compressor = scratch.zlib_compressor.get_or_insert_with(|| {
-                Compress::new(FlateCompression::new(*level), true)
-            });
-            scratch.compress_buf.clear();
-            // Zlib worst-case bound: input + ~0.1% + header/trailer.
-            scratch.compress_buf.reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
-            let status = compressor
-                .compress_vec(uncompressed, &mut scratch.compress_buf, FlushCompress::Finish)
-                .map_err(|e| io::Error::other(format!("zlib compress error: {e}")))?;
-            if !matches!(status, Status::StreamEnd) {
-                return Err(io::Error::other("zlib compress did not complete in one call"));
-            }
-            compressor.reset();
-            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
-            })?;
-            // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
-            // Blob field 3: zlib_data (bytes, len-delimited)
-            encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
+            compress_zlib(uncompressed, *level, scratch)?;
         }
         Compression::Zstd(level) => {
             scratch.compress_buf.clear();
@@ -747,6 +735,63 @@ fn encode_blob_body(
             encode_bytes_field(&mut scratch.blob_buf, 7, &scratch.compress_buf);
         }
     }
+    Ok(())
+}
+
+/// Zlib compression via reusable `flate2::Compress` with `reset()`.
+#[cfg(not(feature = "libdeflater"))]
+fn compress_zlib(
+    uncompressed: &[u8],
+    level: u32,
+    scratch: &mut FrameScratch,
+) -> io::Result<()> {
+    let compressor = scratch.zlib_compressor.get_or_insert_with(|| {
+        Compress::new(FlateCompression::new(level), true)
+    });
+    scratch.compress_buf.clear();
+    // Zlib worst-case bound: input + ~0.1% + header/trailer.
+    scratch.compress_buf.reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);
+    let status = compressor
+        .compress_vec(uncompressed, &mut scratch.compress_buf, FlushCompress::Finish)
+        .map_err(|e| io::Error::other(format!("zlib compress error: {e}")))?;
+    if !matches!(status, Status::StreamEnd) {
+        return Err(io::Error::other("zlib compress did not complete in one call"));
+    }
+    compressor.reset();
+    let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
+        io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+    })?;
+    encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
+    encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
+    Ok(())
+}
+
+/// Zlib compression via reusable `libdeflater::Compressor` (2-3x faster than miniz_oxide).
+#[cfg(feature = "libdeflater")]
+fn compress_zlib(
+    uncompressed: &[u8],
+    level: u32,
+    scratch: &mut FrameScratch,
+) -> io::Result<()> {
+    if scratch.zlib_compressor.is_none() {
+        let lvl = libdeflater::CompressionLvl::new(level.min(12).cast_signed())
+            .map_err(|_| io::Error::other(format!("invalid zlib level: {level}")))?;
+        scratch.zlib_compressor = Some(libdeflater::Compressor::new(lvl));
+    }
+    // SAFETY: just initialized above if None.
+    let compressor = scratch.zlib_compressor.as_mut().expect("compressor initialized above");
+    let bound = compressor.zlib_compress_bound(uncompressed.len());
+    scratch.compress_buf.clear();
+    scratch.compress_buf.resize(bound, 0);
+    let n = compressor
+        .zlib_compress(uncompressed, &mut scratch.compress_buf)
+        .map_err(|e| io::Error::other(format!("libdeflater zlib compress error: {e:?}")))?;
+    scratch.compress_buf.truncate(n);
+    let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
+        io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+    })?;
+    encode_int32_field(&mut scratch.blob_buf, 2, raw_size);
+    encode_bytes_field(&mut scratch.blob_buf, 3, &scratch.compress_buf);
     Ok(())
 }
 

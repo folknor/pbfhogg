@@ -88,5 +88,6 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - `zlib`: system zlib
 - `zlib-ng`: zlib-ng (mutually exclusive with above)
 - `commands` (default): enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`)
+- `libdeflater`: use libdeflate for zlib compression (2-3x faster, requires C compiler)
 - `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)

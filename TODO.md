@@ -334,6 +334,14 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   Write benchmark improved ~11% (sync none 7.1s→6.2s, pipelined floor
   7.0s→6.2s) from eliminating DenseNodes/Blob prost overhead.
 
+- [ ] **`frame_blob()` per-call allocation.** `writer.rs:frame_blob()` allocates 3 fresh
+  `Vec<u8>` per call (`blob_buf`, `header_bytes`, `out`). On Denmark that's ~4 GB of
+  allocation churn across ~7400 blobs. In the pipelined path, `frame_blob` runs in rayon
+  tasks, so per-thread buffer reuse would need `thread_local::ThreadLocal` or passing
+  reusable buffers into the closure. In sync mode, a single set of reusable buffers on
+  `PbfWriter` would eliminate all allocation after the first blob. At planet scale (80×
+  Denmark), this is ~320 GB of allocator churn.
+
 - [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
   / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with
   read-ahead for passthrough blobs and reduced syscall overhead without requiring

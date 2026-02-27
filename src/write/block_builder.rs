@@ -828,20 +828,20 @@ impl BlockBuilder {
         if self.has_dense_metadata {
             // Build DenseInfo into elem_scratch
             self.elem_scratch.clear();
-            let mut packed_scratch = Vec::new();
+            self.packed_scratch.clear();
 
             // DenseInfo field 1: version (packed int32)
-            encode_packed_int32(&mut self.elem_scratch, &mut packed_scratch, 1, &self.dense_versions);
+            encode_packed_int32(&mut self.elem_scratch, &mut self.packed_scratch, 1, &self.dense_versions);
             // DenseInfo field 2: timestamp (packed sint64)
-            encode_packed_sint64(&mut self.elem_scratch, &mut packed_scratch, 2, &self.dense_timestamps);
+            encode_packed_sint64(&mut self.elem_scratch, &mut self.packed_scratch, 2, &self.dense_timestamps);
             // DenseInfo field 3: changeset (packed sint64)
-            encode_packed_sint64(&mut self.elem_scratch, &mut packed_scratch, 3, &self.dense_changesets);
+            encode_packed_sint64(&mut self.elem_scratch, &mut self.packed_scratch, 3, &self.dense_changesets);
             // DenseInfo field 4: uid (packed sint32)
-            encode_packed_sint32(&mut self.elem_scratch, &mut packed_scratch, 4, &self.dense_uids);
+            encode_packed_sint32(&mut self.elem_scratch, &mut self.packed_scratch, 4, &self.dense_uids);
             // DenseInfo field 5: user_sid (packed sint32)
-            encode_packed_sint32(&mut self.elem_scratch, &mut packed_scratch, 5, &self.dense_user_sids);
+            encode_packed_sint32(&mut self.elem_scratch, &mut self.packed_scratch, 5, &self.dense_user_sids);
             // DenseInfo field 6: visible (packed bool)
-            encode_packed_bool(&mut self.elem_scratch, &mut packed_scratch, 6, &self.dense_visibles);
+            encode_packed_bool(&mut self.elem_scratch, &mut self.packed_scratch, 6, &self.dense_visibles);
 
             encode_bytes_field(&mut self.group_buf, 5, &self.elem_scratch);
         }
@@ -905,40 +905,43 @@ impl BlockBuilder {
 
 /// Encode an `int32` field unconditionally (even when value is 0).
 ///
-/// Matches prost's encoding of `Option<i32>::Some(0)` which writes the
-/// field tag + varint(0) even for the zero value. This differs from
+/// Writes the field tag + varint(0) even for the zero value. This differs from
 /// `encode_int32_field` which skips zero values (matching non-optional fields).
+/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_optional_int32(buf: &mut Vec<u8>, field: u32, value: i32) {
+    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
     buf.push((field << 3) as u8); // wire type 0 (varint)
     encode_varint(buf, value as i64 as u64);
 }
 
 /// Encode an `int64` field unconditionally (even when value is 0).
 ///
-/// Matches prost's encoding of `Option<i64>::Some(0)`.
+/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn encode_optional_int64(buf: &mut Vec<u8>, field: u32, value: i64) {
+    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
     buf.push((field << 3) as u8);
     encode_varint(buf, value as u64);
 }
 
 /// Encode a `uint32` field unconditionally (even when value is 0).
 ///
-/// Matches prost's encoding of `Option<u32>::Some(0)`.
+/// Only valid for field numbers <= 15 (single-byte tag encoding).
 #[inline]
 #[allow(clippy::cast_possible_truncation)]
 fn encode_optional_uint32(buf: &mut Vec<u8>, field: u32, value: u32) {
+    debug_assert!(field <= 15, "single-byte tag requires field <= 15, got {field}");
     buf.push((field << 3) as u8);
     encode_varint(buf, u64::from(value));
 }
 
 /// Encode an `Info` submessage from high-level [`Metadata`].
 ///
-/// Uses unconditional field writers (matching prost's `Option<T>::Some(v)` encoding)
-/// to produce bit-identical output with the previous prost-based `build_info`.
+/// Uses unconditional field writers to always emit all metadata fields,
+/// even when their value is zero (matching the OSMPBF convention).
 fn encode_info_to(
     info: &mut Vec<u8>,
     string_table: &mut StringTable,

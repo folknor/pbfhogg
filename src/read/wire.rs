@@ -125,12 +125,28 @@ impl<'a> Cursor<'a> {
         Ok(slice)
     }
 
+    /// Skip a varint by scanning for the terminating byte (MSB=0)
+    /// without decoding the value.
+    #[inline]
+    pub fn skip_varint(&mut self) -> Result<()> {
+        loop {
+            if self.pos >= self.data.len() {
+                return Err(new_wire_error("unexpected end of input skipping varint"));
+            }
+            let b = self.data[self.pos];
+            self.pos += 1;
+            if b < 0x80 {
+                return Ok(());
+            }
+        }
+    }
+
     /// Skip an unknown field given its wire type.
     #[inline]
     pub fn skip_field(&mut self, wire_type: u32) -> Result<()> {
         match wire_type {
             WIRE_VARINT => {
-                self.read_varint()?;
+                self.skip_varint()?;
             }
             WIRE_64BIT => {
                 if self.pos + 8 > self.data.len() {
@@ -158,7 +174,7 @@ impl<'a> Cursor<'a> {
 // ---------------------------------------------------------------------------
 
 #[inline]
-fn zigzag_decode_64(v: u64) -> i64 {
+pub(crate) fn zigzag_decode_64(v: u64) -> i64 {
     #[allow(clippy::cast_possible_wrap)]
     let signed = (v >> 1) as i64;
     #[allow(clippy::cast_possible_wrap)]

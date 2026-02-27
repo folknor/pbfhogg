@@ -130,28 +130,24 @@ impl BlobFilter {
 // ---------------------------------------------------------------------------
 // Lightweight protobuf scanner: extract element type + ID range
 // without full PrimitiveBlock parsing.
+// Uses Cursor from read::wire for varint/tag/skip primitives.
 // ---------------------------------------------------------------------------
+
+use crate::read::wire::{zigzag_decode_64, Cursor};
 
 /// Scan decompressed PrimitiveBlock bytes to extract element type and ID range.
 /// This walks the protobuf wire format manually, only reading element IDs.
 /// Much cheaper than a full PrimitiveBlock parse (skips string tables,
 /// coordinates, tags, metadata, etc.).
-#[allow(clippy::cast_possible_truncation)]
 pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
-    let mut cursor = 0;
+    let mut cur = Cursor::new(raw);
     let mut result: Option<BlobIndex> = None;
 
-    while cursor < raw.len() {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
+    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
         if tag == 2 && wire_type == 2 {
             // PrimitiveGroup (field 2, length-delimited)
-            let (group_len, new_pos) = read_varint(raw, cursor)?;
-            let group_end = new_pos + group_len as usize;
-            cursor = new_pos;
-
-            if let Some(scan) = scan_primitive_group(raw, cursor, group_end) {
+            let group_data = cur.read_len_delimited().ok()?;
+            if let Some(scan) = scan_primitive_group(group_data) {
                 result = Some(match result {
                     None => scan,
                     Some(mut prev) => {
@@ -162,60 +158,41 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
                     }
                 });
             }
-            cursor = group_end;
         } else {
-            // Skip other fields (StringTable, granularity, offsets, etc.)
-            cursor = skip_field(raw, wire_type, cursor)?;
+            cur.skip_field(wire_type).ok()?;
         }
     }
     result
 }
 
 /// Scan a PrimitiveGroup submessage for element type + IDs.
-#[allow(clippy::cast_possible_truncation)]
-fn scan_primitive_group(raw: &[u8], mut cursor: usize, end: usize) -> Option<BlobIndex> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
+fn scan_primitive_group(raw: &[u8]) -> Option<BlobIndex> {
+    let mut cur = Cursor::new(raw);
 
+    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
         match (tag, wire_type) {
             (2, 2) => {
                 // DenseNodes (field 2, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let dense_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_dense_node_ids(raw, cursor, dense_end);
+                let data = cur.read_len_delimited().ok()?;
+                return scan_dense_node_ids(data);
             }
             (3, 2) => {
                 // Way (field 3, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_repeated_element_ids(raw, cursor, msg_end, end, 3, ElemKind::Way);
+                let first_msg = cur.read_len_delimited().ok()?;
+                return scan_repeated_element_ids(first_msg, &mut cur, 3, ElemKind::Way);
             }
             (4, 2) => {
                 // Relation (field 4, length-delimited)
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_repeated_element_ids(
-                    raw,
-                    cursor,
-                    msg_end,
-                    end,
-                    4,
-                    ElemKind::Relation,
-                );
+                let first_msg = cur.read_len_delimited().ok()?;
+                return scan_repeated_element_ids(first_msg, &mut cur, 4, ElemKind::Relation);
             }
             (1, 2) => {
                 // Node (field 1, length-delimited) — rare, non-dense
-                let (len, new_pos) = read_varint(raw, cursor)?;
-                let msg_end = new_pos + len as usize;
-                cursor = new_pos;
-                return scan_repeated_element_ids(raw, cursor, msg_end, end, 1, ElemKind::Node);
+                let first_msg = cur.read_len_delimited().ok()?;
+                return scan_repeated_element_ids(first_msg, &mut cur, 1, ElemKind::Node);
             }
             _ => {
-                cursor = skip_field(raw, wire_type, cursor)?;
+                cur.skip_field(wire_type).ok()?;
             }
         }
     }
@@ -224,28 +201,23 @@ fn scan_primitive_group(raw: &[u8], mut cursor: usize, end: usize) -> Option<Blo
 
 /// Scan DenseNodes to extract min/max IDs and count.
 /// DenseNodes stores IDs as packed delta-encoded sint64 in field 1.
-#[allow(clippy::cast_sign_loss, clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
-fn scan_dense_node_ids(raw: &[u8], mut cursor: usize, end: usize) -> Option<BlobIndex> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
+fn scan_dense_node_ids(raw: &[u8]) -> Option<BlobIndex> {
+    let mut cur = Cursor::new(raw);
 
+    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
         if tag == 1 && wire_type == 2 {
             // Packed sint64 IDs
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            let ids_end = new_pos + len as usize;
-            cursor = new_pos;
+            let ids_data = cur.read_len_delimited().ok()?;
+            let mut id_cur = Cursor::new(ids_data);
 
             let mut min_id = i64::MAX;
             let mut max_id = i64::MIN;
             let mut current_id: i64 = 0;
             let mut count: u64 = 0;
 
-            while cursor < ids_end {
-                let (raw_val, new_pos) = read_varint(raw, cursor)?;
-                cursor = new_pos;
-                // Zigzag decode: sint64
-                let delta = ((raw_val >> 1) as i64) ^ -((raw_val & 1) as i64);
+            while !id_cur.is_empty() {
+                let raw_val = id_cur.read_varint().ok()?;
+                let delta = zigzag_decode_64(raw_val);
                 current_id += delta;
                 min_id = min_id.min(current_id);
                 max_id = max_id.max(current_id);
@@ -262,50 +234,38 @@ fn scan_dense_node_ids(raw: &[u8], mut cursor: usize, end: usize) -> Option<Blob
             }
             return None;
         }
-        cursor = skip_field(raw, wire_type, cursor)?;
+        cur.skip_field(wire_type).ok()?;
     }
     None
 }
 
 /// Scan repeated Way/Relation/Node messages to extract min/max IDs.
-/// We already have the first message boundaries; scan through the group
-/// to find additional messages of the same field tag.
-#[allow(clippy::cast_possible_truncation)]
+/// `first_msg` is the first message body; `rest` is positioned after it
+/// in the parent group for scanning remaining messages.
 fn scan_repeated_element_ids(
-    raw: &[u8],
-    first_msg_start: usize,
-    first_msg_end: usize,
-    group_end: usize,
+    first_msg: &[u8],
+    rest: &mut Cursor<'_>,
     expected_tag: u32,
     kind: ElemKind,
 ) -> Option<BlobIndex> {
-    // Extract ID from the first message
-    let first_id = extract_element_id(raw, first_msg_start, first_msg_end)?;
+    let first_id = extract_element_id(first_msg)?;
     let mut min_id = first_id;
     let mut max_id = first_id;
     let mut count: u64 = 1;
     let mut last_id = first_id;
 
     // Scan remaining messages in the group
-    let mut cursor = first_msg_end;
-    while cursor < group_end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
-
+    while let Some((tag, wire_type)) = rest.read_tag().ok()? {
         if tag == expected_tag && wire_type == 2 {
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            let msg_end = new_pos + len as usize;
-            cursor = new_pos;
-
-            if let Some(id) = extract_element_id(raw, cursor, msg_end) {
+            let msg = rest.read_len_delimited().ok()?;
+            if let Some(id) = extract_element_id(msg) {
                 min_id = min_id.min(id);
                 max_id = max_id.max(id);
                 last_id = id;
                 count += 1;
             }
-            cursor = msg_end;
         } else {
-            cursor = skip_field(raw, wire_type, cursor)?;
+            rest.skip_field(wire_type).ok()?;
         }
     }
 
@@ -322,80 +282,15 @@ fn scan_repeated_element_ids(
 
 /// Extract the element ID (field 1, varint/int64) from a Node/Way/Relation message.
 #[allow(clippy::cast_possible_wrap)]
-fn extract_element_id(raw: &[u8], mut cursor: usize, end: usize) -> Option<i64> {
-    while cursor < end {
-        let (tag, wire_type, new_pos) = read_tag(raw, cursor)?;
-        cursor = new_pos;
+fn extract_element_id(msg: &[u8]) -> Option<i64> {
+    let mut cur = Cursor::new(msg);
+    while let Some((tag, wire_type)) = cur.read_tag().ok()? {
         if tag == 1 && wire_type == 0 {
-            let (val, _) = read_varint(raw, cursor)?;
-            return Some(val as i64);
+            return Some(cur.read_varint().ok()? as i64);
         }
-        cursor = skip_field(raw, wire_type, cursor)?;
+        cur.skip_field(wire_type).ok()?;
     }
     None
-}
-
-// ---------------------------------------------------------------------------
-// Protobuf wire format helpers
-// ---------------------------------------------------------------------------
-
-/// Read a varint from the buffer. Returns (value, new_cursor).
-fn read_varint(raw: &[u8], mut cursor: usize) -> Option<(u64, usize)> {
-    let mut result: u64 = 0;
-    let mut shift = 0;
-    loop {
-        if cursor >= raw.len() {
-            return None;
-        }
-        let byte = raw[cursor];
-        cursor += 1;
-        result |= ((byte & 0x7F) as u64) << shift;
-        if byte & 0x80 == 0 {
-            return Some((result, cursor));
-        }
-        shift += 7;
-        if shift >= 64 {
-            return None;
-        }
-    }
-}
-
-/// Read a field tag. Returns (field_number, wire_type, new_cursor).
-fn read_tag(raw: &[u8], cursor: usize) -> Option<(u32, u32, usize)> {
-    let (val, new_pos) = read_varint(raw, cursor)?;
-    #[allow(clippy::cast_possible_truncation)]
-    let wire_type = (val & 0x07) as u32;
-    #[allow(clippy::cast_possible_truncation)]
-    let field_number = (val >> 3) as u32;
-    Some((field_number, wire_type, new_pos))
-}
-
-/// Skip a field value based on wire type. Returns new cursor position.
-#[allow(clippy::cast_possible_truncation)]
-fn skip_field(raw: &[u8], wire_type: u32, mut cursor: usize) -> Option<usize> {
-    match wire_type {
-        0 => {
-            // Varint — skip bytes until MSB is 0
-            loop {
-                if cursor >= raw.len() {
-                    return None;
-                }
-                let byte = raw[cursor];
-                cursor += 1;
-                if byte & 0x80 == 0 {
-                    return Some(cursor);
-                }
-            }
-        }
-        1 => Some(cursor + 8), // 64-bit fixed
-        2 => {
-            // Length-delimited
-            let (len, new_pos) = read_varint(raw, cursor)?;
-            Some(new_pos + len as usize)
-        }
-        5 => Some(cursor + 4), // 32-bit fixed
-        _ => None,             // Unknown wire type
-    }
 }
 
 #[cfg(test)]

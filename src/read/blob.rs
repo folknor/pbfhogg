@@ -223,6 +223,17 @@ impl Blob {
         decompress_blob(&self.blob, None).and_then(PrimitiveBlock::new)
     }
 
+    /// Returns the blob-level index from the header's `indexdata` field, if present.
+    ///
+    /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs
+    /// (Geofabrik, osmium) typically do not — this returns `None` for those.
+    pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
+        self.header
+            .indexdata
+            .as_ref()
+            .and_then(|data| crate::blob_index::BlobIndex::deserialize(data))
+    }
+
     /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
     /// from a [`DecompressPool`]. Used by the pipeline for buffer reuse.
     pub(crate) fn to_primitiveblock_pooled(

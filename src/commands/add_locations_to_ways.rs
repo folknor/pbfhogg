@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -221,7 +221,9 @@ fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Res
         IndexType::Hash => NodeLocationIndex::Hash(FxHashMap::default()),
         IndexType::Dense { capacity } => NodeLocationIndex::Dense(DenseMmapIndex::new(capacity)?),
     };
-    let reader = ElementReader::open(input, direct_io)?;
+    // Skip way and relation blobs in Pass 1 — only node coordinates needed.
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_nodes());
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         for element in block.elements() {

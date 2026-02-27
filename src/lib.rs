@@ -119,6 +119,7 @@ pub use read::elements::*;
 pub use read::indexed::*;
 pub use read::mmap_blob::*;
 pub use read::reader::*;
+pub use blob_index::BlobFilter;
 pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)

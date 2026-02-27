@@ -5,6 +5,7 @@
 
 use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
+use crate::blob_index::BlobFilter;
 use crate::error::Result;
 use std::collections::VecDeque;
 use std::io::Read;
@@ -30,6 +31,7 @@ const DECODE_AHEAD: usize = 32;
 pub(crate) fn run_pipeline<R, F>(
     blob_reader: BlobReader<R>,
     decode_thread_count: Option<usize>,
+    blob_filter: Option<BlobFilter>,
     mut block_fn: F,
 ) -> Result<()>
 where
@@ -103,7 +105,19 @@ where
                     Ok(blob) => {
                         decode_pool.spawn(move || {
                             let item = match blob.get_type() {
-                                BlobType::OsmData => Some(blob.to_primitiveblock_pooled(&bp)),
+                                BlobType::OsmData => {
+                                    // If a blob filter is set and the blob has indexdata,
+                                    // skip decompression for blobs that don't match.
+                                    // Files without indexdata always pass through.
+                                    if let Some(ref filter) = blob_filter
+                                        && let Some(idx) = blob.index()
+                                        && !filter.wants(idx.kind)
+                                    {
+                                        drop(tx.send((seq, None)));
+                                        return;
+                                    }
+                                    Some(blob.to_primitiveblock_pooled(&bp))
+                                }
                                 _ => None,
                             };
                             drop(tx.send((seq, item)));

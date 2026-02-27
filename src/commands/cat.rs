@@ -8,7 +8,7 @@ use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobDecode, BlobReader, Element};
+use crate::{BlobDecode, BlobFilter, BlobReader, Element};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -195,12 +195,21 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     let mut bb = BlockBuilder::new();
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
+    let blob_filter = BlobFilter::new(filter_node, filter_way, filter_relation);
 
     for file in files {
         let reader = BlobReader::open(file, direct_io)?;
 
         for blob in reader {
             let blob = blob?;
+            // Skip blobs whose indexdata doesn't match the type filter.
+            // Avoids decompression + protobuf parse for non-matching blobs.
+            // Files without indexdata fall through (index() returns None).
+            if let Some(idx) = blob.index()
+                && !blob_filter.wants(idx.kind)
+            {
+                continue;
+            }
             match blob.decode()? {
                 BlobDecode::OsmHeader(_) => {}
                 BlobDecode::OsmData(block) => {

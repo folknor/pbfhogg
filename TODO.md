@@ -143,39 +143,36 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     blobs are nodes and can be skipped entirely. Explains the 4.7x gap on
     way-only filters.
 
-    **How it works with indexdata:** `BlobHeader.indexdata` (26 bytes) contains
-    `ElemKind` (Node/Way/Relation), available after parsing the blob header
-    but *before* reading or decompressing blob data. All pbfhogg-written PBFs
-    embed indexdata automatically. For third-party PBFs without indexdata,
-    degrade gracefully to current behavior (decompress everything).
+    **Infrastructure (DONE):**
+    - `Blob::index() -> Option<BlobIndex>` — expose indexdata from header
+    - `BlobFilter { want_nodes, want_ways, want_relations }` — public struct
+    - Pipeline Stage 2 in `pipeline.rs` — checks `blob.index()` vs filter,
+      returns `None` to skip decompression (~5ns check vs ~1-2ms zlib saved)
+    - `ElementReader::with_blob_filter()` — builder method
+    - `BlobFilter` exported from `lib.rs`
+    - Files without indexdata degrade gracefully (all blobs pass through)
 
-    **Where the skip decision goes:** Pipeline Stage 2 (decode pool) in
-    `pipeline.rs`. Currently:
-    ```
-    BlobType::OsmData => Some(blob.to_primitiveblock_pooled(&bp))
-    ```
-    With filter: check `blob.index()` against a `BlobFilter`, return `None`
-    to skip decompression. Saves CPU (zlib ~1-2ms/blob) but not I/O (blob
-    bytes already read). For seekable readers, a future optimization could
-    skip reading blob data entirely via `seek()` past `header.datasize`.
+    **Per-command status:**
 
-    **API surface:**
-    - Add `Blob::index() -> Option<BlobIndex>` (expose indexdata from header)
-    - Add `BlobFilter { want_nodes: bool, want_ways: bool, want_relations: bool }`
-    - Thread `BlobFilter` through `ElementReader` into `run_pipeline()`
-    - Each command computes its `BlobFilter` from arguments
-
-    **Commands that benefit:**
-
-    | Command | Filter | Blobs skipped (Denmark) |
-    |---------|--------|------------------------|
-    | `cat --type way` | skip nodes+relations | ~87% |
-    | `tags-filter w/highway=primary -R` | skip nodes+relations | ~87% |
-    | `tags-filter` (any typed expr) | skip non-matching types | varies |
-    | `getid w123 w456` | skip nodes+relations | ~87% |
-    | `add-locs-to-ways` pass 1 | skip ways+relations | ~15% |
-    | `getid --add-referenced` pass 1 | skip nodes+relations | ~87% |
-    | `extract` complete-ways pass 1 | limited opportunity | small |
+    | Command | Status | Filter | Notes |
+    |---------|--------|--------|-------|
+    | `cat --type` | DONE | skip non-matching types | `BlobFilter` from `--type` arg |
+    | `tags-filter -R` (single-pass) | DONE | union of expression type filters | `blob_filter_from_expressions()` helper |
+    | `tags-filter` (two-pass) | DONE | Pass 1: expr union, Pass 2: nodes+matched types | Nodes always included in Pass 2 for way deps |
+    | `tags-count --type-filter` | DONE | skip non-matching types | Only when single type specified |
+    | `add-locs-to-ways` Pass 1 | DONE | `only_nodes()` | Pass 2 needs all types |
+    | `node-stats` | DONE | `only_nodes()` | Only processes nodes |
+    | `getid` | TODO | skip types not in ID set | Analyze `IdSet::{node,way,relation}_ids` emptiness |
+    | `getid --add-referenced` | TODO | Pass 1: skip by ID types, Pass 2: needs nodes+ways | Similar to tags-filter two-pass |
+    | `removeid` | TODO | skip types not in ID set | Same as getid |
+    | `diff --type` | TODO | skip non-matching types | Has `TypeFilter`, loads all into memory |
+    | `derive-changes` | TODO | skip non-matching types | Has `type_filter`, loads all into memory |
+    | `check-refs` | LIMITED | skip relations if `--check-relations=false` | Needs all 3 types for full check |
+    | `extract` | LIMITED | skip relations in simple mode only | complete-ways/smart need all types |
+    | `fileinfo` | N/A | no benefit | Counts blobs, needs all |
+    | `sort` | N/A | already uses BlobIndex | Blob-level permutation sort |
+    | `merge` | N/A | already uses BlobIndex | Specialized blob-level filtering |
+    | `cat` (no filter) | N/A | raw passthrough, zero decode | Already optimal |
 
     **Sorted PBF early exit:** In sorted PBFs (`Sort.Type_then_ID`), all
     node blobs precede way blobs precede relation blobs. Commands that only
@@ -183,15 +180,6 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     blob type appears. Already naturally supported by `into_blocks_pipelined`
     (dropping the iterator shuts down the pipeline). With indexdata, the
     transition is detected without decompressing the boundary blob.
-
-    **Implementation order:**
-    1. Add `Blob::index()` method
-    2. Add `BlobFilter` struct, wire into pipeline Stage 2
-    3. Add `ElementReader::with_blob_filter()` builder method
-    4. Update `cat --type` (simplest consumer, good test case)
-    5. Update `tags_filter` (single-pass with type prefix)
-    6. Update `getid` (skip by empty ID set type)
-    7. Update `add_locations_to_ways` pass 1 (skip non-node blobs)
 
   - [ ] **Parallel element processing.** Process decoded blocks in parallel
     with ordered output, not just parallel decompression. Would close the

@@ -70,6 +70,64 @@ impl BlobIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Blob-type filter
+// ---------------------------------------------------------------------------
+
+/// Filter for skipping blobs by element type during pipelined reads.
+///
+/// When a `BlobFilter` is set on an [`ElementReader`](crate::ElementReader),
+/// the pipeline skips decompressing blobs whose element type (from indexdata)
+/// does not match the filter. Files without indexdata are unaffected — all
+/// blobs pass through.
+///
+/// # Example
+/// ```no_run
+/// use pbfhogg::{ElementReader, BlobFilter};
+///
+/// let reader = ElementReader::from_path("data.osm.pbf")?;
+/// let reader = reader.with_blob_filter(BlobFilter::only_ways());
+/// // Only way blobs are decompressed; node and relation blobs are skipped.
+/// # Ok::<(), Box<dyn std::error::Error>>(())
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct BlobFilter {
+    pub(crate) want_nodes: bool,
+    pub(crate) want_ways: bool,
+    pub(crate) want_relations: bool,
+}
+
+impl BlobFilter {
+    /// Create a filter that accepts only the specified element types.
+    pub fn new(want_nodes: bool, want_ways: bool, want_relations: bool) -> Self {
+        Self { want_nodes, want_ways, want_relations }
+    }
+
+    /// Filter that accepts only node blobs.
+    pub fn only_nodes() -> Self {
+        Self { want_nodes: true, want_ways: false, want_relations: false }
+    }
+
+    /// Filter that accepts only way blobs.
+    pub fn only_ways() -> Self {
+        Self { want_nodes: false, want_ways: true, want_relations: false }
+    }
+
+    /// Filter that accepts only relation blobs.
+    pub fn only_relations() -> Self {
+        Self { want_nodes: false, want_ways: false, want_relations: true }
+    }
+
+    /// Returns true if the filter accepts blobs of the given element kind.
+    pub(crate) fn wants(&self, kind: ElemKind) -> bool {
+        match kind {
+            ElemKind::Node => self.want_nodes,
+            ElemKind::Way => self.want_ways,
+            ElemKind::Relation => self.want_relations,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Lightweight protobuf scanner: extract element type + ID range
 // without full PrimitiveBlock parsing.
 // ---------------------------------------------------------------------------

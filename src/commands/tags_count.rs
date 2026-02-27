@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rustc_hash::FxHashMap;
 
-use crate::{Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -36,6 +36,13 @@ pub fn tags_count(
     direct_io: bool,
 ) -> Result<Vec<TagCount>> {
     let reader = ElementReader::open(path, direct_io)?;
+    // Skip blob types that don't match the type filter (avoids decompression).
+    let reader = match type_filter {
+        Some("node") => reader.with_blob_filter(BlobFilter::only_nodes()),
+        Some("way") => reader.with_blob_filter(BlobFilter::only_ways()),
+        Some("relation") => reader.with_blob_filter(BlobFilter::only_relations()),
+        _ => reader,
+    };
     let mut counts: FxHashMap<String, FxHashMap<String, u64>> = FxHashMap::default();
 
     let filter_node = type_filter.is_none() || type_filter == Some("node");

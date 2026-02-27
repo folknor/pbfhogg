@@ -5,7 +5,7 @@ use std::path::Path;
 use super::{dense_node_metadata, element_metadata, flush_block};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -148,6 +148,24 @@ fn tag_matches(matcher: &TagMatcher, key: &str, value: &str) -> bool {
     }
 }
 
+/// Compute a `BlobFilter` from the union of all expression type filters.
+/// Returns `None` if all types are needed (no benefit from filtering).
+fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter> {
+    let mut need_nodes = false;
+    let mut need_ways = false;
+    let mut need_relations = false;
+    for expr in expressions {
+        need_nodes |= expr.type_filter.nodes;
+        need_ways |= expr.type_filter.ways;
+        need_relations |= expr.type_filter.relations;
+    }
+    if need_nodes && need_ways && need_relations {
+        None
+    } else {
+        Some(BlobFilter::new(need_nodes, need_ways, need_relations))
+    }
+}
+
 /// Check if an element's tags match any applicable expression (OR semantics).
 fn element_matches(
     expressions: &[Expression],
@@ -240,6 +258,11 @@ fn tags_filter_single_pass(
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
+    // Skip blob types that no expression targets.
+    let reader = match blob_filter_from_expressions(expressions) {
+        Some(filter) => reader.with_blob_filter(filter),
+        None => reader,
+    };
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
         hb = hb.sorted();
@@ -390,7 +413,12 @@ fn tags_filter_two_pass(
     let mut matched_relation_ids: Vec<i64> = Vec::new();
     let mut way_dep_node_ids: Vec<i64> = Vec::new();
 
+    // Pass 1: skip blob types that no expression targets.
     let reader = ElementReader::open(input, direct_io)?;
+    let reader = match blob_filter_from_expressions(expressions) {
+        Some(filter) => reader.with_blob_filter(filter),
+        None => reader,
+    };
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         let mut tags_buf: Vec<(&str, &str)> = Vec::new();
@@ -450,7 +478,14 @@ fn tags_filter_two_pass(
     way_dep_node_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
+    // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
     let reader = ElementReader::open(input, direct_io)?;
+    let reader = if let Some(filter) = blob_filter_from_expressions(expressions) {
+        // Ensure nodes are always included — matched ways pull in referenced nodes.
+        reader.with_blob_filter(BlobFilter::new(true, filter.want_ways, filter.want_relations))
+    } else {
+        reader
+    };
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
         hb = hb.sorted();

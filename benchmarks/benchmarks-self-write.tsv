@@ -40,3 +40,9 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-pipe-zlib:6	6980	52489653	6616526	46103	483
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-zstd:3	8793	52489653	6616526	46103	483
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-pipe-zstd:3	6911	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-none	6247	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-pipe-none	6205	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-zlib:6	14552	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-pipe-zlib:6	6304	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-zstd:3	8131	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	write-pipe-zstd:3	6242	52489653	6616526	46103	483

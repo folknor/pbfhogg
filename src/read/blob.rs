@@ -1,10 +1,8 @@
 //! Read and decode blobs
 
 use super::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{new_blob_error, new_error, new_protobuf_error, BlobError, ErrorKind, Result};
-use crate::proto;
+use crate::error::{new_blob_error, new_error, new_wire_error, BlobError, ErrorKind, Result};
 use bytes::Bytes;
-use prost::Message;
 use super::file_reader::FileReader;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -99,6 +97,123 @@ fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wire-format protobuf message types for blob reading
+// ---------------------------------------------------------------------------
+
+/// Parsed BlobHeader from protobuf wire format.
+///
+/// Fields: type (string, field 1), indexdata (bytes, field 2), datasize (int32, field 3).
+#[derive(Clone, Debug)]
+pub(crate) struct WireBlobHeader {
+    pub blob_type: String,
+    pub datasize: i32,
+    pub indexdata: Option<Vec<u8>>,
+}
+
+impl WireBlobHeader {
+    /// Parse a BlobHeader from raw protobuf bytes.
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        use super::wire::Cursor;
+        let mut cursor = Cursor::new(data);
+        let mut blob_type = String::new();
+        let mut datasize: i32 = 0;
+        let mut indexdata: Option<Vec<u8>> = None;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match field {
+                1 => {
+                    // type: string (len-delimited)
+                    let bytes = cursor.read_len_delimited()?;
+                    blob_type = String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in BlobHeader type"))?;
+                }
+                2 => {
+                    // indexdata: bytes (len-delimited)
+                    let bytes = cursor.read_len_delimited()?;
+                    indexdata = Some(bytes.to_vec());
+                }
+                3 => {
+                    // datasize: int32 (varint)
+                    #[allow(clippy::cast_possible_truncation)]
+                    { datasize = cursor.read_varint()? as i32; }
+                }
+                _ => cursor.skip_field(wire_type)?,
+            }
+        }
+
+        Ok(WireBlobHeader { blob_type, datasize, indexdata })
+    }
+}
+
+/// Compressed data variant in a Blob.
+#[derive(Clone, Debug)]
+pub(crate) enum BlobData {
+    Raw(Bytes),
+    Zlib(Bytes),
+    Zstd(Bytes),
+}
+
+/// Parsed Blob envelope from protobuf wire format.
+///
+/// Fields: raw (bytes, field 1), raw_size (int32, field 2),
+/// zlib_data (bytes, field 3), zstd_data (bytes, field 7).
+#[derive(Clone, Debug)]
+pub(crate) struct WireBlob {
+    pub data: Option<BlobData>,
+    pub raw_size: Option<i32>,
+}
+
+impl WireBlob {
+    /// Parse a Blob from `Bytes`, preserving zero-copy slices for compressed data.
+    ///
+    /// The returned `BlobData` variants hold `Bytes` slices of the input, so
+    /// decompressors get zero-copy access to the compressed payload.
+    pub fn parse(input: &Bytes) -> Result<Self> {
+        use super::wire::Cursor;
+        let mut cursor = Cursor::new(input);
+        let mut data: Option<BlobData> = None;
+        let mut raw_size: Option<i32> = None;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match field {
+                1 => {
+                    // raw: bytes (len-delimited)
+                    let slice = cursor.read_len_delimited()?;
+                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
+                    data = Some(BlobData::Raw(input.slice(offset..offset + slice.len())));
+                }
+                2 => {
+                    // raw_size: int32 (varint)
+                    #[allow(clippy::cast_possible_truncation)]
+                    { raw_size = Some(cursor.read_varint()? as i32); }
+                }
+                3 => {
+                    // zlib_data: bytes (len-delimited)
+                    let slice = cursor.read_len_delimited()?;
+                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
+                    data = Some(BlobData::Zlib(input.slice(offset..offset + slice.len())));
+                }
+                7 => {
+                    // zstd_data: bytes (len-delimited)
+                    let slice = cursor.read_len_delimited()?;
+                    let offset = slice.as_ptr() as usize - input.as_ptr() as usize;
+                    data = Some(BlobData::Zstd(input.slice(offset..offset + slice.len())));
+                }
+                _ => cursor.skip_field(wire_type)?,
+            }
+        }
+
+        Ok(WireBlob { data, raw_size })
+    }
+
+    /// Parse a Blob from `&[u8]`, copying the input internally.
+    pub fn parse_slice(data: &[u8]) -> Result<Self> {
+        let bytes = Bytes::copy_from_slice(data);
+        Self::parse(&bytes)
+    }
+}
+
 /// Maximum allowed [`BlobHeader`] size in bytes.
 /// Compile-time constant per the PBF spec. Uses `const` (not `static`) so the value
 /// is inlined at each use site with no memory address or indirection overhead.
@@ -159,15 +274,15 @@ pub struct ByteOffset(pub u64);
 /// to different types of blocks that are usually more interesting to the user.
 #[derive(Clone, Debug)]
 pub struct Blob {
-    header: proto::BlobHeader,
-    blob: proto::Blob,
+    header: WireBlobHeader,
+    blob: WireBlob,
     offset: Option<ByteOffset>,
 }
 
 impl Blob {
     fn new(
-        header: proto::BlobHeader,
-        blob: proto::Blob,
+        header: WireBlobHeader,
+        blob: WireBlob,
         offset: Option<ByteOffset>,
     ) -> Blob {
         Blob {
@@ -197,7 +312,7 @@ impl Blob {
     // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.r#type.as_str() {
+        match self.header.blob_type.as_str() {
             x if x == BlobType::OsmHeader.as_str() => BlobType::OsmHeader,
             x if x == BlobType::OsmData.as_str() => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -214,7 +329,7 @@ impl Blob {
     /// Tries to decode the blob to a [`HeaderBlock`]. This operation might involve an expensive
     /// decompression step.
     pub fn to_headerblock(&self) -> Result<HeaderBlock> {
-        decode_blob(&self.blob, None).map(HeaderBlock::new)
+        decode_headerblock(&self.blob, None).map(HeaderBlock::new)
     }
 
     /// Tries to decode the blob to a [`PrimitiveBlock`]. This operation might involve an expensive
@@ -230,8 +345,8 @@ impl Blob {
     pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
         self.header
             .indexdata
-            .as_ref()
-            .and_then(|data| crate::blob_index::BlobIndex::deserialize(data))
+            .as_deref()
+            .and_then(crate::blob_index::BlobIndex::deserialize)
     }
 
     /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
@@ -249,18 +364,18 @@ impl Blob {
 /// Just contains information about the size and type of the following [`Blob`].
 #[derive(Clone, Debug)]
 pub struct BlobHeader {
-    header: proto::BlobHeader,
+    header: WireBlobHeader,
 }
 
 impl BlobHeader {
-    fn new(header: proto::BlobHeader) -> Self {
+    fn new(header: WireBlobHeader) -> Self {
         BlobHeader { header }
     }
 
     /// Returns the type of the following blob.
     #[inline]
     pub fn blob_type(&self) -> BlobType<'_> {
-        match self.header.r#type.as_str() {
+        match self.header.blob_type.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
             "OSMData" => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -317,7 +432,7 @@ impl<R: Read + Send> BlobReader<R> {
     }
 
     #[allow(clippy::cast_possible_truncation)]
-    fn read_blob_header(&mut self) -> Option<Result<proto::BlobHeader>> {
+    fn read_blob_header(&mut self) -> Option<Result<WireBlobHeader>> {
         let header_size: u64 = {
             let mut buf = [0u8; 4];
             // Read the first byte separately to distinguish clean EOF (0 bytes
@@ -342,7 +457,7 @@ impl<R: Read + Send> BlobReader<R> {
                     u64::from(u32::from_be_bytes(buf))
                 }
                 Err(e) => {
-                    // Truncated header or I/O error — propagate the real cause.
+                    // Truncated header or I/O error -- propagate the real cause.
                     self.offset = None;
                     self.last_blob_ok = false;
                     return Some(Err(e.into()));
@@ -363,10 +478,10 @@ impl<R: Read + Send> BlobReader<R> {
             return self.handle_error(e.into());
         }
 
-        let header = match proto::BlobHeader::decode(Bytes::from(header_data)) {
+        let header = match WireBlobHeader::parse(&header_data) {
             Ok(header) => header,
             Err(e) => {
-                return self.handle_error(new_protobuf_error(e, "could not parse read header data"))
+                return self.handle_error(e)
             }
         };
 
@@ -457,9 +572,10 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             return self.handle_error(e.into());
         }
 
-        let blob = match proto::Blob::decode(Bytes::from(blob_data)) {
+        let blob_bytes = Bytes::from(blob_data);
+        let blob = match WireBlob::parse(&blob_bytes) {
             Ok(blob) => blob,
-            Err(e) => return self.handle_error(new_protobuf_error(e, "blob content")),
+            Err(e) => return self.handle_error(e),
         };
 
         self.offset = self
@@ -641,96 +757,31 @@ impl BlobReader<BufReader<File>> {
 // ---------------------------------------------------------------------------
 // Public decode helpers
 // ---------------------------------------------------------------------------
-//
-// ## Why `Bytes` matters here
-//
-// protobuf's `parse_from_tokio_bytes` takes `&Bytes` and performs zero-copy
-// field access: parsed string/bytes fields reference the original `Bytes`
-// buffer via `Bytes::slice()` rather than allocating new memory for each
-// field. This is why the protobuf layer needs `Bytes`, not `&[u8]`.
-//
-// ## The copy problem (what was here before)
-//
-// Previously, every function below accepted `&[u8]` and internally called
-// `Bytes::from(slice.to_vec())`. This has two costs:
-//   1. `to_vec()` allocates a new `Vec<u8>` and copies all bytes into it.
-//   2. `Bytes::from(vec)` then takes ownership of that `Vec`.
-//
-// The irony is that callers in the merge and cat commands already *have*
-// owned `Vec<u8>` data (read from the file into `RawBlobFrame::blob_bytes`
-// or `RawBlobFrame::header_bytes`). They pass `&frame.blob_bytes`, which
-// borrows the Vec, and then this code copies it right back into a new Vec.
-// For a typical PBF blob of 16-32KB, that's 16-32KB of unnecessary memcpy
-// plus an allocation per blob. Over a full planet file (~2.5M blobs), this
-// adds up to tens of GB of redundant copies.
-//
-// ## The solution: dual signatures
-//
-// Each helper now has two variants:
-//
-// - `foo(bytes: &[u8])` -- the original signature, kept for backward
-//   compatibility. Internally calls `Bytes::copy_from_slice(bytes)` which
-//   is the same cost as the old `Bytes::from(slice.to_vec())` but more
-//   idiomatic. Then delegates to the `_from_bytes` variant.
-//
-// - `foo_from_bytes(bytes: Bytes)` -- the new zero-copy variant. Takes
-//   ownership of a `Bytes` value directly. Callers with `Vec<u8>` can
-//   use `Bytes::from(vec)` which is O(1) -- it wraps the existing
-//   allocation without copying. Callers with `Bytes` (e.g. from mmap)
-//   can pass it directly.
-//
-// ## Alternatives considered
-//
-// - `impl Into<Bytes>`: Would provide a single function signature, but
-//   `&[u8]` does not implement `Into<Bytes>` (only `&'static [u8]` does),
-//   so existing callers passing `&slice` would not compile. We'd need
-//   `impl AsRef<[u8]>` which would still require copying internally.
-//
-// - Changing all callers to pass `Bytes`: Would work but requires
-//   modifying merge.rs, cat.rs, and any external consumers. The dual-
-//   signature approach is non-breaking and lets callers migrate at their
-//   own pace.
-//
-// - Generic `Into<Bytes>` with `Bytes::copy_from_slice` fallback for
-//   non-owned data: Not possible because the compiler can't distinguish
-//   "owned vs borrowed" at the trait level without specialization.
-// ---------------------------------------------------------------------------
 
 /// Parse raw blob frame bytes into a BlobHeader type string and Blob payload bytes.
 ///
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
-///
-/// This variant accepts `&[u8]` for convenience but must copy the bytes
-/// internally (protobuf needs `Bytes` for zero-copy field access). If you
-/// already have a `Vec<u8>` or `Bytes`, prefer [`parse_blob_header_from_bytes`]
-/// to avoid the copy.
 pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(String, usize)> {
-    // Bytes::copy_from_slice: allocates + copies, same cost as the old
-    // Bytes::from(slice.to_vec()) but more idiomatic -- it avoids the
-    // intermediate Vec and goes straight to the Bytes shared buffer.
-    parse_blob_header_from_bytes(&Bytes::copy_from_slice(header_bytes))
-}
-
-/// Zero-copy variant of [`parse_blob_header`].
-///
-/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
-/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
-/// O(1) -- the existing allocation is reused, not copied.
-///
-/// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
-/// Returns: `(blob_type, data_size)`.
-pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usize)> {
-    let header = proto::BlobHeader::decode(header_bytes.clone())
-        .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,
         }));
     }
     #[allow(clippy::cast_sign_loss)]
-    // Clone is fine: type string is short ("OSMData"/"OSMHeader"), called once per blob.
-    Ok((header.r#type.clone(), header.datasize as usize))
+    Ok((header.blob_type, header.datasize as usize))
+}
+
+/// Zero-copy variant of [`parse_blob_header`].
+///
+/// Accepts a `&Bytes` for backward compatibility. Delegates to the `&[u8]`
+/// variant since the hand-rolled parser operates on `&[u8]` directly.
+///
+/// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
+/// Returns: `(blob_type, data_size)`.
+pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usize)> {
+    parse_blob_header(header_bytes)
 }
 
 /// Parse a BlobHeader and also extract the optional `indexdata` field.
@@ -741,17 +792,14 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usi
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(String, usize, Option<Vec<u8>>)> {
-    let header = proto::BlobHeader::decode(header_bytes)
-        .map_err(|e| new_protobuf_error(e, "parse blob header"))?;
+    let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,
         }));
     }
-    let indexdata = header.indexdata.as_ref().map(|b| b.to_vec());
-    // Clone is fine: type string is short ("OSMData"/"OSMHeader"), called once per blob.
     #[allow(clippy::cast_sign_loss)]
-    Ok((header.r#type.clone(), header.datasize as usize, indexdata))
+    Ok((header.blob_type, header.datasize as usize, header.indexdata))
 }
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
@@ -771,8 +819,7 @@ pub fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::Primiti
 pub fn decode_blob_to_primitiveblock_from_bytes(
     blob_bytes: &Bytes,
 ) -> Result<crate::PrimitiveBlock> {
-    let blob = proto::Blob::decode(blob_bytes.clone())
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    let blob = WireBlob::parse(blob_bytes)?;
     decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
 }
 
@@ -784,8 +831,7 @@ pub fn decode_blob_to_primitiveblock_from_bytes(
 /// `Vec<u8>` or `Bytes`, prefer [`decompress_blob_data_from_bytes`] to
 /// avoid the copy.
 pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
-    let blob = proto::Blob::decode(blob_bytes)
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    let blob = WireBlob::parse_slice(blob_bytes)?;
     decompress_blob(&blob, None).map(|b| b.to_vec())
 }
 
@@ -793,11 +839,10 @@ pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
 ///
 /// Like [`decompress_blob_data`] but clears and reuses `buf` instead of
 /// allocating a new `Vec` each time. For loops that decompress many blobs,
-/// this avoids repeated large allocations — the buffer grows to high-water
+/// this avoids repeated large allocations -- the buffer grows to high-water
 /// mark and stays there.
 pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
-    let blob = proto::Blob::decode(blob_bytes)
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    let blob = WireBlob::parse_slice(blob_bytes)?;
     decompress_parsed_blob_into(&blob, buf)
 }
 
@@ -805,17 +850,16 @@ pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result
 ///
 /// Accepts a `Bytes` value directly, avoiding the envelope copy.
 pub fn decompress_blob_data_into_from_bytes(blob_bytes: &Bytes, buf: &mut Vec<u8>) -> Result<()> {
-    let blob = proto::Blob::decode(blob_bytes.clone())
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    let blob = WireBlob::parse(blob_bytes)?;
     decompress_parsed_blob_into(&blob, buf)
 }
 
 /// Decompress a parsed Blob protobuf into a caller-provided buffer.
 #[allow(clippy::cast_sign_loss)]
-fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<()> {
+fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()> {
     buf.clear();
     match &blob.data {
-        Some(proto::blob::Data::Raw(bytes)) => {
+        Some(BlobData::Raw(bytes)) => {
             let size = bytes.len() as u64;
             if size < MAX_BLOB_MESSAGE_SIZE {
                 buf.extend_from_slice(bytes);
@@ -824,7 +868,7 @@ fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<
                 Err(new_blob_error(BlobError::MessageTooBig { size }))
             }
         }
-        Some(proto::blob::Data::ZlibData(bytes)) => {
+        Some(BlobData::Zlib(bytes)) => {
             if blob.raw_size.unwrap_or(0) > 0 {
                 let capacity = blob.raw_size.unwrap_or(0) as usize;
                 buf.reserve(capacity.saturating_sub(buf.capacity()));
@@ -833,7 +877,7 @@ fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<
             decoder.read_to_end(buf)?;
             Ok(())
         }
-        Some(proto::blob::Data::ZstdData(bytes)) => {
+        Some(BlobData::Zstd(bytes)) => {
             if blob.raw_size.unwrap_or(0) > 0 {
                 let capacity = blob.raw_size.unwrap_or(0) as usize;
                 buf.reserve(capacity.saturating_sub(buf.capacity()));
@@ -845,7 +889,7 @@ fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<
             }
             Ok(())
         }
-        _ => Err(new_blob_error(BlobError::Empty)),
+        None => Err(new_blob_error(BlobError::Empty)),
     }
 }
 
@@ -859,14 +903,9 @@ fn decompress_parsed_blob_into(blob: &proto::Blob, buf: &mut Vec<u8>) -> Result<
 #[allow(clippy::cast_sign_loss)]
 #[hotpath::measure]
 pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
-    // prost::Message::decode takes impl Buf. By accepting &Bytes here instead
-    // of &[u8], callers with owned Vec<u8> avoid a redundant memcpy -- they can
-    // do Bytes::from(vec) which is O(1) pointer handoff, then pass &bytes.
-    // Bytes::clone() is O(1) ref-count bump.
-    let blob = proto::Blob::decode(blob_bytes.clone())
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
+    let blob = WireBlob::parse(blob_bytes)?;
     match &blob.data {
-        Some(proto::blob::Data::Raw(bytes)) => {
+        Some(BlobData::Raw(bytes)) => {
             let size = bytes.len() as u64;
             if size < MAX_BLOB_MESSAGE_SIZE {
                 Ok(bytes.to_vec())
@@ -874,7 +913,7 @@ pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
                 Err(new_blob_error(BlobError::MessageTooBig { size }))
             }
         }
-        Some(proto::blob::Data::ZlibData(bytes)) => {
+        Some(BlobData::Zlib(bytes)) => {
             // When raw_size is set (the common case for modern PBF files), we use
             // the exact decompressed size -- one perfect allocation, no reallocs.
             //
@@ -896,20 +935,13 @@ pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
             decoder.read_to_end(&mut decoded)?;
             Ok(decoded)
         }
-        Some(proto::blob::Data::ZstdData(bytes)) => {
-            // Zstd decompression: 3-5x faster than zlib at equivalent compression
-            // ratios. The PBF spec added zstd_data (field 7) as an optional
-            // compression format. We use zstd::stream::copy_decode with a size limit
-            // to prevent decompression bombs, matching the zlib path's .take() guard.
+        Some(BlobData::Zstd(bytes)) => {
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {
                 bytes.len() * 4
             };
             let mut decoded = Vec::with_capacity(capacity);
-            // copy_decode reads from a reader and writes to a writer, handling
-            // internal zstd frame management. The Cursor wraps the Bytes slice
-            // as a Read impl without copying.
             zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded)?;
             let size = decoded.len() as u64;
             if size > MAX_BLOB_MESSAGE_SIZE {
@@ -917,7 +949,7 @@ pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
             }
             Ok(decoded)
         }
-        _ => Err(new_blob_error(BlobError::Empty)),
+        None => Err(new_blob_error(BlobError::Empty)),
     }
 }
 
@@ -959,24 +991,23 @@ pub fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBloc
 /// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
 /// O(1).
 pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
-    let blob = proto::Blob::decode(blob_bytes.clone())
-        .map_err(|e| new_protobuf_error(e, "parse blob"))?;
-    decode_blob::<crate::proto::HeaderBlock>(&blob, None).map(crate::HeaderBlock::new)
+    let blob = WireBlob::parse(blob_bytes)?;
+    let raw = decompress_blob(&blob, None)?;
+    crate::HeaderBlock::parse_from_bytes(&raw)
 }
 
 /// Decompress a blob's data into `Bytes` without parsing it as a protobuf message.
 ///
-/// This is the PrimitiveBlock hot path: decompress → wrap as Bytes →
+/// This is the PrimitiveBlock hot path: decompress -> wrap as Bytes ->
 /// pass to `PrimitiveBlock::new()` which does zero-copy wire-format parsing.
-/// `decode_blob<T: Message>` is kept only for HeaderBlock parsing.
 #[allow(clippy::cast_sign_loss)]
 #[hotpath::measure]
 pub(crate) fn decompress_blob(
-    blob: &proto::Blob,
+    blob: &WireBlob,
     pool: Option<&Arc<DecompressPool>>,
 ) -> Result<Bytes> {
     match &blob.data {
-        Some(proto::blob::Data::Raw(bytes)) => {
+        Some(BlobData::Raw(bytes)) => {
             let size = bytes.len() as u64;
             if size < MAX_BLOB_MESSAGE_SIZE {
                 Ok(bytes.clone())
@@ -984,7 +1015,7 @@ pub(crate) fn decompress_blob(
                 Err(new_blob_error(BlobError::MessageTooBig { size }))
             }
         }
-        Some(proto::blob::Data::ZlibData(bytes)) => {
+        Some(BlobData::Zlib(bytes)) => {
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {
@@ -995,7 +1026,7 @@ pub(crate) fn decompress_blob(
             decoder.read_to_end(&mut decoded_bytes)?;
             Ok(pool_wrap(decoded_bytes, pool))
         }
-        Some(proto::blob::Data::ZstdData(bytes)) => {
+        Some(BlobData::Zstd(bytes)) => {
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {
@@ -1009,66 +1040,20 @@ pub(crate) fn decompress_blob(
             }
             Ok(pool_wrap(decoded_bytes, pool))
         }
-        _ => Err(new_blob_error(BlobError::Empty)),
+        None => Err(new_blob_error(BlobError::Empty)),
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
-#[hotpath::measure]
-pub(crate) fn decode_blob<T: Message + Default>(
-    blob: &proto::Blob,
+/// Decompress and parse a blob's data as a HeaderBlock.
+///
+/// Used for the OsmHeader blob path where the decompressed bytes need to be
+/// parsed as a HeaderBlock message.
+pub(crate) fn decode_headerblock(
+    blob: &WireBlob,
     pool: Option<&Arc<DecompressPool>>,
-) -> Result<T> {
-    match &blob.data {
-        Some(proto::blob::Data::Raw(bytes)) => {
-            let size = bytes.len() as u64;
-            if size < MAX_BLOB_MESSAGE_SIZE {
-                T::decode(bytes.clone()).map_err(|e| new_protobuf_error(e, "raw blob data"))
-            } else {
-                Err(new_blob_error(BlobError::MessageTooBig { size }))
-            }
-        }
-        Some(proto::blob::Data::ZlibData(bytes)) => {
-            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
-            // When raw_size is set (the common case for modern PBF files), we use
-            // the exact decompressed size — one perfect allocation, no reallocs.
-            //
-            // When raw_size is missing (rare, older PBF files), compressed size alone
-            // is 3-10x too small because zlib typically achieves that compression ratio.
-            // Using compressed size as capacity would cause multiple Vec reallocations
-            // as read_to_end grows the buffer.
-            //
-            // 4x is a conservative middle ground: it avoids most reallocations without
-            // grossly over-allocating. Even if we over-estimate, the Vec only uses
-            // actual bytes written after read_to_end returns.
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut decoded_bytes = pool_get(pool, capacity);
-            decoder.read_to_end(&mut decoded_bytes)?;
-
-            T::decode(pool_wrap(decoded_bytes, pool))
-                .map_err(|e| new_protobuf_error(e, "blob zlib data"))
-        }
-        Some(proto::blob::Data::ZstdData(bytes)) => {
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut decoded_bytes = pool_get(pool, capacity);
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded_bytes)?;
-            let size = decoded_bytes.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
-            T::decode(pool_wrap(decoded_bytes, pool))
-                .map_err(|e| new_protobuf_error(e, "blob zstd data"))
-        }
-        _ => Err(new_blob_error(BlobError::Empty)),
-    }
+) -> Result<super::block::WireHeaderBlock> {
+    let raw = decompress_blob(blob, pool)?;
+    super::block::WireHeaderBlock::parse(&raw)
 }
 
 // Tests use `unwrap()` throughout because panicking is the correct failure mode
@@ -1092,12 +1077,12 @@ mod tests {
         ];
 
         for (string, blob_type) in pairs {
-            let ff_header = proto::BlobHeader {
-                r#type: string.to_string(),
+            let ff_header = WireBlobHeader {
+                blob_type: string.to_string(),
                 datasize: 0,
-                ..Default::default()
+                indexdata: None,
             };
-            let ff_blob = proto::Blob::default();
+            let ff_blob = WireBlob { data: None, raw_size: None };
 
             let blob = Blob::new(ff_header, ff_blob, None);
             assert_eq!(blob.get_type(), blob_type);

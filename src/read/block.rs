@@ -5,20 +5,151 @@ use super::elements::{Element, Node, Relation, Way};
 use super::wire::{
     WireBlock, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation, WireWay,
 };
-use crate::error::{new_error, ErrorKind, Result};
-use crate::proto;
+use crate::error::{new_error, new_wire_error, ErrorKind, Result};
 use bytes::Bytes;
 use std;
+
+// ---------------------------------------------------------------------------
+// Wire-format protobuf message types for header parsing
+// ---------------------------------------------------------------------------
+
+/// Parsed HeaderBBox from a PBF header.
+#[derive(Clone, Debug)]
+pub(crate) struct WireHeaderBBox {
+    pub left: i64,
+    pub right: i64,
+    pub top: i64,
+    pub bottom: i64,
+}
+
+impl WireHeaderBBox {
+    fn parse(data: &[u8]) -> Result<Self> {
+        use super::wire::Cursor;
+        let mut cursor = Cursor::new(data);
+        let mut left: i64 = 0;
+        let mut right: i64 = 0;
+        let mut top: i64 = 0;
+        let mut bottom: i64 = 0;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match field {
+                1 => left = cursor.read_sint64()?,
+                2 => right = cursor.read_sint64()?,
+                3 => top = cursor.read_sint64()?,
+                4 => bottom = cursor.read_sint64()?,
+                _ => cursor.skip_field(wire_type)?,
+            }
+        }
+
+        Ok(WireHeaderBBox { left, right, top, bottom })
+    }
+}
+
+/// Parsed HeaderBlock from protobuf wire format.
+#[derive(Clone, Debug)]
+pub(crate) struct WireHeaderBlock {
+    pub bbox: Option<WireHeaderBBox>,
+    pub required_features: Vec<String>,
+    pub optional_features: Vec<String>,
+    pub writingprogram: Option<String>,
+    pub source: Option<String>,
+    pub osmosis_replication_timestamp: Option<i64>,
+    pub osmosis_replication_sequence_number: Option<i64>,
+    pub osmosis_replication_base_url: Option<String>,
+}
+
+impl WireHeaderBlock {
+    /// Parse a HeaderBlock from decompressed protobuf bytes.
+    pub fn parse(data: &[u8]) -> Result<Self> {
+        use super::wire::Cursor;
+        let mut cursor = Cursor::new(data);
+        let mut bbox: Option<WireHeaderBBox> = None;
+        let mut required_features: Vec<String> = Vec::new();
+        let mut optional_features: Vec<String> = Vec::new();
+        let mut writingprogram: Option<String> = None;
+        let mut source: Option<String> = None;
+        let mut osmosis_replication_timestamp: Option<i64> = None;
+        let mut osmosis_replication_sequence_number: Option<i64> = None;
+        let mut osmosis_replication_base_url: Option<String> = None;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match field {
+                1 => {
+                    // bbox: HeaderBBox submessage
+                    let sub_data = cursor.read_len_delimited()?;
+                    bbox = Some(WireHeaderBBox::parse(sub_data)?);
+                }
+                4 => {
+                    // required_features: repeated string
+                    let bytes = cursor.read_len_delimited()?;
+                    let s = String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in required_features"))?;
+                    required_features.push(s);
+                }
+                5 => {
+                    // optional_features: repeated string
+                    let bytes = cursor.read_len_delimited()?;
+                    let s = String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in optional_features"))?;
+                    optional_features.push(s);
+                }
+                16 => {
+                    // writingprogram: string
+                    let bytes = cursor.read_len_delimited()?;
+                    writingprogram = Some(String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in writingprogram"))?);
+                }
+                17 => {
+                    // source: string
+                    let bytes = cursor.read_len_delimited()?;
+                    source = Some(String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in source"))?);
+                }
+                32 => {
+                    // osmosis_replication_timestamp: int64
+                    osmosis_replication_timestamp = Some(cursor.read_varint_i64()?);
+                }
+                33 => {
+                    // osmosis_replication_sequence_number: int64
+                    osmosis_replication_sequence_number = Some(cursor.read_varint_i64()?);
+                }
+                34 => {
+                    // osmosis_replication_base_url: string
+                    let bytes = cursor.read_len_delimited()?;
+                    osmosis_replication_base_url = Some(String::from_utf8(bytes.to_vec())
+                        .map_err(|_| new_wire_error("invalid UTF-8 in replication_base_url"))?);
+                }
+                _ => cursor.skip_field(wire_type)?,
+            }
+        }
+
+        Ok(WireHeaderBlock {
+            bbox,
+            required_features,
+            optional_features,
+            writingprogram,
+            source,
+            osmosis_replication_timestamp,
+            osmosis_replication_sequence_number,
+            osmosis_replication_base_url,
+        })
+    }
+}
 
 /// A `HeaderBlock`. It contains metadata about following [`PrimitiveBlock`]s.
 #[derive(Clone, Debug)]
 pub struct HeaderBlock {
-    header: proto::HeaderBlock,
+    header: WireHeaderBlock,
 }
 
 impl HeaderBlock {
-    pub fn new(header: proto::HeaderBlock) -> HeaderBlock {
+    pub(crate) fn new(header: WireHeaderBlock) -> HeaderBlock {
         HeaderBlock { header }
+    }
+
+    /// Parse a HeaderBlock from decompressed protobuf bytes.
+    pub(crate) fn parse_from_bytes(data: &[u8]) -> Result<HeaderBlock> {
+        WireHeaderBlock::parse(data).map(HeaderBlock::new)
     }
 
     /// Returns the (optional) bounding box of the included features.

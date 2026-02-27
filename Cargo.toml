@@ -66,7 +66,6 @@ linux-io-uring = ["dep:io-uring", "dep:libc"]
 bytes = "1"
 flate2 = { version = "1.0", default-features = false }
 memmap2 = "0.9"
-prost = "0.14"
 rayon = "1.5"
 rustc-hash = "2"
 zstd = "0.13"
@@ -76,10 +75,6 @@ serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
 io-uring = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
-
-[build-dependencies]
-prost-build = "0.14"
-protox = "0.9"
 
 [dev-dependencies]
 tempfile = "3"

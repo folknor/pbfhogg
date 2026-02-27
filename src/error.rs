@@ -5,8 +5,6 @@ use std::result;
 use std::str;
 use std::str::Utf8Error;
 
-use prost::DecodeError;
-
 // Error data structures are modeled on the `csv` crate by BurntSushi.
 // Manual Display/StdError impls are intentional — avoids a thiserror dependency
 // for a small, stable enum that rarely changes.
@@ -19,11 +17,6 @@ pub(crate) fn new_error(kind: ErrorKind) -> Error {
 #[cold]
 pub(crate) fn new_blob_error(kind: BlobError) -> Error {
     Error(Box::new(ErrorKind::Blob(kind)))
-}
-
-#[cold]
-pub(crate) fn new_protobuf_error(err: DecodeError, location: &'static str) -> Error {
-    Error(Box::new(ErrorKind::Protobuf { err, location }))
 }
 
 /// A type alias for `Result<T, pbfhogg::Error>`.
@@ -53,11 +46,6 @@ impl Error {
 pub enum ErrorKind {
     /// An error for I/O operations.
     Io(io::Error),
-    /// An error that occurs when decoding a protobuf message.
-    Protobuf {
-        err: DecodeError,
-        location: &'static str,
-    },
     /// The stringtable contains an entry at `index` that could not be decoded to a valid UTF-8
     /// string.
     StringtableUtf8 { err: Utf8Error, index: usize },
@@ -117,7 +105,6 @@ impl StdError for Error {
     fn source(&self) -> Option<&(dyn StdError + 'static)> {
         match *self.0 {
             ErrorKind::Io(ref err) => Some(err),
-            ErrorKind::Protobuf { ref err, .. } => Some(err),
             ErrorKind::StringtableUtf8 { ref err, .. } => Some(err),
             ErrorKind::StringtableIndexOutOfBounds { .. } => None,
             ErrorKind::Blob(_) => None,
@@ -131,9 +118,6 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match *self.0 {
             ErrorKind::Io(ref err) => err.fmt(f),
-            ErrorKind::Protobuf { ref err, location } => {
-                write!(f, "protobuf error at '{location}': {err}")
-            }
             ErrorKind::StringtableUtf8 { ref err, index } => {
                 write!(f, "invalid UTF-8 at string table index {index}: {err}")
             }

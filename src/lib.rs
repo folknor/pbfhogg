@@ -81,11 +81,6 @@ pub mod osc;
 pub(crate) mod blob_index;
 mod error;
 
-#[allow(clippy::all, clippy::pedantic, clippy::restriction)]
-pub(crate) mod proto {
-    include!(concat!(env!("OUT_DIR"), "/mod.rs"));
-}
-
 // ---------------------------------------------------------------------------
 // Public API re-exports
 //

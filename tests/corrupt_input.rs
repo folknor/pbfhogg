@@ -89,7 +89,7 @@ fn header_too_big() {
     }
 }
 
-/// Valid header length but too few bytes for the header data → protobuf parse error.
+/// Valid header length but too few bytes for the header data → wire-format parse error.
 #[test]
 fn truncated_header_data() {
     let mut data = Vec::new();
@@ -98,12 +98,12 @@ fn truncated_header_data() {
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
     match err.into_kind() {
-        ErrorKind::Protobuf { .. } => {}
-        other => panic!("expected Protobuf error for truncated header, got {other:?}"),
+        ErrorKind::WireFormat { .. } => {}
+        other => panic!("expected WireFormat error for truncated header, got {other:?}"),
     }
 }
 
-/// Valid header length with garbage bytes → protobuf parse error.
+/// Valid header length with garbage bytes → wire-format parse error.
 #[test]
 fn garbage_header() {
     let mut data = Vec::new();
@@ -112,8 +112,8 @@ fn garbage_header() {
     let mut reader = BlobReader::new(Cursor::new(data));
     let err = reader.next().unwrap().unwrap_err();
     match err.into_kind() {
-        ErrorKind::Protobuf { .. } => {}
-        other => panic!("expected Protobuf error for garbage header, got {other:?}"),
+        ErrorKind::WireFormat { .. } => {}
+        other => panic!("expected WireFormat error for garbage header, got {other:?}"),
     }
 }
 

@@ -12,12 +12,10 @@
 //! compression entirely.
 
 use crate::blob_index;
-use crate::proto;
 use crate::write::file_writer::FileWriter;
-use bytes::Bytes;
+use crate::write::wire::{encode_bytes_field, encode_int32_field};
 use flate2::write::ZlibEncoder;
 use flate2::Compression as FlateCompression;
-use prost::Message;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
@@ -589,18 +587,15 @@ pub(crate) fn frame_blob(
     compression: &Compression,
     indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
-    // Step 1: Build the Blob protobuf (optionally compressed)
-    let mut blob = proto::Blob::default();
+    // Step 1: Encode the Blob protobuf (optionally compressed)
+    let mut blob_buf = Vec::new();
     match compression {
         Compression::None => {
-            blob.data = Some(proto::blob::Data::Raw(Bytes::copy_from_slice(
-                uncompressed,
-            )));
+            // Blob field 1: raw (bytes, len-delimited)
+            encode_bytes_field(&mut blob_buf, 1, uncompressed);
         }
         Compression::Zlib(level) => {
             // Pre-allocate for ~2x compression ratio (conservative estimate).
-            // Zlib on OSM data typically achieves 2–10x. Starting from the
-            // worst case avoids progressive reallocation during encoding.
             let estimated_compressed_size = uncompressed.len() / 2;
             let mut encoder = ZlibEncoder::new(
                 Vec::with_capacity(estimated_compressed_size),
@@ -608,44 +603,60 @@ pub(crate) fn frame_blob(
             );
             encoder.write_all(uncompressed)?;
             let compressed = encoder.finish()?;
-            blob.raw_size = Some(i32::try_from(uncompressed.len()).map_err(|_| {
+            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
-            })?);
-            blob.data = Some(proto::blob::Data::ZlibData(Bytes::from(compressed)));
+            })?;
+            // Blob field 2: raw_size (int32, varint)
+            encode_int32_field(&mut blob_buf, 2, raw_size);
+            // Blob field 3: zlib_data (bytes, len-delimited)
+            encode_bytes_field(&mut blob_buf, 3, &compressed);
         }
         Compression::Zstd(level) => {
             let compressed =
                 zstd::bulk::compress(uncompressed, *level).map_err(io::Error::other)?;
-            blob.raw_size = Some(i32::try_from(uncompressed.len()).map_err(|_| {
+            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
-            })?);
-            blob.data = Some(proto::blob::Data::ZstdData(Bytes::from(compressed)));
+            })?;
+            // Blob field 2: raw_size (int32, varint)
+            encode_int32_field(&mut blob_buf, 2, raw_size);
+            // Blob field 7: zstd_data (bytes, len-delimited)
+            encode_bytes_field(&mut blob_buf, 7, &compressed);
         }
     }
 
-    let blob_bytes = blob.encode_to_vec();
-
-    // Step 2: Build the BlobHeader
-    let header = proto::BlobHeader {
-        r#type: blob_type.to_string(),
-        datasize: i32::try_from(blob_bytes.len()).map_err(|_| {
-            io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
-        })?,
-        indexdata: indexdata.map(Bytes::copy_from_slice),
-    };
-
-    let header_bytes = header.encode_to_vec();
+    // Step 2: Encode the BlobHeader
+    let datasize = i32::try_from(blob_buf.len()).map_err(|_| {
+        io::Error::other(format!("blob datasize overflow: {} bytes", blob_buf.len()))
+    })?;
+    let header_bytes = encode_blob_header(blob_type, datasize, indexdata);
 
     // Step 3: Assemble [4-byte BE header_len][BlobHeader][Blob]
     let header_len = u32::try_from(header_bytes.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;
-    let total_len = 4 + header_bytes.len() + blob_bytes.len();
+    let total_len = 4 + header_bytes.len() + blob_buf.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
     out.extend_from_slice(&header_bytes);
-    out.extend_from_slice(&blob_bytes);
+    out.extend_from_slice(&blob_buf);
 
     Ok(out)
+}
+
+/// Encode a BlobHeader to wire-format bytes.
+///
+/// BlobHeader fields: type (string, field 1), indexdata (bytes, field 2),
+/// datasize (int32, field 3).
+fn encode_blob_header(blob_type: &str, datasize: i32, indexdata: Option<&[u8]>) -> Vec<u8> {
+    let mut buf = Vec::new();
+    // Field 1: type (string = len-delimited bytes)
+    encode_bytes_field(&mut buf, 1, blob_type.as_bytes());
+    // Field 2: indexdata (optional bytes)
+    if let Some(data) = indexdata {
+        encode_bytes_field(&mut buf, 2, data);
+    }
+    // Field 3: datasize (int32 varint)
+    encode_int32_field(&mut buf, 3, datasize);
+    buf
 }
 
 /// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
@@ -660,15 +671,10 @@ pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
 ) -> io::Result<Vec<u8>> {
-    let header = proto::BlobHeader {
-        r#type: "OSMData".to_string(),
-        datasize: i32::try_from(blob_bytes.len()).map_err(|_| {
-            io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
-        })?,
-        indexdata: Some(Bytes::copy_from_slice(indexdata)),
-    };
-
-    let header_bytes = header.encode_to_vec();
+    let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
+        io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
+    })?;
+    let header_bytes = encode_blob_header("OSMData", datasize, Some(indexdata));
 
     let header_len = u32::try_from(header_bytes.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;

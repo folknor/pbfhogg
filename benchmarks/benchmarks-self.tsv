@@ -54,3 +54,8 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	pipelined	1272	52489653	6616526	46103	483
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	mmap	2860	52489653	6616526	46103	483
 2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	blobreader	2864	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	sequential	2837	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	parallel	333	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	pipelined	1354	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	mmap	3783	52489653	6616526	46103	483
+2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	blobreader	2923	52489653	6616526	46103	483

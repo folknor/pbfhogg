@@ -55,7 +55,7 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 ## Workspace
 
 The repo is a Cargo workspace with two packages:
-- **`pbfhogg`** (root) — library crate. Read/write API, commands, protobuf codegen.
+- **`pbfhogg`** (root) — library crate. Read/write API, commands.
 - **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary.
 
 Library users who only need read/write can depend on `pbfhogg` with `default-features = false, features = ["rust-zlib"]` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
@@ -69,19 +69,16 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - `pipeline.rs`: 3-stage pipelined decoder (IO thread -> rayon pool -> reorder buffer)
 
 **Write path:** `BlockBuilder` (block_builder.rs) -> `PbfWriter` (writer.rs)
-- `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block. Dense nodes use prost; ways/relations use direct wire-format encoding via reusable scratch buffers (`wire.rs` primitives).
+- `BlockBuilder`: accumulates nodes/ways/relations, handles string table, delta encoding, dense packing. Max 8000 entities/block. One element type per block. All element types use direct wire-format encoding via reusable scratch buffers (`wire.rs` primitives).
 - `wire.rs`: write-side protobuf encoding primitives (varint, zigzag, field encoders, packed repeated fields). Mirrors the read-side `src/read/wire.rs` decoding primitives.
 - `PbfWriter`: blob framing, compression (zlib/zstd/none), raw passthrough for merges. Sync mode (`to_path`) or pipelined mode (`to_path_pipelined`) with parallel compression via rayon + reorder buffer. O_DIRECT variants (`to_path_direct`, `to_path_pipelined_direct`) bypass page cache. io_uring variant (`to_path_pipelined_uring`) uses registered buffers + WriteFixed for I/O-bound workloads.
 - `uring_writer.rs`: io_uring writer thread — `AlignedBufferPool` (64×256KB registered buffers), `UringState` (buffered accumulation + WriteFixed submission + CQE reaping)
-
-**Proto:** `src/proto/{fileformat,osmformat}.proto` compiled by `prost-build` + `protox` in `build.rs`
 
 ## Conventions
 
 - All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark TSV files record this automatically via the bench scripts.
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
-- `pub(crate) mod proto` is `#[allow(clippy::all)]` (generated code)
 - Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind). `MissingHeader` error if a PBF doesn't start with an OsmHeader blob.
 - Tests live in `tests/` (roundtrip.rs, roundtrip_real.rs) and inline in blob.rs/indexed.rs
 

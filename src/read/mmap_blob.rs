@@ -1,13 +1,12 @@
 //! Iterate over blobs from a memory map
 
 use super::blob::{
-    decode_blob, decompress_blob, BlobDecode, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE,
+    decode_headerblock, decompress_blob, BlobDecode, BlobType, ByteOffset,
+    WireBlob, WireBlobHeader, MAX_BLOB_HEADER_SIZE,
 };
 use super::block::{HeaderBlock, PrimitiveBlock};
-use crate::error::{new_blob_error, new_protobuf_error, BlobError, Result};
-use crate::proto;
+use crate::error::{new_blob_error, BlobError, Result};
 use bytes::Bytes;
-use prost::Message;
 use std::fs::File;
 use std::path::Path;
 
@@ -76,7 +75,7 @@ impl Mmap {
 /// A PBF blob from a memory map.
 #[derive(Clone, Debug)]
 pub struct MmapBlob {
-    header: proto::BlobHeader,
+    header: WireBlobHeader,
     data: Bytes,
     offset: ByteOffset,
 }
@@ -85,11 +84,10 @@ impl MmapBlob {
     /// Decodes the blob and tries to obtain the inner content (usually a [`HeaderBlock`] or a
     /// [`PrimitiveBlock`]). This operation might involve an expensive decompression step.
     pub fn decode(&self) -> Result<BlobDecode<'_>> {
-        let blob = proto::Blob::decode(self.data.clone())
-            .map_err(|e| new_protobuf_error(e, "blob content"))?;
-        match self.header.r#type.as_str() {
+        let blob = WireBlob::parse(&self.data)?;
+        match self.header.blob_type.as_str() {
             "OSMHeader" => {
-                let block = Box::new(HeaderBlock::new(decode_blob(&blob, None)?));
+                let block = Box::new(HeaderBlock::new(decode_headerblock(&blob, None)?));
                 Ok(BlobDecode::OsmHeader(block))
             }
             "OSMData" => {
@@ -104,7 +102,7 @@ impl MmapBlob {
     // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.r#type.as_str() {
+        match self.header.blob_type.as_str() {
             "OSMHeader" => BlobType::OsmHeader,
             "OSMData" => BlobType::OsmData,
             x => BlobType::Unknown(x),
@@ -312,36 +310,14 @@ impl Iterator for MmapBlobReader {
             return Some(Err(io_error.into()));
         }
 
-        // ---- OPTIMIZATION: Bytes::copy_from_slice() for header instead of Bytes::slice() ----
-        //
-        // Previously:
-        //   BlobHeader::parse_from_tokio_bytes(&slice.slice(4..(4 + header_size)))
-        //
-        // `slice` was a `Bytes` (from the `self.bytes.slice(self.offset..)` above), so
-        // calling `.slice(4..(4 + header_size))` on it triggered *another* atomic
-        // refcount increment on the shared mmap buffer's Arc.
-        //
-        // Now: we use `Bytes::copy_from_slice()` to create a small, independent Bytes
-        // from the header data (~100-200 bytes for a typical BlobHeader). This does a
-        // memcpy of ~200 bytes which completes in <100 ns -- far cheaper than an atomic
-        // refcount operation on a potentially contended cache line (~20-100 ns for the
-        // atomic itself, plus potential cache-line bouncing overhead).
-        //
-        // The copied Bytes is small, cache-local, and has its own independent refcount
-        // (which starts at 1 and is dropped at the end of this scope with no contention).
-        //
-        // Alternative considered: pass `&[u8]` directly to avoid the Bytes allocation
-        // entirely. Unfortunately, protobuf's `parse_from_tokio_bytes` requires `&Bytes`,
-        // not `&[u8]`, for its zero-copy deserialization path. We could use
-        // `parse_from_bytes` instead (which accepts `&[u8]`), but that copies internally
-        // anyway, so `copy_from_slice` + `parse_from_tokio_bytes` is equivalent and keeps
-        // the code consistent with the rest of the codebase.
-        let header_bytes = Bytes::copy_from_slice(&slice[4..4 + header_size]);
-        let header = match proto::BlobHeader::decode(header_bytes) {
+        // Parse the BlobHeader directly from &[u8] -- no Bytes allocation needed.
+        // The hand-rolled parser operates on raw byte slices, avoiding the atomic
+        // refcount overhead that the old Bytes-based protobuf path required.
+        let header = match WireBlobHeader::parse(&slice[4..4 + header_size]) {
             Ok(x) => x,
             Err(e) => {
                 self.last_blob_ok = false;
-                return Some(Err(new_protobuf_error(e, "blob header")));
+                return Some(Err(e));
             }
         };
 

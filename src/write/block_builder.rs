@@ -6,17 +6,15 @@
 //! Handles string table construction, delta encoding, dense node packing,
 //! and block size limits (8000 entities per block, matching osmium).
 
-use crate::proto;
 use crate::PrimitiveBlock;
-use bytes::Bytes;
-use prost::Message;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::io;
 
 use super::wire::{
     encode_bytes_field, encode_bytes_field_always, encode_int64_field,
-    encode_varint, zigzag_encode_64,
+    encode_packed_bool, encode_packed_int32, encode_packed_sint32, encode_packed_sint64,
+    encode_sint64_field_always, encode_varint, zigzag_encode_64,
 };
 
 /// Maximum number of entities in a single `PrimitiveBlock`.
@@ -130,10 +128,15 @@ impl StringTable {
         self.strings.push(String::new());
     }
 
-    fn into_proto(self) -> proto::StringTable {
-        let mut st = proto::StringTable::default();
-        st.s.extend(self.strings.into_iter().map(|s| Bytes::from(s.into_bytes())));
-        st
+    /// Encode the string table directly to wire format bytes.
+    ///
+    /// StringTable has one field: `repeated bytes s = 1;`
+    fn encode_to(&self, buf: &mut Vec<u8>, scratch: &mut Vec<u8>) {
+        scratch.clear();
+        for s in &self.strings {
+            encode_bytes_field_always(scratch, 1, s.as_bytes());
+        }
+        encode_bytes_field(buf, 1, scratch);
     }
 }
 
@@ -191,15 +194,18 @@ pub(crate) struct RawMetadata {
     pub visible: bool,
 }
 
-fn member_type_to_proto(mt: MemberType) -> proto::relation::MemberType {
+/// Map a MemberType to its protobuf enum integer value.
+///
+/// MemberType enum: NODE=0, WAY=1, RELATION=2.
+fn member_type_value(mt: MemberType) -> i32 {
     match mt {
-        MemberType::Node => proto::relation::MemberType::Node,
-        MemberType::Way => proto::relation::MemberType::Way,
-        MemberType::Relation => proto::relation::MemberType::Relation,
+        MemberType::Node => 0,
+        MemberType::Way => 1,
+        MemberType::Relation => 2,
         // Unknown member types from newer PBF producers — round-trip as Node
         // since the protobuf enum has no "unknown" value. Callers should filter
         // these out before writing if lossless preservation is needed.
-        MemberType::Unknown(_) => proto::relation::MemberType::Node,
+        MemberType::Unknown(_) => 0,
     }
 }
 
@@ -769,39 +775,23 @@ impl BlockBuilder {
             None => return Ok(None),
         };
 
+        // All block types: direct wire-format encoding
+        self.encode_buf.clear();
+
+        // PrimitiveBlock field 1: StringTable submessage
+        self.string_table.encode_to(&mut self.encode_buf, &mut self.elem_scratch);
+
         match block_type {
             BlockType::DenseNodes => {
-                // DenseNodes: use prost encoding (unchanged)
-                let mut block = proto::PrimitiveBlock::default();
-
-                let string_table =
-                    std::mem::replace(&mut self.string_table, StringTable::new());
-                block.stringtable = string_table.into_proto();
-
+                // PrimitiveBlock field 2: PrimitiveGroup submessage
+                // containing DenseNodes (field 2 of PrimitiveGroup).
+                //
                 // Note: we do NOT set granularity, lat_offset, lon_offset, or
                 // date_granularity. Omitting them uses the protobuf defaults
                 // (granularity=100, offsets=0, date_gran=1000).
-
-                let group = self.take_dense_nodes_group();
-                block.primitivegroup.push(group);
-
-                self.encode_buf.clear();
-                block
-                    .encode(&mut self.encode_buf)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                self.encode_dense_nodes_group();
             }
             BlockType::Ways | BlockType::Relations => {
-                // Ways/Relations: direct wire-format encoding (no prost intermediary)
-                self.encode_buf.clear();
-
-                // PrimitiveBlock field 1: StringTable submessage
-                // Encode the StringTable body into elem_scratch, then wrap it.
-                self.elem_scratch.clear();
-                for s in &self.string_table.strings {
-                    encode_bytes_field_always(&mut self.elem_scratch, 1, s.as_bytes());
-                }
-                encode_bytes_field(&mut self.encode_buf, 1, &self.elem_scratch);
-
                 // PrimitiveBlock field 2: PrimitiveGroup submessage
                 // group_buf already contains the Way/Relation field entries
                 // that form the body of the PrimitiveGroup.
@@ -813,42 +803,62 @@ impl BlockBuilder {
         Ok(Some(&self.encode_buf))
     }
 
-    /// Move the dense node data into a `PrimitiveGroup`.
+    /// Encode DenseNodes directly to wire format into `encode_buf`.
     ///
-    /// Uses `std::mem::take()` to transfer ownership of the filled Vecs into
-    /// the protobuf message. `take()` replaces each Vec with `Vec::new()`
-    /// (zero capacity), so after this call all dense_* fields are empty Vecs
-    /// with no heap allocation.
+    /// Encodes PrimitiveGroup (field 2 of PrimitiveBlock) containing
+    /// DenseNodes (field 2 of PrimitiveGroup) with all packed fields.
     ///
-    /// This means the dense_* fields are left at zero capacity after this call.
-    /// `reset()` detects this and re-allocates them with `Vec::with_capacity`,
-    /// so the next block-building cycle starts with the same pre-allocation as
-    /// `new()`.
-    fn take_dense_nodes_group(&mut self) -> proto::PrimitiveGroup {
-        let mut group = proto::PrimitiveGroup::default();
-        let denseinfo = if self.has_dense_metadata {
-            Some(proto::DenseInfo {
-                version: std::mem::take(&mut self.dense_versions),
-                timestamp: std::mem::take(&mut self.dense_timestamps),
-                changeset: std::mem::take(&mut self.dense_changesets),
-                uid: std::mem::take(&mut self.dense_uids),
-                user_sid: std::mem::take(&mut self.dense_user_sids),
-                visible: std::mem::take(&mut self.dense_visibles),
-            })
-        } else {
-            None
-        };
+    /// DenseNodes fields:
+    ///   id (sint64 packed, field 1), denseinfo (submessage, field 5),
+    ///   lat (sint64 packed, field 8), lon (sint64 packed, field 9),
+    ///   keys_vals (int32 packed, field 10).
+    ///
+    /// DenseInfo fields:
+    ///   version (int32 packed, field 1), timestamp (sint64 packed, field 2),
+    ///   changeset (sint64 packed, field 3), uid (sint32 packed, field 4),
+    ///   user_sid (sint32 packed, field 5), visible (bool packed, field 6).
+    fn encode_dense_nodes_group(&mut self) {
+        // Build the DenseNodes body into group_buf (reused scratch)
+        self.group_buf.clear();
 
-        let dense = proto::DenseNodes {
-            id: std::mem::take(&mut self.dense_ids),
-            lat: std::mem::take(&mut self.dense_lats),
-            lon: std::mem::take(&mut self.dense_lons),
-            keys_vals: std::mem::take(&mut self.dense_keys_vals),
-            denseinfo,
-        };
+        // DenseNodes field 1: id (packed sint64)
+        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 1, &self.dense_ids);
 
-        group.dense = Some(dense);
-        group
+        // DenseNodes field 5: denseinfo (submessage)
+        if self.has_dense_metadata {
+            // Build DenseInfo into elem_scratch
+            self.elem_scratch.clear();
+            let mut packed_scratch = Vec::new();
+
+            // DenseInfo field 1: version (packed int32)
+            encode_packed_int32(&mut self.elem_scratch, &mut packed_scratch, 1, &self.dense_versions);
+            // DenseInfo field 2: timestamp (packed sint64)
+            encode_packed_sint64(&mut self.elem_scratch, &mut packed_scratch, 2, &self.dense_timestamps);
+            // DenseInfo field 3: changeset (packed sint64)
+            encode_packed_sint64(&mut self.elem_scratch, &mut packed_scratch, 3, &self.dense_changesets);
+            // DenseInfo field 4: uid (packed sint32)
+            encode_packed_sint32(&mut self.elem_scratch, &mut packed_scratch, 4, &self.dense_uids);
+            // DenseInfo field 5: user_sid (packed sint32)
+            encode_packed_sint32(&mut self.elem_scratch, &mut packed_scratch, 5, &self.dense_user_sids);
+            // DenseInfo field 6: visible (packed bool)
+            encode_packed_bool(&mut self.elem_scratch, &mut packed_scratch, 6, &self.dense_visibles);
+
+            encode_bytes_field(&mut self.group_buf, 5, &self.elem_scratch);
+        }
+
+        // DenseNodes field 8: lat (packed sint64)
+        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 8, &self.dense_lats);
+        // DenseNodes field 9: lon (packed sint64)
+        encode_packed_sint64(&mut self.group_buf, &mut self.elem_scratch, 9, &self.dense_lons);
+        // DenseNodes field 10: keys_vals (packed int32)
+        encode_packed_int32(&mut self.group_buf, &mut self.elem_scratch, 10, &self.dense_keys_vals);
+
+        // Wrap DenseNodes as PrimitiveGroup field 2 (submessage)
+        self.elem_scratch.clear();
+        encode_bytes_field(&mut self.elem_scratch, 2, &self.group_buf);
+
+        // Write PrimitiveGroup as PrimitiveBlock field 2
+        encode_bytes_field(&mut self.encode_buf, 2, &self.elem_scratch);
     }
 
     fn reset(&mut self) {
@@ -868,20 +878,17 @@ impl BlockBuilder {
         // Clear wire-format accumulators for ways/relations.
         self.group_buf.clear();
 
-        // Re-allocate dense Vecs that were consumed by take_dense_nodes_group().
-        // mem::take() leaves zero capacity; this restores the pre-allocation from new().
-        if self.dense_ids.capacity() == 0 {
-            self.dense_ids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_lats = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_lons = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_keys_vals = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK * 2);
-            self.dense_versions = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_timestamps = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_changesets = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_uids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_user_sids = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-            self.dense_visibles = Vec::with_capacity(MAX_ENTITIES_PER_BLOCK);
-        }
+        // Clear dense Vecs (encode_dense_nodes_group reads without consuming).
+        self.dense_ids.clear();
+        self.dense_lats.clear();
+        self.dense_lons.clear();
+        self.dense_keys_vals.clear();
+        self.dense_versions.clear();
+        self.dense_timestamps.clear();
+        self.dense_changesets.clear();
+        self.dense_uids.clear();
+        self.dense_user_sids.clear();
+        self.dense_visibles.clear();
 
         // Reset string table (reuse allocation, clear content).
         self.string_table.clear();
@@ -1167,7 +1174,7 @@ fn encode_relation(
         for m in members {
             // Protobuf int32 wire encoding: sign-extend i32 → i64 → u64.
             // MemberType enum values are 0/1/2 so no actual sign extension occurs.
-            let mt = member_type_to_proto(m.id.member_type()) as i32;
+            let mt = member_type_value(m.id.member_type());
             #[allow(clippy::cast_sign_loss)]
             encode_varint(packed, mt as u64);
         }
@@ -1337,56 +1344,60 @@ impl<'a> HeaderBuilder<'a> {
 
     /// Serialize the header into protobuf bytes suitable for
     /// [`PbfWriter::write_header`](crate::writer::PbfWriter::write_header).
+    ///
+    /// HeaderBlock fields: bbox (submessage, field 1),
+    /// required_features (repeated string, field 4),
+    /// optional_features (repeated string, field 5),
+    /// writingprogram (string, field 16), source (string, field 17),
+    /// osmosis_replication_timestamp (int64, field 32),
+    /// osmosis_replication_sequence_number (int64, field 33),
+    /// osmosis_replication_base_url (string, field 34).
     #[allow(clippy::cast_possible_truncation)]
     pub fn build(self) -> io::Result<Vec<u8>> {
-        let mut header = proto::HeaderBlock::default();
+        let mut buf = Vec::new();
 
-        // Required features — every PBF reader must support these
-        header
-            .required_features
-            .push("OsmSchema-V0.6".to_string());
-        header
-            .required_features
-            .push("DenseNodes".to_string());
-
-        // Sort flag
-        if self.sorted {
-            header
-                .optional_features
-                .push(crate::HeaderBlock::SORT_TYPE_THEN_ID.to_string());
-        }
-
-        // Other optional features
-        for feature in &self.optional_features {
-            header
-                .optional_features
-                .push((*feature).to_string());
-        }
-
-        // Writing program
-        header.writingprogram = Some(self.writing_program.to_string());
-
-        // Bounding box (nanodegrees)
+        // Field 1: bbox (HeaderBBox submessage, optional)
+        // HeaderBBox: left (sint64, field 1), right (sint64, field 2),
+        //             top (sint64, field 3), bottom (sint64, field 4).
         if let Some((left, bottom, right, top)) = self.bbox {
-            header.bbox = Some(proto::HeaderBBox {
-                left: (left * 1e9).round() as i64,
-                right: (right * 1e9).round() as i64,
-                top: (top * 1e9).round() as i64,
-                bottom: (bottom * 1e9).round() as i64,
-            });
+            let mut bbox_buf = Vec::new();
+            encode_sint64_field_always(&mut bbox_buf, 1, (left * 1e9).round() as i64);
+            encode_sint64_field_always(&mut bbox_buf, 2, (right * 1e9).round() as i64);
+            encode_sint64_field_always(&mut bbox_buf, 3, (top * 1e9).round() as i64);
+            encode_sint64_field_always(&mut bbox_buf, 4, (bottom * 1e9).round() as i64);
+            encode_bytes_field(&mut buf, 1, &bbox_buf);
         }
 
-        // Replication metadata
+        // Field 4: required_features (repeated string)
+        encode_bytes_field(&mut buf, 4, b"OsmSchema-V0.6");
+        encode_bytes_field(&mut buf, 4, b"DenseNodes");
+
+        // Field 5: optional_features (repeated string)
+        if self.sorted {
+            encode_bytes_field(&mut buf, 5, crate::HeaderBlock::SORT_TYPE_THEN_ID.as_bytes());
+        }
+        for feature in &self.optional_features {
+            encode_bytes_field(&mut buf, 5, feature.as_bytes());
+        }
+
+        // Field 16: writingprogram (string)
+        encode_bytes_field(&mut buf, 16, self.writing_program.as_bytes());
+
+        // Field 32: osmosis_replication_timestamp (int64)
         if let Some(ts) = self.replication_timestamp {
-            header.osmosis_replication_timestamp = Some(ts);
-        }
-        if let Some(seq) = self.replication_sequence_number {
-            header.osmosis_replication_sequence_number = Some(seq);
-        }
-        if let Some(url) = self.replication_base_url {
-            header.osmosis_replication_base_url = Some(url.to_string());
+            encode_int64_field(&mut buf, 32, ts);
         }
 
-        Ok(header.encode_to_vec())
+        // Field 33: osmosis_replication_sequence_number (int64)
+        if let Some(seq) = self.replication_sequence_number {
+            encode_int64_field(&mut buf, 33, seq);
+        }
+
+        // Field 34: osmosis_replication_base_url (string)
+        if let Some(url) = self.replication_base_url {
+            encode_bytes_field(&mut buf, 34, url.as_bytes());
+        }
+
+        Ok(buf)
     }
 }

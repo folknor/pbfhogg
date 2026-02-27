@@ -328,69 +328,11 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     - The Dense mmap index variant avoids this entirely (direct indexing, no
       hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
 
-- [ ] **Remove prost dependency.** Replace prost-generated code with hand-rolled
-  wire-format encoding/decoding for all remaining protobuf messages. Eliminates
-  prost (runtime), prost-build + protox (build-time codegen), and the `build.rs`
-  codegen step entirely.
-
-  **Already hand-rolled (read hot path):**
-  - `PrimitiveBlock` decode: `WireBlock`, `WireGroup`, `WireDenseNodes`,
-    `WireNode`, `WireWay`, `WireRelation` in `src/read/wire.rs` + `block.rs`.
-    Zero-copy, zero-alloc iteration via `PackedIter` and `WireMessageIter`.
-  - Way/relation encode: direct wire-format in `src/write/wire.rs` +
-    `block_builder.rs` (lines 794+). Already bypasses prost for the write
-    hot path.
-
-  **Still using prost (6 message types):**
-
-  | Message | Where | Direction | Frequency |
-  |---------|-------|-----------|-----------|
-  | `BlobHeader` | `blob.rs:355,449`, `mmap_blob.rs:340` | decode | Every blob (~7K/Denmark, ~2.5M/planet) |
-  | `Blob` | `blob.rs:449,763,776,788,797,855,951` | decode | Every blob |
-  | `HeaderBlock` | `blob.rs:953,941` via `decode_blob<T>` | decode | Once per file |
-  | `DenseNodes` + `DenseInfo` + `StringTable` + `PrimitiveBlock` | `block_builder.rs:775-850` | encode | Every node block written |
-  | `Blob` + `BlobHeader` | `writer.rs:593-665` | encode | Every output blob |
-  | `HeaderBlock` + `HeaderBBox` | `block_builder.rs:1342-1380` | encode | Once per output file |
-
-  **Decode side — BlobHeader and Blob:** These are small, fixed-structure
-  messages (~100 bytes each). `BlobHeader` has 3 fields (type, indexdata,
-  datasize). `Blob` has 4 fields (raw, raw_size, zlib_data, zstd_data).
-  Hand-rolling these is straightforward using the existing `read/wire.rs`
-  primitives (varint, len-delimited field). Replaces `prost::Message::decode`
-  with direct field-by-field parsing.
-
-  **Decode side — HeaderBlock:** Parsed once per file. More fields (bbox,
-  required_features, optional_features, writingprogram, source,
-  osmosis_replication_*) but still a simple flat message. Low priority since
-  it's not on the hot path.
-
-  **Encode side — DenseNodes:** The last prost-encoded hot path. Currently
-  builds `proto::DenseNodes`, `proto::DenseInfo`, `proto::StringTable`,
-  wraps in `proto::PrimitiveGroup` + `proto::PrimitiveBlock`, then
-  `Message::encode()`. Replace with direct wire-format encoding using
-  `write/wire.rs` primitives, same pattern as ways/relations already use.
-  This eliminates intermediate Vec allocations from the prost structs.
-
-  **Encode side — Blob/BlobHeader framing:** `frame_blob()` in `writer.rs`
-  builds `proto::Blob` + `proto::BlobHeader` then encodes. Simple flat
-  messages, straightforward to hand-roll.
-
-  **Benefits:**
-  - Eliminates 3 dependencies: `prost` (runtime), `prost-build` + `protox`
-    (build-time). Faster clean builds, smaller dependency tree.
-  - Removes `build.rs` codegen step and `src/proto/*.proto` files.
-  - Removes `pub(crate) mod proto` with its `#[allow(clippy::all)]` blanket.
-  - Full control over DenseNodes encoding (potential for further optimization).
-  - The `.proto` files are stable (OSM PBF format hasn't changed in years) —
-    no need for codegen flexibility.
-
-  **Implementation order:**
-  1. BlobHeader decode (small, every-blob hot path, most impact)
-  2. Blob decode (small, every-blob hot path)
-  3. Blob + BlobHeader encode (writer framing)
-  4. DenseNodes + StringTable + PrimitiveBlock encode (write hot path)
-  5. HeaderBlock decode + encode (once per file, lowest priority)
-  6. Remove prost/prost-build/protox deps, build.rs, proto files
+- [x] **Remove prost dependency.** Replaced all prost-generated code with
+  hand-rolled wire-format encoding/decoding. Eliminated prost (runtime),
+  prost-build + protox (build-time codegen), build.rs, and src/proto/.
+  Write benchmark improved ~11% (sync none 7.1s→6.2s, pipelined floor
+  7.0s→6.2s) from eliminating DenseNodes/Blob prost overhead.
 
 - [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
   / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with

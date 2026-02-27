@@ -32,7 +32,7 @@ The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmar
 ## Scripts
 
 Remaining scripts:
-- `scripts/build.sh` — build release binary (still used by verify scripts)
+- `scripts/build.sh` — build release binary
 - `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
 - `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
 - `scripts/run-hotpath-germany.sh` — Germany scale hotpath profiling
@@ -51,22 +51,24 @@ dev run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.
 ```
 There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
 
-## Verify scripts
+## Verify subcommands
 
-Cross-validation scripts live in `verify/`. Each compares pbfhogg output against osmium (and other tools where applicable) on real PBF data. They build pbfhogg internally.
-- `verify/merge.sh [base.pbf] [changes.osc.gz]` — merge vs osmium/osmosis/osmconvert
-- `verify/sort.sh [input.pbf]` — sort vs osmium sort
-- `verify/cat.sh [input.pbf]` — cat with type filters vs osmium cat
-- `verify/extract.sh [input.pbf]` — bbox extract (simple + complete-ways) vs osmium extract
-- `verify/derive-changes.sh [old.pbf] [changes.osc.gz]` — derive-changes roundtrip vs osmium
-- `verify/diff.sh [old.pbf] [changes.osc.gz]` — diff summary vs osmium diff
-- `verify/add-locations-to-ways.sh [input.pbf]` — add-locations-to-ways vs osmium
-- `verify/tags-filter.sh [input.pbf]` — tags-filter with 3 expressions vs osmium
-- `verify/getid-removeid.sh [input.pbf]` — getid vs osmium getid, removeid complement test
-- `verify/check-refs.sh [input.pbf]` — check-refs vs osmium check-refs
+Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconvert). All default to `--dataset denmark`.
+
+- `cargo dev verify sort [--dataset name] [--pbf path]` — sort vs osmium sort
+- `cargo dev verify cat [--dataset name] [--pbf path]` — cat with type filters vs osmium cat
+- `cargo dev verify extract [--dataset name] [--pbf path] [--bbox bbox]` — bbox extract (simple/complete/smart) vs osmium extract
+- `cargo dev verify tags-filter [--dataset name] [--pbf path]` — tags-filter with 3 expressions vs osmium
+- `cargo dev verify getid-removeid [--dataset name] [--pbf path]` — getid/removeid vs osmium getid
+- `cargo dev verify add-locations-to-ways [--dataset name] [--pbf path]` — add-locations-to-ways vs osmium
+- `cargo dev verify check-refs [--dataset name] [--pbf path]` — check-refs vs osmium check-refs
+- `cargo dev verify merge [--dataset name] [--pbf path] [--osc path]` — merge vs osmium/osmosis/osmconvert
+- `cargo dev verify derive-changes [--dataset name] [--pbf path] [--osc path]` — derive-changes roundtrip vs osmium
+- `cargo dev verify diff [--dataset name] [--pbf path] [--osc path]` — diff summary vs osmium diff
+- `cargo dev verify all [--dataset name] [--pbf path] [--osc path] [--bbox bbox]` — run all verify commands sequentially
 
 ## Benchmarking Rules
-- **NEVER run benchmark, profiling, or verify scripts in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench scripts, hotpath scripts, verify scripts, and any script that measures performance.
+- **NEVER run benchmark, profiling, or verify commands in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench subcommands, verify subcommands, hotpath scripts, and any script that measures performance.
 - When an optimization workflow requires multiple benchmark runs (baseline, mid-work, post-work), run each one **sequentially** and report results between runs. Do NOT launch them as parallel background tasks.
 
 ## Subagents

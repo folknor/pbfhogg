@@ -19,6 +19,18 @@ mod output;
 #[allow(dead_code)]
 mod preflight;
 mod tools;
+mod verify;
+mod verify_add_locations;
+mod verify_all;
+mod verify_cat;
+mod verify_check_refs;
+mod verify_derive_changes;
+mod verify_diff;
+mod verify_extract;
+mod verify_getid_removeid;
+mod verify_merge;
+mod verify_sort;
+mod verify_tags_filter;
 
 use std::path::PathBuf;
 use std::process;
@@ -54,6 +66,11 @@ enum Command {
     Bench {
         #[command(subcommand)]
         bench: BenchCommand,
+    },
+    /// Cross-validate pbfhogg output against reference tools
+    Verify {
+        #[command(subcommand)]
+        verify: VerifyCommand,
     },
     /// Query benchmark results
     Results {
@@ -245,10 +262,149 @@ enum BenchCommand {
     },
 }
 
+#[derive(Subcommand)]
+enum VerifyCommand {
+    /// Cross-validate merge against osmium/osmosis/osmconvert
+    Merge {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+    },
+    /// Cross-validate sort against osmium sort
+    Sort {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Cross-validate cat (type filters) against osmium cat
+    Cat {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Cross-validate extract (bbox strategies) against osmium extract
+    Extract {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Bounding box (left,bottom,right,top)
+        #[arg(long)]
+        bbox: Option<String>,
+    },
+    /// Cross-validate derive-changes roundtrip against osmium
+    DeriveChanges {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+    },
+    /// Cross-validate diff summary against osmium diff
+    Diff {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+    },
+    /// Cross-validate add-locations-to-ways against osmium
+    AddLocationsToWays {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Cross-validate tags-filter against osmium tags-filter
+    TagsFilter {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Cross-validate getid/removeid against osmium getid
+    GetidRemoveid {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Cross-validate check-refs against osmium check-refs
+    CheckRefs {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+    },
+    /// Run all verify commands sequentially
+    All {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+
+        /// Bounding box (left,bottom,right,top)
+        #[arg(long)]
+        bbox: Option<String>,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Bench { bench } => cmd_bench(bench),
+        Command::Verify { verify } => cmd_verify(verify),
         Command::Check { args } => cmd_check(&args),
         Command::Env => cmd_env(),
         Command::Run { args } => cmd_run(&args),
@@ -718,6 +874,214 @@ fn cmd_bench_all(
         file_mb,
         runs,
         &dataset,
+    )
+}
+
+fn cmd_verify(verify: VerifyCommand) -> Result<(), DevError> {
+    match verify {
+        VerifyCommand::Merge { dataset, pbf, osc } => cmd_verify_merge(dataset, pbf, osc),
+        VerifyCommand::Sort { dataset, pbf } => cmd_verify_sort(dataset, pbf),
+        VerifyCommand::Cat { dataset, pbf } => cmd_verify_cat(dataset, pbf),
+        VerifyCommand::Extract { dataset, pbf, bbox } => cmd_verify_extract(dataset, pbf, bbox),
+        VerifyCommand::DeriveChanges { dataset, pbf, osc } => {
+            cmd_verify_derive_changes(dataset, pbf, osc)
+        }
+        VerifyCommand::Diff { dataset, pbf, osc } => cmd_verify_diff(dataset, pbf, osc),
+        VerifyCommand::AddLocationsToWays { dataset, pbf } => {
+            cmd_verify_add_locations(dataset, pbf)
+        }
+        VerifyCommand::TagsFilter { dataset, pbf } => cmd_verify_tags_filter(dataset, pbf),
+        VerifyCommand::GetidRemoveid { dataset, pbf } => {
+            cmd_verify_getid_removeid(dataset, pbf)
+        }
+        VerifyCommand::CheckRefs { dataset, pbf } => cmd_verify_check_refs(dataset, pbf),
+        VerifyCommand::All {
+            dataset,
+            pbf,
+            osc,
+            bbox,
+        } => cmd_verify_all(dataset, pbf, osc, bbox),
+    }
+}
+
+fn cmd_verify_merge(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+
+    let osmosis = match tools::ensure_osmosis(&paths.data_dir, &ws.workspace_root) {
+        Ok(tools) => Some(tools),
+        Err(e) => {
+            output::verify_msg(&format!("osmosis not available (non-fatal): {e}"));
+            None
+        }
+    };
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_merge::run(&harness, &pbf_path, &osc_path, osmosis.as_ref())
+}
+
+fn cmd_verify_sort(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_sort::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_cat(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_cat::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_extract(
+    dataset: String,
+    pbf: Option<String>,
+    bbox: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let bbox = resolve_bbox(&bbox, &dataset, &dev_config)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_extract::run(&harness, &pbf_path, &bbox)
+}
+
+fn cmd_verify_derive_changes(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_derive_changes::run(&harness, &pbf_path, &osc_path)
+}
+
+fn cmd_verify_diff(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_diff::run(&harness, &pbf_path, &osc_path)
+}
+
+fn cmd_verify_add_locations(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_add_locations::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_tags_filter(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_tags_filter::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_getid_removeid(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_getid_removeid::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_check_refs(dataset: String, pbf: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_check_refs::run(&harness, &pbf_path)
+}
+
+fn cmd_verify_all(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+    bbox: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(&dev_config, &hostname, &ws.workspace_root, &ws.target_dir);
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    // OSC is optional for verify all — commands that need it are skipped.
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths).ok();
+
+    // bbox is optional — extract is skipped if not available.
+    let bbox_str = match bbox {
+        Some(b) => Some(b),
+        None => resolve_bbox(&None, &dataset, &dev_config).ok(),
+    };
+
+    let harness = verify::VerifyHarness::new(&paths, &ws.workspace_root, &ws.target_dir)?;
+    verify_all::run(
+        &harness,
+        &pbf_path,
+        osc_path.as_deref(),
+        bbox_str.as_deref(),
+        &paths.data_dir,
+        &ws.workspace_root,
     )
 }
 

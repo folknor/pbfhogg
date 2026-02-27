@@ -27,6 +27,10 @@ pub fn bench_msg(msg: &str) {
     println!("[bench]   {msg}");
 }
 
+pub fn verify_msg(msg: &str) {
+    println!("[verify]  {msg}");
+}
+
 /// Print an error message. Multi-line messages get each line prefixed.
 pub fn error(msg: &str) {
     for line in msg.lines() {

@@ -17,11 +17,17 @@ pub struct PlanetilerTools {
     pub bench_class_dir: PathBuf,
 }
 
+pub struct OsmosisTools {
+    pub osmosis: PathBuf,
+    pub java_home: PathBuf,
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
 
 const JDK_MAJOR: u32 = 25;
+const OSMOSIS_VERSION: &str = "0.49.2";
 
 // ---------------------------------------------------------------------------
 // Top-level entry point
@@ -44,6 +50,87 @@ pub fn ensure_planetiler(
         planetiler_jar,
         bench_class_dir,
     })
+}
+
+/// Ensure JDK + Osmosis are ready for merge verification.
+pub fn ensure_osmosis(
+    data_dir: &Path,
+    #[allow(unused_variables)] workspace_root: &Path,
+) -> Result<OsmosisTools, DevError> {
+    check_curl()?;
+
+    let java_home = data_dir.join("jdk");
+    ensure_jdk(data_dir)?;
+
+    let osmosis = ensure_osmosis_binary(data_dir)?;
+
+    Ok(OsmosisTools {
+        osmosis,
+        java_home,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Osmosis
+// ---------------------------------------------------------------------------
+
+fn ensure_osmosis_binary(data_dir: &Path) -> Result<PathBuf, DevError> {
+    let osmosis_dir = data_dir.join("osmosis");
+    let version_file = data_dir.join(".osmosis-version");
+    let osmosis_bin = osmosis_dir.join("bin/osmosis");
+
+    // Check cached version.
+    if osmosis_bin.exists() {
+        if let Ok(cached) = fs::read_to_string(&version_file) {
+            if cached.trim() == OSMOSIS_VERSION {
+                return Ok(osmosis_bin);
+            }
+        }
+    }
+
+    let download_url = format!(
+        "https://github.com/openstreetmap/osmosis/releases/download/{OSMOSIS_VERSION}/osmosis-{OSMOSIS_VERSION}.tgz"
+    );
+
+    // Download.
+    let tarball = data_dir.join("osmosis-download.tgz");
+    let tarball_str = tarball.display().to_string();
+    output::verify_msg(&format!("downloading Osmosis {OSMOSIS_VERSION}"));
+    run_curl(
+        &["-fsSL", "-o", &tarball_str, &download_url],
+        Path::new("."),
+    )?;
+
+    // Remove old dir and recreate.
+    if osmosis_dir.exists() {
+        fs::remove_dir_all(&osmosis_dir)?;
+    }
+    fs::create_dir_all(&osmosis_dir)?;
+
+    // Extract.
+    let osmosis_dir_str = osmosis_dir.display().to_string();
+    let captured = output::run_captured(
+        "tar",
+        &["xzf", &tarball_str, "-C", &osmosis_dir_str],
+        Path::new("."),
+    )?;
+    if !captured.status.success() {
+        let stderr = String::from_utf8_lossy(&captured.stderr);
+        return Err(DevError::Subprocess {
+            program: "tar".into(),
+            code: captured.status.code(),
+            stderr: stderr.into_owned(),
+        });
+    }
+
+    // Write version file.
+    fs::write(&version_file, OSMOSIS_VERSION)?;
+
+    // Clean up tarball.
+    let _ = fs::remove_file(&tarball);
+
+    output::verify_msg(&format!("installed Osmosis {OSMOSIS_VERSION}"));
+    Ok(osmosis_bin)
 }
 
 // ---------------------------------------------------------------------------

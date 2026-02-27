@@ -5,7 +5,8 @@ source "$(dirname "$0")/lib.sh"
 
 PBF="${1:-data/denmark-latest.osm.pbf}"
 RUNS="${2:-3}"
-LOG="benchmarks.tsv"
+LOG="benchmarks/benchmarks.tsv"
+HOST=$(hostname)
 
 if [ ! -f "$PBF" ]; then
     echo "PBF not found: $PBF"
@@ -41,7 +42,7 @@ echo ""
 
 # Create TSV header if needed
 if [ ! -f "$LOG" ]; then
-    printf "date\tcommit\tsubject\tpbf\ttool\tmode\telapsed_ms\tnodes\tways\trelations\tfile_mb\n" > "$LOG"
+    printf "date\thost\tcommit\tsubject\tpbf\ttool\tmode\telapsed_ms\tnodes\tways\trelations\tfile_mb\n" > "$LOG"
 fi
 
 STDERR_FILE=$(mktemp "$CARGO_TARGET_DIR/.bench_stderr.XXXXXX")
@@ -67,8 +68,8 @@ record_results() {
         if [ "$line" = "---" ]; then
             # Emit previous block if we had one
             if [ "$in_block" -eq 1 ] && [ -n "$tool" ]; then
-                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-                    "$DATE" "$COMMIT" "$SUBJECT" "$NAME" \
+                printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+                    "$DATE" "$HOST" "$COMMIT" "$SUBJECT" "$NAME" \
                     "$tool" "$mode" "$elapsed" "$nodes" "$ways" "$relations" "$fmb" >> "$LOG"
                 printf "  %-12s %-12s %6s ms\n" "$tool" "$mode" "$elapsed"
             fi
@@ -89,8 +90,8 @@ record_results() {
 
     # Emit last block
     if [ "$in_block" -eq 1 ] && [ -n "$tool" ]; then
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$DATE" "$COMMIT" "$SUBJECT" "$NAME" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$DATE" "$HOST" "$COMMIT" "$SUBJECT" "$NAME" \
             "$tool" "$mode" "$elapsed" "$nodes" "$ways" "$relations" "$fmb" >> "$LOG"
         printf "  %-12s %-12s %6s ms\n" "$tool" "$mode" "$elapsed"
     fi
@@ -122,8 +123,8 @@ if command -v osmium &>/dev/null; then
         fi
     done
     printf "  %-12s %-12s %6s ms\n" "osmium" "cat-opl" "$BEST_MS"
-    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$DATE" "$COMMIT" "$SUBJECT" "$NAME" \
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$DATE" "$HOST" "$COMMIT" "$SUBJECT" "$NAME" \
         "osmium" "cat-opl" "$BEST_MS" "-" "-" "-" "$FILE_MB" >> "$LOG"
     echo ""
 fi
@@ -164,8 +165,8 @@ if [ -f "$OSC" ]; then
         done
         rm -f "$OSMIUM_OUT"
         printf "  %-12s %-12s %6s ms\n" "osmium" "merge" "$BEST_MS"
-        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-            "$DATE" "$COMMIT" "$SUBJECT" "$NAME" \
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+            "$DATE" "$HOST" "$COMMIT" "$SUBJECT" "$NAME" \
             "osmium" "merge" "$BEST_MS" "-" "-" "-" "$FILE_MB" >> "$LOG"
         echo ""
     fi

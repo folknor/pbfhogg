@@ -16,8 +16,8 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 - `scripts/test.sh [args]` — run tests (passes args to `cargo test`)
 - `scripts/clippy.sh [args]` — run clippy lints (passes args to `cargo clippy`)
 - `scripts/run.sh [args]` — build + run the CLI (passes args to the `pbfhogg` binary)
-- `scripts/bench-self.sh [pbf] [runs]` — pbfhogg-only read benchmark (logs to benchmarks-self.tsv)
-- `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks-self-write.tsv)
+- `scripts/bench-self.sh [pbf] [runs]` — pbfhogg-only read benchmark (logs to benchmarks/benchmarks-self.tsv)
+- `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks/benchmarks-self-write.tsv)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
 - `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)

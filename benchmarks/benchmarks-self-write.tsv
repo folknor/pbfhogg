@@ -1,0 +1,36 @@
+date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-none	9034	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zlib:6	17386	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:3	10816	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:19	112423	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-none	9166	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zlib:6	17449	52489653	6616526	46103	483
+2026-02-25	plantasjen	d5c8095*	Add compression flag to hotpath scripts	denmark-latest	write-zstd:3	10925	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-none	9006	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-pipe-none	9020	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-zlib:6	17503	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-pipe-zlib:6	9133	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-zstd:3	11024	52489653	6616526	46103	483
+2026-02-25	plantasjen	3afbf59*	Hardcode hotpath scripts to versioned dataset, add check-refs + merge	denmark-latest	write-pipe-zstd:3	9067	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-none	10654	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-none	10521	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-zlib:6	20105	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-zlib:6	10657	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-zstd:3	12880	52489653	6616526	46103	483
+2026-02-26	plantasjen	8a824f6*	Add TODO for Sort.Type_then_ID library API ergonomics	denmark-latest	write-pipe-zstd:3	10735	52489653	6616526	46103	483
+2026-02-26	plantasjen	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-none	9646	52489653	6616526	46103	483
+2026-02-26	plantasjen	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-pipe-none	9627	52489653	6616526	46103	483
+2026-02-26	plantasjen	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-zlib:6	18916	52489653	6616526	46103	483
+2026-02-26	plantasjen	3383873	Merge branch 'main' of https://github.com/folknor/pbfhogg	denmark-latest	write-pipe-zlib:6	9223	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-none	7067	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-none	7064	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-zlib:6	15540	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-zlib:6	7126	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-zstd:3	9061	52489653	6616526	46103	483
+2026-02-26	plantasjen	aed93e0*	Cross-region profiling: 7 regions, timing + allocation analysis	denmark-latest	write-pipe-zstd:3	7036	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-none	6970	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-pipe-none	7014	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-zlib:6	15580	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-pipe-zlib:6	7074	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-zstd:3	9017	52489653	6616526	46103	483
+2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-pipe-zstd:3	7018	52489653	6616526	46103	483

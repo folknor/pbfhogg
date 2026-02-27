@@ -6,7 +6,8 @@ source "$(dirname "$0")/lib.sh"
 PBF="${1:-data/denmark-latest.osm.pbf}"
 RUNS="${2:-3}"
 COMPRESSION="${3:-none,zlib:6,zstd:3}"
-LOG="benchmarks-self-write.tsv"
+LOG="benchmarks/benchmarks-self-write.tsv"
+HOST=$(hostname)
 
 if [ ! -f "$PBF" ]; then
     echo "PBF not found: $PBF"
@@ -40,7 +41,7 @@ echo ""
 
 # Create TSV header if needed
 if [ ! -f "$LOG" ]; then
-    printf "date\tcommit\tsubject\tpbf\tmode\telapsed_ms\tnodes\tways\trelations\tfile_mb\n" > "$LOG"
+    printf "date\thost\tcommit\tsubject\tpbf\tmode\telapsed_ms\tnodes\tways\trelations\tfile_mb\n" > "$LOG"
 fi
 
 STDERR_FILE=$(mktemp "$CARGO_TARGET_DIR/.bench_self_write_stderr.XXXXXX")
@@ -55,8 +56,8 @@ mode="" elapsed="" nodes="" ways="" relations="" fmb=""
 while IFS= read -r line; do
     if [ "$line" = "---" ]; then
         if [ "$in_block" -eq 1 ] && [ -n "$mode" ]; then
-            printf "%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-                "$DATE" "$COMMIT" "$DIRTY" "$SUBJECT" "$NAME" \
+            printf "%s\t%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+                "$DATE" "$HOST" "$COMMIT" "$DIRTY" "$SUBJECT" "$NAME" \
                 "$mode" "$elapsed" "$nodes" "$ways" "$relations" "$fmb" >> "$LOG"
             printf "  %-14s %6s ms  (%s nodes, %s ways, %s rels)\n" \
                 "$mode" "$elapsed" "$nodes" "$ways" "$relations"
@@ -77,8 +78,8 @@ done < "$STDERR_FILE"
 
 # Emit last block
 if [ "$in_block" -eq 1 ] && [ -n "$mode" ]; then
-    printf "%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
-        "$DATE" "$COMMIT" "$DIRTY" "$SUBJECT" "$NAME" \
+    printf "%s\t%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$DATE" "$HOST" "$COMMIT" "$DIRTY" "$SUBJECT" "$NAME" \
         "$mode" "$elapsed" "$nodes" "$ways" "$relations" "$fmb" >> "$LOG"
     printf "  %-14s %6s ms  (%s nodes, %s ways, %s rels)\n" \
         "$mode" "$elapsed" "$nodes" "$ways" "$relations"

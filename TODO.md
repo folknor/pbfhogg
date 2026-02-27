@@ -95,44 +95,256 @@ zlib-compressed PBFs, any filesystem, any Linux 5.x+), so there are two tiers.
 
 ### Tier 1: Generic path (any Linux, zlib PBFs, any filesystem)
 
+Most users won't use io_uring or erofs. The generic buffered I/O path needs to
+be excellent on its own. Read throughput is already strong (0.31s parallel, 1.3s
+pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
+
+- [ ] **CLI command performance vs osmium.** Current numbers on Denmark 465 MB
+  (commit `3944a3f`, plantasjen, solo runs via `verify/*.sh`):
+
+  | Command | pbfhogg | osmium | ratio |
+  |---------|---------|--------|-------|
+  | extract --simple | 4.1s | 1.7s | 2.4x |
+  | extract (complete-ways) | 8.6s | 2.8s | 3.1x |
+  | extract --smart | 11.2s | 3.5s | 3.2x |
+  | add-locations-to-ways | 23.4s → 16.2s | 13.1s | 1.24x |
+  | tags-filter highway=primary -R | 2.8s | 1.4s | 2.0x |
+  | tags-filter amenity=restaurant -R | 2.8s | 1.2s | 2.3x |
+  | tags-filter w/highway=primary -R | 2.8s | 0.6s | 4.7x |
+  | getid (9 elements) | 1.8s | 0.8s | 2.1x |
+  | removeid (59M elements) | 11.1s | — | — |
+
+  All commands already use pipelined reader + pipelined writer (verified Feb 27).
+  Buffer reuse (clear+extend pattern) applied to all commands — shaves 5-31%
+  but doesn't close the fundamental gap. The remaining ~2x gap across commands
+  is architectural: pbfhogg parallelizes decompression only, while osmium
+  parallelizes element processing across cores. Evidence: osmium wall/user
+  ratios show ~7x parallelism (e.g. tags-filter: 1.7s/12.5s) vs pbfhogg's
+  ~2x (3.3s/6.3s). The main thread is the bottleneck.
+
+  Done:
+
+  - [x] **getid/removeid buffer reuse.** `write_element_reuse()` with hoisted
+    buffers per block. Removeid 11.1s → 10.5s (-5%).
+
+  - [x] **tags-filter buffer reuse.** clear+extend in all 3 loops.
+    amenity=restaurant 2.8s → 2.5s (-10%), w/highway=primary 2.8s → 2.5s (-10%).
+
+  - [x] **extract buffer reuse.** clear+extend in all 4 write helpers, buffers
+    declared per-block in all 3 strategies. Denmark within variance (bbox subset).
+
+  - [x] **add-locations-to-ways FxHashMap.** Switched `std::HashMap` → `FxHashMap`
+    for node location index. 23.4s → 16.2s (-31%), ratio 1.8x → 1.24x.
+
+  Remaining:
+
+  - [ ] **Blob-type skipping.** Skip decompressing blobs whose element type is
+    irrelevant to the command. For `tags-filter w/highway=primary`, ~85% of
+    blobs are nodes and can be skipped entirely. Explains the 4.7x gap on
+    way-only filters.
+
+    **How it works with indexdata:** `BlobHeader.indexdata` (26 bytes) contains
+    `ElemKind` (Node/Way/Relation), available after parsing the blob header
+    but *before* reading or decompressing blob data. All pbfhogg-written PBFs
+    embed indexdata automatically. For third-party PBFs without indexdata,
+    degrade gracefully to current behavior (decompress everything).
+
+    **Where the skip decision goes:** Pipeline Stage 2 (decode pool) in
+    `pipeline.rs`. Currently:
+    ```
+    BlobType::OsmData => Some(blob.to_primitiveblock_pooled(&bp))
+    ```
+    With filter: check `blob.index()` against a `BlobFilter`, return `None`
+    to skip decompression. Saves CPU (zlib ~1-2ms/blob) but not I/O (blob
+    bytes already read). For seekable readers, a future optimization could
+    skip reading blob data entirely via `seek()` past `header.datasize`.
+
+    **API surface:**
+    - Add `Blob::index() -> Option<BlobIndex>` (expose indexdata from header)
+    - Add `BlobFilter { want_nodes: bool, want_ways: bool, want_relations: bool }`
+    - Thread `BlobFilter` through `ElementReader` into `run_pipeline()`
+    - Each command computes its `BlobFilter` from arguments
+
+    **Commands that benefit:**
+
+    | Command | Filter | Blobs skipped (Denmark) |
+    |---------|--------|------------------------|
+    | `cat --type way` | skip nodes+relations | ~87% |
+    | `tags-filter w/highway=primary -R` | skip nodes+relations | ~87% |
+    | `tags-filter` (any typed expr) | skip non-matching types | varies |
+    | `getid w123 w456` | skip nodes+relations | ~87% |
+    | `add-locs-to-ways` pass 1 | skip ways+relations | ~15% |
+    | `getid --add-referenced` pass 1 | skip nodes+relations | ~87% |
+    | `extract` complete-ways pass 1 | limited opportunity | small |
+
+    **Sorted PBF early exit:** In sorted PBFs (`Sort.Type_then_ID`), all
+    node blobs precede way blobs precede relation blobs. Commands that only
+    need one type can break the pipeline iterator once the first unwanted
+    blob type appears. Already naturally supported by `into_blocks_pipelined`
+    (dropping the iterator shuts down the pipeline). With indexdata, the
+    transition is detected without decompressing the boundary blob.
+
+    **Implementation order:**
+    1. Add `Blob::index()` method
+    2. Add `BlobFilter` struct, wire into pipeline Stage 2
+    3. Add `ElementReader::with_blob_filter()` builder method
+    4. Update `cat --type` (simplest consumer, good test case)
+    5. Update `tags_filter` (single-pass with type prefix)
+    6. Update `getid` (skip by empty ID set type)
+    7. Update `add_locations_to_ways` pass 1 (skip non-node blobs)
+
+  - [ ] **Parallel element processing.** Process decoded blocks in parallel
+    with ordered output, not just parallel decompression. Would close the
+    ~2x wall-time gap by using ~7 cores instead of ~2.
+
+    **The problem:** The pipelined reader parallelizes decompression (Stage 2)
+    but delivers blocks to a single consumer thread (Stage 3) which does all
+    element processing sequentially. Evidence from wall/user ratios: osmium
+    achieves ~7x parallelism (tags-filter: 1.7s wall / 12.5s user) vs
+    pbfhogg's ~2x (3.3s wall / 6.3s user).
+
+    **Existing precedent — merge Phase 3→4:** The merge command already does
+    parallel element processing with ordered output:
+    ```
+    rewrite_jobs.par_iter().map_init(BlockBuilder::new, |bb, job| {
+        rewrite_block_parallel(block, &diff, bb, creates, kind)
+    }).collect()  // → Vec<RewriteOutput { blocks: Vec<Vec<u8>>, stats }>
+    ```
+    Then writes results sequentially in Phase 4. Each rayon thread owns its
+    own `BlockBuilder` (it's `Send`). Output is serialized `Vec<u8>` block
+    bytes, not borrowed data — so it can cross thread boundaries.
+
+    **Architecture for filter/write commands:**
+    ```
+    Stage 1: I/O + decode (existing pipeline, unchanged)
+        → delivers Vec<(seq, PrimitiveBlock)> in batches
+
+    Stage 2: Parallel element processing (NEW)
+        batch.par_iter().map_init(BlockBuilder::new, |bb, (seq, block)| {
+            for element in block.elements() {
+                if filter(&element) { bb.add_*(...) }
+            }
+            (seq, bb.drain_blocks())  // Vec<Vec<u8>>
+        }).collect()
+
+    Stage 3: Reorder + sequential write
+        Reorder buffer restores block order.
+        writer.write_primitive_block(&block_bytes) for each.
+        Writer's internal rayon pool parallelizes compression.
+    ```
+
+    **Which commands parallelize:**
+
+    | Command | Cross-block state? | Parallelizable? |
+    |---------|-------------------|-----------------|
+    | `cat --type` | None | Yes, per block |
+    | `tags-filter -R` (single-pass) | None | Yes, per block |
+    | `tags-filter` (two-pass) | Pass 1 collects IDs | Each pass separately |
+    | `getid` / `removeid` | None (IdSet is read-only) | Yes, per block |
+    | `add-locs` pass 2 | None (index is read-only) | Yes, per block |
+    | `extract` simple | matched_node_ids grows | Per-phase (nodes→ways→rels) |
+    | `extract` complete/smart | Multi-pass state | Each pass separately |
+    | `tags-count` | Accumulates HashMap | Par + merge-reduce |
+    | `sort` | Global ordering | No (already specialized) |
+    | `merge` | Already parallel | Already done |
+
+    **Key details:**
+    - `BlockBuilder` is `Send` (all `Vec`/`FxHashMap`/primitives). Each rayon
+      thread owns one via `map_init(BlockBuilder::new, ...)`.
+    - `BlockBuilder` produces one-type-per-block. Each task may produce
+      multiple output blocks from a single input block. Use
+      `Vec<Vec<u8>>` to collect (same as merge's `RewriteOutput.blocks`).
+    - Need `BlockBuilder::drain_blocks() -> Vec<Vec<u8>>` or similar to
+      extract all pending blocks as owned bytes.
+    - `PbfWriter` takes `&mut self` — must submit blocks sequentially.
+      The writer's internal reorder buffer handles compression parallelism.
+    - Stats are per-thread counters, summed after `collect()`.
+    - Batching (e.g. 64 blocks per rayon dispatch, as merge does) amortizes
+      scheduling overhead. Denmark ~7K blocks → ~110 dispatches. Planet
+      ~2.5M blocks → ~39K dispatches.
+
+    **Implementation order:**
+    1. Add `BlockBuilder::drain_blocks() -> Vec<Vec<u8>>`
+    2. Build a `parallel_filter_write()` helper (pipeline → par process →
+       reorder → write) that commands can call with a filter closure
+    3. Convert `cat --type` first (simplest, no cross-block state)
+    4. Convert `tags-filter -R`, `getid`/`removeid`
+    5. Convert two-pass commands (tags-filter default, extract, add-locs)
+    6. Convert `tags-count` (par + merge-reduce, read-only)
+
+- [ ] **Remove prost dependency.** Replace prost-generated code with hand-rolled
+  wire-format encoding/decoding for all remaining protobuf messages. Eliminates
+  prost (runtime), prost-build + protox (build-time codegen), and the `build.rs`
+  codegen step entirely.
+
+  **Already hand-rolled (read hot path):**
+  - `PrimitiveBlock` decode: `WireBlock`, `WireGroup`, `WireDenseNodes`,
+    `WireNode`, `WireWay`, `WireRelation` in `src/read/wire.rs` + `block.rs`.
+    Zero-copy, zero-alloc iteration via `PackedIter` and `WireMessageIter`.
+  - Way/relation encode: direct wire-format in `src/write/wire.rs` +
+    `block_builder.rs` (lines 794+). Already bypasses prost for the write
+    hot path.
+
+  **Still using prost (6 message types):**
+
+  | Message | Where | Direction | Frequency |
+  |---------|-------|-----------|-----------|
+  | `BlobHeader` | `blob.rs:355,449`, `mmap_blob.rs:340` | decode | Every blob (~7K/Denmark, ~2.5M/planet) |
+  | `Blob` | `blob.rs:449,763,776,788,797,855,951` | decode | Every blob |
+  | `HeaderBlock` | `blob.rs:953,941` via `decode_blob<T>` | decode | Once per file |
+  | `DenseNodes` + `DenseInfo` + `StringTable` + `PrimitiveBlock` | `block_builder.rs:775-850` | encode | Every node block written |
+  | `Blob` + `BlobHeader` | `writer.rs:593-665` | encode | Every output blob |
+  | `HeaderBlock` + `HeaderBBox` | `block_builder.rs:1342-1380` | encode | Once per output file |
+
+  **Decode side — BlobHeader and Blob:** These are small, fixed-structure
+  messages (~100 bytes each). `BlobHeader` has 3 fields (type, indexdata,
+  datasize). `Blob` has 4 fields (raw, raw_size, zlib_data, zstd_data).
+  Hand-rolling these is straightforward using the existing `read/wire.rs`
+  primitives (varint, len-delimited field). Replaces `prost::Message::decode`
+  with direct field-by-field parsing.
+
+  **Decode side — HeaderBlock:** Parsed once per file. More fields (bbox,
+  required_features, optional_features, writingprogram, source,
+  osmosis_replication_*) but still a simple flat message. Low priority since
+  it's not on the hot path.
+
+  **Encode side — DenseNodes:** The last prost-encoded hot path. Currently
+  builds `proto::DenseNodes`, `proto::DenseInfo`, `proto::StringTable`,
+  wraps in `proto::PrimitiveGroup` + `proto::PrimitiveBlock`, then
+  `Message::encode()`. Replace with direct wire-format encoding using
+  `write/wire.rs` primitives, same pattern as ways/relations already use.
+  This eliminates intermediate Vec allocations from the prost structs.
+
+  **Encode side — Blob/BlobHeader framing:** `frame_blob()` in `writer.rs`
+  builds `proto::Blob` + `proto::BlobHeader` then encodes. Simple flat
+  messages, straightforward to hand-roll.
+
+  **Benefits:**
+  - Eliminates 3 dependencies: `prost` (runtime), `prost-build` + `protox`
+    (build-time). Faster clean builds, smaller dependency tree.
+  - Removes `build.rs` codegen step and `src/proto/*.proto` files.
+  - Removes `pub(crate) mod proto` with its `#[allow(clippy::all)]` blanket.
+  - Full control over DenseNodes encoding (potential for further optimization).
+  - The `.proto` files are stable (OSM PBF format hasn't changed in years) —
+    no need for codegen flexibility.
+
+  **Implementation order:**
+  1. BlobHeader decode (small, every-blob hot path, most impact)
+  2. Blob decode (small, every-blob hot path)
+  3. Blob + BlobHeader encode (writer framing)
+  4. DenseNodes + StringTable + PrimitiveBlock encode (write hot path)
+  5. HeaderBlock decode + encode (once per file, lowest priority)
+  6. Remove prost/prost-build/protox deps, build.rs, proto files
+
+- [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
+  / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with
+  read-ahead for passthrough blobs and reduced syscall overhead without requiring
+  io_uring.
+
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
-  2MB huge pages automatically. An 80GB mmap'd PBF goes from ~20M TLB entries
-  (4KB pages) to ~40K entries (2MB folios). Combined with `MADV_POPULATE_READ`
-  (5.14+) to prefault pages ahead, the mmap read path gets substantially faster.
-  `MmapBlobReader` could use `MADV_SEQUENTIAL` + `MADV_POPULATE_READ` in chunks
-  (e.g. 256MB ahead) for predictable prefaulting without committing all 80GB at once.
-
-  **Caveat: low priority.** The mmap path (`MmapBlobReader`) is not the production
-  hot path — elivagar and nidhogg use `for_each_pipelined` (read) and `merge`
-  (write). Mmap is already the slowest read mode at Denmark scale (3.2s vs 0.3s
-  parallel, 1.6s pipelined). `MADV_POPULATE_READ` adds upfront page fault cost
-  that would hurt country-scale files (~120K faults for 483MB) where TLB pressure
-  isn't the bottleneck. The win is planet-scale only (80GB, 20M TLB entries). If
-  implemented, should be opt-in (`MmapBlobReader::with_prefault(true)` or similar)
-  to avoid regressing small-file performance. Consider skipping entirely in favor
-  of Tier 2 work (io_uring + erofs) which targets the actual production path.
-
-### Tier 2: erofs + io_uring (nidhogg, Linux 6.14+, Compression::None)
-
-With erofs + `Compression::None`, zlib is eliminated entirely. erofs handles lz4 in
-kernel at ~4 GB/s (SIMD-optimized), `decompress_blob` becomes a no-op, and the
-pipeline becomes **I/O-bound**. Now io_uring's batched async writes and registered
-buffers actually matter — the writer thread is the bottleneck, not compression.
-
-- [x] **SQ polling (`setup_sqpoll`)** — implemented (`--sqpoll` flag). Fixed crash
-  on North America: SQ overflow under sqpoll (submit() returns without syscall,
-  SQ entries accumulate). Fix: `push_sqe`/`push_sqe_pair` with `squeue_wait()`,
-  increased ring depth (256), drain before `register_files_update`. Result:
-  sqpoll adds no improvement over regular uring (<1% difference at NA scale).
-  Tested on Linux 6.18.0-9-generic.
-
-- [x] **`ReadFixed` + linked `WriteFixed` for CopyRange** — implemented. Linked
-  SQE pairs eliminate pread syscalls for passthrough blobs. North America results:
-  **-32%** (zlib), **-42%** (none) vs buffered. No improvement at Denmark/Japan
-  scale (page cache absorbs everything).
-
-- [x] **`pread` directly into registered buffer** — implemented as part of the
-  linked ReadFixed+WriteFixed chain. No separate pread path needed.
+  2MB huge pages automatically. Low priority — mmap is not the production hot path
+  and is already the slowest read mode. Only relevant at planet scale (80GB, 20M
+  TLB entries). If implemented, should be opt-in to avoid regressing small files.
 
 ## Before crates.io publish
 
@@ -190,19 +402,6 @@ with owned `String` instead of borrowed `Metadata<'a>`).
   decode+write (cat --type), and allocations. Run:
   `scripts/profile-region.sh germany data/germany-20260224-seq4704.osm.pbf data/germany-20260225-seq4705.osc.gz`
   Then update `notes/region-profiles.md` with the results.
-
-## CLI: verify all commands use pipelined writer
-
-- [ ] Audit every CLI command that writes PBF output to verify it uses `to_path_pipelined`
-  (not `to_path` sync). `cat` was observed running single-threaded on a 17.4 GB file
-  (Threads: 1, ~11 MB RSS) — suggesting it uses the sync writer path. At planet scale,
-  single-threaded zlib compression is the bottleneck. Commands to check:
-  - `cat` — confirmed single-threaded, needs pipelined writer
-  - `sort`
-  - `extract`
-  - `add-locations-to-ways`
-  - `tags-filter`
-  - `getid` / `removeid`
 
 ## Nice to have
 

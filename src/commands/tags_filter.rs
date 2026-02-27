@@ -229,9 +229,6 @@ pub fn tags_filter(
 
 // ---------------------------------------------------------------------------
 // Single-pass filter (-R mode)
-// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per element here
-// and in the two-pass path below. Hoisting buffers per cat.rs pattern would avoid
-// allocations at planet scale but requires refactoring the write helpers.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_lines)]
@@ -259,11 +256,15 @@ fn tags_filter_single_pass(
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
-                    let tags: Vec<(&str, &str)> = dn.tags().collect();
-                    if element_matches(expressions, &tags, true, false, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    if element_matches(expressions, &tags_buf, true, false, false) {
                         if !bb.can_add_node() {
                             flush_block(&mut bb, &mut writer)?;
                         }
@@ -272,15 +273,16 @@ fn tags_filter_single_pass(
                             dn.id(),
                             dn.decimicro_lat(),
                             dn.decimicro_lon(),
-                            &tags,
+                            &tags_buf,
                             meta.as_ref(),
                         );
                         stats.nodes_matched += 1;
                     }
                 }
                 Element::Node(n) => {
-                    let tags: Vec<(&str, &str)> = n.tags().collect();
-                    if element_matches(expressions, &tags, true, false, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    if element_matches(expressions, &tags_buf, true, false, false) {
                         if !bb.can_add_node() {
                             flush_block(&mut bb, &mut writer)?;
                         }
@@ -289,39 +291,40 @@ fn tags_filter_single_pass(
                             n.id(),
                             n.decimicro_lat(),
                             n.decimicro_lon(),
-                            &tags,
+                            &tags_buf,
                             meta.as_ref(),
                         );
                         stats.nodes_matched += 1;
                     }
                 }
                 Element::Way(w) => {
-                    let tags: Vec<(&str, &str)> = w.tags().collect();
-                    if element_matches(expressions, &tags, false, true, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    if element_matches(expressions, &tags_buf, false, true, false) {
                         if !bb.can_add_way() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let refs: Vec<i64> = w.refs().collect();
+                        refs_buf.clear();
+                        refs_buf.extend(w.refs());
                         let meta = element_metadata(&w.info());
-                        bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                        bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                         stats.ways_matched += 1;
                     }
                 }
                 Element::Relation(r) => {
-                    let tags: Vec<(&str, &str)> = r.tags().collect();
-                    if element_matches(expressions, &tags, false, false, true) {
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    if element_matches(expressions, &tags_buf, false, false, true) {
                         if !bb.can_add_relation() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let members: Vec<MemberData<'_>> = r
-                            .members()
-                            .map(|m| MemberData {
-                                id: m.id,
-                                role: m.role().unwrap_or(""),
-                            })
-                            .collect();
+                        members_buf.clear();
+                        members_buf.extend(r.members().map(|m| MemberData {
+                            id: m.id,
+                            role: m.role().unwrap_or(""),
+                        }));
                         let meta = element_metadata(&r.info());
-                        bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                        bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                         stats.relations_matched += 1;
                     }
                 }
@@ -390,30 +393,35 @@ fn tags_filter_two_pass(
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
-                    let tags: Vec<(&str, &str)> = dn.tags().collect();
-                    if element_matches(expressions, &tags, true, false, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    if element_matches(expressions, &tags_buf, true, false, false) {
                         matched_node_ids.push(dn.id());
                     }
                 }
                 Element::Node(n) => {
-                    let tags: Vec<(&str, &str)> = n.tags().collect();
-                    if element_matches(expressions, &tags, true, false, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    if element_matches(expressions, &tags_buf, true, false, false) {
                         matched_node_ids.push(n.id());
                     }
                 }
                 Element::Way(w) => {
-                    let tags: Vec<(&str, &str)> = w.tags().collect();
-                    if element_matches(expressions, &tags, false, true, false) {
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    if element_matches(expressions, &tags_buf, false, true, false) {
                         matched_way_ids.push(w.id());
                         way_dep_node_ids.extend(w.refs());
                     }
                 }
                 Element::Relation(r) => {
-                    let tags: Vec<(&str, &str)> = r.tags().collect();
-                    if element_matches(expressions, &tags, false, false, true) {
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    if element_matches(expressions, &tags_buf, false, false, true) {
                         matched_relation_ids.push(r.id());
                     }
                 }
@@ -453,25 +461,26 @@ fn tags_filter_two_pass(
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
-                    // binary_search on sorted slices: O(log n) lookup, same
-                    // as BTreeSet but with contiguous memory for better cache
-                    // performance.
                     let direct = matched_node_ids.binary_search(&dn.id()).is_ok();
                     let from_way = way_dep_node_ids.binary_search(&dn.id()).is_ok();
                     if direct || from_way {
                         if !bb.can_add_node() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let tags: Vec<(&str, &str)> = dn.tags().collect();
+                        tags_buf.clear();
+                        tags_buf.extend(dn.tags());
                         let meta = dense_node_metadata(dn);
                         bb.add_node(
                             dn.id(),
                             dn.decimicro_lat(),
                             dn.decimicro_lon(),
-                            &tags,
+                            &tags_buf,
                             meta.as_ref(),
                         );
                         if direct {
@@ -488,13 +497,14 @@ fn tags_filter_two_pass(
                         if !bb.can_add_node() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let tags: Vec<(&str, &str)> = n.tags().collect();
+                        tags_buf.clear();
+                        tags_buf.extend(n.tags());
                         let meta = element_metadata(&n.info());
                         bb.add_node(
                             n.id(),
                             n.decimicro_lat(),
                             n.decimicro_lon(),
-                            &tags,
+                            &tags_buf,
                             meta.as_ref(),
                         );
                         if direct {
@@ -509,10 +519,12 @@ fn tags_filter_two_pass(
                         if !bb.can_add_way() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let tags: Vec<(&str, &str)> = w.tags().collect();
-                        let refs: Vec<i64> = w.refs().collect();
+                        tags_buf.clear();
+                        tags_buf.extend(w.tags());
+                        refs_buf.clear();
+                        refs_buf.extend(w.refs());
                         let meta = element_metadata(&w.info());
-                        bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                        bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                         stats.ways_matched += 1;
                     }
                 }
@@ -521,16 +533,15 @@ fn tags_filter_two_pass(
                         if !bb.can_add_relation() {
                             flush_block(&mut bb, &mut writer)?;
                         }
-                        let tags: Vec<(&str, &str)> = r.tags().collect();
-                        let members: Vec<MemberData<'_>> = r
-                            .members()
-                            .map(|m| MemberData {
-                                id: m.id,
-                                role: m.role().unwrap_or(""),
-                            })
-                            .collect();
+                        tags_buf.clear();
+                        tags_buf.extend(r.tags());
+                        members_buf.clear();
+                        members_buf.extend(r.members().map(|m| MemberData {
+                            id: m.id,
+                            role: m.role().unwrap_or(""),
+                        }));
                         let meta = element_metadata(&r.info());
-                        bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                        bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                         stats.relations_matched += 1;
                     }
                 }

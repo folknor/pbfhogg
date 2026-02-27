@@ -446,19 +446,22 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
                     if region.contains(dn.lat(), dn.lon()) {
                         matched_node_ids.push(dn.id());
-                        write_dense_node(dn, &mut bb, &mut writer)?;
+                        write_dense_node(dn, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
                     }
                 }
                 Element::Node(n) => {
                     if region.contains(n.lat(), n.lon()) {
                         matched_node_ids.push(n.id());
-                        write_node(n, &mut bb, &mut writer)?;
+                        write_node(n, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
                     }
                 }
@@ -473,7 +476,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
                     }
                     if w.refs().any(|r| matched_node_ids.binary_search(&r).is_ok()) {
                         matched_way_ids.push(w.id());
-                        write_way(w, &mut bb, &mut writer)?;
+                        write_way(w, &mut bb, &mut writer, &mut tags_buf, &mut refs_buf)?;
                         stats.ways_written += 1;
                     }
                 }
@@ -494,7 +497,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
                         way_ids_sorted = true;
                     }
                     if relation_has_matched_member(r, &matched_node_ids, &matched_way_ids) {
-                        write_relation(r, &mut bb, &mut writer)?;
+                        write_relation(r, &mut bb, &mut writer, &mut tags_buf, &mut members_buf)?;
                         stats.relations_written += 1;
                     }
                 }
@@ -714,6 +717,9 @@ fn write_pass2_elements(
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
@@ -722,7 +728,7 @@ fn write_pass2_elements(
                 let in_bbox = bbox_node_ids.binary_search(&dn.id()).is_ok();
                 let from_way = all_way_node_ids.binary_search(&dn.id()).is_ok();
                 if in_bbox || from_way {
-                    write_dense_node(dn, bb, writer)?;
+                    write_dense_node(dn, bb, writer, &mut tags_buf)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -734,7 +740,7 @@ fn write_pass2_elements(
                 let in_bbox = bbox_node_ids.binary_search(&n.id()).is_ok();
                 let from_way = all_way_node_ids.binary_search(&n.id()).is_ok();
                 if in_bbox || from_way {
-                    write_node(n, bb, writer)?;
+                    write_node(n, bb, writer, &mut tags_buf)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -744,13 +750,13 @@ fn write_pass2_elements(
             }
             Element::Way(w) => {
                 if matched_way_ids.binary_search(&w.id()).is_ok() {
-                    write_way(w, bb, writer)?;
+                    write_way(w, bb, writer, &mut tags_buf, &mut refs_buf)?;
                     stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
                 if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                    write_relation(r, bb, writer)?;
+                    write_relation(r, bb, writer, &mut tags_buf, &mut members_buf)?;
                     stats.relations_written += 1;
                 }
             }
@@ -959,6 +965,9 @@ fn write_pass3_smart(
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
@@ -967,7 +976,7 @@ fn write_pass3_smart(
                 let from_way = all_way_node_ids.binary_search(&id).is_ok();
                 let from_rel = extra_node_ids.binary_search(&id).is_ok();
                 if in_bbox || from_way || from_rel {
-                    write_dense_node(dn, bb, writer)?;
+                    write_dense_node(dn, bb, writer, &mut tags_buf)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -983,7 +992,7 @@ fn write_pass3_smart(
                 let from_way = all_way_node_ids.binary_search(&id).is_ok();
                 let from_rel = extra_node_ids.binary_search(&id).is_ok();
                 if in_bbox || from_way || from_rel {
-                    write_node(n, bb, writer)?;
+                    write_node(n, bb, writer, &mut tags_buf)?;
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -995,13 +1004,13 @@ fn write_pass3_smart(
             }
             Element::Way(w) => {
                 if matched_way_ids.binary_search(&w.id()).is_ok() {
-                    write_way(w, bb, writer)?;
+                    write_way(w, bb, writer, &mut tags_buf, &mut refs_buf)?;
                     stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
                 if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                    write_relation(r, bb, writer)?;
+                    write_relation(r, bb, writer, &mut tags_buf, &mut members_buf)?;
                     stats.relations_written += 1;
                 }
             }
@@ -1039,72 +1048,79 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Element writers
-// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per call.
-// Hoisting buffers per cat.rs pattern would avoid allocations at planet scale.
+// Element writers (buffer-reuse variants)
 // ---------------------------------------------------------------------------
 
-fn write_dense_node(
-    dn: &crate::DenseNode,
+fn write_dense_node<'a>(
+    dn: &crate::DenseNode<'a>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    tags_buf: &mut Vec<(&'a str, &'a str)>,
 ) -> Result<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
     }
-    let tags: Vec<(&str, &str)> = dn.tags().collect();
+    tags_buf.clear();
+    tags_buf.extend(dn.tags());
     let meta = dense_node_metadata(dn);
-    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags, meta.as_ref());
+    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags_buf, meta.as_ref());
     Ok(())
 }
 
-fn write_node(
-    n: &crate::Node,
+fn write_node<'a>(
+    n: &crate::Node<'a>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    tags_buf: &mut Vec<(&'a str, &'a str)>,
 ) -> Result<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
     }
-    let tags: Vec<(&str, &str)> = n.tags().collect();
+    tags_buf.clear();
+    tags_buf.extend(n.tags());
     let meta = element_metadata(&n.info());
-    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags, meta.as_ref());
+    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), tags_buf, meta.as_ref());
     Ok(())
 }
 
-fn write_way(
-    w: &crate::Way,
+fn write_way<'a>(
+    w: &crate::Way<'a>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    refs_buf: &mut Vec<i64>,
 ) -> Result<()> {
     if !bb.can_add_way() {
         flush_block(bb, writer)?;
     }
-    let tags: Vec<(&str, &str)> = w.tags().collect();
-    let refs: Vec<i64> = w.refs().collect();
+    tags_buf.clear();
+    tags_buf.extend(w.tags());
+    refs_buf.clear();
+    refs_buf.extend(w.refs());
     let meta = element_metadata(&w.info());
-    bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+    bb.add_way(w.id(), tags_buf, refs_buf, meta.as_ref());
     Ok(())
 }
 
-fn write_relation(
-    r: &crate::Relation,
+fn write_relation<'a>(
+    r: &crate::Relation<'a>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    members_buf: &mut Vec<MemberData<'a>>,
 ) -> Result<()> {
     if !bb.can_add_relation() {
         flush_block(bb, writer)?;
     }
-    let tags: Vec<(&str, &str)> = r.tags().collect();
-    let members: Vec<MemberData<'_>> = r
-        .members()
-        .map(|m| MemberData {
-            id: m.id,
-            role: m.role().unwrap_or(""),
-        })
-        .collect();
+    tags_buf.clear();
+    tags_buf.extend(r.tags());
+    members_buf.clear();
+    members_buf.extend(r.members().map(|m| MemberData {
+        id: m.id,
+        role: m.role().unwrap_or(""),
+    }));
     let meta = element_metadata(&r.info());
-    bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+    bb.add_relation(r.id(), tags_buf, members_buf, meta.as_ref());
     Ok(())
 }
 

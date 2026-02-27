@@ -1,7 +1,8 @@
 //! Embed node coordinates in ways. Equivalent to `osmium add-locations-to-ways`.
 
-use std::collections::HashMap;
 use std::path::Path;
+
+use rustc_hash::FxHashMap;
 
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
@@ -16,13 +17,13 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 /// Node location index type for add-locations-to-ways.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexType {
-    /// HashMap-based index. ~24 bytes/node, good for country-scale.
+    /// FxHashMap-based index. ~24 bytes/node, good for country-scale.
     Hash,
     /// Dense mmap-based index. 8 bytes/slot with direct indexing by node ID.
     /// Uses anonymous mmap with lazy page allocation — virtual memory is
     /// allocated for the full ID range but physical memory is only committed
     /// for pages actually written. Required for planet-scale (8.5B nodes →
-    /// ~68 GB physical vs HashMap's ~192 GB).
+    /// ~68 GB physical vs FxHashMap's ~192 GB).
     ///
     /// The `capacity` field is the max number of entries (node IDs). For planet,
     /// use [`DENSE_INDEX_DEFAULT_CAPACITY`] (16 billion). Smaller values work
@@ -44,8 +45,15 @@ pub const DENSE_INDEX_DEFAULT_CAPACITY: usize = 16_000_000_000;
 // ---------------------------------------------------------------------------
 
 /// Node location index abstraction supporting multiple backends.
+/// Node location index abstraction supporting multiple backends.
+///
+/// The `Hash` variant uses `FxHashMap` (from `rustc-hash`) instead of the
+/// standard `HashMap`. For integer keys like node IDs, FxHash (foldhash) is
+/// 2-4x faster than SipHash because it uses a simple multiply-shift instead
+/// of the cryptographic SipHash-2-4 rounds. Hash-DoS resistance is irrelevant
+/// here since the keys come from PBF file data we control, not user input.
 pub enum NodeLocationIndex {
-    Hash(HashMap<i64, (i32, i32)>),
+    Hash(FxHashMap<i64, (i32, i32)>),
     Dense(DenseMmapIndex),
 }
 
@@ -210,7 +218,7 @@ pub fn add_locations_to_ways(
 
 fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Result<NodeLocationIndex> {
     let mut index = match index_type {
-        IndexType::Hash => NodeLocationIndex::Hash(HashMap::new()),
+        IndexType::Hash => NodeLocationIndex::Hash(FxHashMap::default()),
         IndexType::Dense { capacity } => NodeLocationIndex::Dense(DenseMmapIndex::new(capacity)?),
     };
     let reader = ElementReader::open(input, direct_io)?;

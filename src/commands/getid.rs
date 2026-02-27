@@ -155,6 +155,9 @@ fn filter_by_id(
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             let dominated = match &element {
                 Element::DenseNode(dn) => ids.node_ids.contains(&dn.id()),
@@ -164,7 +167,8 @@ fn filter_by_id(
             };
             let write = if include { dominated } else { !dominated };
             if write {
-                write_element(&element, &mut bb, &mut writer, &mut stats)?;
+                write_element_reuse(&element, &mut bb, &mut writer, &mut stats,
+                    &mut tags_buf, &mut refs_buf, &mut members_buf)?;
             }
         }
     }
@@ -214,6 +218,9 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             let write = match &element {
                 Element::DenseNode(dn) => {
@@ -228,7 +235,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
                 Element::Relation(r) => ids.relation_ids.contains(&r.id()),
             };
             if write {
-                write_element(&element, &mut bb, &mut writer, &mut stats)?;
+                write_element_reuse(&element, &mut bb, &mut writer, &mut stats,
+                    &mut tags_buf, &mut refs_buf, &mut members_buf)?;
             }
         }
     }
@@ -240,28 +248,30 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
 // ---------------------------------------------------------------------------
 // Helpers
-// wontfix(perf-drain-reuse): tags/refs/members Vec collected fresh per element.
-// Hoisting buffers per cat.rs pattern would avoid allocations at planet scale.
 // ---------------------------------------------------------------------------
 
-fn write_element(
-    element: &Element<'_>,
+fn write_element_reuse<'a>(
+    element: &Element<'a>,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut GetidStats,
+    tags_buf: &mut Vec<(&'a str, &'a str)>,
+    refs_buf: &mut Vec<i64>,
+    members_buf: &mut Vec<MemberData<'a>>,
 ) -> Result<()> {
     match element {
         Element::DenseNode(dn) => {
             if !bb.can_add_node() {
                 flush_block(bb, writer)?;
             }
-            let tags: Vec<(&str, &str)> = dn.tags().collect();
+            tags_buf.clear();
+            tags_buf.extend(dn.tags());
             let meta = dense_node_metadata(dn);
             bb.add_node(
                 dn.id(),
                 dn.decimicro_lat(),
                 dn.decimicro_lon(),
-                &tags,
+                tags_buf,
                 meta.as_ref(),
             );
             stats.nodes_written += 1;
@@ -270,13 +280,14 @@ fn write_element(
             if !bb.can_add_node() {
                 flush_block(bb, writer)?;
             }
-            let tags: Vec<(&str, &str)> = n.tags().collect();
+            tags_buf.clear();
+            tags_buf.extend(n.tags());
             let meta = element_metadata(&n.info());
             bb.add_node(
                 n.id(),
                 n.decimicro_lat(),
                 n.decimicro_lon(),
-                &tags,
+                tags_buf,
                 meta.as_ref(),
             );
             stats.nodes_written += 1;
@@ -285,26 +296,27 @@ fn write_element(
             if !bb.can_add_way() {
                 flush_block(bb, writer)?;
             }
-            let tags: Vec<(&str, &str)> = w.tags().collect();
-            let refs: Vec<i64> = w.refs().collect();
+            tags_buf.clear();
+            tags_buf.extend(w.tags());
+            refs_buf.clear();
+            refs_buf.extend(w.refs());
             let meta = element_metadata(&w.info());
-            bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+            bb.add_way(w.id(), tags_buf, refs_buf, meta.as_ref());
             stats.ways_written += 1;
         }
         Element::Relation(r) => {
             if !bb.can_add_relation() {
                 flush_block(bb, writer)?;
             }
-            let tags: Vec<(&str, &str)> = r.tags().collect();
-            let members: Vec<MemberData<'_>> = r
-                .members()
-                .map(|m| MemberData {
-                    id: m.id,
-                    role: m.role().unwrap_or(""),
-                })
-                .collect();
+            tags_buf.clear();
+            tags_buf.extend(r.tags());
+            members_buf.clear();
+            members_buf.extend(r.members().map(|m| MemberData {
+                id: m.id,
+                role: m.role().unwrap_or(""),
+            }));
             let meta = element_metadata(&r.info());
-            bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+            bb.add_relation(r.id(), tags_buf, members_buf, meta.as_ref());
             stats.relations_written += 1;
         }
     }

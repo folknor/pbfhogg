@@ -34,3 +34,9 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-pipe-zlib:6	7074	52489653	6616526	46103	483
 2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-zstd:3	9017	52489653	6616526	46103	483
 2026-02-26	plantasjen	ee966cd*	Direct wire-format encoding for ways/relations in BlockBuilder	denmark-latest	write-pipe-zstd:3	7018	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-none	6886	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-pipe-none	6885	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-zlib:6	15173	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-pipe-zlib:6	6980	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-zstd:3	8793	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	write-pipe-zstd:3	6911	52489653	6616526	46103	483

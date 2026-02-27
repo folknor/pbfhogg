@@ -49,3 +49,8 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-26	plantasjen	7b65ab7	Fix io_uring sqpoll crash on large files	denmark-latest	pipelined	1309	52489653	6616526	46103	483
 2026-02-26	plantasjen	7b65ab7	Fix io_uring sqpoll crash on large files	denmark-latest	mmap	2895	52489653	6616526	46103	483
 2026-02-26	plantasjen	7b65ab7	Fix io_uring sqpoll crash on large files	denmark-latest	blobreader	2888	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	sequential	2725	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	parallel	298	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	pipelined	1272	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	mmap	2860	52489653	6616526	46103	483
+2026-02-27	plantasjen	3944a3f*	Require commit hash and hostname on all benchmark data in CLAUDE.md	denmark-latest	blobreader	2864	52489653	6616526	46103	483

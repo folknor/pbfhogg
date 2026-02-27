@@ -58,3 +58,15 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-pipe-zlib:6	6249	52489653	6616526	46103	483
 2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-zstd:3	8109	52489653	6616526	46103	483
 2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-pipe-zstd:3	6200	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-none	6227	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-none	6269	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-zlib:6	14697	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zlib:6	6378	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-zstd:3	8364	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zstd:3	6301	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-none	6135	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-none	6234	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-zlib:6	14547	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zlib:6	6334	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-zstd:3	8196	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zstd:3	6277	52489653	6616526	46103	483

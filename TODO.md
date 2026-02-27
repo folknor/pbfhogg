@@ -66,7 +66,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   |------|---------|------|---------|
   | `pipeline.rs:85-104` | `ThreadPoolBuilder` + `spawn` | Dedicated | Decode pool (Stage 2) |
   | `writer.rs:289` | `rayon::spawn()` | Global | Parallel compression |
-  | `merge.rs:1045` | `par_iter().map_init()` | Global | Batch classify |
+  | `merge.rs` | `par_iter().map_init()` | Global | Batch classify + parallel rewrite |
   | `reader.rs:350` | `into_par_iter().try_fold().try_reduce()` | Global | `par_map_reduce` |
 
   The pipeline decode pool uses a dedicated `ThreadPoolBuilder` with `available_parallelism() - 2`
@@ -83,6 +83,51 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   only if rayon becomes a proven bottleneck (e.g. if parallel `rewrite_block` exposes contention
   in the global pool).
 
+## Merge architecture (done, commit `547449a`)
+
+Single-pass 4-phase batch pipeline with O(log n) Phase 2, reader thread
+read-ahead, and passthrough coalescing. Replaced the old sequential Phase 2
+(`collect_modifications` + `CreateEmitter` + `emitted_*` HashSets) with binary
+search on sorted upsert vecs — all upsert IDs in a blob's range go to the
+rewrite function, which handles both modifications (matching base elements) and
+creates (non-matching IDs) in one pass.
+
+**Key results (indexed PBFs, NVMe output, best of 3):**
+
+| Dataset | Old | New | Change |
+|---------|-----|-----|--------|
+| Japan 2.4 GB | 4.83s | **3.03s** | -37% (15x faster than osmium) |
+| Germany 4.5 GB (zlib) | 35.1s | **10.1s** | -71% |
+| Germany 4.5 GB (none) | 46.4s | **5.9s** | -87% |
+| N. America 18.8 GB (zlib) | 43.2s | **24.4s** | -43% |
+| N. America 18.8 GB (none) | 36.4s | **13.3s** | -63% |
+
+io_uring no longer helps — buffered writer matches it at all tested scales.
+The old bottleneck (write syscall latency during idle passthrough) is gone
+because the reader thread + coalescing keep the writer pipeline fed.
+
+## Performance: CLI commands vs osmium
+
+All CLI commands now beat osmium except extract --simple.
+
+- [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower on
+  Denmark, 1.70x on Japan. The gap is structural: 2 passes vs osmium's 1.
+  The extra file read costs ~1.3s on Denmark, ~5s on Japan. Full analysis
+  in `notes/extract-parallel-collection.md`.
+  - [ ] **Single-pass simple with parallel inline writing.** Stream through
+    the pipelined reader, collect + filter matching elements per block, batch
+    matched blocks for parallel writing via rayon. Eliminates the second file
+    read. Challenge: the collection consumer (which is sequential) and the
+    write dispatch (which needs rayon) must coexist in the same pass.
+
+- [ ] **`add-locations-to-ways` Pass 1 (hash index building).** Already faster
+  than osmium on Denmark (11.4s vs 12.0s), but Pass 1 (FxHashMap node index
+  build) is sequential and the bottleneck at larger scales. Options:
+  - Parallel hash map build: partition nodes by ID range across threads, each
+    builds a sub-map, then merge. Or use a concurrent map (dashmap/flurry).
+  - The Dense mmap index variant avoids this entirely (direct indexing, no
+    hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
+
 ## Performance: Linux kernel features for planet-scale I/O
 
 Research notes: `notes/linux-async-io.md`.
@@ -90,93 +135,6 @@ Research notes: `notes/linux-async-io.md`.
 Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
 Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 `Compression::None` PBFs on erofs is the baseline assumption for the optimized path.
-The library also needs to work well for the broader OSM ecosystem (standard
-zlib-compressed PBFs, any filesystem, any Linux 5.x+), so there are two tiers.
-
-### Tier 1: Generic path (any Linux, zlib PBFs, any filesystem)
-
-Most users won't use io_uring or erofs. The generic buffered I/O path needs to
-be excellent on its own. Read throughput is already strong (0.31s parallel, 1.3s
-pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
-
-- [ ] **CLI command performance vs osmium.** Current numbers on Denmark 465 MB
-  (commit `3944a3f`, plantasjen, solo runs via `verify/*.sh`):
-
-  | Command | pbfhogg | osmium | ratio | notes |
-  |---------|---------|--------|-------|-------|
-  | cat --type way | **1.06s** | 2.23s | **0.48x** | parallel + blob-skip (indexdata) |
-  | tags-filter amenity=restaurant -R | **0.46s** | 1.16s | **0.40x** | parallel + blob-skip |
-  | getid (9 elements) | **0.38s** | 0.84s | **0.45x** | parallel |
-  | tags-count --type way | **0.35s** | 0.60s | **0.58x** | fold+reduce + blob-skip (indexdata) |
-  | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
-  | tags-filter highway=primary 2pass | **2.39s** | 2.50s | **0.96x** | skip-metadata Pass 1 + parallel Pass 2 |
-  | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
-  | extract --simple | **2.48s** | 1.69s | 1.47x | skip-metadata + Pass 2 parallel |
-  | extract (complete-ways) | **2.48s** | 2.79s | **0.89x** | skip-metadata + Pass 2 parallel |
-  | extract --smart | **2.83s** | 3.25s | **0.87x** | skip-metadata + ways-only Pass 2 |
-
-  All commands use pipelined reader + pipelined writer. All write passes use
-  parallel element processing via rayon batches (64 blocks per dispatch).
-  Blob-type skipping via indexdata provides additional gains for type-filtered
-  commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
-  `scripts/bench-commands.sh` on Denmark 483 MB, commit `1b62e2c`.
-
-  Japan extract (2.3 GB, 344M elements, Tokyo bbox, commit `1b62e2c`):
-
-  | Strategy | pbfhogg | osmium | ratio |
-  |----------|---------|--------|-------|
-  | simple | 12.2s | **7.2s** | 1.70x |
-  | complete-ways | 12.8s | **11.0s** | 1.16x |
-  | smart | 14.6s | **13.4s** | 1.09x |
-
-  Remaining:
-
-  - [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower
-    on Denmark, 1.70x on Japan. **Complete-ways and smart now beat osmium.**
-    Full analysis in `notes/extract-parallel-collection.md`.
-
-    The gap is structural: simple does 2 passes vs osmium's 1. The extra file
-    read costs ~1.3s on Denmark, ~5s on Japan. A single-pass approach with
-    parallel inline writing would close most of this gap.
-
-    **Implemented optimizations:**
-    - ~~Skip-metadata mode for scan-only passes~~ — `elements_skip_metadata()`
-      skips 6 packed metadata arrays per dense node (version, timestamp,
-      changeset, uid, user_sid, visible). Denmark: -7% simple, -10% complete,
-      -34% smart. Japan: -16% simple, -10% complete, -39% smart.
-    - ~~Smart Pass 2 ways-only iteration~~ — `block.groups()` / `group.ways()`
-      skips all dense nodes, sparse nodes, and relations in the way dependency
-      resolution pass. This was the main contributor to the 34-39% smart gain.
-
-    **Investigated and ruled out:**
-    - ~~Parallel ID collection with IndexedReader~~ — implemented three-phase
-      parallel collection (blob buffering + rayon `try_fold`/`try_reduce`),
-      benchmarked on Denmark (483 MB) and Japan (2.3 GB). No improvement: the
-      pipelined reader already parallelizes decompression, and the collection
-      consumer work (bbox check, ID set insert) is ~5% of per-block time.
-      Buffering all compressed blobs adds I/O + allocation overhead that
-      negates any parallelism gains.
-    - ~~Concurrent ID sets (dashmap/atomic bitsets)~~ — not applicable since
-      the bottleneck is decode, not consumer writes.
-    - ~~io_uring reads~~ — merge benchmarks show io_uring only helps above
-      ~15 GB (beyond page cache). Extract reads are sequential scans where
-      kernel readahead with `posix_fadvise` is already optimal.
-
-    **Possible approach:**
-    - [ ] **Single-pass simple with parallel inline writing.** Stream through
-      the pipelined reader, collect + filter matching elements per block, batch
-      matched blocks for parallel writing via rayon. Eliminates the second file
-      read. Challenge: the collection consumer (which is sequential) and the
-      write dispatch (which needs rayon) must coexist in the same pass.
-
-    **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
-    Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is
-    sequential and dominates wall time. Denmark: ~11.3s total vs osmium ~10.3s.
-    The hash index build is ~6-7s (52.5M node inserts into FxHashMap). Options:
-    - Parallel hash map build: partition nodes by ID range across threads, each
-      builds a sub-map, then merge. Or use a concurrent map (dashmap/flurry).
-    - The Dense mmap index variant avoids this entirely (direct indexing, no
-      hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
 
 - [ ] **Zstd compressor state reuse.** The `zstd` crate has the same per-call
   encoder problem (`zstd::stream::write::Encoder::new()` allocates fresh state
@@ -185,10 +143,9 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   FrameScratch, reuse across blobs. Lower priority since zstd PBFs are rare in
   the OSM ecosystem.
 
-- [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
-  / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with
-  read-ahead for passthrough blobs and reduced syscall overhead without requiring
-  io_uring.
+- [x] **Buffered merge at planet scale.** Done — reader thread + passthrough
+  coalescing eliminated the buffered/io_uring gap. North America buffered merge
+  is now 24.4s (zlib) / 13.3s (none), matching io_uring. See commit `547449a`.
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. Low priority — mmap is not the production hot path

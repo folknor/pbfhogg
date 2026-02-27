@@ -59,3 +59,13 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	pipelined	1354	52489653	6616526	46103	483
 2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	mmap	3783	52489653	6616526	46103	483
 2026-02-27	plantasjen	30fa384*	Update TODO.md: mark extract optimizations done, update benchmark numbers	denmark-latest	blobreader	2923	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	sequential	2729	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	parallel	324	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	pipelined	1246	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	mmap	2900	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	blobreader	2912	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	sequential	2694	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	parallel	301	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	pipelined	1262	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	mmap	2915	52489653	6616526	46103	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	blobreader	2899	52489653	6616526	46103	483

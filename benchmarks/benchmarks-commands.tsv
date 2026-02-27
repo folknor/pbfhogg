@@ -83,3 +83,19 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-smart	3.25	483
 2026-02-27	plantasjen	44ad7d2*	Skip metadata in extract scan-only passes for 7-39% speedup	denmark-20260220-seq4704	pbfhogg	tags-filter-twopass	2.39	483
 2026-02-27	plantasjen	44ad7d2*	Skip metadata in extract scan-only passes for 7-39% speedup	denmark-20260220-seq4704	osmium	tags-filter-twopass	2.5	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	pbfhogg (indexdata)	cat-way	1.11	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	pbfhogg	cat-way	1.27	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	osmium	cat-way	2.31	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	pbfhogg (indexdata)	cat-way	1.11	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	pbfhogg	cat-way	1.26	483
+2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-20260220-seq4704	osmium	cat-way	2.24	483
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-zlib	10.02	4748
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-none	4.58	4748
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-buffered-zlib	24.45	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-buffered-none	13.57	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-uring-zlib	24.37	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-uring-none	13.28	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-uring-sqpoll-zlib	25.29	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-uring-sqpoll-none	18.26	18814
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-zlib	10.06	4748
+2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-none	5.87	4748

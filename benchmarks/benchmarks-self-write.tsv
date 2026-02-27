@@ -52,3 +52,9 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	def80d9	Remove prost dependency: hand-roll all protobuf encode/decode	denmark-latest	write-pipe-zlib:6	6293	52489653	6616526	46103	483
 2026-02-27	plantasjen	def80d9	Remove prost dependency: hand-roll all protobuf encode/decode	denmark-latest	write-zstd:3	8144	52489653	6616526	46103	483
 2026-02-27	plantasjen	def80d9	Remove prost dependency: hand-roll all protobuf encode/decode	denmark-latest	write-pipe-zstd:3	6218	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-none	6147	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-pipe-none	6264	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-zlib:6	14499	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-pipe-zlib:6	6249	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-zstd:3	8109	52489653	6616526	46103	483
+2026-02-27	plantasjen	28e434d*	Reuse packed_scratch in DenseNodes encoding, add debug_assert guards	denmark-latest	write-pipe-zstd:3	6200	52489653	6616526	46103	483

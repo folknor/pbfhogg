@@ -16,6 +16,7 @@ use crate::write::file_writer::FileWriter;
 use crate::write::wire::{encode_bytes_field, encode_int32_field};
 use flate2::write::ZlibEncoder;
 use flate2::Compression as FlateCompression;
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
@@ -80,6 +81,28 @@ struct WritePipeline {
     join_handle: Option<JoinHandle<io::Result<()>>>,
 }
 
+/// Reusable scratch buffers for blob framing, avoiding per-call allocation.
+///
+/// After the first blob, all three buffers have sufficient capacity and
+/// subsequent calls reuse them without allocating.
+struct FrameScratch {
+    /// Blob protobuf body (raw/compressed data fields).
+    blob_buf: Vec<u8>,
+    /// BlobHeader protobuf.
+    header_buf: Vec<u8>,
+    /// Intermediate compression output (zlib/zstd only).
+    compress_buf: Vec<u8>,
+}
+
+thread_local! {
+    /// Per-rayon-thread scratch buffers for pipelined blob framing.
+    static PIPELINE_SCRATCH: RefCell<FrameScratch> = const { RefCell::new(FrameScratch {
+        blob_buf: Vec::new(),
+        header_buf: Vec::new(),
+        compress_buf: Vec::new(),
+    }) };
+}
+
 /// Writes PBF files as a sequence of framed, compressed blobs.
 ///
 /// # Usage
@@ -102,6 +125,8 @@ pub struct PbfWriter<W: Write> {
     writer: Option<W>,
     compression: Compression,
     pipeline: Option<WritePipeline>,
+    /// Scratch buffers for sync-mode blob framing (unused in pipelined mode).
+    scratch: FrameScratch,
 }
 
 impl PbfWriter<FileWriter> {
@@ -112,6 +137,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
         })
     }
 
@@ -127,6 +153,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
         })
     }
 
@@ -215,6 +242,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
         })
     }
 
@@ -240,6 +268,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
         })
     }
 }
@@ -257,6 +286,7 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new() },
         }
     }
 
@@ -288,19 +318,22 @@ impl<W: Write> PbfWriter<W> {
             rayon::spawn(move || {
                 let indexdata = blob_index::scan_block_ids(&uncompressed)
                     .map(|idx| idx.serialize());
-                let result = frame_blob(
-                    "OSMData",
-                    &uncompressed,
-                    &compression,
-                    indexdata.as_ref().map(<[u8; 26]>::as_slice),
-                );
+                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                    frame_blob_into(
+                        "OSMData",
+                        &uncompressed,
+                        &compression,
+                        indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                        scratch,
+                    )
+                });
                 drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
             });
             Ok(())
         } else {
             let indexdata = blob_index::scan_block_ids(block_bytes)
                 .map(|idx| idx.serialize());
-            self.write_blob_with_index(
+            self.write_framed_blob(
                 "OSMData",
                 block_bytes,
                 indexdata.as_ref().map(<[u8; 26]>::as_slice),
@@ -403,18 +436,47 @@ impl<W: Write> PbfWriter<W> {
     // only 2 constants ("OSMHeader"/"OSMData"), no real typo risk.
     #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
-        let framed = frame_blob(blob_type, uncompressed, &self.compression, None)?;
-        self.writer_mut().write_all(&framed)
+        self.write_framed_blob(blob_type, uncompressed, None)
     }
 
-    fn write_blob_with_index(
+    /// Encode, compress, and write a blob directly to the writer using reusable
+    /// scratch buffers. Eliminates all intermediate `Vec` allocations after warmup.
+    fn write_framed_blob(
         &mut self,
         blob_type: &str,
         uncompressed: &[u8],
         indexdata: Option<&[u8]>,
     ) -> io::Result<()> {
-        let framed = frame_blob(blob_type, uncompressed, &self.compression, indexdata)?;
-        self.writer_mut().write_all(&framed)
+        encode_blob_body(
+            uncompressed,
+            &self.compression,
+            &mut self.scratch.blob_buf,
+            &mut self.scratch.compress_buf,
+        )?;
+        let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
+            io::Error::other(format!(
+                "blob datasize overflow: {} bytes",
+                self.scratch.blob_buf.len()
+            ))
+        })?;
+        encode_blob_header_into(
+            blob_type,
+            datasize,
+            indexdata,
+            &mut self.scratch.header_buf,
+        );
+        let header_len = u32::try_from(self.scratch.header_buf.len()).map_err(|_| {
+            io::Error::other(format!(
+                "header too large: {} bytes",
+                self.scratch.header_buf.len()
+            ))
+        })?;
+        // Write the 3 frame parts directly — no intermediate `out` Vec.
+        let writer = self.writer.as_mut().expect("writer consumed by pipeline");
+        writer.write_all(&header_len.to_be_bytes())?;
+        writer.write_all(&self.scratch.header_buf)?;
+        writer.write_all(&self.scratch.blob_buf)?;
+        Ok(())
     }
 }
 
@@ -578,85 +640,120 @@ fn copy_range(
 /// Compress and frame a blob into the complete PBF wire format:
 /// `[4-byte BE header_len][BlobHeader bytes][Blob bytes]`.
 ///
-/// This is a pure function with no I/O or shared state, suitable for calling
-/// from any thread (e.g. rayon tasks for parallel compression).
-#[hotpath::measure]
+/// Allocates fresh buffers — use only for one-off calls (e.g. header framing).
+/// For hot-path data blocks, use `frame_blob_into` (pipelined) or
+/// `write_framed_blob` (sync) which reuse scratch buffers.
 pub(crate) fn frame_blob(
     blob_type: &str,
     uncompressed: &[u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
-    // Step 1: Encode the Blob protobuf (optionally compressed)
-    let mut blob_buf = Vec::new();
-    match compression {
-        Compression::None => {
-            // Blob field 1: raw (bytes, len-delimited)
-            encode_bytes_field(&mut blob_buf, 1, uncompressed);
-        }
-        Compression::Zlib(level) => {
-            // Pre-allocate for ~2x compression ratio (conservative estimate).
-            let estimated_compressed_size = uncompressed.len() / 2;
-            let mut encoder = ZlibEncoder::new(
-                Vec::with_capacity(estimated_compressed_size),
-                FlateCompression::new(*level),
-            );
-            encoder.write_all(uncompressed)?;
-            let compressed = encoder.finish()?;
-            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
-            })?;
-            // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(&mut blob_buf, 2, raw_size);
-            // Blob field 3: zlib_data (bytes, len-delimited)
-            encode_bytes_field(&mut blob_buf, 3, &compressed);
-        }
-        Compression::Zstd(level) => {
-            let compressed =
-                zstd::bulk::compress(uncompressed, *level).map_err(io::Error::other)?;
-            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
-                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
-            })?;
-            // Blob field 2: raw_size (int32, varint)
-            encode_int32_field(&mut blob_buf, 2, raw_size);
-            // Blob field 7: zstd_data (bytes, len-delimited)
-            encode_bytes_field(&mut blob_buf, 7, &compressed);
-        }
-    }
+    let mut scratch = FrameScratch {
+        blob_buf: Vec::new(),
+        header_buf: Vec::new(),
+        compress_buf: Vec::new(),
+    };
+    frame_blob_into(blob_type, uncompressed, compression, indexdata, &mut scratch)
+}
 
-    // Step 2: Encode the BlobHeader
-    let datasize = i32::try_from(blob_buf.len()).map_err(|_| {
-        io::Error::other(format!("blob datasize overflow: {} bytes", blob_buf.len()))
+/// Compress and frame a blob using reusable scratch buffers.
+///
+/// Returns an owned `Vec<u8>` suitable for sending through a pipeline channel.
+/// The scratch buffers are cleared and reused — after warmup, only the returned
+/// `out` Vec is allocated per call.
+#[hotpath::measure]
+fn frame_blob_into(
+    blob_type: &str,
+    uncompressed: &[u8],
+    compression: &Compression,
+    indexdata: Option<&[u8]>,
+    scratch: &mut FrameScratch,
+) -> io::Result<Vec<u8>> {
+    encode_blob_body(uncompressed, compression, &mut scratch.blob_buf, &mut scratch.compress_buf)?;
+
+    let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
+        io::Error::other(format!("blob datasize overflow: {} bytes", scratch.blob_buf.len()))
     })?;
-    let header_bytes = encode_blob_header(blob_type, datasize, indexdata);
+    encode_blob_header_into(blob_type, datasize, indexdata, &mut scratch.header_buf);
 
-    // Step 3: Assemble [4-byte BE header_len][BlobHeader][Blob]
-    let header_len = u32::try_from(header_bytes.len())
-        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;
-    let total_len = 4 + header_bytes.len() + blob_buf.len();
+    let header_len = u32::try_from(scratch.header_buf.len())
+        .map_err(|_| io::Error::other(format!("header too large: {} bytes", scratch.header_buf.len())))?;
+    let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
-    out.extend_from_slice(&header_bytes);
-    out.extend_from_slice(&blob_buf);
+    out.extend_from_slice(&scratch.header_buf);
+    out.extend_from_slice(&scratch.blob_buf);
 
     Ok(out)
 }
 
-/// Encode a BlobHeader to wire-format bytes.
+/// Encode the Blob protobuf body (optionally compressed) into `blob_buf`.
+///
+/// Uses `compress_buf` as an intermediate for zlib/zstd compression output.
+/// Both buffers are cleared before use and retain their capacity for reuse.
+fn encode_blob_body(
+    uncompressed: &[u8],
+    compression: &Compression,
+    blob_buf: &mut Vec<u8>,
+    compress_buf: &mut Vec<u8>,
+) -> io::Result<()> {
+    blob_buf.clear();
+    match compression {
+        Compression::None => {
+            // Blob field 1: raw (bytes, len-delimited)
+            encode_bytes_field(blob_buf, 1, uncompressed);
+        }
+        Compression::Zlib(level) => {
+            compress_buf.clear();
+            let mut encoder =
+                ZlibEncoder::new(&mut *compress_buf, FlateCompression::new(*level));
+            encoder.write_all(uncompressed)?;
+            encoder.finish()?;
+            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
+                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+            })?;
+            // Blob field 2: raw_size (int32, varint)
+            encode_int32_field(blob_buf, 2, raw_size);
+            // Blob field 3: zlib_data (bytes, len-delimited)
+            encode_bytes_field(blob_buf, 3, compress_buf);
+        }
+        Compression::Zstd(level) => {
+            compress_buf.clear();
+            let mut encoder = zstd::stream::write::Encoder::new(&mut *compress_buf, *level)?;
+            encoder.write_all(uncompressed)?;
+            encoder.finish()?;
+            let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
+                io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
+            })?;
+            // Blob field 2: raw_size (int32, varint)
+            encode_int32_field(blob_buf, 2, raw_size);
+            // Blob field 7: zstd_data (bytes, len-delimited)
+            encode_bytes_field(blob_buf, 7, compress_buf);
+        }
+    }
+    Ok(())
+}
+
+/// Encode a BlobHeader into `buf` (cleared and reused).
 ///
 /// BlobHeader fields: type (string, field 1), indexdata (bytes, field 2),
 /// datasize (int32, field 3).
-fn encode_blob_header(blob_type: &str, datasize: i32, indexdata: Option<&[u8]>) -> Vec<u8> {
-    let mut buf = Vec::new();
+fn encode_blob_header_into(
+    blob_type: &str,
+    datasize: i32,
+    indexdata: Option<&[u8]>,
+    buf: &mut Vec<u8>,
+) {
+    buf.clear();
     // Field 1: type (string = len-delimited bytes)
-    encode_bytes_field(&mut buf, 1, blob_type.as_bytes());
+    encode_bytes_field(buf, 1, blob_type.as_bytes());
     // Field 2: indexdata (optional bytes)
     if let Some(data) = indexdata {
-        encode_bytes_field(&mut buf, 2, data);
+        encode_bytes_field(buf, 2, data);
     }
     // Field 3: datasize (int32 varint)
-    encode_int32_field(&mut buf, 3, datasize);
-    buf
+    encode_int32_field(buf, 3, datasize);
 }
 
 /// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
@@ -674,14 +771,15 @@ pub(crate) fn reframe_raw_with_index(
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
     })?;
-    let header_bytes = encode_blob_header("OSMData", datasize, Some(indexdata));
+    let mut header_buf = Vec::new();
+    encode_blob_header_into("OSMData", datasize, Some(indexdata), &mut header_buf);
 
-    let header_len = u32::try_from(header_bytes.len())
-        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_bytes.len())))?;
-    let total_len = 4 + header_bytes.len() + blob_bytes.len();
+    let header_len = u32::try_from(header_buf.len())
+        .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_buf.len())))?;
+    let total_len = 4 + header_buf.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
-    out.extend_from_slice(&header_bytes);
+    out.extend_from_slice(&header_buf);
     out.extend_from_slice(blob_bytes);
 
     Ok(out)

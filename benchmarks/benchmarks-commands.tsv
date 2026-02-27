@@ -29,3 +29,21 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	osmium	extract-complete	2.74	483
 2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	pbfhogg	extract-smart	6.12	483
 2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	osmium	extract-smart	3.2	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-simple	4.17	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-simple	1.76	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-complete	4.75	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-complete	2.82	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-smart	7.39	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-smart	3.2	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-simple	4.05	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-simple	1.66	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-complete	4.42	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-complete	2.75	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-smart	6.12	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-smart	3.17	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-simple	2.84	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-simple	1.7	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-complete	2.72	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-complete	2.76	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	pbfhogg	extract-smart	4.23	483
+2026-02-27	plantasjen	c2a49d0*	Update TODO.md: mark all write passes parallelized, document extract constraints	denmark-20260220-seq4704	osmium	extract-smart	3.23	483

@@ -12,6 +12,61 @@ use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 // ---------------------------------------------------------------------------
+// Dense bitset for O(1) element ID membership testing
+// ---------------------------------------------------------------------------
+
+/// Chunked sparse bitset for O(1) element ID membership testing.
+///
+/// Mirrors osmium's `IdSetDense`: a vector of on-demand 4MB byte-array chunks,
+/// each covering 33M IDs via bit-level addressing. Lookup and insertion are
+/// 3 instructions (chunk index + byte offset + bitmask), with no hashing or
+/// sorting overhead.
+///
+/// Memory: 1 bit per ID present in each allocated chunk, 4MB per chunk, zero
+/// for empty ranges. For Denmark's 52M nodes: 2 chunks = 8MB. For planet
+/// (12B node IDs): ~364 chunks = 1.5GB.
+struct IdSetDense {
+    chunks: Vec<Option<Box<[u8; CHUNK_SIZE]>>>,
+}
+
+const CHUNK_BITS: usize = 22;
+const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
+
+impl IdSetDense {
+    fn new() -> Self {
+        Self { chunks: Vec::new() }
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn set(&mut self, id: i64) {
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        if cid >= self.chunks.len() {
+            self.chunks.resize_with(cid + 1, || None);
+        }
+        let chunk = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
+        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
+        chunk[offset] |= 1u8 << (id & 7);
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn get(&self, id: i64) -> bool {
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        if cid >= self.chunks.len() {
+            return false;
+        }
+        match &self.chunks[cid] {
+            None => false,
+            Some(chunk) => {
+                let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
+                (chunk[offset] & (1u8 << (id & 7))) != 0
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Bounding box
 // ---------------------------------------------------------------------------
 
@@ -426,39 +481,8 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
 
     let mut bb = BlockBuilder::new();
 
-    // OPTIMIZATION: Use sorted Vec<i64> instead of BTreeSet<i64> for matched element IDs.
-    //
-    // Previously these were BTreeSet<i64>, which stores each entry in a B-tree node
-    // with ~40 bytes overhead per entry (node pointers, balance metadata). For large
-    // extracts with millions of matched IDs, this wastes significant memory.
-    //
-    // Sorted Vec<i64> uses exactly 8 bytes per entry (just the i64 itself), a ~5x
-    // memory reduction. Lookups use binary_search() which is O(log n) -- the same
-    // asymptotic complexity as BTreeSet::contains() -- but with much better cache
-    // locality since the data is contiguous in memory.
-    //
-    // Alternatives considered:
-    // - HashSet<i64>: Even worse memory overhead (~72 bytes/entry due to hash table
-    //   buckets, load factor headroom, and per-entry hash storage).
-    // - roaring::RoaringBitmap: Excellent compression for dense ID ranges, but adds
-    //   an external dependency. Overkill for extract-sized sets where the simple
-    //   sorted Vec approach is sufficient.
-    //
-    // The sort+dedup step is deferred until the first lookup via boolean flags. This
-    // is safe because OSM PBF files are conventionally ordered: all nodes come before
-    // all ways, and all ways come before all relations. So by the time we need to
-    // look up node IDs (when processing ways), all nodes have already been collected,
-    // and similarly for way IDs when processing relations.
-    //
-    // sort_unstable() is used instead of sort() because i64 has no meaningful
-    // stability requirement (equal elements are identical), and sort_unstable()
-    // avoids the temporary allocation that sort() needs for its merge step.
-    let mut matched_node_ids: Vec<i64> = Vec::new();
-    let mut matched_way_ids: Vec<i64> = Vec::new();
-    // Track whether each Vec has been sorted+deduped yet, to sort lazily on first
-    // lookup. This avoids sorting after every push (which would be O(n^2) total).
-    let mut node_ids_sorted = false;
-    let mut way_ids_sorted = false;
+    let mut matched_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
@@ -477,49 +501,26 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
             match &element {
                 Element::DenseNode(dn) => {
                     if region.contains(dn.lat(), dn.lon()) {
-                        matched_node_ids.push(dn.id());
+                        matched_node_ids.set(dn.id());
                         write_dense_node(dn, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
                     }
                 }
                 Element::Node(n) => {
                     if region.contains(n.lat(), n.lon()) {
-                        matched_node_ids.push(n.id());
+                        matched_node_ids.set(n.id());
                         write_node(n, &mut bb, &mut writer, &mut tags_buf)?;
                         stats.nodes_in_bbox += 1;
                     }
                 }
                 Element::Way(w) => {
-                    // Sort+dedup node IDs on first way encounter. All nodes
-                    // precede ways in OSM PBF file order, so the Vec is
-                    // complete by the time we reach the first way.
-                    if !node_ids_sorted {
-                        matched_node_ids.sort_unstable();
-                        matched_node_ids.dedup();
-                        node_ids_sorted = true;
-                    }
-                    if w.refs().any(|r| matched_node_ids.binary_search(&r).is_ok()) {
-                        matched_way_ids.push(w.id());
+                    if w.refs().any(|r| matched_node_ids.get(r)) {
+                        matched_way_ids.set(w.id());
                         write_way(w, &mut bb, &mut writer, &mut tags_buf, &mut refs_buf)?;
                         stats.ways_written += 1;
                     }
                 }
                 Element::Relation(r) => {
-                    // Sort+dedup way IDs on first relation encounter. All ways
-                    // precede relations in OSM PBF file order, so the Vec is
-                    // complete by the time we reach the first relation.
-                    // Also ensure node IDs are sorted (in case the file
-                    // contained no ways, the sort would not have triggered yet).
-                    if !node_ids_sorted {
-                        matched_node_ids.sort_unstable();
-                        matched_node_ids.dedup();
-                        node_ids_sorted = true;
-                    }
-                    if !way_ids_sorted {
-                        matched_way_ids.sort_unstable();
-                        matched_way_ids.dedup();
-                        way_ids_sorted = true;
-                    }
                     if relation_has_matched_member(r, &matched_node_ids, &matched_way_ids) {
                         write_relation(r, &mut bb, &mut writer, &mut tags_buf, &mut members_buf)?;
                         stats.relations_written += 1;
@@ -550,44 +551,10 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     };
 
     // --- Pass 1: Collect matches ---
-    //
-    // OPTIMIZATION: Use Vec<i64> instead of BTreeSet<i64> for all ID collections.
-    //
-    // Previously these were BTreeSet<i64>, which has ~40 bytes per-entry overhead
-    // from B-tree node allocations (child/parent pointers, balance metadata). For a
-    // country-sized extract with millions of matched nodes and ways, this overhead
-    // dominates memory usage.
-    //
-    // Sorted Vec<i64> stores just the raw 8-byte i64 values contiguously, giving
-    // ~5x memory reduction. Lookups via binary_search() have the same O(log n)
-    // complexity as BTreeSet::contains() but with better cache locality.
-    //
-    // During pass 1, some Vecs are queried while others are still being built:
-    // bbox_node_ids is looked up when processing ways, and matched_way_ids is looked
-    // up when processing relations. This works because OSM PBF files are ordered
-    // (nodes -> ways -> relations), so each Vec is complete before its first lookup.
-    // Lazy sorting via boolean flags ensures each Vec is sorted exactly once, right
-    // before its first binary_search.
-    //
-    // After pass 1 completes, all four Vecs are sorted+deduped for pass 2 lookups.
-    //
-    // Alternatives considered:
-    // - HashSet<i64>: Worse memory (~72 bytes/entry from hash buckets and load factor).
-    // - roaring::RoaringBitmap: Great compression for dense ranges but adds an
-    //   external dependency; overkill for typical extract sizes.
-    //
-    // sort_unstable() is preferred over sort() for primitive types -- no stability
-    // needed (equal i64 values are identical), and it avoids the temporary buffer
-    // allocation that sort() uses internally for its merge step.
-    let mut bbox_node_ids: Vec<i64> = Vec::new();
-    let mut matched_way_ids: Vec<i64> = Vec::new();
-    let mut all_way_node_ids: Vec<i64> = Vec::new();
-    let mut matched_relation_ids: Vec<i64> = Vec::new();
-    // Lazy-sort flags for within-pass-1 lookups. These persist across blocks so
-    // each Vec is sorted at most once during pass 1 (on the first block that needs
-    // to look it up). See collect_pass1_matches for details.
-    let mut bbox_node_ids_sorted = false;
-    let mut way_ids_sorted = false;
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut all_way_node_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
@@ -599,29 +566,8 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
             &mut matched_way_ids,
             &mut all_way_node_ids,
             &mut matched_relation_ids,
-            &mut bbox_node_ids_sorted,
-            &mut way_ids_sorted,
         );
     }
-
-    // Sort and deduplicate all ID Vecs between pass 1 and pass 2. This is the key
-    // step that makes binary_search() valid for pass 2 lookups.
-    //
-    // bbox_node_ids and matched_way_ids may already be sorted from lazy sorting
-    // during pass 1 (see collect_pass1_matches), but sorting an already-sorted Vec
-    // is O(n) with sort_unstable's pattern detection, so the redundant sort is cheap.
-    //
-    // all_way_node_ids is only ever appended to during pass 1 (never looked up), so
-    // this is its first sort. matched_relation_ids is similarly only appended to
-    // during pass 1.
-    bbox_node_ids.sort_unstable();
-    bbox_node_ids.dedup();
-    matched_way_ids.sort_unstable();
-    matched_way_ids.dedup();
-    all_way_node_ids.sort_unstable();
-    all_way_node_ids.dedup();
-    matched_relation_ids.sort_unstable();
-    matched_relation_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -657,74 +603,43 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
 
 /// Collect matching element IDs during pass 1 of the complete-ways strategy.
 ///
-/// This function is called once per PrimitiveBlock. Within pass 1, some Vecs need
-/// to be looked up while others are still being populated:
-/// - `bbox_node_ids` is queried when processing ways (to check if a way has any
-///   node in the region).
-/// - `matched_way_ids` is queried when processing relations (to check if a relation
-///   references a matched way).
+/// This function is called once per PrimitiveBlock. Nodes in the region are
+/// added to `bbox_node_ids`, ways with any node in the region are added to
+/// `matched_way_ids` (and all their node refs to `all_way_node_ids`), and
+/// relations referencing matched nodes/ways are added to `matched_relation_ids`.
 ///
-/// This works because OSM PBF files are ordered: all node blocks come before way
-/// blocks, and all way blocks come before relation blocks. We lazily sort each Vec
-/// on the first block that needs to look it up. The `bbox_node_ids_sorted` and
-/// `way_ids_sorted` flags persist across block boundaries (passed by the caller)
-/// so each Vec is sorted at most once.
-///
-/// After pass 1 completes, the caller performs a final sort+dedup on all Vecs to
-/// prepare them for pass 2 lookups.
-#[allow(clippy::too_many_arguments)]
+/// All ID sets use `IdSetDense` for O(1) lookup and insertion with no sorting.
 fn collect_pass1_matches(
     block: &crate::PrimitiveBlock,
     region: &Region,
-    bbox_node_ids: &mut Vec<i64>,
-    matched_way_ids: &mut Vec<i64>,
-    all_way_node_ids: &mut Vec<i64>,
-    matched_relation_ids: &mut Vec<i64>,
-    bbox_node_ids_sorted: &mut bool,
-    way_ids_sorted: &mut bool,
+    bbox_node_ids: &mut IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    all_way_node_ids: &mut IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
 ) {
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
                 if region.contains(dn.lat(), dn.lon()) {
-                    bbox_node_ids.push(dn.id());
+                    bbox_node_ids.set(dn.id());
                 }
             }
             Element::Node(n) => {
                 if region.contains(n.lat(), n.lon()) {
-                    bbox_node_ids.push(n.id());
+                    bbox_node_ids.set(n.id());
                 }
             }
             Element::Way(w) => {
-                // Sort+dedup bbox_node_ids on first way encounter. All nodes precede
-                // ways in OSM PBF file order, so the Vec is complete by now.
-                if !*bbox_node_ids_sorted {
-                    bbox_node_ids.sort_unstable();
-                    bbox_node_ids.dedup();
-                    *bbox_node_ids_sorted = true;
-                }
-                if w.refs().any(|r| bbox_node_ids.binary_search(&r).is_ok()) {
-                    matched_way_ids.push(w.id());
-                    all_way_node_ids.extend(w.refs());
+                if w.refs().any(|r| bbox_node_ids.get(r)) {
+                    matched_way_ids.set(w.id());
+                    for r in w.refs() {
+                        all_way_node_ids.set(r);
+                    }
                 }
             }
             Element::Relation(r) => {
-                // Sort+dedup matched_way_ids on first relation encounter. All ways
-                // precede relations in OSM PBF file order, so the Vec is complete.
-                // Also ensure bbox_node_ids is sorted (for relation_has_matched_member
-                // to check node membership, and in case the file had no ways).
-                if !*bbox_node_ids_sorted {
-                    bbox_node_ids.sort_unstable();
-                    bbox_node_ids.dedup();
-                    *bbox_node_ids_sorted = true;
-                }
-                if !*way_ids_sorted {
-                    matched_way_ids.sort_unstable();
-                    matched_way_ids.dedup();
-                    *way_ids_sorted = true;
-                }
                 if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
-                    matched_relation_ids.push(r.id());
+                    matched_relation_ids.set(r.id());
                 }
             }
         }
@@ -737,10 +652,10 @@ fn collect_pass1_matches(
 
 /// Read-only ID sets for Pass 2 of complete-ways strategy, shared across rayon threads.
 struct ExtractPass2IdSets<'a> {
-    bbox_node_ids: &'a [i64],
-    all_way_node_ids: &'a [i64],
-    matched_way_ids: &'a [i64],
-    matched_relation_ids: &'a [i64],
+    bbox_node_ids: &'a IdSetDense,
+    all_way_node_ids: &'a IdSetDense,
+    matched_way_ids: &'a IdSetDense,
+    matched_relation_ids: &'a IdSetDense,
 }
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
@@ -767,8 +682,8 @@ fn extract_block_pass2(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                let in_bbox = ids.bbox_node_ids.binary_search(&dn.id()).is_ok();
-                let from_way = ids.all_way_node_ids.binary_search(&dn.id()).is_ok();
+                let in_bbox = ids.bbox_node_ids.get(dn.id());
+                let from_way = ids.all_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -785,8 +700,8 @@ fn extract_block_pass2(
                 }
             }
             Element::Node(n) => {
-                let in_bbox = ids.bbox_node_ids.binary_search(&n.id()).is_ok();
-                let from_way = ids.all_way_node_ids.binary_search(&n.id()).is_ok();
+                let in_bbox = ids.bbox_node_ids.get(n.id());
+                let from_way = ids.all_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -803,7 +718,7 @@ fn extract_block_pass2(
                 }
             }
             Element::Way(w) => {
-                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                if ids.matched_way_ids.get(w.id()) {
                     if !bb.can_add_way() {
                         flush_local(bb, output)?;
                     }
@@ -817,7 +732,7 @@ fn extract_block_pass2(
                 }
             }
             Element::Relation(r) => {
-                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                if ids.matched_relation_ids.get(r.id()) {
                     if !bb.can_add_relation() {
                         flush_local(bb, output)?;
                     }
@@ -892,14 +807,12 @@ fn extract_smart(
     };
 
     // --- Pass 1: Collect matches + smart relation deps ---
-    let mut bbox_node_ids: Vec<i64> = Vec::new();
-    let mut matched_way_ids: Vec<i64> = Vec::new();
-    let mut all_way_node_ids: Vec<i64> = Vec::new();
-    let mut matched_relation_ids: Vec<i64> = Vec::new();
-    let mut extra_way_ids: Vec<i64> = Vec::new();
-    let mut extra_node_ids: Vec<i64> = Vec::new();
-    let mut bbox_node_ids_sorted = false;
-    let mut way_ids_sorted = false;
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut all_way_node_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
+    let mut extra_way_ids = IdSetDense::new();
+    let mut extra_node_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
@@ -909,21 +822,8 @@ fn extract_smart(
             &mut bbox_node_ids, &mut matched_way_ids,
             &mut all_way_node_ids, &mut matched_relation_ids,
             &mut extra_way_ids, &mut extra_node_ids,
-            &mut bbox_node_ids_sorted, &mut way_ids_sorted,
         );
     }
-
-    // Sort + dedup all Vecs between pass 1 and pass 2.
-    bbox_node_ids.sort_unstable();
-    bbox_node_ids.dedup();
-    matched_way_ids.sort_unstable();
-    matched_way_ids.dedup();
-    all_way_node_ids.sort_unstable();
-    all_way_node_ids.dedup();
-    matched_relation_ids.sort_unstable();
-    matched_relation_ids.dedup();
-    extra_way_ids.sort_unstable();
-    extra_way_ids.dedup();
 
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
@@ -934,24 +834,14 @@ fn extract_smart(
         for element in block.elements() {
             if let Element::Way(w) = &element {
                 let wid = w.id();
-                if extra_way_ids.binary_search(&wid).is_ok()
-                    && matched_way_ids.binary_search(&wid).is_err()
-                {
-                    extra_node_ids.extend(w.refs());
+                if extra_way_ids.get(wid) && !matched_way_ids.get(wid) {
+                    for r in w.refs() {
+                        extra_node_ids.set(r);
+                    }
                 }
             }
         }
     }
-
-    // Merge extra IDs into the main sets.
-    let extra_ways_count = extra_way_ids.len();
-    matched_way_ids.extend_from_slice(&extra_way_ids);
-    matched_way_ids.sort_unstable();
-    matched_way_ids.dedup();
-    stats.ways_from_relations = (matched_way_ids.len() - (matched_way_ids.len() - extra_ways_count).min(matched_way_ids.len())) as u64;
-
-    extra_node_ids.sort_unstable();
-    extra_node_ids.dedup();
 
     // --- Pass 3: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -967,6 +857,7 @@ fn extract_smart(
         all_way_node_ids: &all_way_node_ids,
         extra_node_ids: &extra_node_ids,
         matched_way_ids: &matched_way_ids,
+        extra_way_ids: &extra_way_ids,
         matched_relation_ids: &matched_relation_ids,
     };
 
@@ -994,58 +885,43 @@ fn extract_smart(
 fn collect_pass1_smart(
     block: &crate::PrimitiveBlock,
     region: &Region,
-    bbox_node_ids: &mut Vec<i64>,
-    matched_way_ids: &mut Vec<i64>,
-    all_way_node_ids: &mut Vec<i64>,
-    matched_relation_ids: &mut Vec<i64>,
-    extra_way_ids: &mut Vec<i64>,
-    extra_node_ids: &mut Vec<i64>,
-    bbox_node_ids_sorted: &mut bool,
-    way_ids_sorted: &mut bool,
+    bbox_node_ids: &mut IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    all_way_node_ids: &mut IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+    extra_way_ids: &mut IdSetDense,
+    extra_node_ids: &mut IdSetDense,
 ) {
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
                 if region.contains(dn.lat(), dn.lon()) {
-                    bbox_node_ids.push(dn.id());
+                    bbox_node_ids.set(dn.id());
                 }
             }
             Element::Node(n) => {
                 if region.contains(n.lat(), n.lon()) {
-                    bbox_node_ids.push(n.id());
+                    bbox_node_ids.set(n.id());
                 }
             }
             Element::Way(w) => {
-                if !*bbox_node_ids_sorted {
-                    bbox_node_ids.sort_unstable();
-                    bbox_node_ids.dedup();
-                    *bbox_node_ids_sorted = true;
-                }
-                if w.refs().any(|r| bbox_node_ids.binary_search(&r).is_ok()) {
-                    matched_way_ids.push(w.id());
-                    all_way_node_ids.extend(w.refs());
+                if w.refs().any(|r| bbox_node_ids.get(r)) {
+                    matched_way_ids.set(w.id());
+                    for r in w.refs() {
+                        all_way_node_ids.set(r);
+                    }
                 }
             }
             Element::Relation(r) => {
-                if !*bbox_node_ids_sorted {
-                    bbox_node_ids.sort_unstable();
-                    bbox_node_ids.dedup();
-                    *bbox_node_ids_sorted = true;
-                }
-                if !*way_ids_sorted {
-                    matched_way_ids.sort_unstable();
-                    matched_way_ids.dedup();
-                    *way_ids_sorted = true;
-                }
                 if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
-                    matched_relation_ids.push(r.id());
+                    matched_relation_ids.set(r.id());
                     // For multipolygon/boundary relations, collect all member
                     // IDs so their ways and nodes are fully included.
                     if is_smart_relation(r) {
                         for m in r.members() {
                             match m.id {
-                                MemberId::Way(id) => extra_way_ids.push(id),
-                                MemberId::Node(id) => extra_node_ids.push(id),
+                                MemberId::Way(id) => extra_way_ids.set(id),
+                                MemberId::Node(id) => extra_node_ids.set(id),
                                 MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
                             }
                         }
@@ -1062,11 +938,12 @@ fn collect_pass1_smart(
 
 /// Read-only ID sets for Pass 3 of smart strategy, shared across rayon threads.
 struct ExtractPass3IdSets<'a> {
-    bbox_node_ids: &'a [i64],
-    all_way_node_ids: &'a [i64],
-    extra_node_ids: &'a [i64],
-    matched_way_ids: &'a [i64],
-    matched_relation_ids: &'a [i64],
+    bbox_node_ids: &'a IdSetDense,
+    all_way_node_ids: &'a IdSetDense,
+    extra_node_ids: &'a IdSetDense,
+    matched_way_ids: &'a IdSetDense,
+    extra_way_ids: &'a IdSetDense,
+    matched_relation_ids: &'a IdSetDense,
 }
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
@@ -1094,9 +971,9 @@ fn extract_block_pass3(
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                let in_bbox = ids.bbox_node_ids.binary_search(&id).is_ok();
-                let from_way = ids.all_way_node_ids.binary_search(&id).is_ok();
-                let from_rel = ids.extra_node_ids.binary_search(&id).is_ok();
+                let in_bbox = ids.bbox_node_ids.get(id);
+                let from_way = ids.all_way_node_ids.get(id);
+                let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -1116,9 +993,9 @@ fn extract_block_pass3(
             }
             Element::Node(n) => {
                 let id = n.id();
-                let in_bbox = ids.bbox_node_ids.binary_search(&id).is_ok();
-                let from_way = ids.all_way_node_ids.binary_search(&id).is_ok();
-                let from_rel = ids.extra_node_ids.binary_search(&id).is_ok();
+                let in_bbox = ids.bbox_node_ids.get(id);
+                let from_way = ids.all_way_node_ids.get(id);
+                let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -1137,7 +1014,9 @@ fn extract_block_pass3(
                 }
             }
             Element::Way(w) => {
-                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                let in_matched = ids.matched_way_ids.get(w.id());
+                let in_extra = ids.extra_way_ids.get(w.id());
+                if in_matched || in_extra {
                     if !bb.can_add_way() {
                         flush_local(bb, output)?;
                     }
@@ -1147,11 +1026,15 @@ fn extract_block_pass3(
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
                     bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
-                    stats.ways_written += 1;
+                    if in_extra && !in_matched {
+                        stats.ways_from_relations += 1;
+                    } else {
+                        stats.ways_written += 1;
+                    }
                 }
             }
             Element::Relation(r) => {
-                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                if ids.matched_relation_ids.get(r.id()) {
                     if !bb.can_add_relation() {
                         flush_local(bb, output)?;
                     }
@@ -1208,17 +1091,14 @@ fn process_extract_pass3_batch(
 // ---------------------------------------------------------------------------
 
 /// Check if a relation has any member whose ID is in the matched node or way sets.
-///
-/// Takes sorted slices (not BTreeSet) -- uses binary_search() for O(log n) lookups
-/// with contiguous memory layout for better cache performance than tree-based lookups.
 fn relation_has_matched_member(
     r: &crate::Relation,
-    node_ids: &[i64],
-    way_ids: &[i64],
+    node_ids: &IdSetDense,
+    way_ids: &IdSetDense,
 ) -> bool {
     r.members().any(|m| match m.id {
-        MemberId::Node(id) => node_ids.binary_search(&id).is_ok(),
-        MemberId::Way(id) => way_ids.binary_search(&id).is_ok(),
+        MemberId::Node(id) => node_ids.get(id),
+        MemberId::Way(id) => way_ids.get(id),
         MemberId::Relation(_) | MemberId::Unknown(_, _) => false,
     })
 }

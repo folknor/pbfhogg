@@ -237,11 +237,86 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
       parallel writes to the ID collection during Pass 1. Overkill for the
       current single-type-per-phase approach but could work with a redesigned
       multi-phase collector.
-    - [ ] **Profile osmium's approach.** osmium extract is 2-3x faster despite
-      being single-threaded. Likely uses a fundamentally different algorithm or
-      data structure (e.g. ID bitmaps, or a single-pass approach with different
-      completeness semantics). Understanding their approach could reveal
-      optimizations independent of parallelism.
+    - [x] **Profile osmium's approach.** DONE — see analysis below.
+
+    **Osmium extract analysis (source: `data/osmium-tool/`, `data/libosmium/`).**
+    Osmium uses the same algorithmic structure as pbfhogg (simple=1 pass,
+    complete-ways=2 passes, smart=3 passes) with identical element ordering
+    dependencies. The speed difference comes from data structures and decode
+    optimizations, not a fundamentally different algorithm.
+
+    **Finding 1: O(1) chunked bitset vs O(log n) binary search (DOMINANT).**
+    Osmium stores ID sets in `IdSetDense` (`libosmium/include/osmium/index/id_set.hpp`),
+    a chunked sparse bitset: `Vec<Option<Box<[u8; 4MB]>>>` with `chunk_bits=22`.
+    Each chunk covers 33M IDs. `set()` and `get()` are 3 instructions: one array
+    index, one byte offset, one bitmask. Memory: 1 bit per ID present in the
+    chunk, 4MB per allocated chunk, zero for empty ranges.
+
+    pbfhogg uses sorted `Vec<i64>` + `binary_search()`. For 52M Denmark nodes,
+    that's a ~400MB contiguous array with O(log n) ≈ 25 comparisons per lookup,
+    each a potential L2/L3 cache miss. On the complete-ways Pass 2 hot path
+    (52M nodes × 2 ID set lookups), this is ~300ns/node vs osmium's ~6ns/node —
+    a **~50x difference on the lookup-dominated inner loop**.
+
+    The sorted Vec was chosen over BTreeSet (5x memory savings) and HashSet
+    (cache-friendly sequential access), which was the right tradeoff at the time.
+    But a bitset is strictly better: O(1), cache-friendly (sequential bit scanning),
+    and comparable memory for dense ID ranges (node IDs are dense 1..12B).
+
+    - [ ] **Replace `Vec<i64>` + `binary_search` with a chunked dense bitset.**
+      Hand-roll a Rust equivalent of osmium's `IdSetDense`: chunked
+      `Vec<Option<Box<[u8; CHUNK_SIZE]>>>` with bit-level set/get. ~50 lines.
+      CHUNK_SIZE=4MB (matching osmium's `chunk_bits=22`) covers 33M IDs per
+      chunk. For Denmark's 52M nodes: 2 chunks allocated = 8MB total vs current
+      ~400MB sorted Vec. Planet (12B node IDs): ~364 chunks = ~1.5GB bitset vs
+      ~96GB sorted Vec (impossible). This is the single highest-impact change.
+      Roaring bitmaps (`roaring` crate, already a dependency) are an alternative
+      but heavier — the hand-rolled bitset is simpler, zero-dep, and matches
+      the proven osmium design exactly.
+
+    **Finding 2: Metadata skipping in collection passes.**
+    Osmium passes `read_meta::no` for all non-write passes:
+    - complete-ways Pass 1 (`strategy_complete_ways.cpp:175`)
+    - smart Pass 1 (`strategy_smart.cpp:310`)
+    - smart Pass 2 (`strategy_smart.cpp:324`)
+
+    The PBF decoder has a dedicated `decode_dense_nodes_without_metadata()`
+    path (`pbf_decoder.hpp:632`) that skips version, timestamp, changeset, uid,
+    user, and visible fields entirely. For ways and relations, individual fields
+    are skipped via `pbf_node.skip()`. Metadata is ~30-40% of dense node data
+    by byte volume.
+
+    pbfhogg always decodes all fields via the wire-format parser. The `WireInfo`
+    struct is parsed for every element even when only IDs and coordinates are
+    needed (collection passes) or only IDs and refs are needed (way matching).
+
+    - [ ] **Add skip-metadata mode for collection passes.** Add a flag or
+      alternative code path in the wire-format decoder that skips `WireInfo`
+      fields when the consumer only needs IDs + coordinates (Pass 1) or
+      IDs + refs (Pass 2 way scanning). Estimated ~15-25% decode speedup
+      on collection passes. Could be a `BlobFilter`-style builder method
+      on `ElementReader`, or a per-block decode flag.
+
+    **Finding 3: Integer bbox containment vs float conversion.**
+    Osmium's `Box::contains()` (`libosmium/include/osmium/osm/box.hpp:224-229`)
+    does 4 int32 comparisons on raw decimicrodegree coordinates:
+    ```
+    location.x() >= bottom_left().x() && location.y() >= bottom_left().y() &&
+    location.x() <= top_right().x() && location.y() <= top_right().y();
+    ```
+    The `Location` class stores `int32_t m_x, m_y` natively — no conversion.
+
+    pbfhogg converts nanodegrees → f64 via `1e-9 * self.nano_lat() as f64`
+    before each bbox test (`extract.rs:479,486`). The i64→f64 cast + f64
+    multiply + 4 f64 comparisons cost ~5ns/node vs ~2ns/node for int32.
+    At 52M nodes this is ~156ms vs ~104ms — small but free to fix.
+
+    - [ ] **Use integer bbox containment.** Convert the bbox to
+      decimicrodegree int32 once at startup. Compare `dn.decimicro_lat()` /
+      `dn.decimicro_lon()` directly (already available, `elements.rs:53-60`).
+      Eliminates the i64→f64 conversion and uses integer comparison.
+      Polygon containment can keep f64 (rare path, already has bbox
+      fast-rejection).
 
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is

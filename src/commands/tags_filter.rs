@@ -2,10 +2,12 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use super::{dense_node_metadata, element_metadata, flush_block};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -249,6 +251,107 @@ pub fn tags_filter(
 // Single-pass filter (-R mode)
 // ---------------------------------------------------------------------------
 
+const BATCH_SIZE: usize = 64;
+
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
+    if let Some(bytes) = bb.take().map_err(|e| e.to_string())? {
+        output.push(bytes.to_vec());
+    }
+    Ok(())
+}
+
+/// Process a single block through tag-filter expressions on a rayon thread.
+/// Returns per-block stats.
+fn filter_block_parallel(
+    block: &PrimitiveBlock,
+    expressions: &[Expression],
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+) -> std::result::Result<TagsFilterStats, String> {
+    let mut stats = TagsFilterStats {
+        nodes_matched: 0,
+        nodes_from_ways: 0,
+        ways_matched: 0,
+        relations_matched: 0,
+    };
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                tags_buf.clear();
+                tags_buf.extend(dn.tags());
+                if element_matches(expressions, &tags_buf, true, false, false) {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(
+                        dn.id(),
+                        dn.decimicro_lat(),
+                        dn.decimicro_lon(),
+                        &tags_buf,
+                        meta.as_ref(),
+                    );
+                    stats.nodes_matched += 1;
+                }
+            }
+            Element::Node(n) => {
+                tags_buf.clear();
+                tags_buf.extend(n.tags());
+                if element_matches(expressions, &tags_buf, true, false, false) {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(
+                        n.id(),
+                        n.decimicro_lat(),
+                        n.decimicro_lon(),
+                        &tags_buf,
+                        meta.as_ref(),
+                    );
+                    stats.nodes_matched += 1;
+                }
+            }
+            Element::Way(w) => {
+                tags_buf.clear();
+                tags_buf.extend(w.tags());
+                if element_matches(expressions, &tags_buf, false, true, false) {
+                    if !bb.can_add_way() {
+                        flush_local(bb, output)?;
+                    }
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    let meta = element_metadata(&w.info());
+                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    stats.ways_matched += 1;
+                }
+            }
+            Element::Relation(r) => {
+                tags_buf.clear();
+                tags_buf.extend(r.tags());
+                if element_matches(expressions, &tags_buf, false, false, true) {
+                    if !bb.can_add_relation() {
+                        flush_local(bb, output)?;
+                    }
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    stats.relations_matched += 1;
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
 #[allow(clippy::too_many_lines)]
 fn tags_filter_single_pass(
     input: &Path,
@@ -258,7 +361,6 @@ fn tags_filter_single_pass(
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
-    // Skip blob types that no expression targets.
     let reader = match blob_filter_from_expressions(expressions) {
         Some(filter) => reader.with_blob_filter(filter),
         None => reader,
@@ -269,7 +371,6 @@ fn tags_filter_single_pass(
     }
     let header_bytes = hb.build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -277,87 +378,54 @@ fn tags_filter_single_pass(
         relations_matched: 0,
     };
 
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        let meta = dense_node_metadata(dn);
-                        bb.add_node(
-                            dn.id(),
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        stats.nodes_matched += 1;
-                    }
-                }
-                Element::Node(n) => {
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        let meta = element_metadata(&n.info());
-                        bb.add_node(
-                            n.id(),
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        stats.nodes_matched += 1;
-                    }
-                }
-                Element::Way(w) => {
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
-                    if element_matches(expressions, &tags_buf, false, true, false) {
-                        if !bb.can_add_way() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        refs_buf.clear();
-                        refs_buf.extend(w.refs());
-                        let meta = element_metadata(&w.info());
-                        bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
-                        stats.ways_matched += 1;
-                    }
-                }
-                Element::Relation(r) => {
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
-                    if element_matches(expressions, &tags_buf, false, false, true) {
-                        if !bb.can_add_relation() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        members_buf.clear();
-                        members_buf.extend(r.members().map(|m| MemberData {
-                            id: m.id,
-                            role: m.role().unwrap_or(""),
-                        }));
-                        let meta = element_metadata(&r.info());
-                        bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
-                        stats.relations_matched += 1;
-                    }
-                }
-            }
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+
+    for block_result in reader.into_blocks_pipelined() {
+        batch.push(block_result?);
+        if batch.len() >= BATCH_SIZE {
+            process_filter_batch(&batch, expressions, &mut writer, &mut stats)?;
+            batch.clear();
         }
     }
+    if !batch.is_empty() {
+        process_filter_batch(&batch, expressions, &mut writer, &mut stats)?;
+    }
 
-    flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
     Ok(stats)
+}
+
+/// Process a batch of blocks in parallel for single-pass tag filtering.
+fn process_filter_batch(
+    batch: &[PrimitiveBlock],
+    expressions: &[Expression],
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut TagsFilterStats,
+) -> Result<()> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, TagsFilterStats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let block_stats = filter_block_parallel(block, expressions, bb, &mut output)?;
+                flush_local(bb, &mut output)?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        stats.nodes_matched += block_stats.nodes_matched;
+        stats.ways_matched += block_stats.ways_matched;
+        stats.relations_matched += block_stats.relations_matched;
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

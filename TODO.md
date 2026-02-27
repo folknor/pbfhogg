@@ -123,9 +123,23 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
 
   Remaining:
 
-  - [ ] **Extract: remaining gap vs osmium.** Simple is 1.5x slower, smart is
-    1.2x slower. The bottleneck is per-element decode speed, not parallelism or
-    I/O. Full analysis in `notes/extract-parallel-collection.md`.
+  - [ ] **Extract: remaining gap vs osmium.** Simple is 1.5x slower, smart
+    is 1.2x slower. **Complete-ways is already faster** (0.97x). Full analysis
+    in `notes/extract-parallel-collection.md`.
+
+    The gap is NOT decoder efficiency — complete-ways proves our decoder is
+    competitive (identical 2-pass structure, pbfhogg wins). The gaps are:
+
+    1. **Simple: 2 passes vs osmium's 1.** Simple was restructured from
+       single-pass to streaming collection (Pass 1) + parallel write (Pass 2).
+       The extra file read costs ~1.3s (pipelined decode of Denmark). Osmium's
+       single-pass at 1.74s vs our two-pass at 2.66s — the difference is
+       nearly one extra read. A single-pass approach with parallel inline
+       writing would close most of this gap.
+    2. **Smart: metadata skipping in scan-only passes.** Smart Pass 2 (way dep
+       resolution) only needs way IDs and refs. Osmium skips metadata entirely
+       via `read_meta::no`, saving ~30-40% of dense node decode volume.
+       pbfhogg decodes full elements including unused metadata fields.
 
     **Investigated and ruled out:**
     - ~~Parallel ID collection with IndexedReader~~ — implemented three-phase
@@ -143,28 +157,21 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
 
     **Osmium extract analysis (source: `data/osmium-tool/`, `data/libosmium/`).**
     Osmium does NOT parallelize extract. Element processing is fully sequential.
-    The speed difference comes from decoder efficiency, not a different algorithm:
 
-    1. **Metadata skipping** — `read_meta::no` for non-write passes skips
-       version, timestamp, changeset, uid, user, visible fields entirely.
-       Dedicated `decode_dense_nodes_without_metadata()` path
-       (`pbf_decoder.hpp:632`). Metadata is ~30-40% of dense node data by
-       byte volume.
-    2. **Eager protobuf decoder** — protobuf-generated decoders with compiled
-       field dispatch vs pbfhogg's hand-rolled wire-format scanner that scans
-       all varint field boundaries including metadata bytes.
-    3. **posix_fadvise(POSIX_FADV_SEQUENTIAL)** — pbfhogg now has this too.
-
-    - [ ] **Add skip-metadata mode for collection passes.** pbfhogg's
-      zero-copy wire-format parser is already partially lazy — `WireInfo`
-      stores byte offsets, not parsed values, so unused metadata fields
-      aren't materialized. However, the initial `WireBlock` parse still
-      scans through all varint field boundaries including metadata bytes.
-      A true skip would require the protobuf wire format to support
-      jumping over fields without scanning (it doesn't — varints are
-      variable-length). **Low priority** — the remaining gain is the
-      varint scanning cost (~5-10% of decode, not the 15-25% that osmium
-      saves from its eager decoder).
+    **Possible approaches:**
+    - [ ] **Single-pass simple with parallel inline writing.** Stream through
+      the pipelined reader, collect + filter matching elements per block, batch
+      matched blocks for parallel writing via rayon. Eliminates the second file
+      read. Challenge: the collection consumer (which is sequential) and the
+      write dispatch (which needs rayon) must coexist in the same pass.
+    - [ ] **Add skip-metadata mode for smart Pass 2.** Smart Pass 2 only needs
+      way IDs and refs. Skipping metadata varint scanning could save ~5-10% of
+      decode time in that pass. pbfhogg's wire-format parser already stores byte
+      offsets (not parsed values) for metadata, so unused fields aren't
+      materialized — but the initial `WireBlock` parse still scans through all
+      varint field boundaries. A true skip requires the protobuf wire format to
+      support jumping over fields without scanning (it doesn't — varints are
+      variable-length).
 
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is

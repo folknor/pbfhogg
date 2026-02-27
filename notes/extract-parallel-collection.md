@@ -201,9 +201,16 @@ existing pipelined reader already parallelizes the expensive part (decode),
 and the consumer work is trivial. io_uring reads don't address this because
 the bottleneck is decode, not I/O.
 
-The remaining performance gap vs osmium comes from:
-- Metadata skipping in collection passes (low priority, ~5-10% decode savings)
-- Decoder efficiency differences (protobuf-generated vs hand-rolled wire format)
+The remaining performance gap vs osmium is NOT decoder efficiency — the
+complete-ways comparison (identical 2-pass structure) shows pbfhogg is
+already faster (2.74s vs 2.82s). The gaps are:
+
+- **Simple: 2 passes vs osmium's 1.** The extra file read costs ~1.3s.
+  A single-pass approach with parallel inline writing would close most
+  of this gap.
+- **Smart: metadata skipping in scan-only passes.** Smart Pass 2 (way dep
+  resolution) only needs way IDs and refs. Osmium skips metadata entirely,
+  saving decode work. pbfhogg decodes full elements including unused fields.
 
 ## Retained changes
 

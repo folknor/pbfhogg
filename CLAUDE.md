@@ -18,6 +18,8 @@ The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoke
 - `cargo dev run [args]` — build release CLI and run with passthrough args (e.g., `cargo dev run fileinfo tests/test.osm.pbf`).
 - `cargo dev bench read [--dataset name] [--pbf path] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite.
 - `cargo dev bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
+- `cargo dev bench merge [--dataset name] [--pbf path] [--osc path] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite.
+- `cargo dev bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (14 commands, external timing). Use `all` for full suite. Results stored in SQLite.
 - `cargo dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
 
 The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmark results stored in `dev/results.db` (SQLite, committed in git).
@@ -28,7 +30,6 @@ Remaining bench/hotpath scripts (being migrated to `dev` in later phases):
 - `scripts/build.sh` — build release binary (still used by bench/verify scripts)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
-- `scripts/bench-commands.sh <cmd> [pbf] [runs]` — CLI command benchmark vs osmium (logs to benchmarks/benchmarks-commands.tsv). Commands: cat-way, cat-relation, tags-count, tags-count-way, tags-filter-way, tags-filter-amenity, tags-filter-twopass, getid, removeid, add-locations-to-ways, extract-simple, extract-complete, extract-smart, node-stats, all
 - `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
 - `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
 

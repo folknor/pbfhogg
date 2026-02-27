@@ -1,3 +1,5 @@
+mod bench_commands;
+mod bench_merge;
 mod bench_read;
 mod bench_write;
 mod build;
@@ -108,6 +110,50 @@ enum BenchCommand {
         /// Comma-separated compression modes (default: none,zlib:6,zstd:3)
         #[arg(long, default_value = "none,zlib:6,zstd:3")]
         compression: String,
+    },
+    /// Benchmark merge performance (I/O modes x compression)
+    Merge {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Enable io_uring variants (with preflight checks)
+        #[arg(long)]
+        uring: bool,
+
+        /// Comma-separated compression modes (default: zlib,none)
+        #[arg(long, default_value = "zlib,none")]
+        compression: String,
+    },
+    /// Benchmark CLI commands (external timing)
+    Commands {
+        /// Command to benchmark (or "all" for full suite)
+        #[arg(default_value = "all")]
+        command: String,
+
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
     },
 }
 
@@ -253,6 +299,20 @@ fn cmd_bench(bench: BenchCommand) -> Result<(), DevError> {
             runs,
             compression,
         } => cmd_bench_write(dataset, pbf, runs, compression),
+        BenchCommand::Merge {
+            dataset,
+            pbf,
+            osc,
+            runs,
+            uring,
+            compression,
+        } => cmd_bench_merge(dataset, pbf, osc, runs, uring, compression),
+        BenchCommand::Commands {
+            command,
+            dataset,
+            pbf,
+            runs,
+        } => cmd_bench_commands(command, dataset, pbf, runs),
     }
 }
 
@@ -309,6 +369,83 @@ fn cmd_bench_write(
     bench_write::run(&harness, &pbf_path, file_mb, runs, &compressions)
 }
 
+fn cmd_bench_merge(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+    runs: usize,
+    uring: bool,
+    compression_str: String,
+) -> Result<(), DevError> {
+    if uring {
+        bench_merge::check_uring_preflight()?;
+    }
+
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+    let compressions = bench_merge::parse_compressions(&compression_str)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_merge::run(
+        &harness,
+        &pbf_path,
+        &osc_path,
+        file_mb,
+        runs,
+        &compressions,
+        uring,
+        &paths.scratch_dir,
+    )
+}
+
+fn cmd_bench_commands(
+    command: String,
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let commands = bench_commands::parse_command(&command)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let binary = build::cargo_build(
+        &build::BuildConfig::release_cli(),
+        &ws.workspace_root,
+    )?;
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_commands::run(
+        &harness,
+        &binary,
+        &pbf_path,
+        file_mb,
+        runs,
+        &commands,
+        &ws.workspace_root,
+    )
+}
+
 /// Resolve the PBF path from --pbf or --dataset.
 fn resolve_pbf_path(
     pbf: &Option<String>,
@@ -329,6 +466,38 @@ fn resolve_pbf_path(
     if !path.exists() {
         return Err(DevError::Config(format!(
             "PBF file not found: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+/// Resolve the OSC path from --osc or --dataset.
+fn resolve_osc_path(
+    osc: &Option<String>,
+    dataset: &str,
+    config: &config::DevConfig,
+    paths: &config::ResolvedPaths,
+) -> Result<PathBuf, DevError> {
+    let path = match osc {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let ds = config.datasets.get(dataset).ok_or_else(|| {
+                DevError::Config(format!("unknown dataset: {dataset}"))
+            })?;
+            let osc_file = ds.osc.as_ref().ok_or_else(|| {
+                DevError::Config(format!(
+                    "dataset '{dataset}' has no osc file configured"
+                ))
+            })?;
+            paths.data_dir.join(osc_file)
+        }
+    };
+
+    if !path.exists() {
+        return Err(DevError::Config(format!(
+            "OSC file not found: {}",
             path.display()
         )));
     }

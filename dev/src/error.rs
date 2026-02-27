@@ -14,7 +14,6 @@ pub enum DevError {
     /// Build failure (cargo returned non-zero, or compilation error).
     Build(String),
     /// One or more preflight checks failed.
-    #[allow(dead_code)]
     Preflight(Vec<String>),
     /// A subprocess exited with an error.
     Subprocess {

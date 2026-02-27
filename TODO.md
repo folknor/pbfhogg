@@ -111,35 +111,42 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
   | tags-filter highway=primary 2pass | 2.69s | 2.42s | 1.11x | two-pass, parallel Pass 2 |
   | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
-  | extract --simple | **2.66s** | 1.74s | 1.53x | Pass 1 streaming + Pass 2 parallel |
-  | extract (complete-ways) | **2.74s** | 2.82s | **0.97x** | Pass 1 streaming + Pass 2 parallel |
-  | extract --smart | **4.29s** | 3.54s | 1.21x | Pass 1 streaming + Pass 3 parallel |
+  | extract --simple | **2.48s** | 1.69s | 1.47x | skip-metadata + Pass 2 parallel |
+  | extract (complete-ways) | **2.48s** | 2.79s | **0.89x** | skip-metadata + Pass 2 parallel |
+  | extract --smart | **2.83s** | 3.25s | **0.87x** | skip-metadata + ways-only Pass 2 |
 
   All commands use pipelined reader + pipelined writer. All write passes use
   parallel element processing via rayon batches (64 blocks per dispatch).
   Blob-type skipping via indexdata provides additional gains for type-filtered
   commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
-  `scripts/bench-commands.sh` on Denmark 483 MB, commit `4f18350`.
+  `scripts/bench-commands.sh` on Denmark 483 MB, commit `1b62e2c`.
+
+  Japan extract (2.3 GB, 344M elements, Tokyo bbox, commit `1b62e2c`):
+
+  | Strategy | pbfhogg | osmium | ratio |
+  |----------|---------|--------|-------|
+  | simple | 12.2s | **7.2s** | 1.70x |
+  | complete-ways | 12.8s | **11.0s** | 1.16x |
+  | smart | 14.6s | **13.4s** | 1.09x |
 
   Remaining:
 
-  - [ ] **Extract: remaining gap vs osmium.** Simple is 1.5x slower, smart
-    is 1.2x slower. **Complete-ways is already faster** (0.97x). Full analysis
-    in `notes/extract-parallel-collection.md`.
+  - [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower
+    on Denmark, 1.70x on Japan. **Complete-ways and smart now beat osmium.**
+    Full analysis in `notes/extract-parallel-collection.md`.
 
-    The gap is NOT decoder efficiency — complete-ways proves our decoder is
-    competitive (identical 2-pass structure, pbfhogg wins). The gaps are:
+    The gap is structural: simple does 2 passes vs osmium's 1. The extra file
+    read costs ~1.3s on Denmark, ~5s on Japan. A single-pass approach with
+    parallel inline writing would close most of this gap.
 
-    1. **Simple: 2 passes vs osmium's 1.** Simple was restructured from
-       single-pass to streaming collection (Pass 1) + parallel write (Pass 2).
-       The extra file read costs ~1.3s (pipelined decode of Denmark). Osmium's
-       single-pass at 1.74s vs our two-pass at 2.66s — the difference is
-       nearly one extra read. A single-pass approach with parallel inline
-       writing would close most of this gap.
-    2. **Smart: metadata skipping in scan-only passes.** Smart Pass 2 (way dep
-       resolution) only needs way IDs and refs. Osmium skips metadata entirely
-       via `read_meta::no`, saving ~30-40% of dense node decode volume.
-       pbfhogg decodes full elements including unused metadata fields.
+    **Implemented optimizations:**
+    - ~~Skip-metadata mode for scan-only passes~~ — `elements_skip_metadata()`
+      skips 6 packed metadata arrays per dense node (version, timestamp,
+      changeset, uid, user_sid, visible). Denmark: -7% simple, -10% complete,
+      -34% smart. Japan: -16% simple, -10% complete, -39% smart.
+    - ~~Smart Pass 2 ways-only iteration~~ — `block.groups()` / `group.ways()`
+      skips all dense nodes, sparse nodes, and relations in the way dependency
+      resolution pass. This was the main contributor to the 34-39% smart gain.
 
     **Investigated and ruled out:**
     - ~~Parallel ID collection with IndexedReader~~ — implemented three-phase
@@ -155,23 +162,12 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
       ~15 GB (beyond page cache). Extract reads are sequential scans where
       kernel readahead with `posix_fadvise` is already optimal.
 
-    **Osmium extract analysis (source: `data/osmium-tool/`, `data/libosmium/`).**
-    Osmium does NOT parallelize extract. Element processing is fully sequential.
-
-    **Possible approaches:**
+    **Possible approach:**
     - [ ] **Single-pass simple with parallel inline writing.** Stream through
       the pipelined reader, collect + filter matching elements per block, batch
       matched blocks for parallel writing via rayon. Eliminates the second file
       read. Challenge: the collection consumer (which is sequential) and the
       write dispatch (which needs rayon) must coexist in the same pass.
-    - [ ] **Add skip-metadata mode for smart Pass 2.** Smart Pass 2 only needs
-      way IDs and refs. Skipping metadata varint scanning could save ~5-10% of
-      decode time in that pass. pbfhogg's wire-format parser already stores byte
-      offsets (not parsed values) for metadata, so unused fields aren't
-      materialized — but the initial `WireBlock` parse still scans through all
-      varint field boundaries. A true skip requires the protobuf wire format to
-      support jumping over fields without scanning (it doesn't — varints are
-      variable-length).
 
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is

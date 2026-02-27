@@ -112,6 +112,27 @@ impl<'a> DenseNodeIter<'a> {
         }
     }
 
+    pub(crate) fn new_skip_metadata(
+        block: &'a WireBlock<'static>,
+        dense: WireDenseNodes<'a>,
+    ) -> DenseNodeIter<'a> {
+        DenseNodeIter {
+            block,
+            dids: PackedSint64Iter::new(dense.id_data),
+            cid: 0,
+            dlats: PackedSint64Iter::new(dense.lat_data),
+            clat: 0,
+            dlons: PackedSint64Iter::new(dense.lon_data),
+            clon: 0,
+            kv_data: dense.keys_vals_data,
+            kv_pos: 0,
+            info_iter: None,
+            granularity: i64::from(block.granularity),
+            lat_offset: block.lat_offset,
+            lon_offset: block.lon_offset,
+        }
+    }
+
     pub(crate) fn empty(block: &'a WireBlock<'static>) -> DenseNodeIter<'a> {
         DenseNodeIter {
             block,

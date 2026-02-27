@@ -75,3 +75,9 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-smart	3.45	483
 2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.66	483
 2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	1.77	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	pbfhogg	extract-simple	2.48	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-simple	1.69	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	pbfhogg	extract-complete	2.48	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-complete	2.79	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	pbfhogg	extract-smart	2.83	483
+2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-smart	3.25	483

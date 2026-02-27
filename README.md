@@ -143,7 +143,7 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark extract (483 MB, 59M elements, commit `1a3fcd3`):
+CLI commands — Denmark (483 MB, 59M elements, commit `1a3fcd3`):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
@@ -156,9 +156,18 @@ CLI commands — Denmark extract (483 MB, 59M elements, commit `1a3fcd3`):
 | merge (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
 | sort (sorted) | **2.3s** | 11.6s | **5.0x** |
 | sort (unsorted) | **2.8s** | 21.3s | **7.6x** |
-| extract (simple / complete / smart) | 4.1 / 8.6 / 11.2s | **1.7 / 2.8 / 3.5s** | 0.4x |
 
-Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata get an additional boost by skipping decompression of irrelevant blob types. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses blob-level permutation. Extract is not yet parallelized.
+Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata get an additional boost by skipping decompression of irrelevant blob types. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses blob-level permutation.
+
+Extract — Japan (2.3 GB, 344M elements, Tokyo bbox, commit `1b62e2c`):
+
+| Strategy | pbfhogg | osmium | ratio |
+|----------|---------|--------|-------|
+| simple | 12.2s | **7.2s** | 1.70x |
+| complete-ways | 12.8s | **11.0s** | 1.16x |
+| smart | 14.6s | **13.4s** | 1.09x |
+
+Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium; simple's gap is structural (two passes vs osmium's single pass — the extra file read costs ~5s at this scale).
 
 Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten). Before = sequential rewrite (commit `d79f673`), after = parallel rewrite (commit `14034c1`):
 

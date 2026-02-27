@@ -564,7 +564,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        for element in block.elements() {
+        for element in block.elements_skip_metadata() {
             match &element {
                 Element::DenseNode(dn) => {
                     if region.contains_decimicro(&bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
@@ -708,7 +708,7 @@ fn collect_pass1_matches(
     all_way_node_ids: &mut IdSetDense,
     matched_relation_ids: &mut IdSetDense,
 ) {
-    for element in block.elements() {
+    for element in block.elements_skip_metadata() {
         match &element {
             Element::DenseNode(dn) => {
                 if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
@@ -923,8 +923,8 @@ fn extract_smart(
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        for element in block.elements() {
-            if let Element::Way(w) = &element {
+        for group in block.groups() {
+            for w in group.ways() {
                 let wid = w.id();
                 if extra_way_ids.get(wid) && !matched_way_ids.get(wid) {
                     for r in w.refs() {
@@ -985,7 +985,7 @@ fn collect_pass1_smart(
     extra_way_ids: &mut IdSetDense,
     extra_node_ids: &mut IdSetDense,
 ) {
-    for element in block.elements() {
+    for element in block.elements_skip_metadata() {
         match &element {
             Element::DenseNode(dn) => {
                 if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {

@@ -404,6 +404,14 @@ impl PrimitiveBlock {
         BlockElementsIter::new(&self.block)
     }
 
+    /// Returns an iterator over the elements in this `PrimitiveBlock`,
+    /// skipping metadata (version, timestamp, changeset, uid, user) for
+    /// dense nodes. Use this for scan-only passes that only need IDs,
+    /// coordinates, refs, and tags.
+    pub fn elements_skip_metadata(&self) -> BlockElementsIter<'_> {
+        BlockElementsIter::new_skip_metadata(&self.block)
+    }
+
     /// Returns the number of entries in this block's string table.
     pub fn string_table_len(&self) -> usize {
         self.block.stringtable.len()
@@ -509,6 +517,7 @@ pub struct BlockElementsIter<'a> {
     nodes: WireMessageIter<'a>,
     ways: WireMessageIter<'a>,
     relations: WireMessageIter<'a>,
+    skip_metadata: bool,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -531,6 +540,21 @@ impl<'a> BlockElementsIter<'a> {
             nodes: WireMessageIter::empty(),
             ways: WireMessageIter::empty(),
             relations: WireMessageIter::empty(),
+            skip_metadata: false,
+        }
+    }
+
+    fn new_skip_metadata(block: &'a WireBlock<'static>) -> BlockElementsIter<'a> {
+        BlockElementsIter {
+            block,
+            state: ElementsIterState::Group,
+            group_index: 0,
+            group_count: block.group_ranges.len(),
+            dense_nodes: DenseNodeIter::empty(block),
+            nodes: WireMessageIter::empty(),
+            ways: WireMessageIter::empty(),
+            relations: WireMessageIter::empty(),
+            skip_metadata: true,
         }
     }
 
@@ -550,7 +574,11 @@ impl<'a> BlockElementsIter<'a> {
                 let group = WireGroup::new(group_data);
                 self.dense_nodes = match group.dense() {
                     Ok(Some(data)) => match WireDenseNodes::parse(data) {
-                        Ok(dense) => DenseNodeIter::new(self.block, dense),
+                        Ok(dense) => if self.skip_metadata {
+                            DenseNodeIter::new_skip_metadata(self.block, dense)
+                        } else {
+                            DenseNodeIter::new(self.block, dense)
+                        },
                         Err(_) => DenseNodeIter::empty(self.block),
                     },
                     _ => DenseNodeIter::empty(self.block),

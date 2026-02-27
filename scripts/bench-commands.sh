@@ -13,8 +13,8 @@ source "$(dirname "$0")/lib.sh"
 #
 # Commands:
 #   cat-way, cat-relation, tags-count, tags-count-way, tags-filter-way,
-#   tags-filter-amenity, getid, removeid, add-locations-to-ways, node-stats,
-#   all (runs everything)
+#   tags-filter-amenity, tags-filter-twopass, getid, removeid,
+#   add-locations-to-ways, node-stats, all (runs everything)
 #
 # Examples:
 #   scripts/bench-commands.sh cat-way
@@ -173,6 +173,15 @@ bench_tags_filter_amenity() {
     echo ""
 }
 
+bench_tags_filter_twopass() {
+    echo "=== tags-filter highway=primary (two-pass) ==="
+    best_of "pbfhogg" "tags-filter-twopass" "$BIN" tags-filter "$PBF" highway=primary -o /dev/null
+    if [ "$HAS_OSMIUM" = "yes" ]; then
+        best_of "osmium" "tags-filter-twopass" osmium tags-filter "$PBF" highway=primary -o "$OSMIUM_OUT" --overwrite
+    fi
+    echo ""
+}
+
 bench_getid() {
     echo "=== getid (9 elements) ==="
     best_of "pbfhogg" "getid" "$BIN" getid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o /dev/null
@@ -217,6 +226,7 @@ case "$CMD" in
     tags-count-way)         bench_tags_count_way ;;
     tags-filter-way)        bench_tags_filter_way ;;
     tags-filter-amenity)    bench_tags_filter_amenity ;;
+    tags-filter-twopass)    bench_tags_filter_twopass ;;
     getid)                  bench_getid ;;
     removeid)               bench_removeid ;;
     add-locations-to-ways)  bench_add_locations_to_ways ;;
@@ -228,6 +238,7 @@ case "$CMD" in
         bench_tags_count_way
         bench_tags_filter_way
         bench_tags_filter_amenity
+        bench_tags_filter_twopass
         bench_getid
         bench_removeid
         bench_add_locations_to_ways
@@ -238,8 +249,8 @@ case "$CMD" in
         echo ""
         echo "Available commands:"
         echo "  cat-way, cat-relation, tags-count, tags-count-way,"
-        echo "  tags-filter-way, tags-filter-amenity, getid, removeid,"
-        echo "  add-locations-to-ways, node-stats, all"
+        echo "  tags-filter-way, tags-filter-amenity, tags-filter-twopass,"
+        echo "  getid, removeid, add-locations-to-ways, node-stats, all"
         exit 1
         ;;
 esac

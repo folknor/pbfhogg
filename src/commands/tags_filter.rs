@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata, flush_block};
+use super::{dense_node_metadata, element_metadata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -429,6 +429,135 @@ fn process_filter_batch(
 }
 
 // ---------------------------------------------------------------------------
+// Two-pass filter: Pass 2 parallel helpers
+// ---------------------------------------------------------------------------
+
+/// Read-only ID sets for Pass 2, shared across rayon threads.
+struct Pass2IdSets<'a> {
+    matched_node_ids: &'a [i64],
+    matched_way_ids: &'a [i64],
+    matched_relation_ids: &'a [i64],
+    way_dep_node_ids: &'a [i64],
+}
+
+/// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
+fn filter_block_pass2(
+    block: &PrimitiveBlock,
+    ids: &Pass2IdSets<'_>,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<Vec<u8>>,
+) -> std::result::Result<TagsFilterStats, String> {
+    let mut stats = TagsFilterStats {
+        nodes_matched: 0,
+        nodes_from_ways: 0,
+        ways_matched: 0,
+        relations_matched: 0,
+    };
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                let direct = ids.matched_node_ids.binary_search(&dn.id()).is_ok();
+                let from_way = ids.way_dep_node_ids.binary_search(&dn.id()).is_ok();
+                if direct || from_way {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    if direct { stats.nodes_matched += 1; } else { stats.nodes_from_ways += 1; }
+                }
+            }
+            Element::Node(n) => {
+                let direct = ids.matched_node_ids.binary_search(&n.id()).is_ok();
+                let from_way = ids.way_dep_node_ids.binary_search(&n.id()).is_ok();
+                if direct || from_way {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    if direct { stats.nodes_matched += 1; } else { stats.nodes_from_ways += 1; }
+                }
+            }
+            Element::Way(w) => {
+                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                    if !bb.can_add_way() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    let meta = element_metadata(&w.info());
+                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    stats.ways_matched += 1;
+                }
+            }
+            Element::Relation(r) => {
+                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                    if !bb.can_add_relation() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    stats.relations_matched += 1;
+                }
+            }
+        }
+    }
+    Ok(stats)
+}
+
+/// Process a batch of blocks in parallel for Pass 2 of two-pass tag filtering.
+fn process_pass2_batch(
+    batch: &[PrimitiveBlock],
+    ids: &Pass2IdSets<'_>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut TagsFilterStats,
+) -> Result<()> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, TagsFilterStats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let block_stats = filter_block_pass2(block, ids, bb, &mut output)?;
+                flush_local(bb, &mut output)?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        stats.nodes_matched += block_stats.nodes_matched;
+        stats.nodes_from_ways += block_stats.nodes_from_ways;
+        stats.ways_matched += block_stats.ways_matched;
+        stats.relations_matched += block_stats.relations_matched;
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Two-pass filter (default mode, include references)
 // ---------------------------------------------------------------------------
 
@@ -545,7 +674,7 @@ fn tags_filter_two_pass(
     way_dep_node_ids.sort_unstable();
     way_dep_node_ids.dedup();
 
-    // --- Pass 2: Write matching elements in file order ---
+    // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
     let reader = ElementReader::open(input, direct_io)?;
     let reader = if let Some(filter) = blob_filter_from_expressions(expressions) {
@@ -560,99 +689,27 @@ fn tags_filter_two_pass(
     }
     let header_bytes = hb.build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
+
+    let id_sets = Pass2IdSets {
+        matched_node_ids: &matched_node_ids,
+        matched_way_ids: &matched_way_ids,
+        matched_relation_ids: &matched_relation_ids,
+        way_dep_node_ids: &way_dep_node_ids,
+    };
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
 
     for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    let direct = matched_node_ids.binary_search(&dn.id()).is_ok();
-                    let from_way = way_dep_node_ids.binary_search(&dn.id()).is_ok();
-                    if direct || from_way {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(dn.tags());
-                        let meta = dense_node_metadata(dn);
-                        bb.add_node(
-                            dn.id(),
-                            dn.decimicro_lat(),
-                            dn.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        if direct {
-                            stats.nodes_matched += 1;
-                        } else {
-                            stats.nodes_from_ways += 1;
-                        }
-                    }
-                }
-                Element::Node(n) => {
-                    let direct = matched_node_ids.binary_search(&n.id()).is_ok();
-                    let from_way = way_dep_node_ids.binary_search(&n.id()).is_ok();
-                    if direct || from_way {
-                        if !bb.can_add_node() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(n.tags());
-                        let meta = element_metadata(&n.info());
-                        bb.add_node(
-                            n.id(),
-                            n.decimicro_lat(),
-                            n.decimicro_lon(),
-                            &tags_buf,
-                            meta.as_ref(),
-                        );
-                        if direct {
-                            stats.nodes_matched += 1;
-                        } else {
-                            stats.nodes_from_ways += 1;
-                        }
-                    }
-                }
-                Element::Way(w) => {
-                    if matched_way_ids.binary_search(&w.id()).is_ok() {
-                        if !bb.can_add_way() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(w.tags());
-                        refs_buf.clear();
-                        refs_buf.extend(w.refs());
-                        let meta = element_metadata(&w.info());
-                        bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
-                        stats.ways_matched += 1;
-                    }
-                }
-                Element::Relation(r) => {
-                    if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                        if !bb.can_add_relation() {
-                            flush_block(&mut bb, &mut writer)?;
-                        }
-                        tags_buf.clear();
-                        tags_buf.extend(r.tags());
-                        members_buf.clear();
-                        members_buf.extend(r.members().map(|m| MemberData {
-                            id: m.id,
-                            role: m.role().unwrap_or(""),
-                        }));
-                        let meta = element_metadata(&r.info());
-                        bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
-                        stats.relations_matched += 1;
-                    }
-                }
-            }
+        batch.push(block?);
+        if batch.len() >= BATCH_SIZE {
+            process_pass2_batch(&batch, &id_sets, &mut writer, &mut stats)?;
+            batch.clear();
         }
     }
+    if !batch.is_empty() {
+        process_pass2_batch(&batch, &id_sets, &mut writer, &mut stats)?;
+    }
 
-    flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
     Ok(stats)
 }

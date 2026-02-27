@@ -21,3 +21,5 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	add-locations-to-ways	11.98	483
 2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg (indexdata)	node-stats	1.43	483
 2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	node-stats	1.68	483
+2026-02-27	plantasjen	61dc380*	Add CLI command benchmark baseline (Denmark, commit b51439e)	denmark-20260220-seq4704	pbfhogg	tags-filter-twopass	2.69	483
+2026-02-27	plantasjen	61dc380*	Add CLI command benchmark baseline (Denmark, commit b51439e)	denmark-20260220-seq4704	osmium	tags-filter-twopass	2.42	483

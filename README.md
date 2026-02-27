@@ -143,14 +143,22 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~7s — the decode + wire-format serialization floor. Ways and relations are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark extract (483 MB, 59M elements, commits `f817b66`–`4259ba7`):
+CLI commands — Denmark extract (483 MB, 59M elements, commit `1a3fcd3`):
 
-| Tool | merge | sort | sort (unsorted) | diff | extract | add-locs |
-|------|-------|------|-----------------|------|---------|----------|
-| **pbfhogg** | **2.7s** | **2.3s** | **2.8s** | **24s** | 9 / 16 / 21s | 67s |
-| osmium 1.19 | 7.2s | 11.6s | 21.3s | 46s | **2 / 3 / 4s** | **13s** |
+| Command | pbfhogg | osmium | speedup |
+|---------|---------|--------|---------|
+| cat --type way (indexdata) | **1.07s** | 2.22s | **2.1x** |
+| tags-filter amenity=restaurant -R | **0.45s** | 1.19s | **2.6x** |
+| getid (9 elements) | **0.38s** | 0.83s | **2.2x** |
+| tags-count --type way (indexdata) | **0.36s** | 0.59s | **1.6x** |
+| tags-filter w/highway=primary -R | **0.45s** | 0.56s | **1.2x** |
+| add-locations-to-ways | **11.5s** | 12.1s | **1.1x** |
+| merge (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
+| sort (sorted) | **2.3s** | 11.6s | **5.0x** |
+| sort (unsorted) | **2.8s** | 21.3s | **7.6x** |
+| extract (simple / complete / smart) | 4.1 / 8.6 / 11.2s | **1.7 / 2.8 / 3.5s** | 0.4x |
 
-Merge applies an OSC diff (294 KB, ~4700 changesets). Sort (sorted) reorders an already-sorted PBF (7396 blobs, 100% passthrough). Sort (unsorted) reorders a PBF with ways before nodes (7390 blobs). Extract shows simple / complete-ways / smart strategy. Add-locs is add-locations-to-ways (10.2M output elements, byte-identical output). osmium uses multi-threaded compression; pbfhogg extract and add-locations-to-ways are single-threaded.
+Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata get an additional boost by skipping decompression of irrelevant blob types. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses blob-level permutation. Extract is not yet parallelized.
 
 Merge at scale — Germany (4.5 GB, 500M elements, daily diff with 146K changes, 18.4% blobs rewritten). Before = sequential rewrite (commit `d79f673`), after = parallel rewrite (commit `14034c1`):
 

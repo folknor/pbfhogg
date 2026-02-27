@@ -5,6 +5,7 @@ source "$(dirname "$0")/lib.sh"
 
 # ---------------------------------------------------------------------------
 # Benchmark pbfhogg CLI commands vs osmium. Runs best-of-N wall-clock times.
+# Logs results to benchmarks/benchmarks-commands.tsv.
 #
 # Usage:
 #   scripts/bench-commands.sh <command> [pbf] [runs]
@@ -32,8 +33,18 @@ if [ ! -f "$PBF" ]; then
 fi
 
 PBF_IDX="${PBF%.osm.pbf}-with-indexdata.osm.pbf"
+NAME="$(basename "${PBF%.osm.pbf}")"
 FILE_MB=$(file_size_mb "$PBF")
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+DIRTY=""
+if ! git diff --quiet HEAD 2>/dev/null; then
+    DIRTY="*"
+fi
+DATE=$(date +%Y-%m-%d)
+SUBJECT=$(git log -1 --format=%s 2>/dev/null || echo "-")
+HOST=$(hostname)
+LOG="benchmarks/benchmarks-commands.tsv"
+
 HAS_IDX="no"
 if [ -f "$PBF_IDX" ]; then
     HAS_IDX="yes"
@@ -49,20 +60,28 @@ echo "=== bench-commands: $CMD ==="
 echo "  file: $PBF ($FILE_MB MB)"
 echo "  indexdata: $HAS_IDX"
 echo "  runs: $RUNS (best of)"
-echo "  commit: $COMMIT"
+echo "  commit: ${COMMIT}${DIRTY}"
 echo ""
 
 scripts/build.sh
 BIN="$PBFHOGG"
 echo ""
 
+# Create TSV header if needed
+if [ ! -f "$LOG" ]; then
+    mkdir -p benchmarks
+    printf "date\thost\tcommit\tsubject\tpbf\ttool\tcommand\telapsed_s\tfile_mb\n" > "$LOG"
+fi
+
 # ---------------------------------------------------------------------------
 # Timing helper: run a command RUNS times, print best wall-clock time.
-# Stderr from the command is discarded; timing comes from /usr/bin/time.
+# Also logs the result to the TSV file.
+# Usage: best_of TOOL_NAME COMMAND_NAME CMD...
 # ---------------------------------------------------------------------------
 best_of() {
-    local label="$1"
-    shift
+    local tool="$1"
+    local command="$2"
+    shift 2
     local best=""
     local tmpfile
     tmpfile=$(mktemp "$CARGO_TARGET_DIR/.bench_time.XXXXXX")
@@ -79,7 +98,12 @@ best_of() {
     done
 
     rm -f "$tmpfile"
-    printf "  %-45s %ss\n" "$label" "$best"
+    printf "  %-45s %ss\n" "$tool" "$best"
+
+    # Log to TSV
+    printf "%s\t%s\t%s%s\t%s\t%s\t%s\t%s\t%s\t%s\n" \
+        "$DATE" "$HOST" "$COMMIT" "$DIRTY" "$SUBJECT" "$NAME" \
+        "$tool" "$command" "$best" "$FILE_MB" >> "$LOG"
 }
 
 # ---------------------------------------------------------------------------
@@ -89,11 +113,11 @@ best_of() {
 bench_cat_way() {
     echo "=== cat --type way ==="
     if [ "$HAS_IDX" = "yes" ]; then
-        best_of "pbfhogg (indexdata)" "$BIN" cat "$PBF_IDX" --type way -o /dev/null
+        best_of "pbfhogg (indexdata)" "cat-way" "$BIN" cat "$PBF_IDX" --type way -o /dev/null
     fi
-    best_of "pbfhogg" "$BIN" cat "$PBF" --type way -o /dev/null
+    best_of "pbfhogg" "cat-way" "$BIN" cat "$PBF" --type way -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium cat "$PBF" -t way -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "cat-way" osmium cat "$PBF" -t way -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
@@ -101,20 +125,20 @@ bench_cat_way() {
 bench_cat_relation() {
     echo "=== cat --type relation ==="
     if [ "$HAS_IDX" = "yes" ]; then
-        best_of "pbfhogg (indexdata)" "$BIN" cat "$PBF_IDX" --type relation -o /dev/null
+        best_of "pbfhogg (indexdata)" "cat-relation" "$BIN" cat "$PBF_IDX" --type relation -o /dev/null
     fi
-    best_of "pbfhogg" "$BIN" cat "$PBF" --type relation -o /dev/null
+    best_of "pbfhogg" "cat-relation" "$BIN" cat "$PBF" --type relation -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium cat "$PBF" -t relation -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "cat-relation" osmium cat "$PBF" -t relation -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
 
 bench_tags_count() {
     echo "=== tags-count (all) ==="
-    best_of "pbfhogg" "$BIN" tags-count "$PBF" --min-count 999999999
+    best_of "pbfhogg" "tags-count" "$BIN" tags-count "$PBF" --min-count 999999999
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium tags-count "$PBF" --min-count 999999999
+        best_of "osmium" "tags-count" osmium tags-count "$PBF" --min-count 999999999
     fi
     echo ""
 }
@@ -122,53 +146,53 @@ bench_tags_count() {
 bench_tags_count_way() {
     echo "=== tags-count --type way ==="
     if [ "$HAS_IDX" = "yes" ]; then
-        best_of "pbfhogg (indexdata)" "$BIN" tags-count "$PBF_IDX" --type way --min-count 999999999
+        best_of "pbfhogg (indexdata)" "tags-count-way" "$BIN" tags-count "$PBF_IDX" --type way --min-count 999999999
     fi
-    best_of "pbfhogg" "$BIN" tags-count "$PBF" --type way --min-count 999999999
+    best_of "pbfhogg" "tags-count-way" "$BIN" tags-count "$PBF" --type way --min-count 999999999
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium tags-count "$PBF" -t way --min-count 999999999
+        best_of "osmium" "tags-count-way" osmium tags-count "$PBF" -t way --min-count 999999999
     fi
     echo ""
 }
 
 bench_tags_filter_way() {
     echo "=== tags-filter w/highway=primary -R ==="
-    best_of "pbfhogg" "$BIN" tags-filter "$PBF" -R w/highway=primary -o /dev/null
+    best_of "pbfhogg" "tags-filter-way" "$BIN" tags-filter "$PBF" -R w/highway=primary -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium tags-filter "$PBF" w/highway=primary -R -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "tags-filter-way" osmium tags-filter "$PBF" w/highway=primary -R -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
 
 bench_tags_filter_amenity() {
     echo "=== tags-filter amenity=restaurant -R ==="
-    best_of "pbfhogg" "$BIN" tags-filter "$PBF" -R amenity=restaurant -o /dev/null
+    best_of "pbfhogg" "tags-filter-amenity" "$BIN" tags-filter "$PBF" -R amenity=restaurant -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium tags-filter "$PBF" amenity=restaurant -R -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "tags-filter-amenity" osmium tags-filter "$PBF" amenity=restaurant -R -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
 
 bench_getid() {
     echo "=== getid (9 elements) ==="
-    best_of "pbfhogg" "$BIN" getid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o /dev/null
+    best_of "pbfhogg" "getid" "$BIN" getid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium getid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "getid" osmium getid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
 
 bench_removeid() {
     echo "=== removeid (9 elements removed) ==="
-    best_of "pbfhogg" "$BIN" removeid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o /dev/null
+    best_of "pbfhogg" "removeid" "$BIN" removeid "$PBF" n115722 n115723 n115724 w2080 w2081 w2082 r174 r213 r339 -o /dev/null
     echo ""
 }
 
 bench_add_locations_to_ways() {
     echo "=== add-locations-to-ways ==="
-    best_of "pbfhogg" "$BIN" add-locations-to-ways "$PBF" -o /dev/null
+    best_of "pbfhogg" "add-locations-to-ways" "$BIN" add-locations-to-ways "$PBF" -o /dev/null
     if [ "$HAS_OSMIUM" = "yes" ]; then
-        best_of "osmium" osmium add-locations-to-ways "$PBF" -o "$OSMIUM_OUT" --overwrite
+        best_of "osmium" "add-locations-to-ways" osmium add-locations-to-ways "$PBF" -o "$OSMIUM_OUT" --overwrite
     fi
     echo ""
 }
@@ -176,9 +200,9 @@ bench_add_locations_to_ways() {
 bench_node_stats() {
     echo "=== node-stats ==="
     if [ "$HAS_IDX" = "yes" ]; then
-        best_of "pbfhogg (indexdata)" "$BIN" node-stats "$PBF_IDX"
+        best_of "pbfhogg (indexdata)" "node-stats" "$BIN" node-stats "$PBF_IDX"
     fi
-    best_of "pbfhogg" "$BIN" node-stats "$PBF"
+    best_of "pbfhogg" "node-stats" "$BIN" node-stats "$PBF"
     echo ""
 }
 
@@ -221,4 +245,4 @@ case "$CMD" in
 esac
 
 rm -f "$OSMIUM_OUT"
-echo "Done."
+echo "=== Logged to $LOG ==="

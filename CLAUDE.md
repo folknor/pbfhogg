@@ -20,6 +20,7 @@ Write new scripts in `scripts/` as needed. Follow these conventions:
 - `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks/benchmarks-self-write.tsv)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
+- `scripts/bench-commands.sh <cmd> [pbf] [runs]` — CLI command benchmark vs osmium (logs to benchmarks/benchmarks-commands.tsv). Commands: cat-way, cat-relation, tags-count, tags-count-way, tags-filter-way, tags-filter-amenity, getid, removeid, add-locations-to-ways, node-stats, all
 - `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
 - `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
 

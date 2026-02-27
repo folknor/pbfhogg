@@ -104,20 +104,22 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
 
   | Command | pbfhogg | osmium | ratio | notes |
   |---------|---------|--------|-------|-------|
-  | cat --type way | **1.23s** | 2.27s | **0.54x** | parallel + blob-skip (indexdata) |
-  | tags-filter w/highway=primary -R | **0.46s** | 0.55s | **0.84x** | parallel + blob-skip |
-  | tags-filter amenity=restaurant -R | **0.47s** | 1.23s | **0.38x** | parallel + blob-skip |
+  | cat --type way | **1.06s** | 2.23s | **0.48x** | parallel + blob-skip (indexdata) |
+  | tags-filter amenity=restaurant -R | **0.46s** | 1.16s | **0.40x** | parallel + blob-skip |
+  | getid (9 elements) | **0.38s** | 0.84s | **0.45x** | parallel |
   | tags-count --type way | **0.35s** | 0.60s | **0.58x** | fold+reduce + blob-skip (indexdata) |
-  | getid (9 elements) | **0.42s** | 0.84s | **0.50x** | parallel |
-  | add-locations-to-ways | 11.3s | 10.3s | 1.10x | Pass 1 hash build is bottleneck |
-  | extract --simple | 4.1s | 1.7s | 2.4x | not yet parallelized |
-  | extract (complete-ways) | 8.6s | 2.8s | 3.1x | not yet parallelized |
-  | extract --smart | 11.2s | 3.5s | 3.2x | not yet parallelized |
+  | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
+  | tags-filter highway=primary 2pass | 2.69s | 2.42s | 1.11x | two-pass, parallel Pass 2 |
+  | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
+  | extract --simple | 4.08s | 1.65s | 2.47x | incremental state, cannot parallelize |
+  | extract (complete-ways) | 4.45s | 2.74s | 1.62x | Pass 2 parallel, Pass 1 sequential |
+  | extract --smart | 6.12s | 3.20s | 1.91x | Pass 3 parallel, Passes 1-2 sequential |
 
-  All commands use pipelined reader + pipelined writer. Most now also use
+  All commands use pipelined reader + pipelined writer. All write passes use
   parallel element processing via rayon batches (64 blocks per dispatch).
   Blob-type skipping via indexdata provides additional gains for type-filtered
-  commands. Ratios below 1.0 = pbfhogg is faster.
+  commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
+  `scripts/bench-commands.sh all` on Denmark 483 MB, commit `5d2d759`.
 
   Done:
 
@@ -197,10 +199,49 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     | `tags-count` | DONE | `par_iter().fold().reduce()` merge pattern, 0.81s → 0.35s |
     | `getid` / `removeid` | DONE | `process_filter_batch`, getid 2x faster than osmium |
     | `add-locs-to-ways` Pass 2 | DONE | `process_batch` with `&NodeLocationIndex` shared across threads |
-    | `tags-filter` (two-pass) | TODO | Pass 2 write path not yet parallelized |
-    | `extract` simple | TODO | Per-phase (nodes→ways→rels), `matched_node_ids` grows |
-    | `extract` complete/smart | TODO | Multi-pass state, each pass separately |
+    | `tags-filter` (two-pass) | DONE | Pass 2 parallel batch, `Pass2IdSets` shared across threads |
+    | `extract` complete-ways | DONE | Pass 2 parallel batch, `ExtractPass2IdSets` shared across threads |
+    | `extract` smart | DONE | Pass 3 parallel batch, `ExtractPass3IdSets` shared across threads |
+    | `extract` simple | BLOCKED | Single-pass incremental state — see below |
     | `sort` | N/A | Already specialized (blob-level permutation) |
+
+    **Extract parallelization constraints.** Extract is the one command where osmium
+    is significantly faster (~2-3x on Denmark). The bottleneck is the *collection*
+    passes, not the write passes (which are now parallelized):
+
+    - **Simple strategy:** Single-pass, builds node/way ID sets incrementally as
+      elements are encountered. Each way lookup depends on the full node ID set
+      collected so far; each relation lookup depends on the full way ID set.
+      The OSM element ordering dependency (nodes→ways→relations) makes this
+      inherently sequential.
+
+    - **Complete-ways Pass 1 / Smart Pass 1:** Same incremental ID collection as
+      simple. `collect_pass1_matches()` sorts bbox_node_ids lazily on first way
+      encounter, then matched_way_ids lazily on first relation encounter. Cannot
+      parallelize without a fundamentally different approach.
+
+    - **Smart Pass 2 (scan-only):** Collects extra_node_ids from ways matching
+      extra_way_ids. Read-only lookups on sorted slices but mutates a shared Vec.
+      Could be parallelized with thread-local Vecs + merge, but the pass is I/O
+      bound (only visiting way blobs) so the gain would be minimal.
+
+    **Possible approaches to close the gap:**
+    - [ ] **Parallel ID collection with IndexedReader.** Use blob-level indexdata
+      to partition the file into node/way/relation ranges. Process all node blobs
+      in parallel to build bbox_node_ids (embarrassingly parallel — each node is
+      independent). Then process way blobs in parallel (bbox_node_ids is immutable
+      by then). Then relation blobs in parallel. This is a different architecture
+      from the current pipelined approach and would require IndexedReader-based
+      scanning rather than sequential `into_blocks_pipelined`.
+    - [ ] **Concurrent ID sets.** Use `dashmap` or atomic bitsets to allow
+      parallel writes to the ID collection during Pass 1. Overkill for the
+      current single-type-per-phase approach but could work with a redesigned
+      multi-phase collector.
+    - [ ] **Profile osmium's approach.** osmium extract is 2-3x faster despite
+      being single-threaded. Likely uses a fundamentally different algorithm or
+      data structure (e.g. ID bitmaps, or a single-pass approach with different
+      completeness semantics). Understanding their approach could reveal
+      optimizations independent of parallelism.
 
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is

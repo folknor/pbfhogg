@@ -53,3 +53,25 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	osmium	extract-complete	2.83	483
 2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	pbfhogg	extract-smart	4.21	483
 2026-02-27	plantasjen	4c30d3e*	Replace sorted Vec<i64> with O(1) chunked bitset for extract ID tracking	denmark-20260220-seq4704	osmium	extract-smart	3.26	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.94	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-complete	3.09	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	2.24	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-smart	5.44	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-complete	3.53	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-smart	3.31	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.66	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	1.78	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.78	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	1.74	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-complete	2.74	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-complete	2.82	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-smart	4.29	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-smart	3.54	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.76	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	1.74	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-complete	2.83	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-complete	2.99	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-smart	4.61	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-smart	3.45	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	pbfhogg	extract-simple	2.66	483
+2026-02-27	plantasjen	2cd6ed6*	Update docs with zlib compressor reuse and libdeflater benchmarks	denmark-20260220-seq4704	osmium	extract-simple	1.77	483

@@ -121,91 +121,9 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
   `scripts/bench-commands.sh all` on Denmark 483 MB, commit `2bac649`.
 
-  Done:
-
-  - [x] **getid/removeid buffer reuse.** `write_element_reuse()` with hoisted
-    buffers per block. Removeid 11.1s → 10.5s (-5%).
-
-  - [x] **tags-filter buffer reuse.** clear+extend in all 3 loops.
-    amenity=restaurant 2.8s → 2.5s (-10%), w/highway=primary 2.8s → 2.5s (-10%).
-
-  - [x] **extract buffer reuse.** clear+extend in all 4 write helpers, buffers
-    declared per-block in all 3 strategies. Denmark within variance (bbox subset).
-
-  - [x] **add-locations-to-ways FxHashMap.** Switched `std::HashMap` → `FxHashMap`
-    for node location index. 23.4s → 16.2s (-31%), ratio 1.8x → 1.24x.
-
   Remaining:
 
-  - [ ] **Blob-type skipping.** Skip decompressing blobs whose element type is
-    irrelevant to the command. For `tags-filter w/highway=primary`, ~85% of
-    blobs are nodes and can be skipped entirely. Explains the 4.7x gap on
-    way-only filters.
-
-    **Infrastructure (DONE):**
-    - `Blob::index() -> Option<BlobIndex>` — expose indexdata from header
-    - `BlobFilter { want_nodes, want_ways, want_relations }` — public struct
-    - Pipeline Stage 2 in `pipeline.rs` — checks `blob.index()` vs filter,
-      returns `None` to skip decompression (~5ns check vs ~1-2ms zlib saved)
-    - `ElementReader::with_blob_filter()` — builder method
-    - `BlobFilter` exported from `lib.rs`
-    - Files without indexdata degrade gracefully (all blobs pass through)
-
-    **Per-command status:**
-
-    | Command | Status | Filter | Notes |
-    |---------|--------|--------|-------|
-    | `cat --type` | DONE | skip non-matching types | `BlobFilter` from `--type` arg |
-    | `tags-filter -R` (single-pass) | DONE | union of expression type filters | `blob_filter_from_expressions()` helper |
-    | `tags-filter` (two-pass) | DONE | Pass 1: expr union, Pass 2: nodes+matched types | Nodes always included in Pass 2 for way deps |
-    | `tags-count --type-filter` | DONE | skip non-matching types | Only when single type specified |
-    | `add-locs-to-ways` Pass 1 | DONE | `only_nodes()` | Pass 2 needs all types |
-    | `node-stats` | DONE | `only_nodes()` | Only processes nodes |
-    | `getid` | DONE | skip types not in ID set | `BlobFilter` from `IdSet` type emptiness |
-    | `getid --add-referenced` | DONE | Pass 1: `only_ways()`, Pass 2: nodes+ways+needed types | Pass 2 includes nodes if dep_node_ids non-empty |
-    | `removeid` | N/A | all types needed for pass-through | Cannot skip — outputs all non-matching elements |
-    | `diff --type` | DONE | skip non-matching types | `BlobFilter` from `TypeFilter`, passed to `read_elements()` |
-    | `derive-changes` | N/A | no type filter, needs all types | Always reads all element types |
-    | `check-refs` | DONE | skip relations if `--check-relations=false` | `BlobFilter::new(true, true, false)` |
-    | `extract` | LIMITED | skip relations in simple mode only | complete-ways/smart need all types |
-    | `fileinfo` | N/A | no benefit | Counts blobs, needs all |
-    | `sort` | N/A | already uses BlobIndex | Blob-level permutation sort |
-    | `merge` | N/A | already uses BlobIndex | Specialized blob-level filtering |
-    | `cat` (no filter) | N/A | raw passthrough, zero decode | Already optimal |
-
-    **Sorted PBF early exit:** In sorted PBFs (`Sort.Type_then_ID`), all
-    node blobs precede way blobs precede relation blobs. Commands that only
-    need one type can break the pipeline iterator once the first unwanted
-    blob type appears. Already naturally supported by `into_blocks_pipelined`
-    (dropping the iterator shuts down the pipeline). With indexdata, the
-    transition is detected without decompressing the boundary blob.
-
-  - [ ] **Parallel element processing.** Process decoded blocks in parallel
-    with ordered output, not just parallel decompression.
-
-    **Pattern:** Collect decoded `PrimitiveBlock`s into batches of 64, then
-    `batch.par_iter().map_init(BlockBuilder::new, ...)` processes blocks in
-    parallel. Each rayon thread owns a `BlockBuilder`, flushes serialized
-    blocks to `Vec<Vec<u8>>` via `flush_local()`. Sequential phase writes
-    results in order. Stats are per-thread, merged after `collect()`.
-
-    **Per-command status:**
-
-    | Command | Status | Notes |
-    |---------|--------|-------|
-    | `merge` | DONE | `rewrite_block_parallel` (original precedent) |
-    | `cat --type` | DONE | `process_batch` + `process_block`, 2.63s → 1.23s |
-    | `tags-filter -R` (single-pass) | DONE | `process_filter_batch`, 2.8s → 0.46s |
-    | `tags-count` | DONE | `par_iter().fold().reduce()` merge pattern, 0.81s → 0.35s |
-    | `getid` / `removeid` | DONE | `process_filter_batch`, getid 2x faster than osmium |
-    | `add-locs-to-ways` Pass 2 | DONE | `process_batch` with `&NodeLocationIndex` shared across threads |
-    | `tags-filter` (two-pass) | DONE | Pass 2 parallel batch, `Pass2IdSets` shared across threads |
-    | `extract` complete-ways | DONE | Pass 2 parallel batch, `ExtractPass2IdSets` shared across threads |
-    | `extract` smart | DONE | Pass 3 parallel batch, `ExtractPass3IdSets` shared across threads |
-    | `extract` simple | BLOCKED | Single-pass incremental state — see below |
-    | `sort` | N/A | Already specialized (blob-level permutation) |
-
-    **Extract parallelization constraints.** Extract is the one command where osmium
+  - [ ] **Extract collection-pass parallelization.** Extract is the one command where osmium
     is significantly faster (~2-3x on Denmark). The bottleneck is the *collection*
     passes, not the write passes (which are now parallelized):
 
@@ -237,41 +155,13 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
       parallel writes to the ID collection during Pass 1. Overkill for the
       current single-type-per-phase approach but could work with a redesigned
       multi-phase collector.
-    - [x] **Profile osmium's approach.** DONE — see analysis below.
-
     **Osmium extract analysis (source: `data/osmium-tool/`, `data/libosmium/`).**
     Osmium uses the same algorithmic structure as pbfhogg (simple=1 pass,
     complete-ways=2 passes, smart=3 passes) with identical element ordering
     dependencies. The speed difference comes from data structures and decode
     optimizations, not a fundamentally different algorithm.
 
-    **Finding 1: O(1) chunked bitset vs O(log n) binary search (DOMINANT).**
-    Osmium stores ID sets in `IdSetDense` (`libosmium/include/osmium/index/id_set.hpp`),
-    a chunked sparse bitset: `Vec<Option<Box<[u8; 4MB]>>>` with `chunk_bits=22`.
-    Each chunk covers 33M IDs. `set()` and `get()` are 3 instructions: one array
-    index, one byte offset, one bitmask. Memory: 1 bit per ID present in the
-    chunk, 4MB per allocated chunk, zero for empty ranges.
-
-    pbfhogg uses sorted `Vec<i64>` + `binary_search()`. For 52M Denmark nodes,
-    that's a ~400MB contiguous array with O(log n) ≈ 25 comparisons per lookup,
-    each a potential L2/L3 cache miss. On the complete-ways Pass 2 hot path
-    (52M nodes × 2 ID set lookups), this is ~300ns/node vs osmium's ~6ns/node —
-    a **~50x difference on the lookup-dominated inner loop**.
-
-    The sorted Vec was chosen over BTreeSet (5x memory savings) and HashSet
-    (cache-friendly sequential access), which was the right tradeoff at the time.
-    But a bitset is strictly better: O(1), cache-friendly (sequential bit scanning),
-    and comparable memory for dense ID ranges (node IDs are dense 1..12B).
-
-    - [x] **Replace `Vec<i64>` + `binary_search` with a chunked dense bitset.**
-      DONE (commit `4c30d3e`). Hand-rolled `IdSetDense` in `extract.rs`:
-      chunked `Vec<Option<Box<[u8; CHUNK_SIZE]>>>` with bit-level set/get.
-      CHUNK_SIZE=4MB (matching osmium's `chunk_bits=22`), covers 33M IDs per
-      chunk. Denmark results: simple 4.05s→2.84s (-30%), complete-ways
-      4.42s→2.72s (-38%, matches osmium), smart 6.12s→4.23s (-31%).
-      Memory: 8MB for Denmark's 52M nodes vs ~400MB sorted Vec.
-
-    **Finding 2: Metadata skipping in collection passes.**
+    **Finding: Metadata skipping in collection passes.**
     Osmium passes `read_meta::no` for all non-write passes:
     - complete-ways Pass 1 (`strategy_complete_ways.cpp:175`)
     - smart Pass 1 (`strategy_smart.cpp:310`)
@@ -298,27 +188,6 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
       varint scanning cost (~5-10% of decode, not the 15-25% that osmium
       saves from its eager decoder).
 
-    **Finding 3: Integer bbox containment vs float conversion.**
-    Osmium's `Box::contains()` (`libosmium/include/osmium/osm/box.hpp:224-229`)
-    does 4 int32 comparisons on raw decimicrodegree coordinates:
-    ```
-    location.x() >= bottom_left().x() && location.y() >= bottom_left().y() &&
-    location.x() <= top_right().x() && location.y() <= top_right().y();
-    ```
-    The `Location` class stores `int32_t m_x, m_y` natively — no conversion.
-
-    pbfhogg converts nanodegrees → f64 via `1e-9 * self.nano_lat() as f64`
-    before each bbox test (`extract.rs:479,486`). The i64→f64 cast + f64
-    multiply + 4 f64 comparisons cost ~5ns/node vs ~2ns/node for int32.
-    At 52M nodes this is ~156ms vs ~104ms — small but free to fix.
-
-    - [x] **Use integer bbox containment.** DONE (commit `2bac649`).
-      `BboxInt` with decimicrodegree i32 coordinates computed once at startup.
-      `Region::contains_decimicro()` uses 4 integer comparisons for bbox,
-      falls back to f64 ray-casting only for polygon regions. ~1% improvement
-      across all strategies (2.84s→2.81s simple, 2.72s→2.69s complete-ways,
-      4.23s→4.21s smart).
-
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is
     sequential and dominates wall time. Denmark: ~11.3s total vs osmium ~10.3s.
@@ -328,67 +197,12 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     - The Dense mmap index variant avoids this entirely (direct indexing, no
       hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
 
-- [x] **Remove prost dependency.** Replaced all prost-generated code with
-  hand-rolled wire-format encoding/decoding. Eliminated prost (runtime),
-  prost-build + protox (build-time codegen), build.rs, and src/proto/.
-  Write benchmark improved ~11% (sync none 7.1s→6.2s, pipelined floor
-  7.0s→6.2s) from eliminating DenseNodes/Blob prost overhead.
-
-- [x] **`frame_blob()` buffer reuse.** Sync path: `FrameScratch` fields on PbfWriter
-  hold blob_buf, header_buf, compress_buf — zero allocation after warmup (no `out`
-  Vec, writes 3 parts directly to writer). Pipelined path: `thread_local!` scratch
-  buffers in rayon tasks — reduces intermediate allocs from 7400/file to ~12 (one
-  per rayon thread). Compression buffers also reused via streaming zlib/zstd encoders
-  that borrow the scratch Vec instead of allocating fresh.
-
-- [x] **Zlib compressor state reuse + libdeflater.** Two stacking optimizations
-  for the write-path zlib compression, both targeting `encode_blob_body` in
-  `writer.rs` via a `compress_zlib()` helper with `#[cfg(feature)]` dispatch.
-
-  **Step 1 (commit `47d3b03`): `flate2::Compress::reset()`.**
-  Replaced per-blob `ZlibEncoder` (~312 KB internal deflate state allocated and
-  freed per call) with a persistent `Compress` on `FrameScratch`, reused via
-  `reset()`. Lazy-initialized on first zlib blob. Sync path: one compressor on
-  PbfWriter. Pipelined path: one per rayon thread via `thread_local!`.
-
-  Allocation results (Denmark 486 MB, commit `47d3b03`, plantasjen):
-
-  | Metric | Before (75e8edd) | After | Change |
-  |---|---|---|---|
-  | frame_blob_into total | 2.9 GB | 542 MB | **-81%** |
-  | frame_blob_into avg/call | ~400 KB | 75 KB | **-81%** |
-  | merge frame_blob_into | 327 MB | 136 MB | **-59%** |
-
-  Remaining per-call alloc is the `out` Vec for rayon channel ownership (~75 KB
-  avg). At planet scale (600K blobs): eliminates ~187 GB of deflate state churn.
-
-  **Step 2 (commit `4a55c88`): `libdeflater` feature flag.**
-  Optional `libdeflater` feature replaces flate2's miniz_oxide with libdeflate
-  for write-path zlib compression. Whole-buffer API is a natural fit for PBF
-  blob compression (~32 KB compressed, ~1.4 MB uncompressed). Output is standard
-  zlib (RFC 1950), compatible with flate2 decompression on the read side.
-  Requires C compiler (`libdeflate-sys` compiles C source via `build.rs`).
-  Levels clamped to 0-12 (libdeflater range) with `.min(12)`.
-
-  Write benchmark results (Denmark 486 MB, commit `4a55c88`, plantasjen):
-
-  | Mode | flate2 (miniz_oxide) | libdeflater | Speedup |
-  |---|---|---|---|
-  | **Sync zlib:6** | **24,374 ms** | **12,661 ms** | **1.92x** |
-  | Pipelined zlib:6 | 6,880 ms | 6,700 ms | 1.03x |
-
-  Sync path shows the raw compression throughput gain: **1.92x**. Pipelined path
-  shows only 3% because compression is already parallelized across ~5 rayon
-  threads and decode + wire-format serialization is the wall-time bottleneck at
-  Denmark scale. At planet scale where `frame_blob` cumulative thread time is
-  146s (Germany) and compression is 217% of wall time, the throughput gain
-  directly reduces worker contention.
-
-  **Zstd equivalent:** The `zstd` crate has the same per-call encoder problem
-  (`zstd::stream::write::Encoder::new()` allocates fresh state each blob).
-  `zstd::bulk::Compressor` provides a reusable whole-buffer compressor with
-  `compress_to_buffer()`. Same pattern — add to FrameScratch, reuse across
-  blobs. Lower priority since zstd PBFs are rare in the OSM ecosystem.
+- [ ] **Zstd compressor state reuse.** The `zstd` crate has the same per-call
+  encoder problem (`zstd::stream::write::Encoder::new()` allocates fresh state
+  each blob). `zstd::bulk::Compressor` provides a reusable whole-buffer
+  compressor with `compress_to_buffer()`. Same pattern as the zlib fix — add to
+  FrameScratch, reuse across blobs. Lower priority since zstd PBFs are rare in
+  the OSM ecosystem.
 
 - [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
   / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with
@@ -404,7 +218,6 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Verify edition 2024 is intentional — most published crates use 2021 for broader compatibility
-- [ ] Add `tests/test.osm.pbf` to version control (generated by `cargo run --example gen_test_pbf`)
 - [ ] Fix crate-level doc example: says `pbfhogg = "0.1"` but Cargo.toml is 0.2.0
 - [ ] Add doc comments to `writer.rs` public API (PbfWriter, Compression)
 - [ ] Add doc comments to `block_builder.rs` public API (BlockBuilder, Metadata, MemberData)

@@ -25,8 +25,18 @@ pub enum FileReader {
 
 impl FileReader {
     /// Open a file for buffered reading (256 KB `BufReader`).
+    ///
+    /// On Linux, advises the kernel for sequential readahead via
+    /// `posix_fadvise(POSIX_FADV_SEQUENTIAL)`.
     pub fn buffered(path: &Path) -> io::Result<Self> {
         let f = File::open(path)?;
+        #[cfg(all(target_os = "linux", any(feature = "linux-direct-io", feature = "linux-io-uring")))]
+        {
+            use std::os::unix::io::AsRawFd;
+            // Advisory hint for sequential readahead — matches osmium's approach.
+            // SAFETY: valid fd, advisory-only, no-op on failure.
+            unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+        }
         Ok(Self::Buffered(BufReader::with_capacity(256 * 1024, f)))
     }
 

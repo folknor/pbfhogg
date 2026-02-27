@@ -5,7 +5,6 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
-use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
@@ -61,6 +60,32 @@ impl IdSetDense {
             Some(chunk) => {
                 let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
                 (chunk[offset] & (1u8 << (id & 7))) != 0
+            }
+        }
+    }
+
+    /// Merge another IdSetDense into this one via bitwise OR.
+    #[allow(dead_code)]
+    ///
+    /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
+    /// processes a contiguous ID range), chunks are moved with zero copying.
+    /// For overlapping chunks, byte-level OR is applied.
+    fn merge(&mut self, other: Self) {
+        if other.chunks.len() > self.chunks.len() {
+            self.chunks.resize_with(other.chunks.len(), || None);
+        }
+        for (i, other_chunk) in other.chunks.into_iter().enumerate() {
+            if let Some(oc) = other_chunk {
+                match &mut self.chunks[i] {
+                    Some(sc) => {
+                        for (a, b) in sc.iter_mut().zip(oc.iter()) {
+                            *a |= *b;
+                        }
+                    }
+                    slot @ None => {
+                        *slot = Some(oc);
+                    }
+                }
             }
         }
     }
@@ -516,7 +541,7 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 }
 
 // ---------------------------------------------------------------------------
-// Simple strategy (single pass)
+// Simple strategy (two passes: streaming collection + parallel write)
 // ---------------------------------------------------------------------------
 
 fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
@@ -530,59 +555,70 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         strategy: "simple",
     };
 
-    let mut bb = BlockBuilder::new();
-
-    let mut matched_node_ids = IdSetDense::new();
+    // --- Pass 1: Streaming collection (pipelined decode, sequential consumer) ---
+    let mut bbox_node_ids = IdSetDense::new();
     let mut matched_way_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
 
+    let bbox_int = BboxInt::from_bbox(region.bbox());
     let reader = ElementReader::open(input, direct_io)?;
-    let bbox = region.bbox();
-    let bbox_int = BboxInt::from_bbox(bbox);
-    let header_bytes = HeaderBuilder::from_header(reader.header())
-        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        .sorted()
-        .build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
                     if region.contains_decimicro(&bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
-                        matched_node_ids.set(dn.id());
-                        write_dense_node(dn, &mut bb, &mut writer, &mut tags_buf)?;
-                        stats.nodes_in_bbox += 1;
+                        bbox_node_ids.set(dn.id());
                     }
                 }
                 Element::Node(n) => {
                     if region.contains_decimicro(&bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
-                        matched_node_ids.set(n.id());
-                        write_node(n, &mut bb, &mut writer, &mut tags_buf)?;
-                        stats.nodes_in_bbox += 1;
+                        bbox_node_ids.set(n.id());
                     }
                 }
                 Element::Way(w) => {
-                    if w.refs().any(|r| matched_node_ids.get(r)) {
+                    if w.refs().any(|r| bbox_node_ids.get(r)) {
                         matched_way_ids.set(w.id());
-                        write_way(w, &mut bb, &mut writer, &mut tags_buf, &mut refs_buf)?;
-                        stats.ways_written += 1;
                     }
                 }
                 Element::Relation(r) => {
-                    if relation_has_matched_member(r, &matched_node_ids, &matched_way_ids) {
-                        write_relation(r, &mut bb, &mut writer, &mut tags_buf, &mut members_buf)?;
-                        stats.relations_written += 1;
+                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
+                        matched_relation_ids.set(r.id());
                     }
                 }
             }
         }
     }
 
-    flush_block(&mut bb, &mut writer)?;
+    // --- Pass 2: Parallel write (same pattern as complete-ways) ---
+    let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
+    let reader = ElementReader::open(input, direct_io)?;
+    let bbox = region.bbox();
+    let header_bytes = HeaderBuilder::from_header(reader.header())
+        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        .sorted()
+        .build()?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+
+    let ids = ExtractPass2IdSets {
+        bbox_node_ids: &bbox_node_ids,
+        all_way_node_ids: &all_way_node_ids,
+        matched_way_ids: &matched_way_ids,
+        matched_relation_ids: &matched_relation_ids,
+    };
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for block in reader.into_blocks_pipelined() {
+        batch.push(block?);
+        if batch.len() >= BATCH_SIZE {
+            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+    }
+
     writer.flush()?;
     Ok(stats)
 }
@@ -1168,88 +1204,10 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
     r.tags().any(|(k, v)| k == "type" && (v == "multipolygon" || v == "boundary"))
 }
 
-// ---------------------------------------------------------------------------
-// Element writers (buffer-reuse variants)
-// ---------------------------------------------------------------------------
-
-fn write_dense_node<'a>(
-    dn: &crate::DenseNode<'a>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_block(bb, writer)?;
-    }
-    tags_buf.clear();
-    tags_buf.extend(dn.tags());
-    let meta = dense_node_metadata(dn);
-    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), tags_buf, meta.as_ref());
-    Ok(())
-}
-
-fn write_node<'a>(
-    n: &crate::Node<'a>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_block(bb, writer)?;
-    }
-    tags_buf.clear();
-    tags_buf.extend(n.tags());
-    let meta = element_metadata(&n.info());
-    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), tags_buf, meta.as_ref());
-    Ok(())
-}
-
-fn write_way<'a>(
-    w: &crate::Way<'a>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    refs_buf: &mut Vec<i64>,
-) -> Result<()> {
-    if !bb.can_add_way() {
-        flush_block(bb, writer)?;
-    }
-    tags_buf.clear();
-    tags_buf.extend(w.tags());
-    refs_buf.clear();
-    refs_buf.extend(w.refs());
-    let meta = element_metadata(&w.info());
-    bb.add_way(w.id(), tags_buf, refs_buf, meta.as_ref());
-    Ok(())
-}
-
-fn write_relation<'a>(
-    r: &crate::Relation<'a>,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    tags_buf: &mut Vec<(&'a str, &'a str)>,
-    members_buf: &mut Vec<MemberData<'a>>,
-) -> Result<()> {
-    if !bb.can_add_relation() {
-        flush_block(bb, writer)?;
-    }
-    tags_buf.clear();
-    tags_buf.extend(r.tags());
-    members_buf.clear();
-    members_buf.extend(r.members().map(|m| MemberData {
-        id: m.id,
-        role: m.role().unwrap_or(""),
-    }));
-    let meta = element_metadata(&r.info());
-    bb.add_relation(r.id(), tags_buf, members_buf, meta.as_ref());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-use super::{dense_node_metadata, element_metadata, flush_block};
+use super::{dense_node_metadata, element_metadata};
 
 
 // ---------------------------------------------------------------------------

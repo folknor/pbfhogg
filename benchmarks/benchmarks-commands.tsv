@@ -23,3 +23,9 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	node-stats	1.68	483
 2026-02-27	plantasjen	61dc380*	Add CLI command benchmark baseline (Denmark, commit b51439e)	denmark-20260220-seq4704	pbfhogg	tags-filter-twopass	2.69	483
 2026-02-27	plantasjen	61dc380*	Add CLI command benchmark baseline (Denmark, commit b51439e)	denmark-20260220-seq4704	osmium	tags-filter-twopass	2.42	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	pbfhogg	extract-simple	4.08	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	osmium	extract-simple	1.65	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	pbfhogg	extract-complete	4.45	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	osmium	extract-complete	2.74	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	pbfhogg	extract-smart	6.12	483
+2026-02-27	plantasjen	c167a24*	Parallelize tags-filter two-pass Pass 2 via rayon	denmark-20260220-seq4704	osmium	extract-smart	3.2	483

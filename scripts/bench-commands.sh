@@ -14,7 +14,8 @@ source "$(dirname "$0")/lib.sh"
 # Commands:
 #   cat-way, cat-relation, tags-count, tags-count-way, tags-filter-way,
 #   tags-filter-amenity, tags-filter-twopass, getid, removeid,
-#   add-locations-to-ways, node-stats, all (runs everything)
+#   add-locations-to-ways, extract-simple, extract-complete, extract-smart,
+#   node-stats, all (runs everything)
 #
 # Examples:
 #   scripts/bench-commands.sh cat-way
@@ -206,6 +207,33 @@ bench_add_locations_to_ways() {
     echo ""
 }
 
+bench_extract_simple() {
+    echo "=== extract --simple -b 12.4,55.6,12.7,55.8 ==="
+    best_of "pbfhogg" "extract-simple" "$BIN" extract "$PBF" --simple -b 12.4,55.6,12.7,55.8 -o /dev/null
+    if [ "$HAS_OSMIUM" = "yes" ]; then
+        best_of "osmium" "extract-simple" osmium extract "$PBF" -s simple -b 12.4,55.6,12.7,55.8 -o "$OSMIUM_OUT" --overwrite
+    fi
+    echo ""
+}
+
+bench_extract_complete() {
+    echo "=== extract (complete-ways) -b 12.4,55.6,12.7,55.8 ==="
+    best_of "pbfhogg" "extract-complete" "$BIN" extract "$PBF" -b 12.4,55.6,12.7,55.8 -o /dev/null
+    if [ "$HAS_OSMIUM" = "yes" ]; then
+        best_of "osmium" "extract-complete" osmium extract "$PBF" -s complete_ways -b 12.4,55.6,12.7,55.8 -o "$OSMIUM_OUT" --overwrite
+    fi
+    echo ""
+}
+
+bench_extract_smart() {
+    echo "=== extract --smart -b 12.4,55.6,12.7,55.8 ==="
+    best_of "pbfhogg" "extract-smart" "$BIN" extract "$PBF" --smart -b 12.4,55.6,12.7,55.8 -o /dev/null
+    if [ "$HAS_OSMIUM" = "yes" ]; then
+        best_of "osmium" "extract-smart" osmium extract "$PBF" -s smart -b 12.4,55.6,12.7,55.8 -o "$OSMIUM_OUT" --overwrite
+    fi
+    echo ""
+}
+
 bench_node_stats() {
     echo "=== node-stats ==="
     if [ "$HAS_IDX" = "yes" ]; then
@@ -230,6 +258,9 @@ case "$CMD" in
     getid)                  bench_getid ;;
     removeid)               bench_removeid ;;
     add-locations-to-ways)  bench_add_locations_to_ways ;;
+    extract-simple)         bench_extract_simple ;;
+    extract-complete)       bench_extract_complete ;;
+    extract-smart)          bench_extract_smart ;;
     node-stats)             bench_node_stats ;;
     all)
         bench_cat_way
@@ -242,6 +273,9 @@ case "$CMD" in
         bench_getid
         bench_removeid
         bench_add_locations_to_ways
+        bench_extract_simple
+        bench_extract_complete
+        bench_extract_smart
         bench_node_stats
         ;;
     *)
@@ -250,7 +284,8 @@ case "$CMD" in
         echo "Available commands:"
         echo "  cat-way, cat-relation, tags-count, tags-count-way,"
         echo "  tags-filter-way, tags-filter-amenity, tags-filter-twopass,"
-        echo "  getid, removeid, add-locations-to-ways, node-stats, all"
+        echo "  getid, removeid, add-locations-to-ways, extract-simple,"
+        echo "  extract-complete, extract-smart, node-stats, all"
         exit 1
         ;;
 esac

@@ -2,10 +2,12 @@
 
 use std::path::Path;
 
+use rayon::prelude::*;
+
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader, MemberId};
+use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -386,6 +388,28 @@ pub fn extract(
 }
 
 // ---------------------------------------------------------------------------
+// Parallel batch infrastructure
+// ---------------------------------------------------------------------------
+
+const BATCH_SIZE: usize = 64;
+
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
+    if let Some(bytes) = bb.take().map_err(|e| e.to_string())? {
+        output.push(bytes.to_vec());
+    }
+    Ok(())
+}
+
+fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
+    target.nodes_in_bbox += source.nodes_in_bbox;
+    target.nodes_from_ways += source.nodes_from_ways;
+    target.nodes_from_relations += source.nodes_from_relations;
+    target.ways_written += source.ways_written;
+    target.ways_from_relations += source.ways_from_relations;
+    target.relations_written += source.relations_written;
+}
+
+// ---------------------------------------------------------------------------
 // Simple strategy (single pass)
 // ---------------------------------------------------------------------------
 
@@ -607,23 +631,26 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
         .sorted()
         .build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
 
+    let ids = ExtractPass2IdSets {
+        bbox_node_ids: &bbox_node_ids,
+        all_way_node_ids: &all_way_node_ids,
+        matched_way_ids: &matched_way_ids,
+        matched_relation_ids: &matched_relation_ids,
+    };
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        write_pass2_elements(
-            &block,
-            &bbox_node_ids,
-            &all_way_node_ids,
-            &matched_way_ids,
-            &matched_relation_ids,
-            &mut bb,
-            &mut writer,
-            &mut stats,
-        )?;
+        batch.push(block?);
+        if batch.len() >= BATCH_SIZE {
+            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
     }
 
-    flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
     Ok(stats)
 }
@@ -704,31 +731,52 @@ fn collect_pass1_matches(
     }
 }
 
-/// Write matching elements during pass 2. All ID Vecs are pre-sorted+deduped by
-/// the caller between pass 1 and pass 2, so binary_search() is valid here.
-#[allow(clippy::too_many_arguments)]
-fn write_pass2_elements(
-    block: &crate::PrimitiveBlock,
-    bbox_node_ids: &[i64],
-    all_way_node_ids: &[i64],
-    matched_way_ids: &[i64],
-    matched_relation_ids: &[i64],
+// ---------------------------------------------------------------------------
+// Complete-ways Pass 2: Parallel helpers
+// ---------------------------------------------------------------------------
+
+/// Read-only ID sets for Pass 2 of complete-ways strategy, shared across rayon threads.
+struct ExtractPass2IdSets<'a> {
+    bbox_node_ids: &'a [i64],
+    all_way_node_ids: &'a [i64],
+    matched_way_ids: &'a [i64],
+    matched_relation_ids: &'a [i64],
+}
+
+/// Process a single block for Pass 2 of complete-ways: write elements whose IDs
+/// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
+fn extract_block_pass2(
+    block: &PrimitiveBlock,
+    ids: &ExtractPass2IdSets<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut ExtractStats,
-) -> Result<()> {
+    output: &mut Vec<Vec<u8>>,
+) -> std::result::Result<ExtractStats, String> {
+    let mut stats = ExtractStats {
+        nodes_in_bbox: 0,
+        nodes_from_ways: 0,
+        nodes_from_relations: 0,
+        ways_written: 0,
+        ways_from_relations: 0,
+        relations_written: 0,
+        strategy: "",
+    };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                // binary_search on sorted slices: O(log n) lookup, same as BTreeSet
-                // but with contiguous memory for better cache performance.
-                let in_bbox = bbox_node_ids.binary_search(&dn.id()).is_ok();
-                let from_way = all_way_node_ids.binary_search(&dn.id()).is_ok();
+                let in_bbox = ids.bbox_node_ids.binary_search(&dn.id()).is_ok();
+                let from_way = ids.all_way_node_ids.binary_search(&dn.id()).is_ok();
                 if in_bbox || from_way {
-                    write_dense_node(dn, bb, writer, &mut tags_buf)?;
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -737,10 +785,16 @@ fn write_pass2_elements(
                 }
             }
             Element::Node(n) => {
-                let in_bbox = bbox_node_ids.binary_search(&n.id()).is_ok();
-                let from_way = all_way_node_ids.binary_search(&n.id()).is_ok();
+                let in_bbox = ids.bbox_node_ids.binary_search(&n.id()).is_ok();
+                let from_way = ids.all_way_node_ids.binary_search(&n.id()).is_ok();
                 if in_bbox || from_way {
-                    write_node(n, bb, writer, &mut tags_buf)?;
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -749,17 +803,67 @@ fn write_pass2_elements(
                 }
             }
             Element::Way(w) => {
-                if matched_way_ids.binary_search(&w.id()).is_ok() {
-                    write_way(w, bb, writer, &mut tags_buf, &mut refs_buf)?;
+                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                    if !bb.can_add_way() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    let meta = element_metadata(&w.info());
+                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
-                if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                    write_relation(r, bb, writer, &mut tags_buf, &mut members_buf)?;
+                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                    if !bb.can_add_relation() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }
+        }
+    }
+    Ok(stats)
+}
+
+/// Process a batch of blocks in parallel for Pass 2 of complete-ways extraction.
+fn process_extract_pass2_batch(
+    batch: &[PrimitiveBlock],
+    ids: &ExtractPass2IdSets<'_>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+) -> Result<()> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, ExtractStats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let block_stats = extract_block_pass2(block, ids, bb, &mut output)?;
+                flush_local(bb, &mut output)?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge_extract_stats(stats, &block_stats);
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
         }
     }
     Ok(())
@@ -857,24 +961,27 @@ fn extract_smart(
         .sorted()
         .build()?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
-    let mut bb = BlockBuilder::new();
 
+    let ids = ExtractPass3IdSets {
+        bbox_node_ids: &bbox_node_ids,
+        all_way_node_ids: &all_way_node_ids,
+        extra_node_ids: &extra_node_ids,
+        matched_way_ids: &matched_way_ids,
+        matched_relation_ids: &matched_relation_ids,
+    };
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        write_pass3_smart(
-            &block,
-            &bbox_node_ids,
-            &all_way_node_ids,
-            &extra_node_ids,
-            &matched_way_ids,
-            &matched_relation_ids,
-            &mut bb,
-            &mut writer,
-            &mut stats,
-        )?;
+        batch.push(block?);
+        if batch.len() >= BATCH_SIZE {
+            process_extract_pass3_batch(&batch, &ids, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_extract_pass3_batch(&batch, &ids, &mut writer, &mut stats)?;
     }
 
-    flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
     Ok(stats)
 }
@@ -949,34 +1056,55 @@ fn collect_pass1_smart(
     }
 }
 
-/// Write matching elements during pass 3 of the smart strategy.
-///
-/// Like `write_pass2_elements` but with an additional `extra_node_ids` set
-/// for nodes pulled in via smart relation dependencies.
-#[allow(clippy::too_many_arguments)]
-fn write_pass3_smart(
-    block: &crate::PrimitiveBlock,
-    bbox_node_ids: &[i64],
-    all_way_node_ids: &[i64],
-    extra_node_ids: &[i64],
-    matched_way_ids: &[i64],
-    matched_relation_ids: &[i64],
+// ---------------------------------------------------------------------------
+// Smart Pass 3: Parallel helpers
+// ---------------------------------------------------------------------------
+
+/// Read-only ID sets for Pass 3 of smart strategy, shared across rayon threads.
+struct ExtractPass3IdSets<'a> {
+    bbox_node_ids: &'a [i64],
+    all_way_node_ids: &'a [i64],
+    extra_node_ids: &'a [i64],
+    matched_way_ids: &'a [i64],
+    matched_relation_ids: &'a [i64],
+}
+
+/// Process a single block for Pass 3 of smart extraction: write elements whose IDs
+/// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
+fn extract_block_pass3(
+    block: &PrimitiveBlock,
+    ids: &ExtractPass3IdSets<'_>,
     bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut ExtractStats,
-) -> Result<()> {
+    output: &mut Vec<Vec<u8>>,
+) -> std::result::Result<ExtractStats, String> {
+    let mut stats = ExtractStats {
+        nodes_in_bbox: 0,
+        nodes_from_ways: 0,
+        nodes_from_relations: 0,
+        ways_written: 0,
+        ways_from_relations: 0,
+        relations_written: 0,
+        strategy: "",
+    };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                let in_bbox = bbox_node_ids.binary_search(&id).is_ok();
-                let from_way = all_way_node_ids.binary_search(&id).is_ok();
-                let from_rel = extra_node_ids.binary_search(&id).is_ok();
+                let in_bbox = ids.bbox_node_ids.binary_search(&id).is_ok();
+                let from_way = ids.all_way_node_ids.binary_search(&id).is_ok();
+                let from_rel = ids.extra_node_ids.binary_search(&id).is_ok();
                 if in_bbox || from_way || from_rel {
-                    write_dense_node(dn, bb, writer, &mut tags_buf)?;
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -988,11 +1116,17 @@ fn write_pass3_smart(
             }
             Element::Node(n) => {
                 let id = n.id();
-                let in_bbox = bbox_node_ids.binary_search(&id).is_ok();
-                let from_way = all_way_node_ids.binary_search(&id).is_ok();
-                let from_rel = extra_node_ids.binary_search(&id).is_ok();
+                let in_bbox = ids.bbox_node_ids.binary_search(&id).is_ok();
+                let from_way = ids.all_way_node_ids.binary_search(&id).is_ok();
+                let from_rel = ids.extra_node_ids.binary_search(&id).is_ok();
                 if in_bbox || from_way || from_rel {
-                    write_node(n, bb, writer, &mut tags_buf)?;
+                    if !bb.can_add_node() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -1003,17 +1137,67 @@ fn write_pass3_smart(
                 }
             }
             Element::Way(w) => {
-                if matched_way_ids.binary_search(&w.id()).is_ok() {
-                    write_way(w, bb, writer, &mut tags_buf, &mut refs_buf)?;
+                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                    if !bb.can_add_way() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    let meta = element_metadata(&w.info());
+                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
-                if matched_relation_ids.binary_search(&r.id()).is_ok() {
-                    write_relation(r, bb, writer, &mut tags_buf, &mut members_buf)?;
+                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                    if !bb.can_add_relation() {
+                        flush_local(bb, output)?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }
+        }
+    }
+    Ok(stats)
+}
+
+/// Process a batch of blocks in parallel for Pass 3 of smart extraction.
+fn process_extract_pass3_batch(
+    batch: &[PrimitiveBlock],
+    ids: &ExtractPass3IdSets<'_>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+) -> Result<()> {
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, ExtractStats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<Vec<u8>> = Vec::new();
+                let block_stats = extract_block_pass3(block, ids, bb, &mut output)?;
+                flush_local(bb, &mut output)?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge_extract_stats(stats, &block_stats);
+        for block_bytes in &blocks {
+            writer.write_primitive_block(block_bytes)?;
         }
     }
     Ok(())

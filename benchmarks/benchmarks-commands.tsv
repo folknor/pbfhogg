@@ -81,3 +81,5 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-complete	2.79	483
 2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	pbfhogg	extract-smart	2.83	483
 2026-02-27	plantasjen	1b62e2c*	Correct extract performance analysis: decoder is competitive, not slow	denmark-20260220-seq4704	osmium	extract-smart	3.25	483
+2026-02-27	plantasjen	44ad7d2*	Skip metadata in extract scan-only passes for 7-39% speedup	denmark-20260220-seq4704	pbfhogg	tags-filter-twopass	2.39	483
+2026-02-27	plantasjen	44ad7d2*	Skip metadata in extract scan-only passes for 7-39% speedup	denmark-20260220-seq4704	osmium	tags-filter-twopass	2.5	483

@@ -109,7 +109,7 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   | getid (9 elements) | **0.38s** | 0.84s | **0.45x** | parallel |
   | tags-count --type way | **0.35s** | 0.60s | **0.58x** | fold+reduce + blob-skip (indexdata) |
   | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
-  | tags-filter highway=primary 2pass | 2.69s | 2.42s | 1.11x | two-pass, parallel Pass 2 |
+  | tags-filter highway=primary 2pass | **2.39s** | 2.50s | **0.96x** | skip-metadata Pass 1 + parallel Pass 2 |
   | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
   | extract --simple | **2.48s** | 1.69s | 1.47x | skip-metadata + Pass 2 parallel |
   | extract (complete-ways) | **2.48s** | 2.79s | **0.89x** | skip-metadata + Pass 2 parallel |

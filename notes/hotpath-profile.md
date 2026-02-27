@@ -519,9 +519,14 @@ proto construction.
 - FrameScratch (commit 75e8edd) reuses blob_buf, header_buf, compress_buf.
   Sync path: `write_framed_blob` writes directly to writer (zero alloc after warmup).
   Pipelined: `thread_local!` scratch buffers (7400 allocs → ~12, one per rayon thread).
-- Remaining 2.9 GB: `out` Vec for rayon channel (~1.0 GB) + ZlibEncoder internal
-  deflate state (~1.9 GB, ~312 KB per call). Fix: `flate2::Compress::reset()` —
-  reuses encoder state in-place without reallocation. See TODO.md.
+- ~~Remaining 2.9 GB: `out` Vec for rayon channel (~1.0 GB) + ZlibEncoder internal
+  deflate state (~1.9 GB, ~312 KB per call).~~
+- `flate2::Compress::reset()` (commit 47d3b03) eliminates deflate state churn:
+  frame_blob_into 2.9 GB → 542 MB (-81%), avg 400 KB → 75 KB per call.
+  Remaining 542 MB is the `out` Vec for rayon channel (unavoidable floor).
+- `libdeflater` feature flag (commit 4a55c88) for 1.92x faster zlib compression
+  on top. Sync zlib:6: 24.4s → 12.7s. Pipelined: 6.9s → 6.7s (compression
+  already parallelized, decode is the bottleneck at Denmark scale).
 
 ### decompress_blob buffer reuse (33% of read time)
 - DecompressPool already exists for pipelined path

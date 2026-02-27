@@ -341,134 +341,48 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   per rayon thread). Compression buffers also reused via streaming zlib/zstd encoders
   that borrow the scratch Vec instead of allocating fresh.
 
-- [ ] **Zlib compressor state reuse.** `frame_blob_into` still allocates ~1.9 GB
-  on Denmark (~312 KB `flate2::Compress` internal deflate state per blob × 7400
-  blobs). `flate2::write::ZlibEncoder::new()` creates a fresh zlib stream each
-  call and drops it after compression — allocating and freeing ~312 KB of hash
-  tables, Huffman state, and dictionary buffers every time.
+- [x] **Zlib compressor state reuse + libdeflater.** Two stacking optimizations
+  for the write-path zlib compression, both targeting `encode_blob_body` in
+  `writer.rs` via a `compress_zlib()` helper with `#[cfg(feature)]` dispatch.
 
-  **Root cause:** `ZlibEncoder` is a high-level streaming wrapper that owns a
-  `Compress` struct. On `finish()`, the `Compress` is dropped and its ~312 KB
-  internal state is freed. On the next blob, `ZlibEncoder::new()` allocates it
-  all again. The FrameScratch reuse (commit `75e8edd`) solved the *output buffer*
-  reuse but not the *encoder state* reuse — the three scratch Vecs (`blob_buf`,
-  `header_buf`, `compress_buf`) are reused, but the encoder itself is not.
+  **Step 1 (commit `47d3b03`): `flate2::Compress::reset()`.**
+  Replaced per-blob `ZlibEncoder` (~312 KB internal deflate state allocated and
+  freed per call) with a persistent `Compress` on `FrameScratch`, reused via
+  `reset()`. Lazy-initialized on first zlib blob. Sync path: one compressor on
+  PbfWriter. Pipelined path: one per rayon thread via `thread_local!`.
 
-  **Internal state breakdown** (miniz_oxide backend, verified from source):
+  Allocation results (Denmark 486 MB, commit `47d3b03`, plantasjen):
 
-  | Component | Size |
-  |---|---|
-  | `HashBuffers.dict` | `Box<[u8; 33,026]>` = 33 KB |
-  | `HashBuffers.next` | `Box<[u16; 32,768]>` = 64 KB |
-  | `HashBuffers.hash` | `Box<[u16; 32,768]>` = 64 KB |
-  | `LZOxide.codes` | `[u8; 65,536]` = 64 KB |
-  | `ParamsOxide.local_buf` | `Box<[u8; 85,196]>` = 83 KB |
-  | `HuffmanOxide` | `Box<~4,320 bytes>` = 4 KB |
-  | **Total** | **~312 KB** |
+  | Metric | Before (75e8edd) | After | Change |
+  |---|---|---|---|
+  | frame_blob_into total | 2.9 GB | 542 MB | **-81%** |
+  | frame_blob_into avg/call | ~400 KB | 75 KB | **-81%** |
+  | merge frame_blob_into | 327 MB | 136 MB | **-59%** |
 
-  At planet scale (600K blobs): **~187 GB** of deflate state churn.
+  Remaining per-call alloc is the `out` Vec for rayon channel ownership (~75 KB
+  avg). At planet scale (600K blobs): eliminates ~187 GB of deflate state churn.
 
-  **Solution: `flate2::Compress` with `reset()`.** flate2 exposes a lower-level
-  `Compress` struct (distinct from `ZlibEncoder`) that supports in-place state
-  reset without reallocation:
+  **Step 2 (commit `4a55c88`): `libdeflater` feature flag.**
+  Optional `libdeflater` feature replaces flate2's miniz_oxide with libdeflate
+  for write-path zlib compression. Whole-buffer API is a natural fit for PBF
+  blob compression (~32 KB compressed, ~1.4 MB uncompressed). Output is standard
+  zlib (RFC 1950), compatible with flate2 decompression on the read side.
+  Requires C compiler (`libdeflate-sys` compiles C source via `build.rs`).
+  Levels clamped to 0-12 (libdeflater range) with `.min(12)`.
 
-  ```rust
-  // Create once (~312 KB allocated, kept for lifetime of FrameScratch)
-  let mut compressor = flate2::Compress::new(flate2::Compression::new(6), true);
+  Write benchmark results (Denmark 486 MB, commit `4a55c88`, plantasjen):
 
-  // For each blob:
-  compress_buf.clear();
-  compressor.compress_vec(input, &mut compress_buf, FlushCompress::Finish)?;
-  compressor.reset();  // resets state in-place, NO reallocation
-  ```
+  | Mode | flate2 (miniz_oxide) | libdeflater | Speedup |
+  |---|---|---|---|
+  | **Sync zlib:6** | **24,374 ms** | **12,661 ms** | **1.92x** |
+  | Pipelined zlib:6 | 6,880 ms | 6,700 ms | 1.03x |
 
-  `reset()` works across all flate2 backends:
-  - **miniz_oxide** (`rust-zlib`): calls `CompressorOxide::reset()` — resets
-    `LZOxide`, `ParamsOxide`, `HuffmanOxide`, `DictOxide` in-place. All boxed
-    arrays keep their heap allocations.
-  - **zlib-ng**: calls C `deflateReset()` — canonical C API for stream reuse.
-  - **zlib-rs**: calls `Deflate::reset()` — Rust equivalent.
-
-  **Integration points (two paths, matching existing FrameScratch design):**
-
-  1. **Sync path** (`write_framed_blob`): Add `compressor: Option<Compress>` to
-     `FrameScratch` on `PbfWriter`. Lazy-init on first zlib blob. Reused for
-     every subsequent blob — one allocation total for the entire file.
-
-  2. **Pipelined path** (`PIPELINE_SCRATCH` thread_local): Add `compressor` to
-     the thread-local `FrameScratch`. Each rayon thread gets one compressor,
-     lazy-inited on first use, reused across all blobs dispatched to that thread.
-     With ~12 rayon threads, total state is 12 × 312 KB ≈ 3.7 MB (vs current
-     7400 × 312 KB ≈ 2.3 GB).
-
-  `encode_blob_body` changes from `ZlibEncoder::new()` + `write_all()` +
-  `finish()` to `compressor.compress_vec()` + `compressor.reset()`. The existing
-  `compress_buf` scratch Vec serves as the output buffer — no new allocations.
-
-  **Expected impact:**
-
-  | Metric | Current | After `Compress::reset()` |
-  |---|---|---|
-  | Denmark alloc (frame_blob) | 2.9 GB | ~1.0 GB (-66%) |
-  | Planet alloc (frame_blob) | ~240 GB | ~80 GB (-66%) |
-  | Remaining alloc | `out` Vec for rayon channel | Same (unavoidable) |
-
-  The `out` Vec (~1.0 GB on Denmark, ~135 KB/blob for rayon channel ownership)
-  remains — the channel needs owned data. This is the floor.
-
-  **Two independent wins — allocation reuse AND compression throughput.**
-
-  `flate2::Compress::reset()` eliminates allocation churn (the ~312 KB per-call
-  state) but does not make the compression itself any faster. Compression is
-  the dominant bottleneck: **57% of sync write time** (Denmark), **217% of
-  pipelined wall time** (parallel rewrite), **146s cumulative thread time**
-  (Germany 4.5 GB). A 2-3x speedup on the compression kernel itself would
-  directly shrink that bottleneck — these are not marginal gains.
-
-  **Step 1: `flate2::Compress::reset()`** — zero-dependency fix, eliminates
-  allocation churn. Do this first. Measures the allocation-only improvement.
-
-  **Step 2: libdeflater behind a feature flag** — adds C dependency, 2-3x faster
-  compression throughput on top of the allocation fix. The `Compressor` is
-  inherently stateless for whole-buffer operations (no `reset()` needed — each
-  `zlib_compress()` call is self-contained). API:
-
-  ```rust
-  let mut comp = libdeflater::Compressor::new(CompressionLvl::new(6)?);
-  let bound = comp.zlib_compress_bound(input.len());
-  compress_buf.resize(bound, 0);
-  let n = comp.zlib_compress(input, &mut compress_buf)?;
-  // compress_buf[..n] is standard zlib output, compatible with any decompressor
-  ```
-
-  libdeflater is optimized for whole-buffer compression of chunks < 1 MB —
-  exactly the PBF blob use case (~32 KB compressed, ~1.4 MB uncompressed).
-  elivagar uses it for tile compression (`pipeline.rs:1450`, `map_init` with
-  per-rayon-thread reuse). Output is standard zlib (RFC 1950), compatible
-  with flate2/zlib decompression on the read side.
-
-  Feature flag design: `libdeflater` feature that replaces the `Compress` path
-  in `encode_blob_body`. When enabled, the `FrameScratch` holds a
-  `libdeflater::Compressor` instead of `flate2::Compress`. The `compress_buf`
-  scratch Vec still serves as the output buffer. Build requires C compiler
-  (`libdeflate-sys` compiles C source via `build.rs`, no cmake needed).
-  Levels 1-12 (vs flate2's 0-9) — level 6 produces comparable ratios.
-
-  **Alternatives evaluated:**
-
-  | Option | Reuse? | Pure Rust | New dep? | Speed vs miniz_oxide |
-  |---|---|---|---|---|
-  | **`flate2::Compress::reset()`** | **Yes** | **Yes** | **No** | **Same** |
-  | **`libdeflater::Compressor`** | **Yes** | **No (C)** | **Yes** | **2-3x faster** |
-  | `miniz_oxide::CompressorOxide` | Yes | Yes | No | Same (is flate2 backend) |
-  | `zlib-rs` via flate2 | Yes | Yes (unsafe) | No | ~6% slower at L6 |
-  | `deflate` crate | No | Yes | Would add | Slower, unmaintained |
-
-  `flate2::Compress::reset()` and libdeflater are both recommended — the first
-  for the zero-dependency allocation fix, the second for throughput. They
-  target the same code path (`encode_blob_body`) so the libdeflater feature
-  flag would simply replace the `Compress` codepath rather than layering on
-  top of it.
+  Sync path shows the raw compression throughput gain: **1.92x**. Pipelined path
+  shows only 3% because compression is already parallelized across ~5 rayon
+  threads and decode + wire-format serialization is the wall-time bottleneck at
+  Denmark scale. At planet scale where `frame_blob` cumulative thread time is
+  146s (Germany) and compression is 217% of wall time, the throughput gain
+  directly reduces worker contention.
 
   **Zstd equivalent:** The `zstd` crate has the same per-call encoder problem
   (`zstd::stream::write::Encoder::new()` allocates fresh state each blob).

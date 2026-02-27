@@ -9,7 +9,7 @@ use super::{dense_node_metadata, element_metadata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -142,6 +142,16 @@ fn filter_by_id(
     direct_io: bool,
 ) -> Result<GetidStats> {
     let reader = ElementReader::open(input, direct_io)?;
+    // Skip blob types with no matching IDs (getid only — removeid needs all types).
+    let reader = if include {
+        reader.with_blob_filter(BlobFilter::new(
+            !ids.node_ids.is_empty(),
+            !ids.way_ids.is_empty(),
+            !ids.relation_ids.is_empty(),
+        ))
+    } else {
+        reader
+    };
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
         hb = hb.sorted();
@@ -200,7 +210,9 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
     let mut dep_node_ids: BTreeSet<i64> = BTreeSet::new();
 
     if !ids.way_ids.is_empty() {
-        let reader = ElementReader::open(input, direct_io)?;
+        // Pass 1: only scan way blobs to collect referenced node IDs.
+        let reader = ElementReader::open(input, direct_io)?
+            .with_blob_filter(BlobFilter::only_ways());
         for block in reader.into_blocks_pipelined() {
             let block = block?;
             for element in block.elements() {
@@ -215,6 +227,13 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
     // Pass 2: Write matching elements + dependent nodes (parallel batches).
     let reader = ElementReader::open(input, direct_io)?;
+    // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
+    // ways always needed (add-referenced mode), relations if no relation IDs.
+    let reader = reader.with_blob_filter(BlobFilter::new(
+        !ids.node_ids.is_empty() || !dep_node_ids.is_empty(),
+        true,
+        !ids.relation_ids.is_empty(),
+    ));
     let mut hb = HeaderBuilder::from_header(reader.header());
     if reader.header().is_sorted() {
         hb = hb.sorted();

@@ -8,7 +8,7 @@ use super::owned_elements::{
     format_coord, from_decimicro, nodes_equal, read_elements, relations_equal, ways_equal,
     OwnedMember, OwnedNode, OwnedRelation, OwnedWay,
 };
-use crate::MemberType;
+use crate::{BlobFilter, MemberType};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -99,8 +99,20 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
 ) -> Result<DiffStats> {
-    let mut old = read_elements(old_path, direct_io)?;
-    let mut new = read_elements(new_path, direct_io)?;
+    let filter = match options.type_filter.as_deref() {
+        Some(s) => parse_type_filter(s),
+        None => TypeFilter::all(),
+    };
+
+    // Skip blob decompression for irrelevant element types (via indexdata).
+    let blob_filter = if filter.nodes && filter.ways && filter.relations {
+        None
+    } else {
+        Some(BlobFilter::new(filter.nodes, filter.ways, filter.relations))
+    };
+
+    let mut old = read_elements(old_path, direct_io, blob_filter)?;
+    let mut new = read_elements(new_path, direct_io, blob_filter)?;
 
     // Ensure sorted by ID
     old.nodes.sort_by_key(|n| n.id);
@@ -109,11 +121,6 @@ pub fn diff(
     new.nodes.sort_by_key(|n| n.id);
     new.ways.sort_by_key(|w| w.id);
     new.relations.sort_by_key(|r| r.id);
-
-    let filter = match options.type_filter.as_deref() {
-        Some(s) => parse_type_filter(s),
-        None => TypeFilter::all(),
-    };
 
     let mut stats = DiffStats {
         common: 0,

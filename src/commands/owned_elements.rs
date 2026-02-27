@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::{BlobDecode, BlobReader, Element, MemberId};
+use crate::{BlobDecode, BlobFilter, BlobReader, Element, MemberId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -48,20 +48,36 @@ pub(crate) struct ReadResult {
     pub(crate) relations: Vec<OwnedRelation>,
 }
 
-pub(crate) fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult> {
+pub(crate) fn read_elements(
+    input: &Path,
+    direct_io: bool,
+    filter: Option<BlobFilter>,
+) -> Result<ReadResult> {
     let reader = BlobReader::open(input, direct_io)?;
     let mut nodes: Vec<OwnedNode> = Vec::new();
     let mut ways: Vec<OwnedWay> = Vec::new();
     let mut relations: Vec<OwnedRelation> = Vec::new();
 
+    let want_nodes = filter.as_ref().is_none_or(|f| f.want_nodes);
+    let want_ways = filter.as_ref().is_none_or(|f| f.want_ways);
+    let want_relations = filter.as_ref().is_none_or(|f| f.want_relations);
+
     for blob in reader {
         let blob = blob?;
+        // Skip blob decompression if indexdata says it's an irrelevant type.
+        if let Some(ref f) = filter
+            && let Some(idx) = blob.index()
+            && !f.wants(idx.kind)
+        {
+            continue;
+        }
         match blob.decode()? {
             BlobDecode::OsmHeader(_) => {}
             BlobDecode::OsmData(block) => {
                 for element in block.elements() {
                     match &element {
                         Element::DenseNode(dn) => {
+                            if !want_nodes { continue; }
                             nodes.push(OwnedNode {
                                 id: dn.id(),
                                 decimicro_lat: dn.decimicro_lat(),
@@ -74,6 +90,7 @@ pub(crate) fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult>
                             });
                         }
                         Element::Node(n) => {
+                            if !want_nodes { continue; }
                             nodes.push(OwnedNode {
                                 id: n.id(),
                                 decimicro_lat: n.decimicro_lat(),
@@ -86,6 +103,7 @@ pub(crate) fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult>
                             });
                         }
                         Element::Way(w) => {
+                            if !want_ways { continue; }
                             ways.push(OwnedWay {
                                 id: w.id(),
                                 tags: w
@@ -97,6 +115,7 @@ pub(crate) fn read_elements(input: &Path, direct_io: bool) -> Result<ReadResult>
                             });
                         }
                         Element::Relation(r) => {
+                            if !want_relations { continue; }
                             relations.push(OwnedRelation {
                                 id: r.id(),
                                 tags: r

@@ -4,7 +4,7 @@ use std::path::Path;
 
 use roaring::RoaringTreemap;
 
-use crate::{Element, ElementReader, MemberId};
+use crate::{BlobFilter, Element, ElementReader, MemberId};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -86,6 +86,12 @@ impl RefCheckResult {
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result<RefCheckResult> {
     let reader = ElementReader::open(path, direct_io)?;
+    // Skip relation blobs when not checking relation references.
+    let reader = if check_relations {
+        reader
+    } else {
+        reader.with_blob_filter(BlobFilter::new(true, true, false))
+    };
 
     let mut node_ids = RoaringTreemap::new();
     let mut way_ids = RoaringTreemap::new();

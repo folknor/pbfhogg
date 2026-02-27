@@ -161,12 +161,12 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     | `tags-count --type-filter` | DONE | skip non-matching types | Only when single type specified |
     | `add-locs-to-ways` Pass 1 | DONE | `only_nodes()` | Pass 2 needs all types |
     | `node-stats` | DONE | `only_nodes()` | Only processes nodes |
-    | `getid` | TODO | skip types not in ID set | Analyze `IdSet::{node,way,relation}_ids` emptiness |
-    | `getid --add-referenced` | TODO | Pass 1: skip by ID types, Pass 2: needs nodes+ways | Similar to tags-filter two-pass |
-    | `removeid` | TODO | skip types not in ID set | Same as getid |
-    | `diff --type` | TODO | skip non-matching types | Has `TypeFilter`, loads all into memory |
-    | `derive-changes` | TODO | skip non-matching types | Has `type_filter`, loads all into memory |
-    | `check-refs` | LIMITED | skip relations if `--check-relations=false` | Needs all 3 types for full check |
+    | `getid` | DONE | skip types not in ID set | `BlobFilter` from `IdSet` type emptiness |
+    | `getid --add-referenced` | DONE | Pass 1: `only_ways()`, Pass 2: nodes+ways+needed types | Pass 2 includes nodes if dep_node_ids non-empty |
+    | `removeid` | N/A | all types needed for pass-through | Cannot skip — outputs all non-matching elements |
+    | `diff --type` | DONE | skip non-matching types | `BlobFilter` from `TypeFilter`, passed to `read_elements()` |
+    | `derive-changes` | N/A | no type filter, needs all types | Always reads all element types |
+    | `check-refs` | DONE | skip relations if `--check-relations=false` | `BlobFilter::new(true, true, false)` |
     | `extract` | LIMITED | skip relations in simple mode only | complete-ways/smart need all types |
     | `fileinfo` | N/A | no benefit | Counts blobs, needs all |
     | `sort` | N/A | already uses BlobIndex | Blob-level permutation sort |

@@ -13,7 +13,7 @@
 
 use crate::blob_index;
 use crate::write::file_writer::FileWriter;
-use crate::write::wire::{encode_bytes_field, encode_int32_field};
+use protohoggr::{encode_bytes_field, encode_int32_field};
 #[cfg(not(feature = "libdeflater"))]
 use flate2::Compress;
 #[cfg(not(feature = "libdeflater"))]

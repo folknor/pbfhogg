@@ -70,3 +70,9 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zlib:6	6334	52489653	6616526	46103	483
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-zstd:3	8196	52489653	6616526	46103	483
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	write-pipe-zstd:3	6277	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-none	6003	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-pipe-none	6147	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-zlib:6	14363	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-pipe-zlib:6	6363	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-zstd:3	8253	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	write-pipe-zstd:3	6264	52489653	6616526	46103	483

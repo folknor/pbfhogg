@@ -133,7 +133,7 @@ impl BlobFilter {
 // Uses Cursor from read::wire for varint/tag/skip primitives.
 // ---------------------------------------------------------------------------
 
-use crate::read::wire::{zigzag_decode_64, Cursor};
+use protohoggr::{zigzag_decode_64, Cursor};
 
 /// Scan decompressed PrimitiveBlock bytes to extract element type and ID range.
 /// This walks the protobuf wire format manually, only reading element IDs.

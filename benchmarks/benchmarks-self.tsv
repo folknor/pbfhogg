@@ -69,3 +69,8 @@ date	host	commit	subject	pbf	mode	elapsed_ms	nodes	ways	relations	file_mb
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	pipelined	1262	52489653	6616526	46103	483
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	mmap	2915	52489653	6616526	46103	483
 2026-02-27	plantasjen	15e084e*	Skip metadata in tags-filter two-pass collection for 11% speedup	denmark-latest	blobreader	2899	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	sequential	2809	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	parallel	319	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	pipelined	1397	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	mmap	3000	52489653	6616526	46103	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-latest	blobreader	2995	52489653	6616526	46103	483

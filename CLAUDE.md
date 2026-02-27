@@ -49,6 +49,10 @@ Cross-validation scripts live in `verify/`. Each compares pbfhogg output against
 - `verify/getid-removeid.sh [input.pbf]` — getid vs osmium getid, removeid complement test
 - `verify/check-refs.sh [input.pbf]` — check-refs vs osmium check-refs
 
+## Benchmarking Rules
+- **NEVER run benchmark, profiling, or verify scripts in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench scripts, hotpath scripts, verify scripts, and any script that measures performance.
+- When an optimization workflow requires multiple benchmark runs (baseline, mid-work, post-work), run each one **sequentially** and report results between runs. Do NOT launch them as parallel background tasks.
+
 ## Subagents
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.
 

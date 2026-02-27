@@ -19,6 +19,11 @@ pub(crate) fn new_blob_error(kind: BlobError) -> Error {
     Error(Box::new(ErrorKind::Blob(kind)))
 }
 
+#[cold]
+pub(crate) fn new_wire_error(msg: &'static str) -> Error {
+    Error(Box::new(ErrorKind::WireFormat { msg }))
+}
+
 /// A type alias for `Result<T, pbfhogg::Error>`.
 pub type Result<T> = result::Result<T, Error>;
 
@@ -90,6 +95,12 @@ impl From<io::Error> for Error {
     }
 }
 
+impl From<protohoggr::WireError> for Error {
+    fn from(err: protohoggr::WireError) -> Error {
+        new_error(ErrorKind::WireFormat { msg: err.msg })
+    }
+}
+
 impl From<Error> for io::Error {
     fn from(err: Error) -> io::Error {
         io::Error::other(err)
@@ -149,7 +160,3 @@ impl fmt::Display for Error {
     }
 }
 
-#[cold]
-pub(crate) fn new_wire_error(msg: &'static str) -> Error {
-    new_error(ErrorKind::WireFormat { msg })
-}

@@ -11,7 +11,7 @@ use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
 use std::io;
 
-use super::wire::{
+use protohoggr::{
     encode_bytes_field, encode_bytes_field_always, encode_int64_field,
     encode_packed_bool, encode_packed_int32, encode_packed_sint32, encode_packed_sint64,
     encode_sint64_field_always, encode_varint, zigzag_encode_64,

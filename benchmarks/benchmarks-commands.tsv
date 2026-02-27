@@ -99,3 +99,6 @@ date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
 2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	north-america-seq4710-with-indexdata	pbfhogg	merge-uring-sqpoll-none	18.26	18814
 2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-zlib	10.06	4748
 2026-02-27	plantasjen	d6a9b55*	Consolidate blob_index.rs wire-format code onto read::wire::Cursor	germany-20260224-seq4704-with-indexdata	pbfhogg	merge-buffered-none	5.87	4748
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-20260220-seq4704	pbfhogg (indexdata)	cat-way	1.09	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-20260220-seq4704	pbfhogg	cat-way	1.26	483
+2026-02-27	plantasjen	1ba677d*	Update TODO and benchmark logs for single-pass merge results	denmark-20260220-seq4704	osmium	cat-way	2.17	483

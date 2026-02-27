@@ -1,0 +1,23 @@
+date	host	commit	subject	pbf	tool	command	elapsed_s	file_mb
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg (indexdata)	cat-way	1.06	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	cat-way	1.25	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	cat-way	2.23	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg (indexdata)	cat-relation	0.22	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	cat-relation	0.41	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	cat-relation	0.32	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	tags-count	1.71	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	tags-count	1.53	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg (indexdata)	tags-count-way	0.35	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	tags-count-way	0.5	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	tags-count-way	0.6	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	tags-filter-way	0.44	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	tags-filter-way	0.55	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	tags-filter-amenity	0.46	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	tags-filter-amenity	1.16	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	getid	0.38	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	getid	0.84	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	removeid	2.59	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	add-locations-to-ways	11.42	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	osmium	add-locations-to-ways	11.98	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg (indexdata)	node-stats	1.43	483
+2026-02-27	plantasjen	b51439e	Update README benchmarks, add TSV logging to bench-commands.sh	denmark-20260220-seq4704	pbfhogg	node-stats	1.68	483

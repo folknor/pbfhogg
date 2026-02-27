@@ -115,10 +115,40 @@ Total alloc: 16.8 GB (!). Net RSS: 10 MB (massive churn, tiny footprint).
 
 add_way at 4.1 GB across 6.6M calls = 659 bytes/call avg.
 This is from fresh Vec allocs for tags.collect() + refs.collect() on every element.
-The drain-reuse optimization (reuse Vec across calls) would cut this significantly.
 
 take allocates 4.6 GB — proto serialization buffers, rebuilt every flush.
 frame_blob allocates 4.0 GB — compression output buffers.
+
+### Current allocations (pipelined writer, commit 75e8edd)
+
+Wire-format encoding (no prost), take encode buffer reuse, FrameScratch buffer
+reuse in frame_blob_into. Pipelined writer — frame_blob runs on rayon threads.
+
+| Function                    | Calls      | Total  | vs d5c8095 |
+|-----------------------------|------------|--------|------------|
+| block_builder::take         | 7,378      | 4.9 GB | +0.3 GB*   |
+| writer::frame_blob_into     | 7,372      | 2.9 GB | -1.1 GB    |
+| block_builder::add_node     | 52,489,653 | 1.4 GB | -0.4 GB    |
+| blob::decompress_blob       | 7,398      | 1.2 GB | -0.4 GB    |
+| block_builder::add_way      | 6,616,502  | 1.2 GB | -2.9 GB    |
+| wire::parse                 | 14,792     | 342 MB | 0          |
+| block_builder::add_relation | 46,046     | 22 MB  | -30 MB     |
+
+Thread totals: 33.2 GB alloc, 32.4 GB dealloc. RSS: 2.2 GB.
+
+*take cumulative alloc slightly higher due to pipelined measurement including
+rayon thread overhead; actual per-call alloc reduced by encode buffer reuse.
+
+**Key changes from d5c8095:**
+- **add_way: 4.1 GB → 1.2 GB (-71%)** — direct wire-format encoding eliminated
+  per-element `proto::Way` Vec allocations. Reusable scratch buffers instead.
+- **frame_blob: 4.0 GB → 2.9 GB (-28%)** — FrameScratch reuses blob_buf,
+  header_buf, compress_buf via thread_local. Remaining 2.9 GB: ~1.0 GB `out` Vec
+  (owned for rayon channel) + ~1.9 GB ZlibEncoder internal deflate state (allocated
+  per call, ~260 KB each).
+- **add_node: 1.8 GB → 1.4 GB (-22%)** — encode_dense_nodes_group reads Vecs in
+  place, reset() clears without re-allocation.
+- **add_relation: 52 MB → 22 MB (-58%)** — same wire-format encoding as ways.
 
 ## Merge (base PBF + 1 OSC diff)
 
@@ -316,6 +346,25 @@ to the same rayon pool that handles compression.
 
 RSS: 132 MB. Main thread CPU: 0.38s total. 5 threads visible, workers sleeping.
 
+### Merge allocations (indexdata + zlib, commit 75e8edd)
+
+FrameScratch buffer reuse in frame_blob_into (thread_local for pipelined path).
+
+| Function                      | Calls | Total    | % Total |
+|-------------------------------|-------|----------|---------|
+| merge::rewrite_block_parallel | 612   | 1.1 GB   | 155%*   |
+| merge::read_raw_frame         | 7,399 | 464.8 MB | 66%     |
+| block_builder::take           | 8,017 | 397.9 MB | 57%     |
+| writer::frame_blob_into       | 614   | 326.6 MB | 47%     |
+| wire::parse                   | 1,247 | 45.0 MB  | 6%      |
+
+*>100% because cumulative (parallel rewrite on rayon threads).
+
+Main thread alloc: 702 MB. Thread totals: 2.7 GB alloc, 2.7 GB dealloc.
+Previous (commit b750e60, before FrameScratch): total merge 931 MB (main thread).
+frame_blob_into avg 545 KB/call — remaining per-call cost is the `out` Vec
+(~135 KB compressed blob) + ZlibEncoder internal state (~260 KB).
+
 The main thread is no longer the bottleneck. At 0.38s CPU, it finishes
 classify_blob + read_raw_frame and dispatches all rewrite work before the
 rayon pool has finished compressing. Wall time improvement is marginal
@@ -464,6 +513,15 @@ proto construction.
 - Direct wire encoding eliminated all per-element Vec allocations for ways/relations.
   4 reusable `Vec<u8>` scratch buffers replace `Vec<proto::Way>` / `Vec<proto::Relation>`.
   `StringTable::clear()` reuses HashMap/Vec capacity across blocks.
+
+### ~~frame_blob alloc churn (24% of write alloc)~~ — RESOLVED
+- ~~frame_blob allocates 3 fresh `Vec<u8>` per call (~4.0 GB on Denmark)~~
+- FrameScratch (commit 75e8edd) reuses blob_buf, header_buf, compress_buf.
+  Sync path: `write_framed_blob` writes directly to writer (zero alloc after warmup).
+  Pipelined: `thread_local!` scratch buffers (7400 allocs → ~12, one per rayon thread).
+- Remaining 2.9 GB: `out` Vec for rayon channel (~1.0 GB) + ZlibEncoder internal
+  deflate state (~1.9 GB, ~260 KB per call). Encoder state reuse would require
+  libdeflater or persistent zlib stream reset.
 
 ### decompress_blob buffer reuse (33% of read time)
 - DecompressPool already exists for pipelined path

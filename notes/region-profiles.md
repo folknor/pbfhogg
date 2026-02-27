@@ -202,14 +202,14 @@ improvements on passthrough-dominated regions (Norway, Japan).
 
 ## Decode + write allocations (cat --type)
 
-> **Note (prost fully removed, commit `def80d9`):** The `add_way`,
-> `add_relation`, and `take` columns below reflect the old prost-based encoding
-> (commit `aed93e0`) which allocated fresh `proto::Way`/`proto::Relation` objects
-> per element and used prost's two-pass encode (encoded_len + encode_raw).
-> All prost code has been replaced with hand-rolled wire-format encoding:
-> ways/relations encode into reusable scratch buffers, DenseNodes encode directly
-> without proto struct construction, and take reuses an encode buffer.
-> These numbers are preserved as the pre-optimization baseline.
+> **Note (prost removed + FrameScratch, commit `75e8edd`):** The columns below
+> reflect the old prost-based encoding (commit `aed93e0`) — preserved as baseline.
+> Current state: all prost code replaced with hand-rolled wire-format encoding
+> (ways/relations into reusable scratch buffers, DenseNodes without proto struct,
+> take reuses encode buffer). `frame_blob_into()` reuses blob_buf, header_buf,
+> compress_buf via FrameScratch (thread_local for pipelined path). Denmark current:
+> add_way 4.1→1.2 GB (-71%), frame_blob 4.0→2.9 GB (-28%), add_node 1.8→1.4 GB
+> (-22%). See `notes/hotpath-profile.md` for full current numbers.
 
 | Region | Total | take | add_way | frame_blob | add_node | decompress | add_relation |
 |--------|-------|------|---------|------------|----------|------------|--------------|

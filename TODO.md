@@ -341,6 +341,19 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   per rayon thread). Compression buffers also reused via streaming zlib/zstd encoders
   that borrow the scratch Vec instead of allocating fresh.
 
+- [ ] **libdeflater for encoder state reuse.** `frame_blob_into` still allocates
+  ~1.9 GB on Denmark (~260 KB ZlibEncoder internal deflate state per blob × 7400
+  blobs). `flate2::write::ZlibEncoder::new()` creates a fresh zlib stream each call
+  and drops it after compression. libdeflater (`libdeflater::Compressor`) holds a
+  reusable compressor object — `compress_deflate()` takes `&[u8]` input and
+  `&mut [u8]` output, no per-call allocation. Combined with the existing
+  FrameScratch `compress_buf`, this would eliminate all compression-related alloc
+  in `frame_blob_into`. The `out` Vec (~1.0 GB for rayon channel ownership) would
+  remain. At planet scale (600K blobs), eliminates ~150 GB of deflate state churn.
+  elivagar already uses libdeflater for the same reason. Adds a native C dependency
+  (cmake build) but libdeflater is widely packaged and typically faster than zlib-ng
+  for single-shot compression.
+
 - [ ] **Buffered merge at planet scale.** North America buffered merge is 43s (zlib)
   / 36s (none) vs io_uring's 33s/25s. The buffered path could be improved with
   read-ahead for passthrough blobs and reduced syscall overhead without requiring

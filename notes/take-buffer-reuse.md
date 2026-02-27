@@ -197,8 +197,11 @@ allocator lock contention.
 
 These are separate optimizations, noted here for completeness:
 
-- **`frame_blob` encode_to_vec (4.0 GB, `writer.rs:603/615`):** Runs in rayon tasks
-  for pipelined mode. Would need per-thread buffers via `thread_local::ThreadLocal`.
+- ~~**`frame_blob` encode_to_vec (4.0 GB, `writer.rs:603/615`):**~~ Resolved by
+  FrameScratch buffer reuse (commit `75e8edd`). `frame_blob_into()` reuses blob_buf,
+  header_buf, compress_buf via `thread_local!` for pipelined path. Sync path
+  (`write_framed_blob`) writes directly to writer — zero alloc after warmup.
+  Remaining 2.9 GB: `out` Vec for rayon channel + ZlibEncoder internal state.
 - ~~**`add_way` Vec allocation (4.1 GB):**~~ Resolved by direct wire-format
   encoding. Ways/relations now encode directly to protobuf bytes using reusable
   scratch buffers — no `proto::Way`/`proto::Relation` Vec allocations.

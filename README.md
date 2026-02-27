@@ -133,15 +133,15 @@ Read throughput — count all 59M elements in Denmark extract (461 MB), best of 
 | Planetiler 0.10 | sequential | 8.7s | Java, `OsmInputFile` single-threaded |
 <!-- BENCH:END -->
 
-Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null` (commit `ee966cd`):
+Write throughput — decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev/null` (commit `def80d9`):
 
 | Compression | Sync | Pipelined | Notes |
 |-------------|------|-----------|-------|
-| none | 7.1s | 7.1s | decode + wire-format serialization floor |
-| zstd:3 | 9.1s | **7.0s** | pipelined hides compression cost |
-| zlib:6 | 15.5s | **7.1s** | 2.2x speedup from parallel compression |
+| none | 6.2s | 6.2s | decode + wire-format serialization floor |
+| zstd:3 | 8.1s | **6.2s** | pipelined hides compression cost |
+| zlib:6 | 14.5s | **6.3s** | 2.3x speedup from parallel compression |
 
-With pipelined writes, all compression modes converge to ~7s — the decode + wire-format serialization floor. Ways and relations are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation). `Compression::None` on erofs is the target production config.
+With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies). `Compression::None` on erofs is the target production config.
 
 CLI commands — Denmark extract (483 MB, 59M elements, commit `1a3fcd3`):
 

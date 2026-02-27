@@ -1,5 +1,12 @@
 # `block_builder::take` buffer reuse investigation
 
+> **Superseded (commit `def80d9`):** Prost has been fully removed. `take()` now uses
+> direct wire-format encoding into a reusable `Vec<u8>` encode buffer — the exact
+> optimization described in the "Implementation" section below, but without prost's
+> `encode()` method. Dense Vec re-allocation (section 1) is also eliminated: the new
+> `encode_dense_nodes_group()` reads Vecs without consuming them, so `reset()` clears
+> in place (zero re-allocation). The 4.6 GB allocation churn is gone.
+
 Investigation of the 4.6 GB allocation churn in `BlockBuilder::take()`, profiled on
 Denmark seq4704 (483 MB, 59.1M elements, 7396 blocks). Hotpath data from
 `notes/hotpath-profile.md` (commit d5c8095, fat LTO, zlib-ng).

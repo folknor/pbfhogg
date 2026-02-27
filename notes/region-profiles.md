@@ -202,13 +202,14 @@ improvements on passthrough-dominated regions (Norway, Japan).
 
 ## Decode + write allocations (cat --type)
 
-> **Note (post direct wire encoding, commit `ee966cd`):** The `add_way` and
-> `add_relation` columns below reflect the old prost-based encoding (commit
-> `aed93e0`) which allocated fresh `proto::Way`/`proto::Relation` objects per
-> element. Direct wire encoding eliminated these allocations entirely —
-> ways/relations now encode into reusable scratch buffers. The `take` column
-> is also reduced (no prost two-pass encode). These numbers are preserved as
-> the pre-optimization baseline.
+> **Note (prost fully removed, commit `def80d9`):** The `add_way`,
+> `add_relation`, and `take` columns below reflect the old prost-based encoding
+> (commit `aed93e0`) which allocated fresh `proto::Way`/`proto::Relation` objects
+> per element and used prost's two-pass encode (encoded_len + encode_raw).
+> All prost code has been replaced with hand-rolled wire-format encoding:
+> ways/relations encode into reusable scratch buffers, DenseNodes encode directly
+> without proto struct construction, and take reuses an encode buffer.
+> These numbers are preserved as the pre-optimization baseline.
 
 | Region | Total | take | add_way | frame_blob | add_node | decompress | add_relation |
 |--------|-------|------|---------|------------|----------|------------|--------------|

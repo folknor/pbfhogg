@@ -399,9 +399,17 @@ with parallel rewrite + zlib compression overlap.
 ## Write benchmark: sync vs pipelined (bench_write)
 
 Denmark 483 MB, best of 3, decode + write to /dev/null.
-Current (direct wire): commit ee966cd. Previous (prost): commit d5c8095.
+Three stages of write-path optimization, each measured best-of-3.
 
-**Current (direct wire encoding):**
+**Current (prost fully removed): commit def80d9**
+
+| Compression | Sync   | Pipelined | Speedup |
+|-------------|--------|-----------|---------|
+| none        | 6.2s   | 6.2s      | 1.0x    |
+| zstd:3      | 8.1s   | 6.2s      | 1.3x    |
+| zlib:6      | 14.5s  | 6.3s      | 2.3x    |
+
+**Previous (direct wire for Ways/Relations, prost for DenseNodes+Blob): commit ee966cd**
 
 | Compression | Sync   | Pipelined | Speedup |
 |-------------|--------|-----------|---------|
@@ -409,7 +417,7 @@ Current (direct wire): commit ee966cd. Previous (prost): commit d5c8095.
 | zstd:3      | 9.1s   | 7.0s      | 1.3x    |
 | zlib:6      | 15.5s  | 7.1s      | 2.2x    |
 
-**Previous (prost-based proto::Way/Relation):**
+**Original (fully prost-based): commit d5c8095**
 
 | Compression | Sync   | Pipelined | Speedup |
 |-------------|--------|-----------|---------|
@@ -417,31 +425,37 @@ Current (direct wire): commit ee966cd. Previous (prost): commit d5c8095.
 | zstd:3      | 11.0s  | 9.1s      | 1.2x    |
 | zlib:6      | 17.5s  | 9.1s      | 1.9x    |
 
-Direct wire encoding reduced the pipelined floor from ~9s to ~7s (**22% faster**).
-Ways and relations are encoded directly to protobuf wire format using 4 reusable
-`Vec<u8>` scratch buffers, eliminating per-element `proto::Way`/`proto::Relation`
-allocation (~580 bytes/call). Dense nodes stay on prost (already optimized with
-pre-allocated Vecs).
+**Cumulative improvement: 9.0s → 6.2s (31% faster).**
+
+Stage 1 (ee966cd): Direct wire encoding for Ways/Relations reduced the pipelined
+floor from ~9s to ~7s (22% faster). Eliminated per-element `proto::Way`/`proto::Relation`
+allocation (~580 bytes/call) using 4 reusable `Vec<u8>` scratch buffers.
+
+Stage 2 (def80d9): Full prost removal — DenseNodes encoding, Blob/BlobHeader
+framing, and HeaderBlock encoding all replaced with hand-rolled wire-format code.
+Reduced the pipelined floor from ~7s to ~6.2s (11% faster). Eliminated prost
+runtime dependency, build.rs codegen step, and proto files.
 
 Pipelined writer parallelizes compression across rayon workers. All modes
-converge to ~7s — the decode + wire-format serialization floor. With
+converge to ~6.2s — the decode + wire-format serialization floor. With
 Compression::None (nidhogg production config on erofs), there's nothing
 to parallelize so sync = pipelined.
 
-The previous 9s floor broke down as (from hotpath data, pre-wire-encoding):
+The original 9s floor broke down as (from hotpath data, pre-wire-encoding):
 - block_builder::add_node: 2.3s (5.4%)
 - block_builder::add_way: 1.5s (3.5%)
 - block_builder::take: 3.5s (8.3%)
 - blob::decompress_blob: 2.0s (4.7%)
 - wire::parse + block::new: 0.1s
-Total: ~9.4s. Direct wire encoding eliminated the add_way/add_relation
-allocation overhead and take's prost two-pass encode (encoded_len + encode_raw).
+Total: ~9.4s. Direct wire encoding eliminated add_way/add_relation allocation
+overhead, take's prost two-pass encode (encoded_len + encode_raw), and DenseNodes
+proto construction.
 
 ## Optimization targets
 
-### Write floor (~7s, decode + wire-format serialization)
+### Write floor (~6.2s, decode + wire-format serialization)
 - Compression is solved — pipelined writer hides it completely
-- Direct wire encoding reduced floor from ~9s to ~7s (22% faster)
+- Full prost removal reduced floor from ~9s to ~6.2s (31% faster)
 - Remaining cost is decode (4.7%) + BlockBuilder insertion + wire-format serialization
 - With Compression::None the write path is I/O-bound at planet scale
 

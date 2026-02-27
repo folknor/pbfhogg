@@ -111,71 +111,49 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
   | tags-filter highway=primary 2pass | 2.69s | 2.42s | 1.11x | two-pass, parallel Pass 2 |
   | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
-  | extract --simple | **2.81s** | 1.66s | 1.69x | IdSetDense + int bbox, sequential |
-  | extract (complete-ways) | **2.69s** | 2.83s | **0.95x** | IdSetDense + int bbox, Pass 2 parallel |
-  | extract --smart | **4.21s** | 3.26s | 1.29x | IdSetDense + int bbox, Pass 3 parallel |
+  | extract --simple | **2.66s** | 1.74s | 1.53x | Pass 1 streaming + Pass 2 parallel |
+  | extract (complete-ways) | **2.74s** | 2.82s | **0.97x** | Pass 1 streaming + Pass 2 parallel |
+  | extract --smart | **4.29s** | 3.54s | 1.21x | Pass 1 streaming + Pass 3 parallel |
 
   All commands use pipelined reader + pipelined writer. All write passes use
   parallel element processing via rayon batches (64 blocks per dispatch).
   Blob-type skipping via indexdata provides additional gains for type-filtered
   commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
-  `scripts/bench-commands.sh all` on Denmark 483 MB, commit `2bac649`.
+  `scripts/bench-commands.sh` on Denmark 483 MB, commit `4f18350`.
 
   Remaining:
 
-  - [ ] **Extract collection-pass parallelization.** Extract is the one command where osmium
-    is significantly faster (~2-3x on Denmark). The bottleneck is the *collection*
-    passes, not the write passes (which are now parallelized):
+  - [ ] **Extract: remaining gap vs osmium.** Simple is 1.5x slower, smart is
+    1.2x slower. The bottleneck is per-element decode speed, not parallelism or
+    I/O. Full analysis in `notes/extract-parallel-collection.md`.
 
-    - **Simple strategy:** Single-pass, builds node/way ID sets incrementally as
-      elements are encountered. Each way lookup depends on the full node ID set
-      collected so far; each relation lookup depends on the full way ID set.
-      The OSM element ordering dependency (nodes→ways→relations) makes this
-      inherently sequential.
+    **Investigated and ruled out:**
+    - ~~Parallel ID collection with IndexedReader~~ — implemented three-phase
+      parallel collection (blob buffering + rayon `try_fold`/`try_reduce`),
+      benchmarked on Denmark (483 MB) and Japan (2.3 GB). No improvement: the
+      pipelined reader already parallelizes decompression, and the collection
+      consumer work (bbox check, ID set insert) is ~5% of per-block time.
+      Buffering all compressed blobs adds I/O + allocation overhead that
+      negates any parallelism gains.
+    - ~~Concurrent ID sets (dashmap/atomic bitsets)~~ — not applicable since
+      the bottleneck is decode, not consumer writes.
+    - ~~io_uring reads~~ — merge benchmarks show io_uring only helps above
+      ~15 GB (beyond page cache). Extract reads are sequential scans where
+      kernel readahead with `posix_fadvise` is already optimal.
 
-    - **Complete-ways Pass 1 / Smart Pass 1:** Same incremental ID collection as
-      simple. `collect_pass1_matches()` sorts bbox_node_ids lazily on first way
-      encounter, then matched_way_ids lazily on first relation encounter. Cannot
-      parallelize without a fundamentally different approach.
-
-    - **Smart Pass 2 (scan-only):** Collects extra_node_ids from ways matching
-      extra_way_ids. Read-only lookups on sorted slices but mutates a shared Vec.
-      Could be parallelized with thread-local Vecs + merge, but the pass is I/O
-      bound (only visiting way blobs) so the gain would be minimal.
-
-    **Possible approaches to close the gap:**
-    - [ ] **Parallel ID collection with IndexedReader.** Use blob-level indexdata
-      to partition the file into node/way/relation ranges. Process all node blobs
-      in parallel to build bbox_node_ids (embarrassingly parallel — each node is
-      independent). Then process way blobs in parallel (bbox_node_ids is immutable
-      by then). Then relation blobs in parallel. This is a different architecture
-      from the current pipelined approach and would require IndexedReader-based
-      scanning rather than sequential `into_blocks_pipelined`.
-    - [ ] **Concurrent ID sets.** Use `dashmap` or atomic bitsets to allow
-      parallel writes to the ID collection during Pass 1. Overkill for the
-      current single-type-per-phase approach but could work with a redesigned
-      multi-phase collector.
     **Osmium extract analysis (source: `data/osmium-tool/`, `data/libosmium/`).**
-    Osmium uses the same algorithmic structure as pbfhogg (simple=1 pass,
-    complete-ways=2 passes, smart=3 passes) with identical element ordering
-    dependencies. The speed difference comes from data structures and decode
-    optimizations, not a fundamentally different algorithm.
+    Osmium does NOT parallelize extract. Element processing is fully sequential.
+    The speed difference comes from decoder efficiency, not a different algorithm:
 
-    **Finding: Metadata skipping in collection passes.**
-    Osmium passes `read_meta::no` for all non-write passes:
-    - complete-ways Pass 1 (`strategy_complete_ways.cpp:175`)
-    - smart Pass 1 (`strategy_smart.cpp:310`)
-    - smart Pass 2 (`strategy_smart.cpp:324`)
-
-    The PBF decoder has a dedicated `decode_dense_nodes_without_metadata()`
-    path (`pbf_decoder.hpp:632`) that skips version, timestamp, changeset, uid,
-    user, and visible fields entirely. For ways and relations, individual fields
-    are skipped via `pbf_node.skip()`. Metadata is ~30-40% of dense node data
-    by byte volume.
-
-    pbfhogg always decodes all fields via the wire-format parser. The `WireInfo`
-    struct is parsed for every element even when only IDs and coordinates are
-    needed (collection passes) or only IDs and refs are needed (way matching).
+    1. **Metadata skipping** — `read_meta::no` for non-write passes skips
+       version, timestamp, changeset, uid, user, visible fields entirely.
+       Dedicated `decode_dense_nodes_without_metadata()` path
+       (`pbf_decoder.hpp:632`). Metadata is ~30-40% of dense node data by
+       byte volume.
+    2. **Eager protobuf decoder** — protobuf-generated decoders with compiled
+       field dispatch vs pbfhogg's hand-rolled wire-format scanner that scans
+       all varint field boundaries including metadata bytes.
+    3. **posix_fadvise(POSIX_FADV_SEQUENTIAL)** — pbfhogg now has this too.
 
     - [ ] **Add skip-metadata mode for collection passes.** pbfhogg's
       zero-copy wire-format parser is already partially lazy — `WireInfo`

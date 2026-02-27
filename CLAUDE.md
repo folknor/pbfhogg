@@ -7,15 +7,22 @@ Rust library for reading and writing OpenStreetMap PBF files. Fork of [osmpbf](h
 - Never chain commands with &&. Write a script instead.
 - Never pipe commands with |. Write a script instead.
 - Never read or write from /tmp. All data lives in the project.
-- Never run raw cargo, curl, pkill. Use the scripts below.
+- Never run raw cargo, curl, pkill. Use `dev` or the scripts below.
+
+## Dev tool
+
+The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoked via cargo alias:
+
+- `cargo dev check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `cargo dev check -- --ignored`).
+- `cargo dev env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
+- `cargo dev run [args]` — build release CLI and run with passthrough args (e.g., `cargo dev run fileinfo tests/test.osm.pbf`).
+
+The alias is defined in `.cargo/config.toml`. Auto-builds on first use.
 
 ## Scripts
 
-Write new scripts in `scripts/` as needed. Follow these conventions:
-- `scripts/build.sh` — build release binary
-- `scripts/test.sh [args]` — run tests (passes args to `cargo test`)
-- `scripts/clippy.sh [args]` — run clippy lints (passes args to `cargo clippy`)
-- `scripts/run.sh [args]` — build + run the CLI (passes args to the `pbfhogg` binary)
+Remaining bench/hotpath scripts (being migrated to `dev` in later phases):
+- `scripts/build.sh` — build release binary (still used by bench/verify scripts)
 - `scripts/bench-self.sh [pbf] [runs]` — pbfhogg-only read benchmark (logs to benchmarks/benchmarks-self.tsv)
 - `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks/benchmarks-self-write.tsv)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
@@ -31,7 +38,7 @@ If you need something these scripts don't cover, write a new script.
 
 To generate a PBF with blob-level indexdata (required for fast passthrough merges), use `cat`:
 ```
-scripts/run.sh cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
+dev run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
 ```
 There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
 
@@ -58,9 +65,10 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 
 ## Workspace
 
-The repo is a Cargo workspace with two packages:
+The repo is a Cargo workspace with three packages:
 - **`pbfhogg`** (root) — library crate. Read/write API, commands.
 - **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary.
+- **`pbfhogg-dev`** (`dev/`) — dev tooling binary. Structured build/bench/verify harness. Produces the `dev` binary.
 
 Library users who only need read/write can depend on `pbfhogg` with `default-features = false, features = ["rust-zlib"]` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
 

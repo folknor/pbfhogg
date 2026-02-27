@@ -1,0 +1,72 @@
+# ---------------------------------------------------------------------------
+# Datasets — identical across all machines.
+# Files resolved as {data}/{filename}.
+# Preflight verifies existence. Cannot auto-download (too large).
+# ---------------------------------------------------------------------------
+
+[datasets.denmark]
+pbf = "denmark-20260220-seq4704-with-indexdata.osm.pbf"
+osc = "denmark-20260221-seq4705.osc.gz"
+origin = "Geofabrik 2026-02-20 seq 4704, indexdata via pbfhogg cat"
+
+[datasets.germany]
+pbf = "germany-20260224-seq4704-with-indexdata.osm.pbf"
+osc = "germany-20260225-seq4705.osc.gz"
+origin = "Geofabrik 2026-02-24 seq 4704, indexdata via pbfhogg cat"
+
+[datasets.japan]
+pbf = "japan-20260225-seq4706-with-indexdata.osm.pbf"
+osc = "japan-20260225-seq4706.osc.gz"
+origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
+
+[datasets.north-america]
+pbf = "north-america-seq4710-with-indexdata.osm.pbf"
+osc = "north-america-seq4710.osc.gz"
+origin = "Geofabrik seq 4710, indexdata via pbfhogg cat"
+
+[datasets.norway]
+pbf = "norway-20260225-seq4709-with-indexdata.osm.pbf"
+osc = "norway-20260225-seq4709.osc.gz"
+origin = "Geofabrik 2026-02-25 seq 4709, indexdata via pbfhogg cat"
+
+[datasets.switzerland]
+pbf = "switzerland-20260225-seq4707-with-indexdata.osm.pbf"
+osc = "switzerland-20260225-seq4707.osc.gz"
+origin = "Geofabrik 2026-02-25 seq 4707, indexdata via pbfhogg cat"
+
+[datasets.malta]
+pbf = "malta-20260225-seq4706-with-indexdata.osm.pbf"
+osc = "malta-20260225-seq4706.osc.gz"
+origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
+
+[datasets.greater-london]
+pbf = "greater-london-20260225-seq4704-with-indexdata.osm.pbf"
+osc = "greater-london-20260225-seq4704.osc.gz"
+origin = "Geofabrik 2026-02-25 seq 4704, indexdata via pbfhogg cat"
+
+# ---------------------------------------------------------------------------
+# Per-machine configuration, keyed by hostname.
+# Unknown hostnames fall back to defaults: data="data", scratch="data/scratch".
+# ---------------------------------------------------------------------------
+
+[plantasjen]
+data = "data"
+scratch = "data/bench-tmp"
+target = "target"
+
+[plantasjen.drives]
+source = "nvme"
+data = "nvme"
+scratch = "nvme"
+target = "hdd"
+
+[dm6]
+data = "/fast/pbfhogg/data"
+scratch = "/fast/pbfhogg/scratch"
+target = "target"
+
+[dm6.drives]
+source = "nvme"
+data = "nvme"
+scratch = "nvme"
+target = "nvme"

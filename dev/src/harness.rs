@@ -99,6 +99,7 @@ impl BenchHarness {
 
     /// External timing: run subprocess N times, measure wall-clock.
     /// Best-of-N (minimum).
+    #[allow(dead_code)]
     pub fn run_external(
         &self,
         config: &BenchConfig,
@@ -144,6 +145,7 @@ impl BenchHarness {
     }
 
     /// Distribution timing: collect all N samples, compute min/p50/p95/max.
+    #[allow(dead_code)]
     pub fn run_distribution<F>(
         &self,
         config: &BenchConfig,
@@ -280,11 +282,13 @@ fn format_json_value(value: &serde_json::Value) -> String {
 }
 
 /// Convert a `Duration` to milliseconds as `i64`.
+#[allow(dead_code)]
 fn elapsed_to_ms(duration: &Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
 /// Compute a percentile from a sorted slice.
+#[allow(dead_code)]
 fn percentile(sorted: &[i64], pct: usize) -> i64 {
     if sorted.is_empty() {
         return 0;
@@ -302,6 +306,7 @@ fn pick_best(current: Option<BenchResult>, candidate: BenchResult) -> BenchResul
 }
 
 /// Pick the smaller of two millisecond values.
+#[allow(dead_code)]
 fn pick_best_ms(current: Option<i64>, candidate: i64) -> i64 {
     match current {
         Some(best) if best <= candidate => best,

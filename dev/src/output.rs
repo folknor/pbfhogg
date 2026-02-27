@@ -23,7 +23,6 @@ pub fn result_msg(msg: &str) {
     println!("[result]  {msg}");
 }
 
-#[allow(dead_code)]
 pub fn bench_msg(msg: &str) {
     println!("[bench]   {msg}");
 }
@@ -38,11 +37,11 @@ pub fn error(msg: &str) {
 // --- Subprocess types ---
 
 /// Captured output from a subprocess.
-#[allow(dead_code)]
 pub struct CapturedOutput {
     pub status: ExitStatus,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    #[allow(dead_code)]
     pub elapsed: Duration,
 }
 

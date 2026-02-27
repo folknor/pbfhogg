@@ -6,7 +6,6 @@ use std::io;
 ///
 /// No `Box` wrapping — this is a binary, not a library. Keeping it simple.
 #[derive(Debug)]
-#[allow(dead_code)]
 pub enum DevError {
     /// An I/O error.
     Io(io::Error),
@@ -15,6 +14,7 @@ pub enum DevError {
     /// Build failure (cargo returned non-zero, or compilation error).
     Build(String),
     /// One or more preflight checks failed.
+    #[allow(dead_code)]
     Preflight(Vec<String>),
     /// A subprocess exited with an error.
     Subprocess {
@@ -97,5 +97,11 @@ impl From<serde_json::Error> for DevError {
 impl From<rusqlite::Error> for DevError {
     fn from(err: rusqlite::Error) -> DevError {
         DevError::Database(err.to_string())
+    }
+}
+
+impl From<pbfhogg::Error> for DevError {
+    fn from(err: pbfhogg::Error) -> DevError {
+        DevError::Io(err.into())
     }
 }

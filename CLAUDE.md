@@ -16,6 +16,8 @@ The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoke
 - `cargo dev check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `cargo dev check -- --ignored`).
 - `cargo dev env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `cargo dev run [args]` — build release CLI and run with passthrough args (e.g., `cargo dev run fileinfo tests/test.osm.pbf`).
+- `cargo dev bench read [--dataset name] [--pbf path] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite.
+- `cargo dev bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
 - `cargo dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
 
 The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmark results stored in `dev/results.db` (SQLite, committed in git).
@@ -24,8 +26,6 @@ The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmar
 
 Remaining bench/hotpath scripts (being migrated to `dev` in later phases):
 - `scripts/build.sh` — build release binary (still used by bench/verify scripts)
-- `scripts/bench-self.sh [pbf] [runs]` — pbfhogg-only read benchmark (logs to benchmarks/benchmarks-self.tsv)
-- `scripts/bench-self-write.sh [pbf] [runs]` — pbfhogg-only write benchmark (logs to benchmarks/benchmarks-self-write.tsv)
 - `scripts/bench.sh [pbf] [runs]` — full comparison suite (pbfhogg vs osmpbf vs osmium vs planetiler)
 - `scripts/bench-planetiler.sh [pbf] [runs]` — planetiler PBF read benchmark only
 - `scripts/bench-commands.sh <cmd> [pbf] [runs]` — CLI command benchmark vs osmium (logs to benchmarks/benchmarks-commands.tsv). Commands: cat-way, cat-relation, tags-count, tags-count-way, tags-filter-way, tags-filter-amenity, tags-filter-twopass, getid, removeid, add-locations-to-ways, extract-simple, extract-complete, extract-smart, node-stats, all

@@ -1,18 +1,18 @@
+mod bench_read;
+mod bench_write;
 mod build;
 mod config;
 mod db;
 mod env;
 mod error;
-#[allow(dead_code)]
 mod git;
-#[allow(dead_code)]
 mod harness;
-#[allow(dead_code)]
 mod lockfile;
 mod output;
 #[allow(dead_code)]
 mod preflight;
 
+use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, Subcommand};
@@ -42,6 +42,11 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Run benchmarks
+    Bench {
+        #[command(subcommand)]
+        bench: BenchCommand,
+    },
     /// Query benchmark results
     Results {
         /// Show results for a specific commit (prefix match)
@@ -66,9 +71,50 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum BenchCommand {
+    /// Benchmark PBF read performance (5 reader modes)
+    Read {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Comma-separated list of modes (default: all)
+        #[arg(long)]
+        modes: Option<String>,
+    },
+    /// Benchmark PBF write performance (sync + pipelined x compression)
+    Write {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Number of runs, best-of-N (default: 3)
+        #[arg(long, default_value = "3")]
+        runs: usize,
+
+        /// Comma-separated compression modes (default: none,zlib:6,zstd:3)
+        #[arg(long, default_value = "none,zlib:6,zstd:3")]
+        compression: String,
+    },
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Bench { bench } => cmd_bench(bench),
         Command::Check { args } => cmd_check(&args),
         Command::Env => cmd_env(),
         Command::Run { args } => cmd_run(&args),
@@ -191,6 +237,110 @@ fn cmd_results(
     }
 
     Ok(())
+}
+
+fn cmd_bench(bench: BenchCommand) -> Result<(), DevError> {
+    match bench {
+        BenchCommand::Read {
+            dataset,
+            pbf,
+            runs,
+            modes,
+        } => cmd_bench_read(dataset, pbf, runs, modes),
+        BenchCommand::Write {
+            dataset,
+            pbf,
+            runs,
+            compression,
+        } => cmd_bench_write(dataset, pbf, runs, compression),
+    }
+}
+
+fn cmd_bench_read(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+    modes_str: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+
+    let modes = match modes_str {
+        Some(ref s) => bench_read::parse_modes(s)?,
+        None => bench_read::ALL_MODES.to_vec(),
+    };
+
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_read::run(&harness, &pbf_path, file_mb, runs, &modes)
+}
+
+fn cmd_bench_write(
+    dataset: String,
+    pbf: Option<String>,
+    runs: usize,
+    compression_str: String,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let compressions = bench_write::parse_compressions(&compression_str)?;
+    let file_mb = file_size_mb(&pbf_path);
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    bench_write::run(&harness, &pbf_path, file_mb, runs, &compressions)
+}
+
+/// Resolve the PBF path from --pbf or --dataset.
+fn resolve_pbf_path(
+    pbf: &Option<String>,
+    dataset: &str,
+    config: &config::DevConfig,
+    paths: &config::ResolvedPaths,
+) -> Result<PathBuf, DevError> {
+    let path = match pbf {
+        Some(p) => PathBuf::from(p),
+        None => {
+            let ds = config.datasets.get(dataset).ok_or_else(|| {
+                DevError::Config(format!("unknown dataset: {dataset}"))
+            })?;
+            paths.data_dir.join(&ds.pbf)
+        }
+    };
+
+    if !path.exists() {
+        return Err(DevError::Config(format!(
+            "PBF file not found: {}",
+            path.display()
+        )));
+    }
+
+    Ok(path)
+}
+
+/// Get file size in MB (decimal, consistent with bench scripts).
+fn file_size_mb(path: &std::path::Path) -> f64 {
+    std::fs::metadata(path)
+        .map(|m| m.len() as f64 / 1_000_000.0)
+        .unwrap_or(0.0)
 }
 
 fn cmd_run(args: &[String]) -> Result<(), DevError> {

@@ -4,7 +4,7 @@ cd "$(dirname "$0")/.."
 source "$(dirname "$0")/lib.sh"
 
 PBF="data/denmark-latest.osm.pbf"
-OSC="data/4705.osc.gz"
+OSC="data/denmark-20260221-seq4705.osc.gz"
 RUNS=5
 BIN="$PBFHOGG"
 

@@ -49,18 +49,7 @@ STDERR_FILE=$(mktemp "$CARGO_TARGET_DIR/.bench_stderr.XXXXXX")
 trap 'rm -f "$STDERR_FILE"' EXIT
 
 record_results() {
-    # Parse all --- delimited blocks from stderr
-    local block_start=0
-    local line_num=0
-
-    while IFS= read -r line; do
-        line_num=$((line_num + 1))
-        if [ "$line" = "---" ]; then
-            block_start=$line_num
-        fi
-    done < "$STDERR_FILE"
-
-    # Process each block
+    # Process each --- delimited block from stderr
     local in_block=0
     local tool="" mode="" elapsed="" nodes="" ways="" relations="" fmb=""
 
@@ -141,7 +130,8 @@ else
 fi
 
 # Run merge benchmark if diff file exists
-OSC="${OSC:-data/4705.osc.gz}"
+# OSC can be overridden via environment; default is the Denmark seq4705 diff
+OSC="${OSC:-data/denmark-20260221-seq4705.osc.gz}"
 if [ -f "$OSC" ]; then
     echo "--- merge ---"
     "$MERGE_BIN" "$PBF" "$OSC" "$RUNS" 2> "$STDERR_FILE"

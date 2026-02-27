@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib.sh"
 
 # Benchmark extract strategies on Japan with a Tokyo-area bbox.
 # Usage: scripts/bench-extract-japan.sh [strategy] [runs]
@@ -11,7 +12,8 @@ PBF="data/japan-20260225-seq4706.osm.pbf"
 BBOX="139.5,35.5,140.0,36.0"  # Tokyo metro area
 RUNS="${2:-3}"
 STRATEGY="${1:-all}"
-BIN="target/release/pbfhogg"
+BIN="$PBFHOGG"
+OSMIUM_OUT="$CARGO_TARGET_DIR/bench-extract-japan.osm.pbf"
 
 if [ ! -f "$PBF" ]; then
     echo "Japan PBF not found: $PBF"
@@ -24,31 +26,25 @@ echo "  bbox: $BBOX (Tokyo area)"
 echo "  runs: $RUNS (best of)"
 echo ""
 
-cargo build --release 2>&1 | tail -2
+scripts/build.sh
 
 best_of() {
     local label="$1"
     shift
     local best=""
-    for i in $(seq 1 "$RUNS"); do
+    local tmpfile
+    tmpfile=$(mktemp "$CARGO_TARGET_DIR/.bench_time.XXXXXX")
+    for _i in $(seq 1 "$RUNS"); do
+        /usr/bin/time -f "%e" "$@" > /dev/null 2> "$tmpfile"
         local t
-        t=$( { time "$@" > /dev/null 2>&1 ; } 2>&1 | grep real | sed 's/real\t//' | sed 's/,/./' | sed 's/s$//' )
-        # Parse minutes and seconds
-        local mins secs
-        mins=$(echo "$t" | sed 's/m.*//')
-        secs=$(echo "$t" | sed 's/.*m//')
-        local total
-        total=$(echo "$mins * 60 + $secs" | bc)
+        t=$(cat "$tmpfile")
         if [ -z "$best" ]; then
-            best="$total"
+            best="$t"
         else
-            local is_less
-            is_less=$(echo "$total < $best" | bc)
-            if [ "$is_less" -eq 1 ]; then
-                best="$total"
-            fi
+            best=$(python3 -c "print(min(float('$t'), float('$best')))")
         fi
     done
+    rm -f "$tmpfile"
     printf "  %-40s %ss\n" "$label" "$best"
 }
 
@@ -58,19 +54,25 @@ run_strategy() {
         simple)
             echo "--- extract --simple ---"
             best_of "pbfhogg" "$BIN" extract "$PBF" --simple -b "$BBOX" -o /dev/null
-            best_of "osmium" osmium extract "$PBF" -s simple -b "$BBOX" -o /tmp/osmium-japan-extract.pbf --overwrite
+            if command -v osmium &>/dev/null; then
+                best_of "osmium" osmium extract "$PBF" -s simple -b "$BBOX" -o "$OSMIUM_OUT" --overwrite
+            fi
             echo ""
             ;;
         complete)
             echo "--- extract (complete-ways, default) ---"
             best_of "pbfhogg" "$BIN" extract "$PBF" -b "$BBOX" -o /dev/null
-            best_of "osmium" osmium extract "$PBF" -s complete_ways -b "$BBOX" -o /tmp/osmium-japan-extract.pbf --overwrite
+            if command -v osmium &>/dev/null; then
+                best_of "osmium" osmium extract "$PBF" -s complete_ways -b "$BBOX" -o "$OSMIUM_OUT" --overwrite
+            fi
             echo ""
             ;;
         smart)
             echo "--- extract --smart ---"
             best_of "pbfhogg" "$BIN" extract "$PBF" --smart -b "$BBOX" -o /dev/null
-            best_of "osmium" osmium extract "$PBF" -s smart -b "$BBOX" -o /tmp/osmium-japan-extract.pbf --overwrite
+            if command -v osmium &>/dev/null; then
+                best_of "osmium" osmium extract "$PBF" -s smart -b "$BBOX" -o "$OSMIUM_OUT" --overwrite
+            fi
             echo ""
             ;;
     esac
@@ -84,4 +86,4 @@ else
     run_strategy "$STRATEGY"
 fi
 
-rm -f /tmp/osmium-japan-extract.pbf
+rm -f "$OSMIUM_OUT"

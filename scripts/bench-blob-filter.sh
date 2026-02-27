@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+cd "$(dirname "$0")/.."
+source "$(dirname "$0")/lib.sh"
 
 # Benchmark blob-type skipping: compare indexdata PBF (filter active) vs
 # non-indexdata PBF (filter degrades to full decode).
@@ -8,11 +10,9 @@ PBF_WITH="${1:-data/denmark-20260220-seq4704-with-indexdata.osm.pbf}"
 PBF_WITHOUT="${2:-data/denmark-20260220-seq4704.osm.pbf}"
 RUNS="${3:-3}"
 
-cd "$(dirname "$0")/.."
-
 echo "Building release..."
-cargo build --release --bin pbfhogg 2>&1 | tail -1
-BIN=target/release/pbfhogg
+scripts/build.sh
+BIN="$PBFHOGG"
 
 echo ""
 echo "=== cat --type way ==="

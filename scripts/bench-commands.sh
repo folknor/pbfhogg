@@ -88,7 +88,11 @@ best_of() {
     tmpfile=$(mktemp "$CARGO_TARGET_DIR/.bench_time.XXXXXX")
 
     for _i in $(seq 1 "$RUNS"); do
-        /usr/bin/time -f "%e" "$@" >"$tmpfile" 2>&1 || true
+        if ! /usr/bin/time -f "%e" "$@" >"$tmpfile" 2>&1; then
+            echo "  FAILED: $*"
+            rm -f "$tmpfile"
+            return 1
+        fi
         local elapsed
         elapsed=$(tail -1 "$tmpfile")
         if [ -z "$best" ]; then

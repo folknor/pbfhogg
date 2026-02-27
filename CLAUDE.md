@@ -77,6 +77,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 ## Conventions
 
+- All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark TSV files record this automatically via the bench scripts.
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - `pub(crate) mod proto` is `#[allow(clippy::all)]` (generated code)

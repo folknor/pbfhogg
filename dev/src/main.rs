@@ -1,7 +1,12 @@
 mod build;
 mod config;
+mod db;
 mod env;
 mod error;
+#[allow(dead_code)]
+mod git;
+#[allow(dead_code)]
+mod harness;
 #[allow(dead_code)]
 mod lockfile;
 mod output;
@@ -37,6 +42,28 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Query benchmark results
+    Results {
+        /// Show results for a specific commit (prefix match)
+        #[arg(long)]
+        commit: Option<String>,
+
+        /// Compare two commits side-by-side
+        #[arg(long, num_args = 2, value_names = ["COMMIT_A", "COMMIT_B"])]
+        compare: Option<Vec<String>>,
+
+        /// Filter by command name (e.g. "bench read", "bench merge")
+        #[arg(long)]
+        command: Option<String>,
+
+        /// Filter by variant (e.g. "buffered+zlib", "pipelined")
+        #[arg(long)]
+        variant: Option<String>,
+
+        /// Maximum number of results to show
+        #[arg(long, short = 'n', default_value = "20")]
+        limit: usize,
+    },
 }
 
 fn main() {
@@ -45,6 +72,13 @@ fn main() {
         Command::Check { args } => cmd_check(&args),
         Command::Env => cmd_env(),
         Command::Run { args } => cmd_run(&args),
+        Command::Results {
+            commit,
+            compare,
+            command,
+            variant,
+            limit,
+        } => cmd_results(commit, compare, command, variant, limit),
     };
     if let Err(e) = result {
         output::error(&e.to_string());
@@ -114,6 +148,48 @@ fn cmd_env() -> Result<(), DevError> {
 
     let info = env::collect(&dev_config, &paths);
     env::print(&info);
+    Ok(())
+}
+
+fn cmd_results(
+    commit: Option<String>,
+    compare: Option<Vec<String>>,
+    command: Option<String>,
+    variant: Option<String>,
+    limit: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let db_path = ws.workspace_root.join("dev/results.db");
+
+    if !db_path.exists() {
+        output::result_msg("no results yet (run a benchmark first)");
+        return Ok(());
+    }
+
+    let results_db = db::ResultsDb::open(&db_path)?;
+
+    if let Some(commits) = compare {
+        let commit_a = commits.first().map_or("", String::as_str);
+        let commit_b = commits.get(1).map_or("", String::as_str);
+        let (rows_a, rows_b) = results_db.query_compare(commit_a, commit_b)?;
+        let table = db::format_compare(commit_a, &rows_a, commit_b, &rows_b);
+        println!("{table}");
+    } else {
+        let filter = db::QueryFilter {
+            commit,
+            command,
+            variant,
+            limit,
+        };
+        let rows = results_db.query(&filter)?;
+        if rows.is_empty() {
+            output::result_msg("no matching results");
+        } else {
+            let table = db::format_table(&rows);
+            println!("{table}");
+        }
+    }
+
     Ok(())
 }
 

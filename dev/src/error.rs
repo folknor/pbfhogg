@@ -24,6 +24,8 @@ pub enum DevError {
     },
     /// Lock file conflict (another dev instance is running).
     Lock(String),
+    /// Database error (SQLite operations).
+    Database(String),
 }
 
 impl fmt::Display for DevError {
@@ -55,6 +57,7 @@ impl fmt::Display for DevError {
                 Ok(())
             }
             DevError::Lock(msg) => write!(f, "lock: {msg}"),
+            DevError::Database(msg) => write!(f, "database: {msg}"),
         }
     }
 }
@@ -67,7 +70,8 @@ impl StdError for DevError {
             | DevError::Build(_)
             | DevError::Preflight(_)
             | DevError::Subprocess { .. }
-            | DevError::Lock(_) => None,
+            | DevError::Lock(_)
+            | DevError::Database(_) => None,
         }
     }
 }
@@ -87,5 +91,11 @@ impl From<toml::de::Error> for DevError {
 impl From<serde_json::Error> for DevError {
     fn from(err: serde_json::Error) -> DevError {
         DevError::Config(format!("json: {err}"))
+    }
+}
+
+impl From<rusqlite::Error> for DevError {
+    fn from(err: rusqlite::Error) -> DevError {
+        DevError::Database(err.to_string())
     }
 }

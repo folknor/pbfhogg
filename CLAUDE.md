@@ -16,8 +16,9 @@ The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoke
 - `cargo dev check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `cargo dev check -- --ignored`).
 - `cargo dev env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `cargo dev run [args]` — build release CLI and run with passthrough args (e.g., `cargo dev run fileinfo tests/test.osm.pbf`).
+- `cargo dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
 
-The alias is defined in `.cargo/config.toml`. Auto-builds on first use.
+The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmark results stored in `dev/results.db` (SQLite, committed in git).
 
 ## Scripts
 

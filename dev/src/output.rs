@@ -23,6 +23,11 @@ pub fn result_msg(msg: &str) {
     println!("[result]  {msg}");
 }
 
+#[allow(dead_code)]
+pub fn bench_msg(msg: &str) {
+    println!("[bench]   {msg}");
+}
+
 /// Print an error message. Multi-line messages get each line prefixed.
 pub fn error(msg: &str) {
     for line in msg.lines() {

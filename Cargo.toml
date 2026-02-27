@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "protohoggr"]
+members = ["cli"]
 
 [workspace.package]
 version = "0.2.0"
@@ -64,7 +64,7 @@ linux-direct-io = ["dep:libc"]
 linux-io-uring = ["dep:io-uring", "dep:libc"]
 
 [dependencies]
-protohoggr = { path = "protohoggr" }
+protohoggr = { git = "https://github.com/folknor/protohoggr.git" }
 bytes = "1"
 flate2 = { version = "1.0", default-features = false }
 memmap2 = "0.9"

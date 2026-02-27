@@ -111,15 +111,15 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
   | tags-filter w/highway=primary -R | **0.44s** | 0.55s | **0.80x** | parallel + blob-skip |
   | tags-filter highway=primary 2pass | 2.69s | 2.42s | 1.11x | two-pass, parallel Pass 2 |
   | add-locations-to-ways | 11.42s | 11.98s | 0.95x | Pass 1 hash build is bottleneck |
-  | extract --simple | 4.08s | 1.65s | 2.47x | incremental state, cannot parallelize |
-  | extract (complete-ways) | 4.45s | 2.74s | 1.62x | Pass 2 parallel, Pass 1 sequential |
-  | extract --smart | 6.12s | 3.20s | 1.91x | Pass 3 parallel, Passes 1-2 sequential |
+  | extract --simple | **2.81s** | 1.66s | 1.69x | IdSetDense + int bbox, sequential |
+  | extract (complete-ways) | **2.69s** | 2.83s | **0.95x** | IdSetDense + int bbox, Pass 2 parallel |
+  | extract --smart | **4.21s** | 3.26s | 1.29x | IdSetDense + int bbox, Pass 3 parallel |
 
   All commands use pipelined reader + pipelined writer. All write passes use
   parallel element processing via rayon batches (64 blocks per dispatch).
   Blob-type skipping via indexdata provides additional gains for type-filtered
   commands. Ratios below 1.0 = pbfhogg is faster. Numbers from
-  `scripts/bench-commands.sh all` on Denmark 483 MB, commit `5d2d759`.
+  `scripts/bench-commands.sh all` on Denmark 483 MB, commit `2bac649`.
 
   Done:
 
@@ -263,16 +263,13 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     But a bitset is strictly better: O(1), cache-friendly (sequential bit scanning),
     and comparable memory for dense ID ranges (node IDs are dense 1..12B).
 
-    - [ ] **Replace `Vec<i64>` + `binary_search` with a chunked dense bitset.**
-      Hand-roll a Rust equivalent of osmium's `IdSetDense`: chunked
-      `Vec<Option<Box<[u8; CHUNK_SIZE]>>>` with bit-level set/get. ~50 lines.
-      CHUNK_SIZE=4MB (matching osmium's `chunk_bits=22`) covers 33M IDs per
-      chunk. For Denmark's 52M nodes: 2 chunks allocated = 8MB total vs current
-      ~400MB sorted Vec. Planet (12B node IDs): ~364 chunks = ~1.5GB bitset vs
-      ~96GB sorted Vec (impossible). This is the single highest-impact change.
-      Roaring bitmaps (`roaring` crate, already a dependency) are an alternative
-      but heavier — the hand-rolled bitset is simpler, zero-dep, and matches
-      the proven osmium design exactly.
+    - [x] **Replace `Vec<i64>` + `binary_search` with a chunked dense bitset.**
+      DONE (commit `4c30d3e`). Hand-rolled `IdSetDense` in `extract.rs`:
+      chunked `Vec<Option<Box<[u8; CHUNK_SIZE]>>>` with bit-level set/get.
+      CHUNK_SIZE=4MB (matching osmium's `chunk_bits=22`), covers 33M IDs per
+      chunk. Denmark results: simple 4.05s→2.84s (-30%), complete-ways
+      4.42s→2.72s (-38%, matches osmium), smart 6.12s→4.23s (-31%).
+      Memory: 8MB for Denmark's 52M nodes vs ~400MB sorted Vec.
 
     **Finding 2: Metadata skipping in collection passes.**
     Osmium passes `read_meta::no` for all non-write passes:
@@ -290,12 +287,16 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     struct is parsed for every element even when only IDs and coordinates are
     needed (collection passes) or only IDs and refs are needed (way matching).
 
-    - [ ] **Add skip-metadata mode for collection passes.** Add a flag or
-      alternative code path in the wire-format decoder that skips `WireInfo`
-      fields when the consumer only needs IDs + coordinates (Pass 1) or
-      IDs + refs (Pass 2 way scanning). Estimated ~15-25% decode speedup
-      on collection passes. Could be a `BlobFilter`-style builder method
-      on `ElementReader`, or a per-block decode flag.
+    - [ ] **Add skip-metadata mode for collection passes.** pbfhogg's
+      zero-copy wire-format parser is already partially lazy — `WireInfo`
+      stores byte offsets, not parsed values, so unused metadata fields
+      aren't materialized. However, the initial `WireBlock` parse still
+      scans through all varint field boundaries including metadata bytes.
+      A true skip would require the protobuf wire format to support
+      jumping over fields without scanning (it doesn't — varints are
+      variable-length). **Low priority** — the remaining gain is the
+      varint scanning cost (~5-10% of decode, not the 15-25% that osmium
+      saves from its eager decoder).
 
     **Finding 3: Integer bbox containment vs float conversion.**
     Osmium's `Box::contains()` (`libosmium/include/osmium/osm/box.hpp:224-229`)
@@ -311,12 +312,12 @@ pipelined on Denmark). The gaps are in CLI commands and the buffered merge path.
     multiply + 4 f64 comparisons cost ~5ns/node vs ~2ns/node for int32.
     At 52M nodes this is ~156ms vs ~104ms — small but free to fix.
 
-    - [ ] **Use integer bbox containment.** Convert the bbox to
-      decimicrodegree int32 once at startup. Compare `dn.decimicro_lat()` /
-      `dn.decimicro_lon()` directly (already available, `elements.rs:53-60`).
-      Eliminates the i64→f64 conversion and uses integer comparison.
-      Polygon containment can keep f64 (rare path, already has bbox
-      fast-rejection).
+    - [x] **Use integer bbox containment.** DONE (commit `2bac649`).
+      `BboxInt` with decimicrodegree i32 coordinates computed once at startup.
+      `Region::contains_decimicro()` uses 4 integer comparisons for bbox,
+      falls back to f64 ray-casting only for polygon regions. ~1% improvement
+      across all strategies (2.84s→2.81s simple, 2.72s→2.69s complete-ways,
+      4.23s→4.21s smart).
 
     **Remaining bottleneck: `add-locations-to-ways` Pass 1 (hash index building).**
     Pass 2 is now parallel, but Pass 1 (building the FxHashMap node index) is

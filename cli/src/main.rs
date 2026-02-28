@@ -261,6 +261,41 @@ enum Command {
         #[arg(long, requires = "io_uring")]
         sqpoll: bool,
     },
+    /// Benchmark: count elements using a single read mode (emits kv to stderr)
+    BenchRead {
+        /// Input PBF file
+        file: PathBuf,
+        /// Read mode: sequential, parallel, pipelined, mmap, blobreader
+        #[arg(long)]
+        mode: String,
+    },
+    /// Benchmark: decode + write all elements through BlockBuilder (emits kv to stderr)
+    BenchWrite {
+        /// Input PBF file
+        file: PathBuf,
+        /// Compression spec (e.g. none, zlib:6, zstd:3)
+        #[arg(long, default_value = "zlib:6")]
+        compression: String,
+        /// Writer mode: sync or pipelined
+        #[arg(long, default_value = "sync")]
+        writer: String,
+    },
+    /// Benchmark: merge base PBF with OSC diff (emits kv to stderr)
+    BenchMerge {
+        /// Base PBF file
+        base: PathBuf,
+        /// OSC diff file (.osc.gz)
+        changes: PathBuf,
+        /// Output PBF file
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Compression spec (e.g. none, zlib, zstd:3)
+        #[arg(long, default_value = "zlib")]
+        compression: String,
+        /// I/O mode: buffered, uring, uring-sqpoll
+        #[arg(long, default_value = "buffered")]
+        io_mode: String,
+    },
 }
 
 fn main() {
@@ -361,6 +396,11 @@ fn main() {
             io_uring,
             sqpoll,
         } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring, sqpoll),
+        Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
+        Command::BenchWrite { file, compression, writer } => run_bench_write(&file, &compression, &writer),
+        Command::BenchMerge { base, changes, output, compression, io_mode } => {
+            run_bench_merge(&base, &changes, &output, &compression, &io_mode)
+        }
     };
 
     if let Err(e) = result {
@@ -690,5 +730,268 @@ fn run_merge(
     let compression = parse_compression(compression)?;
     let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring, sqpoll)?;
     stats.print_summary();
+    Ok(())
+}
+
+fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    let (elapsed_ms, nodes, ways, rels): (u128, u64, u64, u64) = match mode {
+        "sequential" => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            reader.for_each(|el| match el {
+                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                pbfhogg::Element::Way(_) => ways += 1,
+                pbfhogg::Element::Relation(_) => rels += 1,
+                _ => {}
+            })?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        "parallel" => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let start = Instant::now();
+            let (nodes, ways, rels) = reader.par_map_reduce(
+                |el| match el {
+                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => (1u64, 0u64, 0u64),
+                    pbfhogg::Element::Way(_) => (0, 1, 0),
+                    pbfhogg::Element::Relation(_) => (0, 0, 1),
+                    _ => (0, 0, 0),
+                },
+                || (0, 0, 0),
+                |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2),
+            )?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        "pipelined" => {
+            let reader = pbfhogg::ElementReader::from_path(path)?;
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            reader.for_each_pipelined(|el| match el {
+                pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                pbfhogg::Element::Way(_) => ways += 1,
+                pbfhogg::Element::Relation(_) => rels += 1,
+                _ => {}
+            })?;
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        "mmap" => {
+            let mmap = unsafe { pbfhogg::Mmap::from_path(path) }?;
+            let reader = pbfhogg::MmapBlobReader::new(mmap);
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            for blob_result in reader {
+                let blob = blob_result?;
+                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+                    for el in block.elements() {
+                        match el {
+                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                            pbfhogg::Element::Way(_) => ways += 1,
+                            pbfhogg::Element::Relation(_) => rels += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        "blobreader" => {
+            use std::io::BufReader;
+            let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
+            let mut nodes = 0u64;
+            let mut ways = 0u64;
+            let mut rels = 0u64;
+            let start = Instant::now();
+            for blob_result in reader {
+                let blob = blob_result?;
+                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+                    for el in block.elements() {
+                        match el {
+                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                            pbfhogg::Element::Way(_) => ways += 1,
+                            pbfhogg::Element::Relation(_) => rels += 1,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            (start.elapsed().as_millis(), nodes, ways, rels)
+        }
+        other => return Err(format!("unknown read mode: {other} (expected: sequential, parallel, pipelined, mmap, blobreader)").into()),
+    };
+
+    eprintln!("elapsed_ms={elapsed_ms}");
+    eprintln!("nodes={nodes}");
+    eprintln!("ways={ways}");
+    eprintln!("relations={rels}");
+    Ok(())
+}
+
+fn bench_write_loop<W: std::io::Write>(
+    path: &std::path::Path,
+    writer: &mut pbfhogg::writer::PbfWriter<W>,
+) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
+    use std::io::BufReader;
+    use pbfhogg::block_builder::{BlockBuilder, MemberData};
+
+    let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
+    let mut bb = BlockBuilder::new();
+    let mut nodes = 0u64;
+    let mut ways = 0u64;
+    let mut rels = 0u64;
+
+    for blob_result in reader {
+        let blob = blob_result?;
+        if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
+            for el in block.elements() {
+                match el {
+                    pbfhogg::Element::DenseNode(dn) => {
+                        if !bb.can_add_node() {
+                            if let Some(bytes) = bb.take()? {
+                                writer.write_primitive_block(bytes)?;
+                            }
+                        }
+                        let tags: Vec<_> = dn.tags().collect();
+                        bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags, None);
+                        nodes += 1;
+                    }
+                    pbfhogg::Element::Node(n) => {
+                        if !bb.can_add_node() {
+                            if let Some(bytes) = bb.take()? {
+                                writer.write_primitive_block(bytes)?;
+                            }
+                        }
+                        let tags: Vec<_> = n.tags().collect();
+                        bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags, None);
+                        nodes += 1;
+                    }
+                    pbfhogg::Element::Way(w) => {
+                        if !bb.can_add_way() {
+                            if let Some(bytes) = bb.take()? {
+                                writer.write_primitive_block(bytes)?;
+                            }
+                        }
+                        let tags: Vec<_> = w.tags().collect();
+                        let refs: Vec<_> = w.refs().collect();
+                        bb.add_way(w.id(), &tags, &refs, None);
+                        ways += 1;
+                    }
+                    pbfhogg::Element::Relation(r) => {
+                        if !bb.can_add_relation() {
+                            if let Some(bytes) = bb.take()? {
+                                writer.write_primitive_block(bytes)?;
+                            }
+                        }
+                        let tags: Vec<_> = r.tags().collect();
+                        let members: Vec<_> = r.members().map(|m| MemberData {
+                            id: m.id,
+                            role: m.role().ok().unwrap_or_default(),
+                        }).collect();
+                        bb.add_relation(r.id(), &tags, &members, None);
+                        rels += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if let Some(bytes) = bb.take()? {
+        writer.write_primitive_block(bytes)?;
+    }
+
+    Ok((nodes, ways, rels))
+}
+
+fn run_bench_write(
+    path: &std::path::Path,
+    compression: &str,
+    writer_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+    use pbfhogg::block_builder::HeaderBuilder;
+
+    let compression = parse_compression(compression)?;
+    let header_bytes = HeaderBuilder::new().build()?;
+
+    let (elapsed_ms, nodes, ways, rels) = match writer_mode {
+        "sync" => {
+            let mut writer = pbfhogg::writer::PbfWriter::to_path(
+                std::path::Path::new("/dev/null"),
+                compression,
+            )?;
+            writer.write_header(&header_bytes)?;
+            let start = Instant::now();
+            let (nodes, ways, rels) = bench_write_loop(path, &mut writer)?;
+            let elapsed_ms = start.elapsed().as_millis();
+            (elapsed_ms, nodes, ways, rels)
+        }
+        "pipelined" => {
+            let mut writer = pbfhogg::writer::PbfWriter::to_path_pipelined(
+                std::path::Path::new("/dev/null"),
+                compression,
+                &header_bytes,
+            )?;
+            let start = Instant::now();
+            let (nodes, ways, rels) = bench_write_loop(path, &mut writer)?;
+            drop(writer);
+            let elapsed_ms = start.elapsed().as_millis();
+            (elapsed_ms, nodes, ways, rels)
+        }
+        other => return Err(format!("unknown writer mode: {other} (expected: sync, pipelined)").into()),
+    };
+
+    eprintln!("elapsed_ms={elapsed_ms}");
+    eprintln!("nodes={nodes}");
+    eprintln!("ways={ways}");
+    eprintln!("relations={rels}");
+    Ok(())
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn run_bench_merge(
+    base: &std::path::Path,
+    changes: &std::path::Path,
+    output: &std::path::Path,
+    compression: &str,
+    io_mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Instant;
+
+    let compression = parse_compression(compression)?;
+    let (io_uring, sqpoll) = match io_mode {
+        "buffered" => (false, false),
+        "uring" => (true, false),
+        "uring-sqpoll" => (true, true),
+        other => return Err(format!("unknown I/O mode: {other} (expected: buffered, uring, uring-sqpoll)").into()),
+    };
+
+    let _ = std::fs::remove_file(output);
+
+    let start = Instant::now();
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, false, io_uring, sqpoll)?;
+    let elapsed_ms = start.elapsed().as_millis();
+
+    let output_mb = std::fs::metadata(output)
+        .map(|m| m.len() as f64 / 1_000_000.0)
+        .unwrap_or(0.0);
+
+    eprintln!("elapsed_ms={elapsed_ms}");
+    eprintln!("base_nodes={}", stats.base_nodes);
+    eprintln!("base_ways={}", stats.base_ways);
+    eprintln!("base_relations={}", stats.base_relations);
+    eprintln!("diff_nodes={}", stats.diff_nodes);
+    eprintln!("diff_ways={}", stats.diff_ways);
+    eprintln!("diff_relations={}", stats.diff_relations);
+    eprintln!("blobs_passthrough={}", stats.blobs_passthrough);
+    eprintln!("blobs_rewritten={}", stats.blobs_rewritten);
+    eprintln!("output_mb={output_mb:.2}");
     Ok(())
 }

@@ -1,3 +1,5 @@
+project = "pbfhogg"
+
 # ---------------------------------------------------------------------------
 # Datasets — identical across all machines.
 # Files resolved as {data}/{filename}.

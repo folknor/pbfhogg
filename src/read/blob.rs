@@ -465,6 +465,10 @@ pub struct BlobReader<R: Read + Send> {
     /// Current reader offset in bytes from the start of the stream.
     offset: Option<ByteOffset>,
     last_blob_ok: bool,
+    /// Reusable buffer for reading blob header bytes. Cleared and refilled each
+    /// iteration to avoid allocating a new Vec per blob (~16K allocs per Denmark,
+    /// ~2.5M per planet).
+    header_buf: Vec<u8>,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -489,6 +493,7 @@ impl<R: Read + Send> BlobReader<R> {
             reader,
             offset: None,
             last_blob_ok: true,
+            header_buf: Vec::new(),
         }
     }
 
@@ -540,12 +545,13 @@ impl<R: Read + Send> BlobReader<R> {
         }
 
         let mut reader = self.reader.by_ref().take(header_size);
-        let mut header_data = Vec::with_capacity(header_size as usize);
-        if let Err(e) = reader.read_to_end(&mut header_data) {
+        self.header_buf.clear();
+        self.header_buf.reserve(header_size as usize);
+        if let Err(e) = reader.read_to_end(&mut self.header_buf) {
             return self.handle_error(e.into());
         }
 
-        let header = match WireBlobHeader::parse(&header_data) {
+        let header = match WireBlobHeader::parse(&self.header_buf) {
             Ok(header) => header,
             Err(e) => {
                 return self.handle_error(e)
@@ -587,6 +593,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
+            header_buf: Vec::new(),
         })
     }
 
@@ -601,6 +608,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
+            header_buf: Vec::new(),
         })
     }
 
@@ -611,6 +619,7 @@ impl BlobReader<FileReader> {
             reader,
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
+            header_buf: Vec::new(),
         })
     }
 }
@@ -680,6 +689,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             reader,
             offset: Some(ByteOffset(pos)),
             last_blob_ok: true,
+            header_buf: Vec::new(),
         })
     }
 

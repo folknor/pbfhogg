@@ -1,5 +1,5 @@
 [workspace]
-members = ["cli", "dev"]
+members = ["cli"]
 exclude = ["bench/osmpbf-baseline"]
 
 [workspace.package]

@@ -1,2 +1,1 @@
 [alias]
-dev = "run -q -p pbfhogg-dev --release --"

@@ -104,21 +104,30 @@ where
                 match blob_result {
                     Ok(blob) => {
                         decode_pool.spawn(move || {
-                            let item = match blob.get_type() {
-                                BlobType::OsmData => {
-                                    // If a blob filter is set and the blob has indexdata,
-                                    // skip decompression for blobs that don't match.
-                                    // Files without indexdata always pass through.
-                                    if let Some(ref filter) = blob_filter
-                                        && let Some(idx) = blob.index()
-                                        && !filter.wants(idx.kind)
-                                    {
-                                        drop(tx.send((seq, None)));
-                                        return;
+                            let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                                match blob.get_type() {
+                                    BlobType::OsmData => {
+                                        // If a blob filter is set and the blob has indexdata,
+                                        // skip decompression for blobs that don't match.
+                                        // Files without indexdata always pass through.
+                                        if let Some(ref filter) = blob_filter
+                                            && let Some(idx) = blob.index()
+                                            && !filter.wants(idx.kind)
+                                        {
+                                            return None;
+                                        }
+                                        Some(blob.to_primitiveblock_pooled(&bp))
                                     }
-                                    Some(blob.to_primitiveblock_pooled(&bp))
+                                    _ => None,
                                 }
-                                _ => None,
+                            }));
+                            let item = match item {
+                                Ok(item) => item,
+                                Err(_) => Some(Err(crate::error::new_error(
+                                    crate::error::ErrorKind::Io(
+                                        std::io::Error::other("decode task panicked"),
+                                    ),
+                                ))),
                             };
                             drop(tx.send((seq, item)));
                         });

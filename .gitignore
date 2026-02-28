@@ -7,5 +7,5 @@ Cargo.lock
 data
 bench/osmpbf-baseline/target/
 .bench_stderr.*
-.dev/*
-!.dev/results.db
+.brokkr/*
+!.brokkr/results.db

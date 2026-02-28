@@ -8,41 +8,41 @@ Rust library for reading and writing OpenStreetMap PBF files. Fork of [osmpbf](h
 - Never chain commands with ;. Write a script instead.
 - Never pipe commands with |. Write a script instead.
 - Never read or write from /tmp. All data lives in the project.
-- Never run raw cargo, curl, pkill. Use `dev`.
+- Never run raw cargo, curl, pkill. Use `brokkr`.
 
-## Dev tool
+## Brokkr tool
 
-Standalone development tool at `~/Programs/dev`. Installed via `cargo install --path ~/Programs/dev`. Invoked as `dev` from the project root (reads `./dev.toml` for project detection).
+Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install --path ~/Programs/brokkr`. Invoked as `brokkr` from the project root (reads `./brokkr.toml` for project detection).
 
-- `dev check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `dev check -- --ignored`).
-- `dev env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
-- `dev run [args]` — build release CLI and run with passthrough args (e.g., `dev run fileinfo tests/test.osm.pbf`).
-- `dev bench read [--dataset name] [--pbf path] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite.
-- `dev bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
-- `dev bench merge [--dataset name] [--pbf path] [--osc path] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite.
-- `dev bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (19 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite.
-- `dev bench extract [--dataset name] [--pbf path] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan.
-- `dev bench allocator [--dataset name] [--pbf path] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs.
-- `dev bench blob-filter [--dataset name] [--pbf-indexed path] [--pbf-raw path] [--runs N]` — indexdata vs non-indexdata performance comparison.
-- `dev bench planetiler [--dataset name] [--pbf path] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR.
-- `dev bench all [--dataset name] [--pbf path] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines.
-- `dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
-- `dev hotpath [--dataset name] [--pbf path] [--osc path] [--alloc] [--runs N]` — hotpath profiling (function-level timing/allocation metrics). Default dataset: denmark, runs: 1. `--alloc` uses `hotpath-alloc` feature for allocation tracking. Wall-clock stored in SQLite.
-- `dev profile [--dataset name] [--pbf path] [--osc path]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite.
-- `dev download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
-- `dev clean` — remove scratch temp files and verify output directories.
+- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`).
+- `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
+- `brokkr run [args]` — build release CLI and run with passthrough args (e.g., `brokkr run fileinfo tests/test.osm.pbf`).
+- `brokkr bench read [--dataset name] [--pbf path] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite.
+- `brokkr bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
+- `brokkr bench merge [--dataset name] [--pbf path] [--osc path] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite.
+- `brokkr bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (19 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite.
+- `brokkr bench extract [--dataset name] [--pbf path] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan.
+- `brokkr bench allocator [--dataset name] [--pbf path] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs.
+- `brokkr bench blob-filter [--dataset name] [--pbf-indexed path] [--pbf-raw path] [--runs N]` — indexdata vs non-indexdata performance comparison.
+- `brokkr bench planetiler [--dataset name] [--pbf path] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR.
+- `brokkr bench all [--dataset name] [--pbf path] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines.
+- `brokkr results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
+- `brokkr hotpath [--dataset name] [--pbf path] [--osc path] [--alloc] [--runs N]` — hotpath profiling (function-level timing/allocation metrics). Default dataset: denmark, runs: 1. `--alloc` uses `hotpath-alloc` feature for allocation tracking. Wall-clock stored in SQLite.
+- `brokkr profile [--dataset name] [--pbf path] [--osc path]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite.
+- `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
+- `brokkr clean` — remove scratch temp files and verify output directories.
 
-Benchmark results stored in `.dev/results.db` (SQLite, tracked in git).
+Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git).
 
 ## Scripts
 
-No shell scripts remain. All development tooling is in `dev`.
+No shell scripts remain. All development tooling is in `brokkr`.
 
 ## Indexdata PBFs
 
 To generate a PBF with blob-level indexdata (required for fast passthrough merges), use `cat`:
 ```
-dev run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
+brokkr run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
 ```
 There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
 
@@ -50,17 +50,17 @@ There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when
 
 Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconvert). All default to `--dataset denmark`.
 
-- `dev verify sort [--dataset name] [--pbf path]` — sort vs osmium sort
-- `dev verify cat [--dataset name] [--pbf path]` — cat with type filters vs osmium cat
-- `dev verify extract [--dataset name] [--pbf path] [--bbox bbox]` — bbox extract (simple/complete/smart) vs osmium extract
-- `dev verify tags-filter [--dataset name] [--pbf path]` — tags-filter with 3 expressions vs osmium
-- `dev verify getid-removeid [--dataset name] [--pbf path]` — getid/removeid vs osmium getid
-- `dev verify add-locations-to-ways [--dataset name] [--pbf path]` — add-locations-to-ways vs osmium
-- `dev verify check-refs [--dataset name] [--pbf path]` — check-refs vs osmium check-refs
-- `dev verify merge [--dataset name] [--pbf path] [--osc path]` — merge vs osmium/osmosis/osmconvert
-- `dev verify derive-changes [--dataset name] [--pbf path] [--osc path]` — derive-changes roundtrip vs osmium
-- `dev verify diff [--dataset name] [--pbf path] [--osc path]` — diff summary vs osmium diff
-- `dev verify all [--dataset name] [--pbf path] [--osc path] [--bbox bbox]` — run all verify commands sequentially
+- `brokkr verify sort [--dataset name] [--pbf path]` — sort vs osmium sort
+- `brokkr verify cat [--dataset name] [--pbf path]` — cat with type filters vs osmium cat
+- `brokkr verify extract [--dataset name] [--pbf path] [--bbox bbox]` — bbox extract (simple/complete/smart) vs osmium extract
+- `brokkr verify tags-filter [--dataset name] [--pbf path]` — tags-filter with 3 expressions vs osmium
+- `brokkr verify getid-removeid [--dataset name] [--pbf path]` — getid/removeid vs osmium getid
+- `brokkr verify add-locations-to-ways [--dataset name] [--pbf path]` — add-locations-to-ways vs osmium
+- `brokkr verify check-refs [--dataset name] [--pbf path]` — check-refs vs osmium check-refs
+- `brokkr verify merge [--dataset name] [--pbf path] [--osc path]` — merge vs osmium/osmosis/osmconvert
+- `brokkr verify derive-changes [--dataset name] [--pbf path] [--osc path]` — derive-changes roundtrip vs osmium
+- `brokkr verify diff [--dataset name] [--pbf path] [--osc path]` — diff summary vs osmium diff
+- `brokkr verify all [--dataset name] [--pbf path] [--osc path] [--bbox bbox]` — run all verify commands sequentially
 
 ## Benchmarking Rules
 - **NEVER run benchmark, profiling, or verify commands in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench, verify, hotpath, and profile subcommands.
@@ -93,7 +93,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 ## Conventions
 
-- All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark results are stored automatically in `.dev/results.db` (SQLite).
+- All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark results are stored automatically in `.brokkr/results.db` (SQLite).
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind). `MissingHeader` error if a PBF doesn't start with an OsmHeader blob.

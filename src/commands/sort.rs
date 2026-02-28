@@ -11,7 +11,7 @@ use std::path::Path;
 
 use crate::blob::{
     decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
-    parse_blob_header_with_index,
+    parse_blob_header_with_index, BlobKind,
 };
 use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, Metadata};
@@ -240,13 +240,13 @@ fn build_blob_index(
         let frame_len = (4 + header_len + data_size) as u64;
         file_offset += frame_len;
 
-        match blob_type.as_str() {
-            "OSMHeader"
+        match &blob_type {
+            BlobKind::OsmHeader
                 if header.is_none() =>
             {
                 header = Some(decode_blob_to_headerblock(&blob_bytes)?);
             }
-            "OSMData" => {
+            BlobKind::OsmData => {
                 let blob_index = if let Some(idx) = index {
                     idx
                 } else {

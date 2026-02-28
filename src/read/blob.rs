@@ -148,12 +148,23 @@ fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
 // Wire-format protobuf message types for blob reading
 // ---------------------------------------------------------------------------
 
+/// Blob type parsed from BlobHeader, avoiding per-blob String allocation.
+///
+/// OSM PBF files use exactly two blob types: `"OSMHeader"` and `"OSMData"`.
+/// Unknown types are preserved as `String` for forward compatibility.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BlobKind {
+    OsmHeader,
+    OsmData,
+    Unknown(String),
+}
+
 /// Parsed BlobHeader from protobuf wire format.
 ///
 /// Fields: type (string, field 1), indexdata (bytes, field 2), datasize (int32, field 3).
 #[derive(Clone, Debug)]
 pub(crate) struct WireBlobHeader {
-    pub blob_type: String,
+    pub blob_type: BlobKind,
     pub datasize: i32,
     pub indexdata: Option<Vec<u8>>,
 }
@@ -163,7 +174,7 @@ impl WireBlobHeader {
     pub fn parse(data: &[u8]) -> Result<Self> {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
-        let mut blob_type = String::new();
+        let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
         let mut indexdata: Option<Vec<u8>> = None;
 
@@ -172,8 +183,14 @@ impl WireBlobHeader {
                 1 => {
                     // type: string (len-delimited)
                     let bytes = cursor.read_len_delimited()?;
-                    blob_type = String::from_utf8(bytes.to_vec())
-                        .map_err(|_| new_wire_error("invalid UTF-8 in BlobHeader type"))?;
+                    blob_type = match bytes {
+                        b"OSMHeader" => BlobKind::OsmHeader,
+                        b"OSMData" => BlobKind::OsmData,
+                        _ => BlobKind::Unknown(
+                            String::from_utf8(bytes.to_vec())
+                                .map_err(|_| new_wire_error("invalid UTF-8 in BlobHeader type"))?,
+                        ),
+                    };
                 }
                 2 => {
                     // indexdata: bytes (len-delimited)
@@ -359,10 +376,10 @@ impl Blob {
     // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.blob_type.as_str() {
-            x if x == BlobType::OsmHeader.as_str() => BlobType::OsmHeader,
-            x if x == BlobType::OsmData.as_str() => BlobType::OsmData,
-            x => BlobType::Unknown(x),
+        match &self.header.blob_type {
+            BlobKind::OsmHeader => BlobType::OsmHeader,
+            BlobKind::OsmData => BlobType::OsmData,
+            BlobKind::Unknown(s) => BlobType::Unknown(s),
         }
     }
 
@@ -422,10 +439,10 @@ impl BlobHeader {
     /// Returns the type of the following blob.
     #[inline]
     pub fn blob_type(&self) -> BlobType<'_> {
-        match self.header.blob_type.as_str() {
-            "OSMHeader" => BlobType::OsmHeader,
-            "OSMData" => BlobType::OsmData,
-            x => BlobType::Unknown(x),
+        match &self.header.blob_type {
+            BlobKind::OsmHeader => BlobType::OsmHeader,
+            BlobKind::OsmData => BlobType::OsmData,
+            BlobKind::Unknown(s) => BlobType::Unknown(s),
         }
     }
 
@@ -805,11 +822,11 @@ impl BlobReader<BufReader<File>> {
 // Public decode helpers
 // ---------------------------------------------------------------------------
 
-/// Parse raw blob frame bytes into a BlobHeader type string and Blob payload bytes.
+/// Parse raw blob frame bytes into a BlobHeader type and Blob payload size.
 ///
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
-pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(String, usize)> {
+pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
     let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -827,7 +844,7 @@ pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(String, usize)> {
 ///
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
-pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usize)> {
+pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, usize)> {
     parse_blob_header(header_bytes)
 }
 
@@ -838,7 +855,7 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(String, usi
 /// that allows merge to classify blobs without decompression.
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
-) -> Result<(String, usize, Option<Vec<u8>>)> {
+) -> Result<(BlobKind, usize, Option<Vec<u8>>)> {
     let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -1101,23 +1118,23 @@ mod tests {
 
     #[test]
     fn test_get_type() {
-        let pairs = [
-            ("", BlobType::Unknown("")),
-            ("abc", BlobType::Unknown("abc")),
-            ("OSMHeader", BlobType::OsmHeader),
-            ("OSMData", BlobType::OsmData),
+        let pairs: &[(BlobKind, BlobType<'_>)] = &[
+            (BlobKind::Unknown(String::new()), BlobType::Unknown("")),
+            (BlobKind::Unknown("abc".to_string()), BlobType::Unknown("abc")),
+            (BlobKind::OsmHeader, BlobType::OsmHeader),
+            (BlobKind::OsmData, BlobType::OsmData),
         ];
 
-        for (string, blob_type) in pairs {
+        for (kind, expected_type) in pairs {
             let ff_header = WireBlobHeader {
-                blob_type: string.to_string(),
+                blob_type: kind.clone(),
                 datasize: 0,
                 indexdata: None,
             };
             let ff_blob = WireBlob { data: None, raw_size: None };
 
             let blob = Blob::new(ff_header, ff_blob, None);
-            assert_eq!(blob.get_type(), blob_type);
+            assert_eq!(blob.get_type(), *expected_type);
         }
     }
 }

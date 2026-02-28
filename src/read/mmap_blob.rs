@@ -84,17 +84,18 @@ impl MmapBlob {
     /// Decodes the blob and tries to obtain the inner content (usually a [`HeaderBlock`] or a
     /// [`PrimitiveBlock`]). This operation might involve an expensive decompression step.
     pub fn decode(&self) -> Result<BlobDecode<'_>> {
+        use super::blob::BlobKind;
         let blob = WireBlob::parse(&self.data)?;
-        match self.header.blob_type.as_str() {
-            "OSMHeader" => {
+        match &self.header.blob_type {
+            BlobKind::OsmHeader => {
                 let block = Box::new(HeaderBlock::new(decode_headerblock(&blob, None)?));
                 Ok(BlobDecode::OsmHeader(block))
             }
-            "OSMData" => {
+            BlobKind::OsmData => {
                 let block = PrimitiveBlock::new(decompress_blob(&blob, None)?)?;
                 Ok(BlobDecode::OsmData(block))
             }
-            x => Ok(BlobDecode::Unknown(x)),
+            BlobKind::Unknown(s) => Ok(BlobDecode::Unknown(s)),
         }
     }
 
@@ -102,10 +103,11 @@ impl MmapBlob {
     // wontfix(name-no-get-prefix): inherited from osmpbf public API
     #[inline]
     pub fn get_type(&self) -> BlobType<'_> {
-        match self.header.blob_type.as_str() {
-            "OSMHeader" => BlobType::OsmHeader,
-            "OSMData" => BlobType::OsmData,
-            x => BlobType::Unknown(x),
+        use super::blob::BlobKind;
+        match &self.header.blob_type {
+            BlobKind::OsmHeader => BlobType::OsmHeader,
+            BlobKind::OsmData => BlobType::OsmData,
+            BlobKind::Unknown(s) => BlobType::Unknown(s),
         }
     }
 

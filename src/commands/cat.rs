@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use super::{dense_node_metadata, element_metadata};
 use crate::blob_index::BlobIndex;
 use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
-use crate::blob::{decode_blob_to_headerblock, parse_blob_header};
+use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
@@ -61,7 +61,7 @@ pub fn cat(
 /// Raw blob frame: complete framed bytes for write_raw() passthrough.
 struct RawBlobFrame {
     frame_bytes: Vec<u8>,
-    blob_type: String,
+    blob_type: BlobKind,
     blob_bytes: Vec<u8>,
     /// Byte offset of this frame in the input file (for copy_file_range).
     #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
@@ -115,7 +115,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         let mut file_offset: u64 = 0;
         let mut hdr_bytes = None;
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            if frame.blob_type == "OSMHeader" {
+            if frame.blob_type == BlobKind::OsmHeader {
                 let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
                 let mut hb = HeaderBuilder::from_header(&header);
                 if single_file && header.is_sorted() {
@@ -139,9 +139,9 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         let input_fd = reader.raw_fd();
 
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            match frame.blob_type.as_str() {
-                "OSMHeader" => {}
-                "OSMData" => {
+            match &frame.blob_type {
+                BlobKind::OsmHeader => {}
+                BlobKind::OsmData => {
                     #[cfg(feature = "linux-direct-io")]
                     writer.write_raw_copy(
                         input_fd,

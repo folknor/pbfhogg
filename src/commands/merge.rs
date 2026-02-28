@@ -19,7 +19,7 @@ use rayon::prelude::*;
 
 use crate::blob::{
     decode_blob_to_headerblock, decompress_blob_data_into, parse_blob_header_with_index,
-    parse_primitive_block_from_bytes_owned,
+    parse_primitive_block_from_bytes_owned, BlobKind,
 };
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
@@ -245,8 +245,7 @@ impl DiffRanges {
 struct RawBlobFrame {
     /// Complete framed bytes suitable for write_raw().
     frame_bytes: Vec<u8>,
-    /// Blob type: "OSMHeader", "OSMData", etc.
-    blob_type: String,
+    blob_type: BlobKind,
     /// Byte offset within `frame_bytes` where the Blob protobuf starts.
     blob_offset: usize,
     /// Blob-level index from BlobHeader indexdata, if present.
@@ -966,7 +965,7 @@ pub fn merge(
         let mut offset: u64 = 0;
         loop {
             match read_raw_frame(&mut reader, &mut offset)? {
-                Some(frame) if frame.blob_type == "OSMHeader" => {
+                Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                     let header = decode_blob_to_headerblock(frame.blob_bytes())?;
                     break build_header_bytes(&header)?;
                 }
@@ -1016,11 +1015,11 @@ pub fn merge(
         let mut file_offset: u64 = 0;
         let mut past_header = false;
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset).map_err(|e| e.to_string())? {
-            if frame.blob_type == "OSMHeader" {
+            if frame.blob_type == BlobKind::OsmHeader {
                 past_header = true;
                 continue;
             }
-            if !past_header || frame.blob_type != "OSMData" {
+            if !past_header || frame.blob_type != BlobKind::OsmData {
                 continue;
             }
             if frame_tx.send(frame).is_err() {

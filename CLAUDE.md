@@ -5,6 +5,7 @@ Rust library for reading and writing OpenStreetMap PBF files. Fork of [osmpbf](h
 ## Bash rules
 - Never use sed, find, awk, or complex bash commands. Write a script instead.
 - Never chain commands with &&. Write a script instead.
+- Never chain commands with ;. Write a script instead.
 - Never pipe commands with |. Write a script instead.
 - Never read or write from /tmp. All data lives in the project.
 - Never run raw cargo, curl, pkill. Use `dev`.
@@ -19,7 +20,7 @@ Standalone development tool at `~/Programs/dev`. Installed via `cargo install --
 - `dev bench read [--dataset name] [--pbf path] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite.
 - `dev bench write [--dataset name] [--pbf path] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite.
 - `dev bench merge [--dataset name] [--pbf path] [--osc path] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite.
-- `dev bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (17 commands, external timing). Use `all` for full suite. Results stored in SQLite.
+- `dev bench commands [command] [--dataset name] [--pbf path] [--runs N]` — CLI command benchmark (19 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite.
 - `dev bench extract [--dataset name] [--pbf path] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan.
 - `dev bench allocator [--dataset name] [--pbf path] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs.
 - `dev bench blob-filter [--dataset name] [--pbf-indexed path] [--pbf-raw path] [--runs N]` — indexdata vs non-indexdata performance comparison.

@@ -763,16 +763,15 @@ impl BlockBuilder {
         self.dense_visibles.push(meta.visible);
     }
 
-    /// Serialize the current block to `PrimitiveBlock` bytes and reset.
+    /// Encode the current block into `encode_buf` and reset block state.
     ///
-    /// Returns `None` if the block is empty. The returned slice borrows from
-    /// an internal encode buffer that is reused across calls, eliminating
-    /// per-block allocation after the first `take()`.
-    #[hotpath::measure]
-    pub fn take(&mut self) -> io::Result<Option<&[u8]>> {
+    /// Returns `false` if the block is empty (nothing to encode).
+    /// After this returns `true`, `encode_buf` contains the serialized
+    /// `PrimitiveBlock` bytes.
+    fn encode_block(&mut self) -> io::Result<bool> {
         let block_type = match self.block_type {
             Some(t) => t,
-            None => return Ok(None),
+            None => return Ok(false),
         };
 
         // All block types: direct wire-format encoding
@@ -800,7 +799,40 @@ impl BlockBuilder {
         }
 
         self.reset();
-        Ok(Some(&self.encode_buf))
+        Ok(true)
+    }
+
+    /// Serialize the current block to `PrimitiveBlock` bytes and reset.
+    ///
+    /// Returns `None` if the block is empty. The returned slice borrows from
+    /// an internal encode buffer that is reused across calls, eliminating
+    /// per-block allocation after the first `take()`.
+    #[hotpath::measure]
+    pub fn take(&mut self) -> io::Result<Option<&[u8]>> {
+        if self.encode_block()? {
+            Ok(Some(&self.encode_buf))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Serialize the current block and return owned bytes.
+    ///
+    /// Like [`take`](Self::take) but returns an owned `Vec<u8>` instead of a
+    /// borrow. Use this when the caller needs ownership (pipelined writers,
+    /// parallel rayon tasks) to avoid a `to_vec()` copy.
+    ///
+    /// Unlike `take()`, this does not reuse the encode buffer across calls —
+    /// each call yields a fresh `Vec` and the internal buffer restarts empty.
+    /// The total allocation is the same as `take()` + `to_vec()` but the
+    /// `memcpy` is eliminated.
+    #[hotpath::measure]
+    pub fn take_owned(&mut self) -> io::Result<Option<Vec<u8>>> {
+        if self.encode_block()? {
+            Ok(Some(std::mem::take(&mut self.encode_buf)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Encode DenseNodes directly to wire format into `encode_buf`.

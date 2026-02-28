@@ -25,15 +25,16 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 /// Flush the current block from a [`BlockBuilder`] into a [`PbfWriter`].
 ///
-/// If the builder has accumulated elements, `take()` serializes them into a
-/// protobuf `PrimitiveBlock` and the bytes are written as a blob. If the
-/// builder is empty, this is a no-op.
+/// If the builder has accumulated elements, `take_owned()` serializes them
+/// into a protobuf `PrimitiveBlock` and the owned bytes are moved into the
+/// writer (no `to_vec()` copy in pipelined mode). If the builder is empty,
+/// this is a no-op.
 pub(crate) fn flush_block(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if let Some(bytes) = bb.take()? {
-        writer.write_primitive_block(bytes)?;
+    if let Some(bytes) = bb.take_owned()? {
+        writer.write_primitive_block_owned(bytes)?;
     }
     Ok(())
 }

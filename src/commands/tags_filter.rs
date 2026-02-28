@@ -254,8 +254,8 @@ pub fn tags_filter(
 const BATCH_SIZE: usize = 64;
 
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
-    if let Some(bytes) = bb.take().map_err(|e| e.to_string())? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned().map_err(|e| e.to_string())? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -421,8 +421,8 @@ fn process_filter_batch(
         stats.nodes_matched += block_stats.nodes_matched;
         stats.ways_matched += block_stats.ways_matched;
         stats.relations_matched += block_stats.relations_matched;
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
     Ok(())
@@ -550,8 +550,8 @@ fn process_pass2_batch(
         stats.nodes_from_ways += block_stats.nodes_from_ways;
         stats.ways_matched += block_stats.ways_matched;
         stats.relations_matched += block_stats.relations_matched;
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
     Ok(())

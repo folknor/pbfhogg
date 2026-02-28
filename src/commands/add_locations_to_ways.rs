@@ -308,8 +308,8 @@ use super::{dense_node_metadata, element_metadata};
 
 /// Flush the current block from a [`BlockBuilder`] into a local output buffer.
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(bytes) = bb.take()? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned()? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -458,8 +458,8 @@ fn process_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_stats(&mut total, &block_stats);
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
 

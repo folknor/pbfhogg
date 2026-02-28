@@ -398,8 +398,8 @@ fn ensure_relation_capacity(
 // ---------------------------------------------------------------------------
 
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> MergeResult<()> {
-    if let Some(bytes) = bb.take()? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned()? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -1233,9 +1233,9 @@ pub fn merge(
                 }
                 BatchSlot::Rewrite { job_index, index: _ } => {
                     flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
-                    let output = &rewrite_outputs[*job_index];
-                    for block_bytes in &output.blocks {
-                        writer.write_primitive_block(block_bytes)?;
+                    let output = &mut rewrite_outputs[*job_index];
+                    for block_bytes in output.blocks.drain(..) {
+                        writer.write_primitive_block_owned(block_bytes)?;
                     }
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;

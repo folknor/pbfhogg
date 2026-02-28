@@ -355,6 +355,44 @@ impl<W: Write> PbfWriter<W> {
         }
     }
 
+    /// Write an `OSMData` blob, taking ownership of the serialized bytes.
+    ///
+    /// Like [`write_primitive_block`](Self::write_primitive_block) but moves
+    /// the `Vec` into the pipeline closure instead of copying. Use with
+    /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
+    /// to eliminate the `to_vec()` copy in pipelined mode.
+    pub fn write_primitive_block_owned(&mut self, block_bytes: Vec<u8>) -> io::Result<()> {
+        if let Some(ref mut pipeline) = self.pipeline {
+            let seq = pipeline.seq;
+            pipeline.seq += 1;
+            let compression = self.compression;
+            let tx = pipeline.tx.clone();
+            rayon::spawn(move || {
+                let indexdata = blob_index::scan_block_ids(&block_bytes)
+                    .map(|idx| idx.serialize());
+                let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+                    frame_blob_into(
+                        "OSMData",
+                        &block_bytes,
+                        &compression,
+                        indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                        scratch,
+                    )
+                });
+                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
+            });
+            Ok(())
+        } else {
+            let indexdata = blob_index::scan_block_ids(&block_bytes)
+                .map(|idx| idx.serialize());
+            self.write_framed_blob(
+                "OSMData",
+                &block_bytes,
+                indexdata.as_ref().map(<[u8; 26]>::as_slice),
+            )
+        }
+    }
+
     /// Write pre-framed raw blob bytes directly to the output.
     ///
     /// Used for passthrough of unaffected blocks during merge.

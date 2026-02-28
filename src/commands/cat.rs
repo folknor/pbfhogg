@@ -176,8 +176,8 @@ const BATCH_SIZE: usize = 64;
 /// Like `flush_block` but writes to a `Vec<Vec<u8>>` instead of a `PbfWriter`,
 /// so it can be called from rayon worker threads without requiring `&mut PbfWriter`.
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(bytes) = bb.take()? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned()? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -385,8 +385,8 @@ fn process_batch(
         let (blocks, count) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         total_blobs += 1;
         total_elements += count;
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
 

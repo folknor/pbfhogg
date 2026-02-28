@@ -282,8 +282,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 /// Like `flush_block` but writes to a `Vec<Vec<u8>>` instead of a `PbfWriter`,
 /// so it can be called from rayon worker threads without requiring `&mut PbfWriter`.
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(bytes) = bb.take()? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned()? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -421,8 +421,8 @@ fn process_filter_batch(
         total_nodes += nodes;
         total_ways += ways;
         total_relations += relations;
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
 

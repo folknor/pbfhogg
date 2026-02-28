@@ -525,8 +525,8 @@ pub fn extract(
 const BATCH_SIZE: usize = 64;
 
 fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
-    if let Some(bytes) = bb.take().map_err(|e| e.to_string())? {
-        output.push(bytes.to_vec());
+    if let Some(bytes) = bb.take_owned().map_err(|e| e.to_string())? {
+        output.push(bytes);
     }
     Ok(())
 }
@@ -868,8 +868,8 @@ fn process_extract_pass2_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_extract_stats(stats, &block_stats);
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
     Ok(())
@@ -1172,8 +1172,8 @@ fn process_extract_pass3_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_extract_stats(stats, &block_stats);
-        for block_bytes in &blocks {
-            writer.write_primitive_block(block_bytes)?;
+        for block_bytes in blocks {
+            writer.write_primitive_block_owned(block_bytes)?;
         }
     }
     Ok(())

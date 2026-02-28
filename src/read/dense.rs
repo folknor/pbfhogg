@@ -155,6 +155,7 @@ impl<'a> DenseNodeIter<'a> {
 impl<'a> Iterator for DenseNodeIter<'a> {
     type Item = DenseNode<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         match (
             self.dids.next(),

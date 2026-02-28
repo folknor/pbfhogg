@@ -178,6 +178,7 @@ impl<'a> WireGroup<'a> {
         Self { data }
     }
 
+    #[inline]
     pub fn nodes(&self) -> WireMessageIter<'a> {
         WireMessageIter::new(self.data, 1)
     }
@@ -193,10 +194,12 @@ impl<'a> WireGroup<'a> {
         Ok(None)
     }
 
+    #[inline]
     pub fn ways(&self) -> WireMessageIter<'a> {
         WireMessageIter::new(self.data, 3)
     }
 
+    #[inline]
     pub fn relations(&self) -> WireMessageIter<'a> {
         WireMessageIter::new(self.data, 4)
     }
@@ -234,6 +237,7 @@ impl<'a> WireMessageIter<'a> {
 impl<'a> Iterator for WireMessageIter<'a> {
     type Item = &'a [u8];
 
+    #[inline]
     fn next(&mut self) -> Option<&'a [u8]> {
         loop {
             let (field, wire_type) = self.cursor.read_tag().ok()??;

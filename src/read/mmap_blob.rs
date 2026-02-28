@@ -218,6 +218,10 @@ impl MmapBlobReader {
         // Now: we store the raw `memmap2::Mmap` directly. All sub-slicing in `next()`
         // uses `&self.mmap[range]` which goes through `Deref<Target=[u8]>` -- a plain
         // pointer dereference, no atomic operations.
+        // Hint the kernel that we'll read sequentially (madvise MADV_SEQUENTIAL).
+        // This enables aggressive read-ahead and early page eviction, reducing
+        // page faults on large files. Ignore errors (advisory, not critical).
+        drop(mmap.mmap.advise(memmap2::Advice::Sequential));
         MmapBlobReader {
             mmap: mmap.mmap,
             offset: 0,

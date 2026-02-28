@@ -27,7 +27,7 @@ pub(crate) struct BlobIndex {
 const INDEX_VERSION: u8 = 0x01;
 
 /// Serialized index size: 1 version + 1 type + 8 min_id + 8 max_id + 8 count = 26 bytes.
-const INDEX_SIZE: usize = 26;
+pub const INDEX_SIZE: usize = 26;
 
 impl BlobIndex {
     /// Serialize to the 26-byte indexdata format.

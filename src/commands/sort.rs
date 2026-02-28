@@ -230,7 +230,7 @@ fn build_blob_index(
 
         let (blob_type, data_size, raw_index) =
             parse_blob_header_with_index(&header_bytes)?;
-        let index = raw_index.as_deref().and_then(BlobIndex::deserialize);
+        let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
         let has_indexdata = index.is_some();
 
         // Read Blob bytes

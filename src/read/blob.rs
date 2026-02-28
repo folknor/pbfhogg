@@ -166,7 +166,8 @@ pub(crate) enum BlobKind {
 pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
     pub datasize: i32,
-    pub indexdata: Option<Vec<u8>>,
+    /// Blob-level index: always 26 bytes when present, stored inline.
+    pub indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]>,
 }
 
 impl WireBlobHeader {
@@ -176,7 +177,7 @@ impl WireBlobHeader {
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
-        let mut indexdata: Option<Vec<u8>> = None;
+        let mut indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
@@ -195,7 +196,9 @@ impl WireBlobHeader {
                 2 => {
                     // indexdata: bytes (len-delimited)
                     let bytes = cursor.read_len_delimited()?;
-                    indexdata = Some(bytes.to_vec());
+                    if let Ok(arr) = <[u8; crate::blob_index::INDEX_SIZE]>::try_from(bytes) {
+                        indexdata = Some(arr);
+                    }
                 }
                 3 => {
                     // datasize: int32 (varint)
@@ -409,8 +412,8 @@ impl Blob {
     pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
         self.header
             .indexdata
-            .as_deref()
-            .and_then(crate::blob_index::BlobIndex::deserialize)
+            .as_ref()
+            .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
     }
 
     /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
@@ -855,7 +858,7 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, u
 /// that allows merge to classify blobs without decompression.
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
-) -> Result<(BlobKind, usize, Option<Vec<u8>>)> {
+) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>)> {
     let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {

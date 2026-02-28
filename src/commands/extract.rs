@@ -4,7 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::blob_index::BlobIndex;
+use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
@@ -560,26 +560,10 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
         strategy: "complete_ways",
     };
 
-    // --- Pass 1: Collect matches ---
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut all_way_node_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
-
+    // --- Pass 1: Collect matches (parallel batched) ---
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let reader = ElementReader::open(input, direct_io)?;
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        collect_pass1_matches(
-            &block,
-            region,
-            &bbox_int,
-            &mut bbox_node_ids,
-            &mut matched_way_ids,
-            &mut all_way_node_ids,
-            &mut matched_relation_ids,
-        );
-    }
+    let (bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids) =
+        parallel_collect_pass1(input, region, &bbox_int, direct_io)?;
 
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -613,16 +597,207 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     Ok(stats)
 }
 
-/// Collect matching element IDs during pass 1 of the complete-ways strategy.
+// ---------------------------------------------------------------------------
+// Parallel pass 1: batched fold+reduce
+// ---------------------------------------------------------------------------
+
+/// Cheaply detect the element type of a PrimitiveBlock by checking the first group.
+/// For sorted PBFs, each block contains only one element type.
+fn detect_block_kind(block: &PrimitiveBlock) -> Option<ElemKind> {
+    for group in block.groups() {
+        if group.dense_nodes().next().is_some() || group.nodes().next().is_some() {
+            return Some(ElemKind::Node);
+        }
+        if group.ways().next().is_some() {
+            return Some(ElemKind::Way);
+        }
+        if group.relations().next().is_some() {
+            return Some(ElemKind::Relation);
+        }
+    }
+    None
+}
+
+/// Process a batch of node blocks in parallel, merging results into `bbox_node_ids`.
+fn par_merge_node_batch(
+    batch: &[PrimitiveBlock],
+    region: &Region,
+    bbox_int: &BboxInt,
+    bbox_node_ids: &mut IdSetDense,
+) {
+    let partial = batch.par_iter()
+        .fold(IdSetDense::new, |mut set, block| {
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) => {
+                        set.set(dn.id());
+                    }
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) => {
+                        set.set(n.id());
+                    }
+                    _ => {}
+                }
+            }
+            set
+        })
+        .reduce(IdSetDense::new, |mut a, b| { a.merge(b); a });
+    bbox_node_ids.merge(partial);
+}
+
+/// Process a batch of way blocks in parallel, merging results into the way ID sets.
+fn par_merge_way_batch(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    all_way_node_ids: &mut IdSetDense,
+) {
+    let (partial_ways, partial_nodes) = batch.par_iter()
+        .fold(
+            || (IdSetDense::new(), IdSetDense::new()),
+            |(mut ways, mut nodes), block| {
+                for element in block.elements_skip_metadata() {
+                    if let Element::Way(w) = &element
+                        && w.refs().any(|r| bbox_node_ids.get(r))
+                    {
+                        ways.set(w.id());
+                        for r in w.refs() {
+                            nodes.set(r);
+                        }
+                    }
+                }
+                (ways, nodes)
+            },
+        )
+        .reduce(
+            || (IdSetDense::new(), IdSetDense::new()),
+            |(mut wa, mut na), (wb, nb)| { wa.merge(wb); na.merge(nb); (wa, na) },
+        );
+    matched_way_ids.merge(partial_ways);
+    all_way_node_ids.merge(partial_nodes);
+}
+
+/// Process a batch of relation blocks in parallel (complete strategy).
+fn par_merge_rel_batch(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+) {
+    let partial = batch.par_iter()
+        .fold(IdSetDense::new, |mut set, block| {
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
+                    set.set(r.id());
+                }
+            }
+            set
+        })
+        .reduce(IdSetDense::new, |mut a, b| { a.merge(b); a });
+    matched_relation_ids.merge(partial);
+}
+
+/// Process a batch of relation blocks in parallel (smart strategy).
+/// Additionally collects extra way and node IDs from multipolygon/boundary relations.
+#[allow(clippy::too_many_arguments)]
+fn par_merge_rel_batch_smart(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+    extra_way_ids: &mut IdSetDense,
+    extra_node_ids: &mut IdSetDense,
+) {
+    let (partial_rels, partial_ways, partial_nodes) = batch.par_iter()
+        .fold(
+            || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
+            |(mut rels, mut ways, mut nodes), block| {
+                for element in block.elements_skip_metadata() {
+                    if let Element::Relation(r) = &element
+                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                    {
+                        rels.set(r.id());
+                        if is_smart_relation(r) {
+                            for m in r.members() {
+                                match m.id {
+                                    MemberId::Way(id) => ways.set(id),
+                                    MemberId::Node(id) => nodes.set(id),
+                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+                (rels, ways, nodes)
+            },
+        )
+        .reduce(
+            || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
+            |(mut ra, mut wa, mut na), (rb, wb, nb)| {
+                ra.merge(rb); wa.merge(wb); na.merge(nb);
+                (ra, wa, na)
+            },
+        );
+    matched_relation_ids.merge(partial_rels);
+    extra_way_ids.merge(partial_ways);
+    extra_node_ids.merge(partial_nodes);
+}
+
+/// Parallel pass 1 for the complete-ways strategy.
 ///
-/// This function is called once per PrimitiveBlock. Nodes in the region are
-/// added to `bbox_node_ids`, ways with any node in the region are added to
-/// `matched_way_ids` (and all their node refs to `all_way_node_ids`), and
-/// relations referencing matched nodes/ways are added to `matched_relation_ids`.
-///
-/// All ID sets use `IdSetDense` for O(1) lookup and insertion with no sorting.
-fn collect_pass1_matches(
-    block: &crate::PrimitiveBlock,
+/// Processes blocks in batches via rayon, transitioning between phases
+/// (nodes -> ways -> relations) based on block element type.
+fn parallel_collect_pass1(
+    input: &Path,
+    region: &Region,
+    bbox_int: &BboxInt,
+    direct_io: bool,
+) -> Result<(IdSetDense, IdSetDense, IdSetDense, IdSetDense)> {
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut all_way_node_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
+
+    let reader = ElementReader::open(input, direct_io)?;
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut phase = ElemKind::Node;
+
+    for block_result in reader.into_blocks_pipelined() {
+        let block = block_result?;
+        let kind = detect_block_kind(&block).unwrap_or(ElemKind::Node);
+
+        // Handle phase transitions: flush current batch before switching
+        if kind != phase {
+            flush_pass1_batch(&mut batch, phase, region, bbox_int,
+                &mut bbox_node_ids, &mut matched_way_ids,
+                &mut all_way_node_ids, &mut matched_relation_ids);
+            phase = kind;
+        }
+
+        batch.push(block);
+        if batch.len() >= BATCH_SIZE {
+            flush_pass1_batch(&mut batch, phase, region, bbox_int,
+                &mut bbox_node_ids, &mut matched_way_ids,
+                &mut all_way_node_ids, &mut matched_relation_ids);
+        }
+    }
+
+    // Flush remaining
+    flush_pass1_batch(&mut batch, phase, region, bbox_int,
+        &mut bbox_node_ids, &mut matched_way_ids,
+        &mut all_way_node_ids, &mut matched_relation_ids);
+
+    Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids))
+}
+
+/// Dispatch a batch to the appropriate parallel merge function based on current phase.
+#[allow(clippy::too_many_arguments)]
+fn flush_pass1_batch(
+    batch: &mut Vec<PrimitiveBlock>,
+    phase: ElemKind,
     region: &Region,
     bbox_int: &BboxInt,
     bbox_node_ids: &mut IdSetDense,
@@ -630,33 +805,91 @@ fn collect_pass1_matches(
     all_way_node_ids: &mut IdSetDense,
     matched_relation_ids: &mut IdSetDense,
 ) {
-    for element in block.elements_skip_metadata() {
-        match &element {
-            Element::DenseNode(dn) => {
-                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
-                    bbox_node_ids.set(dn.id());
-                }
-            }
-            Element::Node(n) => {
-                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
-                    bbox_node_ids.set(n.id());
-                }
-            }
-            Element::Way(w) => {
-                if w.refs().any(|r| bbox_node_ids.get(r)) {
-                    matched_way_ids.set(w.id());
-                    for r in w.refs() {
-                        all_way_node_ids.set(r);
-                    }
-                }
-            }
-            Element::Relation(r) => {
-                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
-                    matched_relation_ids.set(r.id());
-                }
-            }
+    if batch.is_empty() {
+        return;
+    }
+    match phase {
+        ElemKind::Node => par_merge_node_batch(batch, region, bbox_int, bbox_node_ids),
+        ElemKind::Way => par_merge_way_batch(batch, bbox_node_ids, matched_way_ids, all_way_node_ids),
+        ElemKind::Relation => par_merge_rel_batch(batch, bbox_node_ids, matched_way_ids, matched_relation_ids),
+    }
+    batch.clear();
+}
+
+/// Parallel pass 1 for the smart strategy.
+///
+/// Same as `parallel_collect_pass1` but additionally collects extra way and node IDs
+/// from multipolygon/boundary relations.
+fn parallel_collect_pass1_smart(
+    input: &Path,
+    region: &Region,
+    bbox_int: &BboxInt,
+    direct_io: bool,
+) -> Result<(IdSetDense, IdSetDense, IdSetDense, IdSetDense, IdSetDense, IdSetDense)> {
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut all_way_node_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
+    let mut extra_way_ids = IdSetDense::new();
+    let mut extra_node_ids = IdSetDense::new();
+
+    let reader = ElementReader::open(input, direct_io)?;
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut phase = ElemKind::Node;
+
+    for block_result in reader.into_blocks_pipelined() {
+        let block = block_result?;
+        let kind = detect_block_kind(&block).unwrap_or(ElemKind::Node);
+
+        if kind != phase {
+            flush_pass1_batch_smart(&mut batch, phase, region, bbox_int,
+                &mut bbox_node_ids, &mut matched_way_ids,
+                &mut all_way_node_ids, &mut matched_relation_ids,
+                &mut extra_way_ids, &mut extra_node_ids);
+            phase = kind;
+        }
+
+        batch.push(block);
+        if batch.len() >= BATCH_SIZE {
+            flush_pass1_batch_smart(&mut batch, phase, region, bbox_int,
+                &mut bbox_node_ids, &mut matched_way_ids,
+                &mut all_way_node_ids, &mut matched_relation_ids,
+                &mut extra_way_ids, &mut extra_node_ids);
         }
     }
+
+    flush_pass1_batch_smart(&mut batch, phase, region, bbox_int,
+        &mut bbox_node_ids, &mut matched_way_ids,
+        &mut all_way_node_ids, &mut matched_relation_ids,
+        &mut extra_way_ids, &mut extra_node_ids);
+
+    Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids, extra_way_ids, extra_node_ids))
+}
+
+/// Dispatch a batch for the smart strategy.
+#[allow(clippy::too_many_arguments)]
+fn flush_pass1_batch_smart(
+    batch: &mut Vec<PrimitiveBlock>,
+    phase: ElemKind,
+    region: &Region,
+    bbox_int: &BboxInt,
+    bbox_node_ids: &mut IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    all_way_node_ids: &mut IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+    extra_way_ids: &mut IdSetDense,
+    extra_node_ids: &mut IdSetDense,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    match phase {
+        ElemKind::Node => par_merge_node_batch(batch, region, bbox_int, bbox_node_ids),
+        ElemKind::Way => par_merge_way_batch(batch, bbox_node_ids, matched_way_ids, all_way_node_ids),
+        ElemKind::Relation => par_merge_rel_batch_smart(batch, bbox_node_ids, matched_way_ids,
+            matched_relation_ids, extra_way_ids, extra_node_ids),
+    }
+    batch.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -819,25 +1052,11 @@ fn extract_smart(
         strategy: "smart",
     };
 
-    // --- Pass 1: Collect matches + smart relation deps ---
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut all_way_node_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
-    let mut extra_way_ids = IdSetDense::new();
-    let mut extra_node_ids = IdSetDense::new();
-
+    // --- Pass 1: Collect matches + smart relation deps (parallel batched) ---
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let reader = ElementReader::open(input, direct_io)?;
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        collect_pass1_smart(
-            &block, region, &bbox_int,
-            &mut bbox_node_ids, &mut matched_way_ids,
-            &mut all_way_node_ids, &mut matched_relation_ids,
-            &mut extra_way_ids, &mut extra_node_ids,
-        );
-    }
+    let (bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+         extra_way_ids, mut extra_node_ids) =
+        parallel_collect_pass1_smart(input, region, &bbox_int, direct_io)?;
 
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
@@ -890,62 +1109,6 @@ fn extract_smart(
 
     writer.flush()?;
     Ok(stats)
-}
-
-/// Collect matching element IDs during pass 1 of the smart strategy.
-///
-/// Same as `collect_pass1_matches` but additionally collects extra way and
-/// node IDs from matched multipolygon/boundary relations.
-#[allow(clippy::too_many_arguments)]
-fn collect_pass1_smart(
-    block: &crate::PrimitiveBlock,
-    region: &Region,
-    bbox_int: &BboxInt,
-    bbox_node_ids: &mut IdSetDense,
-    matched_way_ids: &mut IdSetDense,
-    all_way_node_ids: &mut IdSetDense,
-    matched_relation_ids: &mut IdSetDense,
-    extra_way_ids: &mut IdSetDense,
-    extra_node_ids: &mut IdSetDense,
-) {
-    for element in block.elements_skip_metadata() {
-        match &element {
-            Element::DenseNode(dn) => {
-                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
-                    bbox_node_ids.set(dn.id());
-                }
-            }
-            Element::Node(n) => {
-                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
-                    bbox_node_ids.set(n.id());
-                }
-            }
-            Element::Way(w) => {
-                if w.refs().any(|r| bbox_node_ids.get(r)) {
-                    matched_way_ids.set(w.id());
-                    for r in w.refs() {
-                        all_way_node_ids.set(r);
-                    }
-                }
-            }
-            Element::Relation(r) => {
-                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
-                    matched_relation_ids.set(r.id());
-                    // For multipolygon/boundary relations, collect all member
-                    // IDs so their ways and nodes are fully included.
-                    if is_smart_relation(r) {
-                        for m in r.members() {
-                            match m.id {
-                                MemberId::Way(id) => extra_way_ids.set(id),
-                                MemberId::Node(id) => extra_node_ids.set(id),
-                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

@@ -4,6 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use super::id_set_dense::IdSetDense;
 use super::{dense_node_metadata, element_metadata};
 use crate::blob_index::BlobIndex;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
@@ -438,7 +439,7 @@ struct Pass2IdSets<'a> {
     matched_node_ids: &'a [i64],
     matched_way_ids: &'a [i64],
     matched_relation_ids: &'a [i64],
-    way_dep_node_ids: &'a [i64],
+    way_dep_node_ids: &'a IdSetDense,
 }
 
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
@@ -462,7 +463,7 @@ fn filter_block_pass2(
         match &element {
             Element::DenseNode(dn) => {
                 let direct = ids.matched_node_ids.binary_search(&dn.id()).is_ok();
-                let from_way = ids.way_dep_node_ids.binary_search(&dn.id()).is_ok();
+                let from_way = ids.way_dep_node_ids.get(dn.id());
                 if direct || from_way {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -476,7 +477,7 @@ fn filter_block_pass2(
             }
             Element::Node(n) => {
                 let direct = ids.matched_node_ids.binary_search(&n.id()).is_ok();
-                let from_way = ids.way_dep_node_ids.binary_search(&n.id()).is_ok();
+                let from_way = ids.way_dep_node_ids.get(n.id());
                 if direct || from_way {
                     if !bb.can_add_node() {
                         flush_local(bb, output)?;
@@ -609,7 +610,7 @@ fn tags_filter_two_pass(
     let mut matched_node_ids: Vec<i64> = Vec::new();
     let mut matched_way_ids: Vec<i64> = Vec::new();
     let mut matched_relation_ids: Vec<i64> = Vec::new();
-    let mut way_dep_node_ids: Vec<i64> = Vec::new();
+    let mut way_dep_node_ids = IdSetDense::new();
 
     // Pass 1: skip blob types that no expression targets.
     let reader = ElementReader::open(input, direct_io)?;
@@ -641,7 +642,9 @@ fn tags_filter_two_pass(
                     tags_buf.extend(w.tags());
                     if element_matches(expressions, &tags_buf, false, true, false) {
                         matched_way_ids.push(w.id());
-                        way_dep_node_ids.extend(w.refs());
+                        for r in w.refs() {
+                            way_dep_node_ids.set(r);
+                        }
                     }
                 }
                 Element::Relation(r) => {
@@ -672,8 +675,6 @@ fn tags_filter_two_pass(
     matched_way_ids.dedup();
     matched_relation_ids.sort_unstable();
     matched_relation_ids.dedup();
-    way_dep_node_ids.sort_unstable();
-    way_dep_node_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.

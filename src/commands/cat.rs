@@ -138,7 +138,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         #[cfg(feature = "linux-direct-io")]
         let input_fd = reader.raw_fd();
 
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             match frame.blob_type.as_str() {
                 "OSMHeader" => {}
                 "OSMData" => {
@@ -149,7 +149,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
                         frame.frame_bytes.len() as u64,
                     )?;
                     #[cfg(not(feature = "linux-direct-io"))]
-                    writer.write_raw(&frame.frame_bytes)?;
+                    writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                     blobs += 1;
                 }
                 _ => {}

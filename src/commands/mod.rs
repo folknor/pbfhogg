@@ -33,8 +33,8 @@ pub(crate) fn flush_block(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if let Some(bytes) = bb.take_owned()? {
-        writer.write_primitive_block_owned(bytes)?;
+    if let Some((bytes, index)) = bb.take_owned()? {
+        writer.write_primitive_block_owned(bytes, index)?;
     }
     Ok(())
 }

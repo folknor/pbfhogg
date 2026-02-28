@@ -6,6 +6,7 @@
 //! Handles string table construction, delta encoding, dense node packing,
 //! and block size limits (8000 entities per block, matching osmium).
 
+use crate::blob_index::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
 use rustc_hash::FxHashMap;
 use std::collections::hash_map::Entry;
@@ -227,6 +228,10 @@ pub struct BlockBuilder {
     block_type: Option<BlockType>,
     count: usize,
 
+    // ID range tracking for BlobIndex (avoids scan_block_ids on the write path).
+    min_id: i64,
+    max_id: i64,
+
     // Dense node accumulators
     dense_ids: Vec<i64>,
     dense_lats: Vec<i64>,
@@ -297,6 +302,8 @@ impl BlockBuilder {
             string_table: StringTable::new(),
             block_type: None,
             count: 0,
+            min_id: i64::MAX,
+            max_id: i64::MIN,
 
             // Pre-allocate dense node vectors to the max block size (8000).
             // One entry per node for each of id, lat, lon.
@@ -343,6 +350,17 @@ impl BlockBuilder {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.count == 0
+    }
+
+    /// Track an element ID for BlobIndex min/max range.
+    #[inline]
+    fn track_id(&mut self, id: i64) {
+        if id < self.min_id {
+            self.min_id = id;
+        }
+        if id > self.max_id {
+            self.max_id = id;
+        }
     }
 
     /// Returns `true` if the string table has been pre-seeded from an input block.
@@ -446,6 +464,7 @@ impl BlockBuilder {
             self.push_default_dense_metadata();
         }
 
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -548,6 +567,7 @@ impl BlockBuilder {
             refs,
             metadata,
         );
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -583,6 +603,7 @@ impl BlockBuilder {
             locations,
             metadata,
         );
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -613,6 +634,7 @@ impl BlockBuilder {
             members,
             metadata,
         );
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -677,6 +699,7 @@ impl BlockBuilder {
             self.push_default_dense_metadata();
         }
 
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -707,6 +730,7 @@ impl BlockBuilder {
             refs_data,
             info_data,
         );
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -742,6 +766,7 @@ impl BlockBuilder {
             types_data,
             info_data,
         );
+        self.track_id(id);
         self.count += 1;
     }
 
@@ -765,13 +790,26 @@ impl BlockBuilder {
 
     /// Encode the current block into `encode_buf` and reset block state.
     ///
-    /// Returns `false` if the block is empty (nothing to encode).
-    /// After this returns `true`, `encode_buf` contains the serialized
-    /// `PrimitiveBlock` bytes.
-    fn encode_block(&mut self) -> io::Result<bool> {
+    /// Returns `None` if the block is empty (nothing to encode).
+    /// After this returns `Some(index)`, `encode_buf` contains the serialized
+    /// `PrimitiveBlock` bytes and the returned `BlobIndex` describes the block
+    /// contents (element type, ID range, count).
+    fn encode_block(&mut self) -> io::Result<Option<BlobIndex>> {
         let block_type = match self.block_type {
             Some(t) => t,
-            None => return Ok(false),
+            None => return Ok(None),
+        };
+
+        let kind = match block_type {
+            BlockType::DenseNodes => ElemKind::Node,
+            BlockType::Ways => ElemKind::Way,
+            BlockType::Relations => ElemKind::Relation,
+        };
+        let index = BlobIndex {
+            kind,
+            min_id: self.min_id,
+            max_id: self.max_id,
+            count: self.count as u64,
         };
 
         // All block types: direct wire-format encoding
@@ -799,7 +837,7 @@ impl BlockBuilder {
         }
 
         self.reset();
-        Ok(true)
+        Ok(Some(index))
     }
 
     /// Serialize the current block to `PrimitiveBlock` bytes and reset.
@@ -809,27 +847,28 @@ impl BlockBuilder {
     /// per-block allocation after the first `take()`.
     #[hotpath::measure]
     pub fn take(&mut self) -> io::Result<Option<&[u8]>> {
-        if self.encode_block()? {
+        if self.encode_block()?.is_some() {
             Ok(Some(&self.encode_buf))
         } else {
             Ok(None)
         }
     }
 
-    /// Serialize the current block and return owned bytes.
+    /// Serialize the current block and return owned bytes with a [`BlobIndex`].
     ///
     /// Like [`take`](Self::take) but returns an owned `Vec<u8>` instead of a
-    /// borrow. Use this when the caller needs ownership (pipelined writers,
-    /// parallel rayon tasks) to avoid a `to_vec()` copy.
+    /// borrow, plus a pre-computed [`BlobIndex`] describing the block contents
+    /// (element type, ID range, count). This eliminates the need for the
+    /// writer to rescan the serialized bytes via `scan_block_ids`.
     ///
     /// Unlike `take()`, this does not reuse the encode buffer across calls —
     /// each call yields a fresh `Vec` and the internal buffer restarts empty.
     /// The total allocation is the same as `take()` + `to_vec()` but the
     /// `memcpy` is eliminated.
     #[hotpath::measure]
-    pub fn take_owned(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.encode_block()? {
-            Ok(Some(std::mem::take(&mut self.encode_buf)))
+    pub fn take_owned(&mut self) -> io::Result<Option<(Vec<u8>, BlobIndex)>> {
+        if let Some(index) = self.encode_block()? {
+            Ok(Some((std::mem::take(&mut self.encode_buf), index)))
         } else {
             Ok(None)
         }
@@ -896,6 +935,8 @@ impl BlockBuilder {
     fn reset(&mut self) {
         self.block_type = None;
         self.count = 0;
+        self.min_id = i64::MAX;
+        self.max_id = i64::MIN;
         self.has_dense_metadata = false;
         self.pre_seeded = false;
 

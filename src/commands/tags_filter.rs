@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::{dense_node_metadata, element_metadata};
+use crate::blob_index::BlobIndex;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -253,9 +254,9 @@ pub fn tags_filter(
 
 const BATCH_SIZE: usize = 64;
 
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
-    if let Some(bytes) = bb.take_owned().map_err(|e| e.to_string())? {
-        output.push(bytes);
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> std::result::Result<(), String> {
+    if let Some(pair) = bb.take_owned().map_err(|e| e.to_string())? {
+        output.push(pair);
     }
     Ok(())
 }
@@ -266,7 +267,7 @@ fn filter_block_parallel(
     block: &PrimitiveBlock,
     expressions: &[Expression],
     bb: &mut BlockBuilder,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<u8>, BlobIndex)>,
 ) -> std::result::Result<TagsFilterStats, String> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -402,13 +403,13 @@ fn process_filter_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TagsFilterStats,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<Vec<u8>>, TagsFilterStats), String>;
+    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, TagsFilterStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<Vec<u8>> = Vec::new();
+                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
                 let block_stats = filter_block_parallel(block, expressions, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
@@ -421,8 +422,8 @@ fn process_filter_batch(
         stats.nodes_matched += block_stats.nodes_matched;
         stats.ways_matched += block_stats.ways_matched;
         stats.relations_matched += block_stats.relations_matched;
-        for block_bytes in blocks {
-            writer.write_primitive_block_owned(block_bytes)?;
+        for (block_bytes, index) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index)?;
         }
     }
     Ok(())
@@ -445,7 +446,7 @@ fn filter_block_pass2(
     block: &PrimitiveBlock,
     ids: &Pass2IdSets<'_>,
     bb: &mut BlockBuilder,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<u8>, BlobIndex)>,
 ) -> std::result::Result<TagsFilterStats, String> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -530,13 +531,13 @@ fn process_pass2_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TagsFilterStats,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<Vec<u8>>, TagsFilterStats), String>;
+    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, TagsFilterStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<Vec<u8>> = Vec::new();
+                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
                 let block_stats = filter_block_pass2(block, ids, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
@@ -550,8 +551,8 @@ fn process_pass2_batch(
         stats.nodes_from_ways += block_stats.nodes_from_ways;
         stats.ways_matched += block_stats.ways_matched;
         stats.relations_matched += block_stats.relations_matched;
-        for block_bytes in blocks {
-            writer.write_primitive_block_owned(block_bytes)?;
+        for (block_bytes, index) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index)?;
         }
     }
     Ok(())

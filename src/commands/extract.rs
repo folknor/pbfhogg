@@ -4,6 +4,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
+use crate::blob_index::BlobIndex;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
@@ -524,9 +525,9 @@ pub fn extract(
 
 const BATCH_SIZE: usize = 64;
 
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<Vec<u8>>) -> std::result::Result<(), String> {
-    if let Some(bytes) = bb.take_owned().map_err(|e| e.to_string())? {
-        output.push(bytes);
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> std::result::Result<(), String> {
+    if let Some(pair) = bb.take_owned().map_err(|e| e.to_string())? {
+        output.push(pair);
     }
     Ok(())
 }
@@ -755,7 +756,7 @@ fn extract_block_pass2(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
     bb: &mut BlockBuilder,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<u8>, BlobIndex)>,
 ) -> std::result::Result<ExtractStats, String> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -851,13 +852,13 @@ fn process_extract_pass2_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<Vec<u8>>, ExtractStats), String>;
+    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, ExtractStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<Vec<u8>> = Vec::new();
+                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
                 let block_stats = extract_block_pass2(block, ids, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
@@ -868,8 +869,8 @@ fn process_extract_pass2_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_extract_stats(stats, &block_stats);
-        for block_bytes in blocks {
-            writer.write_primitive_block_owned(block_bytes)?;
+        for (block_bytes, index) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index)?;
         }
     }
     Ok(())
@@ -1045,7 +1046,7 @@ fn extract_block_pass3(
     block: &PrimitiveBlock,
     ids: &ExtractPass3IdSets<'_>,
     bb: &mut BlockBuilder,
-    output: &mut Vec<Vec<u8>>,
+    output: &mut Vec<(Vec<u8>, BlobIndex)>,
 ) -> std::result::Result<ExtractStats, String> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -1155,13 +1156,13 @@ fn process_extract_pass3_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<Vec<u8>>, ExtractStats), String>;
+    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, ExtractStats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<Vec<u8>> = Vec::new();
+                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
                 let block_stats = extract_block_pass3(block, ids, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
@@ -1172,8 +1173,8 @@ fn process_extract_pass3_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_extract_stats(stats, &block_stats);
-        for block_bytes in blocks {
-            writer.write_primitive_block_owned(block_bytes)?;
+        for (block_bytes, index) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index)?;
         }
     }
     Ok(())

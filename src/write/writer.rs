@@ -358,24 +358,28 @@ impl<W: Write> PbfWriter<W> {
     /// Write an `OSMData` blob, taking ownership of the serialized bytes.
     ///
     /// Like [`write_primitive_block`](Self::write_primitive_block) but moves
-    /// the `Vec` into the pipeline closure instead of copying. Use with
+    /// the `Vec` into the pipeline closure instead of copying, and uses a
+    /// pre-computed [`BlobIndex`](crate::blob_index::BlobIndex) from
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
-    /// to eliminate the `to_vec()` copy in pipelined mode.
-    pub fn write_primitive_block_owned(&mut self, block_bytes: Vec<u8>) -> io::Result<()> {
+    /// instead of rescanning the serialized bytes.
+    pub fn write_primitive_block_owned(
+        &mut self,
+        block_bytes: Vec<u8>,
+        index: blob_index::BlobIndex,
+    ) -> io::Result<()> {
+        let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let tx = pipeline.tx.clone();
             rayon::spawn(move || {
-                let indexdata = blob_index::scan_block_ids(&block_bytes)
-                    .map(|idx| idx.serialize());
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
                         &block_bytes,
                         &compression,
-                        indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                        Some(indexdata.as_slice()),
                         scratch,
                     )
                 });
@@ -383,12 +387,10 @@ impl<W: Write> PbfWriter<W> {
             });
             Ok(())
         } else {
-            let indexdata = blob_index::scan_block_ids(&block_bytes)
-                .map(|idx| idx.serialize());
             self.write_framed_blob(
                 "OSMData",
                 &block_bytes,
-                indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                Some(indexdata.as_slice()),
             )
         }
     }

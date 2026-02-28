@@ -436,9 +436,9 @@ fn process_filter_batch(
 
 /// Read-only ID sets for Pass 2, shared across rayon threads.
 struct Pass2IdSets<'a> {
-    matched_node_ids: &'a [i64],
-    matched_way_ids: &'a [i64],
-    matched_relation_ids: &'a [i64],
+    matched_node_ids: &'a IdSetDense,
+    matched_way_ids: &'a IdSetDense,
+    matched_relation_ids: &'a IdSetDense,
     way_dep_node_ids: &'a IdSetDense,
 }
 
@@ -462,7 +462,7 @@ fn filter_block_pass2(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) => {
-                let direct = ids.matched_node_ids.binary_search(&dn.id()).is_ok();
+                let direct = ids.matched_node_ids.get(dn.id());
                 let from_way = ids.way_dep_node_ids.get(dn.id());
                 if direct || from_way {
                     if !bb.can_add_node() {
@@ -476,7 +476,7 @@ fn filter_block_pass2(
                 }
             }
             Element::Node(n) => {
-                let direct = ids.matched_node_ids.binary_search(&n.id()).is_ok();
+                let direct = ids.matched_node_ids.get(n.id());
                 let from_way = ids.way_dep_node_ids.get(n.id());
                 if direct || from_way {
                     if !bb.can_add_node() {
@@ -490,7 +490,7 @@ fn filter_block_pass2(
                 }
             }
             Element::Way(w) => {
-                if ids.matched_way_ids.binary_search(&w.id()).is_ok() {
+                if ids.matched_way_ids.get(w.id()) {
                     if !bb.can_add_way() {
                         flush_local(bb, output)?;
                     }
@@ -504,7 +504,7 @@ fn filter_block_pass2(
                 }
             }
             Element::Relation(r) => {
-                if ids.matched_relation_ids.binary_search(&r.id()).is_ok() {
+                if ids.matched_relation_ids.get(r.id()) {
                     if !bb.can_add_relation() {
                         flush_local(bb, output)?;
                     }
@@ -580,36 +580,11 @@ fn tags_filter_two_pass(
 
     // --- Pass 1: Collect match results and way dependencies ---
     //
-    // OPTIMIZATION: Use Vec<i64> instead of BTreeSet<i64> for matched element IDs.
-    //
-    // Previously these were BTreeSet<i64>, which stores each entry in a B-tree node
-    // with ~40 bytes overhead per entry (node pointers, balance metadata, alignment
-    // padding). For large tag filters on planet-scale files with millions of matched
-    // elements, this overhead dominates memory usage.
-    //
-    // Sorted Vec<i64> uses exactly 8 bytes per entry (just the i64 itself), giving
-    // a ~5x memory reduction. Lookups use binary_search() which is O(log n) -- the
-    // same asymptotic complexity as BTreeSet::contains() -- but with much better
-    // cache locality since the data is stored contiguously in memory rather than
-    // scattered across heap-allocated tree nodes.
-    //
-    // The pattern is straightforward here because tags_filter_two_pass has a clean
-    // separation: pass 1 ONLY inserts IDs (no lookups within pass 1), and pass 2
-    // ONLY does lookups. The sort+dedup happens in the gap between passes.
-    //
-    // Alternatives considered:
-    // - HashSet<i64>: Even worse memory overhead (~72 bytes/entry due to hash table
-    //   bucket array, load factor headroom, and per-entry hash + metadata storage).
-    // - roaring::RoaringBitmap: Excellent compression for dense ID ranges, but adds
-    //   an external dependency. Overkill for typical filter result sizes where the
-    //   simple sorted Vec approach is sufficient.
-    //
-    // sort_unstable() is used instead of sort() because i64 has no meaningful
-    // stability requirement (equal elements are identical), and sort_unstable()
-    // avoids the temporary allocation that sort() needs for its merge step.
-    let mut matched_node_ids: Vec<i64> = Vec::new();
-    let mut matched_way_ids: Vec<i64> = Vec::new();
-    let mut matched_relation_ids: Vec<i64> = Vec::new();
+    // IdSetDense: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
+    // No sort/dedup step needed between passes (bitset deduplicates inherently).
+    let mut matched_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
     let mut way_dep_node_ids = IdSetDense::new();
 
     // Pass 1: skip blob types that no expression targets.
@@ -627,21 +602,21 @@ fn tags_filter_two_pass(
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     if element_matches(expressions, &tags_buf, true, false, false) {
-                        matched_node_ids.push(dn.id());
+                        matched_node_ids.set(dn.id());
                     }
                 }
                 Element::Node(n) => {
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     if element_matches(expressions, &tags_buf, true, false, false) {
-                        matched_node_ids.push(n.id());
+                        matched_node_ids.set(n.id());
                     }
                 }
                 Element::Way(w) => {
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
                     if element_matches(expressions, &tags_buf, false, true, false) {
-                        matched_way_ids.push(w.id());
+                        matched_way_ids.set(w.id());
                         for r in w.refs() {
                             way_dep_node_ids.set(r);
                         }
@@ -651,30 +626,12 @@ fn tags_filter_two_pass(
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
                     if element_matches(expressions, &tags_buf, false, false, true) {
-                        matched_relation_ids.push(r.id());
+                        matched_relation_ids.set(r.id());
                     }
                 }
             }
         }
     }
-
-    // Sort and deduplicate all ID Vecs between pass 1 and pass 2. This is the key
-    // step that converts the unsorted append-only Vecs into sorted arrays suitable
-    // for binary_search() lookups in pass 2.
-    //
-    // sort_unstable() is preferred over sort() for primitive types: no stability is
-    // needed (equal i64 values are identical), and it avoids the temporary buffer
-    // allocation that sort()'s merge step requires.
-    //
-    // dedup() removes consecutive duplicates (requires prior sorting). Duplicates
-    // can arise from the same element appearing in multiple blocks, or from
-    // way_dep_node_ids collecting the same node ref from multiple matching ways.
-    matched_node_ids.sort_unstable();
-    matched_node_ids.dedup();
-    matched_way_ids.sort_unstable();
-    matched_way_ids.dedup();
-    matched_relation_ids.sort_unstable();
-    matched_relation_ids.dedup();
 
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.

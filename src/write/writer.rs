@@ -90,9 +90,10 @@ struct WritePipeline {
 /// Reusable scratch buffers for blob framing, avoiding per-call allocation.
 ///
 /// After the first blob, all three buffers have sufficient capacity and
-/// subsequent calls reuse them without allocating. The zlib compressor is
-/// lazy-initialized on the first zlib blob and reused via `reset()` —
-/// avoiding ~312 KB of deflate state allocation per blob.
+/// subsequent calls reuse them without allocating. The zlib and zstd
+/// compressors are lazy-initialized on the first blob of each type and
+/// reused — avoiding ~312 KB (zlib) or ~512 KB (zstd) of compressor state
+/// allocation per blob.
 struct FrameScratch {
     /// Blob protobuf body (raw/compressed data fields).
     blob_buf: Vec<u8>,
@@ -105,6 +106,8 @@ struct FrameScratch {
     zlib_compressor: Option<Compress>,
     #[cfg(feature = "libdeflater")]
     zlib_compressor: Option<libdeflater::Compressor>,
+    /// Reusable zstd compressor (lazy-initialized on first zstd blob).
+    zstd_compressor: Option<zstd::bulk::Compressor<'static>>,
 }
 
 thread_local! {
@@ -114,6 +117,7 @@ thread_local! {
         header_buf: Vec::new(),
         compress_buf: Vec::new(),
         zlib_compressor: None,
+        zstd_compressor: None,
     }) };
 }
 
@@ -151,7 +155,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
         })
     }
 
@@ -167,7 +171,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
         })
     }
 
@@ -256,7 +260,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
         })
     }
 
@@ -282,7 +286,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
         })
     }
 }
@@ -300,7 +304,7 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None },
+            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
         }
     }
 
@@ -707,6 +711,7 @@ pub(crate) fn frame_blob(
         header_buf: Vec::new(),
         compress_buf: Vec::new(),
         zlib_compressor: None,
+        zstd_compressor: None,
     };
     frame_blob_into(blob_type, uncompressed, compression, indexdata, &mut scratch)
 }
@@ -745,8 +750,8 @@ fn frame_blob_into(
 /// Encode the Blob protobuf body (optionally compressed) into scratch buffers.
 ///
 /// Uses `compress_buf` as an intermediate for zlib/zstd compression output.
-/// The zlib compressor is lazy-initialized and reused via `reset()` to avoid
-/// ~312 KB of deflate state allocation per blob.
+/// Both zlib and zstd compressors are lazy-initialized and reused to avoid
+/// ~312 KB (zlib) or ~512 KB (zstd) of compressor state allocation per blob.
 fn encode_blob_body(
     uncompressed: &[u8],
     compression: &Compression,
@@ -762,10 +767,15 @@ fn encode_blob_body(
             compress_zlib(uncompressed, *level, scratch)?;
         }
         Compression::Zstd(level) => {
-            scratch.compress_buf.clear();
-            let mut encoder = zstd::stream::write::Encoder::new(&mut scratch.compress_buf, *level)?;
-            encoder.write_all(uncompressed)?;
-            encoder.finish()?;
+            if scratch.zstd_compressor.is_none() {
+                scratch.zstd_compressor = Some(
+                    zstd::bulk::Compressor::new(*level).map_err(io::Error::other)?,
+                );
+            }
+            let Some(compressor) = scratch.zstd_compressor.as_mut() else {
+                unreachable!()
+            };
+            scratch.compress_buf = compressor.compress(uncompressed).map_err(io::Error::other)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
             })?;

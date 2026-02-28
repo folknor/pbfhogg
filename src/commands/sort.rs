@@ -2,9 +2,12 @@
 //!
 //! Uses blob-level permutation sort: index each blob's element type + ID range,
 //! sort the index, write in sorted order. Non-overlapping blobs pass through as
-//! raw bytes; overlapping blobs are decoded, sorted, and re-encoded.
-//! Memory usage is O(num_blobs) instead of O(num_elements).
+//! raw bytes; overlapping blobs are decoded and merged via a streaming sweep.
+//! Memory usage is O(num_blobs) for non-overlapping inputs. Overlapping blobs
+//! use a streaming sweep merge with O(overlap_depth) memory.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
@@ -81,11 +84,33 @@ struct OwnedNode {
     metadata: Option<OwnedMetadata>,
 }
 
+impl PartialEq for OwnedNode {
+    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+}
+impl Eq for OwnedNode {}
+impl PartialOrd for OwnedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for OwnedNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
+}
+
 struct OwnedWay {
     id: i64,
     tags: Vec<(String, String)>,
     refs: Vec<i64>,
     metadata: Option<OwnedMetadata>,
+}
+
+impl PartialEq for OwnedWay {
+    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+}
+impl Eq for OwnedWay {}
+impl PartialOrd for OwnedWay {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for OwnedWay {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
 }
 
 struct OwnedMember {
@@ -98,6 +123,17 @@ struct OwnedRelation {
     tags: Vec<(String, String)>,
     members: Vec<OwnedMember>,
     metadata: Option<OwnedMetadata>,
+}
+
+impl PartialEq for OwnedRelation {
+    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+}
+impl Eq for OwnedRelation {}
+impl PartialOrd for OwnedRelation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+impl Ord for OwnedRelation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +445,12 @@ fn count_entry(entry: &BlobEntry, stats: &mut SortStats) {
 // Pass 2: Overlap run rewrite
 // ---------------------------------------------------------------------------
 
-/// Decode all blobs in an overlap run, sort elements by ID, and write.
+/// Decode all blobs in an overlap run and write elements in sorted order.
+///
+/// Uses a streaming sweep merge: walks entries by min_id, maintains a min-heap,
+/// and flushes elements when their ID is guaranteed to be in final position
+/// (i.e. smaller than all future blobs' min_id). Memory is O(overlap_depth)
+/// rather than O(total_elements_in_run).
 fn write_overlap_run(
     entries: &[BlobEntry],
     input_file: &mut File,
@@ -417,124 +458,224 @@ fn write_overlap_run(
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut SortStats,
 ) -> Result<()> {
-    let mut nodes: Vec<OwnedNode> = Vec::new();
-    let mut ways: Vec<OwnedWay> = Vec::new();
-    let mut relations: Vec<OwnedRelation> = Vec::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
-
-    // Decode all blobs in the run
-    for entry in entries {
-        read_frame_into(input_file, entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
-
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => nodes.push(read_dense_node(dn)),
-                Element::Node(n) => nodes.push(read_node(n)),
-                Element::Way(w) => ways.push(read_way(w)),
-                Element::Relation(r) => relations.push(read_relation(r)),
-            }
-        }
-    }
-
-    // Sort and write each type
-    if !nodes.is_empty() {
-        nodes.sort_by_key(|n| n.id);
-        stats.nodes += nodes.len() as u64;
-        write_owned_nodes(&nodes, bb, writer)?;
-    }
-    if !ways.is_empty() {
-        ways.sort_by_key(|w| w.id);
-        stats.ways += ways.len() as u64;
-        write_owned_ways(&ways, bb, writer)?;
-    }
-    if !relations.is_empty() {
-        relations.sort_by_key(|r| r.id);
-        stats.relations += relations.len() as u64;
-        write_owned_relations(&relations, bb, writer)?;
-    }
-
+    // All entries in an overlap run have the same kind (entries are sorted by
+    // type_order first, and detect_overlaps only marks adjacent same-type).
+    let kind = entries[0].index.kind;
+    match kind {
+        ElemKind::Node => sweep_merge_nodes(entries, input_file, bb, writer, stats),
+        ElemKind::Way => sweep_merge_ways(entries, input_file, bb, writer, stats),
+        ElemKind::Relation => sweep_merge_rels(entries, input_file, bb, writer, stats),
+    }?;
     stats.blobs_rewritten += entries.len() as u64;
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Write owned elements via BlockBuilder
+// Sweep merge per element type
 // ---------------------------------------------------------------------------
 
-fn write_owned_nodes(
-    nodes: &[OwnedNode],
+fn sweep_merge_nodes(
+    entries: &[BlobEntry],
+    input_file: &mut File,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    stats: &mut SortStats,
 ) -> Result<()> {
-    for node in nodes {
-        if !bb.can_add_node() {
-            flush_block(bb, writer)?;
+    let mut heap: BinaryHeap<Reverse<OwnedNode>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        // Flush elements guaranteed in final position: ID < this blob's min_id
+        flush_heap_below(&mut heap, entry.index.min_id, |node| {
+            write_single_node(&node, bb, writer)?;
+            stats.nodes += 1;
+            Ok(())
+        })?;
+
+        // Decode blob and push elements into heap
+        read_frame_into(input_file, entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
+                Element::Node(n) => heap.push(Reverse(read_node(n))),
+                _ => {}
+            }
         }
-        let tags: Vec<(&str, &str)> = node
-            .tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let meta = owned_to_metadata(node.metadata.as_ref());
-        bb.add_node(
-            node.id,
-            node.decimicro_lat,
-            node.decimicro_lon,
-            &tags,
-            meta.as_ref(),
-        );
+    }
+
+    // Drain remaining
+    while let Some(Reverse(node)) = heap.pop() {
+        write_single_node(&node, bb, writer)?;
+        stats.nodes += 1;
     }
     flush_block(bb, writer)
 }
 
-fn write_owned_ways(
-    ways: &[OwnedWay],
+fn sweep_merge_ways(
+    entries: &[BlobEntry],
+    input_file: &mut File,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
+    stats: &mut SortStats,
 ) -> Result<()> {
-    for way in ways {
-        if !bb.can_add_way() {
-            flush_block(bb, writer)?;
+    let mut heap: BinaryHeap<Reverse<OwnedWay>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        flush_heap_below(&mut heap, entry.index.min_id, |way| {
+            write_single_way(&way, bb, writer)?;
+            stats.ways += 1;
+            Ok(())
+        })?;
+
+        read_frame_into(input_file, entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            if let Element::Way(w) = &element {
+                heap.push(Reverse(read_way(w)));
+            }
         }
-        let tags: Vec<(&str, &str)> = way
-            .tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let meta = owned_to_metadata(way.metadata.as_ref());
-        bb.add_way(way.id, &tags, &way.refs, meta.as_ref());
+    }
+
+    while let Some(Reverse(way)) = heap.pop() {
+        write_single_way(&way, bb, writer)?;
+        stats.ways += 1;
     }
     flush_block(bb, writer)
 }
 
-fn write_owned_relations(
-    relations: &[OwnedRelation],
+fn sweep_merge_rels(
+    entries: &[BlobEntry],
+    input_file: &mut File,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut SortStats,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<OwnedRelation>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        flush_heap_below(&mut heap, entry.index.min_id, |rel| {
+            write_single_relation(&rel, bb, writer)?;
+            stats.relations += 1;
+            Ok(())
+        })?;
+
+        read_frame_into(input_file, entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            if let Element::Relation(r) = &element {
+                heap.push(Reverse(read_relation(r)));
+            }
+        }
+    }
+
+    while let Some(Reverse(rel)) = heap.pop() {
+        write_single_relation(&rel, bb, writer)?;
+        stats.relations += 1;
+    }
+    flush_block(bb, writer)
+}
+
+/// Flush all elements from the min-heap whose ID is below `below`.
+fn flush_heap_below<T: Ord>(
+    heap: &mut BinaryHeap<Reverse<T>>,
+    below: i64,
+    mut emit: impl FnMut(T) -> Result<()>,
+) -> Result<()>
+where
+    T: HasId,
+{
+    while heap.peek().map_or(false, |Reverse(e)| e.id() < below) {
+        if let Some(Reverse(element)) = heap.pop() {
+            emit(element)?;
+        }
+    }
+    Ok(())
+}
+
+/// Trait for accessing the ID of owned element types.
+trait HasId {
+    fn id(&self) -> i64;
+}
+
+impl HasId for OwnedNode {
+    fn id(&self) -> i64 { self.id }
+}
+
+impl HasId for OwnedWay {
+    fn id(&self) -> i64 { self.id }
+}
+
+impl HasId for OwnedRelation {
+    fn id(&self) -> i64 { self.id }
+}
+
+// ---------------------------------------------------------------------------
+// Write single elements via BlockBuilder
+// ---------------------------------------------------------------------------
+
+fn write_single_node(
+    node: &OwnedNode,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    for rel in relations {
-        if !bb.can_add_relation() {
-            flush_block(bb, writer)?;
-        }
-        let tags: Vec<(&str, &str)> = rel
-            .tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect();
-        let members: Vec<MemberData<'_>> = rel
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: &m.role,
-            })
-            .collect();
-        let meta = owned_to_metadata(rel.metadata.as_ref());
-        bb.add_relation(rel.id, &tags, &members, meta.as_ref());
+    if !bb.can_add_node() {
+        flush_block(bb, writer)?;
     }
-    flush_block(bb, writer)
+    let tags: Vec<(&str, &str)> = node
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let meta = owned_to_metadata(node.metadata.as_ref());
+    bb.add_node(node.id, node.decimicro_lat, node.decimicro_lon, &tags, meta.as_ref());
+    Ok(())
+}
+
+fn write_single_way(
+    way: &OwnedWay,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !bb.can_add_way() {
+        flush_block(bb, writer)?;
+    }
+    let tags: Vec<(&str, &str)> = way
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let meta = owned_to_metadata(way.metadata.as_ref());
+    bb.add_way(way.id, &tags, &way.refs, meta.as_ref());
+    Ok(())
+}
+
+fn write_single_relation(
+    rel: &OwnedRelation,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !bb.can_add_relation() {
+        flush_block(bb, writer)?;
+    }
+    let tags: Vec<(&str, &str)> = rel
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let members: Vec<MemberData<'_>> = rel
+        .members
+        .iter()
+        .map(|m| MemberData { id: m.id, role: &m.role })
+        .collect();
+    let meta = owned_to_metadata(rel.metadata.as_ref());
+    bb.add_relation(rel.id, &tags, &members, meta.as_ref());
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

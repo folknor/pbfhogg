@@ -289,3 +289,54 @@ fn sort_cross_validate_osmium() {
         assert_eq!(p.2, o.2, "relation tags mismatch for id {}", p.0);
     }
 }
+
+/// Sort a PBF with 10 interleaving node blobs (deep overlap run).
+/// Each blob has IDs i, i+10, i+20, ..., i+90 for i in 1..=10.
+/// Forces a 10-blob overlap run through the streaming sweep merge.
+#[allow(clippy::cast_possible_truncation)]
+#[test]
+fn sort_many_overlapping_blobs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("many_overlap.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    // Write 10 blobs with interleaving node IDs
+    let mut writer = PbfWriter::to_path(&input, Compression::default()).expect("create writer");
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    for blob_idx in 1..=10_i64 {
+        for step in 0..10_i64 {
+            let id = blob_idx + step * 10;
+            bb.add_node(id, id as i32 * 100_000, id as i32 * 200_000, &[], None);
+        }
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
+
+    pbfhogg::commands::sort::sort(
+        &input, &output, Compression::default(), false, false, false,
+    )
+    .expect("sort");
+
+    let result = read_all_elements_with_coords(&output);
+
+    // All 100 nodes preserved
+    assert_eq!(result.nodes.len(), 100);
+    assert_sorted(&result);
+
+    // Node IDs are 1..=100
+    let node_ids: Vec<i64> = result.nodes.iter().map(|(id, _, _, _)| *id).collect();
+    assert_eq!(node_ids, (1..=100).collect::<Vec<_>>());
+
+    // Coordinates preserved
+    for (id, lat, lon, _) in &result.nodes {
+        assert_eq!(*lat, *id as i32 * 100_000);
+        assert_eq!(*lon, *id as i32 * 200_000);
+    }
+
+    assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+}

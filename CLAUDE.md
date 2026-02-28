@@ -32,7 +32,7 @@ Standalone development tool at `~/Programs/dev`. Installed via `cargo install --
 - `dev download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `dev clean` — remove scratch temp files and verify output directories.
 
-Benchmark results stored in `.dev/results.db` (SQLite, gitignored).
+Benchmark results stored in `.dev/results.db` (SQLite, tracked in git).
 
 ## Scripts
 

@@ -2,19 +2,20 @@
 
 ## Implementation Progress
 
-**Last updated:** `b293c96` (2026-02-28)
+**Last updated:** uncommitted (2026-03-01)
 
 | Tier | Total | Done | Open | Deferred |
 |------|-------|------|------|----------|
 | P0 | 2 | 2 | 0 | 0 |
 | P1 | 3 | 3 | 0 | 0 |
 | P2 | 8 | 6 | 0 | 2 |
-| P3 | 11 | 8 | 3 | 0 |
-| **Total** | **24** | **19** | **3** | **2** |
+| P3 | 11 | 9 | 2 | 0 |
+| **Total** | **24** | **20** | **2** | **2** |
 
 All per-blob allocation waste (the dominant waste pattern, §6.1) has been eliminated.
 The BlockBuilder→PbfWriter API boundary information loss (§6.5) has been resolved.
 P0-P2 tiers complete (P2-12 sqpoll deferred, P2-13 reverted). P3 trivial items done.
+P3-14 (spatial blob filter) adds BlobIndex v2 with per-node-blob bbox for extract.
 Remaining open P3: SIMD varint (P3-20), diff streaming (P3-22).
 Both are high effort and speculative.
 
@@ -256,7 +257,7 @@ Box 4 (section 6.6) identifies spatial blob filtering as "the single largest opt
 
 | # | Description | Source Boxes | Planet-Scale Impact | Effort | Dependencies |
 |---|---|---|---|---|---|
-| 14 | **Spatial blob filter for extract (BlobIndex v2 with bbox)** (box4-indexing-mmap.md §6.6, §8, Priority 3a) | Box 4 | 99%+ node decompression savings for small extracts from planet. Most impactful for city-level planet extracts. | High | BlobIndex format extension, scan_block_ids extension |
+| 14 | **Spatial blob filter for extract (BlobIndex v2 with bbox)** (box4-indexing-mmap.md §6.6, §8, Priority 3a) | Box 4 | 99%+ node decompression savings for small extracts from planet. Most impactful for city-level planet extracts. | High | **DONE** — BlobIndex v2 (42 bytes) with per-node-blob bbox in decimicrodegrees. `scan_block_ids` extended to extract lat/lon from DenseNodes. `BlobFilter::with_node_bbox()` for spatial filtering in pipeline. Wired into extract pass 1. |
 | 15 | **Extend io_uring to sort command** (box7-direct-io-uring.md §11, Priority 5; §10, Box 8) | Box 7 | ~25-30% improvement for planet-scale sort write path. | Medium | **DONE** `b293c96` — `--io-uring` and `--sqpoll` flags, same writer selection as merge |
 | 16 | **Add `#[inline]` to hot iterators** (`WireMessageIter::next()`, `DenseNodeIter::next()`, `WireGroup::{nodes,ways,relations}()`) (box3-wire-parsing.md §8c, §10, Priority 2) | Box 3 | 0% with fat LTO (current build). 1-3% for library consumers without LTO. | Trivial | **DONE** `3c95704` — `#[inline]` on 5 hot iterator methods |
 | 17 | **BlobReader buffer reuse** (box2-blob-decode.md §D2, §Recommended Actions Priority 5) | Box 2 | Eliminates ~80 GB alloc churn for compressed blob data on read side. Low wall-clock impact due to allocator free-list efficiency. | Low-Medium | **DONE** (partial) `4040239` — header buffer reused; blob data buffer consumed by `Bytes::from()`, cannot reuse |

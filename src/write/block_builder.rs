@@ -232,6 +232,12 @@ pub struct BlockBuilder {
     min_id: i64,
     max_id: i64,
 
+    // Coordinate range tracking for BlobIndex v2 spatial bbox (node blobs only).
+    min_lat: i32,
+    max_lat: i32,
+    min_lon: i32,
+    max_lon: i32,
+
     // Dense node accumulators
     dense_ids: Vec<i64>,
     dense_lats: Vec<i64>,
@@ -304,6 +310,10 @@ impl BlockBuilder {
             count: 0,
             min_id: i64::MAX,
             max_id: i64::MIN,
+            min_lat: i32::MAX,
+            max_lat: i32::MIN,
+            min_lon: i32::MAX,
+            max_lon: i32::MIN,
 
             // Pre-allocate dense node vectors to the max block size (8000).
             // One entry per node for each of id, lat, lon.
@@ -361,6 +371,15 @@ impl BlockBuilder {
         if id > self.max_id {
             self.max_id = id;
         }
+    }
+
+    /// Track node coordinates for BlobIndex v2 spatial bbox.
+    #[inline]
+    fn track_coords(&mut self, decimicro_lat: i32, decimicro_lon: i32) {
+        if decimicro_lat < self.min_lat { self.min_lat = decimicro_lat; }
+        if decimicro_lat > self.max_lat { self.max_lat = decimicro_lat; }
+        if decimicro_lon < self.min_lon { self.min_lon = decimicro_lon; }
+        if decimicro_lon > self.max_lon { self.max_lon = decimicro_lon; }
     }
 
     /// Returns `true` if the string table has been pre-seeded from an input block.
@@ -437,6 +456,7 @@ impl BlockBuilder {
         self.last_dense_id = id;
         self.last_dense_lat = lat;
         self.last_dense_lon = lon;
+        self.track_coords(decimicro_lat, decimicro_lon);
 
         // Tags: interleaved [key_sid, val_sid, ...] terminated by 0
         for &(key, val) in tags {
@@ -682,6 +702,7 @@ impl BlockBuilder {
         self.last_dense_id = id;
         self.last_dense_lat = lat;
         self.last_dense_lon = lon;
+        self.track_coords(decimicro_lat, decimicro_lon);
 
         // Tags: write raw indices directly — no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
@@ -805,11 +826,22 @@ impl BlockBuilder {
             BlockType::Ways => ElemKind::Way,
             BlockType::Relations => ElemKind::Relation,
         };
+        let bbox = if kind == ElemKind::Node && self.min_lat <= self.max_lat {
+            Some(crate::blob_index::BlobBbox::new(
+                self.min_lat,
+                self.max_lat,
+                self.min_lon,
+                self.max_lon,
+            ))
+        } else {
+            None
+        };
         let index = BlobIndex {
             kind,
             min_id: self.min_id,
             max_id: self.max_id,
             count: self.count as u64,
+            bbox,
         };
 
         // All block types: direct wire-format encoding
@@ -937,6 +969,10 @@ impl BlockBuilder {
         self.count = 0;
         self.min_id = i64::MAX;
         self.max_id = i64::MIN;
+        self.min_lat = i32::MAX;
+        self.max_lat = i32::MIN;
+        self.min_lon = i32::MAX;
+        self.max_lon = i32::MIN;
         self.has_dense_metadata = false;
         self.pre_seeded = false;
 

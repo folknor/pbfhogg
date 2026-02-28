@@ -487,3 +487,84 @@ fn smart_ignores_non_qualifying_relations() {
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
     assert_eq!(stats.nodes_from_relations, 0);
 }
+
+// ---------------------------------------------------------------------------
+// Spatial blob filter tests
+// ---------------------------------------------------------------------------
+//
+// These tests create multiple node blobs at distinct geographic locations
+// to exercise the v2 indexdata spatial blob filter. When the extraction bbox
+// overlaps only one blob, the pipeline skips decompression of the others.
+
+/// Helper: write a PBF with nodes in separate blobs at distinct locations.
+/// Each blob is flushed after adding its nodes to ensure separate blobs.
+#[allow(clippy::cast_possible_truncation)]
+fn write_multi_blob_pbf(path: &std::path::Path) {
+    use pbfhogg::block_builder::{self, BlockBuilder};
+    use pbfhogg::writer::{Compression, PbfWriter};
+
+    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Blob 1: Copenhagen area (lat ~55.7, lon ~12.5)
+    for i in 1..=10_i64 {
+        bb.add_node(i, 557_000_000 + i as i32 * 1000, 125_000_000 + i as i32 * 1000, &[], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) — far from Copenhagen
+    for i in 11..=20_i64 {
+        bb.add_node(i, 593_000_000 + i as i32 * 1000, 180_000_000 + i as i32 * 1000, &[], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Blob 3: Berlin area (lat ~52.5, lon ~13.4) — far from Copenhagen
+    for i in 21..=30_i64 {
+        bb.add_node(i, 525_000_000 + i as i32 * 1000, 134_000_000 + i as i32 * 1000, &[], None);
+    }
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Extract from a multi-blob PBF with a bbox covering only the Copenhagen blob.
+/// The spatial blob filter should skip Stockholm and Berlin blobs entirely.
+#[test]
+fn spatial_filter_skips_distant_blobs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("multi_blob.osm.pbf");
+    let output = dir.path().join("extracted.osm.pbf");
+
+    write_multi_blob_pbf(&input);
+
+    // Bbox covering Copenhagen area only
+    let bbox = parse_bbox("12.4,55.6,12.7,55.8").expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(
+        &input,
+        &output,
+        &region,
+        ExtractStrategy::Simple,
+        Compression::default(),
+        false,
+    )
+    .expect("extract");
+
+    let c = read_all_elements(&output);
+
+    // Only Copenhagen nodes (1-10) should be in the output
+    let ids = node_ids(&c);
+    assert_eq!(ids, (1..=10).collect::<Vec<_>>());
+    assert_eq!(stats.nodes_in_bbox, 10);
+    // Stockholm (11-20) and Berlin (21-30) nodes should not appear
+    assert!(ids.iter().all(|&id| id <= 10), "no non-Copenhagen nodes should be present");
+}

@@ -61,6 +61,21 @@ impl BboxInt {
     }
 }
 
+/// Build a [`BlobFilter`] that accepts all element types but spatially filters
+/// node blobs: only node blobs whose coordinate bbox intersects the extraction
+/// bbox are decompressed. Way and relation blobs always pass through.
+///
+/// Requires v2 indexdata with spatial bounds. Blobs without spatial indexdata
+/// are conservatively passed through.
+fn spatial_blob_filter(bbox_int: &BboxInt) -> BlobFilter {
+    BlobFilter::new(true, true, true).with_node_bbox(crate::BlobBbox::new(
+        bbox_int.min_lat,
+        bbox_int.max_lat,
+        bbox_int.min_lon,
+        bbox_int.max_lon,
+    ))
+}
+
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
 // String errors are intentional for CLI arg parsing — the bad input value is more
 // useful to users than the underlying ParseFloatError ("invalid float literal").
@@ -634,7 +649,8 @@ fn collect_pass1(
     let mut matched_relation_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
-    for block_result in reader.into_blocks_pipelined() {
+    let filter = spatial_blob_filter(bbox_int);
+    for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
         let block = block_result?;
         for element in block.elements_skip_metadata() {
             match &element {
@@ -687,7 +703,8 @@ fn collect_pass1_smart(
     let mut extra_node_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
-    for block_result in reader.into_blocks_pipelined() {
+    let filter = spatial_blob_filter(bbox_int);
+    for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
         let block = block_result?;
         for element in block.elements_skip_metadata() {
             match &element {

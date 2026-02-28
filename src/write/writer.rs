@@ -341,7 +341,7 @@ impl<W: Write> PbfWriter<W> {
                         "OSMData",
                         &uncompressed,
                         &compression,
-                        indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                        indexdata.as_ref().map(<[u8; 42]>::as_slice),
                         scratch,
                     )
                 });
@@ -354,7 +354,7 @@ impl<W: Write> PbfWriter<W> {
             self.write_framed_blob(
                 "OSMData",
                 block_bytes,
-                indexdata.as_ref().map(<[u8; 26]>::as_slice),
+                indexdata.as_ref().map(<[u8; 42]>::as_slice),
             )
         }
     }

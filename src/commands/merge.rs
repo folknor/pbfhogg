@@ -824,12 +824,14 @@ fn fallback_index(block: &PrimitiveBlock) -> BlobIndex {
             min_id: 0,
             max_id: 0,
             count: 0,
+            bbox: None,
         },
         None => BlobIndex {
             kind: ElemKind::Node,
             min_id: 0,
             max_id: 0,
             count: 0,
+            bbox: None,
         },
     }
 }

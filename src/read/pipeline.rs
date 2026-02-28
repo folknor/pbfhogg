@@ -112,7 +112,7 @@ where
                                         // Files without indexdata always pass through.
                                         if let Some(ref filter) = blob_filter
                                             && let Some(idx) = blob.index()
-                                            && !filter.wants(idx.kind)
+                                            && !filter.wants_index(&idx)
                                         {
                                             return None;
                                         }

@@ -166,7 +166,7 @@ pub(crate) enum BlobKind {
 pub(crate) struct WireBlobHeader {
     pub blob_type: BlobKind,
     pub datasize: i32,
-    /// Blob-level index: always 26 bytes when present, stored inline.
+    /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
     pub indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]>,
 }
 
@@ -194,10 +194,13 @@ impl WireBlobHeader {
                     };
                 }
                 2 => {
-                    // indexdata: bytes (len-delimited)
+                    // indexdata: bytes (len-delimited) — accept v1 (26) or v2 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
-                    if let Ok(arr) = <[u8; crate::blob_index::INDEX_SIZE]>::try_from(bytes) {
-                        indexdata = Some(arr);
+                    let len = bytes.len();
+                    if len == crate::blob_index::INDEX_SIZE || len == 26 {
+                        let mut buf = [0u8; crate::blob_index::INDEX_SIZE];
+                        buf[..len].copy_from_slice(bytes);
+                        indexdata = Some(buf);
                     }
                 }
                 3 => {
@@ -864,8 +867,9 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, u
 /// Parse a BlobHeader and also extract the optional `indexdata` field.
 ///
 /// Returns `(blob_type, data_size, optional_indexdata)`. The indexdata, when
-/// present, contains blob-level metadata (element type, ID range, count)
-/// that allows merge to classify blobs without decompression.
+/// present, contains blob-level metadata (element type, ID range, count, and
+/// optionally spatial bbox) that allows merge to classify blobs without
+/// decompression.
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>)> {

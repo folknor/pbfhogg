@@ -1,5 +1,24 @@
 # Cross-Reference Synthesis: Performance Review Boxes 1-8
 
+## Implementation Progress
+
+**Last updated:** `eeff9c1` (2026-02-28)
+
+| Tier | Total | Done | Open | Deferred |
+|------|-------|------|------|----------|
+| P0 | 2 | 2 | 0 | 0 |
+| P1 | 3 | 2 | 1 | 0 |
+| P2 | 8 | 6 | 1 | 1 |
+| P3 | 11 | 0 | 11 | 0 |
+| **Total** | **24** | **10** | **13** | **1** |
+
+All per-blob allocation waste (the dominant waste pattern, §6.1) has been eliminated.
+The BlockBuilder→PbfWriter API boundary information loss (§6.5) has been resolved.
+Remaining open items are correctness (P1-5 panic recovery), algorithmic (P2-13 parallel extract),
+and speculative/future (P3).
+
+---
+
 ## 1. Duplicate Findings
 
 ### 1.1 `take()` returns `&[u8]`, forcing `to_vec()` copies in pipelined paths
@@ -190,6 +209,8 @@ Box 5 notes that `Compression::None` makes the rayon pipeline wasteful (rayon do
 
 Box 8 identifies that `tags_filter` needs `IdSetDense` (currently only in extract.rs) for its planet-scale memory fix (box8-commands.md §10, P0-1). Box 4 identifies that `IndexedReader` could also benefit from better ID set structures (box4-indexing-mmap.md §4, Finding 3). Neither box notes that `IdSetDense` should be extracted to a shared location (e.g., `src/commands/mod.rs` or its own module) to serve multiple commands. The current duplication risk is that tags_filter might roll its own solution instead of reusing the proven implementation.
 
+**Status (as of `96ada44`):** Resolved. `IdSetDense` extracted to `src/commands/id_set_dense.rs` as a shared module (`88f1a2d`). Both `extract.rs` and `tags_filter.rs` import from it. All 4 ID sets in tags_filter `Pass2IdSets` converted to `IdSetDense` with O(1) `.get()` lookups (`96ada44`).
+
 ### 4.6 Raw-bytes passthrough pattern could extend beyond merge
 
 Box 3, Box 6, and Box 8 all document the 12x speedup of `add_way_raw_bytes()` over `add_way()` (17ns vs 210ns per way) (box6-block-builder.md §6, raw bytes passthrough performance; box3-wire-parsing.md §9, Box 6 interaction). Currently only merge uses this. Box 6 notes: "A potential optimization for cat/sort: add a 'clone block' API that copies an entire PrimitiveBlock's wire-format bytes directly when no transformation is needed" (box6-block-builder.md §9, Box 8 interaction). Box 8 does not list this in its recommendations. For cat with type filters that keep all elements in a block (common case), a block-level passthrough would bypass BlockBuilder entirely, saving the entire StringTable + delta encoding cost. This optimization is missed by all boxes as a concrete recommendation.
@@ -204,31 +225,31 @@ Box 4 (section 6.6) identifies spatial blob filtering as "the single largest opt
 
 ### P0 -- Planet-Scale Blockers / Highest Impact
 
-| # | Description | Source Boxes | Planet-Scale Impact | Effort | Dependencies |
+| # | Description | Source Boxes | Planet-Scale Impact | Effort | Status |
 |---|---|---|---|---|---|
-| 1 | **tags_filter: replace `way_dep_node_ids` Vec\<i64\> with IdSetDense** (box8-commands.md §4B, §10, P0-1) | Box 8 | Prevents OOM: ~40 GB -> ~1.5 GB for broad filters. Enables planet-scale tags_filter two-pass mode. | Low | Extract IdSetDense to shared module |
-| 2 | **Eliminate `scan_block_ids` in write path by exposing BlobIndex from BlockBuilder** (box5-writer-pipeline.md §Finding 4) | Box 5 | Saves ~50-125 seconds wall time at planet scale. Eliminates ~325 GB of redundant wire-format scanning. | Low-Medium | None |
+| 1 | **tags_filter: replace `way_dep_node_ids` Vec\<i64\> with IdSetDense** (box8-commands.md §4B, §10, P0-1) | Box 8 | Prevents OOM: ~40 GB -> ~1.5 GB for broad filters. Enables planet-scale tags_filter two-pass mode. | Low | **DONE** `88f1a2d` — IdSetDense extracted to shared module `src/commands/id_set_dense.rs`, tags_filter updated |
+| 2 | **Eliminate `scan_block_ids` in write path by exposing BlobIndex from BlockBuilder** (box5-writer-pipeline.md §Finding 4) | Box 5 | Saves ~50-125 seconds wall time at planet scale. Eliminates ~325 GB of redundant wire-format scanning. | Low-Medium | **DONE** (combined with P1-3) — `take_owned()` returns `Option<(Vec<u8>, BlobIndex)>`, `write_primitive_block_owned` accepts pre-computed BlobIndex |
 
 ### P1 -- Measurable Wall-Time Improvements
 
-| # | Description | Source Boxes | Planet-Scale Impact | Effort | Dependencies |
+| # | Description | Source Boxes | Planet-Scale Impact | Effort | Status |
 |---|---|---|---|---|---|
-| 3 | **Add `take_owned()` to BlockBuilder to eliminate `to_vec()` copies in pipelined paths** (box5-writer-pipeline.md §Finding 1; box6-block-builder.md §8.1, §10, P0; box8-commands.md §8A, §10, P1-1) | Box 5, Box 6, Box 8 | Eliminates ~155 GB copy churn (cat), ~40-50 seconds wall time. Eliminates flush_local double-copy (~17 GB for parallel rewrite paths). | Low | Combine with P0-2 (same API change point) |
-| 4 | **extract smart pass 2: add BlobFilter for ways-only** (box8-commands.md §3D, §10, P1-2; box4-indexing-mmap.md §6.6) | Box 4, Box 8 | Saves ~60 seconds at planet scale (skips ~80% of decompression in smart pass 2). | Trivial (one line) | None |
-| 5 | **Add panic recovery to decode pool tasks** (box1-read-orchestration.md §5.1, §7, Priority 1) | Box 1 | Prevents silent blob skipping on rayon task panic. Correctness fix, not performance. | Low (~15 lines) | None |
+| 3 | **Add `take_owned()` to BlockBuilder to eliminate `to_vec()` copies in pipelined paths** (box5-writer-pipeline.md §Finding 1; box6-block-builder.md §8.1, §10, P0; box8-commands.md §8A, §10, P1-1) | Box 5, Box 6, Box 8 | Eliminates ~155 GB copy churn (cat), ~40-50 seconds wall time. Eliminates flush_local double-copy (~17 GB for parallel rewrite paths). | Low | **DONE** (combined with P0-2) — `take_owned() -> Option<(Vec<u8>, BlobIndex)>` via `std::mem::replace`. All command `flush_local`/`flush_block` callers updated |
+| 4 | **extract smart pass 2: add BlobFilter for ways-only** (box8-commands.md §3D, §10, P1-2; box4-indexing-mmap.md §6.6) | Box 4, Box 8 | Saves ~60 seconds at planet scale (skips ~80% of decompression in smart pass 2). | Trivial (one line) | **DONE** `b4f2998` |
+| 5 | **Add panic recovery to decode pool tasks** (box1-read-orchestration.md §5.1, §7, Priority 1) | Box 1 | Prevents silent blob skipping on rayon task panic. Correctness fix, not performance. | Low (~15 lines) | Open |
 
 ### P2 -- Moderate Impact, Worth Doing
 
-| # | Description | Source Boxes | Planet-Scale Impact | Effort | Dependencies |
+| # | Description | Source Boxes | Planet-Scale Impact | Effort | Status |
 |---|---|---|---|---|---|
-| 6 | **Pool ZlibDecoder state in DecompressPool** (box2-blob-decode.md §D1, §Recommended Actions Priority 1) | Box 2 | Eliminates ~80 GB allocator churn on read side. Saves ~125-250 ms wall time directly, plus reduced fragmentation pressure. | Low-Medium | None |
-| 7 | **Add zstd compressor reuse to FrameScratch** (box5-writer-pipeline.md §Finding 5, §Recommended Action 2) | Box 5 | Eliminates ~1.28 TB allocator churn when zstd is used. Saves ~2.5-12.5 seconds wall time. | Low (~20 lines) | None (only matters when zstd selected) |
-| 8 | **tags_filter pass 2: use IdSetDense for O(1) lookups** (box8-commands.md §4C, §10, P2-2) | Box 8 | Reduces pass 2 node processing from ~20 min to ~3 min at planet scale. | Low | Depends on P0-1 |
-| 9 | **Eliminate blob_type String allocation with enum** (box2-blob-decode.md §D3, §Recommended Actions Priority 2) | Box 2 | Eliminates ~100 MB cumulative alloc at planet scale. Modest wall-clock savings. | Low | None |
-| 10 | **Use fixed-size array for indexdata** (box2-blob-decode.md §D3, §Recommended Actions Priority 3) | Box 2 | Eliminates ~120 MB cumulative alloc for indexed PBFs at planet scale. | Low | None |
-| 11 | **Use `write_raw_owned` in cat.rs passthrough** (box5-writer-pipeline.md §Finding 7, §Recommended Action 3) | Box 5 | Eliminates one `to_vec()` per passthrough blob in cat. Minor. | Trivial | None |
-| 12 | **Consider removing sqpoll code path** (box7-direct-io-uring.md §7, §11, Priority 2) | Box 7 | No performance gain (<1% across 3 scales). Removes ~30 lines and kernel 5.12+ dependency. Eliminates SQ overflow bug class. | Low | Verify at planet scale first |
-| 13 | **extract pass 1: parallel fold+reduce for IdSetDense** (box8-commands.md §3C, §10, P2-1) | Box 8 | ~2-4x speedup for pass 1 (~170s -> ~50-85s at planet scale). | Medium | None (merge() method exists) |
+| 6 | **Pool ZlibDecoder state in DecompressPool** (box2-blob-decode.md §D1, §Recommended Actions Priority 1) | Box 2 | Eliminates ~80 GB allocator churn on read side. Saves ~125-250 ms wall time directly, plus reduced fragmentation pressure. | Low-Medium | **DONE** `1194dc1` — thread-local `flate2::Decompress` with `reset(true)`, uses `decompress_vec` with `FlushDecompress::None` |
+| 7 | **Add zstd compressor reuse to FrameScratch** (box5-writer-pipeline.md §Finding 5, §Recommended Action 2) | Box 5 | Eliminates ~1.28 TB allocator churn when zstd is used. Saves ~2.5-12.5 seconds wall time. | Low (~20 lines) | **DONE** `9957279` — `zstd::bulk::Compressor<'static>` stored in `FrameScratch`, CCtx reused across blobs |
+| 8 | **tags_filter pass 2: use IdSetDense for O(1) lookups** (box8-commands.md §4C, §10, P2-2) | Box 8 | Reduces pass 2 node processing from ~20 min to ~3 min at planet scale. | Low | **DONE** `96ada44` — all 4 ID sets in `Pass2IdSets` converted to `IdSetDense`, binary_search → `.get()` |
+| 9 | **Eliminate blob_type String allocation with enum** (box2-blob-decode.md §D3, §Recommended Actions Priority 2) | Box 2 | Eliminates ~100 MB cumulative alloc at planet scale. Modest wall-clock savings. | Low | **DONE** `387eaf6` — `BlobKind` enum (`OsmHeader`/`OsmData`/`Unknown(String)`) replaces String, parse matches raw bytes |
+| 10 | **Use fixed-size array for indexdata** (box2-blob-decode.md §D3, §Recommended Actions Priority 3) | Box 2 | Eliminates ~120 MB cumulative alloc for indexed PBFs at planet scale. | Low | **DONE** `eeff9c1` — `Option<[u8; INDEX_SIZE]>` replaces `Option<Vec<u8>>` |
+| 11 | **Use `write_raw_owned` in cat.rs passthrough** (box5-writer-pipeline.md §Finding 7, §Recommended Action 3) | Box 5 | Eliminates one `to_vec()` per passthrough blob in cat. Minor. | Trivial | **DONE** `e5bfa36` — `std::mem::take` moves Vec into writer channel |
+| 12 | **Consider removing sqpoll code path** (box7-direct-io-uring.md §7, §11, Priority 2) | Box 7 | No performance gain (<1% across 3 scales). Removes ~30 lines and kernel 5.12+ dependency. Eliminates SQ overflow bug class. | Low | Deferred — needs planet-scale verification first |
+| 13 | **extract pass 1: parallel fold+reduce for IdSetDense** (box8-commands.md §3C, §10, P2-1) | Box 8 | ~2-4x speedup for pass 1 (~170s -> ~50-85s at planet scale). | Medium | Open |
 
 ### P3 -- Low Priority / Future / Speculative
 
@@ -262,6 +283,10 @@ The most striking cross-cutting finding is that nearly all actionable waste in t
 
 The implication is clear: **optimize the per-blob overhead first.** The three highest-impact items (scan_block_ids elimination, take_owned, ZlibDecoder pooling) are all per-blob optimizations. Per-element optimizations (SIMD varint, faster hashing) yield diminishing returns because they attack the irreducible floor.
 
+**Status (as of `eeff9c1`):** All per-blob allocation waste has been addressed:
+- **Eliminated:** `scan_block_ids` scan (P0-2), `to_vec()` copies via `take_owned()` (P1-3), ZlibDecoder state via thread-local `Decompress` reuse (P2-6), zstd CCtx via `FrameScratch` reuse (P2-7), `blob_type` String via `BlobKind` enum (P2-9), `indexdata` Vec via fixed `[u8; 26]` (P2-10), cat passthrough `to_vec` via `write_raw_owned` (P2-11).
+- **Remaining:** BlobReader buffer reuse (P3-17) — low wall-clock impact due to allocator free-list efficiency.
+
 ### 6.2 The read path is well-optimized; the write path has systematic waste
 
 Across all 8 boxes, the read path receives consistently positive assessments:
@@ -275,7 +300,9 @@ The write path, by contrast, accumulates findings:
 - Box 6: take() return type (P0), encode_packed cost floor (informational). (box6-block-builder.md §8.1, §8.2)
 - Box 8: flush_local double-copy (P1). (box8-commands.md §8A)
 
-This asymmetry reflects the project's history: the read path has been optimized through multiple rounds (DecompressPool, wire-format parser, raw-bytes passthrough), while the write path's `BlockBuilder -> PbfWriter` interface retains the original borrow-based `take()` design that made sense for sync mode but creates waste in pipelined mode.
+This asymmetry reflects the project's history: the read path has been optimized through multiple rounds (DecompressPool, wire-format parser, raw-bytes passthrough), while the write path's `BlockBuilder -> PbfWriter` interface originally retained the borrow-based `take()` design that made sense for sync mode but created waste in pipelined mode.
+
+**Status (as of `eeff9c1`):** The write-path systematic waste has been resolved. `take_owned()` returns `(Vec<u8>, BlobIndex)`, eliminating both the `to_vec()` copy and the redundant `scan_block_ids` rescan. Zstd compressor reuse is in `FrameScratch`. Read-side ZlibDecoder state is now pooled via thread-local. The read/write asymmetry has been largely closed.
 
 ### 6.3 The merge hot path is already near-optimal; other commands are not
 
@@ -315,6 +342,8 @@ Three separate findings trace back to the same architectural pattern: informatio
 3. **Read-side WireBlock -> commands:** `PrimitiveBlock::new()` validates UTF-8 for all string table entries, but this validation result is not exposed. `str_from_stringtable` uses `unsafe from_utf8_unchecked` relying on the validation having occurred. This is correct but the information (validated vs. unvalidated) is implicit in the type system rather than explicit. (box3-wire-parsing.md §6, StringTable Analysis, "The from_utf8_unchecked in str_from_stringtable")
 
 The pattern suggests that tightening the `take()` API to return richer types -- `(Vec<u8>, BlobIndex)` instead of `&[u8]` -- would eliminate two of the three issues simultaneously.
+
+**Status (as of `eeff9c1`):** Issues 1 and 2 are resolved. `take_owned() -> Option<(Vec<u8>, BlobIndex)>` returns both ownership and metadata in a single call, eliminating the information loss at the BlockBuilder→PbfWriter boundary.
 
 ### 6.6 Compression dominates everything
 

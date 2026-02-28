@@ -2,20 +2,21 @@
 
 ## Implementation Progress
 
-**Last updated:** `eeff9c1` (2026-02-28)
+**Last updated:** `4564a61` (2026-02-28)
 
 | Tier | Total | Done | Open | Deferred |
 |------|-------|------|------|----------|
 | P0 | 2 | 2 | 0 | 0 |
-| P1 | 3 | 2 | 1 | 0 |
-| P2 | 8 | 6 | 1 | 1 |
-| P3 | 11 | 0 | 11 | 0 |
-| **Total** | **24** | **10** | **13** | **1** |
+| P1 | 3 | 3 | 0 | 0 |
+| P2 | 8 | 6 | 0 | 2 |
+| P3 | 11 | 6 | 5 | 0 |
+| **Total** | **24** | **17** | **5** | **2** |
 
 All per-blob allocation waste (the dominant waste pattern, §6.1) has been eliminated.
 The BlockBuilder→PbfWriter API boundary information loss (§6.5) has been resolved.
-Remaining open items are correctness (P1-5 panic recovery), algorithmic (P2-13 parallel extract),
-and speculative/future (P3).
+P0-P2 tiers complete (P2-12 sqpoll deferred, P2-13 reverted). P3 trivial items done.
+Remaining open P3: SIMD varint (P3-20), sort streaming (P3-21), diff streaming
+(P3-22), io_uring sort (P3-15). All are medium-high effort or speculative.
 
 ---
 
@@ -236,7 +237,7 @@ Box 4 (section 6.6) identifies spatial blob filtering as "the single largest opt
 |---|---|---|---|---|---|
 | 3 | **Add `take_owned()` to BlockBuilder to eliminate `to_vec()` copies in pipelined paths** (box5-writer-pipeline.md §Finding 1; box6-block-builder.md §8.1, §10, P0; box8-commands.md §8A, §10, P1-1) | Box 5, Box 6, Box 8 | Eliminates ~155 GB copy churn (cat), ~40-50 seconds wall time. Eliminates flush_local double-copy (~17 GB for parallel rewrite paths). | Low | **DONE** (combined with P0-2) — `take_owned() -> Option<(Vec<u8>, BlobIndex)>` via `std::mem::replace`. All command `flush_local`/`flush_block` callers updated |
 | 4 | **extract smart pass 2: add BlobFilter for ways-only** (box8-commands.md §3D, §10, P1-2; box4-indexing-mmap.md §6.6) | Box 4, Box 8 | Saves ~60 seconds at planet scale (skips ~80% of decompression in smart pass 2). | Trivial (one line) | **DONE** `b4f2998` |
-| 5 | **Add panic recovery to decode pool tasks** (box1-read-orchestration.md §5.1, §7, Priority 1) | Box 1 | Prevents silent blob skipping on rayon task panic. Correctness fix, not performance. | Low (~15 lines) | Open |
+| 5 | **Add panic recovery to decode pool tasks** (box1-read-orchestration.md §5.1, §7, Priority 1) | Box 1 | Prevents silent blob skipping on rayon task panic. Correctness fix, not performance. | Low (~15 lines) | **DONE** `d1edf45` — `catch_unwind` wraps decode closure, panics converted to Error |
 
 ### P2 -- Moderate Impact, Worth Doing
 
@@ -249,7 +250,7 @@ Box 4 (section 6.6) identifies spatial blob filtering as "the single largest opt
 | 10 | **Use fixed-size array for indexdata** (box2-blob-decode.md §D3, §Recommended Actions Priority 3) | Box 2 | Eliminates ~120 MB cumulative alloc for indexed PBFs at planet scale. | Low | **DONE** `eeff9c1` — `Option<[u8; INDEX_SIZE]>` replaces `Option<Vec<u8>>` |
 | 11 | **Use `write_raw_owned` in cat.rs passthrough** (box5-writer-pipeline.md §Finding 7, §Recommended Action 3) | Box 5 | Eliminates one `to_vec()` per passthrough blob in cat. Minor. | Trivial | **DONE** `e5bfa36` — `std::mem::take` moves Vec into writer channel |
 | 12 | **Consider removing sqpoll code path** (box7-direct-io-uring.md §7, §11, Priority 2) | Box 7 | No performance gain (<1% across 3 scales). Removes ~30 lines and kernel 5.12+ dependency. Eliminates SQ overflow bug class. | Low | Deferred — needs planet-scale verification first |
-| 13 | **extract pass 1: parallel fold+reduce for IdSetDense** (box8-commands.md §3C, §10, P2-1) | Box 8 | ~2-4x speedup for pass 1 (~170s -> ~50-85s at planet scale). | Medium | Open |
+| 13 | **extract pass 1: parallel fold+reduce for IdSetDense** (box8-commands.md §3C, §10, P2-1) | Box 8 | ~2-4x speedup for pass 1 (~170s -> ~50-85s at planet scale). | Medium | Reverted `b67aa96` — par_iter contends with pipeline decode pool (14x regression at Denmark). Needs shared thread pool architecture. |
 
 ### P3 -- Low Priority / Future / Speculative
 
@@ -257,15 +258,15 @@ Box 4 (section 6.6) identifies spatial blob filtering as "the single largest opt
 |---|---|---|---|---|---|
 | 14 | **Spatial blob filter for extract (BlobIndex v2 with bbox)** (box4-indexing-mmap.md §6.6, §8, Priority 3a) | Box 4 | 99%+ node decompression savings for small extracts from planet. Most impactful for city-level planet extracts. | High | BlobIndex format extension, scan_block_ids extension |
 | 15 | **Extend io_uring to sort command** (box7-direct-io-uring.md §11, Priority 5; §10, Box 8) | Box 7 | ~25-30% improvement for planet-scale sort write path. | Medium | None |
-| 16 | **Add `#[inline]` to hot iterators** (`WireMessageIter::next()`, `DenseNodeIter::next()`, `WireGroup::{nodes,ways,relations}()`) (box3-wire-parsing.md §8c, §10, Priority 2) | Box 3 | 0% with fat LTO (current build). 1-3% for library consumers without LTO. | Trivial | None |
-| 17 | **BlobReader buffer reuse** (box2-blob-decode.md §D2, §Recommended Actions Priority 5) | Box 2 | Eliminates ~80 GB alloc churn for compressed blob data on read side. Low wall-clock impact due to allocator free-list efficiency. | Low-Medium | None |
-| 18 | **Add `madvise(MADV_SEQUENTIAL)` to MmapBlobReader** (box4-indexing-mmap.md §6.2, §8, Priority 2a) | Box 4 | ~50-80 ms improvement for mmap path. Mmap not used by any command. | Trivial (one line) | None |
-| 19 | **Add `/// # Memory` doc section to `par_map_reduce`** (box1-read-orchestration.md §2, Finding 1; §7, Priority 2) | Box 1 | Prevents library users from OOMing on planet files. Documentation only. | Trivial | None |
+| 16 | **Add `#[inline]` to hot iterators** (`WireMessageIter::next()`, `DenseNodeIter::next()`, `WireGroup::{nodes,ways,relations}()`) (box3-wire-parsing.md §8c, §10, Priority 2) | Box 3 | 0% with fat LTO (current build). 1-3% for library consumers without LTO. | Trivial | **DONE** `3c95704` — `#[inline]` on 5 hot iterator methods |
+| 17 | **BlobReader buffer reuse** (box2-blob-decode.md §D2, §Recommended Actions Priority 5) | Box 2 | Eliminates ~80 GB alloc churn for compressed blob data on read side. Low wall-clock impact due to allocator free-list efficiency. | Low-Medium | **DONE** (partial) `4040239` — header buffer reused; blob data buffer consumed by `Bytes::from()`, cannot reuse |
+| 18 | **Add `madvise(MADV_SEQUENTIAL)` to MmapBlobReader** (box4-indexing-mmap.md §6.2, §8, Priority 2a) | Box 4 | ~50-80 ms improvement for mmap path. Mmap not used by any command. | Trivial (one line) | **DONE** `3c95704` — `advise(Sequential)` in `MmapBlobReader::new()` |
+| 19 | **Add `/// # Memory` doc section to `par_map_reduce`** (box1-read-orchestration.md §2, Finding 1; §7, Priority 2) | Box 1 | Prevents library users from OOMing on planet files. Documentation only. | Trivial | **DONE** `4564a61` — documents ~80 GB RAM for planet, recommends `for_each_pipelined` |
 | 20 | **SIMD varint decode for packed arrays (protohoggr)** (box3-wire-parsing.md §5, SIMD varint decoding potential; box6-block-builder.md §8.2, §10, P4) | Box 3, Box 6 | ~25s saved on read side, ~175s on write side (2x on ~350s floor). Requires batch-decode API change. | High | Decompression must be optimized first |
 | 21 | **sort overlap run streaming (priority-queue merge)** (box8-commands.md §5B, §10, P2-3) | Box 8 | Prevents OOM on unsorted planet files (worst case ~1 TB). No impact on sorted inputs (common case). | Medium | None |
 | 22 | **derive_changes / diff streaming merge-join** (box8-commands.md §8B, §10, P3-1) | Box 8 | Enables planet-scale derive_changes/diff (currently OOM at ~680 GB per file). | High | Not a current use case |
-| 23 | **Deprecate or document IndexedReader limitations** (box4-indexing-mmap.md §4, Finding 3; §8, Priority 3b) | Box 4 | Prevents library users from OOMing with `read_ways_and_deps` at planet scale. | Trivial | None |
-| 24 | **Add opcode probe at io_uring init** (box7-direct-io-uring.md §2, Finding 1; §11, Priority 3) | Box 7 | Better error messages on old kernels. No performance impact. | Trivial | None |
+| 23 | **Deprecate or document IndexedReader limitations** (box4-indexing-mmap.md §4, Finding 3; §8, Priority 3b) | Box 4 | Prevents library users from OOMing with `read_ways_and_deps` at planet scale. | Trivial | **DONE** `4564a61` — `# Memory` doc section on `read_ways_and_deps` |
+| 24 | **Add opcode probe at io_uring init** (box7-direct-io-uring.md §2, Finding 1; §11, Priority 3) | Box 7 | Better error messages on old kernels. No performance impact. | Trivial | **DONE** `4704513` — probes WriteFixed/ReadFixed opcodes, returns clear error |
 
 ---
 

@@ -57,6 +57,7 @@ impl IdSetDense {
     /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
     /// processes a contiguous ID range), chunks are moved with zero copying.
     /// For overlapping chunks, byte-level OR is applied.
+    #[allow(dead_code)]
     pub fn merge(&mut self, other: Self) {
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);

@@ -9,8 +9,16 @@ use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use flate2::read::ZlibDecoder;
+use flate2::Decompress;
+use std::cell::RefCell;
 use std::io::Cursor;
+
+thread_local! {
+    /// Per-thread reusable zlib decompressor state (~32 KB inflate tables).
+    /// Reset via `Decompress::reset(true)` between blobs instead of allocating
+    /// a fresh instance each time.
+    static ZLIB_DECOMPRESS: RefCell<Decompress> = RefCell::new(Decompress::new(true));
+}
 
 /// Thread-safe pool of decompression buffers for reuse across pipeline blobs.
 ///
@@ -95,6 +103,45 @@ fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
         }),
         None => Bytes::from(decoded),
     }
+}
+
+/// Decompress zlib data into `buf` using the thread-local reusable decompressor.
+///
+/// Resets the decompressor state between calls instead of allocating a fresh
+/// ~32 KB inflate state per blob. Enforces `MAX_BLOB_MESSAGE_SIZE`.
+#[allow(clippy::cast_possible_truncation)] // total_in delta bounded by input.len() (usize)
+fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    ZLIB_DECOMPRESS.with_borrow_mut(|decompress| {
+        decompress.reset(true);
+        let mut input = compressed;
+        loop {
+            if buf.len() == buf.capacity() {
+                buf.reserve(input.len().max(4096));
+            }
+            let before_in = decompress.total_in();
+            let status = decompress
+                .decompress_vec(input, buf, flate2::FlushDecompress::None)
+                .map_err(|e| {
+                    new_error(ErrorKind::Io(std::io::Error::other(format!(
+                        "zlib decompress error: {e}"
+                    ))))
+                })?;
+            let consumed = (decompress.total_in() - before_in) as usize;
+            input = &input[consumed..];
+            if matches!(status, flate2::Status::StreamEnd) {
+                break;
+            }
+            // Output buffer was full — grow and retry.
+            if buf.len() == buf.capacity() {
+                buf.reserve(buf.len().max(4096));
+            }
+        }
+        let size = buf.len() as u64;
+        if size > MAX_BLOB_MESSAGE_SIZE {
+            return Err(new_blob_error(BlobError::MessageTooBig { size }));
+        }
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -873,9 +920,7 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
                 let capacity = blob.raw_size.unwrap_or(0) as usize;
                 buf.reserve(capacity.saturating_sub(buf.capacity()));
             }
-            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
-            decoder.read_to_end(buf)?;
-            Ok(())
+            zlib_decompress_into(bytes, buf)
         }
         Some(BlobData::Zstd(bytes)) => {
             if blob.raw_size.unwrap_or(0) > 0 {
@@ -914,25 +959,13 @@ pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
             }
         }
         Some(BlobData::Zlib(bytes)) => {
-            // When raw_size is set (the common case for modern PBF files), we use
-            // the exact decompressed size -- one perfect allocation, no reallocs.
-            //
-            // When raw_size is missing (rare, older PBF files), compressed size alone
-            // is 3-10x too small because zlib typically achieves that compression ratio.
-            // Using compressed size as capacity would cause multiple Vec reallocations
-            // as read_to_end grows the buffer.
-            //
-            // 4x is a conservative middle ground: it avoids most reallocations without
-            // grossly over-allocating. Even if we over-estimate, the Vec only uses
-            // actual bytes written after read_to_end returns.
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {
                 bytes.len() * 4
             };
-            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
             let mut decoded = Vec::with_capacity(capacity);
-            decoder.read_to_end(&mut decoded)?;
+            zlib_decompress_into(bytes, &mut decoded)?;
             Ok(decoded)
         }
         Some(BlobData::Zstd(bytes)) => {
@@ -1021,9 +1054,8 @@ pub(crate) fn decompress_blob(
             } else {
                 bytes.len() * 4
             };
-            let mut decoder = ZlibDecoder::new(&**bytes).take(MAX_BLOB_MESSAGE_SIZE);
             let mut decoded_bytes = pool_get(pool, capacity);
-            decoder.read_to_end(&mut decoded_bytes)?;
+            zlib_decompress_into(bytes, &mut decoded_bytes)?;
             Ok(pool_wrap(decoded_bytes, pool))
         }
         Some(BlobData::Zstd(bytes)) => {

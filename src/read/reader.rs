@@ -257,6 +257,18 @@ impl<R: Read + Send> ElementReader<R> {
     /// apply to this method. Use [`for_each`](Self::for_each) or
     /// [`for_each_pipelined`](Self::for_each_pipelined) if you need sorted element order.
     ///
+    /// # Memory
+    ///
+    /// This method collects **all** compressed blobs into memory before parallel
+    /// processing. Memory usage is approximately equal to the PBF file size
+    /// (compressed blobs are ~16-64 KB each). For a planet file (~80 GB), this
+    /// requires ~80 GB of RAM for the blob collection alone, plus one decoded
+    /// block (~1.4 MB) per rayon worker thread.
+    ///
+    /// For memory-constrained environments processing large files, use
+    /// [`for_each_pipelined`](Self::for_each_pipelined) instead, which streams
+    /// blocks through a bounded channel with constant memory overhead.
+    ///
     /// # Errors
     /// Returns the first Error encountered while parsing the PBF structure.
     ///

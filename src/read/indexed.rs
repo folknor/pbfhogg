@@ -251,6 +251,15 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
     /// This method also creates a lightweight in-memory index that speeds up future invocations of
     /// this or any other method of `IndexedReader`.
     ///
+    /// # Memory
+    ///
+    /// Collects all node IDs referenced by matching ways into a `BTreeSet<i64>`.
+    /// For planet-scale files with broad way filters, this set can grow to
+    /// billions of entries (~48 bytes each in `BTreeSet`), potentially exceeding
+    /// available memory. For planet-scale extractions, prefer the `extract`
+    /// command which uses [`IdSetDense`](crate::commands::id_set_dense::IdSetDense)
+    /// (1 bit per ID) and streaming passes.
+    ///
     /// # Example
     /// ```
     /// use pbfhogg::*;

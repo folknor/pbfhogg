@@ -307,6 +307,7 @@ enum Command {
 fn main() {
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50, 95, 99])
+        .with_functions_limit(0)
         .build();
 
     let cli = Cli::parse();

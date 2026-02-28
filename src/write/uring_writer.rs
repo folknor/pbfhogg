@@ -622,6 +622,26 @@ fn uring_init_and_run(
         .build(ring_depth)
         .map_err(|e| io::Error::new(e.kind(), format!("io_uring creation failed: {e}")))?;
 
+    // Step 2b: Probe supported opcodes for clear error messages on old kernels.
+    // WriteFixed requires Linux 5.1+, ReadFixed requires Linux 5.1+.
+    {
+        let mut probe = io_uring::Probe::new();
+        if ring.submitter().register_probe(&mut probe).is_ok() {
+            if !probe.is_supported(opcode::WriteFixed::CODE) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel does not support io_uring WriteFixed (requires Linux 5.1+)",
+                ));
+            }
+            if !probe.is_supported(opcode::ReadFixed::CODE) {
+                return Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "kernel does not support io_uring ReadFixed (requires Linux 5.1+)",
+                ));
+            }
+        }
+    }
+
     // Step 3: Open file with O_DIRECT.
     let file = std::fs::OpenOptions::new()
         .write(true)

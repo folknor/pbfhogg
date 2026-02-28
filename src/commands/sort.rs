@@ -111,7 +111,7 @@ struct OwnedRelation {
 /// sorted, and re-encoded.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bool) -> Result<SortStats> {
+pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bool, io_uring: bool, sqpoll: bool) -> Result<SortStats> {
     // Pass 1: Build blob index
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(input, direct_io)?;
@@ -130,12 +130,33 @@ pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bo
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing sorted output...");
     let header_bytes = HeaderBuilder::from_header(&header).sorted().build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = if io_uring {
+        #[cfg(feature = "linux-io-uring")]
+        {
+            PbfWriter::to_path_pipelined_uring(output, compression, &header_bytes, sqpoll)?
+        }
+        #[cfg(not(feature = "linux-io-uring"))]
+        {
+            let _ = sqpoll;
+            return Err("--io-uring requires the linux-io-uring feature".into());
+        }
+    } else if direct_io {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            PbfWriter::to_path_pipelined_direct(output, compression, &header_bytes)?
+        }
+        #[cfg(not(feature = "linux-direct-io"))]
+        {
+            return Err("--direct-io requires the linux-direct-io feature".into());
+        }
+    } else {
+        PbfWriter::to_path_pipelined(output, compression, &header_bytes)?
+    };
 
     // Open input for random-access reads
     let mut input_file = File::open(input)?;
 
-    // copy_file_range setup
+    // copy_file_range / CopyRange setup
     #[cfg(feature = "linux-direct-io")]
     let input_fd = {
         use std::os::unix::io::AsRawFd;
@@ -143,9 +164,10 @@ pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bo
     };
     #[cfg(not(feature = "linux-direct-io"))]
     let input_fd = 0i32;
-    // Sort always uses buffered output, so copy_file_range is always safe.
+    // io_uring uses linked ReadFixed+WriteFixed for CopyRange.
+    // Buffered output supports copy_file_range. O_DIRECT cannot.
     #[allow(unused_variables)]
-    let use_copy_range = cfg!(feature = "linux-direct-io");
+    let use_copy_range = io_uring || (!direct_io && cfg!(feature = "linux-direct-io"));
 
     let mut stats = SortStats {
         nodes: 0,

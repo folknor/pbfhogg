@@ -91,6 +91,12 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Use io_uring with registered buffers (requires linux-io-uring feature)
+        #[arg(long)]
+        io_uring: bool,
+        /// Enable SQ polling (requires --io-uring)
+        #[arg(long, requires = "io_uring")]
+        sqpoll: bool,
     },
     /// Filter elements by tag expressions
     TagsFilter {
@@ -325,7 +331,7 @@ fn main() {
             compression,
             direct_io,
         } => run_cat(&files, &output, type_filter.as_deref(), &compression, direct_io),
-        Command::Sort { file, output, compression, direct_io } => run_sort(&file, &output, &compression, direct_io),
+        Command::Sort { file, output, compression, direct_io, io_uring, sqpoll } => run_sort(&file, &output, &compression, direct_io, io_uring, sqpoll),
         Command::TagsFilter {
             file,
             output,
@@ -557,9 +563,11 @@ fn run_sort(
     output: &std::path::Path,
     compression: &str,
     direct_io: bool,
+    io_uring: bool,
+    sqpoll: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::sort::sort(file, output, compression, direct_io)?;
+    let stats = pbfhogg::sort::sort(file, output, compression, direct_io, io_uring, sqpoll)?;
     stats.print_summary();
     Ok(())
 }

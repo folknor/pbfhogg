@@ -122,7 +122,7 @@ fn sort_overlapping_blobs() {
     let output = dir.path().join("sorted.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false).expect("sort");
 
     let result = read_all_elements_with_coords(&output);
 
@@ -159,7 +159,7 @@ fn sort_wrong_type_order() {
     let output = dir.path().join("sorted.osm.pbf");
 
     write_type_unsorted_pbf(&input);
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false).expect("sort");
 
     let result = read_all_elements_with_coords(&output);
 
@@ -205,7 +205,7 @@ fn sort_already_sorted() {
         }],
     );
 
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false).expect("sort");
 
     let before = read_all_elements_with_coords(&input);
     let after = read_all_elements_with_coords(&output);
@@ -247,7 +247,7 @@ fn sort_cross_validate_osmium() {
     write_unsorted_overlapping_pbf(&input);
 
     // Sort with pbfhogg
-    pbfhogg::commands::sort::sort(&input, &pbfhogg_out, Compression::default(), false)
+    pbfhogg::commands::sort::sort(&input, &pbfhogg_out, Compression::default(), false, false, false)
         .expect("pbfhogg sort");
 
     // Sort with osmium

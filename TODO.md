@@ -7,7 +7,7 @@ Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run
 release and after completing major work** (especially changes to reader, writer, block_builder,
 or BlockBuilder/PbfWriter APIs):
 
-    scripts/test.sh -- --ignored
+    dev check -- --ignored
 
 `sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` — it
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
@@ -188,6 +188,8 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Code TODOs
 
+- notes/perf-review/cross-reference-synthesis.md
+
 - [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
   unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →
   fetch dependent nodes) and `for_each_node`. A `read_relations_and_deps` would
@@ -205,7 +207,7 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 - [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (tags-count, check-refs),
   decode+write (cat --type), and allocations. Run:
-  `scripts/profile-region.sh germany data/germany-20260224-seq4704.osm.pbf data/germany-20260225-seq4705.osc.gz`
+  `dev profile --dataset germany`
   Then update `notes/region-profiles.md` with the results.
 
 ## Nice to have

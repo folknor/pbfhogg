@@ -14,8 +14,8 @@
 - **Germany:** seq4704 (4.5 GB, 500M elements) + seq4705 OSC (5.9 MB, 146K changes)
 
 Indexdata variants generated via `pbfhogg cat --type node,way,relation`.
-Build: fat LTO, zlib-ng. Run with: `scripts/run-hotpath.sh`,
-`scripts/run-hotpath-alloc.sh`, `scripts/run-hotpath-germany.sh`
+Build: fat LTO, zlib-ng. Run with: `dev hotpath` / `dev hotpath --alloc` / `dev hotpath --dataset germany`
+(originally `scripts/run-hotpath.sh`, `scripts/run-hotpath-alloc.sh`, `scripts/run-hotpath-germany.sh`)
 
 ## Check-refs (pipelined read baseline, commit d5c8095)
 

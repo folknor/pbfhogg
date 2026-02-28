@@ -129,7 +129,7 @@ blob passthrough in `uring_writer.rs`).
 ### Merge io_uring benchmarks for reference
 
 Merge reads have a similar sequential scan pattern to extract collection.
-From North America benchmarks (18.8 GB, `scripts/bench-merge-uring.sh`):
+From North America benchmarks (18.8 GB, `scripts/bench-merge-uring.sh`, now `dev bench merge --uring`):
 
 | Scale | Buffered | io_uring | Delta |
 |-------|----------|----------|-------|

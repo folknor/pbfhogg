@@ -3,7 +3,7 @@
 Host: plantasjen — AMD Ryzen 9 5900X 12c/24t, 32 GB DDR4 (30 GB available), Samsung 970 EVO Plus NVMe.
 Build: fat LTO, zlib-ng, `--features hotpath` / `--features hotpath-alloc`.
 Baseline commit for all region data (except where noted): `aed93e0`.
-Script: `scripts/profile-region.sh <name> <pbf> <osc>`
+Script: `scripts/profile-region.sh <name> <pbf> <osc>` (now `dev profile --dataset <name>`)
 
 ## Region rationale
 
@@ -267,7 +267,4 @@ copies are eliminated entirely. Denmark post-optimization: read_raw_frame
 - **Not run**: Germany full suite (only merge timing exists, no read/write/alloc)
 - **Not downloaded**: Kantō sub-region
 
-To run Germany full suite:
-```
-scripts/profile-region.sh germany data/germany-20260224-seq4704.osm.pbf data/germany-20260225-seq4705.osc.gz 2>&1 | tee notes/germany-profile-raw.txt
-```
+To run Germany full suite: `dev profile --dataset germany`

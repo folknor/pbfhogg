@@ -892,7 +892,7 @@ fn compare_maps<V: std::fmt::Debug + PartialEq>(
 ///    (osmium uses version-based deletes; pbfhogg/osmosis/osmconvert use unconditional)
 ///
 /// Skipped if the data files don't exist or osmium isn't installed.
-/// Run with: `scripts/test.sh -- --ignored`
+/// Run with: `dev check -- --ignored`
 #[test]
 #[ignore]
 #[allow(clippy::cognitive_complexity)]

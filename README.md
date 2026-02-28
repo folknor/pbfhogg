@@ -181,11 +181,11 @@ Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upser
 
 At Japan scale, osmium takes 36.6s for the same operation (9-15x slower) because it decodes and re-encodes every element. pbfhogg passes ~92% of blobs through as raw bytes without decompression, using blob-level indexdata for O(1) classification. The single-pass pipeline overlaps reader I/O, parallel classification, parallel rewrite of touched blobs, and pipelined writes — passthrough blobs are coalesced into large buffers and moved into the writer channel with zero copy.
 
-All CLI commands are cross-validated against osmium on Denmark (`verify/*.sh`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
+All CLI commands are cross-validated against osmium on Denmark (`dev verify`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
 System: plantasjen — AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD (input/output) + HDD (build artifacts), Linux 6.18.
 
-Measured with `scripts/bench-*.sh`. Cross-validated with `verify/*.sh`.
+Measured with `dev bench`. Cross-validated with `dev verify`.
 
 ## O_DIRECT I/O
 

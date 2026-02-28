@@ -31,6 +31,14 @@ pub fn verify_msg(msg: &str) {
     println!("[verify]  {msg}");
 }
 
+pub fn hotpath_msg(msg: &str) {
+    println!("[hotpath] {msg}");
+}
+
+pub fn download_msg(msg: &str) {
+    println!("[download] {msg}");
+}
+
 /// Print an error message. Multi-line messages get each line prefixed.
 pub fn error(msg: &str) {
     for line in msg.lines() {
@@ -71,6 +79,44 @@ pub fn run_captured(
             code: None,
             stderr: e.to_string(),
         })?;
+
+    let elapsed = start.elapsed();
+
+    Ok(CapturedOutput {
+        status: output.status,
+        stdout: output.stdout,
+        stderr: output.stderr,
+        elapsed,
+    })
+}
+
+/// Run a subprocess with extra environment variables, capturing stdout and stderr.
+///
+/// Same as `run_captured` but injects additional environment variables into the
+/// subprocess. Variables are added on top of the inherited environment.
+pub fn run_captured_with_env(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &str)],
+) -> Result<CapturedOutput, DevError> {
+    let start = Instant::now();
+
+    let mut cmd = Command::new(program);
+    cmd.args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    for &(key, value) in env {
+        cmd.env(key, value);
+    }
+
+    let output = cmd.output().map_err(|e| DevError::Subprocess {
+        program: program.to_owned(),
+        code: None,
+        stderr: e.to_string(),
+    })?;
 
     let elapsed = start.elapsed();
 

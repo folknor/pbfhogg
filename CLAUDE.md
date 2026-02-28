@@ -7,7 +7,7 @@ Rust library for reading and writing OpenStreetMap PBF files. Fork of [osmpbf](h
 - Never chain commands with &&. Write a script instead.
 - Never pipe commands with |. Write a script instead.
 - Never read or write from /tmp. All data lives in the project.
-- Never run raw cargo, curl, pkill. Use `dev` or the scripts below.
+- Never run raw cargo, curl, pkill. Use `dev`.
 
 ## Dev tool
 
@@ -26,22 +26,16 @@ The `dev/` crate (`pbfhogg-dev`) provides structured development tooling. Invoke
 - `cargo dev bench planetiler [--dataset name] [--pbf path] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR.
 - `cargo dev bench all [--dataset name] [--pbf path] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines.
 - `cargo dev results [--commit X] [--compare A B] [--command X] [--variant X] [-n N]` — query benchmark results from SQLite database. Results stored by bench harness (clean tree only).
+- `cargo dev hotpath [--dataset name] [--pbf path] [--osc path] [--alloc] [--runs N]` — hotpath profiling (function-level timing/allocation metrics). Default dataset: denmark, runs: 1. `--alloc` uses `hotpath-alloc` feature for allocation tracking. Wall-clock stored in SQLite.
+- `cargo dev profile [--dataset name] [--pbf path] [--osc path]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite.
+- `cargo dev download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
+- `cargo dev clean` — remove scratch temp files and verify output directories.
 
 The alias is defined in `.cargo/config.toml`. Auto-builds on first use. Benchmark results stored in `dev/results.db` (SQLite, committed in git).
 
 ## Scripts
 
-Remaining scripts:
-- `scripts/build.sh` — build release binary
-- `scripts/run-hotpath.sh` — hotpath profiling (pipelined read + decode/write + merge, fixed dataset)
-- `scripts/run-hotpath-alloc.sh` — hotpath allocation profiling (same commands, fixed dataset)
-- `scripts/run-hotpath-germany.sh` — Germany scale hotpath profiling
-- `scripts/profile-region.sh` — cross-region profiling suite
-- `scripts/download-regions.sh` — region dataset downloader
-- `scripts/build-hotpath.sh` — hotpath build wrapper
-
-Hotpath/profiling scripts build internally — no need to run `build.sh` first.
-If you need something these scripts don't cover, write a new script.
+No shell scripts remain. All development tooling is in `cargo dev`.
 
 ## Indexdata PBFs
 
@@ -68,7 +62,7 @@ Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconve
 - `cargo dev verify all [--dataset name] [--pbf path] [--osc path] [--bbox bbox]` — run all verify commands sequentially
 
 ## Benchmarking Rules
-- **NEVER run benchmark, profiling, or verify commands in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench subcommands, verify subcommands, hotpath scripts, and any script that measures performance.
+- **NEVER run benchmark, profiling, or verify commands in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench, verify, hotpath, and profile subcommands.
 - When an optimization workflow requires multiple benchmark runs (baseline, mid-work, post-work), run each one **sequentially** and report results between runs. Do NOT launch them as parallel background tasks.
 
 ## Subagents
@@ -99,7 +93,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 ## Conventions
 
-- All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark TSV files record this automatically via the bench scripts.
+- All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark results are stored automatically in `dev/results.db` (SQLite).
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind). `MissingHeader` error if a PBF doesn't start with an OsmHeader blob.

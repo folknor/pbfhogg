@@ -13,6 +13,7 @@ origin = "Geofabrik 2026-02-20 seq 4704, indexdata via pbfhogg cat"
 
 [datasets.germany]
 pbf = "germany-20260224-seq4704-with-indexdata.osm.pbf"
+pbf_raw = "germany-20260224-seq4704.osm.pbf"
 osc = "germany-20260225-seq4705.osc.gz"
 origin = "Geofabrik 2026-02-24 seq 4704, indexdata via pbfhogg cat"
 
@@ -30,21 +31,25 @@ origin = "Geofabrik seq 4710, indexdata via pbfhogg cat"
 
 [datasets.norway]
 pbf = "norway-20260225-seq4709-with-indexdata.osm.pbf"
+pbf_raw = "norway-20260225-seq4709.osm.pbf"
 osc = "norway-20260225-seq4709.osc.gz"
 origin = "Geofabrik 2026-02-25 seq 4709, indexdata via pbfhogg cat"
 
 [datasets.switzerland]
 pbf = "switzerland-20260225-seq4707-with-indexdata.osm.pbf"
+pbf_raw = "switzerland-20260225-seq4707.osm.pbf"
 osc = "switzerland-20260225-seq4707.osc.gz"
 origin = "Geofabrik 2026-02-25 seq 4707, indexdata via pbfhogg cat"
 
 [datasets.malta]
 pbf = "malta-20260225-seq4706-with-indexdata.osm.pbf"
+pbf_raw = "malta-20260225-seq4706.osm.pbf"
 osc = "malta-20260225-seq4706.osc.gz"
 origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
 
 [datasets.greater-london]
 pbf = "greater-london-20260225-seq4704-with-indexdata.osm.pbf"
+pbf_raw = "greater-london-20260225-seq4704.osm.pbf"
 osc = "greater-london-20260225-seq4704.osc.gz"
 origin = "Geofabrik 2026-02-25 seq 4704, indexdata via pbfhogg cat"
 

@@ -137,7 +137,7 @@ fn ensure_osmosis_binary(data_dir: &Path) -> Result<PathBuf, DevError> {
 // curl preflight
 // ---------------------------------------------------------------------------
 
-fn check_curl() -> Result<(), DevError> {
+pub(crate) fn check_curl() -> Result<(), DevError> {
     let result = std::process::Command::new("which")
         .arg("curl")
         .stdout(std::process::Stdio::null())
@@ -406,7 +406,7 @@ fn detect_os() -> Result<&'static str, DevError> {
 // ---------------------------------------------------------------------------
 
 /// Run curl with the given arguments, returning stdout bytes on success.
-fn run_curl(args: &[&str], cwd: &Path) -> Result<Vec<u8>, DevError> {
+pub(crate) fn run_curl(args: &[&str], cwd: &Path) -> Result<Vec<u8>, DevError> {
     let captured = output::run_captured("curl", args, cwd)?;
 
     if !captured.status.success() {
@@ -419,4 +419,33 @@ fn run_curl(args: &[&str], cwd: &Path) -> Result<Vec<u8>, DevError> {
     }
 
     Ok(captured.stdout)
+}
+
+/// Download a URL to a file with a visible progress bar.
+///
+/// Uses curl with `--progress-bar` and inherited stderr so the user can see
+/// download progress for large files.
+pub(crate) fn download_file(url: &str, dest: &Path) -> Result<(), DevError> {
+    let dest_str = dest.display().to_string();
+
+    let status = std::process::Command::new("curl")
+        .args(["-fL", "--progress-bar", "-o", &dest_str, url])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .map_err(|e| DevError::Subprocess {
+            program: "curl".into(),
+            code: None,
+            stderr: e.to_string(),
+        })?;
+
+    if !status.success() {
+        return Err(DevError::Subprocess {
+            program: "curl".into(),
+            code: status.code(),
+            stderr: format!("download failed: {url}"),
+        });
+    }
+
+    Ok(())
 }

@@ -10,14 +10,17 @@ mod bench_write;
 mod build;
 mod config;
 mod db;
+mod download;
 mod env;
 mod error;
 mod git;
 mod harness;
+mod hotpath;
 mod lockfile;
 mod output;
 #[allow(dead_code)]
 mod preflight;
+mod profile;
 mod tools;
 mod verify;
 mod verify_add_locations;
@@ -94,6 +97,53 @@ enum Command {
         #[arg(long, short = 'n', default_value = "20")]
         limit: usize,
     },
+    /// Run hotpath profiling (timing or allocation instrumentation)
+    Hotpath {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+
+        /// Run allocation profiling instead of timing
+        #[arg(long)]
+        alloc: bool,
+
+        /// Number of runs (default: 1 for profiling)
+        #[arg(long, default_value = "1")]
+        runs: usize,
+    },
+    /// Run two-pass profiling (timing + allocation) for a dataset
+    Profile {
+        /// Dataset name from dev.toml (default: denmark)
+        #[arg(long, default_value = "denmark")]
+        dataset: String,
+
+        /// Explicit PBF file path (overrides --dataset)
+        #[arg(long)]
+        pbf: Option<String>,
+
+        /// Explicit OSC diff file path (overrides --dataset)
+        #[arg(long)]
+        osc: Option<String>,
+    },
+    /// Download a region dataset from Geofabrik
+    Download {
+        /// Region name (malta, greater-london, switzerland, norway, japan, denmark, germany, north-america)
+        region: String,
+
+        /// URL for the OSC diff file
+        #[arg(long)]
+        osc_url: Option<String>,
+    },
+    /// Clean build artifacts and scratch data
+    Clean,
 }
 
 #[derive(Subcommand)]
@@ -415,6 +465,16 @@ fn main() {
             variant,
             limit,
         } => cmd_results(commit, compare, command, variant, limit),
+        Command::Hotpath {
+            dataset,
+            pbf,
+            osc,
+            alloc,
+            runs,
+        } => cmd_hotpath(dataset, pbf, osc, alloc, runs),
+        Command::Profile { dataset, pbf, osc } => cmd_profile(dataset, pbf, osc),
+        Command::Download { region, osc_url } => cmd_download(region, osc_url),
+        Command::Clean => cmd_clean(),
     };
     if let Err(e) = result {
         output::error(&e.to_string());
@@ -1221,5 +1281,137 @@ fn cmd_run(args: &[String]) -> Result<(), DevError> {
     if code != 0 {
         process::exit(code);
     }
+    Ok(())
+}
+
+fn cmd_hotpath(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+    alloc: bool,
+    runs: usize,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+    let pbf_raw_path = resolve_raw_pbf_path(&None, &dataset, &dev_config, &paths).ok();
+    let file_mb = file_size_mb(&pbf_path);
+
+    let feature = if alloc { "hotpath-alloc" } else { "hotpath" };
+    let binary = build::cargo_build(
+        &build::BuildConfig::release_cli_with_features(&[feature]),
+        &ws.workspace_root,
+    )?;
+
+    let harness = harness::BenchHarness::new(&dev_config, &paths, &ws.workspace_root)?;
+    hotpath::run(
+        &harness,
+        &binary,
+        &pbf_path,
+        pbf_raw_path.as_deref(),
+        &osc_path,
+        file_mb,
+        runs,
+        alloc,
+        &paths.scratch_dir,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_profile(
+    dataset: String,
+    pbf: Option<String>,
+    osc: Option<String>,
+) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    let pbf_path = resolve_pbf_path(&pbf, &dataset, &dev_config, &paths)?;
+    let osc_path = resolve_osc_path(&osc, &dataset, &dev_config, &paths)?;
+    let pbf_raw_path = resolve_raw_pbf_path(&None, &dataset, &dev_config, &paths).ok();
+    let file_mb = file_size_mb(&pbf_path);
+
+    profile::run(
+        &pbf_path,
+        pbf_raw_path.as_deref(),
+        &osc_path,
+        &dataset,
+        file_mb,
+        &paths.scratch_dir,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_download(region: String, osc_url: Option<String>) -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    download::run(
+        &region,
+        osc_url.as_deref(),
+        &paths.data_dir,
+        &ws.workspace_root,
+    )
+}
+
+fn cmd_clean() -> Result<(), DevError> {
+    let ws = build::cargo_metadata()?;
+    let hostname = config::hostname()?;
+    let dev_config = config::load(&ws.workspace_root)?;
+    let paths = config::resolve_paths(
+        &dev_config,
+        &hostname,
+        &ws.workspace_root,
+        &ws.target_dir,
+    );
+
+    // Clean verify output.
+    let verify_dir = paths.target_dir.join("verify");
+    if verify_dir.exists() {
+        std::fs::remove_dir_all(&verify_dir)?;
+        output::run_msg("removed verify output");
+    }
+
+    // Clean scratch temp files.
+    if paths.scratch_dir.exists() {
+        let mut removed = 0u32;
+        if let Ok(entries) = std::fs::read_dir(&paths.scratch_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("pbf") {
+                    let _ = std::fs::remove_file(&path);
+                    removed += 1;
+                }
+            }
+        }
+        if removed > 0 {
+            output::run_msg(&format!("removed {removed} scratch file(s)"));
+        }
+    }
+
+    output::result_msg("clean done");
     Ok(())
 }

@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::blob_index::BlobIndex;
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
-use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -921,8 +921,9 @@ fn extract_smart(
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
+    // BlobFilter skips node and relation blobs (only ways are needed here).
     let reader = ElementReader::open(input, direct_io)?;
-    for block in reader.into_blocks_pipelined() {
+    for block in reader.with_blob_filter(BlobFilter::new(false, true, false)).into_blocks_pipelined() {
         let block = block?;
         for group in block.groups() {
             for w in group.ways() {

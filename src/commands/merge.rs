@@ -251,6 +251,9 @@ struct RawBlobFrame {
     /// Blob-level index from BlobHeader indexdata, if present.
     /// When available, classify_blob can skip decompression entirely.
     index: Option<BlobIndex>,
+    /// Per-blob tag key data from BlobHeader field 4, if present.
+    /// Preserved during passthrough so tag metadata survives merges.
+    tagdata: Option<Box<[u8]>>,
     /// Byte offset of this frame in the input file (for copy_file_range).
     #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
     file_offset: u64,
@@ -285,9 +288,9 @@ fn read_raw_frame<R: Read>(
     let mut header_bytes = vec![0u8; header_len];
     reader.read_exact(&mut header_bytes)?;
 
-    // Parse type + datasize + optional indexdata
-    let (blob_type, data_size, raw_index) = parse_blob_header_with_index(&header_bytes)?;
-    let index = raw_index.and_then(|data| BlobIndex::deserialize(&data));
+    // Parse type + datasize + optional indexdata + optional tagdata
+    let (blob_type, data_size, raw_index, tagdata) = parse_blob_header_with_index(&header_bytes)?;
+    let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
 
     // Assemble the complete frame, reading blob data directly into it.
     // This avoids a separate ~55 KB blob_bytes allocation per blob.
@@ -304,6 +307,7 @@ fn read_raw_frame<R: Read>(
         blob_type,
         blob_offset,
         index,
+        tagdata,
         file_offset: frame_start,
     }))
 }
@@ -1394,6 +1398,7 @@ fn coalesce_passthrough(
         let reframed = crate::write::writer::reframe_raw_with_index(
             frame.blob_bytes(),
             &indexdata,
+            frame.tagdata.as_deref(),
         )?;
         buf.extend_from_slice(&reframed);
     }

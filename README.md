@@ -11,7 +11,8 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Write** valid `.osm.pbf` files with `HeaderBuilder`, `BlockBuilder`, and `PbfWriter` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
 - **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
 - **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
-- **Blob indexdata** — embeds element type + ID range in BlobHeader for fast merge classification without decompression
+- **Blob indexdata** — embeds element type + ID range + spatial bbox in BlobHeader for fast merge classification and spatial filtering without decompression
+- **Blob tag index** — embeds per-blob tag key metadata in BlobHeader field 4; the pipeline skips decompression of blobs that provably lack required tag keys (e.g. `tags-filter highway=primary` skips all blobs without a `highway` key)
 - **Configurable compression** — zlib (default), zstd, or none; pure Rust zlib, system zlib, or zlib-ng via feature flags
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
 - **io_uring writes** — optional `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and registered buffers for maximum throughput when I/O-bound
@@ -267,6 +268,16 @@ pbfhogg cat input.osm.pbf -o output.osm.pbf --compression zlib:9
 | `zlib:LEVEL` | Zlib with explicit level (0-9). Higher = smaller + slower. |
 | `zstd` | Zstandard level 3. Better compression ratio and faster decompression than zlib. |
 | `zstd:LEVEL` | Zstandard with explicit level. |
+
+## BlobHeader extensions
+
+pbfhogg embeds additional metadata in BlobHeader fields that standard PBF readers silently skip (per protobuf wire format rules for unknown fields).
+
+**Field 2 (indexdata)**: 42-byte fixed-size blob containing element type (`ElemKind`), ID range (min/max), and spatial bounding box (decimicrodegree `i32` coordinates). Used by merge and sort for O(1) blob classification without decompression.
+
+**Field 4 (tagdata)**: Variable-length blob containing the set of unique tag key strings present in the blob. Wire format: version byte (`0x01`) + key count (`u16` LE) + repeated `[key_len (u16 LE) + key_bytes]`. Used by `tags-filter` and any filtered read to skip decompression of blobs that provably lack required tag keys. Blobs without tagdata (files from other tools) always pass the filter (conservative).
+
+Both fields are written automatically by `PbfWriter` and preserved during sort/merge passthrough. No `optional_features` header declaration is added — these are transparent extensions.
 
 ## License
 

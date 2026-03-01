@@ -51,7 +51,7 @@ pub(crate) struct ReadResult {
 pub(crate) fn read_elements(
     input: &Path,
     direct_io: bool,
-    filter: Option<BlobFilter>,
+    filter: Option<&BlobFilter>,
 ) -> Result<ReadResult> {
     let reader = BlobReader::open(input, direct_io)?;
     let mut nodes: Vec<OwnedNode> = Vec::new();
@@ -65,7 +65,7 @@ pub(crate) fn read_elements(
     for blob in reader {
         let blob = blob?;
         // Skip blob decompression if indexdata says it's an irrelevant type.
-        if let Some(ref f) = filter
+        if let Some(f) = filter
             && let Some(idx) = blob.index()
             && !f.wants(idx.kind)
         {

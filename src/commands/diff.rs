@@ -111,8 +111,8 @@ pub fn diff(
         Some(BlobFilter::new(filter.nodes, filter.ways, filter.relations))
     };
 
-    let mut old = read_elements(old_path, direct_io, blob_filter)?;
-    let mut new = read_elements(new_path, direct_io, blob_filter)?;
+    let mut old = read_elements(old_path, direct_io, blob_filter.as_ref())?;
+    let mut new = read_elements(new_path, direct_io, blob_filter.as_ref())?;
 
     // Ensure sorted by ID
     old.nodes.sort_by_key(|n| n.id);

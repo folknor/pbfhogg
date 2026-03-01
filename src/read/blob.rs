@@ -168,6 +168,8 @@ pub(crate) struct WireBlobHeader {
     pub datasize: i32,
     /// Blob-level index: 42 bytes (v2) or 26 bytes (v1, zero-padded), stored inline.
     pub indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]>,
+    /// Per-blob tag key index (BlobHeader field 4). Variable-length.
+    pub tagdata: Option<Box<[u8]>>,
 }
 
 impl WireBlobHeader {
@@ -178,6 +180,7 @@ impl WireBlobHeader {
         let mut blob_type = BlobKind::Unknown(String::new());
         let mut datasize: i32 = 0;
         let mut indexdata: Option<[u8; crate::blob_index::INDEX_SIZE]> = None;
+        let mut tagdata: Option<Box<[u8]>> = None;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match field {
@@ -208,11 +211,18 @@ impl WireBlobHeader {
                     #[allow(clippy::cast_possible_truncation)]
                     { datasize = cursor.read_varint()? as i32; }
                 }
+                4 => {
+                    // tagdata: per-blob tag key index (len-delimited)
+                    let bytes = cursor.read_len_delimited()?;
+                    if !bytes.is_empty() {
+                        tagdata = Some(bytes.into());
+                    }
+                }
                 _ => cursor.skip_field(wire_type)?,
             }
         }
 
-        Ok(WireBlobHeader { blob_type, datasize, indexdata })
+        Ok(WireBlobHeader { blob_type, datasize, indexdata, tagdata })
     }
 }
 
@@ -417,6 +427,17 @@ impl Blob {
             .indexdata
             .as_ref()
             .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
+    }
+
+    /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
+    ///
+    /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs
+    /// do not — this returns `None` for those.
+    pub(crate) fn tag_index(&self) -> Option<crate::blob_index::TagIndex> {
+        self.header
+            .tagdata
+            .as_ref()
+            .and_then(|d| crate::blob_index::TagIndex::deserialize(d))
     }
 
     /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
@@ -864,15 +885,15 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, u
     parse_blob_header(header_bytes)
 }
 
-/// Parse a BlobHeader and also extract the optional `indexdata` field.
+/// Parse a BlobHeader and extract optional `indexdata` and `tagdata` fields.
 ///
-/// Returns `(blob_type, data_size, optional_indexdata)`. The indexdata, when
-/// present, contains blob-level metadata (element type, ID range, count, and
-/// optionally spatial bbox) that allows merge to classify blobs without
-/// decompression.
+/// Returns `(blob_type, data_size, optional_indexdata, optional_tagdata)`.
+/// The indexdata, when present, contains blob-level metadata (element type,
+/// ID range, count, and optionally spatial bbox) that allows merge to classify
+/// blobs without decompression. The tagdata contains per-blob tag key metadata.
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
-) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>)> {
+) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {
     let header = WireBlobHeader::parse(header_bytes)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -880,7 +901,7 @@ pub fn parse_blob_header_with_index(
         }));
     }
     #[allow(clippy::cast_sign_loss)]
-    Ok((header.blob_type, header.datasize as usize, header.indexdata))
+    Ok((header.blob_type, header.datasize as usize, header.indexdata, header.tagdata))
 }
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
@@ -1147,6 +1168,7 @@ mod tests {
                 blob_type: kind.clone(),
                 datasize: 0,
                 indexdata: None,
+                tagdata: None,
             };
             let ff_blob = WireBlob { data: None, raw_size: None };
 

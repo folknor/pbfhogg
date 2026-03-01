@@ -336,12 +336,15 @@ impl<W: Write> PbfWriter<W> {
             rayon::spawn(move || {
                 let indexdata = blob_index::scan_block_ids(&uncompressed)
                     .map(|idx| idx.serialize());
+                let tagdata = blob_index::scan_block_tags(&uncompressed)
+                    .map(|ti| ti.serialize());
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
                         "OSMData",
                         &uncompressed,
                         &compression,
                         indexdata.as_ref().map(<[u8; 42]>::as_slice),
+                        tagdata.as_deref(),
                         scratch,
                     )
                 });
@@ -351,10 +354,13 @@ impl<W: Write> PbfWriter<W> {
         } else {
             let indexdata = blob_index::scan_block_ids(block_bytes)
                 .map(|idx| idx.serialize());
+            let tagdata = blob_index::scan_block_tags(block_bytes)
+                .map(|ti| ti.serialize());
             self.write_framed_blob(
                 "OSMData",
                 block_bytes,
                 indexdata.as_ref().map(<[u8; 42]>::as_slice),
+                tagdata.as_deref(),
             )
         }
     }
@@ -372,6 +378,8 @@ impl<W: Write> PbfWriter<W> {
         index: blob_index::BlobIndex,
     ) -> io::Result<()> {
         let indexdata = index.serialize();
+        let tagdata = blob_index::scan_block_tags(&block_bytes)
+            .map(|ti| ti.serialize());
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
@@ -384,6 +392,7 @@ impl<W: Write> PbfWriter<W> {
                         &block_bytes,
                         &compression,
                         Some(indexdata.as_slice()),
+                        tagdata.as_deref(),
                         scratch,
                     )
                 });
@@ -395,6 +404,7 @@ impl<W: Write> PbfWriter<W> {
                 "OSMData",
                 &block_bytes,
                 Some(indexdata.as_slice()),
+                tagdata.as_deref(),
             )
         }
     }
@@ -494,7 +504,7 @@ impl<W: Write> PbfWriter<W> {
     // only 2 constants ("OSMHeader"/"OSMData"), no real typo risk.
     #[hotpath::measure]
     fn write_blob(&mut self, blob_type: &str, uncompressed: &[u8]) -> io::Result<()> {
-        self.write_framed_blob(blob_type, uncompressed, None)
+        self.write_framed_blob(blob_type, uncompressed, None, None)
     }
 
     /// Encode, compress, and write a blob directly to the writer using reusable
@@ -504,6 +514,7 @@ impl<W: Write> PbfWriter<W> {
         blob_type: &str,
         uncompressed: &[u8],
         indexdata: Option<&[u8]>,
+        tagdata: Option<&[u8]>,
     ) -> io::Result<()> {
         encode_blob_body(
             uncompressed,
@@ -520,6 +531,7 @@ impl<W: Write> PbfWriter<W> {
             blob_type,
             datasize,
             indexdata,
+            tagdata,
             &mut self.scratch.header_buf,
         );
         let header_len = u32::try_from(self.scratch.header_buf.len()).map_err(|_| {
@@ -713,7 +725,7 @@ pub(crate) fn frame_blob(
         zlib_compressor: None,
         zstd_compressor: None,
     };
-    frame_blob_into(blob_type, uncompressed, compression, indexdata, &mut scratch)
+    frame_blob_into(blob_type, uncompressed, compression, indexdata, None, &mut scratch)
 }
 
 /// Compress and frame a blob using reusable scratch buffers.
@@ -727,6 +739,7 @@ fn frame_blob_into(
     uncompressed: &[u8],
     compression: &Compression,
     indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
     scratch: &mut FrameScratch,
 ) -> io::Result<Vec<u8>> {
     encode_blob_body(uncompressed, compression, scratch)?;
@@ -734,7 +747,7 @@ fn frame_blob_into(
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", scratch.blob_buf.len()))
     })?;
-    encode_blob_header_into(blob_type, datasize, indexdata, &mut scratch.header_buf);
+    encode_blob_header_into(blob_type, datasize, indexdata, tagdata, &mut scratch.header_buf);
 
     let header_len = u32::try_from(scratch.header_buf.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", scratch.header_buf.len())))?;
@@ -848,11 +861,12 @@ fn compress_zlib(
 /// Encode a BlobHeader into `buf` (cleared and reused).
 ///
 /// BlobHeader fields: type (string, field 1), indexdata (bytes, field 2),
-/// datasize (int32, field 3).
+/// datasize (int32, field 3), tagdata (bytes, field 4).
 fn encode_blob_header_into(
     blob_type: &str,
     datasize: i32,
     indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
     buf: &mut Vec<u8>,
 ) {
     buf.clear();
@@ -864,6 +878,10 @@ fn encode_blob_header_into(
     }
     // Field 3: datasize (int32 varint)
     encode_int32_field(buf, 3, datasize);
+    // Field 4: tagdata (optional bytes — per-blob tag key index)
+    if let Some(data) = tagdata {
+        encode_bytes_field(buf, 4, data);
+    }
 }
 
 /// Re-frame an already-compressed Blob with a new BlobHeader that includes indexdata.
@@ -877,12 +895,13 @@ fn encode_blob_header_into(
 pub(crate) fn reframe_raw_with_index(
     blob_bytes: &[u8],
     indexdata: &[u8],
+    tagdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
     })?;
     let mut header_buf = Vec::new();
-    encode_blob_header_into("OSMData", datasize, Some(indexdata), &mut header_buf);
+    encode_blob_header_into("OSMData", datasize, Some(indexdata), tagdata, &mut header_buf);
 
     let header_len = u32::try_from(header_buf.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_buf.len())))?;

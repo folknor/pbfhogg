@@ -302,7 +302,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     // -----------------------------------------------------------------------
     for file in files {
         let reader = ElementReader::open(file, direct_io)?;
-        let blocks_iter = reader.with_blob_filter(blob_filter).into_blocks_pipelined();
+        let blocks_iter = reader.with_blob_filter(blob_filter.clone()).into_blocks_pipelined();
 
         // Collect decoded blocks into batches of BATCH_SIZE, then process
         // each batch in parallel via rayon.

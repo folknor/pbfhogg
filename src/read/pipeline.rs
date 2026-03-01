@@ -12,6 +12,25 @@ use std::io::Read;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
 
+/// Returns `true` if the blob should be skipped based on the filter.
+///
+/// Checks indexdata (element type + spatial bbox) and tagdata (tag key presence).
+/// Blobs without indexdata or tagdata always pass through (conservative).
+fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
+    if let Some(idx) = blob.index()
+        && !filter.wants_index(&idx)
+    {
+        return true;
+    }
+    if filter.has_tag_filter()
+        && let Some(tag_idx) = blob.tag_index()
+        && !filter.wants_tag_index(&tag_idx)
+    {
+        return true;
+    }
+    false
+}
+
 /// Number of raw blobs the I/O thread can read ahead.
 const READ_AHEAD: usize = 16;
 
@@ -41,6 +60,7 @@ where
     type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
     type DecodedItem = (usize, Option<crate::error::Result<PrimitiveBlock>>);
 
+    let blob_filter = blob_filter.map(Arc::new);
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(READ_AHEAD);
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(DECODE_AHEAD);
 
@@ -103,16 +123,13 @@ where
                 let bp = Arc::clone(&buffer_pool);
                 match blob_result {
                     Ok(blob) => {
+                        let bf = blob_filter.clone();
                         decode_pool.spawn(move || {
                             let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 match blob.get_type() {
                                     BlobType::OsmData => {
-                                        // If a blob filter is set and the blob has indexdata,
-                                        // skip decompression for blobs that don't match.
-                                        // Files without indexdata always pass through.
-                                        if let Some(ref filter) = blob_filter
-                                            && let Some(idx) = blob.index()
-                                            && !filter.wants_index(&idx)
+                                        if let Some(ref filter) = bf
+                                            && should_skip_blob(filter, &blob)
                                         {
                                             return None;
                                         }

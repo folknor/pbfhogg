@@ -59,6 +59,8 @@ struct BlobEntry {
     index: BlobIndex,
     /// Whether the BlobHeader already has indexdata embedded.
     has_indexdata: bool,
+    /// Per-blob tag key data from BlobHeader field 4, preserved for passthrough.
+    tagdata: Option<Box<[u8]>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -286,7 +288,7 @@ fn build_blob_index(
         let mut header_bytes = vec![0u8; header_len];
         reader.read_exact(&mut header_bytes)?;
 
-        let (blob_type, data_size, raw_index) =
+        let (blob_type, data_size, raw_index, tagdata) =
             parse_blob_header_with_index(&header_bytes)?;
         let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
         let has_indexdata = index.is_some();
@@ -321,6 +323,7 @@ fn build_blob_index(
                     frame_len,
                     index: blob_index,
                     has_indexdata,
+                    tagdata,
                 });
             }
             _ => {}
@@ -391,7 +394,7 @@ fn write_passthrough_blob(
         // Reframe with indexdata before writing
         read_frame_into(input_file, entry, frame_buf)?;
         let blob_bytes = extract_blob_bytes(frame_buf)?;
-        let reframed = reframe_raw_with_index(blob_bytes, &entry.index.serialize())?;
+        let reframed = reframe_raw_with_index(blob_bytes, &entry.index.serialize(), entry.tagdata.as_deref())?;
         writer.write_raw(&reframed)?;
     }
     Ok(())

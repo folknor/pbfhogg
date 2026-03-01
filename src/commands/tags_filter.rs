@@ -152,22 +152,46 @@ fn tag_matches(matcher: &TagMatcher, key: &str, value: &str) -> bool {
     }
 }
 
-/// Compute a `BlobFilter` from the union of all expression type filters.
-/// Returns `None` if all types are needed (no benefit from filtering).
+/// Compute a `BlobFilter` from the union of all expression type + tag key filters.
+///
+/// Returns `None` only if all types are needed AND no tag keys can be extracted
+/// (no benefit from filtering at blob level).
 fn blob_filter_from_expressions(expressions: &[Expression]) -> Option<BlobFilter> {
     let mut need_nodes = false;
     let mut need_ways = false;
     let mut need_relations = false;
+    let mut keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut prefixes: std::collections::HashSet<String> = std::collections::HashSet::new();
+
     for expr in expressions {
         need_nodes |= expr.type_filter.nodes;
         need_ways |= expr.type_filter.ways;
         need_relations |= expr.type_filter.relations;
+
+        match &expr.matcher {
+            TagMatcher::KeyOnly { key } => { keys.insert(key.clone()); }
+            TagMatcher::KeyPrefix { prefix } => { prefixes.insert(prefix.clone()); }
+            TagMatcher::ExactValue { key, .. }
+            | TagMatcher::MultiValue { key, .. }
+            | TagMatcher::NotValue { key, .. } => { keys.insert(key.clone()); }
+        }
     }
-    if need_nodes && need_ways && need_relations {
-        None
-    } else {
-        Some(BlobFilter::new(need_nodes, need_ways, need_relations))
+
+    let all_types = need_nodes && need_ways && need_relations;
+    let has_tag_filter = !keys.is_empty() || !prefixes.is_empty();
+
+    if all_types && !has_tag_filter {
+        return None;
     }
+
+    let mut filter = BlobFilter::new(need_nodes, need_ways, need_relations);
+    if !keys.is_empty() {
+        filter = filter.with_required_tag_keys(keys.into_iter().collect());
+    }
+    if !prefixes.is_empty() {
+        filter = filter.with_required_tag_prefixes(prefixes.into_iter().collect());
+    }
+    Some(filter)
 }
 
 /// Check if an element's tags match any applicable expression (OR semantics).

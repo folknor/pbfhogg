@@ -684,3 +684,44 @@ benchmarking.
 
 All changes are internal to `merge.rs`. The public `merge()` function signature
 and `MergeStats` return type are unchanged. No library API changes.
+
+## Results (commit e1099c4)
+
+Implementation: replaced `BATCH_SIZE=64` with `BATCH_BYTE_BUDGET=128MB`,
+`BATCH_MIN_BLOBS=8`, `BATCH_MAX_BLOBS=128`, `READER_CHANNEL_SIZE=128`.
+Added `estimate_blob_cost()` using `DiffRanges::range_overlaps()` for
+index-based passthrough detection. Updated progress logging with batch
+size and estimated bytes.
+
+### vs E1.1 baseline (commit 1d291f1)
+
+| Dataset | Variant | Time Δ | RSS Δ |
+|---------|---------|--------|-------|
+| Germany | buffered+zlib | 6381→5728 ms (**-10.2%**) | 652→532 MB (**-18.4%**) |
+| Germany | buffered+none | 4465→3710 ms (**-16.9%**) | 601→388 MB (**-35.4%**) |
+| Denmark | buffered+zlib | 474→395 ms (**-16.7%**) | 212→229 MB (+7.7%) |
+| Denmark | buffered+none | 364→271 ms (**-25.5%**) | 171→178 MB (+3.9%) |
+
+### vs original baseline (commit a3fc5ad, pre-E1.1)
+
+| Dataset | Variant | Time Δ | RSS Δ |
+|---------|---------|--------|-------|
+| Germany | buffered+zlib | 6321→5728 ms (**-9.4%**) | 710→532 MB (**-25.1%**) |
+| Germany | buffered+none | 4685→3710 ms (**-20.8%**) | 635→388 MB (**-38.9%**) |
+| Denmark | buffered+zlib | 453→395 ms (-12.8%) | 220→229 MB (+3.9%) |
+| Denmark | buffered+none | 328→271 ms (-17.4%) | 181→178 MB (-1.8%) |
+
+### Adaptive behavior observed
+
+- **Node section (blobs 1-53500):** Batches hit BATCH_MAX_BLOBS=128 with
+  6-72 MB estimated — mostly passthrough, maximizing parallelism.
+- **Way/relation section (blobs 54000+):** Batches drop to 18-93 blobs with
+  ~128 MB estimated — byte budget actively constrains rewrite-heavy windows.
+- Denmark: all-passthrough means batches always hit 128, small RSS uptick
+  from more raw frames in memory (irrelevant at this scale).
+
+### Decision: KEEP
+
+Both throughput and memory improved on Germany. The throughput improvement
+is a bonus from larger passthrough batches. Denmark's small RSS increase
+is acceptable (228 MB vs 212 MB, all passthrough at small scale).

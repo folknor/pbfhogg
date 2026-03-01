@@ -42,7 +42,7 @@
 - Exit criteria: quantified trigger thresholds for memory spikes.
 
 ## Phase 1: High-ROI, Low-Risk Refactors
-### E1.1 Compact DiffOverlay model
+### E1.1 Compact DiffOverlay model — DONE (commit 1d291f1)
 - Hypothesis: replacing object-heavy OSC representation yields the largest RSS reduction.
 - Change:
 - Replace per-entity heap-heavy structs with arenas + `id -> offset` indexes.
@@ -50,6 +50,7 @@
 - Convert node coords to `i32` decimicro at parse time.
 - Metrics: peak RSS, overlay heap size estimate, parse time.
 - Exit criteria: >= 25% peak RSS reduction on `S3` or `S4` with <= 10% time regression.
+- **Result (S2 Germany):** RSS 710→652 MB (-8.2% zlib), 635→601 MB (-5.4% none). Overlay heap 60→26 MB (-56%). Time within budget. Decision: KEEP.
 
 ### E1.2 Replace inline upsert `Vec` copies with range views
 - Hypothesis: eliminating `to_vec()` per rewrite job reduces alloc churn in rewrite-heavy windows.
@@ -66,11 +67,13 @@
 - Exit criteria: improved RSS recovery with <= 5% throughput regression.
 
 ## Phase 2: Bounded In-Flight Redesign
-### E2.1 Adaptive batch sizing by bytes (not blob count)
+### E2.1 Adaptive batch sizing by bytes (not blob count) — DONE (commit e1099c4)
 - Hypothesis: fixed `BATCH_SIZE=64` over-allocates in high-raw-size windows.
 - Change: drive in-flight limit by estimated bytes budget (frames + decoded + rewrite outputs).
 - Metrics: peak RSS stability across `S3-S5`, throughput.
 - Exit criteria: materially lower peak RSS on stress scenarios with acceptable throughput loss.
+- **Result (S2 Germany):** RSS 652→532 MB (-18.4% zlib), 601→388 MB (-35.4% none). Time 6381→5728 ms (-10.2% zlib). Decision: KEEP.
+- **Cumulative E1.1+E2.1 vs original:** RSS 710→532 MB (-25.1% zlib), 635→388 MB (-38.9% none). Time -9.4% zlib, -20.8% none.
 
 ### E2.2 Stream rewrite outputs to writer
 - Hypothesis: collecting all rewrite outputs before phase 4 causes avoidable peak memory.

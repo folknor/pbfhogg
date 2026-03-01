@@ -122,6 +122,24 @@ impl DirectReader {
         self.file.as_raw_fd()
     }
 
+    /// Skip `n` bytes without materializing data.
+    ///
+    /// Discards any buffered bytes that overlap the skip range, then seeks
+    /// the fd past the remainder.
+    pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
+        let buffered = self.buf.remaining() as u64;
+        if n <= buffered {
+            self.buf.consume(n as usize);
+            return Ok(());
+        }
+        // Consume remaining buffer, then lseek past the rest.
+        let past_buf = n - buffered;
+        self.buf.consume(buffered as usize);
+        use std::io::{Seek, SeekFrom};
+        self.file.seek(SeekFrom::Current(past_buf as i64))?;
+        Ok(())
+    }
+
     /// Open a file for reading with `O_DIRECT`.
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = std::fs::OpenOptions::new()

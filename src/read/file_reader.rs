@@ -68,6 +68,22 @@ impl FileReader {
     }
 }
 
+impl FileReader {
+    /// Skip `n` bytes without materializing data into a destination buffer.
+    ///
+    /// For `BufReader`: uses `seek_relative` (advances within internal buffer
+    /// when possible, otherwise seeks the underlying fd).
+    /// For `DirectReader`: consumes buffered bytes, then lseeks the fd.
+    pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
+        match self {
+            #[allow(clippy::cast_possible_wrap)]
+            Self::Buffered(r) => r.seek_relative(n as i64),
+            #[cfg(feature = "linux-direct-io")]
+            Self::Direct(r) => r.skip(n),
+        }
+    }
+}
+
 #[cfg(feature = "linux-direct-io")]
 impl FileReader {
     /// Return the raw file descriptor for `copy_file_range`.

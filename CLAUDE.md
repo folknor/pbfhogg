@@ -1,12 +1,12 @@
 # pbfhogg
 
-Rust library for reading and writing OpenStreetMap PBF files. Fork of [osmpbf](https://github.com/b-r-u/osmpbf/) with write support added.
+Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
 ## Bash rules
-- Never use sed, find, awk, or complex bash commands. Write a script instead.
-- Never chain commands with &&. Write a script instead.
-- Never chain commands with ;. Write a script instead.
-- Never pipe commands with |. Write a script instead.
+- Never use sed, find, awk, or complex bash commands
+- Never chain commands with &&
+- Never chain commands with ;
+- Never pipe commands with |
 - Never read or write from /tmp. All data lives in the project.
 - Never run raw cargo, curl, pkill. Use `brokkr`.
 

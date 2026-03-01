@@ -796,3 +796,67 @@ larger batches without RSS blowup. No ordering regressions: the reorder
 buffer preserves file order exactly as Phase 4 does today. Low deadlock
 risk, neutral-to-positive throughput impact. Verified by existing
 cross-validation suite.
+
+---
+
+## Results
+
+### Implementation (commit 1e03e5b)
+
+Simpler than the full VecDeque reorder buffer proposed above. Used a
+`received: Vec<Option<RewriteOutput>>` indexed by `job_index` instead.
+The main thread iterates slots in file order and when hitting a Rewrite
+slot, receives from the channel in a loop until that job's result arrives.
+Out-of-order arrivals are buffered; each entry is `take()`d exactly once.
+
+Key changes to `src/commands/merge.rs` (63 insertions, 46 deletions):
+- `Arc<CompactDiffOverlay>` wrapping (simpler than `rayon::scope`)
+- `rayon::spawn` per job with `into_iter()` (moves PrimitiveBlock ownership)
+- Bounded `sync_channel` (capacity = rayon thread count)
+- Per-task `BlockBuilder::new()` (negligible ~48 KB per task)
+- Combined Phase 3+4 hotpath timing (phases now overlap)
+
+### Benchmark: E2.2 vs E2.1 (commit 1e03e5b vs e1099c4)
+
+Host: folk-pc. Clean tree. Best of 3 runs stored in `.brokkr/results.db`.
+
+| Dataset | Variant | E2.1 time | E2.2 time | Δ time | E2.1 RSS | E2.2 RSS | Δ RSS |
+|---------|---------|-----------|-----------|--------|----------|----------|-------|
+| Germany | zlib | 5728 ms | 5335 ms | **-6.9%** | 532 MB | 515 MB | **-3.2%** |
+| Germany | none | 3710 ms | 3420 ms | **-7.8%** | 388 MB | 390 MB | +0.6% |
+| Denmark | zlib | 395 ms | 363 ms | **-8.1%** | 229 MB | 226 MB | -1.1% |
+| Denmark | none | 271 ms | 250 ms | **-7.7%** | 178 MB | 174 MB | -2.1% |
+
+### Cumulative E1.1 + E2.1 + E2.2 vs original (commit 1e03e5b vs a3fc5ad)
+
+| Dataset | Variant | Original | Current | Δ time | Orig RSS | Curr RSS | Δ RSS |
+|---------|---------|----------|---------|--------|----------|----------|-------|
+| Germany | zlib | 6321 ms | 5335 ms | **-15.6%** | 710 MB | 515 MB | **-27.5%** |
+| Germany | none | 4685 ms | 3420 ms | **-27.0%** | 635 MB | 390 MB | **-38.6%** |
+| Denmark | zlib | 453 ms | 363 ms | **-19.9%** | 220 MB | 226 MB | +2.8% |
+| Denmark | none | 328 ms | 250 ms | **-23.8%** | 181 MB | 174 MB | -3.9% |
+
+### Analysis
+
+**Throughput improvement (~7-8%):** The overlap between Phase 3 (rayon rewrite)
+and Phase 4 (main thread drain/write) means the pipelined writer gets data
+sooner. Passthrough slots at the head of each batch drain immediately without
+waiting for all rewrites to complete. Total time ≈ max(Phase 3, Phase 4) instead
+of Phase 3 + Phase 4.
+
+**RSS neutral at Germany scale:** Germany has only 18.4% rewrite ratio. The
+streaming benefit is proportional to the rewrite fraction — at 18.4%, only ~24
+PrimitiveBlocks are held simultaneously in the old design vs ~8 in the new
+design. The ~22 MB savings is noise at this scale.
+
+**Planet-scale projection (92% rewrite, 128-blob batches):** The old design holds
+~118 PrimitiveBlocks × 1.4 MB = ~165 MB simultaneously. The new design holds
+~8 × 1.4 MB = ~11 MB. Expected savings: ~154 MB per batch at steady state.
+Combined with E2.1's byte budget, this makes batch size independent of rewrite
+memory pressure.
+
+### Decision
+
+**KEEP.** 7-8% throughput improvement with no RSS regression at measured scale.
+Architectural win for planet scale (decouples batch size from rewrite memory).
+Correctness verified by `brokkr verify merge` (identical output to osmium).

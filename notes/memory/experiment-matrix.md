@@ -75,11 +75,13 @@
 - **Result (S2 Germany):** RSS 652→532 MB (-18.4% zlib), 601→388 MB (-35.4% none). Time 6381→5728 ms (-10.2% zlib). Decision: KEEP.
 - **Cumulative E1.1+E2.1 vs original:** RSS 710→532 MB (-25.1% zlib), 635→388 MB (-38.9% none). Time -9.4% zlib, -20.8% none.
 
-### E2.2 Stream rewrite outputs to writer
+### E2.2 Stream rewrite outputs to writer — DONE (commit 1e03e5b)
 - Hypothesis: collecting all rewrite outputs before phase 4 causes avoidable peak memory.
-- Change: emit rewrite outputs incrementally to ordered writer channel, reduce temporary materialization.
+- Change: replace par_iter().collect() with rayon::spawn per job + streaming drain loop. Each rayon task owns its RewriteJob (PrimitiveBlock freed on task completion). Main thread receives results via bounded channel, processes slots in file order.
 - Metrics: rewrite phase RSS, end-to-end `VmHWM`, channel backpressure behavior.
 - Exit criteria: rewrite-window RSS reduced without ordering regressions.
+- **Result (S2 Germany):** RSS 532→515 MB (-3.2% zlib), 388→390 MB (+0.6% none). Time 5728→5335 ms (-6.9% zlib), 3710→3420 ms (-7.8% none). Decision: KEEP.
+- **Cumulative E1.1+E2.1+E2.2 vs original:** RSS 710→515 MB (-27.5% zlib), 635→390 MB (-38.6% none). Time -15.6% zlib, -27.0% none.
 
 ## Phase 3: Writer/Framing Memory Tightening
 ### E3.1 Vectored framing instead of per-blob concatenated `Vec`

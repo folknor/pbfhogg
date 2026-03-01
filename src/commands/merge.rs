@@ -50,6 +50,14 @@ pub struct MergeStats {
     pub blobs_skip_decompress: u64,
     pub blobs_scan_only: u64,
     pub blobs_index_hit: u64,
+    /// Bytes of raw passthrough frames (wire size including framing).
+    pub bytes_passthrough: u64,
+    /// Bytes of rewritten blocks (pre-compression protobuf size).
+    pub bytes_rewritten: u64,
+    /// Heap bytes used by the DiffOverlay after OSC parsing.
+    pub diff_heap_bytes: u64,
+    /// Per-blob frame sizes in bytes for percentile computation.
+    blob_sizes: Vec<u32>,
 }
 
 impl MergeStats {
@@ -67,6 +75,10 @@ impl MergeStats {
             blobs_skip_decompress: 0,
             blobs_scan_only: 0,
             blobs_index_hit: 0,
+            bytes_passthrough: 0,
+            bytes_rewritten: 0,
+            diff_heap_bytes: 0,
+            blob_sizes: Vec::new(),
         }
     }
 
@@ -87,6 +99,8 @@ impl MergeStats {
         self.diff_ways += other.diff_ways;
         self.diff_relations += other.diff_relations;
         self.deleted += other.deleted;
+        self.bytes_passthrough += other.bytes_passthrough;
+        self.bytes_rewritten += other.bytes_rewritten;
     }
 
     pub fn print_summary(&self) {
@@ -110,6 +124,97 @@ impl MergeStats {
             self.blobs_skip_decompress,
             self.blobs_rewritten,
         );
+        let total_bytes = self.bytes_passthrough + self.bytes_rewritten;
+        if total_bytes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let rewrite_pct = (self.bytes_rewritten as f64 / total_bytes as f64) * 100.0;
+            eprintln!(
+                "  Bytes: {} passthrough, {} rewritten ({rewrite_pct:.1}% rewrite ratio)",
+                self.bytes_passthrough, self.bytes_rewritten,
+            );
+        }
+        if !self.blob_sizes.is_empty() {
+            let mut sizes = self.blob_sizes.clone();
+            let (p50, p95, p99) = percentiles_u32(&mut sizes);
+            eprintln!("  Blob sizes: p50={p50}, p95={p95}, p99={p99} bytes");
+        }
+        if self.diff_heap_bytes > 0 {
+            #[allow(clippy::cast_precision_loss)]
+            let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
+            eprintln!("  DiffOverlay heap: {mb:.1} MB");
+        }
+    }
+}
+
+/// Compute p50, p95, p99 from a mutable slice. Returns `(0, 0, 0)` if empty.
+fn percentiles_u32(data: &mut [u32]) -> (u32, u32, u32) {
+    if data.is_empty() {
+        return (0, 0, 0);
+    }
+    data.sort_unstable();
+    let len = data.len();
+    (data[len / 2], data[len * 95 / 100], data[len * 99 / 100])
+}
+
+/// Per-phase wall time accumulation across all batches.
+#[cfg(feature = "hotpath")]
+struct PhaseTimers {
+    osc_parse: std::time::Duration,
+    classify_total: std::time::Duration,
+    rewrite_total: std::time::Duration,
+    output_total: std::time::Duration,
+    trailing_creates: std::time::Duration,
+}
+
+#[cfg(feature = "hotpath")]
+impl PhaseTimers {
+    fn new() -> Self {
+        Self {
+            osc_parse: std::time::Duration::ZERO,
+            classify_total: std::time::Duration::ZERO,
+            rewrite_total: std::time::Duration::ZERO,
+            output_total: std::time::Duration::ZERO,
+            trailing_creates: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Read current RSS in kilobytes from `/proc/self/statm`.
+/// Returns 0 on failure (non-Linux, read error, parse error).
+#[cfg(feature = "hotpath")]
+fn read_rss_kb() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(resident_str) = statm.split_whitespace().nth(1) else {
+        return 0;
+    };
+    let Ok(pages) = resident_str.parse::<u64>() else {
+        return 0;
+    };
+    pages * 4 // pages × 4096 / 1024 = pages × 4
+}
+
+/// Per-phase RSS tracking (rolling max across batches, in KB).
+#[cfg(feature = "hotpath")]
+struct PhaseRss {
+    after_osc_parse: u64,
+    classify_max: u64,
+    rewrite_max: u64,
+    output_max: u64,
+    after_flush: u64,
+}
+
+#[cfg(feature = "hotpath")]
+impl PhaseRss {
+    fn new() -> Self {
+        Self {
+            after_osc_parse: 0,
+            classify_max: 0,
+            rewrite_max: 0,
+            output_max: 0,
+            after_flush: 0,
+        }
     }
 }
 
@@ -938,7 +1043,7 @@ fn emit_create_for_output(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
 #[hotpath::measure]
 pub fn merge(
     base_pbf: &Path,
@@ -950,6 +1055,8 @@ pub fn merge(
     sqpoll: bool,
 ) -> MergeResult<MergeStats> {
     // Step 1: Parse the diff
+    #[cfg(feature = "hotpath")]
+    let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());
     let diff = parse_osc_file(osc_file)?;
     eprintln!(
@@ -957,6 +1064,23 @@ pub fn merge(
         diff.nodes.len(), diff.ways.len(), diff.relations.len(),
         diff.deleted_nodes.len(), diff.deleted_ways.len(), diff.deleted_relations.len(),
     );
+    let diff_heap_bytes = diff.heap_size_estimate() as u64;
+    eprintln!(
+        "DiffOverlay heap estimate: {:.1} MB",
+        diff_heap_bytes as f64 / (1024.0 * 1024.0),
+    );
+    #[cfg(feature = "hotpath")]
+    let mut phase_timers = PhaseTimers::new();
+    #[cfg(feature = "hotpath")]
+    {
+        phase_timers.osc_parse = osc_start.elapsed();
+    }
+    #[cfg(feature = "hotpath")]
+    let mut phase_rss = PhaseRss::new();
+    #[cfg(feature = "hotpath")]
+    {
+        phase_rss.after_osc_parse = read_rss_kb();
+    }
 
     // Step 2: Pre-compute sorted ID ranges for fast overlap checking
     let ranges = DiffRanges::from_diff(&diff);
@@ -1049,6 +1173,7 @@ pub fn merge(
 
     let mut bb = BlockBuilder::new();
     let mut stats = MergeStats::new();
+    stats.diff_heap_bytes = diff_heap_bytes;
     let mut blob_count: u64 = 0;
 
     // Per-type cursors on upsert vectors for gap create tracking
@@ -1089,6 +1214,8 @@ pub fn merge(
         }
 
         // Phase 1: Parallel classify
+        #[cfg(feature = "hotpath")]
+        let phase1_start = std::time::Instant::now();
         let classify_results: Vec<Result<ClassifyResult, String>> = batch
             .par_iter()
             .map_init(
@@ -1096,6 +1223,14 @@ pub fn merge(
                 |buf, frame| classify_only(frame, &ranges, &diff, buf),
             )
             .collect();
+        #[cfg(feature = "hotpath")]
+        {
+            phase_timers.classify_total += phase1_start.elapsed();
+            let rss = read_rss_kb();
+            if rss > phase_rss.classify_max {
+                phase_rss.classify_max = rss;
+            }
+        }
 
         // Phase 2: Sequential inline upsert assignment (O(log n) per blob)
         let mut slots: Vec<BatchSlot> = Vec::with_capacity(batch.len());
@@ -1129,6 +1264,8 @@ pub fn merge(
         }
 
         // Phase 3: Parallel rewrite
+        #[cfg(feature = "hotpath")]
+        let phase3_start = std::time::Instant::now();
         let rewrite_results: Vec<Result<RewriteOutput, String>> = rewrite_jobs
             .par_iter()
             .map_init(
@@ -1146,6 +1283,15 @@ pub fn merge(
             )
             .collect();
 
+        #[cfg(feature = "hotpath")]
+        {
+            phase_timers.rewrite_total += phase3_start.elapsed();
+            let rss = read_rss_kb();
+            if rss > phase_rss.rewrite_max {
+                phase_rss.rewrite_max = rss;
+            }
+        }
+
         // Unwrap rewrite results
         let mut rewrite_outputs: Vec<RewriteOutput> = Vec::with_capacity(rewrite_results.len());
         for result in rewrite_results {
@@ -1155,6 +1301,8 @@ pub fn merge(
         }
 
         // Phase 4: Sequential output with passthrough coalescing
+        #[cfg(feature = "hotpath")]
+        let phase4_start = std::time::Instant::now();
         for (i, slot) in slots.iter().enumerate() {
             blob_count += 1;
 
@@ -1235,13 +1383,20 @@ pub fn merge(
                         ElemKind::Relation => stats.base_relations += index.count,
                     }
                     stats.blobs_passthrough += 1;
+                    let frame_len = batch[i].frame_bytes.len() as u64;
+                    stats.bytes_passthrough += frame_len;
+                    #[allow(clippy::cast_possible_truncation)]
+                    stats.blob_sizes.push(frame_len as u32);
                 }
                 BatchSlot::Rewrite { job_index, index: _ } => {
                     flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
                     let output = &mut rewrite_outputs[*job_index];
+                    let mut rewrite_bytes: u64 = 0;
                     for (block_bytes, index, tagdata) in output.blocks.drain(..) {
+                        rewrite_bytes += block_bytes.len() as u64;
                         writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                     }
+                    stats.bytes_rewritten += rewrite_bytes;
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;
 
@@ -1268,6 +1423,14 @@ pub fn merge(
 
         // Flush any remaining coalesced passthrough bytes at batch boundary
         flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+        #[cfg(feature = "hotpath")]
+        {
+            phase_timers.output_total += phase4_start.elapsed();
+            let rss = read_rss_kb();
+            if rss > phase_rss.output_max {
+                phase_rss.output_max = rss;
+            }
+        }
     }
 
     // Join reader thread (should already be done since channel is drained)
@@ -1277,6 +1440,8 @@ pub fn merge(
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Trailing creates: flush remaining upserts per type
+    #[cfg(feature = "hotpath")]
+    let trailing_start = std::time::Instant::now();
     if let Some(prev) = last_type {
         let types_to_flush = match prev {
             ElemKind::Node => &[ElemKind::Node, ElemKind::Way, ElemKind::Relation][..],
@@ -1305,8 +1470,32 @@ pub fn merge(
         }
     }
 
+    #[cfg(feature = "hotpath")]
+    {
+        phase_timers.trailing_creates = trailing_start.elapsed();
+    }
+
     writer.flush()?;
+    #[cfg(feature = "hotpath")]
+    {
+        phase_rss.after_flush = read_rss_kb();
+    }
     stats.print_summary();
+
+    #[cfg(feature = "hotpath")]
+    {
+        eprintln!("osc_parse_ms={}", phase_timers.osc_parse.as_millis());
+        eprintln!("classify_total_ms={}", phase_timers.classify_total.as_millis());
+        eprintln!("rewrite_total_ms={}", phase_timers.rewrite_total.as_millis());
+        eprintln!("output_total_ms={}", phase_timers.output_total.as_millis());
+        eprintln!("trailing_creates_ms={}", phase_timers.trailing_creates.as_millis());
+        eprintln!("phase_rss_after_osc_kb={}", phase_rss.after_osc_parse);
+        eprintln!("phase_rss_classify_max_kb={}", phase_rss.classify_max);
+        eprintln!("phase_rss_rewrite_max_kb={}", phase_rss.rewrite_max);
+        eprintln!("phase_rss_output_max_kb={}", phase_rss.output_max);
+        eprintln!("phase_rss_after_flush_kb={}", phase_rss.after_flush);
+    }
+
     Ok(stats)
 }
 

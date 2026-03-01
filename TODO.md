@@ -16,42 +16,32 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Memory work — instrumentation prerequisites
 
-Before any planet-scale memory optimization (P1-P6 in `notes/memory/`), we
-need measurement infrastructure. Depends on brokkr schema v3 (`SCHEMA_REDESIGN.md`)
-being implemented first — peak_rss_mb becomes a first-class DB column, and
-subprocess kv pairs flow into `run_kv` instead of JSON.
+Instrumentation code is implemented. Remaining: brokkr schema v3
+(`SCHEMA_REDESIGN.md`) for `peak_rss_mb` as a first-class DB column and
+subprocess kv pairs flowing into `run_kv` instead of JSON.
 
-### Emit peak RSS from bench-merge (~20 lines, `cli/src/main.rs`)
-- [ ] Add `read_peak_rss_kb()` — parse VmHWM from `/proc/self/status`
-- [ ] Call after `merge()` returns in `run_bench_merge()`, emit `peak_rss_kb=NNN`
-  to stderr. brokkr's kv parser picks it up automatically.
-- Unblocks basic before/after RSS comparison for every experiment.
+### Emit peak RSS from bench-merge — DONE
+- [x] `read_peak_rss_kb()` in `cli/src/main.rs` (Linux: VmHWM, non-Linux: None)
+- [x] Emits `peak_rss_kb=NNN` to stderr after merge
 
-### Blob-size and byte-level rewrite stats (~60 lines, `src/commands/merge.rs`)
-- [ ] Add `bytes_passthrough: u64` and `bytes_rewritten: u64` to `MergeStats`
-- [ ] Track per-blob `raw_size` in Phase 4, compute p50/p95/p99
-- [ ] Emit blob-size percentiles and byte-level rewrite ratio in summary
-- Unblocks E0.2 (blob-size/rewrite-ratio sensitivity).
+### Blob-size and byte-level rewrite stats — DONE
+- [x] `bytes_passthrough`, `bytes_rewritten`, `blob_sizes` in `MergeStats`
+- [x] Phase 4 tracking: passthrough frame sizes + rewrite block sizes
+- [x] `print_summary()` emits byte rewrite ratio and p50/p95/p99 blob sizes
 
-### DiffOverlay heap size estimate (~40 lines, `src/osc.rs`)
-- [ ] Add `DiffOverlay::heap_size_estimate(&self) -> usize`
-  Sum HashMap capacity × entry size + Vec/String heap bytes per entity.
-- [ ] Call after `parse_osc_file()` in merge, emit to stderr
-- Validates the hypothesis that DiffOverlay dominates peak RSS.
+### DiffOverlay heap size estimate — DONE
+- [x] `DiffOverlay::heap_size_estimate(&self) -> usize` in `src/osc.rs`
+- [x] `diff_heap_bytes` field in `MergeStats`, set after `parse_osc_file()`
+- [x] Emitted in `print_summary()` and `run_bench_merge()` kv output
 
-### Per-phase RSS sampling (~80 lines, gated behind `#[cfg(feature = "hotpath")]`)
-- [ ] Read `/proc/self/statm` at merge phase boundaries: after OSC parse,
-  after each batch's classify/rewrite/drain, after writer flush
-- [ ] Track rolling max RSS per phase across all batches
-- [ ] Add to `MergeStats`, emit in bench-merge output
-- Full E0.1 (memory attribution by phase). Can defer slightly since
-  VmHWM alone gives a useful first signal.
+### Per-phase RSS sampling — DONE (hotpath-gated)
+- [x] `read_rss_kb()` reads `/proc/self/statm` resident pages
+- [x] `PhaseRss` struct: rolling max at classify/rewrite/output boundaries + after flush
+- [x] 5 kv pairs: `phase_rss_{after_osc,classify_max,rewrite_max,output_max,after_flush}_kb`
 
-### Per-phase wall time accumulation (~60 lines, gated behind hotpath)
-- [ ] Add per-phase `Instant` timers in batch loop, accumulate across batches
-- [ ] Fields: `osc_parse_ms`, `classify_total_ms`, `rewrite_total_ms`,
-  `output_total_ms`, `gap_creates_ms`
-- [ ] Emit in bench-merge output
+### Per-phase wall time accumulation — DONE (hotpath-gated)
+- [x] `PhaseTimers` struct: osc_parse, classify_total, rewrite_total, output_total, trailing_creates
+- [x] 5 kv pairs: `{osc_parse,classify_total,rewrite_total,output_total,trailing_creates}_ms`
 
 ### Research documents
 - `notes/memory/measurement-gaps.md` — full gap analysis

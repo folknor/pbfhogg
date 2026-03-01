@@ -964,6 +964,26 @@ fn run_bench_write(
     Ok(())
 }
 
+/// Read peak resident set size (VmHWM) from `/proc/self/status`.
+/// Returns `None` on non-Linux platforms or if parsing fails.
+#[cfg(target_os = "linux")]
+fn read_peak_rss_kb() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("VmHWM:") {
+            let trimmed = rest.trim();
+            let kb_str = trimmed.strip_suffix("kB").unwrap_or(trimmed).trim();
+            return kb_str.parse::<u64>().ok();
+        }
+    }
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_peak_rss_kb() -> Option<u64> {
+    None
+}
+
 #[allow(clippy::cast_precision_loss)]
 fn run_bench_merge(
     base: &std::path::Path,
@@ -1001,6 +1021,12 @@ fn run_bench_merge(
     eprintln!("diff_relations={}", stats.diff_relations);
     eprintln!("blobs_passthrough={}", stats.blobs_passthrough);
     eprintln!("blobs_rewritten={}", stats.blobs_rewritten);
+    eprintln!("bytes_passthrough={}", stats.bytes_passthrough);
+    eprintln!("bytes_rewritten={}", stats.bytes_rewritten);
+    eprintln!("diff_heap_bytes={}", stats.diff_heap_bytes);
     eprintln!("output_mb={output_mb:.2}");
+    if let Some(peak_kb) = read_peak_rss_kb() {
+        eprintln!("peak_rss_kb={peak_kb}");
+    }
     Ok(())
 }

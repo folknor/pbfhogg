@@ -82,6 +82,55 @@ impl DiffOverlay {
             && self.deleted_relations.is_empty()
     }
 
+    /// Estimate the heap memory used by this overlay in bytes.
+    ///
+    /// Counts HashMap/HashSet backing store plus per-entity Vec and String
+    /// heap allocations. Uses 1 byte per bucket for hashbrown's control byte.
+    /// Does not include the stack size of the `DiffOverlay` struct itself.
+    pub fn heap_size_estimate(&self) -> usize {
+        let mut total: usize = 0;
+
+        // Nodes: HashMap<i64, OscNode>
+        total += self.nodes.capacity() * (std::mem::size_of::<(i64, OscNode)>() + 1);
+        for node in self.nodes.values() {
+            total += node.tags.capacity() * std::mem::size_of::<(String, String)>();
+            for (k, v) in &node.tags {
+                total += k.capacity() + v.capacity();
+            }
+        }
+
+        // Ways: HashMap<i64, OscWay>
+        total += self.ways.capacity() * (std::mem::size_of::<(i64, OscWay)>() + 1);
+        for way in self.ways.values() {
+            total += way.node_refs.capacity() * std::mem::size_of::<i64>();
+            total += way.tags.capacity() * std::mem::size_of::<(String, String)>();
+            for (k, v) in &way.tags {
+                total += k.capacity() + v.capacity();
+            }
+        }
+
+        // Relations: HashMap<i64, OscRelation>
+        total += self.relations.capacity()
+            * (std::mem::size_of::<(i64, OscRelation)>() + 1);
+        for rel in self.relations.values() {
+            total += rel.members.capacity() * std::mem::size_of::<OscRelMember>();
+            for member in &rel.members {
+                total += member.role.capacity();
+            }
+            total += rel.tags.capacity() * std::mem::size_of::<(String, String)>();
+            for (k, v) in &rel.tags {
+                total += k.capacity() + v.capacity();
+            }
+        }
+
+        // Deleted sets: HashSet<i64>
+        total += self.deleted_nodes.capacity() * (std::mem::size_of::<i64>() + 1);
+        total += self.deleted_ways.capacity() * (std::mem::size_of::<i64>() + 1);
+        total += self.deleted_relations.capacity() * (std::mem::size_of::<i64>() + 1);
+
+        total
+    }
+
     /// Merge another overlay into this one. Later overlay wins for conflicts.
     pub fn merge(&mut self, other: DiffOverlay) {
         // Created/modified in other → remove from our deleted sets

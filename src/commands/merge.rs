@@ -26,7 +26,7 @@ use bytes::Bytes;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
-use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
+use crate::osc::{parse_osc_file, CompactDiffOverlay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
@@ -54,7 +54,7 @@ pub struct MergeStats {
     pub bytes_passthrough: u64,
     /// Bytes of rewritten blocks (pre-compression protobuf size).
     pub bytes_rewritten: u64,
-    /// Heap bytes used by the DiffOverlay after OSC parsing.
+    /// Heap bytes used by the CompactDiffOverlay after OSC parsing.
     pub diff_heap_bytes: u64,
     /// Per-blob frame sizes in bytes for percentile computation.
     blob_sizes: Vec<u32>,
@@ -141,7 +141,7 @@ impl MergeStats {
         if self.diff_heap_bytes > 0 {
             #[allow(clippy::cast_precision_loss)]
             let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
-            eprintln!("  DiffOverlay heap: {mb:.1} MB");
+            eprintln!("  CompactDiffOverlay heap: {mb:.1} MB");
         }
     }
 }
@@ -219,15 +219,6 @@ impl PhaseRss {
 }
 
 // ---------------------------------------------------------------------------
-// Coordinate conversion
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::cast_possible_truncation)]
-fn to_decimicro(deg: f64) -> i32 {
-    (deg * 1e7).round() as i32
-}
-
-// ---------------------------------------------------------------------------
 // Diff ID ranges for fast overlap checking
 // ---------------------------------------------------------------------------
 
@@ -253,10 +244,9 @@ struct DiffRanges {
 }
 
 impl DiffRanges {
-    fn from_diff(diff: &DiffOverlay) -> Self {
+    fn from_diff(diff: &CompactDiffOverlay) -> Self {
         let mut node_ids: Vec<i64> = diff
-            .nodes
-            .keys()
+            .node_ids()
             .chain(diff.deleted_nodes.iter())
             .copied()
             .collect();
@@ -264,8 +254,7 @@ impl DiffRanges {
         node_ids.dedup();
 
         let mut way_ids: Vec<i64> = diff
-            .ways
-            .keys()
+            .way_ids()
             .chain(diff.deleted_ways.iter())
             .copied()
             .collect();
@@ -273,23 +262,22 @@ impl DiffRanges {
         way_ids.dedup();
 
         let mut rel_ids: Vec<i64> = diff
-            .relations
-            .keys()
+            .relation_ids()
             .chain(diff.deleted_relations.iter())
             .copied()
             .collect();
         rel_ids.sort_unstable();
         rel_ids.dedup();
 
-        let mut node_upserts: Vec<i64> = diff.nodes.keys().copied().collect();
+        let mut node_upserts: Vec<i64> = diff.node_ids().copied().collect();
         node_upserts.sort_unstable();
         node_upserts.dedup();
 
-        let mut way_upserts: Vec<i64> = diff.ways.keys().copied().collect();
+        let mut way_upserts: Vec<i64> = diff.way_ids().copied().collect();
         way_upserts.sort_unstable();
         way_upserts.dedup();
 
-        let mut rel_upserts: Vec<i64> = diff.relations.keys().copied().collect();
+        let mut rel_upserts: Vec<i64> = diff.relation_ids().copied().collect();
         rel_upserts.sort_unstable();
         rel_upserts.dedup();
 
@@ -438,24 +426,24 @@ fn read_raw_frame<R: Read>(
 /// relative to the passthrough block. This is intentional — rewriting an
 /// otherwise unaffected block just to interleave pure creates would be wasted
 /// work. OSM consumers handle non-strictly-sorted IDs across block boundaries.
-fn block_overlaps_diff(block: &PrimitiveBlock, diff: &DiffOverlay) -> bool {
+fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> bool {
     for element in block.elements() {
         let dominated = match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();
-                diff.deleted_nodes.contains(&id) || diff.nodes.contains_key(&id)
+                diff.deleted_nodes.contains(&id) || diff.has_node(id)
             }
             Element::Node(n) => {
                 let id = n.id();
-                diff.deleted_nodes.contains(&id) || diff.nodes.contains_key(&id)
+                diff.deleted_nodes.contains(&id) || diff.has_node(id)
             }
             Element::Way(w) => {
                 let id = w.id();
-                diff.deleted_ways.contains(&id) || diff.ways.contains_key(&id)
+                diff.deleted_ways.contains(&id) || diff.has_way(id)
             }
             Element::Relation(r) => {
                 let id = r.id();
-                diff.deleted_relations.contains(&id) || diff.relations.contains_key(&id)
+                diff.deleted_relations.contains(&id) || diff.has_relation(id)
             }
         };
         if dominated {
@@ -549,30 +537,30 @@ fn ensure_relation_capacity_local(
 fn write_osc_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    way: &OscWay,
+    way: &crate::osc::CompactWayRef<'_>,
 ) -> MergeResult<()> {
     ensure_way_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    bb.add_way(way.id, &tags, &way.node_refs, None);
+    let tags: Vec<(&str, &str)> = way.tags().collect();
+    let refs: Vec<i64> = way.refs().collect();
+    bb.add_way(way.id(), &tags, &refs, None);
     Ok(())
 }
 
 fn write_osc_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    rel: &OscRelation,
+    rel: &crate::osc::CompactRelationRef<'_>,
 ) -> MergeResult<()> {
     ensure_relation_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let tags: Vec<(&str, &str)> = rel.tags().collect();
     let members: Vec<MemberData<'_>> = rel
-        .members
-        .iter()
-        .map(|m: &OscRelMember| MemberData {
-            id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
-            role: &m.role,
+        .members()
+        .map(|(mt, ref_id, role)| MemberData {
+            id: crate::MemberId::from_id_and_type(ref_id, mt),
+            role,
         })
         .collect();
-    bb.add_relation(rel.id, &tags, &members, None);
+    bb.add_relation(rel.id(), &tags, &members, None);
     Ok(())
 }
 
@@ -704,44 +692,41 @@ struct RewriteOutput {
 fn emit_create_local(
     id: i64,
     kind: ElemKind,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     stats: &mut MergeStats,
 ) -> MergeResult<()> {
     match kind {
         ElemKind::Node => {
-            if let Some(osc) = diff.nodes.get(&id) {
+            if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> =
-                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                bb.add_node(osc.id, to_decimicro(osc.lat), to_decimicro(osc.lon), &tags, None);
+                let tags: Vec<(&str, &str)> = osc.tags().collect();
+                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
                 stats.diff_nodes += 1;
             }
         }
         ElemKind::Way => {
-            if let Some(osc) = diff.ways.get(&id) {
+            if let Some(osc) = diff.get_way(id) {
                 ensure_way_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> =
-                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                bb.add_way(osc.id, &tags, &osc.node_refs, None);
+                let tags: Vec<(&str, &str)> = osc.tags().collect();
+                let refs: Vec<i64> = osc.refs().collect();
+                bb.add_way(osc.id(), &tags, &refs, None);
                 stats.diff_ways += 1;
             }
         }
         ElemKind::Relation => {
-            if let Some(osc) = diff.relations.get(&id) {
+            if let Some(osc) = diff.get_relation(id) {
                 ensure_relation_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> =
-                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                let tags: Vec<(&str, &str)> = osc.tags().collect();
                 let members: Vec<MemberData<'_>> = osc
-                    .members
-                    .iter()
-                    .map(|m: &OscRelMember| MemberData {
-                        id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
-                        role: &m.role,
+                    .members()
+                    .map(|(mt, ref_id, role)| MemberData {
+                        id: crate::MemberId::from_id_and_type(ref_id, mt),
+                        role,
                     })
                     .collect();
-                bb.add_relation(osc.id, &tags, &members, None);
+                bb.add_relation(osc.id(), &tags, &members, None);
                 stats.diff_relations += 1;
             }
         }
@@ -758,7 +743,7 @@ fn emit_create_local(
 #[hotpath::measure]
 fn rewrite_block_parallel(
     block: &PrimitiveBlock,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     inline_upserts: &[i64],
     kind: ElemKind,
@@ -793,17 +778,10 @@ fn rewrite_block_parallel(
                 let id = dn.id();
                 if diff.deleted_nodes.contains(&id) {
                     stats.deleted += 1;
-                } else if let Some(osc) = diff.nodes.get(&id) {
+                } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> =
-                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    bb.add_node(
-                        osc.id,
-                        to_decimicro(osc.lat),
-                        to_decimicro(osc.lon),
-                        &tags,
-                        None,
-                    );
+                    let tags: Vec<(&str, &str)> = osc.tags().collect();
+                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -815,17 +793,10 @@ fn rewrite_block_parallel(
                 let id = n.id();
                 if diff.deleted_nodes.contains(&id) {
                     stats.deleted += 1;
-                } else if let Some(osc) = diff.nodes.get(&id) {
+                } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> =
-                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    bb.add_node(
-                        osc.id,
-                        to_decimicro(osc.lat),
-                        to_decimicro(osc.lon),
-                        &tags,
-                        None,
-                    );
+                    let tags: Vec<(&str, &str)> = osc.tags().collect();
+                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -837,11 +808,11 @@ fn rewrite_block_parallel(
                 let id = w.id();
                 if diff.deleted_ways.contains(&id) {
                     stats.deleted += 1;
-                } else if let Some(osc) = diff.ways.get(&id) {
+                } else if let Some(osc) = diff.get_way(id) {
                     ensure_way_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> =
-                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                    bb.add_way(osc.id, &tags, &osc.node_refs, None);
+                    let tags: Vec<(&str, &str)> = osc.tags().collect();
+                    let refs: Vec<i64> = osc.refs().collect();
+                    bb.add_way(osc.id(), &tags, &refs, None);
 
                     stats.diff_ways += 1;
                 } else {
@@ -853,19 +824,17 @@ fn rewrite_block_parallel(
                 let id = r.id();
                 if diff.deleted_relations.contains(&id) {
                     stats.deleted += 1;
-                } else if let Some(osc) = diff.relations.get(&id) {
+                } else if let Some(osc) = diff.get_relation(id) {
                     ensure_relation_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> =
-                        osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+                    let tags: Vec<(&str, &str)> = osc.tags().collect();
                     let members: Vec<MemberData<'_>> = osc
-                        .members
-                        .iter()
-                        .map(|m: &OscRelMember| MemberData {
-                            id: crate::MemberId::from_id_and_type(m.ref_id, m.member_type),
-                            role: &m.role,
+                        .members()
+                        .map(|(mt, ref_id, role)| MemberData {
+                            id: crate::MemberId::from_id_and_type(ref_id, mt),
+                            role,
                         })
                         .collect();
-                    bb.add_relation(osc.id, &tags, &members, None);
+                    bb.add_relation(osc.id(), &tags, &members, None);
 
                     stats.diff_relations += 1;
                 } else {
@@ -950,7 +919,7 @@ fn fallback_index(block: &PrimitiveBlock) -> BlobIndex {
 fn classify_only(
     frame: &RawBlobFrame,
     ranges: &DiffRanges,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     buf: &mut Vec<u8>,
 ) -> Result<ClassifyResult, String> {
     let has_indexdata = frame.index.is_some();
@@ -996,30 +965,29 @@ fn classify_only(
 fn emit_create_for_output(
     id: i64,
     kind: ElemKind,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
 ) -> MergeResult<()> {
     match kind {
         ElemKind::Node => {
-            if let Some(osc) = diff.nodes.get(&id) {
+            if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity(bb, writer)?;
-                let tags: Vec<(&str, &str)> =
-                    osc.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-                bb.add_node(osc.id, to_decimicro(osc.lat), to_decimicro(osc.lon), &tags, None);
+                let tags: Vec<(&str, &str)> = osc.tags().collect();
+                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
                 stats.diff_nodes += 1;
             }
         }
         ElemKind::Way => {
-            if let Some(osc) = diff.ways.get(&id) {
-                write_osc_way(bb, writer, osc)?;
+            if let Some(osc) = diff.get_way(id) {
+                write_osc_way(bb, writer, &osc)?;
                 stats.diff_ways += 1;
             }
         }
         ElemKind::Relation => {
-            if let Some(osc) = diff.relations.get(&id) {
-                write_osc_relation(bb, writer, osc)?;
+            if let Some(osc) = diff.get_relation(id) {
+                write_osc_relation(bb, writer, &osc)?;
                 stats.diff_relations += 1;
             }
         }
@@ -1061,12 +1029,12 @@ pub fn merge(
     let diff = parse_osc_file(osc_file)?;
     eprintln!(
         "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
-        diff.nodes.len(), diff.ways.len(), diff.relations.len(),
+        diff.node_count(), diff.way_count(), diff.relation_count(),
         diff.deleted_nodes.len(), diff.deleted_ways.len(), diff.deleted_relations.len(),
     );
     let diff_heap_bytes = diff.heap_size_estimate() as u64;
     eprintln!(
-        "DiffOverlay heap estimate: {:.1} MB",
+        "CompactDiffOverlay heap estimate: {:.1} MB",
         diff_heap_bytes as f64 / (1024.0 * 1024.0),
     );
     #[cfg(feature = "hotpath")]
@@ -1511,7 +1479,7 @@ fn flush_remaining_upserts(
     prev: ElemKind,
     next: ElemKind,
     ranges: &DiffRanges,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     node_cursor: &mut usize,
     way_cursor: &mut usize,
     rel_cursor: &mut usize,
@@ -1550,7 +1518,7 @@ fn emit_gap_creates(
     blob_kind: ElemKind,
     min_id: i64,
     ranges: &DiffRanges,
-    diff: &DiffOverlay,
+    diff: &CompactDiffOverlay,
     node_cursor: &mut usize,
     way_cursor: &mut usize,
     rel_cursor: &mut usize,

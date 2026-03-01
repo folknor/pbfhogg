@@ -9,8 +9,8 @@
 use crate::blob_index::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::hash_map::Entry;
 use std::io;
+use std::rc::Rc;
 
 /// Encoded block bytes, blob index, and optional pre-serialized tagdata.
 pub(crate) type OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>);
@@ -66,8 +66,8 @@ const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 /// - Custom perfect hashing: Not viable because the string set is dynamic —
 ///   we do not know all strings upfront.
 struct StringTable {
-    strings: Vec<String>,
-    index: FxHashMap<String, u32>,
+    strings: Vec<Rc<str>>,
+    index: FxHashMap<Rc<str>, u32>,
 }
 
 impl StringTable {
@@ -76,7 +76,7 @@ impl StringTable {
             strings: Vec::with_capacity(256),
             index: FxHashMap::with_capacity_and_hasher(256, Default::default()),
         };
-        st.strings.push(String::new()); // index 0 = empty string
+        st.strings.push(Rc::from("")); // index 0 = empty string
         st
     }
 
@@ -91,26 +91,22 @@ impl StringTable {
     ///
     /// ## Slow path (cache miss, ~1% of calls)
     ///
-    /// On the first occurrence of a string, falls through to the `Entry` API
-    /// which allocates once for the HashMap key, then clones it into the Vec.
-    /// The double-hash (get then entry) costs ~3ns extra on 1% of calls — 0.03ns
-    /// amortized, negligible.
+    /// On the first occurrence of a string, allocates a single `Rc<str>` shared
+    /// between the HashMap key and the Vec entry. `Rc::clone` is just a refcount
+    /// bump — one heap allocation per unique string total.
     #[allow(clippy::cast_possible_truncation)]
     fn add(&mut self, s: &str) -> u32 {
         // Fast path: string already interned — hash-only lookup, no allocation.
         if let Some(&idx) = self.index.get(s) {
             return idx;
         }
-        // Slow path: first occurrence, allocate and insert.
+        // Slow path: first occurrence — single Rc<str> allocation, shared
+        // between the Vec and HashMap (Rc::clone is just a refcount bump).
         let next_idx = self.strings.len() as u32;
-        match self.index.entry(s.to_owned()) {
-            Entry::Occupied(e) => *e.get(),
-            Entry::Vacant(e) => {
-                self.strings.push(e.key().clone());
-                e.insert(next_idx);
-                next_idx
-            }
-        }
+        let rc: Rc<str> = Rc::from(s);
+        self.strings.push(Rc::clone(&rc));
+        self.index.insert(rc, next_idx);
+        next_idx
     }
 
     /// Pre-seed from an input block's string table, populating the index map.
@@ -129,7 +125,7 @@ impl StringTable {
     fn clear(&mut self) {
         self.strings.clear();
         self.index.clear();
-        self.strings.push(String::new());
+        self.strings.push(Rc::from(""));
     }
 
     /// Encode the string table directly to wire format bytes.

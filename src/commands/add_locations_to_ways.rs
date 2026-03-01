@@ -1,11 +1,19 @@
 //! Embed node coordinates in ways. Equivalent to `osmium add-locations-to-ways`.
 
+use std::io::Read;
 use std::path::Path;
 
+use bytes::Bytes;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
+use crate::blob::{
+    decode_blob_to_headerblock, decompress_blob_data_into,
+    parse_blob_header_with_index, parse_primitive_block_from_bytes_owned, BlobKind,
+};
+use crate::blob_index::{BlobIndex, ElemKind};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
+use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -159,6 +167,78 @@ impl DenseMmapIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Raw blob frame reading (for passthrough path)
+// ---------------------------------------------------------------------------
+
+/// A raw blob frame for passthrough or selective decode.
+struct RawBlobFrame {
+    /// Complete framed bytes: `[4-byte header_len][BlobHeader][Blob]`.
+    frame_bytes: Vec<u8>,
+    blob_type: BlobKind,
+    /// Byte offset within `frame_bytes` where the Blob protobuf starts.
+    blob_offset: usize,
+    /// Blob-level index from BlobHeader indexdata, if present.
+    index: Option<BlobIndex>,
+    /// Per-blob tag key data from BlobHeader field 4, if present.
+    #[allow(dead_code)]
+    tagdata: Option<Box<[u8]>>,
+}
+
+impl RawBlobFrame {
+    fn blob_bytes(&self) -> &[u8] {
+        &self.frame_bytes[self.blob_offset..]
+    }
+}
+
+/// Read the next raw blob frame. Returns `None` at EOF.
+fn read_raw_frame<R: Read>(reader: &mut R) -> Result<Option<RawBlobFrame>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let header_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut header_bytes = vec![0u8; header_len];
+    reader.read_exact(&mut header_bytes)?;
+    let (blob_type, data_size, indexdata, tagdata) =
+        parse_blob_header_with_index(&header_bytes)?;
+
+    let blob_offset = 4 + header_len;
+    let frame_len = blob_offset + data_size;
+    let mut frame_bytes = Vec::with_capacity(frame_len);
+    frame_bytes.extend_from_slice(&len_buf);
+    frame_bytes.extend_from_slice(&header_bytes);
+    frame_bytes.resize(frame_len, 0);
+    reader.read_exact(&mut frame_bytes[blob_offset..])?;
+
+    let index = indexdata.and_then(|d| BlobIndex::deserialize(&d));
+
+    Ok(Some(RawBlobFrame {
+        frame_bytes,
+        blob_type,
+        blob_offset,
+        index,
+        tagdata,
+    }))
+}
+
+/// Check if the first OsmData blob in a PBF has indexdata.
+fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
+    let mut reader = FileReader::open(path, direct_io)?;
+    while let Some(frame) = read_raw_frame(&mut reader)? {
+        match frame.blob_type {
+            BlobKind::OsmHeader => continue,
+            BlobKind::OsmData => return Ok(frame.index.is_some()),
+            BlobKind::Unknown(_) => continue,
+        }
+    }
+    Ok(false)
+}
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -170,6 +250,8 @@ pub struct Stats {
     pub ways_written: u64,
     pub relations_written: u64,
     pub missing_locations: u64,
+    pub blobs_passthrough: u64,
+    pub blobs_decoded: u64,
 }
 
 impl Stats {
@@ -185,6 +267,12 @@ impl Stats {
             self.relations_written,
             self.missing_locations,
         );
+        if self.blobs_passthrough > 0 {
+            eprintln!(
+                "  Blobs: {} passthrough, {} decoded",
+                self.blobs_passthrough, self.blobs_decoded,
+            );
+        }
     }
 }
 
@@ -244,13 +332,32 @@ fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Res
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2: Write output with locations on ways (parallel batches)
+// Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
 
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
 const BATCH_SIZE: usize = 64;
 
 fn write_output(
+    input: &Path,
+    output: &Path,
+    index: &NodeLocationIndex,
+    keep_untagged_nodes: bool,
+    compression: Compression,
+    direct_io: bool,
+) -> Result<Stats> {
+    if has_indexdata(input, direct_io)? {
+        write_output_passthrough(input, output, index, keep_untagged_nodes, compression, direct_io)
+    } else {
+        write_output_decode_all(input, output, index, keep_untagged_nodes, compression, direct_io)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2a: Decode-all fallback (no indexdata)
+// ---------------------------------------------------------------------------
+
+fn write_output_decode_all(
     input: &Path,
     output: &Path,
     index: &NodeLocationIndex,
@@ -265,6 +372,8 @@ fn write_output(
         ways_written: 0,
         relations_written: 0,
         missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
     };
 
     let reader = ElementReader::open(input, direct_io)?;
@@ -321,6 +430,8 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
     dst.ways_written += src.ways_written;
     dst.relations_written += src.relations_written;
     dst.missing_locations += src.missing_locations;
+    dst.blobs_passthrough += src.blobs_passthrough;
+    dst.blobs_decoded += src.blobs_decoded;
 }
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
@@ -339,6 +450,8 @@ fn process_block(
         ways_written: 0,
         relations_written: 0,
         missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
     };
 
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
@@ -453,6 +566,331 @@ fn process_batch(
         ways_written: 0,
         relations_written: 0,
         missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    };
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge_stats(&mut total, &block_stats);
+        for (block_bytes, blob_index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
+        }
+    }
+
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2b: Passthrough path (indexdata present)
+// ---------------------------------------------------------------------------
+
+/// Read raw header blob, build output header with `LocationsOnWays`.
+fn read_header_raw<R: Read>(reader: &mut R) -> Result<(Vec<u8>, bool)> {
+    while let Some(frame) = read_raw_frame(reader)? {
+        if frame.blob_type == BlobKind::OsmHeader {
+            let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+            let mut hb = HeaderBuilder::from_header(&header)
+                .optional_feature("LocationsOnWays");
+            let sorted = header.is_sorted();
+            if sorted {
+                hb = hb.sorted();
+            }
+            return Ok((hb.build()?, sorted));
+        }
+    }
+    Err("no OSMHeader blob found".into())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn write_output_passthrough(
+    input: &Path,
+    output: &Path,
+    node_index: &NodeLocationIndex,
+    keep_untagged_nodes: bool,
+    compression: Compression,
+    direct_io: bool,
+) -> Result<Stats> {
+    let mut stats = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    };
+
+    let mut reader = FileReader::open(input, direct_io)?;
+    let (header_bytes, _sorted) = read_header_raw(&mut reader)?;
+    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut node_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+
+    while let Some(mut frame) = read_raw_frame(&mut reader)? {
+        if frame.blob_type != BlobKind::OsmData {
+            continue;
+        }
+
+        let kind = frame.index.as_ref().map(|idx| idx.kind);
+        match kind {
+            Some(ElemKind::Node) if keep_untagged_nodes => {
+                if let Some(ref idx) = frame.index {
+                    stats.nodes_read += idx.count;
+                    stats.nodes_written += idx.count;
+                }
+                stats.blobs_passthrough += 1;
+                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+            }
+            Some(ElemKind::Node) => {
+                // keep_untagged_nodes=false: decode + filter
+                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
+                let raw = std::mem::take(&mut decompress_buf);
+                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
+                stats.blobs_decoded += 1;
+                node_batch.push(block);
+                if node_batch.len() >= BATCH_SIZE {
+                    let batch_stats = process_node_batch(&node_batch, &mut writer)?;
+                    merge_stats(&mut stats, &batch_stats);
+                    node_batch.clear();
+                }
+            }
+            Some(ElemKind::Relation) => {
+                if let Some(ref idx) = frame.index {
+                    stats.relations_written += idx.count;
+                }
+                stats.blobs_passthrough += 1;
+                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+            }
+            Some(ElemKind::Way) => {
+                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
+                let raw = std::mem::take(&mut decompress_buf);
+                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
+                stats.blobs_decoded += 1;
+                way_batch.push(block);
+                if way_batch.len() >= BATCH_SIZE {
+                    let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
+                    merge_stats(&mut stats, &batch_stats);
+                    way_batch.clear();
+                }
+            }
+            None => {
+                // No indexdata on this blob — fall back to full decode.
+                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
+                let raw = std::mem::take(&mut decompress_buf);
+                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
+                stats.blobs_decoded += 1;
+                way_batch.push(block);
+                if way_batch.len() >= BATCH_SIZE {
+                    let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
+                    merge_stats(&mut stats, &batch_stats);
+                    way_batch.clear();
+                }
+            }
+        }
+    }
+
+    // Flush remaining batches.
+    if !node_batch.is_empty() {
+        let batch_stats = process_node_batch(&node_batch, &mut writer)?;
+        merge_stats(&mut stats, &batch_stats);
+    }
+    if !way_batch.is_empty() {
+        let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
+        merge_stats(&mut stats, &batch_stats);
+    }
+
+    writer.flush()?;
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Way-only batch processing (passthrough path)
+// ---------------------------------------------------------------------------
+
+fn process_way_block(
+    block: &PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    index: &NodeLocationIndex,
+) -> std::result::Result<Stats, String> {
+    let mut stats = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    };
+
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+
+    for element in block.elements() {
+        if let Element::Way(w) = &element {
+            if !bb.can_add_way() {
+                flush_local(bb, output).map_err(|e| e.to_string())?;
+            }
+            tags_buf.clear();
+            tags_buf.extend(w.tags());
+            refs_buf.clear();
+            refs_buf.extend(w.refs());
+            locations_buf.clear();
+            for node_id in &refs_buf {
+                match index.get(*node_id) {
+                    Some(loc) => locations_buf.push(loc),
+                    None => {
+                        stats.missing_locations += 1;
+                        locations_buf.push((0, 0));
+                    }
+                }
+            }
+            let meta = element_metadata(&w.info());
+            bb.add_way_with_locations(w.id(), &tags_buf, &refs_buf, &locations_buf, meta.as_ref());
+            stats.ways_written += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn process_way_batch(
+    batch: &[PrimitiveBlock],
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    index: &NodeLocationIndex,
+) -> Result<Stats> {
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<OwnedBlock> = Vec::new();
+                let block_stats = process_way_block(block, bb, &mut output, index)?;
+                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    let mut total = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    };
+
+    for result in results {
+        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge_stats(&mut total, &block_stats);
+        for (block_bytes, blob_index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
+        }
+    }
+
+    Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// Node-only batch processing (passthrough path, keep_untagged_nodes=false)
+// ---------------------------------------------------------------------------
+
+fn process_node_block(
+    block: &PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<Stats, String> {
+    let mut stats = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    };
+
+    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                stats.nodes_read += 1;
+                let has_tags = dn.tags().next().is_some();
+                if has_tags {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            Element::Node(n) => {
+                stats.nodes_read += 1;
+                let has_tags = n.tags().next().is_some();
+                if has_tags {
+                    if !bb.can_add_node() {
+                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                    }
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(stats)
+}
+
+fn process_node_batch(
+    batch: &[PrimitiveBlock],
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+) -> Result<Stats> {
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+    let results: Vec<BatchResult> = batch
+        .par_iter()
+        .map_init(
+            BlockBuilder::new,
+            |bb, block| {
+                let mut output: Vec<OwnedBlock> = Vec::new();
+                let block_stats = process_node_block(block, bb, &mut output)?;
+                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                Ok((output, block_stats))
+            },
+        )
+        .collect();
+
+    let mut total = Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
     };
 
     for result in results {

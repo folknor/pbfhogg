@@ -421,3 +421,177 @@ fn dense_drop_untagged_nodes() {
     assert_eq!(stats.nodes_written, 2);
     assert_eq!(stats.nodes_dropped, 1);
 }
+
+// ---------------------------------------------------------------------------
+// Passthrough tests (indexdata PBFs)
+// ---------------------------------------------------------------------------
+
+/// Write a PBF with indexdata embedded in BlobHeaders.
+///
+/// Uses the pipelined writer which automatically embeds indexdata via
+/// `scan_block_ids` during blob framing.
+fn write_test_pbf_indexed(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
+    let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
+    let mut writer = PbfWriter::to_path_pipelined(path, Compression::default(), &header).expect("create writer");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for w in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_way(w.id, &w.tags, &w.refs, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|(id, role)| MemberData { id: *id, role })
+            .collect();
+        bb.add_relation(r.id, &r.tags, &members, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+#[test]
+fn passthrough_basic_with_indexdata() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
+    assert_eq!(stats.ways_written, 1);
+    assert_eq!(stats.missing_locations, 0);
+    assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
+
+    // Read output and verify way has locations
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut found_way = false;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    assert_eq!(w.id(), 10);
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(
+                        locs,
+                        vec![
+                            (550_000_000, 120_000_000),
+                            (551_000_000, 121_000_000),
+                            (552_000_000, 122_000_000),
+                        ]
+                    );
+                    found_way = true;
+                }
+            }
+        }
+    }
+    assert!(found_way, "way not found in output");
+}
+
+#[test]
+fn passthrough_relations_preserved() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![(MemberId::Way(10), "outer")],
+        tags: vec![("type", "multipolygon")],
+    }];
+
+    write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &relations);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
+    assert_eq!(stats.relations_written, 1);
+    assert!(stats.blobs_passthrough >= 2, "expected node + relation passthrough");
+
+    // Verify relation exists in output
+    let reader = BlobReader::from_path(&output).expect("open output");
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Relation(r) = element {
+                    assert_eq!(r.id(), 100);
+                    return;
+                }
+            }
+        }
+    }
+    panic!("relation not found in output");
+}
+
+#[test]
+fn passthrough_drop_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, IndexType::Hash).expect("add locations");
+
+    // Node 2 has no tags → dropped
+    assert_eq!(stats.nodes_read, 3);
+    assert_eq!(stats.nodes_written, 2);
+    assert_eq!(stats.nodes_dropped, 1);
+    // Relation blobs passthrough, node blobs decoded
+    assert!(stats.blobs_decoded > 0, "expected decoded node blobs");
+}
+
+#[test]
+fn passthrough_keep_untagged_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, IndexType::Hash).expect("add locations");
+
+    assert_eq!(stats.nodes_read, 3);
+    assert_eq!(stats.nodes_written, 3);
+    assert_eq!(stats.nodes_dropped, 0);
+    assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
+}

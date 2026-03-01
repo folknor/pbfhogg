@@ -20,8 +20,7 @@ Merge instrumentation (peak RSS, per-phase RSS/timers, blob stats, rewrite ratio
 is complete. Memory optimization research (E1.1–E3.1) is done. Pipeline reference
 in `notes/merge-pipeline.md`.
 
-- [ ] **I/O throughput in bench-merge.** Compute `read_mbs` and `write_mbs` from
-  input_mb, output_mb, elapsed_ms. Emit to stderr. ~5 lines in CLI.
+- [x] ~~I/O throughput in bench-merge.~~ Done.
 
 ## Performance: parallelism
 
@@ -151,7 +150,6 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
-- [ ] Verify edition 2024 is intentional — most published crates use 2021 for broader compatibility
 - [x] Fix crate-level doc example: `"0.1"` → `"0.2"`
 - [x] Doc comments on `writer.rs` public API — already complete (PbfWriter, Compression, all methods)
 - [x] Doc comments on `block_builder.rs` public API — already complete (BlockBuilder, Metadata, MemberData, HeaderBuilder)
@@ -163,7 +161,6 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 
 ## GitHub
 
-- [ ] Write GitHub repo description and tags (openstreetmap, pbf, protobuf, osm, rust)
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
 - [ ] Add a CHANGELOG.md before first tagged release
@@ -172,15 +169,6 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
-
-## Refactoring: duplicated metadata extraction
-
-`dense_node_metadata()`, `element_metadata()`, `dense_node_raw_metadata()`,
-`element_raw_metadata()`, `flush_block()`, and `rebuild_header()` are shared
-helpers in `commands/mod.rs`.
-
-sort.rs still has its own inline metadata extraction (uses `OwnedMetadata`
-with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Code TODOs
 
@@ -246,10 +234,8 @@ items are preserved below.
 - [x] ~~Unused public decompress functions in `blob.rs`.~~ Deleted 5 functions
   with zero callers.
 
-- [ ] **BlockBuilder StringTable double String allocation.** Slow path in
-  `block_builder.rs` `intern()` (~line 106): `s.to_owned()` for the HashMap
-  key, then `e.key().clone()` for the Vec entry. ~11 seconds at planet
-  scale. Low priority — marginal vs 222-second total string interning cost.
+- [x] ~~BlockBuilder StringTable double String allocation.~~ Fixed: `Rc<str>`
+  shared between HashMap key and Vec entry — one heap alloc per unique string.
 
 - [x] ~~Document fd registration stall bound in `uring_writer.rs`.~~ Done.
 

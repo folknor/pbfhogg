@@ -48,26 +48,46 @@ Cross-validated identical to osmium on Denmark (3.5M nodes, 6.6M ways, 46K relat
 - Pass 1 node index building — already parallel (commit 4055e64).
 - `process_way_block`, `process_node_block`, `process_block` internal logic — only
   signatures changed (scratch buffer params).
-- `RawBlobFrame`, `read_raw_frame`, `Stats`, `merge_stats` — unchanged.
+- `RawBlobFrame`, `Stats`, `merge_stats` — unchanged.
+  (`read_raw_frame` gained `file_offset` tracking in P1.4.)
 
-## P1 (next)
+## P1 — DONE
 
-1. Dense lookup micro-optimization
-- Replace slice+`try_into` path in `DenseMmapIndex::get` with direct unaligned reads from pointer/slice.
-- Keep bounds checks; only optimize data extraction.
-- Consider packing lat/lon as one `u64` in memory for single-load decode.
+All four P1 items landed across commits `1c6f763` (P1.1–P1.3) and `63112f8` (P1.4).
+Cross-validated identical to osmium on Denmark. Benchmark: 8724 ms → 6615 ms (−24%)
+for P1.1–P1.3; P1.4 neutral at Denmark scale but eliminates ~69 GB of userspace copies
+at planet scale (~92% passthrough).
 
-2. Single-pass way encode API to remove `refs_buf` + `locations_buf` materialization
-- Add a `BlockBuilder` method that accepts an iterator of `(ref_id, (lat, lon))`.
-- Encode refs/lat/lon packed fields directly in one pass.
-- This is a deeper change but removes two temporary vectors from the hottest transform loop.
+### What changed
 
-3. Reuse decode buffers with pool-backed ownership
-- Add an add-locations decode path equivalent to read pipeline's `DecompressPool`/`Bytes::from_owner`.
-- Goal: avoid per-blob allocate/free churn while still allowing owned `PrimitiveBlock` handoff.
+1. **Dense lookup single-load decode** — `DenseMmapIndex::get` reads one `u64` from the
+   mmap and splits lat/lon via bit shift, replacing the previous slice + `try_into` path
+   with two separate `i32::from_le_bytes` calls.
 
-4. Add copy-range passthrough option where supported
-- For high passthrough segments, allow kernel-assisted copy path (similar to merge's direct-io copy strategy) when it is compatible with writer mode.
+2. **Three-buffer single-pass way encode** — `encode_way_with_locations` encodes refs,
+   lats, and lons in a single zip loop using three reusable scratch buffers
+   (`packed_lat_scratch`, `packed_lon_scratch` on `BlockBuilder`, plus existing
+   `packed_refs`). Eliminates a second pass over locations.
+
+3. **Per-worker DecompressPool** — `process_slot_batch` creates a `DecompressPool` per
+   rayon worker via `map_init`, reusing decompress buffers across blobs within a batch.
+   Replaces per-blob `decompress_blob_data_into` with `decompress_blob` + pool.
+
+4. **Copy-range passthrough** (feature-gated: `linux-direct-io`) — two-phase blob read
+   (`read_blob_header` → `read_blob_data` or `skip_blob_data`) enables skipping
+   passthrough blob data entirely. `CopyRange` coalesces consecutive passthrough blobs
+   into contiguous file ranges, flushed as single `copy_file_range` calls. Decode blobs
+   between passthrough runs flush the pending range to prevent corrupt coalesced copies.
+   `FileReader::skip` / `DirectReader::skip` advance the reader without materializing
+   data. Second fd opened for `copy_file_range` (explicit offsets, thread-safe).
+   Without the feature, the userspace coalescing path is retained.
+
+### What did NOT change
+
+- `write_output_decode_all` (non-indexed fallback) — unchanged.
+- `process_way_block`, `process_node_block`, `process_block` internal logic — unchanged.
+- Pass 1 node index building — unchanged.
+- Writer infrastructure (`write_raw_copy`, `PipelinePayload::CopyRange`) — reused from merge.
 
 ## P2 (cleanup and maintainability)
 

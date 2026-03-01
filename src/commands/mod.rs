@@ -16,6 +16,10 @@ pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
 
+use std::io::Read;
+
+use crate::blob::{parse_blob_header_with_index, BlobKind};
+use crate::blob_index::BlobIndex;
 use crate::block_builder::{BlockBuilder, Metadata, RawMetadata};
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
@@ -23,6 +27,90 @@ use crate::writer::PbfWriter;
 // Box<dyn Error> is intentional — commands are CLI internals, callers only display
 // errors and exit. Typed error enums would add complexity with no matching benefit.
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+// ---------------------------------------------------------------------------
+// Shared raw blob frame reading (used by merge and add-locations-to-ways)
+// ---------------------------------------------------------------------------
+
+/// A raw blob frame for passthrough or selective decode.
+///
+/// The Blob protobuf bytes are a suffix of `frame_bytes` starting at
+/// `blob_offset`, eliminating a separate allocation per blob.
+pub(crate) struct RawBlobFrame {
+    /// Complete framed bytes: `[4-byte header_len][BlobHeader][Blob]`.
+    pub(crate) frame_bytes: Vec<u8>,
+    pub(crate) blob_type: BlobKind,
+    /// Byte offset within `frame_bytes` where the Blob protobuf starts.
+    pub(crate) blob_offset: usize,
+    /// Blob-level index from BlobHeader indexdata, if present.
+    pub(crate) index: Option<BlobIndex>,
+    /// Per-blob tag key data from BlobHeader field 4, if present.
+    pub(crate) tagdata: Option<Box<[u8]>>,
+    /// Byte offset of this frame in the input file (for copy_file_range).
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
+    pub(crate) file_offset: u64,
+}
+
+impl RawBlobFrame {
+    /// The raw Blob protobuf message bytes (for selective decoding).
+    pub(crate) fn blob_bytes(&self) -> &[u8] {
+        &self.frame_bytes[self.blob_offset..]
+    }
+}
+
+/// Read the next raw blob frame. Returns `None` at EOF.
+/// Updates `file_offset` to track position for copy_file_range.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn read_raw_frame<R: Read>(
+    reader: &mut R,
+    file_offset: &mut u64,
+) -> Result<Option<RawBlobFrame>> {
+    let frame_start = *file_offset;
+
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let header_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut header_bytes = vec![0u8; header_len];
+    reader.read_exact(&mut header_bytes)?;
+
+    let (blob_type, data_size, raw_index, tagdata) =
+        parse_blob_header_with_index(&header_bytes)?;
+    let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
+
+    let blob_offset = 4 + header_len;
+    let frame_len = blob_offset + data_size;
+    *file_offset += frame_len as u64;
+    let mut frame_bytes = vec![0u8; frame_len];
+    frame_bytes[..4].copy_from_slice(&len_buf);
+    frame_bytes[4..blob_offset].copy_from_slice(&header_bytes);
+    reader.read_exact(&mut frame_bytes[blob_offset..])?;
+
+    Ok(Some(RawBlobFrame {
+        frame_bytes,
+        blob_type,
+        blob_offset,
+        index,
+        tagdata,
+        file_offset: frame_start,
+    }))
+}
+
+/// Flush coalesced passthrough bytes as a single `write_raw_owned` (move, no copy).
+pub(crate) fn flush_passthrough_buf(
+    buf: &mut Vec<u8>,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !buf.is_empty() {
+        writer.write_raw_owned(std::mem::take(buf))?;
+    }
+    Ok(())
+}
 
 /// Flush the current block from a [`BlockBuilder`] into a [`PbfWriter`].
 ///

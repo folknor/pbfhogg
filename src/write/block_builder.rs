@@ -8,9 +8,12 @@
 
 use crate::blob_index::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::io;
+
+/// Encoded block bytes, blob index, and optional pre-serialized tagdata.
+pub(crate) type OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>);
 
 use protohoggr::{
     encode_bytes_field, encode_bytes_field_always, encode_int64_field,
@@ -238,6 +241,11 @@ pub struct BlockBuilder {
     min_lon: i32,
     max_lon: i32,
 
+    // Tag key string table indices (for pre-computed tagdata, avoids scan_block_tags rescan).
+    tag_key_indices: FxHashSet<u32>,
+    // Pre-serialized tagdata from the last encode_block() call.
+    last_tagdata: Option<Vec<u8>>,
+
     // Dense node accumulators
     dense_ids: Vec<i64>,
     dense_lats: Vec<i64>,
@@ -314,6 +322,9 @@ impl BlockBuilder {
             max_lat: i32::MIN,
             min_lon: i32::MAX,
             max_lon: i32::MIN,
+
+            tag_key_indices: FxHashSet::default(),
+            last_tagdata: None,
 
             // Pre-allocate dense node vectors to the max block size (8000).
             // One entry per node for each of id, lat, lon.
@@ -460,8 +471,9 @@ impl BlockBuilder {
 
         // Tags: interleaved [key_sid, val_sid, ...] terminated by 0
         for &(key, val) in tags {
-            self.dense_keys_vals
-                .push(self.string_table.add(key) as i32);
+            let key_idx = self.string_table.add(key);
+            self.tag_key_indices.insert(key_idx);
+            self.dense_keys_vals.push(key_idx as i32);
             self.dense_keys_vals
                 .push(self.string_table.add(val) as i32);
         }
@@ -576,6 +588,11 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
+        // Track tag key indices before encode_way (StringTable::add is idempotent)
+        for &(key, _) in tags {
+            let key_idx = self.string_table.add(key);
+            self.tag_key_indices.insert(key_idx);
+        }
         encode_way(
             &mut self.string_table,
             &mut self.group_buf,
@@ -611,6 +628,11 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
+        // Track tag key indices before encode (StringTable::add is idempotent)
+        for &(key, _) in tags {
+            let key_idx = self.string_table.add(key);
+            self.tag_key_indices.insert(key_idx);
+        }
         encode_way_with_locations(
             &mut self.string_table,
             &mut self.group_buf,
@@ -643,6 +665,11 @@ impl BlockBuilder {
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
+        // Track tag key indices before encode (StringTable::add is idempotent)
+        for &(key, _) in tags {
+            let key_idx = self.string_table.add(key);
+            self.tag_key_indices.insert(key_idx);
+        }
         encode_relation(
             &mut self.string_table,
             &mut self.group_buf,
@@ -706,6 +733,8 @@ impl BlockBuilder {
 
         // Tags: write raw indices directly — no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
+            #[allow(clippy::cast_sign_loss)]
+            self.tag_key_indices.insert(key_sid as u32);
             self.dense_keys_vals.push(key_sid);
             self.dense_keys_vals.push(val_sid);
         }
@@ -742,6 +771,8 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
+        // Track tag key indices from raw packed varint keys
+        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_way_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
@@ -776,6 +807,8 @@ impl BlockBuilder {
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
+        // Track tag key indices from raw packed varint keys
+        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
         encode_relation_raw_bytes(
             &mut self.group_buf,
             &mut self.elem_scratch,
@@ -868,6 +901,20 @@ impl BlockBuilder {
             }
         }
 
+        // Build tagdata from tracked tag key indices
+        self.last_tagdata = if self.tag_key_indices.is_empty() {
+            None
+        } else {
+            let mut keys: Vec<Box<[u8]>> = self.tag_key_indices.iter()
+                .filter_map(|&idx| {
+                    let s = &self.string_table.strings[idx as usize];
+                    if s.is_empty() { None } else { Some(s.as_bytes().into()) }
+                })
+                .collect();
+            keys.sort();
+            Some(crate::blob_index::TagIndex::from_keys(keys).serialize())
+        };
+
         self.reset();
         Ok(Some(index))
     }
@@ -886,21 +933,24 @@ impl BlockBuilder {
         }
     }
 
-    /// Serialize the current block and return owned bytes with a [`BlobIndex`].
+    /// Serialize the current block and return owned bytes with a [`BlobIndex`]
+    /// and optional pre-serialized tagdata.
     ///
     /// Like [`take`](Self::take) but returns an owned `Vec<u8>` instead of a
     /// borrow, plus a pre-computed [`BlobIndex`] describing the block contents
-    /// (element type, ID range, count). This eliminates the need for the
-    /// writer to rescan the serialized bytes via `scan_block_ids`.
+    /// (element type, ID range, count) and optional tagdata bytes for the
+    /// BlobHeader tag key index. This eliminates the need for the writer to
+    /// rescan the serialized bytes via `scan_block_ids` and `scan_block_tags`.
     ///
     /// Unlike `take()`, this does not reuse the encode buffer across calls —
     /// each call yields a fresh `Vec` and the internal buffer restarts empty.
     /// The total allocation is the same as `take()` + `to_vec()` but the
     /// `memcpy` is eliminated.
     #[hotpath::measure]
-    pub fn take_owned(&mut self) -> io::Result<Option<(Vec<u8>, BlobIndex)>> {
+    pub fn take_owned(&mut self) -> io::Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
-            Ok(Some((std::mem::take(&mut self.encode_buf), index)))
+            let tagdata = self.last_tagdata.take();
+            Ok(Some((std::mem::take(&mut self.encode_buf), index, tagdata)))
         } else {
             Ok(None)
         }
@@ -973,6 +1023,7 @@ impl BlockBuilder {
         self.max_lat = i32::MIN;
         self.min_lon = i32::MAX;
         self.max_lon = i32::MIN;
+        self.tag_key_indices.clear();
         self.has_dense_metadata = false;
         self.pre_seeded = false;
 
@@ -1324,6 +1375,22 @@ fn encode_relation_raw_bytes(
     encode_bytes_field(elem, 9, memids_data);
     encode_bytes_field(elem, 10, types_data);
     encode_bytes_field(group_buf, 4, elem);
+}
+
+/// Decode packed varint uint32 values from raw bytes and insert them into a set.
+///
+/// Used to extract string table key indices from raw way/relation keys_data
+/// (packed uint32 protobuf field) for tag key tracking.
+#[allow(clippy::cast_possible_truncation)]
+fn collect_packed_varint_keys(data: &[u8], indices: &mut FxHashSet<u32>) {
+    let mut cur = protohoggr::Cursor::new(data);
+    while !cur.is_empty() {
+        if let Ok(val) = cur.read_varint() {
+            indices.insert(val as u32);
+        } else {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

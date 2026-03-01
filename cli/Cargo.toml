@@ -11,6 +11,7 @@ name = "pbfhogg"
 path = "src/main.rs"
 
 [features]
+default = ["pbfhogg/rust-zlib"]
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc-crate"]
 hotpath = ["pbfhogg/hotpath"]
@@ -21,9 +22,9 @@ zlib = ["pbfhogg/zlib"]
 zlib-ng = ["pbfhogg/zlib-ng"]
 
 [dependencies]
-pbfhogg = { path = "..", features = ["commands"] }
+pbfhogg = { path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4", features = ["derive"] }
-hotpath = "0.12"
+hotpath = "0.13"
 tikv-jemallocator = { version = "0.6", optional = true }
 mimalloc-crate = { package = "mimalloc", version = "0.1", optional = true }
 

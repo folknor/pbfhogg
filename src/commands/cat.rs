@@ -6,8 +6,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::{dense_node_metadata, element_metadata};
-use crate::blob_index::BlobIndex;
-use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
@@ -174,12 +173,12 @@ const BATCH_SIZE: usize = 64;
 
 /// Flush the current block from a [`BlockBuilder`] into a local output buffer.
 ///
-/// Like `flush_block` but writes to a `Vec<(Vec<u8>, BlobIndex)>` instead of a
-/// `PbfWriter`, so it can be called from rayon worker threads without requiring
-/// `&mut PbfWriter`.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some((bytes, index)) = bb.take_owned()? {
-        output.push((bytes, index));
+/// Like `flush_block` but writes to a `Vec<OwnedBlock>`
+/// instead of a `PbfWriter`, so it can be called from rayon worker threads
+/// without requiring `&mut PbfWriter`.
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Some(triple) = bb.take_owned()? {
+        output.push(triple);
     }
     Ok(())
 }
@@ -192,7 +191,7 @@ fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) ->
 fn process_block(
     block: &crate::PrimitiveBlock,
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
@@ -345,7 +344,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
 ///
 /// Each rayon worker thread owns a `BlockBuilder` (via `map_init`) and
 /// processes one block at a time, flushing serialized output to a local
-/// `Vec<(Vec<u8>, BlobIndex)>`. After parallel processing, the serialized
+/// `Vec<OwnedBlock>`. After parallel processing, the serialized
 /// blocks are written sequentially to the `PbfWriter` in batch order.
 ///
 /// Returns `(blobs_decoded, elements_written)`.
@@ -357,14 +356,14 @@ fn process_batch(
     filter_relation: bool,
 ) -> Result<(u64, u64)> {
     // Parallel phase: each rayon thread processes one block, returning
-    // serialized block bytes (with BlobIndex) + element count.
-    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, u64), String>;
+    // serialized block bytes (with BlobIndex + tagdata) + element count.
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, u64), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
+                let mut output: Vec<OwnedBlock> = Vec::new();
                 let count = process_block(
                     block, bb, &mut output,
                     filter_node, filter_way, filter_relation,
@@ -387,8 +386,8 @@ fn process_batch(
         let (blocks, count) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         total_blobs += 1;
         total_elements += count;
-        for (block_bytes, index) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index)?;
+        for (block_bytes, index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
         }
     }
 

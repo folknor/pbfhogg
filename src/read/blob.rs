@@ -174,7 +174,12 @@ pub(crate) struct WireBlobHeader {
 
 impl WireBlobHeader {
     /// Parse a BlobHeader from raw protobuf bytes.
-    pub fn parse(data: &[u8]) -> Result<Self> {
+    ///
+    /// When `parse_tagdata` is `false`, field 4 (tagdata) is skipped instead of
+    /// allocated. Most read paths don't need tagdata — only tag-filtered reads
+    /// and merge/sort passthrough use it.
+    #[hotpath::measure]
+    pub fn parse(data: &[u8], parse_tagdata: bool) -> Result<Self> {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
@@ -211,7 +216,7 @@ impl WireBlobHeader {
                     #[allow(clippy::cast_possible_truncation)]
                     { datasize = cursor.read_varint()? as i32; }
                 }
-                4 => {
+                4 if parse_tagdata => {
                     // tagdata: per-blob tag key index (len-delimited)
                     let bytes = cursor.read_len_delimited()?;
                     if !bytes.is_empty() {
@@ -493,6 +498,9 @@ pub struct BlobReader<R: Read + Send> {
     /// iteration to avoid allocating a new Vec per blob (~16K allocs per Denmark,
     /// ~2.5M per planet).
     header_buf: Vec<u8>,
+    /// When `true`, `WireBlobHeader::parse` allocates tagdata (field 4).
+    /// Only needed for tag-filtered reads and merge/sort passthrough.
+    parse_tagdata: bool,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -518,6 +526,7 @@ impl<R: Read + Send> BlobReader<R> {
             offset: None,
             last_blob_ok: true,
             header_buf: Vec::new(),
+            parse_tagdata: false,
         }
     }
 
@@ -525,6 +534,14 @@ impl<R: Read + Send> BlobReader<R> {
         self.offset = None;
         self.last_blob_ok = false;
         Some(Err(error))
+    }
+
+    /// Enable or disable tagdata parsing (BlobHeader field 4).
+    ///
+    /// When enabled, `WireBlobHeader::parse` allocates tagdata per blob.
+    /// Only needed for tag-filtered reads and merge/sort passthrough.
+    pub(crate) fn set_parse_tagdata(&mut self, enable: bool) {
+        self.parse_tagdata = enable;
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -575,7 +592,7 @@ impl<R: Read + Send> BlobReader<R> {
             return self.handle_error(e.into());
         }
 
-        let header = match WireBlobHeader::parse(&self.header_buf) {
+        let header = match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata) {
             Ok(header) => header,
             Err(e) => {
                 return self.handle_error(e)
@@ -618,6 +635,7 @@ impl BlobReader<FileReader> {
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            parse_tagdata: false,
         })
     }
 
@@ -633,6 +651,7 @@ impl BlobReader<FileReader> {
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            parse_tagdata: false,
         })
     }
 
@@ -644,6 +663,7 @@ impl BlobReader<FileReader> {
             offset: Some(ByteOffset(0)),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            parse_tagdata: false,
         })
     }
 }
@@ -714,6 +734,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             offset: Some(ByteOffset(pos)),
             last_blob_ok: true,
             header_buf: Vec::new(),
+            parse_tagdata: false,
         })
     }
 
@@ -864,7 +885,7 @@ impl BlobReader<BufReader<File>> {
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
 pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
-    let header = WireBlobHeader::parse(header_bytes)?;
+    let header = WireBlobHeader::parse(header_bytes, false)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,
@@ -894,7 +915,7 @@ pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, u
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {
-    let header = WireBlobHeader::parse(header_bytes)?;
+    let header = WireBlobHeader::parse(header_bytes, true)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,

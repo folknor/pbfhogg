@@ -144,29 +144,28 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark (483 MB, 59M elements, commit `1a3fcd3`):
+CLI commands — Denmark (487 MB, 59M elements, commit `23862d1`):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| cat --type way (indexdata) | **1.07s** | 2.22s | **2.1x** |
-| tags-filter amenity=restaurant -R | **0.45s** | 1.19s | **2.6x** |
-| getid (9 elements) | **0.38s** | 0.83s | **2.2x** |
-| tags-count --type way (indexdata) | **0.36s** | 0.59s | **1.6x** |
-| tags-filter w/highway=primary -R | **0.45s** | 0.56s | **1.2x** |
-| add-locations-to-ways | **11.5s** | 12.1s | **1.1x** |
+| sort (sorted, indexdata) | **0.14s** | 11.6s | **83x** |
 | merge (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
-| sort (sorted) | **2.3s** | 11.6s | **5.0x** |
-| sort (unsorted) | **2.8s** | 21.3s | **7.6x** |
+| tags-filter w/highway=primary -R | **0.24s** | 0.56s | **2.3x** |
+| tags-filter amenity=restaurant -R | **0.58s** | 1.19s | **2.1x** |
+| cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
+| tags-count --type way (indexdata) | **0.34s** | 0.59s | **1.7x** |
+| getid (9 elements) | **0.53s** | 0.83s | **1.6x** |
+| add-locations-to-ways | **11.5s** | 12.1s | **1.1x** |
 
-Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata get an additional boost by skipping decompression of irrelevant blob types. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses blob-level permutation.
+Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation.
 
-Extract — Japan (2.3 GB, 344M elements, Tokyo bbox, commit `1b62e2c`):
+Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `23862d1`):
 
 | Strategy | pbfhogg | osmium | ratio |
 |----------|---------|--------|-------|
-| simple | 12.2s | **7.2s** | 1.70x |
-| complete-ways | 12.8s | **11.0s** | 1.16x |
-| smart | 14.6s | **13.4s** | 1.09x |
+| simple | 12.9s | **7.2s** | 1.79x |
+| complete-ways | 13.3s | **11.0s** | 1.21x |
+| smart | 14.9s | **13.4s** | 1.11x |
 
 Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium; simple's gap is structural (two passes vs osmium's single pass — the extra file read costs ~5s at this scale).
 

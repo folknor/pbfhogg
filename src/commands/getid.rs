@@ -6,8 +6,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::{dense_node_metadata, element_metadata};
-use crate::blob_index::BlobIndex;
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -280,12 +279,12 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
 /// Flush the current block from a [`BlockBuilder`] into a local output buffer.
 ///
-/// Like `flush_block` but writes to a `Vec<(Vec<u8>, BlobIndex)>` instead of a
-/// `PbfWriter`, so it can be called from rayon worker threads without requiring
-/// `&mut PbfWriter`.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(pair) = bb.take_owned()? {
-        output.push(pair);
+/// Like `flush_block` but writes to a `Vec<OwnedBlock>`
+/// instead of a `PbfWriter`, so it can be called from rayon worker threads
+/// without requiring `&mut PbfWriter`.
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Some(triple) = bb.take_owned()? {
+        output.push(triple);
     }
     Ok(())
 }
@@ -298,7 +297,7 @@ fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) ->
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     ids: &IdSet,
     include: bool,
     dep_node_ids: Option<&BTreeSet<i64>>,
@@ -387,7 +386,7 @@ fn process_block(
 ///
 /// Each rayon worker thread owns a `BlockBuilder` (via `map_init`) and
 /// processes one block at a time, flushing serialized output to a local
-/// `Vec<(Vec<u8>, BlobIndex)>`. After parallel processing, the serialized
+/// `Vec<OwnedBlock>`. After parallel processing, the serialized
 /// blocks are written sequentially to the `PbfWriter` in batch order.
 ///
 /// Returns `(nodes_written, ways_written, relations_written)`.
@@ -398,13 +397,13 @@ fn process_filter_batch(
     include: bool,
     dep_node_ids: Option<&BTreeSet<i64>>,
 ) -> Result<(u64, u64, u64)> {
-    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, u64, u64, u64), String>;
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, u64, u64, u64), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
+                let mut output: Vec<OwnedBlock> = Vec::new();
                 let (nodes, ways, relations) = process_block(
                     block, bb, &mut output, ids, include, dep_node_ids,
                 )?;
@@ -423,8 +422,8 @@ fn process_filter_batch(
         total_nodes += nodes;
         total_ways += ways;
         total_relations += relations;
-        for (block_bytes, index) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index)?;
+        for (block_bytes, index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
         }
     }
 

@@ -5,8 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::blob_index::BlobIndex;
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData};
+use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -308,9 +307,9 @@ fn write_output(
 use super::{dense_node_metadata, element_metadata};
 
 /// Flush the current block from a [`BlockBuilder`] into a local output buffer.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(pair) = bb.take_owned()? {
-        output.push(pair);
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    if let Some(triple) = bb.take_owned()? {
+        output.push(triple);
     }
     Ok(())
 }
@@ -329,7 +328,7 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     index: &NodeLocationIndex,
     keep_untagged_nodes: bool,
 ) -> std::result::Result<Stats, String> {
@@ -431,13 +430,13 @@ fn process_batch(
     index: &NodeLocationIndex,
     keep_untagged_nodes: bool,
 ) -> Result<Stats> {
-    type BatchResult = std::result::Result<(Vec<(Vec<u8>, BlobIndex)>, Stats), String>;
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
             BlockBuilder::new,
             |bb, block| {
-                let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
+                let mut output: Vec<OwnedBlock> = Vec::new();
                 let block_stats = process_block(
                     block, bb, &mut output, index, keep_untagged_nodes,
                 )?;
@@ -459,8 +458,8 @@ fn process_batch(
     for result in results {
         let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_stats(&mut total, &block_stats);
-        for (block_bytes, blob_index) in blocks {
-            writer.write_primitive_block_owned(block_bytes, blob_index)?;
+        for (block_bytes, blob_index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
         }
     }
 

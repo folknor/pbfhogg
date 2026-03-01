@@ -72,7 +72,7 @@ memmap2 = "0.9"
 rayon = "1.5"
 rustc-hash = "2"
 zstd = "0.13"
-hotpath = "0.12"
+hotpath = "0.13"
 quick-xml = "0.39"
 serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }

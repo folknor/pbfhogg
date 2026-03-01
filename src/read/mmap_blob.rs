@@ -319,7 +319,7 @@ impl Iterator for MmapBlobReader {
         // Parse the BlobHeader directly from &[u8] -- no Bytes allocation needed.
         // The hand-rolled parser operates on raw byte slices, avoiding the atomic
         // refcount overhead that the old Bytes-based protobuf path required.
-        let header = match WireBlobHeader::parse(&slice[4..4 + header_size]) {
+        let header = match WireBlobHeader::parse(&slice[4..4 + header_size], false) {
             Ok(x) => x,
             Err(e) => {
                 self.last_blob_ok = false;

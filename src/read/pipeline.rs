@@ -48,7 +48,7 @@ const DECODE_AHEAD: usize = 32;
 #[allow(clippy::needless_pass_by_value)]
 #[hotpath::measure]
 pub(crate) fn run_pipeline<R, F>(
-    blob_reader: BlobReader<R>,
+    mut blob_reader: BlobReader<R>,
     decode_thread_count: Option<usize>,
     blob_filter: Option<BlobFilter>,
     mut block_fn: F,
@@ -60,6 +60,9 @@ where
     type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
     type DecodedItem = (usize, Option<crate::error::Result<PrimitiveBlock>>);
 
+    // Enable tagdata parsing only when the filter needs tag key matching.
+    let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
+    blob_reader.set_parse_tagdata(has_tag_filter);
     let blob_filter = blob_filter.map(Arc::new);
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(READ_AHEAD);
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(DECODE_AHEAD);

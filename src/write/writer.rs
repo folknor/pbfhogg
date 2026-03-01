@@ -326,6 +326,7 @@ impl<W: Write> PbfWriter<W> {
     /// deferred until [`flush`](Self::flush).
     ///
     /// `block_bytes` is produced by [`BlockBuilder::take`](crate::block_builder::BlockBuilder::take).
+    #[hotpath::measure]
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
@@ -369,22 +370,24 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// Like [`write_primitive_block`](Self::write_primitive_block) but moves
     /// the `Vec` into the pipeline closure instead of copying, and uses a
-    /// pre-computed [`BlobIndex`](crate::blob_index::BlobIndex) from
+    /// pre-computed [`BlobIndex`](crate::blob_index::BlobIndex) and optional
+    /// pre-serialized tagdata from
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
     /// instead of rescanning the serialized bytes.
+    #[hotpath::measure]
     pub fn write_primitive_block_owned(
         &mut self,
         block_bytes: Vec<u8>,
         index: blob_index::BlobIndex,
+        tagdata: Option<&[u8]>,
     ) -> io::Result<()> {
         let indexdata = index.serialize();
-        let tagdata = blob_index::scan_block_tags(&block_bytes)
-            .map(|ti| ti.serialize());
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let tx = pipeline.tx.clone();
+            let tagdata_owned = tagdata.map(<[u8]>::to_vec);
             rayon::spawn(move || {
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
@@ -392,7 +395,7 @@ impl<W: Write> PbfWriter<W> {
                         &block_bytes,
                         &compression,
                         Some(indexdata.as_slice()),
-                        tagdata.as_deref(),
+                        tagdata_owned.as_deref(),
                         scratch,
                     )
                 });
@@ -404,7 +407,7 @@ impl<W: Write> PbfWriter<W> {
                 "OSMData",
                 &block_bytes,
                 Some(indexdata.as_slice()),
-                tagdata.as_deref(),
+                tagdata,
             )
         }
     }

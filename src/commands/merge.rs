@@ -23,7 +23,7 @@ use crate::blob::{
 };
 use crate::blob_index::{self, BlobIndex, ElemKind};
 use bytes::Bytes;
-use crate::block_builder::{BlockBuilder, MemberData};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::osc::{parse_osc_file, DiffOverlay, OscRelMember, OscRelation, OscWay};
@@ -400,16 +400,16 @@ fn ensure_relation_capacity(
 // Local flush helpers for parallel rewrite (no PbfWriter)
 // ---------------------------------------------------------------------------
 
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<(Vec<u8>, BlobIndex)>) -> MergeResult<()> {
-    if let Some(pair) = bb.take_owned()? {
-        output.push(pair);
+fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> MergeResult<()> {
+    if let Some(triple) = bb.take_owned()? {
+        output.push(triple);
     }
     Ok(())
 }
 
 fn ensure_node_capacity_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
 ) -> MergeResult<()> {
     if !bb.can_add_node() {
         flush_local(bb, output)?;
@@ -419,7 +419,7 @@ fn ensure_node_capacity_local(
 
 fn ensure_way_capacity_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
 ) -> MergeResult<()> {
     if !bb.can_add_way() {
         flush_local(bb, output)?;
@@ -429,7 +429,7 @@ fn ensure_way_capacity_local(
 
 fn ensure_relation_capacity_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
 ) -> MergeResult<()> {
     if !bb.can_add_relation() {
         flush_local(bb, output)?;
@@ -477,7 +477,7 @@ fn write_osc_relation(
 
 fn write_base_dense_node_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
@@ -499,7 +499,7 @@ fn write_base_dense_node_local(
 
 fn write_base_node_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
@@ -521,7 +521,7 @@ fn write_base_node_local(
 
 fn write_base_way_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
@@ -542,7 +542,7 @@ fn write_base_way_local(
 
 fn write_base_relation_local(
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
 ) -> MergeResult<()> {
@@ -591,7 +591,7 @@ fn element_kind(element: &Element<'_>) -> ElemKind {
 
 /// Output from `rewrite_block_parallel`: serialized blocks + local stats.
 struct RewriteOutput {
-    blocks: Vec<(Vec<u8>, BlobIndex)>,
+    blocks: Vec<OwnedBlock>,
     stats: MergeStats,
 }
 
@@ -601,7 +601,7 @@ fn emit_create_local(
     kind: ElemKind,
     diff: &DiffOverlay,
     bb: &mut BlockBuilder,
-    output: &mut Vec<(Vec<u8>, BlobIndex)>,
+    output: &mut Vec<OwnedBlock>,
     stats: &mut MergeStats,
 ) -> MergeResult<()> {
     match kind {
@@ -658,7 +658,7 @@ fn rewrite_block_parallel(
     inline_upserts: &[i64],
     kind: ElemKind,
 ) -> MergeResult<RewriteOutput> {
-    let mut output: Vec<(Vec<u8>, BlobIndex)> = Vec::new();
+    let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
     let mut upsert_cursor: usize = 0;
 
@@ -1239,8 +1239,8 @@ pub fn merge(
                 BatchSlot::Rewrite { job_index, index: _ } => {
                     flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
                     let output = &mut rewrite_outputs[*job_index];
-                    for (block_bytes, index) in output.blocks.drain(..) {
-                        writer.write_primitive_block_owned(block_bytes, index)?;
+                    for (block_bytes, index, tagdata) in output.blocks.drain(..) {
+                        writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                     }
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;

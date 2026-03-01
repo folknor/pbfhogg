@@ -83,6 +83,28 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   only if rayon becomes a proven bottleneck (e.g. if parallel `rewrite_block` exposes contention
   in the global pool).
 
+## Performance: regressions from indexdata/tagdata
+
+Measured at commit `23862d1` with `zlib-ng`, Denmark indexed PBF (487 MB).
+Old baselines: read at `90df51f` (461 MB non-indexed), write at `def80d9`.
+
+- [ ] **Parallel read: 0.31s → 0.45s (+45%).** `par_map_reduce` regression.
+  Larger blob headers (42-byte indexdata + variable tagdata) are parsed across
+  all cores. The per-blob overhead is small but multiplied by rayon parallelism
+  it adds up. Investigate whether the wire parser skips unknown BlobHeader fields
+  efficiently or does unnecessary work.
+
+- [ ] **Write floor: 6.2s → 7.1s pipelined, 7.8s sync (+15-26%).** The
+  decode+encode floor moved up because BlockBuilder now computes tagdata
+  (per-block tag key set) and bbox (decimicrodegree min/max) for BlobIndex v2.
+  Also reading from the larger indexed PBF adds ~1s decode overhead. Profile
+  tagdata collection and bbox tracking to find low-hanging fruit.
+
+- [ ] **Write sync zlib:6: 14.5s → 16.4s (+13%).** Follows from the higher
+  floor — compression time itself is unchanged but the encode path is slower.
+
+- [ ] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Same root cause as above.
+
 ## Performance: CLI commands vs osmium
 
 All CLI commands now beat osmium except extract --simple.

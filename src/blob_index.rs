@@ -306,6 +306,7 @@ use protohoggr::{zigzag_decode_64, Cursor};
 /// Collects PrimitiveGroup data before processing so that granularity/offset
 /// fields (which appear after groups in the wire format) are available for
 /// coordinate conversion.
+#[hotpath::measure]
 #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
 pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
     let mut cur = Cursor::new(raw);
@@ -600,9 +601,15 @@ pub(crate) struct TagIndex {
 }
 
 impl TagIndex {
+    /// Create a `TagIndex` from pre-sorted unique tag key byte strings.
+    pub(crate) fn from_keys(keys: Vec<Box<[u8]>>) -> Self {
+        TagIndex { keys }
+    }
+
     /// Serialize to the tag index wire format.
     ///
     /// Format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) + key bytes].
+    #[hotpath::measure]
     pub fn serialize(&self) -> Vec<u8> {
         let total: usize = 3 + self.keys.iter().map(|k| 2 + k.len()).sum::<usize>();
         let mut buf = Vec::with_capacity(total);
@@ -682,6 +689,7 @@ fn parse_string_table(raw: &[u8]) -> Option<Vec<&[u8]>> {
 /// from all PrimitiveGroups. Returns a `TagIndex` with sorted unique keys.
 ///
 /// Returns `None` if the block has no groups or cannot be parsed.
+#[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
 pub(crate) fn scan_block_tags(raw: &[u8]) -> Option<TagIndex> {
     let mut cur = Cursor::new(raw);

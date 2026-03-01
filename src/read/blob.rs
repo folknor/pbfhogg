@@ -30,6 +30,19 @@ thread_local! {
 /// The pool holds `Vec<u8>` buffers returned by [`PooledBuffer`]'s `Drop` impl.
 /// Buffers are popped via [`DecompressPool::get`] and returned automatically when
 /// the `Bytes` (and the `PrimitiveBlock` holding slices of it) is dropped.
+/// Maximum capacity (bytes) of a buffer retained in the pool.
+/// Buffers larger than this are dropped on return instead of recycled.
+/// This prevents outlier blobs (up to 32 MB decompressed) from permanently
+/// inflating the pool's retained memory.
+///
+/// Set to 4 MB: covers >99% of real-world PBF blocks (8000 elements at
+/// typical sizes) while dropping the long tail of outlier blocks.
+const MAX_RETAINED_CAPACITY: usize = 4 * 1024 * 1024;
+
+/// Maximum number of buffers retained in the pool.
+/// Defense-in-depth: prevents unbounded pool growth if pipeline topology changes.
+const MAX_POOL_SIZE: usize = 64;
+
 pub(crate) struct DecompressPool {
     buffers: Mutex<Vec<Vec<u8>>>,
 }
@@ -54,10 +67,19 @@ impl DecompressPool {
     }
 
     /// Return a buffer to the pool for reuse.
+    ///
+    /// Drops oversized buffers (capacity > 4 MB) instead of retaining them,
+    /// preventing outlier blobs from permanently inflating pool memory.
+    /// Also enforces a count cap as defense-in-depth.
     fn put(&self, mut buf: Vec<u8>) {
+        if buf.capacity() > MAX_RETAINED_CAPACITY {
+            return;
+        }
         buf.clear();
         if let Ok(mut v) = self.buffers.lock() {
-            v.push(buf);
+            if v.len() < MAX_POOL_SIZE {
+                v.push(buf);
+            }
         }
     }
 }

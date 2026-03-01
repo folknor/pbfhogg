@@ -58,13 +58,15 @@
 - Metrics: allocation count, peak RSS, rewrite phase wall time.
 - Exit criteria: measurable allocation drop and non-negative throughput.
 
-### E1.3 Bound DecompressPool retention
+### E1.3 Bound DecompressPool retention — DONE (commit TBD)
 - Hypothesis: unbounded pooled buffers retain worst-case capacities and inflate tail RSS.
 - Change:
-- Add size classes and retention caps per class.
-- Drop oversized returned buffers beyond cap.
+- Single capacity threshold (`MAX_RETAINED_CAPACITY = 4 MB`) on `put()`: drop oversized buffers instead of recycling.
+- Count cap (`MAX_POOL_SIZE = 64`) as defense-in-depth.
+- Capacity check is before the mutex lock — zero overhead for typical buffers.
 - Metrics: post-spike RSS decay behavior, allocation churn, throughput.
 - Exit criteria: improved RSS recovery with <= 5% throughput regression.
+- **Result (S2 Germany):** Throughput and RSS within noise of E2.2 baseline (no regression). Benefit is structural: prevents outlier blobs (up to 32 MB) from permanently inflating pool memory. Worst-case pool retention drops from 41×16 MB = 656 MB to 41×4 MB = 164 MB. Decision: KEEP.
 
 ## Phase 2: Bounded In-Flight Redesign
 ### E2.1 Adaptive batch sizing by bytes (not blob count) — DONE (commit e1099c4)

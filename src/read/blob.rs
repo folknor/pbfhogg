@@ -917,17 +917,6 @@ pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
     Ok((header.blob_type, header.datasize as usize))
 }
 
-/// Zero-copy variant of [`parse_blob_header`].
-///
-/// Accepts a `&Bytes` for backward compatibility. Delegates to the `&[u8]`
-/// variant since the hand-rolled parser operates on `&[u8]` directly.
-///
-/// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
-/// Returns: `(blob_type, data_size)`.
-pub fn parse_blob_header_from_bytes(header_bytes: &Bytes) -> Result<(BlobKind, usize)> {
-    parse_blob_header(header_bytes)
-}
-
 /// Parse a BlobHeader and extract optional `indexdata` and `tagdata` fields.
 ///
 /// Returns `(blob_type, data_size, optional_indexdata, optional_tagdata)`.
@@ -948,54 +937,19 @@ pub fn parse_blob_header_with_index(
 }
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
-///
-/// This variant accepts `&[u8]` for convenience but must copy the bytes
-/// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
-/// [`decode_blob_to_primitiveblock_from_bytes`] to avoid the copy.
 pub fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
-    decode_blob_to_primitiveblock_from_bytes(&Bytes::copy_from_slice(blob_bytes))
-}
-
-/// Zero-copy variant of [`decode_blob_to_primitiveblock`].
-///
-/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
-/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
-/// O(1).
-pub fn decode_blob_to_primitiveblock_from_bytes(
-    blob_bytes: &Bytes,
-) -> Result<crate::PrimitiveBlock> {
-    let blob = WireBlob::parse(blob_bytes)?;
-    decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
-}
-
-/// Decompress a blob's data without parsing it into a typed message.
-/// Returns the raw decompressed protobuf bytes.
-///
-/// This variant accepts `&[u8]` for convenience but must copy the bytes
-/// internally to parse the Blob protobuf envelope. If you already have a
-/// `Vec<u8>` or `Bytes`, prefer [`decompress_blob_data_from_bytes`] to
-/// avoid the copy.
-pub fn decompress_blob_data(blob_bytes: &[u8]) -> Result<Vec<u8>> {
     let blob = WireBlob::parse_slice(blob_bytes)?;
-    decompress_blob(&blob, None).map(|b| b.to_vec())
+    decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
 }
 
 /// Decompress a blob's data into a caller-provided buffer for reuse.
 ///
-/// Like [`decompress_blob_data`] but clears and reuses `buf` instead of
+/// Clears and reuses `buf` instead of
 /// allocating a new `Vec` each time. For loops that decompress many blobs,
 /// this avoids repeated large allocations -- the buffer grows to high-water
 /// mark and stays there.
 pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     let blob = WireBlob::parse_slice(blob_bytes)?;
-    decompress_parsed_blob_into(&blob, buf)
-}
-
-/// Zero-copy variant of [`decompress_blob_data_into`].
-///
-/// Accepts a `Bytes` value directly, avoiding the envelope copy.
-pub fn decompress_blob_data_into_from_bytes(blob_bytes: &Bytes, buf: &mut Vec<u8>) -> Result<()> {
-    let blob = WireBlob::parse(blob_bytes)?;
     decompress_parsed_blob_into(&blob, buf)
 }
 
@@ -1031,54 +985,6 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
                 return Err(new_blob_error(BlobError::MessageTooBig { size }));
             }
             Ok(())
-        }
-        None => Err(new_blob_error(BlobError::Empty)),
-    }
-}
-
-/// Zero-copy variant of [`decompress_blob_data`].
-///
-/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
-/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
-/// O(1).
-///
-/// Returns the raw decompressed protobuf bytes.
-#[allow(clippy::cast_sign_loss)]
-#[hotpath::measure]
-pub fn decompress_blob_data_from_bytes(blob_bytes: &Bytes) -> Result<Vec<u8>> {
-    let blob = WireBlob::parse(blob_bytes)?;
-    match &blob.data {
-        Some(BlobData::Raw(bytes)) => {
-            let size = bytes.len() as u64;
-            if size < MAX_BLOB_MESSAGE_SIZE {
-                Ok(bytes.to_vec())
-            } else {
-                Err(new_blob_error(BlobError::MessageTooBig { size }))
-            }
-        }
-        Some(BlobData::Zlib(bytes)) => {
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut decoded = Vec::with_capacity(capacity);
-            zlib_decompress_into(bytes, &mut decoded)?;
-            Ok(decoded)
-        }
-        Some(BlobData::Zstd(bytes)) => {
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut decoded = Vec::with_capacity(capacity);
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded)?;
-            let size = decoded.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
-            Ok(decoded)
         }
         None => Err(new_blob_error(BlobError::Empty)),
     }

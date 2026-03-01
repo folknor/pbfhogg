@@ -22,9 +22,6 @@ in `notes/merge-pipeline.md`.
 
 - [ ] **I/O throughput in bench-merge.** Compute `read_mbs` and `write_mbs` from
   input_mb, output_mb, elapsed_ms. Emit to stderr. ~5 lines in CLI.
-- [ ] **brokkr memory comparison view.** Extend `brokkr results --compare` to
-  display peak_rss_mb, blob size distribution, rewrite ratio side-by-side.
-  ~80 lines in brokkr.
 
 ## Performance: parallelism
 
@@ -159,8 +156,8 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 - [x] Doc comments on `writer.rs` public API — already complete (PbfWriter, Compression, all methods)
 - [x] Doc comments on `block_builder.rs` public API — already complete (BlockBuilder, Metadata, MemberData, HeaderBuilder)
 - [x] Crate-level write workflow docs in `lib.rs` (sync + pipelined examples)
-- [ ] Tighten module visibility: `pub mod commands`, `pub mod osc`, `pub use
-  read::file_reader`, `pub use write::file_writer` expose internals as public API
+- [x] ~~Tighten module visibility~~ — `commands` and command re-exports are
+  `#[doc(hidden)]`, `file_reader`/`file_writer` are `pub(crate)`
 - [x] Fix `error.rs:30` doc: "when reading PBF files" → "when reading or writing PBF files"
 - [ ] Publish to crates.io
 
@@ -246,22 +243,15 @@ items are preserved below.
 
 ### Minor uncaptured items
 
-- [ ] **Deprecate unused public decompress functions in `blob.rs`.** Six
-  public functions have zero internal callers: `decompress_blob_data`,
-  `decompress_blob_data_from_bytes`, `decompress_blob_data_into_from_bytes`,
-  `decode_blob_to_primitiveblock`, `decode_blob_to_primitiveblock_from_bytes`,
-  `parse_blob_header_from_bytes`. Either add `#[deprecated]` or document
-  which are the preferred entry points. Zero perf impact.
+- [x] ~~Unused public decompress functions in `blob.rs`.~~ Deleted 5 functions
+  with zero callers.
 
 - [ ] **BlockBuilder StringTable double String allocation.** Slow path in
   `block_builder.rs` `intern()` (~line 106): `s.to_owned()` for the HashMap
   key, then `e.key().clone()` for the Vec entry. ~11 seconds at planet
   scale. Low priority — marginal vs 222-second total string interning cost.
 
-- [ ] **Document fd registration stall bound in `uring_writer.rs`.** The
-  comment at ~line 271 explains the drain reason but does not document
-  the performance impact. Add a note that the stall is bounded by the
-  header write (1 partial buffer, <1ms for merge).
+- [x] ~~Document fd registration stall bound in `uring_writer.rs`.~~ Done.
 
 ## Benchmarking
 

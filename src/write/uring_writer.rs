@@ -272,7 +272,8 @@ impl UringState {
     ///
     /// Only registers on the first call; subsequent calls are no-ops.
     /// Drains all in-flight SQEs first — with sqpoll, the kernel polling thread
-    /// may hold references to the file table during I/O processing.
+    /// may hold references to the file table during I/O processing. The stall
+    /// is bounded by the header write (1 partial buffer, <1ms for merge).
     #[cfg(feature = "linux-direct-io")]
     fn register_input_fd(&mut self, in_fd: std::os::unix::io::RawFd) -> io::Result<()> {
         if self.input_fd_registered {

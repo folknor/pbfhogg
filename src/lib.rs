@@ -116,6 +116,7 @@ writer.flush()?;
 // Module tree
 pub mod read;
 pub mod write;
+#[doc(hidden)]
 pub mod commands;
 pub mod osc;
 pub(crate) mod blob_index;
@@ -159,11 +160,15 @@ pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
 // Required by imports and doc links in commands/, read/, and write/ modules.
-pub use read::{blob, block, dense, elements, file_reader, indexed, mmap_blob, reader};
-pub use write::{block_builder, file_writer, writer};
+pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
+pub(crate) use read::file_reader;
+pub use write::{block_builder, writer};
+pub(crate) use write::file_writer;
+#[doc(hidden)]
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, fileinfo, getid, merge,
     node_stats, sort, tags_count, tags_filter,
 };
 #[cfg(feature = "commands")]
+#[doc(hidden)]
 pub use commands::{check_refs, extract};

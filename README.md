@@ -155,7 +155,7 @@ CLI commands — Denmark (487 MB, 59M elements, commit `23862d1`):
 | cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
 | tags-count --type way (indexdata) | **0.34s** | 0.59s | **1.7x** |
 | getid (9 elements) | **0.53s** | 0.83s | **1.6x** |
-| add-locations-to-ways | **6.8s** | 9.8s | **1.4x** |
+| add-locations-to-ways | **11.5s** | 12.1s | **1.1x** |
 
 Filter commands (cat, tags-filter, tags-count, getid, removeid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Merge uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation. add-locations-to-ways uses parallel node index building (batch-and-dispatch to rayon) and blob passthrough for unchanged node/relation blobs on indexed PBFs.
 

@@ -18,7 +18,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 Merge instrumentation (peak RSS, per-phase RSS/timers, blob stats, rewrite ratio)
 is complete. Memory optimization research (E1.1–E3.1) is done. Pipeline reference
-in `notes/merge-pipeline.md`.
+in `notes/pipeline.md`.
 
 - [x] ~~I/O throughput in bench-merge.~~ Done.
 

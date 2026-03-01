@@ -169,17 +169,19 @@ Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `23862d1`):
 
 Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium; simple's gap is structural (two passes vs osmium's single pass — the extra file read costs ~5s at this scale).
 
-Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `d6a9b55`):
+Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `a6ebbfe`):
 
 | Dataset | Config | Time | vs osmium |
 |---------|--------|------|-----------|
 | Japan (2.4 GB, 43K diff) | indexdata + zlib | **3.0s** | **15x** faster |
-| Germany (4.5 GB, 146K diff) | indexdata + zlib | **10.1s** | — |
-| Germany (4.5 GB, 146K diff) | indexdata + none | **5.9s** | — |
-| N. America (18.8 GB, 645K diff) | indexdata + zlib | **24.4s** | — |
-| N. America (18.8 GB, 645K diff) | indexdata + none | **13.3s** | — |
+| Germany (4.5 GB, 146K diff) | buffered + zlib | **5.3s** | — |
+| Germany (4.5 GB, 146K diff) | buffered + none | **3.4s** | — |
+| N. America (18.8 GB, 645K diff) | buffered + zlib | **17.3s** | — |
+| N. America (18.8 GB, 645K diff) | buffered + none | **14.9s** | — |
+| N. America (18.8 GB, 645K diff) | io_uring + zlib | **15.2s** | — |
+| N. America (18.8 GB, 645K diff) | io_uring + none | **11.9s** | — |
 
-At Japan scale, osmium takes 36.6s for the same operation (9-15x slower) because it decodes and re-encodes every element. pbfhogg passes ~92% of blobs through as raw bytes without decompression, using blob-level indexdata for O(1) classification. The single-pass pipeline overlaps reader I/O, parallel classification, parallel rewrite of touched blobs, and pipelined writes — passthrough blobs are coalesced into large buffers and moved into the writer channel with zero copy.
+At Japan scale, osmium takes 36.6s for the same operation (9-15x slower) because it decodes and re-encodes every element. pbfhogg passes ~92% of blobs through as raw bytes without decompression, using blob-level indexdata for O(1) classification. The single-pass pipeline overlaps reader I/O, parallel classification, parallel rewrite of touched blobs, and pipelined writes — passthrough blobs are coalesced into large buffers and moved into the writer channel with zero copy. Adaptive in-flight memory bounding keeps RSS under 600 MB even at North America scale (18.8 GB).
 
 All CLI commands are cross-validated against osmium on Denmark (`dev verify`). cat, tags-filter, add-locations-to-ways, and getid produce byte-identical output. derive-changes produces a correct roundtrip (apply derived OSC back to old = new, 59.1M elements identical) while osmium's derived OSC loses 1243 delete directives. extract has expected differences in relation inclusion criteria across all three strategies (99.99% node/way match; smart: pbfhogg includes more way-referenced nodes, osmium includes more relations). diff has a 14-element discrepancy out of 59.1M due to different version comparison semantics.
 
@@ -248,7 +250,7 @@ let writer = PbfWriter::to_path_pipelined_uring(path, Compression::None, &header
 
 Requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK` (16 MB for the default 64-buffer pool). If the limit is too low, the error message will suggest `ulimit -l unlimited`.
 
-Note: with the current single-pass merge pipeline (reader thread + passthrough coalescing), the buffered writer keeps up with io_uring at all tested scales. io_uring may still help at planet scale (75 GB+) where the file far exceeds page cache.
+At North America scale (18.8 GB), io_uring + `Compression::None` is 20% faster than buffered writes (11.9s vs 14.9s). At country scale (Denmark 465 MB, Japan 2.4 GB), buffered writes keep up — io_uring overhead dominates when the page cache absorbs everything. The crossover is around 4-5 GB input size.
 
 ## Compression
 

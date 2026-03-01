@@ -3,13 +3,12 @@
 use std::io::Read;
 use std::path::Path;
 
-use bytes::Bytes;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data_into,
-    parse_blob_header_with_index, parse_primitive_block_from_bytes_owned, BlobKind,
+    decode_blob_to_headerblock, decompress_blob, parse_blob_header_with_index,
+    parse_primitive_block_from_bytes_owned, BlobKind, DecompressPool, WireBlob,
 };
 use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
@@ -151,17 +150,13 @@ impl DenseMmapIndex {
             return None;
         }
         let offset = idx * ENTRY_SIZE;
-        let lat_bytes: [u8; 4] = self.mmap[offset..offset + 4]
-            .try_into()
-            .ok()?;
-        let lon_bytes: [u8; 4] = self.mmap[offset + 4..offset + 8]
-            .try_into()
-            .ok()?;
-        let lat = i32::from_le_bytes(lat_bytes);
-        let lon = i32::from_le_bytes(lon_bytes);
-        if lat == 0 && lon == 0 {
+        // Single 8-byte load: lower 32 bits = lat (LE), upper 32 bits = lon (LE).
+        let packed = u64::from_le_bytes(self.mmap[offset..offset + 8].try_into().ok()?);
+        if packed == 0 {
             return None;
         }
+        let lat = packed as i32;
+        let lon = (packed >> 32) as i32;
         Some((lat, lon))
     }
 }
@@ -955,19 +950,21 @@ fn process_slot_batch(
                     Vec::<OwnedBlock>::new(),
                     Vec::<i64>::new(),
                     Vec::<(i32, i32)>::new(),
+                    DecompressPool::new(),
                 )
             },
-            |(bb, output, refs_buf, locations_buf), slot| {
+            |(bb, output, refs_buf, locations_buf, pool), slot| {
                 output.clear();
 
                 // Decompress and parse the blob in this worker thread.
-                let mut decompress_buf = Vec::new();
-                decompress_blob_data_into(slot.frame().blob_bytes(), &mut decompress_buf)
+                // Per-worker DecompressPool reuses the decompression buffer across blobs
+                // via PooledBuffer + Bytes::from_owner (returned to pool on drop).
+                let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
                     .map_err(|e| e.to_string())?;
-                let block = parse_primitive_block_from_bytes_owned(
-                    &Bytes::from(decompress_buf),
-                )
-                .map_err(|e| e.to_string())?;
+                let bytes = decompress_blob(&wire_blob, Some(pool))
+                    .map_err(|e| e.to_string())?;
+                let block = parse_primitive_block_from_bytes_owned(&bytes)
+                    .map_err(|e| e.to_string())?;
 
                 let block_stats = match slot {
                     BatchSlot::Way(_) => {

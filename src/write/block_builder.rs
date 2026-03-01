@@ -269,8 +269,10 @@ pub struct BlockBuilder {
     // Wire-format accumulators for ways and relations
     group_buf: Vec<u8>,       // per-block: all serialized way/relation messages
     elem_scratch: Vec<u8>,    // per-element body (cleared each add_way/add_relation call)
-    packed_scratch: Vec<u8>,  // per-field packed content
-    info_scratch: Vec<u8>,    // Info sub-message body
+    packed_scratch: Vec<u8>,      // per-field packed content (refs in location path)
+    packed_lat_scratch: Vec<u8>,  // way location lat encoding (single-pass)
+    packed_lon_scratch: Vec<u8>,  // way location lon encoding (single-pass)
+    info_scratch: Vec<u8>,        // Info sub-message body
 
     // Reusable encode buffer for take() — avoids allocating a fresh Vec<u8> per block.
     encode_buf: Vec<u8>,
@@ -355,6 +357,8 @@ impl BlockBuilder {
             group_buf: Vec::new(),
             elem_scratch: Vec::new(),
             packed_scratch: Vec::new(),
+            packed_lat_scratch: Vec::new(),
+            packed_lon_scratch: Vec::new(),
             info_scratch: Vec::new(),
 
             encode_buf: Vec::new(),
@@ -634,6 +638,8 @@ impl BlockBuilder {
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
+            &mut self.packed_lat_scratch,
+            &mut self.packed_lon_scratch,
             &mut self.info_scratch,
             id,
             tags,
@@ -1178,12 +1184,17 @@ fn encode_way(
 }
 
 /// Encode a Way with embedded node locations (fields 9/10: lat/lon).
+///
+/// Uses three packed buffers in a single zip loop for refs/lat/lon to avoid
+/// iterating the data three separate times.
 #[allow(clippy::too_many_arguments)]
 fn encode_way_with_locations(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
-    packed: &mut Vec<u8>,
+    packed_refs: &mut Vec<u8>,
+    packed_lats: &mut Vec<u8>,
+    packed_lons: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
     id: i64,
     tags: &[(&str, &str)],
@@ -1195,17 +1206,17 @@ fn encode_way_with_locations(
     encode_int64_field(elem, 1, id);
 
     if !tags.is_empty() {
-        packed.clear();
+        packed_refs.clear();
         for &(key, _) in tags {
-            encode_varint(packed, u64::from(string_table.add(key)));
+            encode_varint(packed_refs, u64::from(string_table.add(key)));
         }
-        encode_bytes_field(elem, 2, packed);
+        encode_bytes_field(elem, 2, packed_refs);
 
-        packed.clear();
+        packed_refs.clear();
         for &(_, val) in tags {
-            encode_varint(packed, u64::from(string_table.add(val)));
+            encode_varint(packed_refs, u64::from(string_table.add(val)));
         }
-        encode_bytes_field(elem, 3, packed);
+        encode_bytes_field(elem, 3, packed_refs);
     }
 
     if let Some(meta) = metadata {
@@ -1213,37 +1224,30 @@ fn encode_way_with_locations(
         encode_bytes_field(elem, 4, info_buf);
     }
 
-    // Fields 8, 9, 10: refs + lat + lon (all delta-encoded)
+    // Fields 8, 9, 10: refs + lat + lon (all delta-encoded, single pass)
     if !refs.is_empty() {
         let mut last_ref: i64 = 0;
         let mut last_lat: i64 = 0;
         let mut last_lon: i64 = 0;
 
-        // Field 8: refs (packed sint64)
-        packed.clear();
-        for &r in refs {
-            encode_varint(packed, zigzag_encode_64(r - last_ref));
+        packed_refs.clear();
+        packed_lats.clear();
+        packed_lons.clear();
+
+        for (&r, &(loc_lat, loc_lon)) in refs.iter().zip(locations.iter()) {
+            encode_varint(packed_refs, zigzag_encode_64(r - last_ref));
             last_ref = r;
-        }
-        encode_bytes_field(elem, 8, packed);
-
-        // Field 9: lat (packed sint64)
-        packed.clear();
-        for &(loc_lat, _) in locations {
             let lat = i64::from(loc_lat);
-            encode_varint(packed, zigzag_encode_64(lat - last_lat));
+            encode_varint(packed_lats, zigzag_encode_64(lat - last_lat));
             last_lat = lat;
-        }
-        encode_bytes_field(elem, 9, packed);
-
-        // Field 10: lon (packed sint64)
-        packed.clear();
-        for &(_, loc_lon) in locations {
             let lon = i64::from(loc_lon);
-            encode_varint(packed, zigzag_encode_64(lon - last_lon));
+            encode_varint(packed_lons, zigzag_encode_64(lon - last_lon));
             last_lon = lon;
         }
-        encode_bytes_field(elem, 10, packed);
+
+        encode_bytes_field(elem, 8, packed_refs);
+        encode_bytes_field(elem, 9, packed_lats);
+        encode_bytes_field(elem, 10, packed_lons);
     }
 
     encode_bytes_field(group_buf, 3, elem);

@@ -1,10 +1,9 @@
 //! PBF merge: apply an OSC diff overlay to a base PBF, producing an updated PBF.
 //!
-//! Single-pass 4-phase batch pipeline:
-//!   Phase 1: Parallel classify       [rayon pool]
-//!   Phase 2: Sequential inline assign [main thread, O(log n) per blob]
-//!   Phase 3: Parallel rewrite        [rayon pool]
-//!   Phase 4: Sequential output       [main thread]
+//! Single-pass streaming batch pipeline:
+//!   Phase 1: Parallel classify              [rayon pool]
+//!   Phase 2: Sequential inline assign       [main thread, O(log n) per blob]
+//!   Phase 3+4: Parallel rewrite + streaming output [rayon pool + main thread]
 //!
 //! Key insight: we pass ALL upsert IDs in a blob's range to the rewrite function.
 //! IDs that match base elements are modifications (handled by normal element processing);
@@ -14,6 +13,7 @@
 use std::io::{self, Read};
 use std::path::Path;
 use std::sync::mpsc;
+use std::sync::Arc;
 
 use rayon::prelude::*;
 
@@ -1018,10 +1018,10 @@ fn emit_create_for_output(
 
 /// Apply an OSC diff to a base PBF file, producing an updated sorted PBF.
 ///
-/// Single-pass 4-phase batch pipeline: for each byte-budgeted batch of raw frames,
+/// Single-pass streaming batch pipeline: for each byte-budgeted batch of raw frames,
 /// Phase 1 classifies blobs in parallel, Phase 2 computes inline upsert
-/// assignments (O(log n) per blob), Phase 3 rewrites affected blobs in parallel,
-/// and Phase 4 emits output sequentially.
+/// assignments (O(log n) per blob), then Phase 3+4 spawns parallel rewrites and
+/// streams output in file order as results arrive.
 ///
 /// # Errors
 ///
@@ -1042,7 +1042,7 @@ pub fn merge(
     #[cfg(feature = "hotpath")]
     let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());
-    let diff = parse_osc_file(osc_file)?;
+    let diff = Arc::new(parse_osc_file(osc_file)?);
     eprintln!(
         "Diff: {} nodes, {} ways, {} relations ({} del nodes, {} del ways, {} del rels)",
         diff.node_count(), diff.way_count(), diff.relation_count(),
@@ -1260,46 +1260,45 @@ pub fn merge(
             }
         }
 
-        // Phase 3: Parallel rewrite
+        // Phase 3+4: Spawn parallel rewrites, then stream output in file order.
+        // Each rayon task owns its RewriteJob (including PrimitiveBlock), freeing
+        // memory as soon as the task completes rather than holding all blocks until
+        // all rewrites finish. The main thread processes slots in order, receiving
+        // rewrite results from the channel on demand.
         #[cfg(feature = "hotpath")]
-        let phase3_start = std::time::Instant::now();
-        let rewrite_results: Vec<Result<RewriteOutput, String>> = rewrite_jobs
-            .par_iter()
-            .map_init(
-                BlockBuilder::new,
-                |thread_bb, job| {
-                    rewrite_block_parallel(
-                        &job.block,
-                        &diff,
-                        thread_bb,
-                        &job.inline_upserts,
-                        job.kind,
-                    )
-                    .map_err(|e| e.to_string())
-                },
-            )
-            .collect();
+        let phase34_start = std::time::Instant::now();
 
-        #[cfg(feature = "hotpath")]
-        {
-            phase_timers.rewrite_total += phase3_start.elapsed();
-            let rss = read_rss_kb();
-            if rss > phase_rss.rewrite_max {
-                phase_rss.rewrite_max = rss;
-            }
-        }
-
-        // Unwrap rewrite results
-        let mut rewrite_outputs: Vec<RewriteOutput> = Vec::with_capacity(rewrite_results.len());
-        for result in rewrite_results {
-            rewrite_outputs.push(
-                result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+        let rewrite_count = rewrite_jobs.len();
+        let (rewrite_tx, rewrite_rx) =
+            mpsc::sync_channel::<(usize, Result<RewriteOutput, String>)>(
+                rayon::current_num_threads().min(rewrite_count.max(1)),
             );
-        }
 
-        // Phase 4: Sequential output with passthrough coalescing
-        #[cfg(feature = "hotpath")]
-        let phase4_start = std::time::Instant::now();
+        for (job_idx, job) in rewrite_jobs.into_iter().enumerate() {
+            let tx = rewrite_tx.clone();
+            let diff_clone = Arc::clone(&diff);
+            rayon::spawn(move || {
+                let mut task_bb = BlockBuilder::new();
+                let result = rewrite_block_parallel(
+                    &job.block,
+                    &diff_clone,
+                    &mut task_bb,
+                    &job.inline_upserts,
+                    job.kind,
+                )
+                .map_err(|e| e.to_string());
+                // job (PrimitiveBlock) dropped here — freed before other tasks finish
+                drop(tx.send((job_idx, result)));
+            });
+        }
+        drop(rewrite_tx); // close channel when all cloned senders are done
+
+        // Streaming drain: process slots in file order, receiving rewrite results
+        // from the channel as needed. Out-of-order arrivals are buffered in
+        // `received` and consumed when their slot is reached.
+        let mut received: Vec<Option<RewriteOutput>> =
+            (0..rewrite_count).map(|_| None).collect();
+
         for (i, slot) in slots.iter().enumerate() {
             blob_count += 1;
 
@@ -1386,8 +1385,20 @@ pub fn merge(
                     stats.blob_sizes.push(frame_len as u32);
                 }
                 BatchSlot::Rewrite { job_index, index: _ } => {
+                    // Wait for this rewrite result, buffering out-of-order arrivals
+                    while received[*job_index].is_none() {
+                        let (idx, result) = rewrite_rx.recv()
+                            .map_err(|_| -> Box<dyn std::error::Error> {
+                                "rewrite channel closed unexpectedly".into()
+                            })?;
+                        received[idx] = Some(
+                            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+                        );
+                    }
                     flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
-                    let output = &mut rewrite_outputs[*job_index];
+                    let mut output = received[*job_index]
+                        .take()
+                        .ok_or("rewrite output missing")?;
                     let mut rewrite_bytes: u64 = 0;
                     for (block_bytes, index, tagdata) in output.blocks.drain(..) {
                         rewrite_bytes += block_bytes.len() as u64;
@@ -1396,6 +1407,7 @@ pub fn merge(
                     stats.bytes_rewritten += rewrite_bytes;
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;
+                    // output dropped here — RewriteOutput freed immediately
 
                     // Advance cursor past max_id (inline upserts handled by rewrite)
                     let (cursor, upserts) = match blob_kind {
@@ -1424,8 +1436,13 @@ pub fn merge(
         flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
         #[cfg(feature = "hotpath")]
         {
-            phase_timers.output_total += phase4_start.elapsed();
+            let elapsed = phase34_start.elapsed();
+            phase_timers.rewrite_total += elapsed;
+            phase_timers.output_total += elapsed;
             let rss = read_rss_kb();
+            if rss > phase_rss.rewrite_max {
+                phase_rss.rewrite_max = rss;
+            }
             if rss > phase_rss.output_max {
                 phase_rss.output_max = rss;
             }

@@ -326,6 +326,22 @@ impl DiffRanges {
 // osc_member_type_to_member_type removed: OscRelMember.member_type is now
 // a MemberType enum directly (see osc.rs), so no string→enum conversion needed.
 
+/// Estimate a blob's in-flight memory cost for byte-budgeted batch sizing.
+///
+/// For indexed blobs whose ID range doesn't overlap the diff, returns just
+/// the raw frame size (pure passthrough — no decompression needed).
+/// For potential rewrite blobs, returns raw_size × 21 (raw + ~16× decompressed
+/// + ~5× rewrite output estimate).
+fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> usize {
+    let raw = frame.frame_bytes.len();
+    if let Some(ref idx) = frame.index {
+        if !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id) {
+            return raw;
+        }
+    }
+    raw * 21
+}
+
 // ---------------------------------------------------------------------------
 // Low-level blob frame reader (preserves raw bytes for passthrough)
 // ---------------------------------------------------------------------------
@@ -1002,7 +1018,7 @@ fn emit_create_for_output(
 
 /// Apply an OSC diff to a base PBF file, producing an updated sorted PBF.
 ///
-/// Single-pass 4-phase batch pipeline: for each batch of BATCH_SIZE raw frames,
+/// Single-pass 4-phase batch pipeline: for each byte-budgeted batch of raw frames,
 /// Phase 1 classifies blobs in parallel, Phase 2 computes inline upsert
 /// assignments (O(log n) per blob), Phase 3 rewrites affected blobs in parallel,
 /// and Phase 4 emits output sequentially.
@@ -1105,9 +1121,12 @@ pub fn merge(
     // Decouples read I/O from processing — while the main thread runs
     // classify/rewrite/output on the current batch, the reader thread
     // pre-fills the next batch.
-    const BATCH_SIZE: usize = 64;
+    const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
+    const BATCH_MIN_BLOBS: usize = 8;
+    const BATCH_MAX_BLOBS: usize = 128;
+    const READER_CHANNEL_SIZE: usize = 128;
     let base_path = base_pbf.to_path_buf();
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(BATCH_SIZE);
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
     let reader_thread = std::thread::spawn(move || -> Result<(), String> {
         let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
         let mut file_offset: u64 = 0;
@@ -1150,7 +1169,7 @@ pub fn merge(
     let mut rel_upsert_cursor: usize = 0;
     let mut last_type: Option<ElemKind> = None;
 
-    let mut batch: Vec<RawBlobFrame> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<RawBlobFrame> = Vec::with_capacity(BATCH_MAX_BLOBS);
     // Passthrough coalescing buffer: accumulates consecutive raw passthrough bytes
     // and flushes them as a single write_raw_owned (move, no copy) to the
     // pipelined writer. At ~92% passthrough (Denmark), this collapses thousands
@@ -1158,16 +1177,26 @@ pub fn merge(
     let mut passthrough_buf: Vec<u8> = Vec::new();
 
     loop {
-        // Receive batch from reader thread
+        // Receive batch from reader thread (byte-budgeted)
         batch.clear();
-        while batch.len() < BATCH_SIZE {
+        let mut batch_bytes: usize = 0;
+        while batch.len() < BATCH_MAX_BLOBS {
+            if batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET {
+                break;
+            }
             match frame_rx.try_recv() {
-                Ok(frame) => batch.push(frame),
+                Ok(frame) => {
+                    batch_bytes += estimate_blob_cost(&frame, &ranges);
+                    batch.push(frame);
+                }
                 Err(mpsc::TryRecvError::Empty) => {
                     if batch.is_empty() {
                         // Nothing yet — block for the first frame
                         match frame_rx.recv() {
-                            Ok(frame) => batch.push(frame),
+                            Ok(frame) => {
+                                batch_bytes += estimate_blob_cost(&frame, &ranges);
+                                batch.push(frame);
+                            }
                             Err(_) => break, // reader done
                         }
                     } else {
@@ -1380,11 +1409,13 @@ pub fn merge(
                 }
             }
 
+            #[allow(clippy::cast_precision_loss)]
             if blob_count.is_multiple_of(500) {
                 eprintln!(
-                    "  Blob {blob_count}: {} pass ({} idx) / {} rewrite, {} elements",
+                    "  Blob {blob_count}: {} pass ({} idx) / {} rewrite, {} elements, batch={} ({:.1} MB est)",
                     stats.blobs_passthrough, stats.blobs_index_hit,
                     stats.blobs_rewritten, stats.total_elements(),
+                    batch.len(), batch_bytes as f64 / (1024.0 * 1024.0),
                 );
             }
         }

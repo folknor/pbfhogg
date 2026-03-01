@@ -286,6 +286,28 @@ fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
 }
 
 // ---------------------------------------------------------------------------
+// Batch slot for parallel decode
+// ---------------------------------------------------------------------------
+
+/// A slot in a parallel decode batch for the passthrough path.
+enum BatchSlot {
+    /// Way blob: decompress, enrich with node locations, re-encode.
+    Way(RawBlobFrame),
+    /// Node blob: decompress, filter untagged, re-encode.
+    Node(RawBlobFrame),
+    /// Unknown blob (no indexdata): decompress, inspect, process generically.
+    Unknown(RawBlobFrame),
+}
+
+impl BatchSlot {
+    fn frame(&self) -> &RawBlobFrame {
+        match self {
+            Self::Way(f) | Self::Node(f) | Self::Unknown(f) => f,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -466,8 +488,16 @@ fn index_batch_hash(batch: &[PrimitiveBlock]) -> FxHashMap<i64, (i32, i32)> {
 // Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
 
-/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
+/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
+/// (used by the decode-all fallback path).
 const BATCH_SIZE: usize = 64;
+
+/// Byte budget for slot batches in the passthrough path.
+const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
+/// Minimum blobs before the byte budget is checked.
+const BATCH_MIN_BLOBS: usize = 8;
+/// Hard cap on blobs per batch.
+const BATCH_MAX_BLOBS: usize = 128;
 
 fn write_output(
     input: &Path,
@@ -573,6 +603,8 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     index: &NodeLocationIndex,
     keep_untagged_nodes: bool,
+    refs_buf: &mut Vec<i64>,
+    locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
     let mut stats = Stats {
         nodes_read: 0,
@@ -586,9 +618,7 @@ fn process_block(
     };
 
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
 
     for element in block.elements() {
         match &element {
@@ -633,7 +663,7 @@ fn process_block(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
-                for node_id in &refs_buf {
+                for node_id in refs_buf.iter() {
                     match index.get(*node_id) {
                         Some(loc) => locations_buf.push(loc),
                         None => {
@@ -643,7 +673,7 @@ fn process_block(
                     }
                 }
                 let meta = element_metadata(&w.info());
-                bb.add_way_with_locations(w.id(), &tags_buf, &refs_buf, &locations_buf, meta.as_ref());
+                bb.add_way_with_locations(w.id(), &tags_buf, refs_buf, locations_buf, meta.as_ref());
                 stats.ways_written += 1;
             }
             Element::Relation(r) => {
@@ -678,11 +708,12 @@ fn process_batch(
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
-            BlockBuilder::new,
-            |bb, block| {
+            || (BlockBuilder::new(), Vec::<i64>::new(), Vec::<(i32, i32)>::new()),
+            |(bb, refs_buf, locations_buf), block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let block_stats = process_block(
                     block, bb, &mut output, index, keep_untagged_nodes,
+                    refs_buf, locations_buf,
                 )?;
                 flush_local(bb, &mut output).map_err(|e| e.to_string())?;
                 Ok((output, block_stats))
@@ -710,6 +741,26 @@ fn process_batch(
     }
 
     Ok(total)
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough coalescing
+// ---------------------------------------------------------------------------
+
+/// Accumulate raw passthrough bytes into a coalescing buffer.
+fn coalesce_passthrough(frame: &mut RawBlobFrame, buf: &mut Vec<u8>) {
+    buf.extend_from_slice(&std::mem::take(&mut frame.frame_bytes));
+}
+
+/// Flush the passthrough coalescing buffer to the writer as a single owned write.
+fn flush_passthrough_buf(
+    buf: &mut Vec<u8>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+) -> Result<()> {
+    if !buf.is_empty() {
+        writer.write_raw_owned(std::mem::take(buf))?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -757,9 +808,9 @@ fn write_output_passthrough(
     let (header_bytes, _sorted) = read_header_raw(&mut reader)?;
     let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
 
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    let mut node_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch: Vec<BatchSlot> = Vec::with_capacity(BATCH_MAX_BLOBS);
+    let mut batch_bytes: usize = 0;
+    let mut passthrough_buf: Vec<u8> = Vec::new();
 
     while let Some(mut frame) = read_raw_frame(&mut reader)? {
         if frame.blob_type != BlobKind::OsmData {
@@ -768,69 +819,60 @@ fn write_output_passthrough(
 
         let kind = frame.index.as_ref().map(|idx| idx.kind);
         match kind {
+            // Passthrough: nodes when keeping untagged, relations always.
             Some(ElemKind::Node) if keep_untagged_nodes => {
                 if let Some(ref idx) = frame.index {
                     stats.nodes_read += idx.count;
                     stats.nodes_written += idx.count;
                 }
                 stats.blobs_passthrough += 1;
-                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
-            }
-            Some(ElemKind::Node) => {
-                // keep_untagged_nodes=false: decode + filter
-                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
-                let raw = std::mem::take(&mut decompress_buf);
-                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
-                stats.blobs_decoded += 1;
-                node_batch.push(block);
-                if node_batch.len() >= BATCH_SIZE {
-                    let batch_stats = process_node_batch(&node_batch, &mut writer)?;
-                    merge_stats(&mut stats, &batch_stats);
-                    node_batch.clear();
-                }
+                coalesce_passthrough(&mut frame, &mut passthrough_buf);
             }
             Some(ElemKind::Relation) => {
                 if let Some(ref idx) = frame.index {
                     stats.relations_written += idx.count;
                 }
                 stats.blobs_passthrough += 1;
-                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                coalesce_passthrough(&mut frame, &mut passthrough_buf);
+            }
+            // Decode: nodes needing tag filter, ways needing locations, unknown.
+            Some(ElemKind::Node) => {
+                stats.blobs_decoded += 1;
+                batch_bytes += frame.frame_bytes.len();
+                batch.push(BatchSlot::Node(frame));
             }
             Some(ElemKind::Way) => {
-                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
-                let raw = std::mem::take(&mut decompress_buf);
-                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
                 stats.blobs_decoded += 1;
-                way_batch.push(block);
-                if way_batch.len() >= BATCH_SIZE {
-                    let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
-                    merge_stats(&mut stats, &batch_stats);
-                    way_batch.clear();
-                }
+                batch_bytes += frame.frame_bytes.len();
+                batch.push(BatchSlot::Way(frame));
             }
             None => {
-                // No indexdata on this blob — fall back to full decode.
-                decompress_blob_data_into(frame.blob_bytes(), &mut decompress_buf)?;
-                let raw = std::mem::take(&mut decompress_buf);
-                let block = parse_primitive_block_from_bytes_owned(&Bytes::from(raw))?;
                 stats.blobs_decoded += 1;
-                way_batch.push(block);
-                if way_batch.len() >= BATCH_SIZE {
-                    let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
-                    merge_stats(&mut stats, &batch_stats);
-                    way_batch.clear();
-                }
+                batch_bytes += frame.frame_bytes.len();
+                batch.push(BatchSlot::Unknown(frame));
             }
+        }
+
+        // Dispatch when byte budget reached or batch is full.
+        if batch.len() >= BATCH_MAX_BLOBS
+            || (batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET)
+        {
+            flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+            let batch_stats = process_slot_batch(
+                &batch, &mut writer, node_index, keep_untagged_nodes,
+            )?;
+            merge_stats(&mut stats, &batch_stats);
+            batch.clear();
+            batch_bytes = 0;
         }
     }
 
-    // Flush remaining batches.
-    if !node_batch.is_empty() {
-        let batch_stats = process_node_batch(&node_batch, &mut writer)?;
-        merge_stats(&mut stats, &batch_stats);
-    }
-    if !way_batch.is_empty() {
-        let batch_stats = process_way_batch(&way_batch, &mut writer, node_index)?;
+    // Flush remaining passthrough bytes and decode batch.
+    flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+    if !batch.is_empty() {
+        let batch_stats = process_slot_batch(
+            &batch, &mut writer, node_index, keep_untagged_nodes,
+        )?;
         merge_stats(&mut stats, &batch_stats);
     }
 
@@ -839,7 +881,7 @@ fn write_output_passthrough(
 }
 
 // ---------------------------------------------------------------------------
-// Way-only batch processing (passthrough path)
+// Per-block element processing (passthrough path)
 // ---------------------------------------------------------------------------
 
 fn process_way_block(
@@ -847,6 +889,8 @@ fn process_way_block(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     index: &NodeLocationIndex,
+    refs_buf: &mut Vec<i64>,
+    locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
     let mut stats = Stats {
         nodes_read: 0,
@@ -860,8 +904,6 @@ fn process_way_block(
     };
 
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut locations_buf: Vec<(i32, i32)> = Vec::new();
 
     for element in block.elements() {
         if let Element::Way(w) = &element {
@@ -873,7 +915,7 @@ fn process_way_block(
             refs_buf.clear();
             refs_buf.extend(w.refs());
             locations_buf.clear();
-            for node_id in &refs_buf {
+            for node_id in refs_buf.iter() {
                 match index.get(*node_id) {
                     Some(loc) => locations_buf.push(loc),
                     None => {
@@ -883,7 +925,7 @@ fn process_way_block(
                 }
             }
             let meta = element_metadata(&w.info());
-            bb.add_way_with_locations(w.id(), &tags_buf, &refs_buf, &locations_buf, meta.as_ref());
+            bb.add_way_with_locations(w.id(), &tags_buf, refs_buf, locations_buf, meta.as_ref());
             stats.ways_written += 1;
         }
     }
@@ -891,21 +933,57 @@ fn process_way_block(
     Ok(stats)
 }
 
-fn process_way_batch(
-    batch: &[PrimitiveBlock],
+/// Process a batch of slots in parallel: decompress, transform, write.
+///
+/// Each rayon worker decompresses and parses its blob, then routes to the
+/// appropriate element handler. Results are collected and written sequentially
+/// to preserve input order.
+fn process_slot_batch(
+    batch: &[BatchSlot],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    index: &NodeLocationIndex,
+    node_index: &NodeLocationIndex,
+    keep_untagged_nodes: bool,
 ) -> Result<Stats> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let results: Vec<BatchResult> = batch
+    type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+
+    let results: Vec<SlotResult> = batch
         .par_iter()
         .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = process_way_block(block, bb, &mut output, index)?;
-                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
-                Ok((output, block_stats))
+            || {
+                (
+                    BlockBuilder::new(),
+                    Vec::<OwnedBlock>::new(),
+                    Vec::<i64>::new(),
+                    Vec::<(i32, i32)>::new(),
+                )
+            },
+            |(bb, output, refs_buf, locations_buf), slot| {
+                output.clear();
+
+                // Decompress and parse the blob in this worker thread.
+                let mut decompress_buf = Vec::new();
+                decompress_blob_data_into(slot.frame().blob_bytes(), &mut decompress_buf)
+                    .map_err(|e| e.to_string())?;
+                let block = parse_primitive_block_from_bytes_owned(
+                    &Bytes::from(decompress_buf),
+                )
+                .map_err(|e| e.to_string())?;
+
+                let block_stats = match slot {
+                    BatchSlot::Way(_) => {
+                        process_way_block(
+                            &block, bb, output, node_index, refs_buf, locations_buf,
+                        )?
+                    }
+                    BatchSlot::Node(_) => process_node_block(&block, bb, output)?,
+                    BatchSlot::Unknown(_) => process_block(
+                        &block, bb, output, node_index, keep_untagged_nodes,
+                        refs_buf, locations_buf,
+                    )?,
+                };
+
+                flush_local(bb, output).map_err(|e| e.to_string())?;
+                Ok((std::mem::take(output), block_stats))
             },
         )
         .collect();
@@ -922,7 +1000,8 @@ fn process_way_batch(
     };
 
     for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let (blocks, block_stats) =
+            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         merge_stats(&mut total, &block_stats);
         for (block_bytes, blob_index, tagdata) in blocks {
             writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
@@ -995,42 +1074,3 @@ fn process_node_block(
     Ok(stats)
 }
 
-fn process_node_batch(
-    batch: &[PrimitiveBlock],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-) -> Result<Stats> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = process_node_block(block, bb, &mut output)?;
-                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
-                Ok((output, block_stats))
-            },
-        )
-        .collect();
-
-    let mut total = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
-
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        merge_stats(&mut total, &block_stats);
-        for (block_bytes, blob_index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
-        }
-    }
-
-    Ok(total)
-}

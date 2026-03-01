@@ -363,70 +363,40 @@ but blob-size distribution and byte-level ratio are not.
 
 ## Section 4: Recommendations
 
-### Priority 1: VmHWM capture in bench-merge (SMALL effort)
+### Priority 1: VmHWM capture in bench-merge — DONE
 
-Add `read_peak_rss_kb()` that reads `/proc/self/status` VmHWM line. Call it
-in `run_bench_merge()` after `merge()` returns. Emit to stderr as
-`peak_rss_kb=NNN`. The existing kv parser puts it into `extra` automatically.
+`read_peak_rss_kb()` in `cli/src/main.rs:970-985` reads VmHWM from
+`/proc/self/status`. Called in `run_bench_merge()` after `merge()` returns.
+Emitted to stderr as `peak_rss_kb=NNN`.
 
-This single change unblocks basic before/after RSS comparison for every
-experiment. Estimated: ~20 lines of code in `cli/src/main.rs`.
+### Priority 2: Blob-size and byte-level rewrite stats — DONE
 
-### Priority 2: Blob-size and byte-level rewrite stats (SMALL effort)
+`MergeStats` has `bytes_passthrough: u64`, `bytes_rewritten: u64`,
+`blob_sizes: Vec<u32>`. Accumulated in Phase 4 batch loop. Percentiles
+(p50/p95/p99) computed in `print_summary()` via `percentiles_u32()`.
+Emitted in `run_bench_merge()`.
 
-Extend `MergeStats` with:
-- `bytes_passthrough: u64`, `bytes_rewritten: u64`
-- `blob_sizes: Vec<u32>` (or a compact histogram)
-- `max_blob_raw_size: u32`
+### Priority 3: DiffOverlay heap size estimate — DONE
 
-Accumulate in Phase 4. Emit p50/p95/p99 blob sizes and byte-level rewrite
-ratio in `print_summary()` and `run_bench_merge()`.
+`DiffOverlay::heap_size_estimate(&self) -> usize` in `src/osc.rs:90-132`.
+Sums HashMap capacity × entry size + per-entity Vec/String heap bytes.
+Called after `parse_osc_file()`, stored in `MergeStats::diff_heap_bytes`,
+emitted to stderr and displayed in `print_summary()`.
 
-This unblocks E0.2 entirely. Estimated: ~50 lines in `merge.rs`, ~10 lines
-in `cli/src/main.rs`.
+### Priority 4: Phase-boundary RSS sampling — DONE
 
-### Priority 3: DiffOverlay heap size estimate (SMALL effort)
+`PhaseRss` struct in `merge.rs:198-219` tracks `after_osc_parse`,
+`classify_max`, `rewrite_max`, `output_max`, `after_flush` (all KB).
+`read_rss_kb()` reads `/proc/self/statm`. Sampled at phase boundaries
+in `merge()`, gated behind `#[cfg(feature = "hotpath")]`. Emitted to
+stderr as `phase_rss_*_kb=NNN`.
 
-Add `DiffOverlay::heap_size_estimate(&self) -> usize` in `src/osc.rs`.
-Sum: each HashMap's capacity * entry size + each Vec/String's heap bytes.
-Does not need to be exact -- an estimate within 20% is sufficient for
-attribution.
+### Priority 5: Results DB schema for memory metrics — DONE
 
-Call after `parse_osc_file()` in `merge()`, emit as eprintln and in
-`MergeStats`. This directly validates the hypothesis that DiffOverlay
-dominates peak RSS.
-
-Estimated: ~40 lines in `osc.rs`, ~5 lines in `merge.rs`.
-
-### Priority 4: Phase-boundary RSS sampling (MEDIUM effort)
-
-Add RSS reads at phase boundaries in `merge()`, gated behind
-`#[cfg(feature = "hotpath")]`:
-- After OSC parse
-- After batch Phase 1 (classify)
-- After batch Phase 3 (rewrite)
-- After batch Phase 4 (output drain)
-- After final writer flush
-
-Track per-phase rolling max RSS. Add to `MergeStats` or a new
-`MergeProfile` struct. Emit in `bench-merge` output.
-
-This is the core of E0.1 but can be deferred slightly because Priority 1
-(VmHWM) gives a useful first signal.
-
-Estimated: ~80 lines in `merge.rs`, ~20 lines reading `/proc/self/statm`.
-
-### Priority 5: Results DB schema for memory metrics (SMALL effort)
-
-Add `peak_rss_kb INTEGER` column to the `runs` table. Populate from the
-bench-merge kv output. This makes memory metrics queryable alongside timing
-without digging into JSON.
-
-Alternatively, since `extra` JSON already captures arbitrary kv pairs, this
-is optional -- but a dedicated column is cleaner for cross-commit comparison
-queries.
-
-Estimated: ~10 lines in `db.rs` (schema + insert + select).
+`peak_rss_mb REAL` column added to `runs` table (brokkr schema migration
+v2→v3). `build_row()` in `harness.rs` now extracts `peak_rss_kb` from
+parsed KV pairs, converts to MB, and populates the column. Verified
+working: Denmark 220/181 MB, Germany 710/635 MB (commit a3fc5ad).
 
 ### Priority 6: I/O throughput computation (SMALL effort)
 
@@ -435,16 +405,12 @@ output_mb, and elapsed_ms. Emit to stderr. Flows into `extra` automatically.
 
 Estimated: ~5 lines in `cli/src/main.rs`.
 
-### Priority 7: Per-phase wall time accumulation (MEDIUM effort)
+### Priority 7: Per-phase wall time accumulation — DONE
 
-Add per-phase `Instant` timers in the batch loop of `merge()`. Accumulate
-across batches. Add to `MergeStats`:
-- `osc_parse_ms`, `classify_total_ms`, `rewrite_total_ms`,
-  `output_total_ms`, `gap_creates_ms`
-
-Gate behind hotpath feature. Emit in bench-merge output.
-
-Estimated: ~60 lines in `merge.rs`.
+`PhaseTimers` struct in `merge.rs:159-180` tracks `osc_parse`,
+`classify_total`, `rewrite_total`, `output_total`, `trailing_creates`.
+Accumulated across batches, gated behind `#[cfg(feature = "hotpath")]`.
+Emitted to stderr as `osc_parse_ms=NNN`, `classify_total_ms=NNN`, etc.
 
 ### Priority 8: brokkr comparison view for memory (MEDIUM effort)
 
@@ -460,15 +426,18 @@ Estimated: ~80 lines in `db.rs` and `hotpath_fmt.rs`.
 
 | Requirement | Status | Blocking E0? | Fix Effort |
 |---|---|---|---|
-| 1. Peak RSS (VmHWM) | Not supported | YES (E0.1) | Small |
-| 2. Per-phase RSS deltas | Not supported | YES (E0.1) | Medium |
-| 3. Allocation tracking | Partial | No (hotpath-alloc works) | Small for overlay estimate |
-| 4. Blob-size distribution | Not supported | YES (E0.2) | Small |
-| 5. Wall time total+phase | Partial | No (total works) | Medium for per-phase |
+| 1. Peak RSS (VmHWM) | **Done** | — | — |
+| 2. Per-phase RSS deltas | **Done** | — | — |
+| 3. Allocation tracking | **Done** (overlay estimate + hotpath-alloc) | — | — |
+| 4. Blob-size distribution | **Done** | — | — |
+| 5. Wall time total+phase | **Done** | — | — |
 | 6. CPU util + I/O throughput | Partial | No | Small |
-| 7. Rewrite ratio (bytes) | Partial (counts only) | YES (E0.2) | Small |
-| 8. SQLite storage | Mostly supported | No | Small for dedicated column |
+| 7. Rewrite ratio (bytes) | **Done** | — | — |
+| 8. SQLite storage | **Done** (peak_rss_mb column populated) | — | — |
 
-**Critical path**: Priorities 1-3 (VmHWM + blob stats + overlay size estimate)
-are all small-effort changes that together unblock both E0.1 and E0.2.
-Total estimated: ~120 lines of new code across 3 files.
+**E0 unblocked.** All measurement infrastructure for E0.1 and E0.2 is in place.
+Remaining gap (Priority 6: I/O throughput computation) is non-blocking.
+
+Baselines recorded (commit a3fc5ad):
+- Denmark: buffered+zlib 453ms / 220 MB, buffered+none 328ms / 181 MB
+- Germany: buffered+zlib 6321ms / 710 MB, buffered+none 4685ms / 635 MB

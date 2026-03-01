@@ -102,8 +102,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 ## Features (library crate)
 
 - `commands` (default): enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`)
-- `libdeflater`: use libdeflate for zlib compression (2-3x faster, requires C compiler)
 - `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)
 
-Zlib backend is hardcoded to `zlib-rs` (pure Rust, no C compiler, faster than zlib-ng). No feature flags for backend selection.
+Zlib backend is hardcoded to `zlib-rs` (pure Rust, no C compiler, faster than zlib-ng). No feature flags for backend selection. Sync zlib compression is 15-19% slower than the previous `libdeflater` (C) backend, but pipelined mode — the production path — shows no difference (decode-bound). The tradeoff is accepted: zero C dependencies for compression, one backend everywhere.

@@ -57,7 +57,6 @@ default = ["commands"]
 commands = ["dep:serde_json", "dep:roaring"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-libdeflater = ["dep:libdeflater"]
 linux-direct-io = ["dep:libc"]
 linux-io-uring = ["dep:io-uring", "dep:libc"]
 
@@ -75,7 +74,7 @@ serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
 io-uring = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
-libdeflater = { version = "1.25", optional = true }
+
 
 [dev-dependencies]
 tempfile = "3"

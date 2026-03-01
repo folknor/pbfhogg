@@ -17,9 +17,8 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 ## Memory work
 
 Merge instrumentation (peak RSS, per-phase RSS/timers, blob stats, rewrite ratio)
-is complete. Memory optimization research (E1.1–E3.1) is done — see
-`notes/memory/experiment-matrix.md` for results summary. Pipeline reference in
-`notes/merge-pipeline.md`.
+is complete. Memory optimization research (E1.1–E3.1) is done. Pipeline reference
+in `notes/merge-pipeline.md`.
 
 - [ ] **I/O throughput in bench-merge.** Compute `read_mbs` and `write_mbs` from
   input_mb, output_mb, elapsed_ms. Emit to stderr. ~5 lines in CLI.
@@ -208,6 +207,62 @@ with owned `String` instead of borrowed `Metadata<'a>`).
   but commented out (line 80-89). The field and method are zero-cost as-is —
   park until a concrete consumer exists (e.g. extract --smart, or a library user
   doing relation-based filtering).
+
+## Performance review: remaining items
+
+Performance review (boxes 1-8) is complete — 20/24 items implemented.
+Full review was in `notes/perf-review/` (deleted). Cross-reference synthesis
+had the unified priority list. The 4 open tracked items and minor uncaptured
+items are preserved below.
+
+### Open tracked items
+
+- [ ] **P2-12: Remove sqpoll code path from io_uring writer.** `uring_writer.rs`
+  has `sqpoll` support (`setup_sqpoll(2000)`, `push_sqe_pair` SQ overflow
+  handling, `--sqpoll` CLI flags). Measured <1% benefit across all scales
+  (Denmark through North America). Syscall overhead is ~0.29% of wall time.
+  Removing it deletes ~30 lines and the kernel 5.12+ dependency. **Deferred
+  until planet-scale verification** — if sqpoll shows no gain at 75 GB, delete.
+
+- [ ] **P2-13: Extract pass 1 parallel fold for IdSetDense.** Would give
+  ~2-4x speedup on pass 1 (~170s → ~50-85s at planet scale). Attempted and
+  reverted (`b67aa96`) — `par_iter` on the consumer side contends with the
+  pipeline's dedicated rayon decode pool, causing 14x regression at Denmark
+  scale. `IdSetDense::merge()` exists but is `#[allow(dead_code)]`. Needs a
+  shared thread pool architecture where pipeline decode and consumer
+  parallelism use the same pool.
+
+- [ ] **P3-20: SIMD varint decode/encode in protohoggr.** ~25s read-side +
+  ~175s write-side savings at planet scale (attacking the irreducible
+  varint floor). Requires a batch-decode API change in `protohoggr` —
+  current `Cursor::read_varint()` is byte-at-a-time. High effort,
+  speculative. Only worth pursuing after compression is no longer the
+  dominant cost (i.e. `Compression::None` production path).
+
+- [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
+  commands load entire PBFs into memory (`owned_elements.rs`), OOMing at
+  planet scale (~680 GB per file). A streaming merge-join on two sorted
+  iterators would fix this. High effort, no current use case — neither
+  command is used at planet scale in nidhogg.
+
+### Minor uncaptured items
+
+- [ ] **Deprecate unused public decompress functions in `blob.rs`.** Six
+  public functions have zero internal callers: `decompress_blob_data`,
+  `decompress_blob_data_from_bytes`, `decompress_blob_data_into_from_bytes`,
+  `decode_blob_to_primitiveblock`, `decode_blob_to_primitiveblock_from_bytes`,
+  `parse_blob_header_from_bytes`. Either add `#[deprecated]` or document
+  which are the preferred entry points. Zero perf impact.
+
+- [ ] **BlockBuilder StringTable double String allocation.** Slow path in
+  `block_builder.rs` `intern()` (~line 106): `s.to_owned()` for the HashMap
+  key, then `e.key().clone()` for the Vec entry. ~11 seconds at planet
+  scale. Low priority — marginal vs 222-second total string interning cost.
+
+- [ ] **Document fd registration stall bound in `uring_writer.rs`.** The
+  comment at ~line 271 explains the drain reason but does not document
+  the performance impact. Add a note that the stall is bounded by the
+  header write (1 partial buffer, <1ms for merge).
 
 ## Benchmarking
 

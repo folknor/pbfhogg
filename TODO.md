@@ -123,8 +123,7 @@ All CLI commands now beat osmium except extract --simple.
 
 - [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower on
   Denmark, 1.70x on Japan. The gap is structural: 2 passes vs osmium's 1.
-  The extra file read costs ~1.3s on Denmark, ~5s on Japan. Full analysis
-  in `notes/extract-parallel-collection.md`.
+  The extra file read costs ~1.3s on Denmark, ~5s on Japan.
   - [ ] **Single-pass simple with parallel inline writing.** Stream through
     the pipelined reader, collect + filter matching elements per block, batch
     matched blocks for parallel writing via rayon. Eliminates the second file
@@ -141,7 +140,7 @@ All CLI commands now beat osmium except extract --simple.
 
 ## Performance: Linux kernel features for planet-scale I/O
 
-Research notes: `notes/linux-async-io.md`.
+io_uring implementation: `src/write/uring_writer.rs`.
 
 Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
 Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
@@ -271,7 +270,6 @@ items are preserved below.
   merge timing exists — missing read baselines (tags-count, check-refs),
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
-  Then update `notes/region-profiles.md` with the results.
 
 ## Nice to have
 

@@ -729,6 +729,13 @@ pub(crate) fn frame_blob(
 /// Returns an owned `Vec<u8>` suitable for sending through a pipeline channel.
 /// The scratch buffers are cleared and reused — after warmup, only the returned
 /// `out` Vec is allocated per call.
+///
+/// NOTE: Buffer recycling pool was attempted to eliminate this per-call
+/// allocation via `Arc<Mutex<Vec<Vec<u8>>>>` shared between rayon workers and
+/// the writer thread. Regressed throughput by +12% (Germany, Compression::None)
+/// due to Mutex contention. The allocator's own thread-local caching handles
+/// the cross-thread alloc/free pattern better than an explicit pool.
+/// Full analysis: `notes/memory/p6-vectored-writer-framing.md` at 2bf438c.
 #[hotpath::measure]
 fn frame_blob_into(
     blob_type: &str,

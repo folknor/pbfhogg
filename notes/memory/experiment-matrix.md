@@ -87,11 +87,12 @@
 - **Cumulative E1.1+E2.1+E2.2 vs original:** RSS 710→515 MB (-27.5% zlib), 635→390 MB (-38.6% none). Time -15.6% zlib, -27.0% none.
 
 ## Phase 3: Writer/Framing Memory Tightening
-### E3.1 Vectored framing instead of per-blob concatenated `Vec`
+### E3.1 Buffer recycling pool for pipelined writer — DROPPED
 - Hypothesis: removing final frame concatenation lowers transient allocations.
-- Change: write `(len prefix, BlobHeader, Blob body)` as segments rather than a single assembled buffer.
+- Change: `Arc<Mutex<Vec<Vec<u8>>>>` buffer pool with capacity-capped retention (2 MB max, 16 buffers). `frame_blob_into` accepts `&mut Vec<u8>` out-param. Writer thread recycles buffers after write. Approach F from `notes/memory/p6-vectored-writer-framing.md`.
 - Metrics: allocation volume, writer thread RSS, throughput.
 - Exit criteria: lower allocator pressure and neutral/improved throughput.
+- **Result (S1 Denmark, S2 Germany, dirty tree):** Regression across the board. Germany zlib: 5627ms/545 MB (+5.5%/+5.8%). Germany none: 3842ms/417 MB (+12.3%/+6.9%). Mutex contention on pool acquire/release offsets reuse benefit. Large blobs (>2 MB) rejected by capacity cap, paying lock overhead without reuse. Decision: DROP.
 
 ### E3.2 Coalescing policy tuning under memory budget
 - Hypothesis: passthrough coalescing can overshoot memory target during long passthrough streaks.

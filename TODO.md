@@ -180,13 +180,13 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Verify edition 2024 is intentional — most published crates use 2021 for broader compatibility
-- [ ] Fix crate-level doc example: says `pbfhogg = "0.1"` but Cargo.toml is 0.2.0
-- [ ] Add doc comments to `writer.rs` public API (PbfWriter, Compression)
-- [ ] Add doc comments to `block_builder.rs` public API (BlockBuilder, Metadata, MemberData)
-- [ ] Add crate-level documentation for write/merge workflows (lib.rs)
+- [x] Fix crate-level doc example: `"0.1"` → `"0.2"`
+- [x] Doc comments on `writer.rs` public API — already complete (PbfWriter, Compression, all methods)
+- [x] Doc comments on `block_builder.rs` public API — already complete (BlockBuilder, Metadata, MemberData, HeaderBuilder)
+- [x] Crate-level write workflow docs in `lib.rs` (sync + pipelined examples)
 - [ ] Tighten module visibility: `pub mod commands`, `pub mod osc`, `pub use
   read::file_reader`, `pub use write::file_writer` expose internals as public API
-- [ ] Fix `error.rs:27` doc: says "when reading PBF files" but errors occur during writing too
+- [x] Fix `error.rs:30` doc: "when reading PBF files" → "when reading or writing PBF files"
 - [ ] Publish to crates.io
 
 ## GitHub
@@ -212,10 +212,10 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Code TODOs
 
-- [ ] **Possible correctness issue in OSC parsing:** In create/modify node
-  parsing, missing lat/lon currently falls back to 0.0 instead of erroring.
-  Ref: `src/osc.rs:261`, `src/osc.rs:262`. Malformed diffs could silently
-  produce wrong geometry at (0,0).
+- [x] ~~OSC parsing lat/lon fallback~~ — Not a real issue. Delete nodes
+  early-return before lat/lon parsing. Create/modify nodes always carry
+  lat/lon per the OSM API spec. Verified across Denmark + Germany diffs
+  (0 nodes without lat/lon). Comment added to `src/osc.rs`.
 
 - [ ] **Merge function complexity hotspot:** The merge flow is very large and
   highly stateful. Ref: `src/commands/merge.rs:943`. Good candidate for

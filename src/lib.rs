@@ -7,7 +7,7 @@ Add this to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-pbfhogg = "0.1"
+pbfhogg = "0.2"
 ```
 
 ## Example: Count ways
@@ -57,6 +57,56 @@ let ways = reader.par_map_reduce(
 
 println!("Number of ways: {ways}");
 # assert_eq!(ways, 1);
+# Ok::<(), std::io::Error>(())
+```
+
+## Example: Write a PBF file
+
+Build blocks with [`BlockBuilder`] and write them with [`PbfWriter`]:
+
+```rust,no_run
+use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
+use pbfhogg::write::writer::{PbfWriter, Compression};
+
+// Write the header
+let header_bytes = HeaderBuilder::new()
+    .bbox(9.0, 54.0, 13.0, 58.0)
+    .sorted()
+    .build()?;
+let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default())?;
+writer.write_header(&header_bytes)?;
+
+// Add elements to blocks
+let mut bb = BlockBuilder::new();
+bb.add_node(1, 556_761_000, 125_683_000, &[("name", "Copenhagen")], None);
+
+// Flush the block to the writer
+if let Some(block_bytes) = bb.take()? {
+    writer.write_primitive_block(block_bytes)?;
+}
+writer.flush()?;
+# Ok::<(), std::io::Error>(())
+```
+
+## Example: Pipelined writing
+
+For large files, use pipelined mode for parallel compression:
+
+```rust,no_run
+use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
+use pbfhogg::write::writer::{PbfWriter, Compression};
+
+let header_bytes = HeaderBuilder::new().sorted().build()?;
+let mut writer = PbfWriter::to_path_pipelined(
+    "output.osm.pbf".as_ref(),
+    Compression::Zlib(6),
+    &header_bytes,
+)?;
+
+let mut bb = BlockBuilder::new();
+// ... add elements in a loop, flush when bb.should_flush() ...
+// Each write_primitive_block dispatches compression to rayon
+writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 */

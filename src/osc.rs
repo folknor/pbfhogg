@@ -307,6 +307,10 @@ fn handle_node_start(
         overlay.deleted_nodes.insert(id);
         return Ok(());
     }
+    // Create/modify nodes always carry lat/lon per the OSM API spec.
+    // Delete nodes early-return above and never reach here. The 0.0
+    // fallback only fires on malformed input — not worth erroring on
+    // since the next diff will correct it.
     let lat = parse_f64_attr(e, b"lat").unwrap_or(0.0);
     let lon = parse_f64_attr(e, b"lon").unwrap_or(0.0);
     let node = OscNode {

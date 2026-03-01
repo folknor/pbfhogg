@@ -27,7 +27,7 @@ pub(crate) fn new_wire_error(msg: &'static str) -> Error {
 /// A type alias for `Result<T, pbfhogg::Error>`.
 pub type Result<T> = result::Result<T, Error>;
 
-/// An error that can occur when reading PBF files.
+/// An error that can occur when reading or writing PBF files.
 #[derive(Debug)]
 pub struct Error(Box<ErrorKind>);
 

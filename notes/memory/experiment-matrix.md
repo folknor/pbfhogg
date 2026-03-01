@@ -58,7 +58,7 @@
 - Metrics: allocation count, peak RSS, rewrite phase wall time.
 - Exit criteria: measurable allocation drop and non-negative throughput.
 
-### E1.3 Bound DecompressPool retention — DONE (commit TBD)
+### E1.3 Bound DecompressPool retention — DONE (commit b9da254)
 - Hypothesis: unbounded pooled buffers retain worst-case capacities and inflate tail RSS.
 - Change:
 - Single capacity threshold (`MAX_RETAINED_CAPACITY = 4 MB`) on `put()`: drop oversized buffers instead of recycling.

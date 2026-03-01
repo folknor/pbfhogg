@@ -134,6 +134,22 @@ All CLI commands now beat osmium except extract --simple.
   - The Dense mmap index variant avoids this entirely (direct indexing, no
     hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
 
+  **Production pipeline — runs every planet refresh cycle:**
+  ```
+  pbfhogg cat → pbfhogg merge → pbfhogg add-locations-to-ways
+                                        │
+                                        ├── elivagar → PMTiles → nidhogg (tile serving)
+                                        └── nidhogg (PBF ingest → query API)
+  ```
+  The enriched PBF feeds both consumers. elivagar gets inline coordinates
+  via `Way::node_locations()`, eliminating the node store entirely.
+  North America benchmark (18.8 GB, plantasjen, commit 8704b11): 605s,
+  22.8 GB peak RSS (of 25 GB). Node store is ~12.4 GB at NA, extrapolated
+  ~44 GB at planet — the dominant memory consumer. With `add-locations-to-ways`
+  in the pipeline, estimated elivagar planet peak RSS drops from ~65-75 GB
+  to ~15-20 GB. **High priority** — on the critical path for planet-scale
+  feasibility on 64 GB hosts.
+
 ## Performance: Linux kernel features for planet-scale I/O
 
 io_uring implementation: `src/write/uring_writer.rs`.

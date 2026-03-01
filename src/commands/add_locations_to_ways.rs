@@ -167,6 +167,53 @@ impl DenseMmapIndex {
 }
 
 // ---------------------------------------------------------------------------
+// Parallel dense index writer
+// ---------------------------------------------------------------------------
+
+/// Thread-safe writer for parallel dense index population.
+///
+/// Holds a raw pointer into the `DenseMmapIndex` mmap buffer. Safe to use
+/// from multiple rayon tasks because PBF node IDs are unique: each ID maps
+/// to a disjoint 8-byte slot (`base + node_id * 8`), so no two tasks write
+/// the same memory.
+///
+/// The caller must ensure the `DenseMmapIndex` outlives all uses of this
+/// writer. In practice, both live in `build_node_index_dense` and `par_iter`
+/// is synchronous (blocks until complete), so the pointer cannot escape.
+struct SharedDenseWriter {
+    base: *mut u8,
+    capacity: usize,
+}
+
+// SAFETY: Writes target disjoint 8-byte slots keyed by unique PBF node IDs.
+// No two rayon tasks access the same offset.
+unsafe impl Send for SharedDenseWriter {}
+unsafe impl Sync for SharedDenseWriter {}
+
+impl SharedDenseWriter {
+    /// Insert a node's coordinates. Silently ignores negative IDs and IDs
+    /// beyond capacity (same semantics as `DenseMmapIndex::insert`).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn insert(&self, node_id: i64, lat: i32, lon: i32) {
+        if node_id < 0 {
+            return;
+        }
+        let idx = node_id as usize;
+        if idx >= self.capacity {
+            return;
+        }
+        let offset = idx * ENTRY_SIZE;
+        // SAFETY: offset + 8 <= capacity * ENTRY_SIZE = mmap length.
+        // Each node ID is unique in a PBF, so no two tasks write the same slot.
+        unsafe {
+            let dst = self.base.add(offset);
+            std::ptr::copy_nonoverlapping(lat.to_le_bytes().as_ptr(), dst, 4);
+            std::ptr::copy_nonoverlapping(lon.to_le_bytes().as_ptr(), dst.add(4), 4);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Raw blob frame reading (for passthrough path)
 // ---------------------------------------------------------------------------
 
@@ -305,30 +352,114 @@ pub fn add_locations_to_ways(
 // Pass 1: Build node coordinate index
 // ---------------------------------------------------------------------------
 
+/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
+/// for parallel node index population.
+const INDEX_BATCH_SIZE: usize = 64;
+
 fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Result<NodeLocationIndex> {
-    let mut index = match index_type {
-        IndexType::Hash => NodeLocationIndex::Hash(FxHashMap::default()),
-        IndexType::Dense { capacity } => NodeLocationIndex::Dense(DenseMmapIndex::new(capacity)?),
+    match index_type {
+        IndexType::Hash => build_node_index_hash(input, direct_io),
+        IndexType::Dense { capacity } => build_node_index_dense(input, direct_io, capacity),
+    }
+}
+
+/// Build the dense mmap index in parallel. Each rayon task writes directly
+/// to disjoint mmap slots via `SharedDenseWriter`.
+fn build_node_index_dense(
+    input: &Path,
+    direct_io: bool,
+    capacity: usize,
+) -> Result<NodeLocationIndex> {
+    let mut index = DenseMmapIndex::new(capacity)?;
+    let writer = SharedDenseWriter {
+        base: index.mmap.as_mut_ptr(),
+        capacity: index.capacity,
     };
-    // Skip way and relation blobs in Pass 1 — only node coordinates needed.
+
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_nodes());
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(INDEX_BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        for element in block.elements() {
+        batch.push(block?);
+        if batch.len() >= INDEX_BATCH_SIZE {
+            index_batch_dense(&batch, &writer);
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        index_batch_dense(&batch, &writer);
+    }
+
+    drop(writer);
+    Ok(NodeLocationIndex::Dense(index))
+}
+
+/// Parallel insert for one batch of blocks into the dense mmap index.
+fn index_batch_dense(batch: &[PrimitiveBlock], writer: &SharedDenseWriter) {
+    batch.par_iter().for_each(|block| {
+        for element in block.elements_skip_metadata() {
             match &element {
                 Element::DenseNode(dn) => {
-                    index.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
+                    writer.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
                 }
                 Element::Node(n) => {
-                    index.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
+                    writer.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
                 }
                 Element::Way(_) | Element::Relation(_) => {}
             }
         }
+    });
+}
+
+/// Build the hash map index in parallel. Each rayon task builds a thread-local
+/// partial map, then they are reduced pairwise and merged into the master map.
+fn build_node_index_hash(input: &Path, direct_io: bool) -> Result<NodeLocationIndex> {
+    let mut master: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
+
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_nodes());
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(INDEX_BATCH_SIZE);
+    for block in reader.into_blocks_pipelined() {
+        batch.push(block?);
+        if batch.len() >= INDEX_BATCH_SIZE {
+            master.extend(index_batch_hash(&batch));
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        master.extend(index_batch_hash(&batch));
     }
 
-    Ok(index)
+    Ok(NodeLocationIndex::Hash(master))
+}
+
+/// Parallel fold+reduce for one batch of blocks into a merged `FxHashMap`.
+fn index_batch_hash(batch: &[PrimitiveBlock]) -> FxHashMap<i64, (i32, i32)> {
+    batch
+        .par_iter()
+        .fold(
+            FxHashMap::default,
+            |mut local: FxHashMap<i64, (i32, i32)>, block| {
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn) => {
+                            local.insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
+                        }
+                        Element::Node(n) => {
+                            local.insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
+                        }
+                        Element::Way(_) | Element::Relation(_) => {}
+                    }
+                }
+                local
+            },
+        )
+        .reduce(FxHashMap::default, |mut a, b| {
+            a.extend(b);
+            a
+        })
 }
 
 // ---------------------------------------------------------------------------

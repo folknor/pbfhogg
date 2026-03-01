@@ -53,10 +53,7 @@ keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
 
 [features]
-default = ["rust-zlib", "commands"]
-rust-zlib = ["flate2/rust_backend"]
-zlib = ["flate2/zlib"]
-zlib-ng = ["flate2/zlib-ng"]
+default = ["commands"]
 commands = ["dep:serde_json", "dep:roaring"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
@@ -67,7 +64,7 @@ linux-io-uring = ["dep:io-uring", "dep:libc"]
 [dependencies]
 protohoggr = { path = "../protohoggr" }
 bytes = "1"
-flate2 = { version = "1.0", default-features = false }
+flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9"
 rayon = "1.5"
 rustc-hash = "2"

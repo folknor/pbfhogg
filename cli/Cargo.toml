@@ -11,15 +11,13 @@ name = "pbfhogg"
 path = "src/main.rs"
 
 [features]
-default = ["pbfhogg/rust-zlib"]
+default = []
 jemalloc = ["dep:tikv-jemallocator"]
 mimalloc = ["dep:mimalloc-crate"]
 hotpath = ["pbfhogg/hotpath"]
 hotpath-alloc = ["pbfhogg/hotpath-alloc"]
 linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
-zlib = ["pbfhogg/zlib"]
-zlib-ng = ["pbfhogg/zlib-ng"]
 
 [dependencies]
 pbfhogg = { path = "..", default-features = false, features = ["commands"] }

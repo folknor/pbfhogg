@@ -13,7 +13,7 @@ Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with P
 - **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
 - **Blob indexdata** — embeds element type + ID range + spatial bbox in BlobHeader for fast merge classification and spatial filtering without decompression
 - **Blob tag index** — embeds per-blob tag key metadata in BlobHeader field 4; the pipeline skips decompression of blobs that provably lack required tag keys (e.g. `tags-filter highway=primary` skips all blobs without a `highway` key)
-- **Configurable compression** — zlib (default), zstd, or none; pure Rust zlib, system zlib, or zlib-ng via feature flags
+- **Configurable compression** — zlib (default), zstd, or none; zlib-rs for fast pure-Rust decompression and compression
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
 - **io_uring writes** — optional `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and registered buffers for maximum throughput when I/O-bound
 
@@ -117,7 +117,7 @@ All write commands accept `--compression` to control blob compression: `none`, `
 
 ## Performance
 
-Read throughput — count all 59M elements in Denmark extract (461 MB), best of 3 runs, `zlib-ng`, fat LTO (commit `90df51f`):
+Read throughput — count all 59M elements in Denmark extract (461 MB), best of 3 runs, fat LTO (commit `90df51f`):
 
 <!-- BENCH:START -->
 | Tool | Mode | Time | Notes |

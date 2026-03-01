@@ -75,7 +75,7 @@ The repo is a Cargo workspace with two packages:
 - **`pbfhogg`** (root) — library crate. Read/write API, commands.
 - **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary.
 
-Library users who only need read/write can depend on `pbfhogg` with `default-features = false, features = ["rust-zlib"]` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
+Library users who only need read/write can depend on `pbfhogg` with `default-features = false` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
 
 ## Architecture
 
@@ -101,10 +101,9 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 ## Features (library crate)
 
-- `rust-zlib` (default): pure Rust zlib via flate2
-- `zlib`: system zlib
-- `zlib-ng`: zlib-ng (mutually exclusive with above)
 - `commands` (default): enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`)
 - `libdeflater`: use libdeflate for zlib compression (2-3x faster, requires C compiler)
 - `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)
+
+Zlib backend is hardcoded to `zlib-rs` (pure Rust, no C compiler, faster than zlib-ng). No feature flags for backend selection.

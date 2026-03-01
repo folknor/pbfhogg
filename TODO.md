@@ -7,7 +7,7 @@ Denmark PBF (~54s) and is too slow for the normal edit-test cycle. **Must be run
 release and after completing major work** (especially changes to reader, writer, block_builder,
 or BlockBuilder/PbfWriter APIs):
 
-    dev check -- --ignored
+    brokkr check -- --ignored
 
 `sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` — it
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
@@ -83,29 +83,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   only if rayon becomes a proven bottleneck (e.g. if parallel `rewrite_block` exposes contention
   in the global pool).
 
-## Merge architecture (done, commit `547449a`)
-
-Single-pass 4-phase batch pipeline with O(log n) Phase 2, reader thread
-read-ahead, and passthrough coalescing. Replaced the old sequential Phase 2
-(`collect_modifications` + `CreateEmitter` + `emitted_*` HashSets) with binary
-search on sorted upsert vecs — all upsert IDs in a blob's range go to the
-rewrite function, which handles both modifications (matching base elements) and
-creates (non-matching IDs) in one pass.
-
-**Key results (indexed PBFs, NVMe output, best of 3):**
-
-| Dataset | Old | New | Change |
-|---------|-----|-----|--------|
-| Japan 2.4 GB | 4.83s | **3.03s** | -37% (15x faster than osmium) |
-| Germany 4.5 GB (zlib) | 35.1s | **10.1s** | -71% |
-| Germany 4.5 GB (none) | 46.4s | **5.9s** | -87% |
-| N. America 18.8 GB (zlib) | 43.2s | **24.4s** | -43% |
-| N. America 18.8 GB (none) | 36.4s | **13.3s** | -63% |
-
-io_uring no longer helps — buffered writer matches it at all tested scales.
-The old bottleneck (write syscall latency during idle passthrough) is gone
-because the reader thread + coalescing keep the writer pipeline fed.
-
 ## Performance: CLI commands vs osmium
 
 All CLI commands now beat osmium except extract --simple.
@@ -135,17 +112,6 @@ Research notes: `notes/linux-async-io.md`.
 Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
 Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
 `Compression::None` PBFs on erofs is the baseline assumption for the optimized path.
-
-- [ ] **Zstd compressor state reuse.** The `zstd` crate has the same per-call
-  encoder problem (`zstd::stream::write::Encoder::new()` allocates fresh state
-  each blob). `zstd::bulk::Compressor` provides a reusable whole-buffer
-  compressor with `compress_to_buffer()`. Same pattern as the zlib fix — add to
-  FrameScratch, reuse across blobs. Lower priority since zstd PBFs are rare in
-  the OSM ecosystem.
-
-- [x] **Buffered merge at planet scale.** Done — reader thread + passthrough
-  coalescing eliminated the buffered/io_uring gap. North America buffered merge
-  is now 24.4s (zlib) / 13.3s (none), matching io_uring. See commit `547449a`.
 
 - [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
   2MB huge pages automatically. Low priority — mmap is not the production hot path
@@ -207,7 +173,7 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 - [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (tags-count, check-refs),
   decode+write (cat --type), and allocations. Run:
-  `dev profile --dataset germany`
+  `brokkr profile --dataset germany`
   Then update `notes/region-profiles.md` with the results.
 
 ## Nice to have

@@ -4,20 +4,6 @@
 
 **Last updated:** uncommitted (2026-03-01)
 
-| Tier | Total | Done | Open | Deferred |
-|------|-------|------|------|----------|
-| P0 | 2 | 2 | 0 | 0 |
-| P1 | 3 | 3 | 0 | 0 |
-| P2 | 8 | 6 | 0 | 2 |
-| P3 | 11 | 9 | 2 | 0 |
-| **Total** | **24** | **20** | **2** | **2** |
-
-All per-blob allocation waste (the dominant waste pattern, see "Per-blob allocation" below) has been eliminated.
-The BlockBuilder→PbfWriter API boundary information loss (see "Information loss at API boundaries" below) has been resolved.
-P0-P2 tiers complete (P2-12 sqpoll deferred, P2-13 reverted). P3 trivial items done.
-P3-14 (spatial blob filter) delivers 5-14% extract improvement (not predicted 99%+): blob bboxes
-in ID-sorted PBFs span most of the geographic area (87% cover >50% of Denmark), but ~20% of
-node blobs are still filtered. Low overhead, free win. Kept.
 Remaining open P3: SIMD varint (P3-20), diff streaming (P3-22).
 Both are high effort and speculative.
 

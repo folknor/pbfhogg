@@ -1,4 +1,4 @@
-# pbfhogg TODO
+# pbfhogg TODO.
 
 ## Important: ignored tests
 
@@ -13,6 +13,52 @@ or BlockBuilder/PbfWriter APIs):
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
+
+## Memory work — instrumentation prerequisites
+
+Before any planet-scale memory optimization (P1-P6 in `notes/memory/`), we
+need measurement infrastructure. Depends on brokkr schema v3 (`SCHEMA_REDESIGN.md`)
+being implemented first — peak_rss_mb becomes a first-class DB column, and
+subprocess kv pairs flow into `run_kv` instead of JSON.
+
+### Emit peak RSS from bench-merge (~20 lines, `cli/src/main.rs`)
+- [ ] Add `read_peak_rss_kb()` — parse VmHWM from `/proc/self/status`
+- [ ] Call after `merge()` returns in `run_bench_merge()`, emit `peak_rss_kb=NNN`
+  to stderr. brokkr's kv parser picks it up automatically.
+- Unblocks basic before/after RSS comparison for every experiment.
+
+### Blob-size and byte-level rewrite stats (~60 lines, `src/commands/merge.rs`)
+- [ ] Add `bytes_passthrough: u64` and `bytes_rewritten: u64` to `MergeStats`
+- [ ] Track per-blob `raw_size` in Phase 4, compute p50/p95/p99
+- [ ] Emit blob-size percentiles and byte-level rewrite ratio in summary
+- Unblocks E0.2 (blob-size/rewrite-ratio sensitivity).
+
+### DiffOverlay heap size estimate (~40 lines, `src/osc.rs`)
+- [ ] Add `DiffOverlay::heap_size_estimate(&self) -> usize`
+  Sum HashMap capacity × entry size + Vec/String heap bytes per entity.
+- [ ] Call after `parse_osc_file()` in merge, emit to stderr
+- Validates the hypothesis that DiffOverlay dominates peak RSS.
+
+### Per-phase RSS sampling (~80 lines, gated behind `#[cfg(feature = "hotpath")]`)
+- [ ] Read `/proc/self/statm` at merge phase boundaries: after OSC parse,
+  after each batch's classify/rewrite/drain, after writer flush
+- [ ] Track rolling max RSS per phase across all batches
+- [ ] Add to `MergeStats`, emit in bench-merge output
+- Full E0.1 (memory attribution by phase). Can defer slightly since
+  VmHWM alone gives a useful first signal.
+
+### Per-phase wall time accumulation (~60 lines, gated behind hotpath)
+- [ ] Add per-phase `Instant` timers in batch loop, accumulate across batches
+- [ ] Fields: `osc_parse_ms`, `classify_total_ms`, `rewrite_total_ms`,
+  `output_total_ms`, `gap_creates_ms`
+- [ ] Emit in bench-merge output
+
+### Research documents
+- `notes/memory/measurement-gaps.md` — full gap analysis
+- `notes/memory/research-conclusions.md` — theoretical overview
+- `notes/memory/experiment-matrix.md` — testing methodology
+- `notes/memory/p1-compact-diff-model.md` through `p6-vectored-writer-framing.md` — action plans
+- `notes/memory/pipeline.md` — pipeline analysis
 
 ## Performance: parallelism
 
@@ -176,7 +222,14 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Code TODOs
 
-- notes/perf-review/cross-reference-synthesis.md
+- [ ] **Possible correctness issue in OSC parsing:** In create/modify node
+  parsing, missing lat/lon currently falls back to 0.0 instead of erroring.
+  Ref: `src/osc.rs:261`, `src/osc.rs:262`. Malformed diffs could silently
+  produce wrong geometry at (0,0).
+
+- [ ] **Merge function complexity hotspot:** The merge flow is very large and
+  highly stateful. Ref: `src/commands/merge.rs:943`. Good candidate for
+  maintainability hardening (fewer latent bugs during future changes).
 
 - [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
   unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →

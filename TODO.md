@@ -14,41 +14,18 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-## Memory work — instrumentation prerequisites
+## Memory work
 
-Instrumentation code is implemented. Remaining: brokkr schema v3
-(`SCHEMA_REDESIGN.md`) for `peak_rss_mb` as a first-class DB column and
-subprocess kv pairs flowing into `run_kv` instead of JSON.
+Merge instrumentation (peak RSS, per-phase RSS/timers, blob stats, rewrite ratio)
+is complete. Memory optimization research (E1.1–E3.1) is done — see
+`notes/memory/experiment-matrix.md` for results summary. Pipeline reference in
+`notes/merge-pipeline.md`.
 
-### Emit peak RSS from bench-merge — DONE
-- [x] `read_peak_rss_kb()` in `cli/src/main.rs` (Linux: VmHWM, non-Linux: None)
-- [x] Emits `peak_rss_kb=NNN` to stderr after merge
-
-### Blob-size and byte-level rewrite stats — DONE
-- [x] `bytes_passthrough`, `bytes_rewritten`, `blob_sizes` in `MergeStats`
-- [x] Phase 4 tracking: passthrough frame sizes + rewrite block sizes
-- [x] `print_summary()` emits byte rewrite ratio and p50/p95/p99 blob sizes
-
-### DiffOverlay heap size estimate — DONE
-- [x] `DiffOverlay::heap_size_estimate(&self) -> usize` in `src/osc.rs`
-- [x] `diff_heap_bytes` field in `MergeStats`, set after `parse_osc_file()`
-- [x] Emitted in `print_summary()` and `run_bench_merge()` kv output
-
-### Per-phase RSS sampling — DONE (hotpath-gated)
-- [x] `read_rss_kb()` reads `/proc/self/statm` resident pages
-- [x] `PhaseRss` struct: rolling max at classify/rewrite/output boundaries + after flush
-- [x] 5 kv pairs: `phase_rss_{after_osc,classify_max,rewrite_max,output_max,after_flush}_kb`
-
-### Per-phase wall time accumulation — DONE (hotpath-gated)
-- [x] `PhaseTimers` struct: osc_parse, classify_total, rewrite_total, output_total, trailing_creates
-- [x] 5 kv pairs: `{osc_parse,classify_total,rewrite_total,output_total,trailing_creates}_ms`
-
-### Research documents
-- `notes/memory/measurement-gaps.md` — full gap analysis
-- `notes/memory/research-conclusions.md` — theoretical overview
-- `notes/memory/experiment-matrix.md` — testing methodology
-- `notes/memory/p1-compact-diff-model.md` through `p6-vectored-writer-framing.md` — action plans
-- `notes/memory/pipeline.md` — pipeline analysis
+- [ ] **I/O throughput in bench-merge.** Compute `read_mbs` and `write_mbs` from
+  input_mb, output_mb, elapsed_ms. Emit to stderr. ~5 lines in CLI.
+- [ ] **brokkr memory comparison view.** Extend `brokkr results --compare` to
+  display peak_rss_mb, blob size distribution, rewrite ratio side-by-side.
+  ~80 lines in brokkr.
 
 ## Performance: parallelism
 
@@ -234,7 +211,7 @@ with owned `String` instead of borrowed `Metadata<'a>`).
 
 ## Benchmarking
 
-- [ ] Track peak RSS during reads and merges at scale. Denmark for CI, planet for release validation.
+- [x] ~~Track peak RSS during reads and merges at scale.~~ `peak_rss_mb` column in results DB, `VmHWM` captured after merge.
 - [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (tags-count, check-refs),
   decode+write (cat --type), and allocations. Run:

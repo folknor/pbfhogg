@@ -52,11 +52,12 @@
 - Exit criteria: >= 25% peak RSS reduction on `S3` or `S4` with <= 10% time regression.
 - **Result (S2 Germany):** RSS 710→652 MB (-8.2% zlib), 635→601 MB (-5.4% none). Overlay heap 60→26 MB (-56%). Time within budget. Decision: KEEP.
 
-### E1.2 Replace inline upsert `Vec` copies with range views
+### E1.2 Replace inline upsert `Vec` copies with range views — DONE (commit TBD)
 - Hypothesis: eliminating `to_vec()` per rewrite job reduces alloc churn in rewrite-heavy windows.
-- Change: carry `(start,end)` into shared sorted upsert arrays instead of allocating per-job vectors.
+- Change: `RewriteJob.inline_upserts: Vec<i64>` → `upsert_range: (usize, usize)` indexing into shared `DiffRanges` arrays. `DiffRanges` wrapped in `Arc` for `rayon::spawn` closures. Eliminates per-job heap allocation entirely.
 - Metrics: allocation count, peak RSS, rewrite phase wall time.
 - Exit criteria: measurable allocation drop and non-negative throughput.
+- **Result (S2 Germany):** Throughput and RSS within noise of E1.3 baseline (no regression). Benefit is structural: eliminates ~11K heap allocations per Germany merge (2.3M at planet scale), removes cross-thread alloc/dealloc churn. Decision: KEEP.
 
 ### E1.3 Bound DecompressPool retention — DONE (commit b9da254)
 - Hypothesis: unbounded pooled buffers retain worst-case capacities and inflate tail RSS.

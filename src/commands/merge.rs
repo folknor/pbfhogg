@@ -902,7 +902,7 @@ enum BatchSlot {
 struct RewriteJob {
     block: PrimitiveBlock,
     kind: ElemKind,
-    inline_upserts: Vec<i64>,
+    upsert_range: (usize, usize),
 }
 
 // ---------------------------------------------------------------------------
@@ -1067,7 +1067,7 @@ pub fn merge(
     }
 
     // Step 2: Pre-compute sorted ID ranges for fast overlap checking
-    let ranges = DiffRanges::from_diff(&diff);
+    let ranges = Arc::new(DiffRanges::from_diff(&diff));
     eprintln!(
         "Diff ID ranges: {} node IDs, {} way IDs, {} rel IDs",
         ranges.node_ids.len(), ranges.way_ids.len(), ranges.rel_ids.len(),
@@ -1247,13 +1247,12 @@ pub fn merge(
                     let upserts = ranges.upserts(index.kind);
                     let start = upserts.partition_point(|&id| id < index.min_id);
                     let end = upserts[start..].partition_point(|&id| id <= index.max_id) + start;
-                    let inline_upserts = upserts[start..end].to_vec();
 
                     let job_idx = rewrite_jobs.len();
                     rewrite_jobs.push(RewriteJob {
                         block,
                         kind: index.kind,
-                        inline_upserts,
+                        upsert_range: (start, end),
                     });
                     slots.push(BatchSlot::Rewrite { job_index: job_idx, index });
                 }
@@ -1277,13 +1276,16 @@ pub fn merge(
         for (job_idx, job) in rewrite_jobs.into_iter().enumerate() {
             let tx = rewrite_tx.clone();
             let diff_clone = Arc::clone(&diff);
+            let ranges_clone = Arc::clone(&ranges);
             rayon::spawn(move || {
                 let mut task_bb = BlockBuilder::new();
+                let upserts = ranges_clone.upserts(job.kind);
+                let inline_slice = &upserts[job.upsert_range.0..job.upsert_range.1];
                 let result = rewrite_block_parallel(
                     &job.block,
                     &diff_clone,
                     &mut task_bb,
-                    &job.inline_upserts,
+                    inline_slice,
                     job.kind,
                 )
                 .map_err(|e| e.to_string());

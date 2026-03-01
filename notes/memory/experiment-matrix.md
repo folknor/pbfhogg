@@ -52,7 +52,7 @@
 - Exit criteria: >= 25% peak RSS reduction on `S3` or `S4` with <= 10% time regression.
 - **Result (S2 Germany):** RSS 710→652 MB (-8.2% zlib), 635→601 MB (-5.4% none). Overlay heap 60→26 MB (-56%). Time within budget. Decision: KEEP.
 
-### E1.2 Replace inline upsert `Vec` copies with range views — DONE (commit TBD)
+### E1.2 Replace inline upsert `Vec` copies with range views — DONE (commit 041d79f)
 - Hypothesis: eliminating `to_vec()` per rewrite job reduces alloc churn in rewrite-heavy windows.
 - Change: `RewriteJob.inline_upserts: Vec<i64>` → `upsert_range: (usize, usize)` indexing into shared `DiffRanges` arrays. `DiffRanges` wrapped in `Arc` for `rayon::spawn` closures. Eliminates per-job heap allocation entirely.
 - Metrics: allocation count, peak RSS, rewrite phase wall time.

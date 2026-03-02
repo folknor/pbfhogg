@@ -16,7 +16,7 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{flush_passthrough_buf, read_raw_frame, RawBlobFrame};
+use super::{flush_passthrough_buf, has_indexdata, read_raw_frame, RawBlobFrame};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -319,20 +319,6 @@ fn skip_blob_data(
     Ok(())
 }
 
-/// Check if the first OsmData blob in a PBF has indexdata.
-fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
-    let mut reader = FileReader::open(path, direct_io)?;
-    let mut offset = 0u64;
-    while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {
-        match frame.blob_type {
-            BlobKind::OsmHeader => continue,
-            BlobKind::OsmData => return Ok(frame.index.is_some()),
-            BlobKind::Unknown(_) => continue,
-        }
-    }
-    Ok(false)
-}
-
 // ---------------------------------------------------------------------------
 // Batch slot for parallel decode
 // ---------------------------------------------------------------------------
@@ -413,9 +399,24 @@ pub fn add_locations_to_ways(
     compression: Compression,
     direct_io: bool,
     index_type: IndexType,
+    force: bool,
 ) -> Result<Stats> {
+    let indexdata_present = has_indexdata(input, direct_io)?;
+    if !indexdata_present && !force {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+             decompressed and re-encoded (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
     let index = build_node_index(input, direct_io, index_type)?;
-    write_output(input, output, &index, keep_untagged_nodes, compression, direct_io)
+    write_output_checked(input, output, &index, keep_untagged_nodes, compression, direct_io, indexdata_present)
 }
 
 // ---------------------------------------------------------------------------
@@ -547,15 +548,16 @@ const BATCH_MIN_BLOBS: usize = 8;
 /// Hard cap on blobs per batch.
 const BATCH_MAX_BLOBS: usize = 128;
 
-fn write_output(
+fn write_output_checked(
     input: &Path,
     output: &Path,
     index: &NodeLocationIndex,
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
+    indexdata_present: bool,
 ) -> Result<Stats> {
-    if has_indexdata(input, direct_io)? {
+    if indexdata_present {
         write_output_passthrough(input, output, index, keep_untagged_nodes, compression, direct_io)
     } else {
         write_output_decode_all(input, output, index, keep_untagged_nodes, compression, direct_io)

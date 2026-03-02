@@ -17,10 +17,12 @@ pub mod tags_count;
 pub mod tags_filter;
 
 use std::io::Read;
+use std::path::Path;
 
 use crate::blob::{parse_blob_header_with_index, BlobKind};
 use crate::blob_index::BlobIndex;
 use crate::block_builder::{BlockBuilder, Metadata, RawMetadata};
+use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::PbfWriter;
 
@@ -183,4 +185,18 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
         user_sid: info.raw_user_sid(),
         visible: info.visible(),
     })
+}
+
+/// Check if the first OsmData blob in a PBF has indexdata.
+pub(crate) fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
+    let mut reader = FileReader::open(path, direct_io)?;
+    let mut offset = 0u64;
+    while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {
+        match frame.blob_type {
+            BlobKind::OsmHeader => continue,
+            BlobKind::OsmData => return Ok(frame.index.is_some()),
+            BlobKind::Unknown(_) => continue,
+        }
+    }
+    Ok(false)
 }

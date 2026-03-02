@@ -97,6 +97,9 @@ enum Command {
         /// Enable SQ polling (requires --io-uring)
         #[arg(long, requires = "io_uring")]
         sqpoll: bool,
+        /// Proceed even if input lacks indexdata (slower: full decode for ID scanning)
+        #[arg(long)]
+        force: bool,
     },
     /// Filter elements by tag expressions
     TagsFilter {
@@ -236,6 +239,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: full decode/re-encode)
+        #[arg(long)]
+        force: bool,
     },
     /// Analyze node coordinate statistics for FOR compression sizing
     NodeStats {
@@ -266,6 +272,9 @@ enum Command {
         /// Use SQ polling for io_uring (eliminates io_uring_enter syscalls, requires --io-uring)
         #[arg(long, requires = "io_uring")]
         sqpoll: bool,
+        /// Proceed even if base PBF lacks indexdata (slower: full decode for classification)
+        #[arg(long)]
+        force: bool,
     },
     /// Benchmark: count elements using a single read mode (emits kv to stderr)
     BenchRead {
@@ -332,7 +341,7 @@ fn main() {
             compression,
             direct_io,
         } => run_cat(&files, &output, type_filter.as_deref(), &compression, direct_io),
-        Command::Sort { file, output, compression, direct_io, io_uring, sqpoll } => run_sort(&file, &output, &compression, direct_io, io_uring, sqpoll),
+        Command::Sort { file, output, compression, direct_io, io_uring, sqpoll, force } => run_sort(&file, &output, &compression, direct_io, io_uring, sqpoll, force),
         Command::TagsFilter {
             file,
             output,
@@ -392,7 +401,8 @@ fn main() {
             index_type,
             compression,
             direct_io,
-        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io),
+            force,
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io, force),
         Command::NodeStats { file, direct_io } => run_node_stats(&file, direct_io),
         Command::Merge {
             base,
@@ -402,7 +412,8 @@ fn main() {
             direct_io,
             io_uring,
             sqpoll,
-        } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring, sqpoll),
+            force,
+        } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring, sqpoll, force),
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
         Command::BenchWrite { file, compression, writer } => run_bench_write(&file, &compression, &writer),
         Command::BenchMerge { base, changes, output, compression, io_mode } => {
@@ -566,9 +577,10 @@ fn run_sort(
     direct_io: bool,
     io_uring: bool,
     sqpoll: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::sort::sort(file, output, compression, direct_io, io_uring, sqpoll)?;
+    let stats = pbfhogg::sort::sort(file, output, compression, direct_io, io_uring, sqpoll, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -702,6 +714,7 @@ fn run_add_locations_to_ways(
     index_type_str: &str,
     compression: &str,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
     let index_type = match index_type_str {
@@ -712,7 +725,7 @@ fn run_add_locations_to_ways(
         other => return Err(format!("unknown index type: {other} (expected: hash, dense)").into()),
     };
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
-        file, output, keep_untagged_nodes, compression, direct_io, index_type,
+        file, output, keep_untagged_nodes, compression, direct_io, index_type, force,
     )?;
     stats.print_summary();
     Ok(())
@@ -735,9 +748,10 @@ fn run_merge(
     direct_io: bool,
     io_uring: bool,
     sqpoll: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring, sqpoll)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring, sqpoll, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -1005,7 +1019,7 @@ fn run_bench_merge(
     let _ = std::fs::remove_file(output);
 
     let start = Instant::now();
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, false, io_uring, sqpoll)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, compression, false, io_uring, sqpoll, true)?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

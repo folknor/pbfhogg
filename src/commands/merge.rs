@@ -30,7 +30,7 @@ use crate::osc::{parse_osc_file, CompactDiffOverlay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
-use super::{flush_passthrough_buf, read_raw_frame, RawBlobFrame};
+use super::{flush_passthrough_buf, has_indexdata, read_raw_frame, RawBlobFrame};
 
 type MergeResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -950,7 +950,7 @@ fn emit_create_for_output(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss, clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn merge(
     base_pbf: &Path,
@@ -960,7 +960,22 @@ pub fn merge(
     direct_io: bool,
     io_uring: bool,
     sqpoll: bool,
+    force: bool,
 ) -> MergeResult<MergeStats> {
+    if !force && !has_indexdata(base_pbf, direct_io)? {
+        return Err(
+            "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
+             decompressed to classify elements (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
+
     // Step 1: Parse the diff
     #[cfg(feature = "hotpath")]
     let osc_start = std::time::Instant::now();

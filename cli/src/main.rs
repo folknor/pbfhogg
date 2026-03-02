@@ -255,6 +255,23 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Inspect PBF file: metadata, block breakdown, ordering analysis
+    Inspect {
+        /// Input PBF file
+        file: PathBuf,
+        /// Dump every block with type, element count, compressed/raw size
+        #[arg(long)]
+        blocks: bool,
+        /// Show min/max element IDs per type and monotonicity
+        #[arg(long)]
+        id_ranges: bool,
+        /// Show locations-on-ways diagnostics
+        #[arg(long)]
+        locations: bool,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
+    },
     /// Analyze node coordinate statistics for FOR compression sizing
     NodeStats {
         /// Input PBF file
@@ -430,6 +447,7 @@ fn main() {
             direct_io,
             force,
         } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &compression, direct_io, force),
+        Command::Inspect { file, blocks, id_ranges, locations, direct_io } => run_inspect(&file, blocks, id_ranges, locations, direct_io),
         Command::NodeStats { file, direct_io, force } => run_node_stats(&file, direct_io, force),
         Command::Merge {
             base,
@@ -767,6 +785,18 @@ fn run_add_locations_to_ways(
         file, output, keep_untagged_nodes, compression, direct_io, force,
     )?;
     stats.print_summary();
+    Ok(())
+}
+
+fn run_inspect(
+    path: &std::path::Path,
+    blocks: bool,
+    id_ranges: bool,
+    locations: bool,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let report = pbfhogg::inspect::inspect(path, blocks, id_ranges, locations, direct_io)?;
+    report.print_report();
     Ok(())
 }
 

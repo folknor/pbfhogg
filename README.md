@@ -87,6 +87,7 @@ These methods are the `ElementReader` API for library consumers. The CLI command
 pbfhogg includes a command-line toolkit for common OSM PBF operations:
 
 ```
+pbfhogg inspect <file>                    Comprehensive file inspection (blocks, ordering, tagged counts)
 pbfhogg fileinfo <file>                   Show PBF metadata (--extended for element counts)
 pbfhogg is-indexed <file>                 Check if PBF has blob-level indexdata (exit 0/1)
 pbfhogg check-refs <file>                 Validate referential integrity
@@ -104,6 +105,8 @@ pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456
 pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
 pbfhogg node-stats <file>                 Analyze node coordinate statistics for FOR compression sizing
 ```
+
+Inspect does a full single-pass scan, decompressing every blob to report block breakdown by type (DenseNodes/Ways/Relations/Mixed) with compressed sizes, element counts with tagged node count, and **ordering analysis** — whether the file follows the standard nodes → ways → relations layout or has non-standard interleaving (with block ranges). Optional flags: `--blocks` dumps a per-block table with element counts and compressed/raw sizes, `--id-ranges` shows min/max element IDs per type with monotonicity checks, and `--locations` reports locations-on-ways diagnostics (coverage percentage, coords-per-way percentiles).
 
 Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
 

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata};
+use super::{dense_node_metadata, element_metadata, has_indexdata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
@@ -115,7 +115,23 @@ pub fn getid(
     add_referenced: bool,
     compression: Compression,
     direct_io: bool,
+    force: bool,
 ) -> Result<GetidStats> {
+    if !force && !has_indexdata(input, direct_io)? {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, the type filter \
+             based on requested ID types is a no-op — all blobs are decompressed \
+             (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
+
     if add_referenced {
         getid_with_refs(input, output, ids, compression, direct_io)
     } else {

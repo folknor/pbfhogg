@@ -10,6 +10,7 @@ use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+use super::has_indexdata;
 use super::id_set_dense::IdSetDense;
 
 // ---------------------------------------------------------------------------
@@ -446,7 +447,21 @@ pub fn extract(
     strategy: ExtractStrategy,
     compression: Compression,
     direct_io: bool,
+    force: bool,
 ) -> Result<ExtractStats> {
+    if !force && !matches!(strategy, ExtractStrategy::Simple) && !has_indexdata(input, direct_io)? {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
+             filter is a no-op — all blobs are decompressed (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
     match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, compression, direct_io),
         ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, compression, direct_io),

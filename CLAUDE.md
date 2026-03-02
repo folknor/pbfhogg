@@ -46,7 +46,7 @@ brokkr run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.o
 ```
 There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
 
-`merge`, `sort`, and `add-locations-to-ways` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower).
+`merge`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, and `tags-count --type` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `is-indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 
 ## Verify subcommands
 

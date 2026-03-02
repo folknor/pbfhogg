@@ -59,6 +59,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: type filter becomes no-op)
+        #[arg(long)]
+        force: bool,
     },
     /// Concatenate PBF files with optional type filtering
     Cat {
@@ -77,6 +80,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: type filter becomes no-op)
+        #[arg(long)]
+        force: bool,
     },
     /// Sort PBF into standard order (nodes → ways → relations, by ID)
     Sort {
@@ -120,6 +126,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: type/tag filters become no-ops)
+        #[arg(long)]
+        force: bool,
     },
     /// Compare two PBF files and show differences
     Diff {
@@ -174,6 +183,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: type filter becomes no-op)
+        #[arg(long)]
+        force: bool,
     },
     /// Remove elements by ID
     Removeid {
@@ -219,6 +231,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even without blob-level indexdata (slower for complete-ways/smart)
+        #[arg(long)]
+        force: bool,
     },
     /// Embed node coordinates in ways
     AddLocationsToWays {
@@ -275,6 +290,14 @@ enum Command {
         /// Proceed even if base PBF lacks indexdata (slower: full decode for classification)
         #[arg(long)]
         force: bool,
+    },
+    /// Check if a PBF file has blob-level indexdata
+    IsIndexed {
+        /// Input PBF file
+        file: PathBuf,
+        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Benchmark: count elements using a single read mode (emits kv to stderr)
     BenchRead {
@@ -333,14 +356,16 @@ fn main() {
             min_count,
             type_filter,
             direct_io,
-        } => run_tags_count(&file, min_count, type_filter.as_deref(), direct_io),
+            force,
+        } => run_tags_count(&file, min_count, type_filter.as_deref(), direct_io, force),
         Command::Cat {
             files,
             output,
             type_filter,
             compression,
             direct_io,
-        } => run_cat(&files, &output, type_filter.as_deref(), &compression, direct_io),
+            force,
+        } => run_cat(&files, &output, type_filter.as_deref(), &compression, direct_io, force),
         Command::Sort { file, output, compression, direct_io, io_uring, sqpoll, force } => run_sort(&file, &output, &compression, direct_io, io_uring, sqpoll, force),
         Command::TagsFilter {
             file,
@@ -349,7 +374,8 @@ fn main() {
             expressions,
             compression,
             direct_io,
-        } => run_tags_filter(&file, &output, &expressions, omit_referenced, &compression, direct_io),
+            force,
+        } => run_tags_filter(&file, &output, &expressions, omit_referenced, &compression, direct_io, force),
         Command::Diff {
             old,
             new,
@@ -372,7 +398,8 @@ fn main() {
             ids,
             compression,
             direct_io,
-        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids, &compression, direct_io),
+            force,
+        } => run_getid(&file, &output, add_referenced, id_file.as_deref(), &ids, &compression, direct_io, force),
         Command::Removeid {
             file,
             output,
@@ -390,9 +417,10 @@ fn main() {
             smart,
             compression,
             direct_io,
+            force,
         } => run_extract(
             &file, &output, bbox.as_deref(), polygon.as_deref(),
-            extract_strategy(simple, smart), &compression, direct_io,
+            extract_strategy(simple, smart), &compression, direct_io, force,
         ),
         Command::AddLocationsToWays {
             file,
@@ -414,6 +442,7 @@ fn main() {
             sqpoll,
             force,
         } => run_merge(&base, &changes, &output, &compression, direct_io, io_uring, sqpoll, force),
+        Command::IsIndexed { file, direct_io } => run_is_indexed(&file, direct_io),
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
         Command::BenchWrite { file, compression, writer } => run_bench_write(&file, &compression, &writer),
         Command::BenchMerge { base, changes, output, compression, io_mode } => {
@@ -451,6 +480,9 @@ fn run_fileinfo(path: &std::path::Path, extended: bool, direct_io: bool) -> Resu
     if let Some(ref url) = info.replication_url {
         println!("Replication URL: {url}");
     }
+    if let Some(indexed) = info.is_indexed {
+        println!("Indexdata: {}", if indexed { "yes" } else { "no" });
+    }
 
     if extended {
         println!();
@@ -468,6 +500,16 @@ fn run_fileinfo(path: &std::path::Path, extended: bool, direct_io: bool) -> Resu
         }
     }
 
+    Ok(())
+}
+
+fn run_is_indexed(path: &std::path::Path, direct_io: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if pbfhogg::has_indexdata(path, direct_io)? {
+        println!("indexed");
+    } else {
+        println!("not indexed");
+        process::exit(1);
+    }
     Ok(())
 }
 
@@ -525,8 +567,9 @@ fn run_tags_count(
     min_count: u64,
     type_filter: Option<&str>,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let results = pbfhogg::tags_count::tags_count(path, min_count, type_filter, direct_io)?;
+    let results = pbfhogg::tags_count::tags_count(path, min_count, type_filter, direct_io, force)?;
 
     for entry in &results {
         println!("{}\t{}\t{}", entry.count, entry.key, entry.value);
@@ -562,10 +605,11 @@ fn run_cat(
     type_filter: Option<&str>,
     compression: &str,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, compression, direct_io)?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, compression, direct_io, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -592,9 +636,10 @@ fn run_tags_filter(
     omit_referenced: bool,
     compression: &str,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, compression, direct_io)?;
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, compression, direct_io, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -650,10 +695,11 @@ fn run_getid(
     ids: &[String],
     compression: &str,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, compression, direct_io)?;
+    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, compression, direct_io, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -691,6 +737,7 @@ fn run_extract(
     strategy: pbfhogg::extract::ExtractStrategy,
     compression: &str,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
     let region = match (bbox_str, polygon_path) {
@@ -702,7 +749,7 @@ fn run_extract(
         (None, None) => return Err("one of --bbox or --polygon is required".into()),
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
-    let stats = pbfhogg::extract::extract(file, output, &region, strategy, compression, direct_io)?;
+    let stats = pbfhogg::extract::extract(file, output, &region, strategy, compression, direct_io, force)?;
     stats.print_summary();
     Ok(())
 }

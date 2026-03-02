@@ -79,7 +79,7 @@ fn simple_filters_nodes_by_bbox() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -97,7 +97,7 @@ fn simple_includes_ways_with_nodes_in_bbox() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Ways 10 and 12 have at least one node in bbox; way 11 does not
@@ -115,7 +115,7 @@ fn simple_does_not_add_extra_nodes() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Simple mode: only nodes actually in bbox, not way dependencies
@@ -133,7 +133,7 @@ fn complete_ways_includes_all_way_nodes() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 refs [1, 2]: node 1 in bbox → way matches → node 2 pulled in
@@ -155,7 +155,7 @@ fn complete_ways_includes_relations() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Relation 100 has member node 1 (in bbox) → included
@@ -180,7 +180,7 @@ fn simple_includes_relations_with_matched_ways() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 matched → relation 200 should be included
@@ -199,7 +199,7 @@ fn empty_extract() {
     // Bbox far away from all test data
     let bbox = parse_bbox("0.0,0.0,1.0,1.0").expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     assert!(c.nodes.is_empty());
@@ -219,7 +219,7 @@ fn tags_preserved_in_extract() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
+    extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Check node 1 tags
@@ -277,7 +277,7 @@ fn polygon_simple_filters_nodes() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
     let region = test_polygon_region();
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Nodes 1 and 3 are inside the triangle; nodes 2 and 4 are outside
@@ -294,7 +294,7 @@ fn polygon_complete_ways_includes_all_way_nodes() {
     write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
 
     let region = test_polygon_region();
-    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::CompleteWays, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 [1,2]: node 1 in polygon → way matches → node 2 pulled in
@@ -346,7 +346,7 @@ fn polygon_with_hole_excludes_interior() {
 
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Node 1 is inside the hole → excluded
@@ -379,7 +379,7 @@ fn polygon_from_geojson_file() {
     write_test_pbf(&input, &test_nodes(), &[], &[]);
 
     let region = parse_geojson(&geojson_path).expect("parse geojson");
-    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -415,7 +415,7 @@ fn smart_includes_multipolygon_way_members() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Way 10 matched (has bbox node 1). Way 11 pulled in via smart deps.
@@ -447,7 +447,7 @@ fn smart_includes_boundary_node_members() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // Node 4 should be pulled in via smart boundary deps.
@@ -476,7 +476,7 @@ fn smart_ignores_non_qualifying_relations() {
 
     let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
     let region = Region::Bbox(bbox);
-    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false).expect("extract");
+    let stats = extract(&input, &output, &region, ExtractStrategy::Smart, Compression::default(), false, true).expect("extract");
     let c = read_all_elements(&output);
 
     // type=route should NOT trigger smart behavior — way 11 stays excluded
@@ -556,6 +556,7 @@ fn spatial_filter_skips_distant_blobs() {
         ExtractStrategy::Simple,
         Compression::default(),
         false,
+        true,
     )
     .expect("extract");
 

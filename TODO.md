@@ -263,6 +263,45 @@ items are preserved below.
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
+## Indexdata awareness: warnings and fast paths
+
+Commands that use `BlobFilter` silently degrade to decompressing all blobs
+when the input PBF lacks indexdata. `merge`, `sort`, and `add-locations-to-ways`
+already warn + require `--force` (commit d3fba45). The remaining commands fall
+into three tiers.
+
+### `is-indexed` CLI command
+
+- [x] ~~**Add `pbfhogg is-indexed <file>` command.**~~ Done. Exit code 0 if
+  indexed, 1 if not. Uses `has_indexdata()` from `src/commands/mod.rs`.
+
+### Tier 1: New fast path needed
+
+- [x] ~~**`fileinfo --extended`: header-only fast path.**~~ Done. Reads
+  `BlobIndex::count` by `kind` from blob headers — no decompression. Falls
+  back to full decode for non-indexed files. Also reports `is_indexed` status.
+
+### Tier 2: Warning when indexdata is missing (BlobFilter already degrades gracefully)
+
+These commands already set `BlobFilter` correctly. Without indexdata, all
+blobs pass through and element-level filtering happens after decompression.
+No code path change needed — just a warning + `--force`, same pattern as
+merge/sort/add-locations-to-ways.
+
+- [x] ~~**`extract` (complete/smart):**~~ Done. Warns + requires `--force`.
+- [x] ~~**`tags_filter`:**~~ Done. Warns + requires `--force`.
+- [x] ~~**`getid` (include mode):**~~ Done. Warns + requires `--force`.
+- [x] ~~**`cat --type`:**~~ Done. Warns + requires `--force`.
+- [x] ~~**`tags_count --type`:**~~ Done. Warns + requires `--force`.
+
+### Tier 3: No benefit (skip)
+
+- `cat` (no filter) — already zero-decode passthrough
+- `derive_changes` — reads all types unconditionally
+- `diff` (no `--type`) — reads all types unconditionally
+- `check_refs` — consumer-bound, relation blobs are ~1-2%, <1% impact
+- `node_stats` — modest ~15% (skips way/relation blobs only)
+
 ## Nice to have
 
 - [ ] Consider adding `serde` feature for element serialization

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata};
+use super::{dense_node_metadata, element_metadata, has_indexdata};
 use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
 use crate::file_reader::FileReader;
@@ -46,7 +46,27 @@ pub fn cat(
     type_filter: Option<&str>,
     compression: Compression,
     direct_io: bool,
+    force: bool,
 ) -> Result<CatStats> {
+    if !force && type_filter.is_some() {
+        // Check the first file for indexdata
+        if let Some(first) = files.first() {
+            if !has_indexdata(first, direct_io)? {
+                return Err(
+                    "input PBF has no blob-level indexdata. Without indexdata, the type \
+                     filter is a no-op — all blobs are decompressed (significantly slower).\n\
+                     \n\
+                     Generate an indexed PBF first:\n\
+                     \n\
+                     \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+                     \n\
+                     Or pass --force to proceed anyway."
+                        .into(),
+                );
+            }
+        }
+    }
+
     match type_filter {
         None => cat_passthrough(files, output, compression, direct_io),
         Some(filter) => cat_filtered(files, output, filter, compression, direct_io),

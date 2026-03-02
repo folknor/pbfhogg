@@ -188,7 +188,7 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 }
 
 /// Check if the first OsmData blob in a PBF has indexdata.
-pub(crate) fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
+pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
     while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {

@@ -5,7 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::id_set_dense::IdSetDense;
-use super::{dense_node_metadata, element_metadata};
+use super::{dense_node_metadata, element_metadata, has_indexdata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -263,7 +263,22 @@ pub fn tags_filter(
     omit_referenced: bool,
     compression: Compression,
     direct_io: bool,
+    force: bool,
 ) -> Result<TagsFilterStats> {
+    if !force && !has_indexdata(input, direct_io)? {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
+             filters are no-ops — all blobs are decompressed (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
+
     let expressions = parse_expressions(expression_strs)?;
     if omit_referenced {
         tags_filter_single_pass(input, output, &expressions, compression, direct_io)

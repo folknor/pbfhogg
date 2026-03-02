@@ -165,6 +165,8 @@ pub(crate) use read::file_reader;
 pub use write::{block_builder, writer};
 pub(crate) use write::file_writer;
 #[doc(hidden)]
+pub use commands::has_indexdata;
+#[doc(hidden)]
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, fileinfo, getid, merge,
     node_stats, sort, tags_count, tags_filter,

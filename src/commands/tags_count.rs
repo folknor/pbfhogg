@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use super::has_indexdata;
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
@@ -33,7 +34,22 @@ pub fn tags_count(
     min_count: u64,
     type_filter: Option<&str>,
     direct_io: bool,
+    force: bool,
 ) -> Result<Vec<TagCount>> {
+    if !force && type_filter.is_some() && !has_indexdata(path, direct_io)? {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, the type filter \
+             is a no-op — all blobs are decompressed (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
+
     let reader = ElementReader::open(path, direct_io)?;
     let reader = match type_filter {
         Some("node") => reader.with_blob_filter(BlobFilter::only_nodes()),

@@ -126,30 +126,6 @@ All CLI commands now beat osmium except extract --simple.
     read. Challenge: the collection consumer (which is sequential) and the
     write dispatch (which needs rayon) must coexist in the same pass.
 
-- [ ] **`add-locations-to-ways` Pass 1 (hash index building).** Already faster
-  than osmium on Denmark (11.4s vs 12.0s), but Pass 1 (FxHashMap node index
-  build) is sequential and the bottleneck at larger scales. Options:
-  - Parallel hash map build: partition nodes by ID range across threads, each
-    builds a sub-map, then merge. Or use a concurrent map (dashmap/flurry).
-  - The Dense mmap index variant avoids this entirely (direct indexing, no
-    hash table) but requires `vm.overcommit_memory=1` for planet-scale capacity.
-
-  **Production pipeline — runs every planet refresh cycle:**
-  ```
-  pbfhogg cat → pbfhogg merge → pbfhogg add-locations-to-ways
-                                        │
-                                        ├── elivagar → PMTiles → nidhogg (tile serving)
-                                        └── nidhogg (PBF ingest → query API)
-  ```
-  The enriched PBF feeds both consumers. elivagar gets inline coordinates
-  via `Way::node_locations()`, eliminating the node store entirely.
-  North America benchmark (18.8 GB, plantasjen, commit 8704b11): 605s,
-  22.8 GB peak RSS (of 25 GB). Node store is ~12.4 GB at NA, extrapolated
-  ~44 GB at planet — the dominant memory consumer. With `add-locations-to-ways`
-  in the pipeline, estimated elivagar planet peak RSS drops from ~65-75 GB
-  to ~15-20 GB. **High priority** — on the critical path for planet-scale
-  feasibility on 64 GB hosts.
-
 ## Performance: Linux kernel features for planet-scale I/O
 
 io_uring implementation: `src/write/uring_writer.rs`.
@@ -245,64 +221,12 @@ items are preserved below.
   iterators would fix this. High effort, no current use case — neither
   command is used at planet scale in nidhogg.
 
-### Minor uncaptured items
-
-- [x] ~~Unused public decompress functions in `blob.rs`.~~ Deleted 5 functions
-  with zero callers.
-
-- [x] ~~BlockBuilder StringTable double String allocation.~~ Fixed: `Rc<str>`
-  shared between HashMap key and Vec entry — one heap alloc per unique string.
-
-- [x] ~~Document fd registration stall bound in `uring_writer.rs`.~~ Done.
-
 ## Benchmarking
 
-- [x] ~~Track peak RSS during reads and merges at scale.~~ `peak_rss_mb` column in results DB, `VmHWM` captured after merge.
 - [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (tags-count, check-refs),
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
-
-## Indexdata awareness: warnings and fast paths
-
-Commands that use `BlobFilter` silently degrade to decompressing all blobs
-when the input PBF lacks indexdata. `merge`, `sort`, and `add-locations-to-ways`
-already warn + require `--force` (commit d3fba45). The remaining commands fall
-into three tiers.
-
-### `is-indexed` CLI command
-
-- [x] ~~**Add `pbfhogg is-indexed <file>` command.**~~ Done. Exit code 0 if
-  indexed, 1 if not. Uses `has_indexdata()` from `src/commands/mod.rs`.
-
-### Tier 1: New fast path needed
-
-- [x] ~~**`fileinfo --extended`: header-only fast path.**~~ Done. Reads
-  `BlobIndex::count` by `kind` from blob headers — no decompression. Falls
-  back to full decode for non-indexed files. Also reports `is_indexed` status.
-
-### Tier 2: Warning when indexdata is missing (BlobFilter already degrades gracefully)
-
-These commands already set `BlobFilter` correctly. Without indexdata, all
-blobs pass through and element-level filtering happens after decompression.
-No code path change needed — just a warning + `--force`, same pattern as
-merge/sort/add-locations-to-ways.
-
-- [x] ~~**`extract` (complete/smart):**~~ Done. Warns + requires `--force`.
-- [x] ~~**`tags_filter`:**~~ Done. Warns + requires `--force`.
-- [x] ~~**`getid` (include mode):**~~ Done. Warns + requires `--force`.
-- [x] ~~**`cat --type`:**~~ Done. Warns + requires `--force`.
-- [x] ~~**`tags_count --type`:**~~ Done. Warns + requires `--force`.
-- [x] ~~**`node_stats`:**~~ Done. Warns + requires `--force` (~15% speedup,
-  skips way/relation blobs). Used frequently from elivagar.
-
-### Tier 3: No benefit (skip)
-
-- `cat` (no filter) — already zero-decode passthrough
-- `derive_changes` — reads all types unconditionally
-- `diff` (no `--type`) — reads all types unconditionally
-- `check_refs` — consumer-bound, relation blobs are ~1-2%, <1% impact
-- ~~`node_stats`~~ — moved to Tier 2, warns + requires `--force`
 
 ## Nice to have
 

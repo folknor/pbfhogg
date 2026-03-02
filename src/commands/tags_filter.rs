@@ -5,7 +5,10 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::id_set_dense::IdSetDense;
-use super::{dense_node_metadata, element_metadata, flush_local, require_indexdata, TypeFilter};
+use super::{
+    dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
+    TypeFilter,
+};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -420,15 +423,11 @@ fn process_filter_batch(
         )
         .collect();
 
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        stats.nodes_matched += block_stats.nodes_matched;
-        stats.ways_matched += block_stats.ways_matched;
-        stats.relations_matched += block_stats.relations_matched;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| {
+        stats.nodes_matched += s.nodes_matched;
+        stats.ways_matched += s.ways_matched;
+        stats.relations_matched += s.relations_matched;
+    })?;
     Ok(())
 }
 
@@ -548,16 +547,12 @@ fn process_pass2_batch(
         )
         .collect();
 
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        stats.nodes_matched += block_stats.nodes_matched;
-        stats.nodes_from_ways += block_stats.nodes_from_ways;
-        stats.ways_matched += block_stats.ways_matched;
-        stats.relations_matched += block_stats.relations_matched;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| {
+        stats.nodes_matched += s.nodes_matched;
+        stats.nodes_from_ways += s.nodes_from_ways;
+        stats.ways_matched += s.ways_matched;
+        stats.relations_matched += s.relations_matched;
+    })?;
     Ok(())
 }
 

@@ -181,6 +181,26 @@ pub(crate) fn flush_block(
     Ok(())
 }
 
+/// Drain parallel batch results: write blocks to the writer, merge stats via closure.
+///
+/// Each result is `(Vec<OwnedBlock>, S)` where `S` is a per-block stats type.
+/// Blocks are written sequentially in batch order. The `merge` closure
+/// accumulates stats from each result into the caller's aggregator.
+pub(crate) fn drain_batch_results<S>(
+    results: Vec<std::result::Result<(Vec<OwnedBlock>, S), String>>,
+    writer: &mut PbfWriter<FileWriter>,
+    mut merge: impl FnMut(S),
+) -> Result<()> {
+    for result in results {
+        let (blocks, stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        merge(stats);
+        for (block_bytes, index, tagdata) in blocks {
+            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
 /// Flush the current block from a [`BlockBuilder`] into a local output buffer.
 ///
 /// Like `flush_block` but writes to a `Vec<OwnedBlock>` instead of a

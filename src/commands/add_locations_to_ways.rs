@@ -16,7 +16,9 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame};
+use super::{
+    drain_batch_results, flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame,
+};
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
@@ -753,13 +755,7 @@ fn process_batch(
         blobs_decoded: 0,
     };
 
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        merge_stats(&mut total, &block_stats);
-        for (block_bytes, blob_index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
 
     Ok(total)
 }
@@ -1037,14 +1033,7 @@ fn process_slot_batch(
         blobs_decoded: 0,
     };
 
-    for result in results {
-        let (blocks, block_stats) =
-            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        merge_stats(&mut total, &block_stats);
-        for (block_bytes, blob_index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, blob_index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
 
     Ok(total)
 }

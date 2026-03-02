@@ -12,7 +12,7 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
-use super::{flush_local, Result, BATCH_SIZE};
+use super::{drain_batch_results, flush_local, Result, BATCH_SIZE};
 
 /// Statistics from a cat operation.
 pub struct CatStats {
@@ -373,15 +373,10 @@ fn process_batch(
     // Sequential phase: write serialized blocks in order, propagate errors.
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
-
-    for result in results {
-        let (blocks, count) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    drain_batch_results(results, writer, |count| {
         total_blobs += 1;
         total_elements += count;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    })?;
 
     Ok((total_blobs, total_elements))
 }

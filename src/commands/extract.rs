@@ -10,7 +10,7 @@ use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
-use super::{flush_local, require_indexdata};
+use super::{drain_batch_results, flush_local, require_indexdata};
 use super::id_set_dense::IdSetDense;
 
 // ---------------------------------------------------------------------------
@@ -874,13 +874,7 @@ fn process_extract_pass2_batch(
         )
         .collect();
 
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        merge_extract_stats(stats, &block_stats);
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s))?;
     Ok(())
 }
 
@@ -1109,13 +1103,7 @@ fn process_extract_pass3_batch(
         )
         .collect();
 
-    for result in results {
-        let (blocks, block_stats) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        merge_extract_stats(stats, &block_stats);
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s))?;
     Ok(())
 }
 

@@ -5,7 +5,9 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata, flush_local, require_indexdata};
+use super::{
+    dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
+};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
@@ -388,7 +390,7 @@ fn process_filter_batch(
     include: bool,
     dep_node_ids: Option<&BTreeSet<i64>>,
 ) -> Result<(u64, u64, u64)> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, u64, u64, u64), String>;
+    type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
@@ -399,7 +401,7 @@ fn process_filter_batch(
                     block, bb, &mut output, ids, include, dep_node_ids,
                 )?;
                 flush_local(bb, &mut output)?;
-                Ok((output, nodes, ways, relations))
+                Ok((output, (nodes, ways, relations)))
             },
         )
         .collect();
@@ -407,16 +409,11 @@ fn process_filter_batch(
     let mut total_nodes: u64 = 0;
     let mut total_ways: u64 = 0;
     let mut total_relations: u64 = 0;
-
-    for result in results {
-        let (blocks, nodes, ways, relations) = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    drain_batch_results(results, writer, |(nodes, ways, relations)| {
         total_nodes += nodes;
         total_ways += ways;
         total_relations += relations;
-        for (block_bytes, index, tagdata) in blocks {
-            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-        }
-    }
+    })?;
 
     Ok((total_nodes, total_ways, total_relations))
 }

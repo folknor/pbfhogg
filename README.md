@@ -88,7 +88,6 @@ pbfhogg includes a command-line toolkit for common OSM PBF operations:
 
 ```
 pbfhogg inspect <file>                    Comprehensive file inspection (blocks, ordering, tagged counts)
-pbfhogg fileinfo <file>                   Show PBF metadata (--extended for element counts)
 pbfhogg is-indexed <file>                 Check if PBF has blob-level indexdata (exit 0/1)
 pbfhogg check-refs <file>                 Validate referential integrity
 pbfhogg cat <files...> -o <out>           Concatenate PBF files (-t node,way,relation to filter)
@@ -114,7 +113,7 @@ Add-locations-to-ways uses a file-backed mmap index (8 bytes/slot, direct addres
 
 Node-stats streams all nodes and reports coordinate value ranges, FOR (Frame of Reference) block bit-width distributions, and estimated compressed size. Designed to evaluate whether FOR compression (128-value blocks, per-block min + bitpacked offsets) is viable for in-RAM sorted node stores at planet scale. Runs in constant memory using the pipelined reader.
 
-Commands that benefit from blob-level indexdata (`merge`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `tags-count --type`, `node-stats`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf`. `fileinfo --extended` uses indexdata for fast header-only element counting when available (no decompression), falling back to full decode otherwise.
+Commands that benefit from blob-level indexdata (`merge`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `tags-count --type`, `node-stats`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf`.
 
 All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 

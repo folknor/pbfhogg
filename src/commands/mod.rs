@@ -6,7 +6,6 @@ pub mod derive_changes;
 pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;
-pub mod fileinfo;
 pub mod getid;
 pub mod inspect;
 pub(crate) mod id_set_dense;

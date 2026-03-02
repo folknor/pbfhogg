@@ -270,7 +270,7 @@ All CLI commands now beat osmium except extract --simple.
   **Priority:** Low — neither command is used at planet scale in the
   nidhogg production pipeline (merge handles the planet refresh). But
   this is the only remaining planet-scale OOM in the codebase. Every other
-  command either streams (cat, sort, merge, node_stats, fileinfo, cat,
+  command either streams (cat, sort, merge, node_stats, inspect, cat,
   tags_count) or uses bounded/sublinear structures (check_refs uses
   RoaringTreemap ~4 GB, extract/tags_filter use IdSetDense bitsets ~1-6 GB,
   add-locations-to-ways uses file-backed mmap).

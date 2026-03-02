@@ -24,17 +24,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Display PBF file metadata
-    Fileinfo {
-        /// Input PBF file
-        file: PathBuf,
-        /// Full scan: count blobs and elements
-        #[arg(long)]
-        extended: bool,
-        /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
-        #[arg(long)]
-        direct_io: bool,
-    },
     /// Validate referential integrity
     CheckRefs {
         /// Input PBF file
@@ -362,7 +351,6 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::Fileinfo { file, extended, direct_io } => run_fileinfo(&file, extended, direct_io),
         Command::CheckRefs {
             file,
             check_relations,
@@ -471,53 +459,6 @@ fn main() {
         eprintln!("Error: {e}");
         process::exit(1);
     }
-}
-
-fn run_fileinfo(path: &std::path::Path, extended: bool, direct_io: bool) -> Result<(), Box<dyn std::error::Error>> {
-    let info = pbfhogg::fileinfo::fileinfo(path, extended, direct_io)?;
-
-    if let Some((left, bottom, right, top)) = info.bbox {
-        println!("Bounding box: ({left}, {bottom}) - ({right}, {top})");
-    }
-    if let Some(ref prog) = info.writing_program {
-        println!("Writing program: {prog}");
-    }
-    if !info.required_features.is_empty() {
-        println!("Required features: {}", info.required_features.join(", "));
-    }
-    if !info.optional_features.is_empty() {
-        println!("Optional features: {}", info.optional_features.join(", "));
-    }
-    if let Some(ts) = info.replication_timestamp {
-        println!("Replication timestamp: {ts}");
-    }
-    if let Some(seq) = info.replication_sequence {
-        println!("Replication sequence: {seq}");
-    }
-    if let Some(ref url) = info.replication_url {
-        println!("Replication URL: {url}");
-    }
-    if let Some(indexed) = info.is_indexed {
-        println!("Indexdata: {}", if indexed { "yes" } else { "no" });
-    }
-
-    if extended {
-        println!();
-        if let Some(n) = info.blob_count {
-            println!("Data blobs: {n}");
-        }
-        if let Some(n) = info.node_count {
-            println!("Nodes: {n}");
-        }
-        if let Some(n) = info.way_count {
-            println!("Ways: {n}");
-        }
-        if let Some(n) = info.relation_count {
-            println!("Relations: {n}");
-        }
-    }
-
-    Ok(())
 }
 
 fn run_is_indexed(path: &std::path::Path, direct_io: bool) -> Result<(), Box<dyn std::error::Error>> {

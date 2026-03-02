@@ -208,12 +208,12 @@ items are preserved below.
   shared thread pool architecture where pipeline decode and consumer
   parallelism use the same pool.
 
-- [ ] **P3-20: SIMD varint decode/encode in protohoggr.** ~25s read-side +
-  ~175s write-side savings at planet scale (attacking the irreducible
-  varint floor). Requires a batch-decode API change in `protohoggr` —
-  current `Cursor::read_varint()` is byte-at-a-time. High effort,
-  speculative. Only worth pursuing after compression is no longer the
-  dominant cost (i.e. `Compression::None` production path).
+- [x] ~~**P3-20: SIMD varint decode/encode in protohoggr.**~~ Investigated
+  and closed. Microbenchmarks (criterion, 8000 sint64 values) show scalar
+  is 2.3–6.3× faster than varint-simd on decode (1-byte fast path is
+  perfectly branch-predicted) and 1.5–3.5× faster on encode. SIMD overhead
+  (SSE shuffle + mask) can't compete with a predicted branch + scalar load.
+  Full research in `notes/SIMD.md`.
 
 - [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
   commands load entire PBFs into memory (`owned_elements.rs`), OOMing at

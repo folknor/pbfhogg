@@ -1,5 +1,9 @@
 # P3-20: SIMD Varint Decode/Encode in protohoggr
 
+**Status: CLOSED — not worth pursuing.** Scalar beats SIMD in all scenarios.
+See [Microbenchmark Results](#microbenchmark-results-protohoggr-go-no-go) and
+[Verdict](#verdict).
+
 Research doc for SIMD-accelerated varint operations. Corresponds to TODO.md
 item P3-20.
 
@@ -388,15 +392,88 @@ whether it's the bottleneck.
 At planet scale (160× Denmark), the write sync-none savings would be
 ~96-160s — still meaningful but much less than the original ~175s estimate.
 
-### Open question
+## Microbenchmark Results (protohoggr, go / no-go)
 
-To nail down the read-side varint fraction precisely, we'd need to
-instrument `PackedSint64Iter::next()` and `PackedUint32Iter::next()` in
-the hotpath feature. These are called billions of times, so instrumentation
-overhead per call must be sub-nanosecond (likely a simple atomic counter
-or TSC read). Alternatively, a targeted protohoggr microbenchmark
-(decode 8000 packed sint64 varints in a loop) would give the ns/varint
-number directly without touching pbfhogg's hotpath infrastructure.
+Criterion benchmarks in protohoggr comparing scalar (current) vs varint-simd.
+Test data: 8000 sint64 values, two scenarios — small deltas (1-byte varints,
+typical of dense node id/lat/lon) and large deltas (3-byte varints, typical
+of way refs).
+
+### Decode (8000 packed sint64)
+
+| Implementation | Small (1B varints) | Large (3B varints) |
+|----------------|--------------------|--------------------|
+| Scalar `PackedSint64Iter` | **4.36 µs (0.54 ns/val)** | **20.9 µs (2.61 ns/val)** |
+| SIMD batch4 (decode_four, u16) | 10.2 µs (1.28 ns/val) | n/a (won't fit u16) |
+| SIMD batch2 (decode_two, u32) | 17.5 µs (2.19 ns/val) | 20.8 µs (2.60 ns/val) |
+| SIMD single (safe decode) | 27.7 µs (3.46 ns/val) | 27.8 µs (3.47 ns/val) |
+
+Scalar is **2.3× faster** than the best SIMD batch for 1-byte varints,
+essentially tied for 3-byte varints, and **6.3× faster** than SIMD single.
+
+### Encode (8000 packed sint64)
+
+| Implementation | Small (1B varints) | Large (3B varints) |
+|----------------|--------------------|--------------------|
+| Scalar `encode_packed_sint64` | **7.69 µs (0.96 ns/val)** | **19.6 µs (2.45 ns/val)** |
+| SIMD `encode_to_slice` | 26.9 µs (3.36 ns/val) | 29.1 µs (3.64 ns/val) |
+
+Scalar is **3.5× faster** for 1-byte and **1.5× faster** for 3-byte.
+
+### Why scalar wins
+
+The 1-byte fast path in `Cursor::read_varint()` is the key:
+
+```rust
+let b = self.data[self.pos];
+if b < 0x80 {
+    self.pos += 1;
+    return Ok(u64::from(b));
+}
+```
+
+For the dominant OSM case (dense node deltas where most varints are 1 byte),
+this single branch is perfectly predicted by the CPU. The entire decode is:
+one array access, one comparison, one increment, one zero-extend. SIMD's
+`_mm_loadu_si128` + `_mm_movemask_epi8` + PSHUFB shuffle + mask lookup
+can't compete with a single predicted branch + scalar load.
+
+For 3-byte varints (way refs, larger deltas), scalar's byte-at-a-time loop
+runs 3 iterations with predictable branching, roughly matching SIMD batch2.
+The SIMD setup overhead exactly cancels the per-varint savings.
+
+On the encode side, scalar's `buf.push((value as u8) | 0x80)` loop benefits
+from the same branch prediction. The SIMD encode_to_slice must do SSE2
+operations (shift, mask, shuffle) regardless of varint length — it can't
+short-circuit the 1-byte case.
+
+## Verdict
+
+**P3-20 is closed. SIMD varint acceleration is not worth pursuing.**
+
+The microbenchmark results decisively show that the current scalar
+implementation in protohoggr already achieves near-optimal throughput for
+LEB128 varints. The CPU's branch predictor perfectly handles the 1-byte
+fast path that dominates OSM data (dense node deltas). Adding varint-simd
+would make performance *worse*, not better, while introducing an external
+dependency, `unsafe` code, and platform restrictions.
+
+The original estimates (~25s read-side + ~175s write-side savings at planet
+scale) assumed a 2× SIMD speedup. The actual measurement shows scalar is
+2-6× *faster* than SIMD for the dominant case, so the projected savings
+are negative.
+
+**What to do instead:**
+
+- The ~10-15% of read wall time spent on varint decode is already well-
+  optimized. Further gains require attacking decompression (66% of wall
+  time) or improving parallelism.
+- For the encode side, the `add_node` (69 ns/call) and `take_owned`
+  (288 µs/call) paths could benefit from reducing string table overhead,
+  delta computation, or memory management — not varint encode speed.
+- Option 3 (scalar multi-byte fast paths) is also unlikely to help given
+  that the 1-byte fast path already covers the dominant case and the
+  branch predictor handles the 2-3 byte cases efficiently.
 
 ## Reference: SIMD Patterns from Rust Ecosystem
 

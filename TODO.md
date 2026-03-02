@@ -293,6 +293,8 @@ merge/sort/add-locations-to-ways.
 - [x] ~~**`getid` (include mode):**~~ Done. Warns + requires `--force`.
 - [x] ~~**`cat --type`:**~~ Done. Warns + requires `--force`.
 - [x] ~~**`tags_count --type`:**~~ Done. Warns + requires `--force`.
+- [x] ~~**`node_stats`:**~~ Done. Warns + requires `--force` (~15% speedup,
+  skips way/relation blobs). Used frequently from elivagar.
 
 ### Tier 3: No benefit (skip)
 
@@ -300,7 +302,7 @@ merge/sort/add-locations-to-ways.
 - `derive_changes` — reads all types unconditionally
 - `diff` (no `--type`) — reads all types unconditionally
 - `check_refs` — consumer-bound, relation blobs are ~1-2%, <1% impact
-- `node_stats` — modest ~15% (skips way/relation blobs only)
+- ~~`node_stats`~~ — moved to Tier 2, warns + requires `--force`
 
 ## Nice to have
 

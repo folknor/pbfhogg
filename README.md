@@ -114,7 +114,7 @@ Add-locations-to-ways supports `--index-type hash` (default, HashMap) and `--ind
 
 Node-stats streams all nodes and reports coordinate value ranges, FOR (Frame of Reference) block bit-width distributions, and estimated compressed size. Designed to evaluate whether FOR compression (128-value blocks, per-block min + bitpacked offsets) is viable for in-RAM sorted node stores at planet scale. Runs in constant memory using the pipelined reader.
 
-Commands that benefit from blob-level indexdata (`merge`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `tags-count --type`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf`. `fileinfo --extended` uses indexdata for fast header-only element counting when available (no decompression), falling back to full decode otherwise.
+Commands that benefit from blob-level indexdata (`merge`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `tags-count --type`, `node-stats`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf`. `fileinfo --extended` uses indexdata for fast header-only element counting when available (no decompression), falling back to full decode otherwise.
 
 All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 

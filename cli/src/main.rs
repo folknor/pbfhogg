@@ -265,6 +265,9 @@ enum Command {
         /// Use O_DIRECT to bypass page cache (requires linux-direct-io feature)
         #[arg(long)]
         direct_io: bool,
+        /// Proceed even if input lacks indexdata (slower: node filter becomes no-op)
+        #[arg(long)]
+        force: bool,
     },
     /// Apply OSC diffs to a PBF file
     Merge {
@@ -431,7 +434,7 @@ fn main() {
             direct_io,
             force,
         } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io, force),
-        Command::NodeStats { file, direct_io } => run_node_stats(&file, direct_io),
+        Command::NodeStats { file, direct_io, force } => run_node_stats(&file, direct_io, force),
         Command::Merge {
             base,
             changes,
@@ -781,8 +784,9 @@ fn run_add_locations_to_ways(
 fn run_node_stats(
     path: &std::path::Path,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let report = pbfhogg::node_stats::node_stats(path, direct_io)?;
+    let report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
     report.print_report();
     Ok(())
 }

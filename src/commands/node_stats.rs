@@ -4,7 +4,7 @@ use crate::reader::ElementReader;
 use crate::elements::Element;
 use crate::BlobFilter;
 
-use super::Result;
+use super::{has_indexdata, Result};
 
 const BLOCK_SIZE: usize = 128;
 
@@ -161,7 +161,21 @@ fn print_histogram(label: &str, stats: &CoordStats) {
 ///
 /// Streams through all nodes, collecting coordinate ranges and FOR block
 /// bit-width distributions. Runs in constant memory.
-pub fn node_stats(path: &Path, direct_io: bool) -> Result<NodeStatsReport> {
+pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStatsReport> {
+    if !force && !has_indexdata(path, direct_io)? {
+        return Err(
+            "input PBF has no blob-level indexdata. Without indexdata, the node-only \
+             filter is a no-op — all blobs are decompressed (significantly slower).\n\
+             \n\
+             Generate an indexed PBF first:\n\
+             \n\
+             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
+             \n\
+             Or pass --force to proceed anyway."
+                .into(),
+        );
+    }
+
     let reader = ElementReader::open(path, direct_io)?
         .with_blob_filter(BlobFilter::only_nodes());
 

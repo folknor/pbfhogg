@@ -103,6 +103,18 @@ struct FrameScratch {
     zstd_compressor: Option<zstd::bulk::Compressor<'static>>,
 }
 
+impl FrameScratch {
+    const fn new() -> Self {
+        Self {
+            blob_buf: Vec::new(),
+            header_buf: Vec::new(),
+            compress_buf: Vec::new(),
+            zlib_compressor: None,
+            zstd_compressor: None,
+        }
+    }
+}
+
 thread_local! {
     /// Per-rayon-thread scratch buffers for pipelined blob framing.
     static PIPELINE_SCRATCH: RefCell<FrameScratch> = const { RefCell::new(FrameScratch {
@@ -148,7 +160,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
+            scratch: FrameScratch::new(),
         })
     }
 
@@ -164,7 +176,7 @@ impl PbfWriter<FileWriter> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
+            scratch: FrameScratch::new(),
         })
     }
 
@@ -253,7 +265,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
+            scratch: FrameScratch::new(),
         })
     }
 
@@ -279,7 +291,7 @@ impl PbfWriter<FileWriter> {
                 seq: 0,
                 join_handle: Some(handle),
             }),
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
+            scratch: FrameScratch::new(),
         })
     }
 }
@@ -297,7 +309,7 @@ impl<W: Write> PbfWriter<W> {
             writer: Some(writer),
             compression,
             pipeline: None,
-            scratch: FrameScratch { blob_buf: Vec::new(), header_buf: Vec::new(), compress_buf: Vec::new(), zlib_compressor: None, zstd_compressor: None },
+            scratch: FrameScratch::new(),
         }
     }
 
@@ -714,13 +726,7 @@ pub(crate) fn frame_blob(
     compression: &Compression,
     indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
-    let mut scratch = FrameScratch {
-        blob_buf: Vec::new(),
-        header_buf: Vec::new(),
-        compress_buf: Vec::new(),
-        zlib_compressor: None,
-        zstd_compressor: None,
-    };
+    let mut scratch = FrameScratch::new();
     frame_blob_into(blob_type, uncompressed, compression, indexdata, None, &mut scratch)
 }
 

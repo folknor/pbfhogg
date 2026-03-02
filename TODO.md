@@ -217,27 +217,17 @@ All 5 items consolidated into `src/commands/mod.rs`:
   `#[command(flatten)]` with shared structs. Also `parse_compression` should be
   a `FromStr` impl on `Compression`.
 
-### Lower value (hygiene)
+### Lower value (hygiene) — DONE
 
-- [ ] **`FrameScratch` default.** Struct literal repeated 7 times in `writer.rs`.
-  Add `Default` impl or `FrameScratch::new()`.
-
+- [x] **`FrameScratch::new()`.** Added `const fn new()`, replaced 7 struct literals.
+- [x] **`MergeOptions` and `SortOptions`.** Replaced 7-8 arg signatures with options structs.
+- [~] **`member_type_value` consolidation.** Skipped — different Unknown handling
+  semantics (lossy protobuf write vs lossless compact storage). Not actually duplicated.
+- [~] **`#[doc(hidden)]` vs `pub(crate)`.** Current pattern is correct — downstream
+  crates need `pub`, `doc(hidden)` keeps them out of API docs. No change needed.
+- [~] **`decompress_blob` near-duplication.** Skipped — fundamentally different buffer
+  management strategies (caller Vec reuse vs DecompressPool+Bytes). Abstraction
+  would add complexity to performance-critical paths.
 - [ ] **Header + writer setup helper.** 9 instances of read header →
   `HeaderBuilder::from_header` → preserve sorted → build → open pipelined
   writer. Could be a shared helper in `mod.rs`.
-
-- [ ] **`member_type_value` consolidation.** MemberType→int mapping in
-  `block_builder.rs:200-209` and `osc.rs:149-152`. An
-  `impl From<MemberType> for i32` centralizes it.
-
-- [ ] **`#[doc(hidden)]` vs `pub(crate)` on commands.** Downstream crates
-  (elivagar, nidhogg) call command functions. Either make them properly public
-  or `pub(crate)` — the current middle ground is confusing.
-
-- [ ] **Options structs for `merge()` and `sort()`.** Both take 7-8 args with
-  3-4 boolean flags. `diff` already uses `DiffOptions` as a pattern.
-
-- [ ] **`decompress_blob` near-duplication.** `blob.rs` has `decompress_blob`
-  (lines 1042-1081, returns `Bytes`) and `decompress_parsed_blob_into` (lines
-  958-991, writes to `&mut Vec<u8>`) with near-identical match arms. Could
-  share the decompression logic.

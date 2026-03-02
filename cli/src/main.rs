@@ -627,7 +627,8 @@ fn run_sort(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::sort::sort(file, output, compression, direct_io, io_uring, sqpoll, force)?;
+    let opts = pbfhogg::sort::SortOptions { compression, direct_io, io_uring, sqpoll, force };
+    let stats = pbfhogg::sort::sort(file, output, &opts)?;
     stats.print_summary();
     Ok(())
 }
@@ -802,7 +803,8 @@ fn run_merge(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, direct_io, io_uring, sqpoll, force)?;
+    let opts = pbfhogg::merge::MergeOptions { compression, direct_io, io_uring, sqpoll, force };
+    let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     stats.print_summary();
     Ok(())
 }
@@ -1048,7 +1050,8 @@ fn run_bench_merge(
     let _ = std::fs::remove_file(output);
 
     let start = Instant::now();
-    let stats = pbfhogg::merge::merge(base, changes, output, compression, false, io_uring, sqpoll, true)?;
+    let opts = pbfhogg::merge::MergeOptions { compression, direct_io: false, io_uring, sqpoll, force: true };
+    let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

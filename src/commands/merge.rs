@@ -1063,18 +1063,24 @@ fn emit_create_for_output(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss, clippy::too_many_arguments)]
+/// Options controlling merge I/O and compression behavior.
+pub struct MergeOptions {
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub io_uring: bool,
+    pub sqpoll: bool,
+    pub force: bool,
+}
+
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
 #[hotpath::measure]
 pub fn merge(
     base_pbf: &Path,
     osc_file: &Path,
     output_pbf: &Path,
-    compression: Compression,
-    direct_io: bool,
-    io_uring: bool,
-    sqpoll: bool,
-    force: bool,
+    opts: &MergeOptions,
 ) -> Result<MergeStats> {
+    let MergeOptions { compression, direct_io, io_uring, sqpoll, force } = *opts;
     require_indexdata(base_pbf, direct_io, force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).")?;

@@ -147,9 +147,19 @@ impl Ord for OwnedRelation {
 /// Uses blob-level permutation sort: O(num_blobs) memory. Non-overlapping
 /// blobs are passed through as raw bytes; overlapping blobs are decoded,
 /// sorted, and re-encoded.
+/// Options controlling sort I/O and compression behavior.
+pub struct SortOptions {
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub io_uring: bool,
+    pub sqpoll: bool,
+    pub force: bool,
+}
+
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bool, io_uring: bool, sqpoll: bool, force: bool) -> Result<SortStats> {
+pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats> {
+    let SortOptions { compression, direct_io, io_uring, sqpoll, force } = *opts;
     require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to scan element IDs (significantly slower).")?;

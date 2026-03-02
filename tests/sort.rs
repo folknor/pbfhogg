@@ -7,6 +7,7 @@ use common::{
     TestRelation, TestWay,
 };
 use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::sort::SortOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
 
 /// Write a PBF with deliberately overlapping node blobs.
@@ -122,7 +123,7 @@ fn sort_overlapping_blobs() {
     let output = dir.path().join("sorted.osm.pbf");
 
     write_unsorted_overlapping_pbf(&input);
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false, true).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, sqpoll: false, force: true }).expect("sort");
 
     let result = read_all_elements_with_coords(&output);
 
@@ -159,7 +160,7 @@ fn sort_wrong_type_order() {
     let output = dir.path().join("sorted.osm.pbf");
 
     write_type_unsorted_pbf(&input);
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false, true).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, sqpoll: false, force: true }).expect("sort");
 
     let result = read_all_elements_with_coords(&output);
 
@@ -205,7 +206,7 @@ fn sort_already_sorted() {
         }],
     );
 
-    pbfhogg::commands::sort::sort(&input, &output, Compression::default(), false, false, false, true).expect("sort");
+    pbfhogg::commands::sort::sort(&input, &output, &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, sqpoll: false, force: true }).expect("sort");
 
     let before = read_all_elements_with_coords(&input);
     let after = read_all_elements_with_coords(&output);
@@ -247,7 +248,7 @@ fn sort_cross_validate_osmium() {
     write_unsorted_overlapping_pbf(&input);
 
     // Sort with pbfhogg
-    pbfhogg::commands::sort::sort(&input, &pbfhogg_out, Compression::default(), false, false, false, true)
+    pbfhogg::commands::sort::sort(&input, &pbfhogg_out, &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, sqpoll: false, force: true })
         .expect("pbfhogg sort");
 
     // Sort with osmium
@@ -318,7 +319,7 @@ fn sort_many_overlapping_blobs() {
     writer.flush().expect("flush");
 
     pbfhogg::commands::sort::sort(
-        &input, &output, Compression::default(), false, false, false, true,
+        &input, &output, &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, sqpoll: false, force: true },
     )
     .expect("sort");
 

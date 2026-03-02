@@ -5,13 +5,11 @@ use std::path::Path;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::has_indexdata;
+use super::{require_indexdata, TypeFilter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{Result, BATCH_SIZE};
 type CountMap = FxHashMap<String, FxHashMap<String, u64>>;
-
-const BATCH_SIZE: usize = 64;
 
 /// A single tag count entry: key, value, count.
 pub struct TagCount {
@@ -36,18 +34,10 @@ pub fn tags_count(
     direct_io: bool,
     force: bool,
 ) -> Result<Vec<TagCount>> {
-    if !force && type_filter.is_some() && !has_indexdata(path, direct_io)? {
-        return Err(
+    if type_filter.is_some() {
+        require_indexdata(path, direct_io, force,
             "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-             is a no-op — all blobs are decompressed (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
+             is a no-op — all blobs are decompressed (significantly slower).")?;
     }
 
     let reader = ElementReader::open(path, direct_io)?;
@@ -58,9 +48,7 @@ pub fn tags_count(
         _ => reader,
     };
 
-    let filter_node = type_filter.is_none() || type_filter == Some("node");
-    let filter_way = type_filter.is_none() || type_filter == Some("way");
-    let filter_relation = type_filter.is_none() || type_filter == Some("relation");
+    let tf = TypeFilter::from_single(type_filter);
 
     let mut counts: CountMap = FxHashMap::default();
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
@@ -68,13 +56,13 @@ pub fn tags_count(
     for block_result in reader.into_blocks_pipelined() {
         batch.push(block_result?);
         if batch.len() >= BATCH_SIZE {
-            let batch_counts = count_batch(&batch, filter_node, filter_way, filter_relation);
+            let batch_counts = count_batch(&batch, tf.nodes, tf.ways, tf.relations);
             merge_counts(&mut counts, batch_counts);
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        let batch_counts = count_batch(&batch, filter_node, filter_way, filter_relation);
+        let batch_counts = count_batch(&batch, tf.nodes, tf.ways, tf.relations);
         merge_counts(&mut counts, batch_counts);
     }
 

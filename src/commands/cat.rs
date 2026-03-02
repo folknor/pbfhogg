@@ -5,14 +5,14 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata, has_indexdata};
+use super::{dense_node_metadata, element_metadata, require_indexdata, TypeFilter};
 use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{flush_local, Result, BATCH_SIZE};
 
 /// Statistics from a cat operation.
 pub struct CatStats {
@@ -48,22 +48,11 @@ pub fn cat(
     direct_io: bool,
     force: bool,
 ) -> Result<CatStats> {
-    if !force && type_filter.is_some() {
-        // Check the first file for indexdata
+    if type_filter.is_some() {
         if let Some(first) = files.first() {
-            if !has_indexdata(first, direct_io)? {
-                return Err(
-                    "input PBF has no blob-level indexdata. Without indexdata, the type \
-                     filter is a no-op — all blobs are decompressed (significantly slower).\n\
-                     \n\
-                     Generate an indexed PBF first:\n\
-                     \n\
-                     \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-                     \n\
-                     Or pass --force to proceed anyway."
-                        .into(),
-                );
-            }
+            require_indexdata(first, direct_io, force,
+                "input PBF has no blob-level indexdata. Without indexdata, the type \
+                 filter is a no-op — all blobs are decompressed (significantly slower).")?;
         }
     }
 
@@ -188,21 +177,6 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 // Filtered path: parallel decode + rebuild
 // ---------------------------------------------------------------------------
 
-/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
-const BATCH_SIZE: usize = 64;
-
-/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
-///
-/// Like `flush_block` but writes to a `Vec<OwnedBlock>`
-/// instead of a `PbfWriter`, so it can be called from rayon worker threads
-/// without requiring `&mut PbfWriter`.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(triple) = bb.take_owned()? {
-        output.push(triple);
-    }
-    Ok(())
-}
-
 /// Process a single `PrimitiveBlock` through the type filter, writing matching
 /// elements into the thread-local `BlockBuilder` and flushing complete blocks
 /// into `output`. Returns the number of elements written.
@@ -228,7 +202,7 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) if filter_node => {
                 if !bb.can_add_node() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
@@ -244,7 +218,7 @@ fn process_block(
             }
             Element::Node(n) if filter_node => {
                 if !bb.can_add_node() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
@@ -260,7 +234,7 @@ fn process_block(
             }
             Element::Way(w) if filter_way => {
                 if !bb.can_add_way() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
@@ -272,7 +246,7 @@ fn process_block(
             }
             Element::Relation(r) if filter_relation => {
                 if !bb.can_add_relation() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
@@ -294,12 +268,10 @@ fn process_block(
 
 #[allow(clippy::too_many_lines)]
 fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool) -> Result<CatStats> {
-    let filter_node = filter.split(',').any(|t| t.trim() == "node");
-    let filter_way = filter.split(',').any(|t| t.trim() == "way");
-    let filter_relation = filter.split(',').any(|t| t.trim() == "relation");
+    let tf = TypeFilter::parse(filter);
 
     let single_file = files.len() == 1;
-    let blob_filter = BlobFilter::new(filter_node, filter_way, filter_relation);
+    let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
 
     // -----------------------------------------------------------------------
     // Read header from first file
@@ -333,7 +305,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
 
             if batch.len() >= BATCH_SIZE {
                 let (batch_blobs, batch_elements) = process_batch(
-                    &batch, &mut writer, filter_node, filter_way, filter_relation,
+                    &batch, &mut writer, tf.nodes, tf.ways, tf.relations,
                 )?;
                 blobs_decoded += batch_blobs;
                 elements += batch_elements;
@@ -344,7 +316,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
         // Flush remaining blocks in the final partial batch
         if !batch.is_empty() {
             let (batch_blobs, batch_elements) = process_batch(
-                &batch, &mut writer, filter_node, filter_way, filter_relation,
+                &batch, &mut writer, tf.nodes, tf.ways, tf.relations,
             )?;
             blobs_decoded += batch_blobs;
             elements += batch_elements;
@@ -392,7 +364,7 @@ fn process_batch(
                 // The builder is reused across blocks within this batch, so we
                 // must drain it after each block to avoid mixing elements from
                 // different source blocks.
-                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                flush_local(bb, &mut output)?;
                 Ok((output, count))
             },
         )

@@ -10,7 +10,7 @@ use super::owned_elements::{
 };
 use crate::{BlobFilter, MemberType};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{Result, TypeFilter};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -55,34 +55,6 @@ impl DiffStats {
 }
 
 // ---------------------------------------------------------------------------
-// Type filter
-// ---------------------------------------------------------------------------
-
-struct TypeFilter {
-    nodes: bool,
-    ways: bool,
-    relations: bool,
-}
-
-impl TypeFilter {
-    fn all() -> Self {
-        Self {
-            nodes: true,
-            ways: true,
-            relations: true,
-        }
-    }
-}
-
-fn parse_type_filter(s: &str) -> TypeFilter {
-    TypeFilter {
-        nodes: s.split(',').any(|t| t.trim() == "node"),
-        ways: s.split(',').any(|t| t.trim() == "way"),
-        relations: s.split(',').any(|t| t.trim() == "relation"),
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -100,7 +72,7 @@ pub fn diff(
     direct_io: bool,
 ) -> Result<DiffStats> {
     let filter = match options.type_filter.as_deref() {
-        Some(s) => parse_type_filter(s),
+        Some(s) => TypeFilter::parse(s),
         None => TypeFilter::all(),
     };
 

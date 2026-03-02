@@ -8,7 +8,7 @@ use crate::blob_index::ElemKind;
 use crate::file_reader::FileReader;
 use crate::{BlobDecode, BlobReader, Element};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::Result;
 
 /// Metadata extracted from a PBF file.
 pub struct FileInfo {

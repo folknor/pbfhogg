@@ -14,7 +14,7 @@ use super::owned_elements::{
 };
 use crate::MemberType;
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::Result;
 
 // ---------------------------------------------------------------------------
 // Stats

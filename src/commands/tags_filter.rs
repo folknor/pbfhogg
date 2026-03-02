@@ -5,34 +5,16 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use super::id_set_dense::IdSetDense;
-use super::{dense_node_metadata, element_metadata, has_indexdata};
+use super::{dense_node_metadata, element_metadata, flush_local, require_indexdata, TypeFilter};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{Result, BATCH_SIZE};
 
 // ---------------------------------------------------------------------------
 // Expression types
 // ---------------------------------------------------------------------------
-
-/// Which element types an expression applies to.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TypeFilter {
-    nodes: bool,
-    ways: bool,
-    relations: bool,
-}
-
-impl TypeFilter {
-    fn all() -> Self {
-        Self {
-            nodes: true,
-            ways: true,
-            relations: true,
-        }
-    }
-}
 
 /// What to match on a tag.
 #[derive(Clone, Debug)]
@@ -265,19 +247,9 @@ pub fn tags_filter(
     direct_io: bool,
     force: bool,
 ) -> Result<TagsFilterStats> {
-    if !force && !has_indexdata(input, direct_io)? {
-        return Err(
-            "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
-             filters are no-ops — all blobs are decompressed (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
-    }
+    require_indexdata(input, direct_io, force,
+        "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
+         filters are no-ops — all blobs are decompressed (significantly slower).")?;
 
     let expressions = parse_expressions(expression_strs)?;
     if omit_referenced {
@@ -291,14 +263,6 @@ pub fn tags_filter(
 // Single-pass filter (-R mode)
 // ---------------------------------------------------------------------------
 
-const BATCH_SIZE: usize = 64;
-
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), String> {
-    if let Some(triple) = bb.take_owned().map_err(|e| e.to_string())? {
-        output.push(triple);
-    }
-    Ok(())
-}
 
 /// Process a single block through tag-filter expressions on a rayon thread.
 /// Returns per-block stats.

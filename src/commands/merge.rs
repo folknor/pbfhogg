@@ -29,13 +29,10 @@ use crate::osc::{parse_osc_file, CompactDiffOverlay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
-use super::{flush_passthrough_buf, has_indexdata, read_raw_frame, RawBlobFrame};
+use super::{flush_local, flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame};
 
-type MergeResult<T> = Result<T, Box<dyn std::error::Error>>;
+use super::{Result, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
-const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
-const BATCH_MIN_BLOBS: usize = 8;
-const BATCH_MAX_BLOBS: usize = 128;
 const READER_CHANNEL_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
@@ -441,7 +438,7 @@ use super::{dense_node_raw_metadata, element_raw_metadata, flush_block};
 fn ensure_node_capacity(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_node() {
         flush_block(bb, writer)?;
     }
@@ -451,7 +448,7 @@ fn ensure_node_capacity(
 fn ensure_way_capacity(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_way() {
         flush_block(bb, writer)?;
     }
@@ -461,20 +458,9 @@ fn ensure_way_capacity(
 fn ensure_relation_capacity(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_relation() {
         flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Local flush helpers for parallel rewrite (no PbfWriter)
-// ---------------------------------------------------------------------------
-
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> MergeResult<()> {
-    if let Some(triple) = bb.take_owned()? {
-        output.push(triple);
     }
     Ok(())
 }
@@ -482,7 +468,7 @@ fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> MergeResu
 fn ensure_node_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_node() {
         flush_local(bb, output)?;
     }
@@ -492,7 +478,7 @@ fn ensure_node_capacity_local(
 fn ensure_way_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_way() {
         flush_local(bb, output)?;
     }
@@ -502,7 +488,7 @@ fn ensure_way_capacity_local(
 fn ensure_relation_capacity_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if !bb.can_add_relation() {
         flush_local(bb, output)?;
     }
@@ -517,7 +503,7 @@ fn write_osc_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     way: &crate::osc::CompactWayRef<'_>,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_way_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = way.tags().collect();
     let refs: Vec<i64> = way.refs().collect();
@@ -529,7 +515,7 @@ fn write_osc_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     rel: &crate::osc::CompactRelationRef<'_>,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_relation_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = rel.tags().collect();
     let members: Vec<MemberData<'_>> = rel
@@ -552,7 +538,7 @@ fn write_base_dense_node_local(
     output: &mut Vec<OwnedBlock>,
     dn: &crate::DenseNode<'_>,
     block: &PrimitiveBlock,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
@@ -574,7 +560,7 @@ fn write_base_node_local(
     output: &mut Vec<OwnedBlock>,
     node: &crate::Node<'_>,
     block: &PrimitiveBlock,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_node_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
@@ -596,7 +582,7 @@ fn write_base_way_local(
     output: &mut Vec<OwnedBlock>,
     way: &crate::Way<'_>,
     block: &PrimitiveBlock,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
@@ -617,7 +603,7 @@ fn write_base_relation_local(
     output: &mut Vec<OwnedBlock>,
     rel: &crate::Relation<'_>,
     block: &PrimitiveBlock,
-) -> MergeResult<()> {
+) -> Result<()> {
     ensure_relation_capacity_local(bb, output)?;
     if !bb.is_pre_seeded() {
         flush_local(bb, output)?;
@@ -639,14 +625,14 @@ fn write_base_relation_local(
 // Header handling
 // ---------------------------------------------------------------------------
 
-fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
+fn build_header_bytes(header: &crate::HeaderBlock) -> Result<Vec<u8>> {
     Ok(crate::block_builder::HeaderBuilder::from_header(header)
         .sorted()
         .build()?)
 }
 
 /// Read the OSMHeader blob from a base PBF and return rebuilt header bytes.
-fn read_header(base_pbf: &Path, direct_io: bool) -> MergeResult<Vec<u8>> {
+fn read_header(base_pbf: &Path, direct_io: bool) -> Result<Vec<u8>> {
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
     loop {
@@ -667,12 +653,12 @@ fn spawn_reader_thread(
     base_pbf: &Path,
     direct_io: bool,
 ) -> (
-    std::thread::JoinHandle<Result<(), String>>,
+    std::thread::JoinHandle<std::result::Result<(), String>>,
     mpsc::Receiver<RawBlobFrame>,
 ) {
     let base_path = base_pbf.to_path_buf();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
-    let handle = std::thread::spawn(move || -> Result<(), String> {
+    let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
         let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
         let mut file_offset: u64 = 0;
         let mut past_header = false;
@@ -762,7 +748,7 @@ fn emit_create_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     stats: &mut MergeStats,
-) -> MergeResult<()> {
+) -> Result<()> {
     match kind {
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
@@ -813,7 +799,7 @@ fn rewrite_block_parallel(
     bb: &mut BlockBuilder,
     inline_upserts: &[i64],
     kind: ElemKind,
-) -> MergeResult<RewriteOutput> {
+) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
     let mut upsert_cursor: usize = 0;
@@ -987,7 +973,7 @@ fn classify_only(
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
     buf: &mut Vec<u8>,
-) -> Result<ClassifyResult, String> {
+) -> std::result::Result<ClassifyResult, String> {
     let has_indexdata = frame.index.is_some();
 
     // Fast path: use inline index from BlobHeader indexdata (no decompression).
@@ -1035,7 +1021,7 @@ fn emit_create_for_output(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-) -> MergeResult<()> {
+) -> Result<()> {
     match kind {
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
@@ -1088,20 +1074,10 @@ pub fn merge(
     io_uring: bool,
     sqpoll: bool,
     force: bool,
-) -> MergeResult<MergeStats> {
-    if !force && !has_indexdata(base_pbf, direct_io)? {
-        return Err(
-            "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
-             decompressed to classify elements (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
-    }
+) -> Result<MergeStats> {
+    require_indexdata(base_pbf, direct_io, force,
+        "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
+         decompressed to classify elements (significantly slower).")?;
 
     // Step 1: Parse the diff
     #[cfg(feature = "hotpath")]
@@ -1208,7 +1184,7 @@ pub fn merge(
         // Phase 1: Parallel classify
         #[cfg(feature = "hotpath")]
         let phase1_start = std::time::Instant::now();
-        let classify_results: Vec<Result<ClassifyResult, String>> = batch
+        let classify_results: Vec<std::result::Result<ClassifyResult, String>> = batch
             .par_iter()
             .map_init(
                 Vec::new,
@@ -1264,7 +1240,7 @@ pub fn merge(
 
         let rewrite_count = rewrite_jobs.len();
         let (rewrite_tx, rewrite_rx) =
-            mpsc::sync_channel::<(usize, Result<RewriteOutput, String>)>(
+            mpsc::sync_channel::<(usize, std::result::Result<RewriteOutput, String>)>(
                 rayon::current_num_threads().min(rewrite_count.max(1)),
             );
 
@@ -1508,7 +1484,7 @@ fn flush_remaining_upserts(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-) -> MergeResult<()> {
+) -> Result<()> {
     // Flush remaining creates of the previous type
     let (cursor, upserts) = cursors.get_mut(prev, ranges);
     while *cursor < upserts.len() {
@@ -1541,7 +1517,7 @@ fn emit_gap_creates(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
-) -> MergeResult<()> {
+) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
     while *cursor < upserts.len() && upserts[*cursor] < min_id {
         emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats)?;
@@ -1558,7 +1534,7 @@ fn coalesce_passthrough(
     index: &BlobIndex,
     has_indexdata: bool,
     buf: &mut Vec<u8>,
-) -> MergeResult<()> {
+) -> Result<()> {
     if has_indexdata {
         let bytes = std::mem::take(&mut frame.frame_bytes);
         buf.extend_from_slice(&bytes);

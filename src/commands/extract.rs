@@ -8,9 +8,9 @@ use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{Result, BATCH_SIZE};
 
-use super::has_indexdata;
+use super::{flush_local, require_indexdata};
 use super::id_set_dense::IdSetDense;
 
 // ---------------------------------------------------------------------------
@@ -449,18 +449,10 @@ pub fn extract(
     direct_io: bool,
     force: bool,
 ) -> Result<ExtractStats> {
-    if !force && !matches!(strategy, ExtractStrategy::Simple) && !has_indexdata(input, direct_io)? {
-        return Err(
+    if !matches!(strategy, ExtractStrategy::Simple) {
+        require_indexdata(input, direct_io, force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
-             filter is a no-op — all blobs are decompressed (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
+             filter is a no-op — all blobs are decompressed (significantly slower).")?;
     }
     match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, compression, direct_io),
@@ -473,14 +465,6 @@ pub fn extract(
 // Parallel batch infrastructure
 // ---------------------------------------------------------------------------
 
-const BATCH_SIZE: usize = 64;
-
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), String> {
-    if let Some(triple) = bb.take_owned().map_err(|e| e.to_string())? {
-        output.push(triple);
-    }
-    Ok(())
-}
 
 fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
     target.nodes_in_bbox += source.nodes_in_bbox;

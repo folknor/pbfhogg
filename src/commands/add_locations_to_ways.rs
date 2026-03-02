@@ -16,9 +16,9 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{flush_passthrough_buf, has_indexdata, read_raw_frame, RawBlobFrame};
+use super::{flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
 // ---------------------------------------------------------------------------
 // Index type
@@ -401,20 +401,9 @@ pub fn add_locations_to_ways(
     index_type: IndexType,
     force: bool,
 ) -> Result<Stats> {
-    let indexdata_present = has_indexdata(input, direct_io)?;
-    if !indexdata_present && !force {
-        return Err(
-            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-             decompressed and re-encoded (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
-    }
+    let indexdata_present = require_indexdata(input, direct_io, force,
+        "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+         decompressed and re-encoded (significantly slower).")?;
     let index = build_node_index(input, direct_io, index_type)?;
     write_output_checked(input, output, &index, keep_untagged_nodes, compression, direct_io, indexdata_present)
 }
@@ -537,16 +526,6 @@ fn index_batch_hash(batch: &[PrimitiveBlock]) -> FxHashMap<i64, (i32, i32)> {
 // Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
 
-/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
-/// (used by the decode-all fallback path).
-const BATCH_SIZE: usize = 64;
-
-/// Byte budget for slot batches in the passthrough path.
-const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
-/// Minimum blobs before the byte budget is checked.
-const BATCH_MIN_BLOBS: usize = 8;
-/// Hard cap on blobs per batch.
-const BATCH_MAX_BLOBS: usize = 128;
 
 fn write_output_checked(
     input: &Path,
@@ -624,15 +603,7 @@ fn write_output_decode_all(
 // Parallel batch processing
 // ---------------------------------------------------------------------------
 
-use super::{dense_node_metadata, element_metadata};
-
-/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(triple) = bb.take_owned()? {
-        output.push(triple);
-    }
-    Ok(())
-}
+use super::{dense_node_metadata, element_metadata, flush_local};
 
 fn merge_stats(dst: &mut Stats, src: &Stats) {
     dst.nodes_read += src.nodes_read;
@@ -677,7 +648,7 @@ fn process_block(
                 let has_tags = dn.tags().next().is_some();
                 if keep_untagged_nodes || has_tags {
                     if !bb.can_add_node() {
-                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                        flush_local(bb, output)?;
                     }
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
@@ -693,7 +664,7 @@ fn process_block(
                 let has_tags = n.tags().next().is_some();
                 if keep_untagged_nodes || has_tags {
                     if !bb.can_add_node() {
-                        flush_local(bb, output).map_err(|e| e.to_string())?;
+                        flush_local(bb, output)?;
                     }
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
@@ -706,7 +677,7 @@ fn process_block(
             }
             Element::Way(w) => {
                 if !bb.can_add_way() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
@@ -728,7 +699,7 @@ fn process_block(
             }
             Element::Relation(r) => {
                 if !bb.can_add_relation() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
@@ -765,7 +736,7 @@ fn process_batch(
                     block, bb, &mut output, index, keep_untagged_nodes,
                     refs_buf, locations_buf,
                 )?;
-                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },
         )
@@ -1049,7 +1020,7 @@ fn process_slot_batch(
                     refs_buf, locations_buf,
                 )?;
 
-                flush_local(bb, output).map_err(|e| e.to_string())?;
+                flush_local(bb, output)?;
                 Ok((std::mem::take(output), block_stats))
             },
         )

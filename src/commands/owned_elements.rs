@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::{BlobDecode, BlobFilter, BlobReader, Element, MemberId};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::Result;
 
 // ---------------------------------------------------------------------------
 // Owned element types — Vec fields are not converted to Box<[T]> because these

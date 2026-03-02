@@ -23,9 +23,7 @@ use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{Element, MemberId};
 
-use super::has_indexdata;
-
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::{require_indexdata, Result};
 
 /// Statistics from a sort operation.
 pub struct SortStats {
@@ -152,19 +150,9 @@ impl Ord for OwnedRelation {
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn sort(input: &Path, output: &Path, compression: Compression, direct_io: bool, io_uring: bool, sqpoll: bool, force: bool) -> Result<SortStats> {
-    if !force && !has_indexdata(input, direct_io)? {
-        return Err(
-            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
-             decompressed to scan element IDs (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
-    }
+    require_indexdata(input, direct_io, force,
+        "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+         decompressed to scan element IDs (significantly slower).")?;
 
     // Pass 1: Build blob index
     eprintln!("Pass 1: indexing blobs...");

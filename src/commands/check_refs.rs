@@ -6,7 +6,7 @@ use roaring::RoaringTreemap;
 
 use crate::{BlobFilter, Element, ElementReader, MemberId};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+use super::Result;
 
 /// Result of a referential integrity check.
 pub struct RefCheckResult {

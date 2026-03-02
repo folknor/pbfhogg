@@ -14,15 +14,7 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
-## Memory work
-
-Merge instrumentation (peak RSS, per-phase RSS/timers, blob stats, rewrite ratio)
-is complete. Memory optimization research (E1.1–E3.1) is done. Pipeline reference
-in `notes/pipeline.md`.
-
-- [x] ~~I/O throughput in bench-merge.~~ Done.
-
-## Performance: parallelism
+## Performance: parallelism (low priority)
 
 - [ ] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
   `READ_AHEAD` bounds the `sync_channel` between the I/O thread (Stage 1) and
@@ -129,13 +121,6 @@ All CLI commands now beat osmium except extract --simple.
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
-- [x] Fix crate-level doc example: `"0.1"` → `"0.2"`
-- [x] Doc comments on `writer.rs` public API — already complete (PbfWriter, Compression, all methods)
-- [x] Doc comments on `block_builder.rs` public API — already complete (BlockBuilder, Metadata, MemberData, HeaderBuilder)
-- [x] Crate-level write workflow docs in `lib.rs` (sync + pipelined examples)
-- [x] ~~Tighten module visibility~~ — `commands` and command re-exports are
-  `#[doc(hidden)]`, `file_reader`/`file_writer` are `pub(crate)`
-- [x] Fix `error.rs:30` doc: "when reading PBF files" → "when reading or writing PBF files"
 - [ ] Publish to crates.io
 
 ## GitHub
@@ -151,16 +136,6 @@ All CLI commands now beat osmium except extract --simple.
 
 ## Code TODOs
 
-- [x] ~~OSC parsing lat/lon fallback~~ — Not a real issue. Delete nodes
-  early-return before lat/lon parsing. Create/modify nodes always carry
-  lat/lon per the OSM API spec. Verified across Denmark + Germany diffs
-  (0 nodes without lat/lon). Comment added to `src/osc.rs`.
-
-- [x] ~~**Merge function complexity hotspot:**~~ Refactored: `UpsertCursors`
-  struct (eliminated 6 repeated 3-arm matches), extracted `read_header`,
-  `spawn_reader_thread`, `collect_batch` helpers, simplified trailing creates
-  (merged duplicate if/else paths). `merge()` 503→410 lines (-18%).
-
 - [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
   unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →
   fetch dependent nodes) and `for_each_node`. A `read_relations_and_deps` would
@@ -172,14 +147,7 @@ All CLI commands now beat osmium except extract --simple.
   park until a concrete consumer exists (e.g. extract --smart, or a library user
   doing relation-based filtering).
 
-## Performance review: remaining items
-
-Performance review (boxes 1-8) is complete — 20/24 items implemented.
-Full review was in `notes/perf-review/` (deleted). Cross-reference synthesis
-had the unified priority list. The 4 open tracked items and minor uncaptured
-items are preserved below.
-
-### Open tracked items
+## Performance review
 
 - [ ] **P2-12: Remove sqpoll code path from io_uring writer.** `uring_writer.rs`
   has `sqpoll` support (`setup_sqpoll(2000)`, `push_sqe_pair` SQ overflow
@@ -209,6 +177,67 @@ items are preserved below.
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
-## Nice to have
+## Code quality: duplicated business logic
 
-- [ ] Consider adding `serde` feature for element serialization
+Audit findings from code quality review. Ranked by effort/impact.
+
+### High value (trivial effort) — DONE
+
+All 5 items consolidated into `src/commands/mod.rs`:
+- `require_indexdata` helper (replaced 9 copy-pasted error blocks)
+- `flush_local` (replaced 6 identical functions)
+- `BATCH_SIZE` + byte-budget constants (replaced 7 local definitions)
+- `type Result<T>` alias made `pub(crate)` (replaced 13 local aliases)
+- `TypeFilter` struct with `parse`/`from_single`/`all` (replaced 4 definitions)
+
+### Medium value (moderate effort)
+
+- [ ] **Batch collection loop.** The pattern of collecting `PrimitiveBlock`s into
+  a `Vec`, dispatching to rayon when full, then clearing — appears 10+ times
+  across 6 files. A `for_each_batch` helper would save ~120 lines.
+
+- [ ] **Parallel batch drain.** The sequential "drain results, merge stats, write
+  OwnedBlocks" loop appears 7+ times across 5 files. A generic
+  `drain_batch_results` helper would save ~140-210 lines.
+
+- [ ] **`RawBlobFrame` duplication in `cat.rs`.** `cat.rs:81-127` defines its own
+  `RawBlobFrame` struct + `read_raw_frame` function (~45 lines) that duplicates
+  the shared version in `mod.rs:41-104`. The `mod.rs` version is a superset.
+
+- [ ] **`ReorderBuffer<T>` utility.** Identical VecDeque-based reorder logic in
+  `writer.rs:620-656`, `uring_writer.rs:710-750`, and `pipeline.rs:189-230`.
+  The uring_writer even comments "identical reorder logic." ~40 lines x 3 sites.
+
+- [ ] **Owned element types.** `sort.rs:74-141` and `owned_elements.rs:14-39`
+  both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata
+  (~170 lines). Could share a base with optional extensions.
+
+- [ ] **CLI flag groups.** `direct_io` on 15 subcommands, `compression` on 9,
+  `force` on 9, `output` on 9 in `cli/src/main.rs`. Use clap
+  `#[command(flatten)]` with shared structs. Also `parse_compression` should be
+  a `FromStr` impl on `Compression`.
+
+### Lower value (hygiene)
+
+- [ ] **`FrameScratch` default.** Struct literal repeated 7 times in `writer.rs`.
+  Add `Default` impl or `FrameScratch::new()`.
+
+- [ ] **Header + writer setup helper.** 9 instances of read header →
+  `HeaderBuilder::from_header` → preserve sorted → build → open pipelined
+  writer. Could be a shared helper in `mod.rs`.
+
+- [ ] **`member_type_value` consolidation.** MemberType→int mapping in
+  `block_builder.rs:200-209` and `osc.rs:149-152`. An
+  `impl From<MemberType> for i32` centralizes it.
+
+- [ ] **`#[doc(hidden)]` vs `pub(crate)` on commands.** Downstream crates
+  (elivagar, nidhogg) call command functions. Either make them properly public
+  or `pub(crate)` — the current middle ground is confusing.
+
+- [ ] **Options structs for `merge()` and `sort()`.** Both take 7-8 args with
+  3-4 boolean flags. `diff` already uses `DiffOptions` as a pattern.
+
+- [ ] **`decompress_blob` near-duplication.** `blob.rs` has `decompress_blob`
+  (lines 1042-1081, returns `Bytes`) and `decompress_parsed_blob_into` (lines
+  958-991, writes to `&mut Vec<u8>`) with near-identical match arms. Could
+  share the decompression logic.

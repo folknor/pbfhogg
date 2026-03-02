@@ -5,16 +5,13 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata, has_indexdata};
+use super::{dense_node_metadata, element_metadata, flush_local, require_indexdata};
 use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-
-/// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon.
-const BATCH_SIZE: usize = 64;
+use super::{Result, BATCH_SIZE};
 
 // ---------------------------------------------------------------------------
 // ID parsing
@@ -117,20 +114,10 @@ pub fn getid(
     direct_io: bool,
     force: bool,
 ) -> Result<GetidStats> {
-    if !force && !has_indexdata(input, direct_io)? {
-        return Err(
-            "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-             based on requested ID types is a no-op — all blobs are decompressed \
-             (significantly slower).\n\
-             \n\
-             Generate an indexed PBF first:\n\
-             \n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\
-             \n\
-             Or pass --force to proceed anyway."
-                .into(),
-        );
-    }
+    require_indexdata(input, direct_io, force,
+        "input PBF has no blob-level indexdata. Without indexdata, the type filter \
+         based on requested ID types is a no-op — all blobs are decompressed \
+         (significantly slower).")?;
 
     if add_referenced {
         getid_with_refs(input, output, ids, compression, direct_io)
@@ -293,18 +280,6 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 // Parallel batch processing
 // ---------------------------------------------------------------------------
 
-/// Flush the current block from a [`BlockBuilder`] into a local output buffer.
-///
-/// Like `flush_block` but writes to a `Vec<OwnedBlock>`
-/// instead of a `PbfWriter`, so it can be called from rayon worker threads
-/// without requiring `&mut PbfWriter`.
-fn flush_local(bb: &mut BlockBuilder, output: &mut Vec<OwnedBlock>) -> std::result::Result<(), Box<dyn std::error::Error>> {
-    if let Some(triple) = bb.take_owned()? {
-        output.push(triple);
-    }
-    Ok(())
-}
-
 /// Process a single `PrimitiveBlock` through the ID filter, writing matching
 /// elements into the thread-local `BlockBuilder` and flushing complete blocks
 /// into `output`. Returns `(nodes, ways, relations)` counts.
@@ -347,7 +322,7 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) => {
                 if !bb.can_add_node() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
@@ -357,7 +332,7 @@ fn process_block(
             }
             Element::Node(n) => {
                 if !bb.can_add_node() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
@@ -367,7 +342,7 @@ fn process_block(
             }
             Element::Way(w) => {
                 if !bb.can_add_way() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
@@ -379,7 +354,7 @@ fn process_block(
             }
             Element::Relation(r) => {
                 if !bb.can_add_relation() {
-                    flush_local(bb, output).map_err(|e| e.to_string())?;
+                    flush_local(bb, output)?;
                 }
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
@@ -423,7 +398,7 @@ fn process_filter_batch(
                 let (nodes, ways, relations) = process_block(
                     block, bb, &mut output, ids, include, dep_node_ids,
                 )?;
-                flush_local(bb, &mut output).map_err(|e| e.to_string())?;
+                flush_local(bb, &mut output)?;
                 Ok((output, nodes, ways, relations))
             },
         )

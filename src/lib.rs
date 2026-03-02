@@ -153,14 +153,13 @@ pub use read::block::*;
 pub use read::dense::*;
 pub use read::elements::*;
 pub use read::indexed::*;
-pub use read::mmap_blob::*;
 pub use read::reader::*;
 pub use blob_index::{BlobBbox, BlobFilter};
 pub use error::{BlobError, Error, ErrorKind, Result};
 
 // Module re-exports: short internal paths (`crate::blob`, `crate::block_builder`, etc.)
 // Required by imports and doc links in commands/, read/, and write/ modules.
-pub use read::{blob, block, dense, elements, indexed, mmap_blob, reader};
+pub use read::{blob, block, dense, elements, indexed, reader};
 pub(crate) use read::file_reader;
 pub use write::{block_builder, writer};
 pub(crate) use write::file_writer;

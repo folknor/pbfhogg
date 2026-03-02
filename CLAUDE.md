@@ -17,7 +17,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`).
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `brokkr run [args]` — build release CLI and run with passthrough args (e.g., `brokkr run fileinfo tests/test.osm.pbf`).
-- `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (5 modes: sequential, parallel, pipelined, mmap, blobreader). Results stored in SQLite. Default variant: indexed.
+- `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (4 modes: sequential, parallel, pipelined, blobreader). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench write [--dataset name] [--variant V] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite. Default variant: indexed.
 - `brokkr bench merge [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite. Default variant: indexed.
 - `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (19 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
@@ -86,7 +86,6 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 **Read path:** `BlobReader` (blob.rs) -> `PrimitiveBlock` (block.rs) -> `Element` (elements.rs)
 - `ElementReader` (reader.rs): high-level sequential/parallel/pipelined iteration. Parses the PBF header eagerly at construction — `header()` returns `&HeaderBlock` with metadata including `is_sorted()` (Sort.Type_then_ID). Debug builds assert monotonic node IDs when sorted. `for_each_block_pipelined` delivers owned `PrimitiveBlock`s for consumers that need to send blocks to other threads for parallel processing. `into_blocks_pipelined` returns an `Iterator<Item = Result<PrimitiveBlock>>` for loop control (early exit, zipping two files); requires `R: 'static`.
-- `MmapBlobReader` (mmap_blob.rs): zero-copy memory-mapped reading
 - `IndexedReader` (indexed.rs): seekable reader with blob-level index for filtered queries
 - `pipeline.rs`: 3-stage pipelined decoder (IO thread -> rayon pool -> reorder buffer)
 

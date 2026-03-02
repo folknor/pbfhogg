@@ -1,7 +1,7 @@
-//! Tests for reading path equivalence: mmap, pipeline, par_map_reduce, and seek operations.
+//! Tests for reading path equivalence: pipeline, par_map_reduce, and seek operations.
 //!
 //! Verifies that all reading modes produce identical results and that seek
-//! operations work correctly on both BlobReader and MmapBlobReader.
+//! operations work correctly on BlobReader.
 #![allow(clippy::unwrap_used, clippy::cognitive_complexity, clippy::too_many_lines)]
 
 use std::io::SeekFrom;
@@ -9,10 +9,7 @@ use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{
-    BlobDecode, BlobReader, BlobType, ByteOffset, Element, ElementReader, Mmap, MemberId,
-    MmapBlobReader,
-};
+use pbfhogg::{BlobReader, BlobType, ByteOffset, Element, ElementReader, MemberId};
 use tempfile::TempDir;
 
 /// Write a multi-block PBF to the given path.
@@ -81,114 +78,6 @@ fn collect_sequential(path: &Path) -> Vec<(char, i64)> {
         })
         .unwrap();
     result
-}
-
-// ---------------------------------------------------------------------------
-// MmapBlobReader tests
-// ---------------------------------------------------------------------------
-
-/// MmapBlobReader produces the same elements as BlobReader for the same file.
-#[test]
-fn mmap_matches_blobreader() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("test.osm.pbf");
-    write_test_pbf(&path);
-
-    // Collect via BlobReader
-    let blob_elements: Vec<(char, i64)> = {
-        let mut result = Vec::new();
-        let reader = BlobReader::from_path(&path).unwrap();
-        for blob in reader {
-            let blob = blob.unwrap();
-            if let BlobDecode::OsmData(block) = blob.decode().unwrap() {
-                for element in block.elements() {
-                    result.push(element_id(&element));
-                }
-            }
-        }
-        result
-    };
-
-    // Collect via MmapBlobReader
-    let mmap_elements: Vec<(char, i64)> = {
-        let mut result = Vec::new();
-        let mmap = unsafe { Mmap::from_path(&path).unwrap() };
-        let reader = MmapBlobReader::new(mmap);
-        for blob in reader {
-            let blob = blob.unwrap();
-            if let BlobDecode::OsmData(block) = blob.decode().unwrap() {
-                for element in block.elements() {
-                    result.push(element_id(&element));
-                }
-            }
-        }
-        result
-    };
-
-    assert_eq!(blob_elements, mmap_elements);
-    assert_eq!(blob_elements.len(), 6); // 3 nodes + 2 ways + 1 relation
-}
-
-/// MmapBlobReader reports correct blob types and monotonically increasing offsets.
-#[test]
-fn mmap_blob_types_and_offsets() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("test.osm.pbf");
-    write_test_pbf(&path);
-
-    let mmap = unsafe { Mmap::from_path(&path).unwrap() };
-    let reader = MmapBlobReader::new(mmap);
-
-    let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
-
-    // 4 blobs: 1 header + 3 data
-    assert_eq!(blobs.len(), 4);
-    assert_eq!(blobs[0].get_type(), BlobType::OsmHeader);
-    for blob in &blobs[1..] {
-        assert_eq!(blob.get_type(), BlobType::OsmData);
-    }
-
-    // Offsets start at 0 and increase
-    assert_eq!(blobs[0].offset(), ByteOffset(0));
-    for i in 1..blobs.len() {
-        assert!(
-            blobs[i].offset().0 > blobs[i - 1].offset().0,
-            "offsets must be monotonically increasing"
-        );
-    }
-}
-
-/// MmapBlobReader::seek repositions to a known blob.
-#[test]
-fn mmap_seek() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("test.osm.pbf");
-    write_test_pbf(&path);
-
-    let mmap = unsafe { Mmap::from_path(&path).unwrap() };
-    let mut reader = MmapBlobReader::new(mmap);
-
-    let _header = reader.next().unwrap().unwrap();
-    let first_data = reader.next().unwrap().unwrap();
-    let target_offset = first_data.offset();
-
-    // Decode the first data block
-    let expected: Vec<(char, i64)> = match first_data.decode().unwrap() {
-        BlobDecode::OsmData(block) => block.elements().map(|e| element_id(&e)).collect(),
-        _ => panic!("expected OsmData"),
-    };
-
-    // Seek back and re-read
-    reader.seek(target_offset);
-    let re_read = reader.next().unwrap().unwrap();
-    assert_eq!(re_read.offset(), target_offset);
-
-    let actual: Vec<(char, i64)> = match re_read.decode().unwrap() {
-        BlobDecode::OsmData(block) => block.elements().map(|e| element_id(&e)).collect(),
-        _ => panic!("expected OsmData"),
-    };
-
-    assert_eq!(expected, actual);
 }
 
 // ---------------------------------------------------------------------------

@@ -3,13 +3,12 @@ pbfhogg
 
 Fast OpenStreetMap PBF reader and writer for Rust.
 
-Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with PBF writing, pipelined parallel decoding, memory-mapped reading, and blob passthrough for efficient merge workflows.
+Originally a fork of [osmpbf](https://github.com/b-r-u/osmpbf/), extended with PBF writing, pipelined parallel decoding, and blob passthrough for efficient merge workflows.
 
 ## Features
 
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder
 - **Write** valid `.osm.pbf` files with `HeaderBuilder`, `BlockBuilder`, and `PbfWriter` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
-- **Memory-mapped reading** via `MmapBlobReader` for zero-copy blob iteration
 - **Blob passthrough** (`write_raw` / `copy_file_range`) for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
 - **Blob indexdata** — embeds element type + ID range + spatial bbox in BlobHeader for fast merge classification and spatial filtering without decompression
 - **Blob tag index** — embeds per-blob tag key metadata in BlobHeader field 4; the pipeline skips decompression of blobs that provably lack required tag keys (e.g. `tags-filter highway=primary` skips all blobs without a `highway` key)
@@ -130,7 +129,6 @@ Read throughput — count all 59M elements in Denmark extract (461 MB), best of 
 | **pbfhogg** | pipelined | **1.3s** | `for_each_pipelined`, preserves file order |
 | Planetiler 0.10 | parallel | 2.0s | Java, `OsmInputFile` + thread pool |
 | **pbfhogg** | sequential | 2.8s | `for_each` |
-| **pbfhogg** | mmap | 2.9s | `MmapBlobReader` sequential decode |
 | **pbfhogg** | blobreader | 2.9s | `BlobReader` sequential decode |
 | osmpbf 0.3 | sequential | 5.6s | upstream `for_each` |
 | osmium 1.19 | cat → opl | 5.7s | `osmium cat -f opl -o /dev/null` |

@@ -306,7 +306,7 @@ enum Command {
     BenchRead {
         /// Input PBF file
         file: PathBuf,
-        /// Read mode: sequential, parallel, pipelined, mmap, blobreader
+        /// Read mode: sequential, parallel, pipelined, blobreader
         #[arg(long)]
         mode: String,
     },
@@ -854,28 +854,6 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
             })?;
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
-        "mmap" => {
-            let mmap = unsafe { pbfhogg::Mmap::from_path(path) }?;
-            let reader = pbfhogg::MmapBlobReader::new(mmap);
-            let mut nodes = 0u64;
-            let mut ways = 0u64;
-            let mut rels = 0u64;
-            let start = Instant::now();
-            for blob_result in reader {
-                let blob = blob_result?;
-                if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
-                    for el in block.elements() {
-                        match el {
-                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
-                            pbfhogg::Element::Way(_) => ways += 1,
-                            pbfhogg::Element::Relation(_) => rels += 1,
-                            _ => {}
-                        }
-                    }
-                }
-            }
-            (start.elapsed().as_millis(), nodes, ways, rels)
-        }
         "blobreader" => {
             use std::io::BufReader;
             let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
@@ -898,7 +876,7 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
             }
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
-        other => return Err(format!("unknown read mode: {other} (expected: sequential, parallel, pipelined, mmap, blobreader)").into()),
+        other => return Err(format!("unknown read mode: {other} (expected: sequential, parallel, pipelined, blobreader)").into()),
     };
 
     eprintln!("elapsed_ms={elapsed_ms}");

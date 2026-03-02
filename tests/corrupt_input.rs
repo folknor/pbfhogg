@@ -1,6 +1,6 @@
 //! Tests for error handling with corrupt/malformed PBF input.
 //!
-//! Verifies that BlobReader and MmapBlobReader produce correct errors (not panics)
+//! Verifies that BlobReader produces correct errors (not panics)
 //! when given truncated, oversized, or garbage data.
 #![allow(
     clippy::unwrap_used,
@@ -13,8 +13,7 @@ use std::io::Cursor;
 
 use pbfhogg::block_builder::{self, BlockBuilder};
 use pbfhogg::writer::{Compression, PbfWriter};
-use pbfhogg::{BlobError, BlobReader, BlobType, ErrorKind, Mmap, MmapBlobReader};
-use tempfile::TempDir;
+use pbfhogg::{BlobError, BlobReader, BlobType, ErrorKind};
 
 /// Write a minimal valid PBF (header blob only, no data blocks) into a Vec.
 fn write_header_only_pbf() -> Vec<u8> {
@@ -168,60 +167,3 @@ fn iteration_stops_after_error() {
     assert!(reader.next().is_none());
 }
 
-// ---------------------------------------------------------------------------
-// MmapBlobReader error tests
-// ---------------------------------------------------------------------------
-
-/// Mmapping an empty file either fails at mmap creation or returns None on iteration.
-#[test]
-fn mmap_empty_file() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("empty.pbf");
-    std::fs::write(&path, b"").unwrap();
-
-    let file = std::fs::File::open(&path).unwrap();
-    match unsafe { Mmap::from_file(&file) } {
-        Ok(mmap) => {
-            // If mmap succeeds on a zero-length file, iteration should yield None
-            let mut reader = MmapBlobReader::new(mmap);
-            assert!(reader.next().is_none());
-        }
-        Err(_) => {
-            // mmap of empty file failed — also acceptable (EINVAL on most platforms)
-        }
-    }
-}
-
-/// MmapBlobReader on 1-3 bytes returns InvalidHeaderSize.
-#[test]
-fn mmap_truncated_header_size() {
-    let dir = TempDir::new().unwrap();
-    for len in 1..=3 {
-        let path = dir.path().join(format!("truncated_{len}.pbf"));
-        std::fs::write(&path, vec![0xAA; len]).unwrap();
-
-        let mmap = unsafe { Mmap::from_path(&path).unwrap() };
-        let mut reader = MmapBlobReader::new(mmap);
-        let err = reader.next().unwrap().unwrap_err();
-        match err.into_kind() {
-            ErrorKind::Blob(BlobError::InvalidHeaderSize) => {}
-            other => panic!("expected InvalidHeaderSize for {len} bytes, got {other:?}"),
-        }
-    }
-}
-
-/// MmapBlobReader on garbage data returns HeaderTooBig (0xFFFFFFFF >> MAX).
-#[test]
-fn mmap_corrupt_data() {
-    let dir = TempDir::new().unwrap();
-    let path = dir.path().join("corrupt.pbf");
-    std::fs::write(&path, [0xFF; 100]).unwrap();
-
-    let mmap = unsafe { Mmap::from_path(&path).unwrap() };
-    let mut reader = MmapBlobReader::new(mmap);
-    let err = reader.next().unwrap().unwrap_err();
-    match err.into_kind() {
-        ErrorKind::Blob(BlobError::HeaderTooBig { .. }) => {}
-        other => panic!("expected HeaderTooBig for all-0xFF data, got {other:?}"),
-    }
-}

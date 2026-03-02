@@ -6,7 +6,6 @@ pub mod direct_reader;
 pub mod elements;
 pub mod file_reader;
 pub mod indexed;
-pub mod mmap_blob;
 pub mod reader;
 pub(crate) mod pipeline;
 pub(crate) mod wire;

@@ -126,19 +126,6 @@ All CLI commands now beat osmium except extract --simple.
     read. Challenge: the collection consumer (which is sequential) and the
     write dispatch (which needs rayon) must coexist in the same pass.
 
-## Performance: Linux kernel features for planet-scale I/O
-
-io_uring implementation: `src/write/uring_writer.rs`.
-
-Target deployment: nidhogg weekly planet merge on Linux 6.18, planet PBF on erofs.
-Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
-`Compression::None` PBFs on erofs is the baseline assumption for the optimized path.
-
-- [ ] **Large folios for mmap reads.** On 6.14+, file-backed mmap gets transparent
-  2MB huge pages automatically. Low priority — mmap is not the production hot path
-  and is already the slowest read mode. Only relevant at planet scale (80GB, 20M
-  TLB entries). If implemented, should be opt-in to avoid regressing small files.
-
 ## Before crates.io publish
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)

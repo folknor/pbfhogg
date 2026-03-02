@@ -790,6 +790,22 @@ fn write_output_passthrough(
             || matches!(kind, Some(ElemKind::Node) if keep_untagged_nodes);
 
         if is_passthrough {
+            // Flush pending decode batch before writing passthrough blobs to
+            // preserve input element ordering (nodes → ways → relations).
+            // Without this, the last decode batch (ways) could be written after
+            // passthrough blobs (relations) at the type boundary.
+            if !batch.is_empty() {
+                #[cfg(feature = "linux-direct-io")]
+                copy_range.flush(&mut writer)?;
+                flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                let batch_stats = process_slot_batch(
+                    &batch, &mut writer, node_index, keep_untagged_nodes,
+                )?;
+                merge_stats(&mut stats, &batch_stats);
+                batch.clear();
+                batch_bytes = 0;
+            }
+
             // Update stats from indexdata.
             if let Some(ref idx) = header.index {
                 match idx.kind {
@@ -856,16 +872,16 @@ fn write_output_passthrough(
         }
     }
 
-    // Flush remaining passthrough and decode batch.
-    #[cfg(feature = "linux-direct-io")]
-    copy_range.flush(&mut writer)?;
-    flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+    // Flush remaining decode batch, then passthrough.
     if !batch.is_empty() {
         let batch_stats = process_slot_batch(
             &batch, &mut writer, node_index, keep_untagged_nodes,
         )?;
         merge_stats(&mut stats, &batch_stats);
     }
+    #[cfg(feature = "linux-direct-io")]
+    copy_range.flush(&mut writer)?;
+    flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
 
     writer.flush()?;
     Ok(stats)

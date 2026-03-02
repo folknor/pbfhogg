@@ -14,6 +14,22 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
+## Performance: add-locations-to-ways batch sizing on unsorted input
+
+The passthrough ordering fix (flush decode batch before accumulating passthrough
+blobs) ensures correct element ordering in the output (nodes → ways → relations),
+but has a potential performance impact on unsorted indexed PBFs. On sorted input,
+the flush triggers exactly once (at the way→relation boundary) — zero cost. On
+unsorted input with interleaved blob types, every decode→passthrough transition
+triggers a batch flush, producing many small batches with worse rayon amortization.
+
+- [ ] **Measure unsorted impact.** Generate an unsorted indexed PBF (e.g.
+  shuffle blob order in a Denmark PBF) and benchmark add-locations-to-ways
+  vs the sorted variant. If the difference is measurable, consider a smarter
+  approach: track interleaved decode/passthrough segments and flush them in
+  input order at batch boundaries, preserving large batches while maintaining
+  correct output ordering.
+
 ## Performance: parallelism (low priority)
 
 - [ ] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.

@@ -169,9 +169,10 @@ Nidhogg will use erofs (atomic swap of entire planet data at runtime), so
   lat/lon per the OSM API spec. Verified across Denmark + Germany diffs
   (0 nodes without lat/lon). Comment added to `src/osc.rs`.
 
-- [ ] **Merge function complexity hotspot:** The merge flow is very large and
-  highly stateful. Ref: `src/commands/merge.rs:943`. Good candidate for
-  maintainability hardening (fewer latent bugs during future changes).
+- [x] ~~**Merge function complexity hotspot:**~~ Refactored: `UpsertCursors`
+  struct (eliminated 6 repeated 3-arm matches), extracted `read_header`,
+  `spawn_reader_thread`, `collect_batch` helpers, simplified trailing creates
+  (merged duplicate if/else paths). `merge()` 503→410 lines (-18%).
 
 - [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
   unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →
@@ -207,13 +208,6 @@ items are preserved below.
   scale. `IdSetDense::merge()` exists but is `#[allow(dead_code)]`. Needs a
   shared thread pool architecture where pipeline decode and consumer
   parallelism use the same pool.
-
-- [x] ~~**P3-20: SIMD varint decode/encode in protohoggr.**~~ Investigated
-  and closed. Microbenchmarks (criterion, 8000 sint64 values) show scalar
-  is 2.3–6.3× faster than varint-simd on decode (1-byte fast path is
-  perfectly branch-predicted) and 1.5–3.5× faster on encode. SIMD overhead
-  (SSE shuffle + mask) can't compete with a predicted branch + scalar load.
-  Full research in `notes/SIMD.md`.
 
 - [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
   commands load entire PBFs into memory (`owned_elements.rs`), OOMing at

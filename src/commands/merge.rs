@@ -10,7 +10,6 @@
 //! IDs that don't match are creates (emitted by the cursor). This eliminates the need
 //! for a separate pass to collect modification IDs and compute create lists.
 
-use std::io::{self, Read};
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -18,7 +17,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data_into, parse_blob_header_with_index,
+    decode_blob_to_headerblock, decompress_blob_data_into,
     parse_primitive_block_from_bytes_owned, BlobKind,
 };
 use crate::blob_index::{self, BlobIndex, ElemKind};
@@ -33,6 +32,11 @@ use crate::{Element, PrimitiveBlock};
 use super::{flush_passthrough_buf, has_indexdata, read_raw_frame, RawBlobFrame};
 
 type MergeResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
+const BATCH_MIN_BLOBS: usize = 8;
+const BATCH_MAX_BLOBS: usize = 128;
+const READER_CHANNEL_SIZE: usize = 128;
 
 // ---------------------------------------------------------------------------
 // Progress counters
@@ -328,6 +332,42 @@ impl DiffRanges {
 // osc_member_type_to_member_type removed: OscRelMember.member_type is now
 // a MemberType enum directly (see osc.rs), so no string→enum conversion needed.
 
+// ---------------------------------------------------------------------------
+// Per-type upsert cursor tracking
+// ---------------------------------------------------------------------------
+
+/// Grouped per-type cursors tracking how far through each upsert vector
+/// we have emitted creates. Replaces three bare `usize` variables.
+struct UpsertCursors {
+    node: usize,
+    way: usize,
+    rel: usize,
+}
+
+impl UpsertCursors {
+    fn new() -> Self {
+        Self { node: 0, way: 0, rel: 0 }
+    }
+
+    /// Mutable cursor + upsert slice for the given element kind.
+    fn get_mut<'a>(&mut self, kind: ElemKind, ranges: &'a DiffRanges) -> (&mut usize, &'a [i64]) {
+        match kind {
+            ElemKind::Node => (&mut self.node, ranges.upserts(ElemKind::Node)),
+            ElemKind::Way => (&mut self.way, ranges.upserts(ElemKind::Way)),
+            ElemKind::Relation => (&mut self.rel, ranges.upserts(ElemKind::Relation)),
+        }
+    }
+
+    /// Immutable cursor value + upsert slice for the given element kind.
+    fn get<'a>(&self, kind: ElemKind, ranges: &'a DiffRanges) -> (usize, &'a [i64]) {
+        match kind {
+            ElemKind::Node => (self.node, ranges.upserts(ElemKind::Node)),
+            ElemKind::Way => (self.way, ranges.upserts(ElemKind::Way)),
+            ElemKind::Relation => (self.rel, ranges.upserts(ElemKind::Relation)),
+        }
+    }
+}
+
 /// Estimate a blob's in-flight memory cost for byte-budgeted batch sizing.
 ///
 /// For indexed blobs whose ID range doesn't overlap the diff, returns just
@@ -603,6 +643,93 @@ fn build_header_bytes(header: &crate::HeaderBlock) -> MergeResult<Vec<u8>> {
     Ok(crate::block_builder::HeaderBuilder::from_header(header)
         .sorted()
         .build()?)
+}
+
+/// Read the OSMHeader blob from a base PBF and return rebuilt header bytes.
+fn read_header(base_pbf: &Path, direct_io: bool) -> MergeResult<Vec<u8>> {
+    let mut reader = FileReader::open(base_pbf, direct_io)?;
+    let mut offset: u64 = 0;
+    loop {
+        match read_raw_frame(&mut reader, &mut offset)? {
+            Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
+                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                return build_header_bytes(&header);
+            }
+            Some(_) => {}
+            None => return Err("base PBF has no OSMHeader blob".into()),
+        }
+    }
+}
+
+/// Spawn a reader thread that streams raw data frames over a bounded channel.
+/// Skips the OSMHeader blob and any non-OsmData blobs.
+fn spawn_reader_thread(
+    base_pbf: &Path,
+    direct_io: bool,
+) -> (
+    std::thread::JoinHandle<Result<(), String>>,
+    mpsc::Receiver<RawBlobFrame>,
+) {
+    let base_path = base_pbf.to_path_buf();
+    let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
+    let handle = std::thread::spawn(move || -> Result<(), String> {
+        let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
+        let mut file_offset: u64 = 0;
+        let mut past_header = false;
+        while let Some(frame) =
+            read_raw_frame(&mut reader, &mut file_offset).map_err(|e| e.to_string())?
+        {
+            if frame.blob_type == BlobKind::OsmHeader {
+                past_header = true;
+                continue;
+            }
+            if !past_header || frame.blob_type != BlobKind::OsmData {
+                continue;
+            }
+            if frame_tx.send(frame).is_err() {
+                break;
+            }
+        }
+        Ok(())
+    });
+    (handle, frame_rx)
+}
+
+/// Collect a byte-budgeted batch of raw frames from the reader channel.
+/// Returns the estimated in-flight byte cost of the batch.
+fn collect_batch(
+    frame_rx: &mpsc::Receiver<RawBlobFrame>,
+    ranges: &DiffRanges,
+    batch: &mut Vec<RawBlobFrame>,
+) -> usize {
+    batch.clear();
+    let mut batch_bytes: usize = 0;
+    while batch.len() < BATCH_MAX_BLOBS {
+        if batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET {
+            break;
+        }
+        match frame_rx.try_recv() {
+            Ok(frame) => {
+                batch_bytes += estimate_blob_cost(&frame, ranges);
+                batch.push(frame);
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                if batch.is_empty() {
+                    match frame_rx.recv() {
+                        Ok(frame) => {
+                            batch_bytes += estimate_blob_cost(&frame, ranges);
+                            batch.push(frame);
+                        }
+                        Err(_) => break,
+                    }
+                } else {
+                    break;
+                }
+            }
+            Err(mpsc::TryRecvError::Disconnected) => break,
+        }
+    }
+    batch_bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -1012,20 +1139,7 @@ pub fn merge(
     );
 
     // Step 3: Read header from base PBF (for writer setup)
-    let header_bytes = {
-        let mut reader = FileReader::open(base_pbf, direct_io)?;
-        let mut offset: u64 = 0;
-        loop {
-            match read_raw_frame(&mut reader, &mut offset)? {
-                Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
-                    let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                    break build_header_bytes(&header)?;
-                }
-                Some(_) => {}
-                None => return Err("base PBF has no OSMHeader blob".into()),
-            }
-        }
-    };
+    let header_bytes = read_header(base_pbf, direct_io)?;
 
     // Step 4: Create pipelined writer
     let mut writer = if io_uring {
@@ -1056,33 +1170,7 @@ pub fn merge(
     };
 
     // Step 5: Spawn reader thread with read-ahead
-    // Decouples read I/O from processing — while the main thread runs
-    // classify/rewrite/output on the current batch, the reader thread
-    // pre-fills the next batch.
-    const BATCH_BYTE_BUDGET: usize = 128 * 1024 * 1024;
-    const BATCH_MIN_BLOBS: usize = 8;
-    const BATCH_MAX_BLOBS: usize = 128;
-    const READER_CHANNEL_SIZE: usize = 128;
-    let base_path = base_pbf.to_path_buf();
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
-    let reader_thread = std::thread::spawn(move || -> Result<(), String> {
-        let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
-        let mut file_offset: u64 = 0;
-        let mut past_header = false;
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset).map_err(|e| e.to_string())? {
-            if frame.blob_type == BlobKind::OsmHeader {
-                past_header = true;
-                continue;
-            }
-            if !past_header || frame.blob_type != BlobKind::OsmData {
-                continue;
-            }
-            if frame_tx.send(frame).is_err() {
-                break; // receiver dropped
-            }
-        }
-        Ok(())
-    });
+    let (reader_thread, frame_rx) = spawn_reader_thread(base_pbf, direct_io);
 
     // Open second handle for copy_file_range.
     // The main thread owns the primary FileReader; this handle provides the fd
@@ -1101,10 +1189,7 @@ pub fn merge(
     stats.diff_heap_bytes = diff_heap_bytes;
     let mut blob_count: u64 = 0;
 
-    // Per-type cursors on upsert vectors for gap create tracking
-    let mut node_upsert_cursor: usize = 0;
-    let mut way_upsert_cursor: usize = 0;
-    let mut rel_upsert_cursor: usize = 0;
+    let mut cursors = UpsertCursors::new();
     let mut last_type: Option<ElemKind> = None;
 
     let mut batch: Vec<RawBlobFrame> = Vec::with_capacity(BATCH_MAX_BLOBS);
@@ -1115,35 +1200,7 @@ pub fn merge(
     let mut passthrough_buf: Vec<u8> = Vec::new();
 
     loop {
-        // Receive batch from reader thread (byte-budgeted)
-        batch.clear();
-        let mut batch_bytes: usize = 0;
-        while batch.len() < BATCH_MAX_BLOBS {
-            if batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET {
-                break;
-            }
-            match frame_rx.try_recv() {
-                Ok(frame) => {
-                    batch_bytes += estimate_blob_cost(&frame, &ranges);
-                    batch.push(frame);
-                }
-                Err(mpsc::TryRecvError::Empty) => {
-                    if batch.is_empty() {
-                        // Nothing yet — block for the first frame
-                        match frame_rx.recv() {
-                            Ok(frame) => {
-                                batch_bytes += estimate_blob_cost(&frame, &ranges);
-                                batch.push(frame);
-                            }
-                            Err(_) => break, // reader done
-                        }
-                    } else {
-                        break; // partial batch, proceed
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => break,
-            }
-        }
+        let batch_bytes = collect_batch(&frame_rx, &ranges, &mut batch);
         if batch.is_empty() {
             break;
         }
@@ -1257,23 +1314,18 @@ pub fn merge(
                 flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
                 flush_remaining_upserts(
                     prev, blob_kind, &ranges, &diff,
-                    &mut node_upsert_cursor, &mut way_upsert_cursor, &mut rel_upsert_cursor,
-                    &mut bb, &mut writer, &mut stats,
+                    &mut cursors, &mut bb, &mut writer, &mut stats,
                 )?;
             }
             last_type = Some(blob_kind);
 
             // Gap creates: emit upserts with ID < this blob's min_id
-            let has_gap = has_gap_creates(
-                blob_kind, min_id, &ranges,
-                &node_upsert_cursor, &way_upsert_cursor, &rel_upsert_cursor,
-            );
+            let has_gap = has_gap_creates(blob_kind, min_id, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
                 emit_gap_creates(
                     blob_kind, min_id, &ranges,
-                    &diff, &mut node_upsert_cursor, &mut way_upsert_cursor,
-                    &mut rel_upsert_cursor, &mut bb, &mut writer, &mut stats,
+                    &diff, &mut cursors, &mut bb, &mut writer, &mut stats,
                 )?;
                 flush_block(&mut bb, &mut writer)?;
             }
@@ -1350,11 +1402,7 @@ pub fn merge(
                     // output dropped here — RewriteOutput freed immediately
 
                     // Advance cursor past max_id (inline upserts handled by rewrite)
-                    let (cursor, upserts) = match blob_kind {
-                        ElemKind::Node => (&mut node_upsert_cursor, ranges.upserts(ElemKind::Node)),
-                        ElemKind::Way => (&mut way_upsert_cursor, ranges.upserts(ElemKind::Way)),
-                        ElemKind::Relation => (&mut rel_upsert_cursor, ranges.upserts(ElemKind::Relation)),
-                    };
+                    let (cursor, upserts) = cursors.get_mut(blob_kind, &ranges);
                     while *cursor < upserts.len() && upserts[*cursor] <= max_id {
                         *cursor += 1;
                     }
@@ -1395,35 +1443,23 @@ pub fn merge(
         .map_err(|_| "reader thread panicked")?
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-    // Trailing creates: flush remaining upserts per type
+    // Trailing creates: flush remaining upserts per type.
+    // When last_type is None (no blobs at all), cursors are at 0 so all types
+    // are flushed in full — equivalent to the previous dedicated else-branch.
     #[cfg(feature = "hotpath")]
     let trailing_start = std::time::Instant::now();
-    if let Some(prev) = last_type {
-        let types_to_flush = match prev {
-            ElemKind::Node => &[ElemKind::Node, ElemKind::Way, ElemKind::Relation][..],
-            ElemKind::Way => &[ElemKind::Way, ElemKind::Relation][..],
-            ElemKind::Relation => &[ElemKind::Relation][..],
-        };
-        for &kind in types_to_flush {
-            let (cursor, upserts) = match kind {
-                ElemKind::Node => (&mut node_upsert_cursor, ranges.upserts(ElemKind::Node)),
-                ElemKind::Way => (&mut way_upsert_cursor, ranges.upserts(ElemKind::Way)),
-                ElemKind::Relation => (&mut rel_upsert_cursor, ranges.upserts(ElemKind::Relation)),
-            };
-            while *cursor < upserts.len() {
-                emit_create_for_output(upserts[*cursor], kind, &diff, &mut bb, &mut writer, &mut stats)?;
-                *cursor += 1;
-            }
-            flush_block(&mut bb, &mut writer)?;
+    let types_to_flush = match last_type {
+        None | Some(ElemKind::Node) => &[ElemKind::Node, ElemKind::Way, ElemKind::Relation][..],
+        Some(ElemKind::Way) => &[ElemKind::Way, ElemKind::Relation][..],
+        Some(ElemKind::Relation) => &[ElemKind::Relation][..],
+    };
+    for &kind in types_to_flush {
+        let (cursor, upserts) = cursors.get_mut(kind, &ranges);
+        while *cursor < upserts.len() {
+            emit_create_for_output(upserts[*cursor], kind, &diff, &mut bb, &mut writer, &mut stats)?;
+            *cursor += 1;
         }
-    } else {
-        // No blobs at all — emit all creates
-        for kind in [ElemKind::Node, ElemKind::Way, ElemKind::Relation] {
-            for &id in ranges.upserts(kind) {
-                emit_create_for_output(id, kind, &diff, &mut bb, &mut writer, &mut stats)?;
-            }
-            flush_block(&mut bb, &mut writer)?;
-        }
+        flush_block(&mut bb, &mut writer)?;
     }
 
     #[cfg(feature = "hotpath")]
@@ -1468,19 +1504,13 @@ fn flush_remaining_upserts(
     next: ElemKind,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
-    node_cursor: &mut usize,
-    way_cursor: &mut usize,
-    rel_cursor: &mut usize,
+    cursors: &mut UpsertCursors,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
 ) -> MergeResult<()> {
     // Flush remaining creates of the previous type
-    let (cursor, upserts) = match prev {
-        ElemKind::Node => (&mut *node_cursor, ranges.upserts(ElemKind::Node)),
-        ElemKind::Way => (&mut *way_cursor, ranges.upserts(ElemKind::Way)),
-        ElemKind::Relation => (&mut *rel_cursor, ranges.upserts(ElemKind::Relation)),
-    };
+    let (cursor, upserts) = cursors.get_mut(prev, ranges);
     while *cursor < upserts.len() {
         emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats)?;
         *cursor += 1;
@@ -1489,10 +1519,10 @@ fn flush_remaining_upserts(
 
     // Handle skipped type: Node -> Relation (flush all Way upserts)
     if prev == ElemKind::Node && next == ElemKind::Relation {
-        let way_upserts = ranges.upserts(ElemKind::Way);
-        while *way_cursor < way_upserts.len() {
-            emit_create_for_output(way_upserts[*way_cursor], ElemKind::Way, diff, bb, writer, stats)?;
-            *way_cursor += 1;
+        let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
+        while *cursor < upserts.len() {
+            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats)?;
+            *cursor += 1;
         }
         flush_block(bb, writer)?;
     }
@@ -1507,18 +1537,12 @@ fn emit_gap_creates(
     min_id: i64,
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
-    node_cursor: &mut usize,
-    way_cursor: &mut usize,
-    rel_cursor: &mut usize,
+    cursors: &mut UpsertCursors,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
 ) -> MergeResult<()> {
-    let (cursor, upserts) = match blob_kind {
-        ElemKind::Node => (&mut *node_cursor, ranges.upserts(ElemKind::Node)),
-        ElemKind::Way => (&mut *way_cursor, ranges.upserts(ElemKind::Way)),
-        ElemKind::Relation => (&mut *rel_cursor, ranges.upserts(ElemKind::Relation)),
-    };
+    let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
     while *cursor < upserts.len() && upserts[*cursor] < min_id {
         emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats)?;
         *cursor += 1;
@@ -1555,14 +1579,8 @@ fn has_gap_creates(
     blob_kind: ElemKind,
     min_id: i64,
     ranges: &DiffRanges,
-    node_cursor: &usize,
-    way_cursor: &usize,
-    rel_cursor: &usize,
+    cursors: &UpsertCursors,
 ) -> bool {
-    let (cursor, upserts) = match blob_kind {
-        ElemKind::Node => (*node_cursor, ranges.upserts(ElemKind::Node)),
-        ElemKind::Way => (*way_cursor, ranges.upserts(ElemKind::Way)),
-        ElemKind::Relation => (*rel_cursor, ranges.upserts(ElemKind::Relation)),
-    };
+    let (cursor, upserts) = cursors.get(blob_kind, ranges);
     cursor < upserts.len() && upserts[cursor] < min_id
 }

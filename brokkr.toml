@@ -18,69 +18,137 @@ scratch = "nvme"
 target = "hdd"
 
 [plantasjen.datasets.denmark]
-pbf = "denmark-20260220-seq4704-with-indexdata.osm.pbf"
-pbf_raw = "denmark-20260220-seq4704.osm.pbf"
-osc = "denmark-20260221-seq4705.osc.gz"
-sha256_pbf = "3f1977fd7825812ed0f2602c01d3b8cf0bfded36cda7d2287e91ac2e160540b8"
-sha256_osc = "fa581f7bd09dfdcaa7490f4dfd8d9522cf84f2ca188b0d7613268e5e62b16e54"
+origin = "Geofabrik"
+download_date = "2026-02-20"
 bbox = "12.4,55.6,12.7,55.8"
-origin = "Geofabrik 2026-02-20 seq 4704, indexdata via pbfhogg cat"
+
+[plantasjen.datasets.denmark.pbf.indexed]
+file = "denmark-20260220-seq4704-with-indexdata.osm.pbf"
+sha256 = "3f1977fd7825812ed0f2602c01d3b8cf0bfded36cda7d2287e91ac2e160540b8"
+seq = 4704
+
+[plantasjen.datasets.denmark.pbf.raw]
+file = "denmark-20260220-seq4704.osm.pbf"
+seq = 4704
+
+[plantasjen.datasets.denmark.osc.4705]
+file = "denmark-20260221-seq4705.osc.gz"
+sha256 = "fa581f7bd09dfdcaa7490f4dfd8d9522cf84f2ca188b0d7613268e5e62b16e54"
 
 [plantasjen.datasets.germany]
-pbf = "germany-20260224-seq4704-with-indexdata.osm.pbf"
-pbf_raw = "germany-20260224-seq4704.osm.pbf"
-osc = "germany-20260225-seq4705.osc.gz"
-sha256_pbf = "6cc377ee78b8d7ba8dedd072defd870b5ec0b3b1104fd73212fbf4cc24977916"
-sha256_osc = "c329c8b2dce5a904d26a42903687222ac6ce72a5e239c587281b10242110370a"
-origin = "Geofabrik 2026-02-24 seq 4704, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+download_date = "2026-02-24"
+
+[plantasjen.datasets.germany.pbf.indexed]
+file = "germany-20260224-seq4704-with-indexdata.osm.pbf"
+sha256 = "6cc377ee78b8d7ba8dedd072defd870b5ec0b3b1104fd73212fbf4cc24977916"
+seq = 4704
+
+[plantasjen.datasets.germany.pbf.raw]
+file = "germany-20260224-seq4704.osm.pbf"
+seq = 4704
+
+[plantasjen.datasets.germany.osc.4705]
+file = "germany-20260225-seq4705.osc.gz"
+sha256 = "c329c8b2dce5a904d26a42903687222ac6ce72a5e239c587281b10242110370a"
 
 [plantasjen.datasets.japan]
-pbf = "japan-20260225-seq4706-with-indexdata.osm.pbf"
-pbf_raw = "japan-20260225-seq4706.osm.pbf"
-osc = "japan-20260225-seq4706.osc.gz"
-sha256_pbf = "4712d2298b0e1e3dbd429496e6627b0ab5acb0fed092e9146835de2848843fc7"
-sha256_osc = "a479a01e5dc07d5f0f08b8119bb26e029116ff0d533024ad912a93f5cbfea72e"
+origin = "Geofabrik"
+download_date = "2026-02-25"
 bbox = "139.5,35.5,140.0,36.0"
-origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
+
+[plantasjen.datasets.japan.pbf.indexed]
+file = "japan-20260225-seq4706-with-indexdata.osm.pbf"
+sha256 = "4712d2298b0e1e3dbd429496e6627b0ab5acb0fed092e9146835de2848843fc7"
+seq = 4706
+
+[plantasjen.datasets.japan.pbf.raw]
+file = "japan-20260225-seq4706.osm.pbf"
+seq = 4706
+
+[plantasjen.datasets.japan.osc.4706]
+file = "japan-20260225-seq4706.osc.gz"
+sha256 = "a479a01e5dc07d5f0f08b8119bb26e029116ff0d533024ad912a93f5cbfea72e"
 
 [plantasjen.datasets.north-america]
-pbf = "north-america-seq4710-with-indexdata.osm.pbf"
-osc = "north-america-seq4710.osc.gz"
-sha256_pbf = "09ad61d6bd537a1b2b6e2dd3380eb1b9778b5bb28bd3300dc695ec2bbe6dd904"
-sha256_osc = "7663ffa833d47eb2933522ab7babfdd04629f31cd9ff165cd8c9cbfb4de8287d"
-origin = "Geofabrik seq 4710, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+
+[plantasjen.datasets.north-america.pbf.indexed]
+file = "north-america-seq4710-with-indexdata.osm.pbf"
+sha256 = "09ad61d6bd537a1b2b6e2dd3380eb1b9778b5bb28bd3300dc695ec2bbe6dd904"
+seq = 4710
+
+[plantasjen.datasets.north-america.osc.4710]
+file = "north-america-seq4710.osc.gz"
+sha256 = "7663ffa833d47eb2933522ab7babfdd04629f31cd9ff165cd8c9cbfb4de8287d"
 
 [plantasjen.datasets.norway]
-pbf = "norway-20260225-seq4709-with-indexdata.osm.pbf"
-pbf_raw = "norway-20260225-seq4709.osm.pbf"
-osc = "norway-20260225-seq4709.osc.gz"
-sha256_pbf = "c501937a0318b82872db9c3be1f967647a05cc59e68cf682f8ee9b7341d75031"
-sha256_osc = "7b9874b3fff74334ad68a55a9c518486a7b9dcf3b2cff0fea42ab60eebe7c38e"
-origin = "Geofabrik 2026-02-25 seq 4709, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+download_date = "2026-02-25"
+
+[plantasjen.datasets.norway.pbf.indexed]
+file = "norway-20260225-seq4709-with-indexdata.osm.pbf"
+sha256 = "c501937a0318b82872db9c3be1f967647a05cc59e68cf682f8ee9b7341d75031"
+seq = 4709
+
+[plantasjen.datasets.norway.pbf.raw]
+file = "norway-20260225-seq4709.osm.pbf"
+seq = 4709
+
+[plantasjen.datasets.norway.osc.4709]
+file = "norway-20260225-seq4709.osc.gz"
+sha256 = "7b9874b3fff74334ad68a55a9c518486a7b9dcf3b2cff0fea42ab60eebe7c38e"
 
 [plantasjen.datasets.switzerland]
-pbf = "switzerland-20260225-seq4707-with-indexdata.osm.pbf"
-pbf_raw = "switzerland-20260225-seq4707.osm.pbf"
-osc = "switzerland-20260225-seq4707.osc.gz"
-sha256_pbf = "bb9f9159333e1742cc7d995bc384cb47e5bcc3ebf74fe8d982efe6d8880f2a45"
-sha256_osc = "36012cd523422db9b18fbaf74908d6b11d84401235e6f8a32537d72106ebb442"
-origin = "Geofabrik 2026-02-25 seq 4707, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+download_date = "2026-02-25"
+
+[plantasjen.datasets.switzerland.pbf.indexed]
+file = "switzerland-20260225-seq4707-with-indexdata.osm.pbf"
+sha256 = "bb9f9159333e1742cc7d995bc384cb47e5bcc3ebf74fe8d982efe6d8880f2a45"
+seq = 4707
+
+[plantasjen.datasets.switzerland.pbf.raw]
+file = "switzerland-20260225-seq4707.osm.pbf"
+seq = 4707
+
+[plantasjen.datasets.switzerland.osc.4707]
+file = "switzerland-20260225-seq4707.osc.gz"
+sha256 = "36012cd523422db9b18fbaf74908d6b11d84401235e6f8a32537d72106ebb442"
 
 [plantasjen.datasets.malta]
-pbf = "malta-20260225-seq4706-with-indexdata.osm.pbf"
-pbf_raw = "malta-20260225-seq4706.osm.pbf"
-osc = "malta-20260225-seq4706.osc.gz"
-sha256_pbf = "518d9551d8eca11aa48f11ad43d54c2234ece650b593c1a7dc880083ac3311a3"
-sha256_osc = "60cccedecebffe5d3d6a74e74c6011a4e92c436ea7ec7a7159fe1dffa6a21963"
-origin = "Geofabrik 2026-02-25 seq 4706, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+download_date = "2026-02-25"
+
+[plantasjen.datasets.malta.pbf.indexed]
+file = "malta-20260225-seq4706-with-indexdata.osm.pbf"
+sha256 = "518d9551d8eca11aa48f11ad43d54c2234ece650b593c1a7dc880083ac3311a3"
+seq = 4706
+
+[plantasjen.datasets.malta.pbf.raw]
+file = "malta-20260225-seq4706.osm.pbf"
+seq = 4706
+
+[plantasjen.datasets.malta.osc.4706]
+file = "malta-20260225-seq4706.osc.gz"
+sha256 = "60cccedecebffe5d3d6a74e74c6011a4e92c436ea7ec7a7159fe1dffa6a21963"
 
 [plantasjen.datasets.greater-london]
-pbf = "greater-london-20260225-seq4704-with-indexdata.osm.pbf"
-pbf_raw = "greater-london-20260225-seq4704.osm.pbf"
-osc = "greater-london-20260225-seq4704.osc.gz"
-sha256_pbf = "fe3ca7ba612020bc8b5e9f7aea1dd39f820efb0e68d3ca2653cf7402fb9ff497"
-sha256_osc = "66c9ae6b9dada026f49e6afbdc22cebf586d15a024d8b122872810793ef91624"
-origin = "Geofabrik 2026-02-25 seq 4704, indexdata via pbfhogg cat"
+origin = "Geofabrik"
+download_date = "2026-02-25"
+
+[plantasjen.datasets.greater-london.pbf.indexed]
+file = "greater-london-20260225-seq4704-with-indexdata.osm.pbf"
+sha256 = "fe3ca7ba612020bc8b5e9f7aea1dd39f820efb0e68d3ca2653cf7402fb9ff497"
+seq = 4704
+
+[plantasjen.datasets.greater-london.pbf.raw]
+file = "greater-london-20260225-seq4704.osm.pbf"
+seq = 4704
+
+[plantasjen.datasets.greater-london.osc.4704]
+file = "greater-london-20260225-seq4704.osc.gz"
+sha256 = "66c9ae6b9dada026f49e6afbdc22cebf586d15a024d8b122872810793ef91624"
 
 [dm6]
 data = "/fast/pbfhogg/data"

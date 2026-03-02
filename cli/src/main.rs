@@ -965,10 +965,9 @@ fn run_bench_write(
 
     let (elapsed_ms, nodes, ways, rels) = match writer_mode {
         "sync" => {
-            let mut writer = pbfhogg::writer::PbfWriter::to_path(
-                std::path::Path::new("/dev/null"),
-                compression,
-            )?;
+            let file = std::fs::File::create("/dev/null")?;
+            let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+            let mut writer = pbfhogg::writer::PbfWriter::new(buf, compression);
             writer.write_header(&header_bytes)?;
             let start = Instant::now();
             let (nodes, ways, rels) = bench_write_loop(path, &mut writer)?;
@@ -976,7 +975,7 @@ fn run_bench_write(
             (elapsed_ms, nodes, ways, rels)
         }
         "pipelined" => {
-            let mut writer = pbfhogg::writer::PbfWriter::to_path_pipelined(
+            let mut writer = pbfhogg::writer::PbfWriter::to_path(
                 std::path::Path::new("/dev/null"),
                 compression,
                 &header_bytes,

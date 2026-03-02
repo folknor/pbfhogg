@@ -56,7 +56,9 @@ fn count_elements(path: &Path) -> Counts {
 fn write_pbf_copy(input: &Path, output: &Path) {
     let file = std::fs::File::open(input).expect("open input");
     let reader = BlobReader::new(BufReader::new(file));
-    let mut writer = PbfWriter::to_path(output, Compression::default()).expect("create output");
+    let file_out = std::fs::File::create(output).expect("create output");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file_out);
+    let mut writer = PbfWriter::new(buf, Compression::default());
 
     // Write a minimal header
     let header_bytes = block_builder::HeaderBuilder::new().build().expect("build header");

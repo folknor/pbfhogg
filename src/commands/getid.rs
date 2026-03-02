@@ -162,7 +162,7 @@ fn filter_by_id(
         hb = hb.sorted();
     }
     let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -244,7 +244,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         hb = hb.sorted();
     }
     let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let dep_ref = if dep_node_ids.is_empty() { None } else { Some(&dep_node_ids) };
 

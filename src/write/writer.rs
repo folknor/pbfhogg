@@ -6,10 +6,9 @@
 //!
 //! # Pipelined mode
 //!
-//! [`to_path_pipelined`](PbfWriter::to_path_pipelined) creates a writer that
-//! compresses blobs in parallel using rayon, with a dedicated writer thread that
-//! reorders results back into sequence order. Raw passthrough blobs bypass
-//! compression entirely.
+//! [`to_path`](PbfWriter::to_path) creates a writer that compresses blobs in
+//! parallel using rayon, with a dedicated writer thread that reorders results
+//! back into sequence order. Raw passthrough blobs bypass compression entirely.
 
 use crate::blob_index;
 use crate::write::file_writer::FileWriter;
@@ -139,7 +138,7 @@ thread_local! {
 ///
 /// # Pipelined mode
 ///
-/// Use [`to_path_pipelined`](Self::to_path_pipelined) for parallel compression.
+/// Use [`to_path`](Self::to_path) for parallel compression.
 /// The header is written eagerly in the constructor; subsequent
 /// `write_primitive_block` calls dispatch compression to the rayon pool,
 /// and a dedicated writer thread reorders and writes results in sequence.
@@ -153,33 +152,6 @@ pub struct PbfWriter<W: Write> {
 }
 
 impl PbfWriter<FileWriter> {
-    /// Create a `PbfWriter` that writes to a file at the given path.
-    pub fn to_path(path: &Path, compression: Compression) -> io::Result<Self> {
-        let writer = FileWriter::buffered(path)?;
-        Ok(PbfWriter {
-            writer: Some(writer),
-            compression,
-            pipeline: None,
-            scratch: FrameScratch::new(),
-        })
-    }
-
-    /// Create a `PbfWriter` with `O_DIRECT` for page-cache-free writes.
-    ///
-    /// All writes bypass the kernel page cache, preventing cache pollution
-    /// during planet-scale (80 GB+) PBF writes. Requires a filesystem that
-    /// supports `O_DIRECT` (not tmpfs).
-    #[cfg(feature = "linux-direct-io")]
-    pub fn to_path_direct(path: &Path, compression: Compression) -> io::Result<Self> {
-        let writer = FileWriter::direct(path)?;
-        Ok(PbfWriter {
-            writer: Some(writer),
-            compression,
-            pipeline: None,
-            scratch: FrameScratch::new(),
-        })
-    }
-
     /// Create a pipelined `PbfWriter` that compresses blobs in parallel.
     ///
     /// Writes the OSMHeader blob synchronously, then spawns a writer thread.
@@ -189,7 +161,7 @@ impl PbfWriter<FileWriter> {
     ///
     /// Call [`flush`](Self::flush) when done to join the writer thread and
     /// propagate any I/O errors.
-    pub fn to_path_pipelined(
+    pub fn to_path(
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
@@ -199,8 +171,12 @@ impl PbfWriter<FileWriter> {
     }
 
     /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
+    ///
+    /// All writes bypass the kernel page cache, preventing cache pollution
+    /// during planet-scale (80 GB+) PBF writes. Requires a filesystem that
+    /// supports `O_DIRECT` (not tmpfs).
     #[cfg(feature = "linux-direct-io")]
-    pub fn to_path_pipelined_direct(
+    pub fn to_path_direct(
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
@@ -217,7 +193,7 @@ impl PbfWriter<FileWriter> {
     ///
     /// Requires the `linux-io-uring` feature and Linux 5.1+.
     #[cfg(feature = "linux-io-uring")]
-    pub fn to_path_pipelined_uring(
+    pub fn to_path_uring(
         path: &Path,
         compression: Compression,
         header_block_bytes: &[u8],
@@ -315,8 +291,8 @@ impl<W: Write> PbfWriter<W> {
 
     /// Write the `OSMHeader` blob. Must be the first blob in the file.
     ///
-    /// Not needed when using [`to_path_pipelined`](Self::to_path_pipelined),
-    /// which writes the header in the constructor.
+    /// Not needed when using [`to_path`](Self::to_path), which writes the
+    /// header in the constructor.
     ///
     /// `header_block_bytes` is a serialized `HeaderBlock` protobuf message,
     /// typically produced by [`HeaderBuilder::build`](crate::block_builder::HeaderBuilder::build).

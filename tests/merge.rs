@@ -208,8 +208,9 @@ fn merge_multi_block_partial_rewrite() {
 
     // Build a PBF with 3 separate node blocks by flushing manually.
     {
-        let mut writer =
-            PbfWriter::to_path(&base, Compression::default()).expect("create writer");
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
             block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");
@@ -527,8 +528,9 @@ fn merge_delete_entire_block() {
 
     // Build a PBF with 2 node blocks + 1 way block.
     {
-        let mut writer =
-            PbfWriter::to_path(&base, Compression::default()).expect("create writer");
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
             block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");
@@ -647,8 +649,9 @@ fn merge_metadata_preservation() {
 
     // Build base PBF with metadata on all nodes.
     {
-        let mut writer =
-            PbfWriter::to_path(&base, Compression::default()).expect("create writer");
+        let file = std::fs::File::create(&base).expect("create file");
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let mut writer = PbfWriter::new(buf, Compression::default());
         let header =
             block_builder::HeaderBuilder::new().build().expect("build header");
         writer.write_header(&header).expect("write header");

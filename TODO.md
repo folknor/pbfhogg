@@ -182,10 +182,82 @@ All CLI commands now beat osmium except extract --simple.
   parallelism use the same pool.
 
 - [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
-  commands load entire PBFs into memory (`owned_elements.rs`), OOMing at
-  planet scale (~680 GB per file). A streaming merge-join on two sorted
-  iterators would fix this. High effort, no current use case — neither
-  command is used at planet scale in nidhogg.
+  commands load entire PBFs into memory via `read_elements()` →
+  `ReadResult { nodes: Vec<OwnedNode>, ways: Vec<OwnedWay>,
+  relations: Vec<OwnedRelation> }` (in `owned_elements.rs`). At planet
+  scale (~8.5B nodes, ~1B ways, ~100M relations), each file materializes
+  to ~2 TB of owned elements. Both files = ~4 TB. Instant OOM.
+
+  **Current flow (both commands identical):**
+  1. `read_elements(old)` → Vec of all owned nodes/ways/relations
+  2. `read_elements(new)` → same
+  3. Sort each Vec by ID (redundant if input is already sorted)
+  4. Two-pointer merge-join per element type
+  5. Emit output (OSC XML for derive_changes, text diff for diff)
+
+  The merge-join logic itself (steps 4-5) is already streaming — classic
+  two-pointer advancing whichever side has the lower ID. The problem is
+  purely in steps 1-3: bulk materialization.
+
+  **Streaming approach:**
+  Use `into_blocks_pipelined()` on both input files simultaneously. Each
+  returns `Iterator<Item = Result<PrimitiveBlock>>`. PBF blobs are
+  type-homogeneous (one element type per blob) and sorted by type then ID
+  when `is_sorted()` is true. Advance whichever iterator has the lower
+  current element ID, comparing elements across the two streams.
+
+  Memory would drop from ~4 TB to ~2 blocks (~2-3 MB). The two-pointer
+  join logic from `merge_join_nodes`/`merge_join_ways`/`merge_join_relations`
+  in `derive_changes.rs` can be reused almost verbatim — it just needs to
+  pull elements from block iterators instead of slices.
+
+  **Complication: block boundaries.** Elements within a block are sorted,
+  but the merge-join cursor can sit partway through a block. Need a
+  peekable element iterator that tracks position within the current block
+  and advances to the next block when exhausted. Sort.rs has a similar
+  pattern in `sweep_merge_nodes` (lines 494-531) — it walks blobs in ID
+  order and flushes from a BinaryHeap when elements are guaranteed in
+  final position. The two-file case is simpler: no heap needed, just two
+  cursors.
+
+  **Complication: requiring sorted inputs.** Current code sorts after
+  loading. The streaming version must require pre-sorted inputs (which is
+  the standard case — `cat` produces sorted PBFs, Geofabrik downloads are
+  sorted). Add a check on `header().is_sorted()` and error if not. This
+  also eliminates the in-memory sort step.
+
+  **Complication: output format.** `derive_changes` writes OSC XML grouped
+  by action (all creates, then all modifies, then all deletes). Streaming
+  produces changes interleaved by ID order, not grouped by action. Options:
+  (a) buffer the `Changes` struct (only changed elements, not the full
+  file — typically <1% of elements for a daily diff), (b) write changes
+  in encounter order (non-standard but valid OSC), (c) three-pass streaming
+  (one pass per action type — 3x I/O but constant memory). Option (a) is
+  likely fine: a daily planet diff touches ~1M elements, so the `Changes`
+  Vecs would be ~200 MB, not terabytes.
+
+  **Complication: diff verbose mode.** `diff` in verbose mode calls
+  `write_node_details`/`write_way_details`/`write_relation_details` which
+  need both old and new elements simultaneously for comparison. This works
+  naturally with streaming — when IDs match, both elements are in hand.
+
+  **Files to change:**
+  - `src/commands/derive_changes.rs` — replace `read_elements` + sort + join
+    with streaming block iterators
+  - `src/commands/diff.rs` — same transformation
+  - `src/commands/owned_elements.rs` — can likely be deleted entirely once
+    both consumers are streaming (check if anything else imports it)
+  - `sort.rs` owns its own `OwnedNode`/`OwnedWay`/`OwnedRelation` — the
+    code quality item about shared owned element types (below) becomes
+    relevant if we want a shared streaming merge-join primitive
+
+  **Priority:** Low — neither command is used at planet scale in the
+  nidhogg production pipeline (merge handles the planet refresh). But
+  this is the only remaining planet-scale OOM in the codebase. Every other
+  command either streams (cat, sort, merge, node_stats, fileinfo, cat,
+  tags_count) or uses bounded/sublinear structures (check_refs uses
+  RoaringTreemap ~4 GB, extract/tags_filter use IdSetDense bitsets ~1-6 GB,
+  add-locations-to-ways uses file-backed mmap).
 
 ## Benchmarking
 

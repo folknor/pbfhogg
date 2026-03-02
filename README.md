@@ -47,14 +47,12 @@ reader.for_each(|element| {
 use pbfhogg::block_builder::{HeaderBuilder, BlockBuilder};
 use pbfhogg::writer::{PbfWriter, Compression};
 
-let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default())?;
-
 // Build a sorted header with bounding box
 let header_bytes = HeaderBuilder::new()
     .bbox(9.0, 54.0, 13.0, 58.0)
     .sorted()
     .build()?;
-writer.write_header(&header_bytes)?;
+let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default(), &header_bytes)?;
 
 // Add elements via BlockBuilder
 let mut bb = BlockBuilder::new();
@@ -217,11 +215,8 @@ use pbfhogg::{BlobReader, ElementReader};
 let reader = BlobReader::open("input.osm.pbf", true)?;
 let reader = ElementReader::open("input.osm.pbf", true)?;
 
-// O_DIRECT writes (sync)
-let writer = PbfWriter::to_path_direct(path, Compression::default())?;
-
-// O_DIRECT writes (pipelined, parallel compression)
-let writer = PbfWriter::to_path_pipelined_direct(path, compression, &header_bytes)?;
+// O_DIRECT writes (parallel compression)
+let writer = PbfWriter::to_path_direct(path, compression, &header_bytes)?;
 ```
 
 O_DIRECT requires a real filesystem (not tmpfs). Wall time is unchanged at country scale (CPU-bound on zlib compression) — the benefit is cache hygiene at planet scale.
@@ -246,7 +241,7 @@ Library usage:
 ```rust
 use pbfhogg::writer::{PbfWriter, Compression};
 
-let writer = PbfWriter::to_path_pipelined_uring(path, Compression::None, &header_bytes)?;
+let writer = PbfWriter::to_path_uring(path, Compression::None, &header_bytes)?;
 ```
 
 Requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK` (16 MB for the default 64-buffer pool). If the limit is too low, the error message will suggest `ulimit -l unlimited`.

@@ -472,7 +472,7 @@ fn write_output_decode_all(
         hb = hb.sorted();
     }
     let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
 
@@ -759,7 +759,7 @@ fn write_output_passthrough(
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset)?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     // Open second handle for copy_file_range (explicit offsets, thread-safe).
     #[cfg(feature = "linux-direct-io")]

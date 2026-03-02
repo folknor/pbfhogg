@@ -576,8 +576,12 @@ fn roundtrip_direct_io() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("direct_io.osm.pbf");
 
-    // Write with O_DIRECT
-    let write_result = PbfWriter::to_path_direct(&path, Compression::default());
+    // Write with O_DIRECT (pipelined)
+    let header = block_builder::HeaderBuilder::new()
+        .bbox(9.0, 54.0, 13.0, 58.0)
+        .build()
+        .unwrap();
+    let write_result = PbfWriter::to_path_direct(&path, Compression::default(), &header);
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {
@@ -586,12 +590,6 @@ fn roundtrip_direct_io() {
         }
         Err(e) => panic!("unexpected error opening with O_DIRECT: {e}"),
     };
-
-    let header = block_builder::HeaderBuilder::new()
-        .bbox(9.0, 54.0, 13.0, 58.0)
-        .build()
-        .unwrap();
-    writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
     bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
@@ -667,7 +665,7 @@ fn roundtrip_pipelined_direct_io() {
     let header = block_builder::HeaderBuilder::new().build().unwrap();
 
     let write_result =
-        PbfWriter::to_path_pipelined_direct(&path, Compression::default(), &header);
+        PbfWriter::to_path_direct(&path, Compression::default(), &header);
     let mut writer = match write_result {
         Ok(w) => w,
         Err(e) if e.raw_os_error() == Some(libc::EINVAL) => {

@@ -28,7 +28,9 @@ struct TestRelation {
 }
 
 fn write_test_pbf(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
-    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
     let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
@@ -327,7 +329,7 @@ fn relations_preserved() {
 /// `scan_block_ids` during blob framing.
 fn write_test_pbf_indexed(path: &Path, nodes: &[TestNode], ways: &[TestWay], relations: &[TestRelation]) {
     let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
-    let mut writer = PbfWriter::to_path_pipelined(path, Compression::default(), &header).expect("create writer");
+    let mut writer = PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
 
     let mut bb = BlockBuilder::new();
 

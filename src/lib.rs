@@ -68,19 +68,20 @@ Build blocks with [`BlockBuilder`] and write them with [`PbfWriter`]:
 use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
 
-// Write the header
 let header_bytes = HeaderBuilder::new()
     .bbox(9.0, 54.0, 13.0, 58.0)
     .sorted()
     .build()?;
-let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default())?;
-writer.write_header(&header_bytes)?;
+let mut writer = PbfWriter::to_path(
+    "output.osm.pbf".as_ref(),
+    Compression::default(),
+    &header_bytes,
+)?;
 
-// Add elements to blocks
 let mut bb = BlockBuilder::new();
 bb.add_node(1, 556_761_000, 125_683_000, &[("name", "Copenhagen")], None);
 
-// Flush the block to the writer
+// Flush the block to the writer — compression dispatches to rayon
 if let Some(block_bytes) = bb.take()? {
     writer.write_primitive_block(block_bytes)?;
 }
@@ -88,24 +89,21 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-## Example: Pipelined writing
+## Example: In-memory writing
 
-For large files, use pipelined mode for parallel compression:
+For tests or small PBFs, use [`PbfWriter::new`] with any [`Write`](std::io::Write) impl:
 
 ```rust,no_run
 use pbfhogg::write::block_builder::{BlockBuilder, HeaderBuilder};
 use pbfhogg::write::writer::{PbfWriter, Compression};
 
 let header_bytes = HeaderBuilder::new().sorted().build()?;
-let mut writer = PbfWriter::to_path_pipelined(
-    "output.osm.pbf".as_ref(),
-    Compression::Zlib(6),
-    &header_bytes,
-)?;
+let mut buf = std::io::Cursor::new(Vec::new());
+let mut writer = PbfWriter::new(&mut buf, Compression::default());
+writer.write_header(&header_bytes)?;
 
 let mut bb = BlockBuilder::new();
-// ... add elements in a loop, flush when bb.should_flush() ...
-// Each write_primitive_block dispatches compression to rayon
+// ... add elements, write blocks synchronously ...
 writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```

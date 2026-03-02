@@ -17,7 +17,9 @@ use pbfhogg::writer::{Compression, PbfWriter};
 /// re-encode the node blobs rather than passing them through.
 #[allow(clippy::cast_possible_truncation)]
 fn write_unsorted_overlapping_pbf(path: &Path) {
-    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
     let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
@@ -64,7 +66,9 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 /// relations. Each type is internally sorted but the type order is wrong.
 #[allow(clippy::cast_possible_truncation)]
 fn write_type_unsorted_pbf(path: &Path) {
-    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
     let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 
@@ -302,7 +306,9 @@ fn sort_many_overlapping_blobs() {
     let output = dir.path().join("sorted.osm.pbf");
 
     // Write 10 blobs with interleaving node IDs
-    let mut writer = PbfWriter::to_path(&input, Compression::default()).expect("create writer");
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
     let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 

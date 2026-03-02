@@ -136,7 +136,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
     };
 
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
     let mut blobs: u64 = 0;
 
     for file in files {
@@ -284,7 +284,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     }
     let header_bytes = hb.build()?;
 
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 

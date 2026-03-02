@@ -80,7 +80,9 @@ pub fn write_test_pbf(
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    let mut writer = PbfWriter::to_path(path, Compression::default()).expect("create writer");
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
     let header = block_builder::HeaderBuilder::new().build().expect("build header");
     writer.write_header(&header).expect("write header");
 

@@ -1127,7 +1127,7 @@ pub fn merge(
     let mut writer = if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            PbfWriter::to_path_pipelined_uring(output_pbf, compression, &header_bytes, sqpoll)?
+            PbfWriter::to_path_uring(output_pbf, compression, &header_bytes, sqpoll)?
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
@@ -1137,7 +1137,7 @@ pub fn merge(
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            PbfWriter::to_path_pipelined_direct(
+            PbfWriter::to_path_direct(
                 output_pbf,
                 compression,
                 &header_bytes,
@@ -1148,7 +1148,7 @@ pub fn merge(
             return Err("--direct-io requires the linux-direct-io feature".into());
         }
     } else {
-        PbfWriter::to_path_pipelined(output_pbf, compression, &header_bytes)?
+        PbfWriter::to_path(output_pbf, compression, &header_bytes)?
     };
 
     // Step 5: Spawn reader thread with read-ahead

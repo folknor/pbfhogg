@@ -377,7 +377,7 @@ fn tags_filter_single_pass(
         hb = hb.sorted();
     }
     let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -644,7 +644,7 @@ fn tags_filter_two_pass(
         hb = hb.sorted();
     }
     let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,

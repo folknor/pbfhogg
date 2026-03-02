@@ -533,7 +533,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         .sorted()
         .build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -585,7 +585,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
         .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         .sorted()
         .build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -932,7 +932,7 @@ fn extract_smart(
         .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         .sorted()
         .build()?;
-    let mut writer = PbfWriter::to_path_pipelined(output, compression, &header_bytes)?;
+    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &bbox_node_ids,

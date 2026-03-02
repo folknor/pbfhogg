@@ -185,7 +185,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
     let mut writer = if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            PbfWriter::to_path_pipelined_uring(output, compression, &header_bytes, sqpoll)?
+            PbfWriter::to_path_uring(output, compression, &header_bytes, sqpoll)?
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
@@ -195,14 +195,14 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
     } else if direct_io {
         #[cfg(feature = "linux-direct-io")]
         {
-            PbfWriter::to_path_pipelined_direct(output, compression, &header_bytes)?
+            PbfWriter::to_path_direct(output, compression, &header_bytes)?
         }
         #[cfg(not(feature = "linux-direct-io"))]
         {
             return Err("--direct-io requires the linux-direct-io feature".into());
         }
     } else {
-        PbfWriter::to_path_pipelined(output, compression, &header_bytes)?
+        PbfWriter::to_path(output, compression, &header_bytes)?
     };
 
     // Open input for random-access reads

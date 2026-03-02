@@ -245,9 +245,6 @@ enum Command {
         /// Keep untagged nodes in output (default: drop them)
         #[arg(long)]
         keep_untagged_nodes: bool,
-        /// Node location index type: hash (default), dense (mmap, for planet-scale)
-        #[arg(short = 'n', long, default_value = "hash")]
-        index_type: String,
         /// Compression: none, zlib (default), zstd. Append :LEVEL for custom (e.g. zlib:9, zstd:19)
         #[arg(long, default_value = "zlib")]
         compression: String,
@@ -429,11 +426,10 @@ fn main() {
             file,
             output,
             keep_untagged_nodes,
-            index_type,
             compression,
             direct_io,
             force,
-        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &index_type, &compression, direct_io, force),
+        } => run_add_locations_to_ways(&file, &output, keep_untagged_nodes, &compression, direct_io, force),
         Command::NodeStats { file, direct_io, force } => run_node_stats(&file, direct_io, force),
         Command::Merge {
             base,
@@ -762,21 +758,13 @@ fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
-    index_type_str: &str,
     compression: &str,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression = parse_compression(compression)?;
-    let index_type = match index_type_str {
-        "hash" => pbfhogg::add_locations_to_ways::IndexType::Hash,
-        "dense" => pbfhogg::add_locations_to_ways::IndexType::Dense {
-            capacity: pbfhogg::add_locations_to_ways::DENSE_INDEX_DEFAULT_CAPACITY,
-        },
-        other => return Err(format!("unknown index type: {other} (expected: hash, dense)").into()),
-    };
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
-        file, output, keep_untagged_nodes, compression, direct_io, index_type, force,
+        file, output, keep_untagged_nodes, compression, direct_io, force,
     )?;
     stats.print_summary();
     Ok(())

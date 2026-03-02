@@ -4,7 +4,6 @@ use std::io::Read;
 use std::path::Path;
 
 use rayon::prelude::*;
-use rustc_hash::FxHashMap;
 
 use crate::blob::{
     decode_blob_to_headerblock, decompress_blob, parse_blob_header_with_index,
@@ -22,88 +21,30 @@ use super::{
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
-// ---------------------------------------------------------------------------
-// Index type
-// ---------------------------------------------------------------------------
-
-/// Node location index type for add-locations-to-ways.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum IndexType {
-    /// FxHashMap-based index. ~24 bytes/node, good for country-scale.
-    Hash,
-    /// Dense mmap-based index. 8 bytes/slot with direct indexing by node ID.
-    /// Uses anonymous mmap with lazy page allocation — virtual memory is
-    /// allocated for the full ID range but physical memory is only committed
-    /// for pages actually written. Required for planet-scale (8.5B nodes →
-    /// ~68 GB physical vs FxHashMap's ~192 GB).
-    ///
-    /// The `capacity` field is the max number of entries (node IDs). For planet,
-    /// use [`DENSE_INDEX_DEFAULT_CAPACITY`] (16 billion). Smaller values work
-    /// for testing or country-scale files.
-    Dense { capacity: usize },
-}
-
 /// Default dense index capacity: 16 billion entries (128 GB virtual).
 /// Covers current OSM max node ID (~12.5B) with headroom for growth.
-///
-/// Requires `vm.overcommit_memory=1` or sufficient physical RAM + swap on
-/// the host. On systems with heuristic overcommit (the default), this
-/// allocation may be rejected. Use a smaller capacity or switch to
-/// `--index-type hash` in that case.
-pub const DENSE_INDEX_DEFAULT_CAPACITY: usize = 16_000_000_000;
-
-// ---------------------------------------------------------------------------
-// Node location index
-// ---------------------------------------------------------------------------
-
-/// Node location index abstraction supporting multiple backends.
-/// Node location index abstraction supporting multiple backends.
-///
-/// The `Hash` variant uses `FxHashMap` (from `rustc-hash`) instead of the
-/// standard `HashMap`. For integer keys like node IDs, FxHash (foldhash) is
-/// 2-4x faster than SipHash because it uses a simple multiply-shift instead
-/// of the cryptographic SipHash-2-4 rounds. Hash-DoS resistance is irrelevant
-/// here since the keys come from PBF file data we control, not user input.
-pub enum NodeLocationIndex {
-    Hash(FxHashMap<i64, (i32, i32)>),
-    Dense(DenseMmapIndex),
-}
-
-impl NodeLocationIndex {
-    fn insert(&mut self, node_id: i64, lat: i32, lon: i32) {
-        match self {
-            Self::Hash(map) => {
-                map.insert(node_id, (lat, lon));
-            }
-            Self::Dense(dense) => dense.insert(node_id, lat, lon),
-        }
-    }
-
-    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
-        match self {
-            Self::Hash(map) => map.get(&node_id).copied(),
-            Self::Dense(dense) => dense.get(node_id),
-        }
-    }
-}
+const DENSE_INDEX_DEFAULT_CAPACITY: usize = 16_000_000_000;
 
 // ---------------------------------------------------------------------------
 // Dense mmap index
 // ---------------------------------------------------------------------------
 
-/// Dense mmap-backed node location index.
+/// File-backed mmap node location index.
 ///
-/// Uses anonymous mmap with direct indexing: `mmap[node_id * 8 .. node_id * 8 + 8]`
-/// stores `(lat: i32, lon: i32)` packed as 8 bytes (little-endian).
+/// Direct indexing: `mmap[node_id * 8 .. node_id * 8 + 8]` stores
+/// `(lat: i32, lon: i32)` packed as 8 bytes (little-endian).
 ///
-/// Zero-initialized by the OS. Pages are lazily allocated (demand-paged): a
-/// 128 GB virtual mapping only consumes physical memory for pages actually
-/// written. For planet (~8.5B nodes, max ID ~12.5B), physical RSS is ~68 GB.
+/// Backed by a temporary file (created and immediately unlinked). The OS
+/// manages physical memory via page cache: under memory pressure, clean
+/// pages are evicted and re-read from disk on demand. This allows the index
+/// to exceed physical RAM without OOM — at planet scale (~68 GB touched),
+/// the kernel pages data in/out transparently.
 ///
 /// Sentinel: `(0, 0)` means unset. ~116 nodes at exactly null island (0°N, 0°E)
 /// will appear as missing — acceptable ambiguity for diagnostic counters.
-pub struct DenseMmapIndex {
+pub(crate) struct DenseMmapIndex {
     mmap: memmap2::MmapMut,
+    _file: std::fs::File,
     capacity: usize,
 }
 
@@ -114,36 +55,7 @@ const ENTRY_SIZE: usize = 8;
 const _: () = assert!(std::mem::size_of::<usize>() >= 8);
 
 impl DenseMmapIndex {
-    fn new(capacity: usize) -> Result<Self> {
-        let byte_len = capacity
-            .checked_mul(ENTRY_SIZE)
-            .ok_or("dense index capacity overflow")?;
-        // String error is intentional — includes the allocation size and actionable
-        // recovery advice that the underlying io::Error wouldn't provide.
-        let mmap = memmap2::MmapMut::map_anon(byte_len).map_err(|e| {
-            format!(
-                "failed to create dense mmap index ({} GB virtual): {e}. \
-                 Try --index-type hash or increase vm.overcommit_ratio.",
-                byte_len / 1_000_000_000
-            )
-        })?;
-        Ok(Self { mmap, capacity })
-    }
-
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn insert(&mut self, node_id: i64, lat: i32, lon: i32) {
-        if node_id < 0 {
-            return;
-        }
-        let idx = node_id as usize;
-        if idx >= self.capacity {
-            return;
-        }
-        let offset = idx * ENTRY_SIZE;
-        self.mmap[offset..offset + 4].copy_from_slice(&lat.to_le_bytes());
-        self.mmap[offset + 4..offset + 8].copy_from_slice(&lon.to_le_bytes());
-    }
-
+    /// Look up a node's coordinates by ID. Returns `None` for unset entries.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         if node_id < 0 {
@@ -162,6 +74,46 @@ impl DenseMmapIndex {
         let lat = packed as i32;
         let lon = (packed >> 32) as i32;
         Some((lat, lon))
+    }
+
+    fn new(capacity: usize, scratch_dir: &Path) -> Result<Self> {
+        let byte_len = capacity
+            .checked_mul(ENTRY_SIZE)
+            .ok_or("dense index capacity overflow")?;
+        let temp_path = scratch_dir.join(format!(
+            ".pbfhogg-node-index-{}",
+            std::process::id()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&temp_path)
+            .map_err(|e| {
+                format!(
+                    "failed to create index temp file at {}: {e}",
+                    temp_path.display()
+                )
+            })?;
+        // Unlink immediately — fd keeps the file alive, OS cleans up on close/crash.
+        // Ignore errors: unlink failure is non-fatal (file just won't auto-clean).
+        drop(std::fs::remove_file(&temp_path));
+        file.set_len(byte_len as u64).map_err(|e| {
+            format!(
+                "failed to set index file size ({} GB): {e}",
+                byte_len / 1_000_000_000
+            )
+        })?;
+        // SAFETY: file is exclusively owned, opened read+write, and sized to byte_len.
+        let mmap = unsafe {
+            memmap2::MmapMut::map_mut(&file).map_err(|e| {
+                format!(
+                    "failed to mmap index file ({} GB): {e}",
+                    byte_len / 1_000_000_000
+                )
+            })?
+        };
+        Ok(Self { mmap, _file: file, capacity })
     }
 }
 
@@ -400,13 +352,13 @@ pub fn add_locations_to_ways(
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
-    index_type: IndexType,
     force: bool,
 ) -> Result<Stats> {
     let indexdata_present = require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).")?;
-    let index = build_node_index(input, direct_io, index_type)?;
+    let scratch_dir = output.parent().unwrap_or(Path::new("."));
+    let index = build_node_index(input, direct_io, scratch_dir)?;
     write_output_checked(input, output, &index, keep_untagged_nodes, compression, direct_io, indexdata_present)
 }
 
@@ -418,11 +370,8 @@ pub fn add_locations_to_ways(
 /// for parallel node index population.
 const INDEX_BATCH_SIZE: usize = 64;
 
-fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Result<NodeLocationIndex> {
-    match index_type {
-        IndexType::Hash => build_node_index_hash(input, direct_io),
-        IndexType::Dense { capacity } => build_node_index_dense(input, direct_io, capacity),
-    }
+fn build_node_index(input: &Path, direct_io: bool, scratch_dir: &Path) -> Result<DenseMmapIndex> {
+    build_node_index_dense(input, direct_io, scratch_dir)
 }
 
 /// Build the dense mmap index in parallel. Each rayon task writes directly
@@ -430,9 +379,9 @@ fn build_node_index(input: &Path, direct_io: bool, index_type: IndexType) -> Res
 fn build_node_index_dense(
     input: &Path,
     direct_io: bool,
-    capacity: usize,
-) -> Result<NodeLocationIndex> {
-    let mut index = DenseMmapIndex::new(capacity)?;
+    scratch_dir: &Path,
+) -> Result<DenseMmapIndex> {
+    let mut index = DenseMmapIndex::new(DENSE_INDEX_DEFAULT_CAPACITY, scratch_dir)?;
     let writer = SharedDenseWriter {
         base: index.mmap.as_mut_ptr(),
         capacity: index.capacity,
@@ -453,8 +402,7 @@ fn build_node_index_dense(
         index_batch_dense(&batch, &writer);
     }
 
-    drop(writer);
-    Ok(NodeLocationIndex::Dense(index))
+    Ok(index)
 }
 
 /// Parallel insert for one batch of blocks into the dense mmap index.
@@ -474,56 +422,6 @@ fn index_batch_dense(batch: &[PrimitiveBlock], writer: &SharedDenseWriter) {
     });
 }
 
-/// Build the hash map index in parallel. Each rayon task builds a thread-local
-/// partial map, then they are reduced pairwise and merged into the master map.
-fn build_node_index_hash(input: &Path, direct_io: bool) -> Result<NodeLocationIndex> {
-    let mut master: FxHashMap<i64, (i32, i32)> = FxHashMap::default();
-
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_nodes());
-
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(INDEX_BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
-        if batch.len() >= INDEX_BATCH_SIZE {
-            master.extend(index_batch_hash(&batch));
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        master.extend(index_batch_hash(&batch));
-    }
-
-    Ok(NodeLocationIndex::Hash(master))
-}
-
-/// Parallel fold+reduce for one batch of blocks into a merged `FxHashMap`.
-fn index_batch_hash(batch: &[PrimitiveBlock]) -> FxHashMap<i64, (i32, i32)> {
-    batch
-        .par_iter()
-        .fold(
-            FxHashMap::default,
-            |mut local: FxHashMap<i64, (i32, i32)>, block| {
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            local.insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
-                        }
-                        Element::Node(n) => {
-                            local.insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
-                        }
-                        Element::Way(_) | Element::Relation(_) => {}
-                    }
-                }
-                local
-            },
-        )
-        .reduce(FxHashMap::default, |mut a, b| {
-            a.extend(b);
-            a
-        })
-}
-
 // ---------------------------------------------------------------------------
 // Pass 2: Write output with locations on ways
 // ---------------------------------------------------------------------------
@@ -532,7 +430,7 @@ fn index_batch_hash(batch: &[PrimitiveBlock]) -> FxHashMap<i64, (i32, i32)> {
 fn write_output_checked(
     input: &Path,
     output: &Path,
-    index: &NodeLocationIndex,
+    index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
@@ -552,7 +450,7 @@ fn write_output_checked(
 fn write_output_decode_all(
     input: &Path,
     output: &Path,
-    index: &NodeLocationIndex,
+    index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
@@ -624,7 +522,7 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    index: &NodeLocationIndex,
+    index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
@@ -724,7 +622,7 @@ fn process_block(
 fn process_batch(
     batch: &[PrimitiveBlock],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    index: &NodeLocationIndex,
+    index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
 ) -> Result<Stats> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
@@ -842,7 +740,7 @@ fn read_header_raw<R: Read>(
 fn write_output_passthrough(
     input: &Path,
     output: &Path,
-    node_index: &NodeLocationIndex,
+    node_index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
     compression: Compression,
     direct_io: bool,
@@ -981,7 +879,7 @@ fn write_output_passthrough(
 fn process_slot_batch(
     batch: &[BatchSlot],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    node_index: &NodeLocationIndex,
+    node_index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
 ) -> Result<Stats> {
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;

@@ -109,7 +109,7 @@ pbfhogg node-stats <file>                 Analyze node coordinate statistics for
 
 Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
 
-Add-locations-to-ways supports `--index-type hash` (default, HashMap) and `--index-type dense` (anonymous mmap, 8 bytes/slot, for planet-scale — ~68 GB physical for 8.5B nodes vs HashMap's ~192 GB).
+Add-locations-to-ways uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID). The index is backed by a temporary file that the kernel pages in/out under memory pressure, so it works from country-scale to planet-scale without OOM.
 
 Node-stats streams all nodes and reports coordinate value ranges, FOR (Frame of Reference) block bit-width distributions, and estimated compressed size. Designed to evaluate whether FOR compression (128-value blocks, per-block min + bitpacked offsets) is viable for in-RAM sorted node stores at planet scale. Runs in constant memory using the pipelined reader.
 

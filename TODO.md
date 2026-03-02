@@ -153,8 +153,25 @@ All CLI commands now beat osmium except extract --simple.
   has `sqpoll` support (`setup_sqpoll(2000)`, `push_sqe_pair` SQ overflow
   handling, `--sqpoll` CLI flags). Measured <1% benefit across all scales
   (Denmark through North America). Syscall overhead is ~0.29% of wall time.
-  Removing it deletes ~30 lines and the kernel 5.12+ dependency. **Deferred
-  until planet-scale verification** — if sqpoll shows no gain at 75 GB, delete.
+  Removing it deletes ~30 lines and the kernel 5.12+ dependency.
+
+  **North America results confirm sqpoll is pure overhead.** At commit `a6ebbfe`
+  (18.8 GB input, 322K blobs, 19.6K rewrites), sqpoll was consistently slower
+  than plain uring across all compression modes:
+
+  | Variant | uring (ms) | sqpoll (ms) | delta |
+  |---|---|---|---|
+  | zlib | 15,157 | 16,349 | +8% slower |
+  | none | 11,850 | 12,346 | +4% slower |
+
+  sqpoll burns a kernel thread spinning on the SQ, stealing a CPU core from
+  rayon's compression/rewrite pool. The benefit — skipping `io_uring_enter()`
+  syscalls (~1-2µs each) — is irrelevant at pbfhogg's IO submission rate
+  (hundreds/sec of 256KB writes, not 500K+ small random IOPS). sqpoll's sweet
+  spot is NVMe random 4K IO at extreme IOPS where per-syscall cost is a
+  meaningful fraction of per-IO latency. Large sequential writes are the
+  opposite of that. **Safe to delete without planet-scale verification** — the
+  workload characteristics don't change at larger scale, only the duration.
 
 - [ ] **P2-13: Extract pass 1 parallel fold for IdSetDense.** Would give
   ~2-4x speedup on pass 1 (~170s → ~50-85s at planet scale). Attempted and

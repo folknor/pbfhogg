@@ -110,3 +110,11 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)
 
 Zlib backend is hardcoded to `zlib-rs` (pure Rust, no C compiler, faster than zlib-ng). No feature flags for backend selection. Sync zlib compression is 15-19% slower than the previous `libdeflater` (C) backend, but pipelined mode — the production path — shows no difference (decode-bound). The tradeoff is accepted: zero C dependencies for compression, one backend everywhere.
+
+## Performance baselines (North America, 18.8 GB, 2.58B elements, commit `a6ebbfe`)
+
+**Read:** parallel 22s, pipelined 57s, sequential 130s.
+**Write:** pipelined zlib 4m27s, pipelined none/zstd ~4m20s, sync zlib 14m34s.
+**Merge** (645K-change daily diff, 303K passthrough / 19.6K rewritten blobs):
+buffered+zlib 17.3s, uring+zlib 15.2s, buffered+none 14.9s, **uring+none 11.9s**.
+All merge variants under 600 MB RSS. io_uring wins 12-20% at this scale (page cache overflow). sqpoll adds no benefit.

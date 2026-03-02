@@ -87,10 +87,16 @@ impl<R: Read + Send> ElementReader<R> {
         &self.header
     }
 
-    /// Decodes the PBF structure sequentially and calls the given closure on each element.
-    /// Elements are delivered in file order. If [`header().is_sorted()`](HeaderBlock::is_sorted)
-    /// returns `true`, nodes are guaranteed to arrive in ascending ID order.
-    /// Consider using `par_map_reduce` instead if you need better performance.
+    /// Decodes the PBF structure sequentially on the calling thread — no background I/O,
+    /// no rayon, no channels. Elements are delivered in file order. If
+    /// [`header().is_sorted()`](HeaderBlock::is_sorted) returns `true`, nodes are guaranteed
+    /// to arrive in ascending ID order.
+    ///
+    /// This is **6x slower** than [`for_each_pipelined`](Self::for_each_pipelined) on large
+    /// files. Prefer `for_each_pipelined` for production workloads — it has the same
+    /// `FnMut` signature and file-order guarantee but overlaps I/O with parallel
+    /// decompression. Use this method when you need simplicity (no `'static` bound on
+    /// the reader) or as a correctness baseline for testing.
     ///
     /// # Errors
     /// Returns the first Error encountered while parsing the PBF structure.

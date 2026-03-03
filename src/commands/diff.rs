@@ -1,16 +1,23 @@
 //! Compare two PBF files and output human-readable differences. Equivalent to `osmium diff`.
+//!
+//! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
+//! Requires both inputs to declare `Sort.Type_then_ID`.
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
 use super::owned_elements::{
-    format_coord, from_decimicro, nodes_equal, read_elements, relations_equal, ways_equal,
-    OwnedMember, OwnedNode, OwnedRelation, OwnedWay,
+    format_coord, from_decimicro, nodes_equal, relations_equal, ways_equal, OwnedMember,
+    OwnedNode, OwnedRelation, OwnedWay,
 };
-use crate::{BlobFilter, MemberType};
-
-use super::{Result, TypeFilter};
+use super::stream_merge::{
+    convert_node, convert_relation, convert_way, is_node_block, is_relation_block, is_way_block,
+    next_element, StreamingBlocks,
+};
+use super::{require_sorted, Result, TypeFilter};
+use crate::{BlobFilter, BlockType, Element, ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -27,6 +34,7 @@ pub struct DiffOptions {
 }
 
 /// Statistics from a diff operation.
+#[derive(Debug)]
 pub struct DiffStats {
     pub common: u64,
     pub created: u64,
@@ -55,14 +63,54 @@ impl DiffStats {
 }
 
 // ---------------------------------------------------------------------------
+// DiffElement trait — per-type accessors for the generic merge-join
+// ---------------------------------------------------------------------------
+
+trait DiffElement: Sized {
+    fn id(&self) -> i64;
+    fn version(&self) -> Option<i32>;
+    fn type_char() -> char;
+    fn is_block_type(bt: BlockType) -> bool;
+    fn equal(&self, other: &Self) -> bool;
+    fn convert(element: &Element<'_>) -> Option<Self>;
+}
+
+impl DiffElement for OwnedNode {
+    fn id(&self) -> i64 { self.id }
+    fn version(&self) -> Option<i32> { self.version }
+    fn type_char() -> char { 'n' }
+    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
+    fn equal(&self, other: &Self) -> bool { nodes_equal(self, other) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
+}
+
+impl DiffElement for OwnedWay {
+    fn id(&self) -> i64 { self.id }
+    fn version(&self) -> Option<i32> { self.version }
+    fn type_char() -> char { 'w' }
+    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
+    fn equal(&self, other: &Self) -> bool { ways_equal(self, other) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
+}
+
+impl DiffElement for OwnedRelation {
+    fn id(&self) -> i64 { self.id }
+    fn version(&self) -> Option<i32> { self.version }
+    fn type_char() -> char { 'r' }
+    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
+    fn equal(&self, other: &Self) -> bool { relations_equal(self, other) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /// Compare two sorted PBF files and write human-readable differences.
 ///
-/// **Note:** Both PBFs are loaded entirely into memory as owned Vecs.
-/// This works for country-scale extracts but will OOM on planet-scale
-/// (~80 GB) files.
+/// Streams through both files in constant memory (~3 MB overhead per cursor)
+/// using pipelined block iterators. Requires both inputs to declare
+/// `Sort.Type_then_ID` — returns an actionable error if either is unsorted.
 #[hotpath::measure]
 pub fn diff(
     old_path: &Path,
@@ -76,234 +124,178 @@ pub fn diff(
         None => TypeFilter::all(),
     };
 
-    // Skip blob decompression for irrelevant element types (via indexdata).
+    // Open readers and check sorted headers before applying any filters.
+    let old_reader = ElementReader::open(old_path, direct_io)?;
+    let new_reader = ElementReader::open(new_path, direct_io)?;
+
+    require_sorted(old_reader.header(), old_path, "Old PBF")?;
+    require_sorted(new_reader.header(), new_path, "New PBF")?;
+
+    // Apply blob filter for type-filtered queries (skips decompressing
+    // irrelevant blob types when indexdata is present).
     let blob_filter = if filter.nodes && filter.ways && filter.relations {
         None
     } else {
         Some(BlobFilter::new(filter.nodes, filter.ways, filter.relations))
     };
-
-    let mut old = read_elements(old_path, direct_io, blob_filter.as_ref())?;
-    let mut new = read_elements(new_path, direct_io, blob_filter.as_ref())?;
-
-    // Ensure sorted by ID
-    old.nodes.sort_by_key(|n| n.id);
-    old.ways.sort_by_key(|w| w.id);
-    old.relations.sort_by_key(|r| r.id);
-    new.nodes.sort_by_key(|n| n.id);
-    new.ways.sort_by_key(|w| w.id);
-    new.relations.sort_by_key(|r| r.id);
-
-    let mut stats = DiffStats {
-        common: 0,
-        created: 0,
-        modified: 0,
-        deleted: 0,
+    let old_reader = match blob_filter.clone() {
+        Some(f) => old_reader.with_blob_filter(f),
+        None => old_reader,
+    };
+    let new_reader = match blob_filter {
+        Some(f) => new_reader.with_blob_filter(f),
+        None => new_reader,
     };
 
+    // Build streaming cursors — two concurrent pipelined decoders.
+    let mut old_src = StreamingBlocks::new(old_reader.into_blocks_pipelined());
+    let mut new_src = StreamingBlocks::new(new_reader.into_blocks_pipelined());
+
+    let mut stats = DiffStats { common: 0, created: 0, modified: 0, deleted: 0 };
+
+    // Phase 1: Nodes
+    // Each phase uses local buffers — T changes between phases so they cannot
+    // be shared. Allocation is negligible (one block's worth, up to 8000 elements).
     if filter.nodes {
-        diff_nodes(&old.nodes, &new.nodes, output, options, &mut stats)?;
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_diff_phase::<OwnedNode>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            (output, options, &mut stats),
+            |out, old, new| write_node_details(out, old, new),
+        )?;
+    } else {
+        drain_phase::<OwnedNode>(&mut old_src)?;
+        drain_phase::<OwnedNode>(&mut new_src)?;
     }
+
+    // Phase 2: Ways
     if filter.ways {
-        diff_ways(&old.ways, &new.ways, output, options, &mut stats)?;
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_diff_phase::<OwnedWay>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            (output, options, &mut stats),
+            |out, old, new| write_way_details(out, old, new),
+        )?;
+    } else {
+        drain_phase::<OwnedWay>(&mut old_src)?;
+        drain_phase::<OwnedWay>(&mut new_src)?;
     }
+
+    // Phase 3: Relations
     if filter.relations {
-        diff_relations(&old.relations, &new.relations, output, options, &mut stats)?;
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_diff_phase::<OwnedRelation>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            (output, options, &mut stats),
+            |out, old, new| write_relation_details(out, old, new),
+        )?;
+    } else {
+        drain_phase::<OwnedRelation>(&mut old_src)?;
+        drain_phase::<OwnedRelation>(&mut new_src)?;
     }
 
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
-// Merge-join per element type
+// Generic streaming merge-join
 // ---------------------------------------------------------------------------
 
-fn diff_nodes(
-    old: &[OwnedNode],
-    new: &[OwnedNode],
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
+/// Streaming two-pointer merge-join for one element type phase.
+///
+/// Pulls elements one at a time from both cursors and emits diff output
+/// immediately. Stops when both cursors return `None` (phase exhausted).
+fn streaming_diff_phase<T: DiffElement>(
+    old_src: &mut StreamingBlocks,
+    old_buf: &mut Vec<T>,
+    new_src: &mut StreamingBlocks,
+    new_buf: &mut Vec<T>,
+    ctx: (&mut impl Write, &DiffOptions, &mut DiffStats),
+    write_details: impl Fn(&mut dyn Write, &T, &T) -> Result<()>,
 ) -> Result<()> {
-    let mut oi = 0;
-    let mut ni = 0;
+    let (output, opts, stats) = ctx;
+    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
 
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                write_compact_line(output, '-', 'n', old[oi].id, old[oi].version)?;
+    loop {
+        match (&old_elem, &new_elem) {
+            (None, None) => break,
+            (Some(o), None) => {
+                write_compact_line(output, '-', T::type_char(), o.id(), o.version())?;
                 stats.deleted += 1;
-                oi += 1;
+                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
             }
-            std::cmp::Ordering::Greater => {
-                write_compact_line(output, '+', 'n', new[ni].id, new[ni].version)?;
+            (None, Some(n)) => {
+                write_compact_line(output, '+', T::type_char(), n.id(), n.version())?;
                 stats.created += 1;
-                ni += 1;
+                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
-            std::cmp::Ordering::Equal => {
-                diff_node_pair(&old[oi], &new[ni], output, opts, stats)?;
-                oi += 1;
-                ni += 1;
+            (Some(o), Some(n)) => {
+                emit_matched_pair(o, n, output, opts, stats, &write_details)?;
+                match o.id().cmp(&n.id()) {
+                    Ordering::Less => {
+                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                    }
+                    Ordering::Greater => {
+                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    }
+                    Ordering::Equal => {
+                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    }
+                }
             }
         }
-    }
-
-    for o in &old[oi..] {
-        write_compact_line(output, '-', 'n', o.id, o.version)?;
-        stats.deleted += 1;
-    }
-    for n in &new[ni..] {
-        write_compact_line(output, '+', 'n', n.id, n.version)?;
-        stats.created += 1;
     }
     Ok(())
 }
 
-fn diff_node_pair(
-    old: &OwnedNode,
-    new: &OwnedNode,
+/// Emit output for a pair where both old and new are present.
+///
+/// Factored out to keep `streaming_diff_phase` under clippy's cognitive
+/// complexity threshold.
+fn emit_matched_pair<T: DiffElement>(
+    old: &T,
+    new: &T,
     output: &mut impl Write,
     opts: &DiffOptions,
     stats: &mut DiffStats,
+    write_details: &impl Fn(&mut dyn Write, &T, &T) -> Result<()>,
 ) -> Result<()> {
-    if nodes_equal(old, new) {
-        if !opts.suppress_common {
-            write_compact_line(output, ' ', 'n', old.id, old.version)?;
+    match old.id().cmp(&new.id()) {
+        Ordering::Less => {
+            write_compact_line(output, '-', T::type_char(), old.id(), old.version())?;
+            stats.deleted += 1;
         }
-        stats.common += 1;
-    } else {
-        write_modified_line(output, 'n', old.id, old.version, new.version)?;
-        if opts.verbose {
-            write_node_details(output, old, new)?;
+        Ordering::Greater => {
+            write_compact_line(output, '+', T::type_char(), new.id(), new.version())?;
+            stats.created += 1;
         }
-        stats.modified += 1;
+        Ordering::Equal => {
+            if T::equal(old, new) {
+                if !opts.suppress_common {
+                    write_compact_line(output, ' ', T::type_char(), old.id(), old.version())?;
+                }
+                stats.common += 1;
+            } else {
+                write_modified_line(output, T::type_char(), old.id(), old.version(), new.version())?;
+                if opts.verbose {
+                    write_details(output, old, new)?;
+                }
+                stats.modified += 1;
+            }
+        }
     }
     Ok(())
 }
 
-fn diff_ways(
-    old: &[OwnedWay],
-    new: &[OwnedWay],
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
-) -> Result<()> {
-    let mut oi = 0;
-    let mut ni = 0;
-
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                write_compact_line(output, '-', 'w', old[oi].id, old[oi].version)?;
-                stats.deleted += 1;
-                oi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                write_compact_line(output, '+', 'w', new[ni].id, new[ni].version)?;
-                stats.created += 1;
-                ni += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                diff_way_pair(&old[oi], &new[ni], output, opts, stats)?;
-                oi += 1;
-                ni += 1;
-            }
-        }
-    }
-
-    for o in &old[oi..] {
-        write_compact_line(output, '-', 'w', o.id, o.version)?;
-        stats.deleted += 1;
-    }
-    for n in &new[ni..] {
-        write_compact_line(output, '+', 'w', n.id, n.version)?;
-        stats.created += 1;
-    }
-    Ok(())
-}
-
-fn diff_way_pair(
-    old: &OwnedWay,
-    new: &OwnedWay,
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
-) -> Result<()> {
-    if ways_equal(old, new) {
-        if !opts.suppress_common {
-            write_compact_line(output, ' ', 'w', old.id, old.version)?;
-        }
-        stats.common += 1;
-    } else {
-        write_modified_line(output, 'w', old.id, old.version, new.version)?;
-        if opts.verbose {
-            write_way_details(output, old, new)?;
-        }
-        stats.modified += 1;
-    }
-    Ok(())
-}
-
-fn diff_relations(
-    old: &[OwnedRelation],
-    new: &[OwnedRelation],
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
-) -> Result<()> {
-    let mut oi = 0;
-    let mut ni = 0;
-
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                write_compact_line(output, '-', 'r', old[oi].id, old[oi].version)?;
-                stats.deleted += 1;
-                oi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                write_compact_line(output, '+', 'r', new[ni].id, new[ni].version)?;
-                stats.created += 1;
-                ni += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                diff_relation_pair(&old[oi], &new[ni], output, opts, stats)?;
-                oi += 1;
-                ni += 1;
-            }
-        }
-    }
-
-    for o in &old[oi..] {
-        write_compact_line(output, '-', 'r', o.id, o.version)?;
-        stats.deleted += 1;
-    }
-    for n in &new[ni..] {
-        write_compact_line(output, '+', 'r', n.id, n.version)?;
-        stats.created += 1;
-    }
-    Ok(())
-}
-
-fn diff_relation_pair(
-    old: &OwnedRelation,
-    new: &OwnedRelation,
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
-) -> Result<()> {
-    if relations_equal(old, new) {
-        if !opts.suppress_common {
-            write_compact_line(output, ' ', 'r', old.id, old.version)?;
-        }
-        stats.common += 1;
-    } else {
-        write_modified_line(output, 'r', old.id, old.version, new.version)?;
-        if opts.verbose {
-            write_relation_details(output, old, new)?;
-        }
-        stats.modified += 1;
-    }
+/// Drain remaining elements of type `T` from a cursor without processing.
+///
+/// Called to advance past a skipped phase (e.g. when type_filter excludes
+/// nodes) so the cursor is positioned for the next phase.
+fn drain_phase<T: DiffElement>(source: &mut StreamingBlocks) -> Result<()> {
+    let mut buf = Vec::new();
+    while next_element(source, &mut buf, T::is_block_type, T::convert)?.is_some() {}
     Ok(())
 }
 
@@ -346,7 +338,7 @@ fn write_modified_line(
 // ---------------------------------------------------------------------------
 
 fn write_node_details(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old: &OwnedNode,
     new: &OwnedNode,
 ) -> Result<()> {
@@ -369,7 +361,7 @@ fn write_node_details(
 }
 
 fn write_way_details(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old: &OwnedWay,
     new: &OwnedWay,
 ) -> Result<()> {
@@ -386,7 +378,7 @@ fn write_way_details(
 }
 
 fn write_relation_details(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old: &OwnedRelation,
     new: &OwnedRelation,
 ) -> Result<()> {
@@ -400,7 +392,7 @@ fn write_relation_details(
 // ---------------------------------------------------------------------------
 
 fn write_tag_diff(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old_tags: &[(String, String)],
     new_tags: &[(String, String)],
 ) -> Result<()> {
@@ -420,7 +412,7 @@ fn write_tag_diff(
 }
 
 fn write_removed_tags(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old_tags: &[(String, String)],
     new_map: &HashMap<&str, &str>,
 ) -> Result<()> {
@@ -433,7 +425,7 @@ fn write_removed_tags(
 }
 
 fn write_added_tags(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     new_tags: &[(String, String)],
     old_map: &HashMap<&str, &str>,
 ) -> Result<()> {
@@ -446,7 +438,7 @@ fn write_added_tags(
 }
 
 fn write_changed_tags(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     new_tags: &[(String, String)],
     old_map: &HashMap<&str, &str>,
 ) -> Result<()> {
@@ -478,7 +470,7 @@ fn member_matches(a: &OwnedMember, b: &OwnedMember) -> bool {
 }
 
 fn write_member_diff(
-    output: &mut impl Write,
+    output: &mut dyn Write,
     old_members: &[OwnedMember],
     new_members: &[OwnedMember],
 ) -> Result<()> {

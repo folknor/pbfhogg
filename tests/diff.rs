@@ -4,7 +4,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{write_test_pbf, TestMember, TestNode, TestRelation, TestWay};
+use common::{write_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay};
 use pbfhogg::diff::{DiffOptions, diff};
 use pbfhogg::MemberId;
 use tempfile::TempDir;
@@ -46,8 +46,8 @@ fn identical_files_empty_output() {
         TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
     ];
 
-    write_test_pbf(&old, &nodes, &ways, &[]);
-    write_test_pbf(&new, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&old, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&new, &nodes, &ways, &[]);
 
     let opts = DiffOptions {
         suppress_common: true,
@@ -74,8 +74,8 @@ fn identical_files_shows_common() {
         TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
     ];
 
-    write_test_pbf(&old, &nodes, &ways, &[]);
-    write_test_pbf(&new, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&old, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&new, &nodes, &ways, &[]);
 
     let opts = DiffOptions {
         suppress_common: false,
@@ -98,13 +98,13 @@ fn added_elements() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -131,7 +131,7 @@ fn deleted_elements() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -140,7 +140,7 @@ fn deleted_elements() {
         &[TestWay { id: 10, refs: vec![1, 2], tags: vec![] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
@@ -164,13 +164,13 @@ fn modified_node_coordinates() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![] }],
         &[],
@@ -193,13 +193,13 @@ fn modified_node_tags() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "old")] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "new")] }],
         &[],
@@ -222,13 +222,13 @@ fn modified_way_refs() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[],
         &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[],
         &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
@@ -251,7 +251,7 @@ fn modified_relation_members() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[],
         &[],
@@ -261,7 +261,7 @@ fn modified_relation_members() {
             tags: vec![("type", "route")],
         }],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[],
         &[],
@@ -292,7 +292,7 @@ fn suppress_common_hides_unchanged() {
     let new = dir.path().join("new.osm.pbf");
 
     // Node 1: unchanged, Node 2: modified, Node 3: deleted, Node 4: created (new only)
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -302,7 +302,7 @@ fn suppress_common_hides_unchanged() {
         &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -333,7 +333,7 @@ fn verbose_shows_tag_details() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode {
             id: 1,
@@ -344,7 +344,7 @@ fn verbose_shows_tag_details() {
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode {
             id: 1,
@@ -384,13 +384,13 @@ fn verbose_shows_coordinate_details() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![] }],
         &[],
@@ -417,13 +417,13 @@ fn type_filter_restricts_output() {
     let old = dir.path().join("old.osm.pbf");
     let new = dir.path().join("new.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[TestWay { id: 10, refs: vec![1], tags: vec![] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -457,4 +457,161 @@ fn type_filter_restricts_output() {
             "type_filter=node should exclude way lines, found: {line:?}",
         );
     }
+}
+
+#[test]
+fn unsorted_input_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    // Write without sorted header.
+    write_test_pbf(
+        &old,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    let mut output = Vec::new();
+    let err = diff(&old, &new, &mut output, &default_options(), false)
+        .expect_err("diff should reject unsorted input");
+    let msg = err.to_string();
+    assert!(msg.contains("not sorted"), "error should mention 'not sorted', got: {msg}");
+    assert!(
+        msg.contains("Sort.Type_then_ID"),
+        "error should mention Sort.Type_then_ID, got: {msg}",
+    );
+    assert!(
+        msg.contains("pbfhogg sort"),
+        "error should mention 'pbfhogg sort', got: {msg}",
+    );
+}
+
+#[test]
+fn empty_files_no_data_blocks() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    // Header-only sorted PBFs (no data blocks).
+    write_test_pbf_sorted(&old, &[], &[], &[]);
+    write_test_pbf_sorted(&new, &[], &[], &[]);
+
+    let (text, stats) = run_diff(&old, &new, &default_options());
+    assert!(text.is_empty(), "empty files should produce no output, got:\n{text}");
+    assert!(!stats.has_differences(), "empty files should have no differences");
+    assert_eq!(stats.common, 0);
+}
+
+#[test]
+fn multi_block_boundary_asymmetric() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    // Create >8000 nodes on old side (forces 2 blocks) and a different count on new side.
+    #[allow(clippy::cast_possible_truncation)]
+    let old_nodes: Vec<TestNode> = (1_i64..=9000)
+        .map(|id| TestNode { id, lat: id as i32, lon: id as i32, tags: vec![] })
+        .collect();
+    // New side: 7500 nodes (different block split point), node 9000 deleted,
+    // but nodes 1-7500 are identical.
+    #[allow(clippy::cast_possible_truncation)]
+    let new_nodes: Vec<TestNode> = (1_i64..=7500)
+        .map(|id| TestNode { id, lat: id as i32, lon: id as i32, tags: vec![] })
+        .collect();
+
+    write_test_pbf_sorted(&old, &old_nodes, &[], &[]);
+    write_test_pbf_sorted(&new, &new_nodes, &[], &[]);
+
+    let opts = DiffOptions {
+        suppress_common: true,
+        ..default_options()
+    };
+    let (text, stats) = run_diff(&old, &new, &opts);
+
+    // Nodes 7501-9000 should be deleted.
+    assert_eq!(stats.deleted, 1500, "expected 1500 deleted nodes, got {}", stats.deleted);
+    assert_eq!(stats.common, 7500, "expected 7500 common nodes, got {}", stats.common);
+    assert_eq!(stats.created, 0);
+    assert_eq!(stats.modified, 0);
+
+    // All output lines should be deletions.
+    for line in text.lines() {
+        assert!(
+            line.starts_with('-'),
+            "all lines should be deletions with suppress_common, got: {line:?}",
+        );
+    }
+}
+
+#[test]
+fn type_filter_way_skips_phases() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    write_test_pbf_sorted(
+        &old,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }],
+        &[TestRelation {
+            id: 100,
+            members: vec![TestMember { id: MemberId::Node(1), role: "stop" }],
+            tags: vec![("type", "route")],
+        }],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+            TestWay { id: 20, refs: vec![1, 3], tags: vec![("highway", "secondary")] },
+        ],
+        &[TestRelation {
+            id: 200,
+            members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+            tags: vec![("type", "multipolygon")],
+        }],
+    );
+
+    let opts = DiffOptions {
+        suppress_common: false,
+        verbose: false,
+        type_filter: Some("way".to_string()),
+    };
+    let (text, stats) = run_diff(&old, &new, &opts);
+
+    // Only way elements should appear in output.
+    // Line format: <prefix><type_char><id> — prefix is at index 0, type char at index 1.
+    for line in text.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let type_char = line.chars().nth(1);
+        assert_eq!(
+            type_char,
+            Some('w'),
+            "type_filter=way should only show ways, found: {line:?}",
+        );
+    }
+
+    // Stats should reflect only ways: w10 common, w20 created.
+    assert_eq!(stats.common, 1, "expected 1 common way");
+    assert_eq!(stats.created, 1, "expected 1 created way");
+    assert_eq!(stats.modified, 0);
+    assert_eq!(stats.deleted, 0);
 }

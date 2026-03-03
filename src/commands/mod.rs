@@ -13,6 +13,7 @@ pub mod merge;
 pub mod node_stats;
 pub(crate) mod owned_elements;
 pub mod sort;
+pub(crate) mod stream_merge;
 pub mod tags_count;
 pub mod tags_filter;
 #[cfg(feature = "commands")]
@@ -437,6 +438,30 @@ pub(crate) fn require_indexdata(
         .into());
     }
     Ok(present)
+}
+
+/// Check that a PBF file declares `Sort.Type_then_ID`.
+///
+/// Returns an error with actionable guidance if the header lacks the sorted flag.
+/// `context` should identify the file role (e.g. "Old PBF" or "New PBF").
+pub(crate) fn require_sorted(
+    header: &crate::HeaderBlock,
+    path: &Path,
+    context: &str,
+) -> Result<()> {
+    if !header.is_sorted() {
+        return Err(format!(
+            "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
+             File: {}\n\n\
+             Sort the input file first:\n\n\
+             \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
+             Streaming diff requires sorted inputs to operate in constant memory.",
+            path.display(),
+            path.display(),
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// Check if the first OsmData blob in a PBF has indexdata.

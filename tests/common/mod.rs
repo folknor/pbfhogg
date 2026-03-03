@@ -144,6 +144,80 @@ pub fn write_test_pbf(
     writer.flush().expect("flush");
 }
 
+/// Same as [`write_test_pbf`] but with the `Sort.Type_then_ID` header flag set.
+///
+/// Used by diff tests (and later derive_changes tests) which require sorted
+/// inputs for streaming merge-join.
+pub fn write_test_pbf_sorted(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    // Nodes
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Ways
+    for w in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_way(w.id, &w.tags, &w.refs, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    // Relations
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| MemberData {
+                id: m.id,
+                role: m.role,
+            })
+            .collect();
+        bb.add_relation(r.id, &r.tags, &members, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
 // ---------------------------------------------------------------------------
 // PBF header reading
 // ---------------------------------------------------------------------------

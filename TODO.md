@@ -127,13 +127,6 @@ Current `--blocks` dumps one line per block — unusable at planet scale (~300K
 blocks). The per-type summary (block counts + sizes) is already shown without
 `--blocks`; these items fill the gap between that and the raw dump.
 
-- [x] **Per-type distribution stats.** Show min/max/median/p99 for
-  elements-per-block and compressed size, grouped by block type. Computed from
-  the existing `Vec<BlockInfo>` — no new data collection needed. Always useful,
-  replaces the raw dump as the default `--blocks` output.
-- [x] **Head/tail limiting (`--blocks=N`).** Show first N and last N blocks
-  instead of the full listing. Good for "what does the start/end look like?"
-  without drowning in output. Change `--blocks` from bool to optional integer.
 - [ ] **Machine-readable output (`--json`).** JSON output for piping to `jq`
   or other tools. Makes the raw per-block listing useful for scripting even at
   scale. Scope: inspect-only initially, could extend to other commands later.
@@ -141,15 +134,6 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   unusually small (partial batches), unusually large, or mixed-type blocks.
   These are the interesting ones when debugging a PBF. Requires defining
   "anomalous" thresholds (e.g. <50% or >150% of median elements for type).
-
-## Performance: CLI commands vs osmium
-
-- [x] **Extract simple: single-pass for sorted inputs.** For PBFs with
-  `Sort.Type_then_ID`, classify + write in one file pass. Blocks are
-  classified sequentially (populating ID sets), then dispatched in batches
-  for parallel writing via `process_extract_pass2_batch`. Unsorted inputs
-  fall back to the existing two-pass code. Design note:
-  `notes/extract-simple-optimization-opportunities.md`
 
 ## Before crates.io publish
 
@@ -214,23 +198,6 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   shared thread pool architecture where pipeline decode and consumer
   parallelism use the same pool.
 
-- [x] **P3-22 Phase 1: Streaming merge-join for diff.** Rewritten at
-  `b14a174`. `diff` now streams through both sorted PBFs in constant
-  memory (~1.1 GB RSS on Denmark vs unbounded OOM for the old approach
-  at planet scale). Uses `StreamingBlocks` cursor with block-level
-  stashing and three sequential type phases (nodes → ways → relations).
-  Requires `Sort.Type_then_ID` on both inputs.
-
-- [x] **P3-22 Phase 2: Streaming merge-join for derive_changes.**
-  Ported to streaming cursors from `stream_merge.rs`. Memory bounded
-  by changed element count, not total input size. Requires
-  `Sort.Type_then_ID` on both inputs.
-
-- [x] **P3-22 Phase 3: Cleanup owned_elements.rs.** Removed
-  `read_elements()`, `ReadResult`, and `take_*` clone helpers.
-  Owned type definitions and equality functions retained (used by
-  both `diff` and `derive_changes` via `stream_merge.rs`).
-
 ## Benchmarking
 
 - [ ] Run Germany full profiling suite (4.5 GB, ~500M elements). Currently only
@@ -246,24 +213,24 @@ Completed: 5 high-value helpers in `mod.rs` (require_indexdata, flush_local,
 BATCH_SIZE, Result alias, TypeFilter), batch collection loop, parallel batch
 drain, RawBlobFrame consolidation, ReorderBuffer utility, CLI flag groups.
 
-Full deep-dive with 6 large consolidation opportunities (shared rewrite engine,
-ElementEmitter API, unified blob pipeline, generic merge-join core,
-dependency-closure planner, I/O mode options normalization):
-`notes/business-logic-consolidation-deep-dive-2026-03-03.md`
+Full deep-dive with 6 large consolidation opportunities reviewed and rejected
+(see `notes/consolidation-review-{1..6}-*.md` for detailed reports). Two small
+concrete improvements identified:
 
-### Remaining
+- [ ] **Promote `ensure_*_capacity_local` to `mod.rs`.** Merge already has
+  `ensure_node_capacity_local`, `ensure_way_capacity_local`,
+  `ensure_relation_capacity_local` (3-line helpers wrapping the
+  `if !bb.can_add_*() { flush_local(...) }` pattern). Promoting these to
+  `mod.rs` replaces the inline capacity check at 28 emission sites across
+  cat, getid, tags_filter, extract, and add_locations_to_ways.
 
-- [x] **Owned element types.** `sort.rs` and `owned_elements.rs` define
-  separate `OwnedNode`/`OwnedWay`/`OwnedRelation` — intentionally kept
-  separate (sort needs full 6-field `OwnedMetadata`, diff/derive only needs
-  `version: Option<i32>`). Consolidated the one identical type: `OwnedMember`
-  is now shared from `owned_elements.rs`.
+- [ ] **Hoist tag/ref/member buffer Vecs into `map_init`.** In cat, getid,
+  tags_filter, and extract, the `tags_buf`, `refs_buf`, `members_buf` Vecs
+  are created inside the `map_init` closure body (re-allocated per batch).
+  Moving them into the init tuple (like add_locations_to_ways already does
+  for `refs_buf`/`locations_buf`) gives cross-batch reuse on rayon threads.
 
 ## Deep-dive findings (2026-03-03)
-
-- [x] **P0 safety: data race UB in dense mmap index writer.** Fixed at `7694f40`.
-- [x] **P1 correctness/UX: `cat --type` indexdata validation.** Fixed: validates all input files.
-- [x] **P1 performance: `sort` pass-1 alloc/read churn.** Fixed at `8cf3c57` (29% CPU reduction).
 
 - [ ] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
   `merge` and `add-locations-to-ways` coalescing appends frame bytes into one
@@ -277,16 +244,8 @@ dependency-closure planner, I/O mode options normalization):
   Investigation/design note:
   `notes/passthrough-coalescing-memcpy-investigation-2026-03-03.md`
 
-- [x] **P2 performance: verbose relation member diff is O(n^2).**
-  Replaced nested `.iter().any()` with `HashSet<(MemberId, &str)>` lookups.
-  Added `Hash` derive to `MemberId`.
-
 - [ ] **P2 correctness edge case: Null Island ambiguity in dense index sentinel.**
   `DenseMmapIndex` uses `(0,0)` as "unset", so valid node coordinates at exactly
   `0,0` are treated as missing (currently documented as acceptable). If we want
   strict correctness for all coordinates, store a separate occupancy bitmap (1
   bit/node) or reserve an impossible sentinel with explicit valid-bit tracking.
-
-- [x] **P1 pipeline guard: `verify ids` subcommand.** Streaming monotonicity + type ordering check.
-- [x] **P2 command design: validation ownership.** Validation lives in `verify` subcommands.
-

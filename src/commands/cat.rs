@@ -7,6 +7,7 @@ use rayon::prelude::*;
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, TypeFilter,
+    ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, BlobKind};
@@ -150,9 +151,7 @@ fn process_block(
     for element in block.elements() {
         match &element {
             Element::DenseNode(dn) if filter_node => {
-                if !bb.can_add_node() {
-                    flush_local(bb, output)?;
-                }
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn);
@@ -166,9 +165,7 @@ fn process_block(
                 count += 1;
             }
             Element::Node(n) if filter_node => {
-                if !bb.can_add_node() {
-                    flush_local(bb, output)?;
-                }
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(&n.info());
@@ -182,9 +179,7 @@ fn process_block(
                 count += 1;
             }
             Element::Way(w) if filter_way => {
-                if !bb.can_add_way() {
-                    flush_local(bb, output)?;
-                }
+                ensure_way_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
@@ -194,9 +189,7 @@ fn process_block(
                 count += 1;
             }
             Element::Relation(r) if filter_relation => {
-                if !bb.can_add_relation() {
-                    flush_local(bb, output)?;
-                }
+                ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 members_buf.clear();

@@ -12,7 +12,8 @@ use super::{Result, BATCH_SIZE};
 
 use super::{
     drain_batch_results, flush_local, for_each_primitive_block_batch, require_indexdata,
-    writer_from_header,
+    writer_from_header, ensure_node_capacity_local, ensure_way_capacity_local,
+    ensure_relation_capacity_local,
 };
 use super::id_set_dense::IdSetDense;
 
@@ -935,9 +936,7 @@ fn extract_block_pass2(
                 let in_bbox = ids.bbox_node_ids.get(dn.id());
                 let from_way = ids.all_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
@@ -953,9 +952,7 @@ fn extract_block_pass2(
                 let in_bbox = ids.bbox_node_ids.get(n.id());
                 let from_way = ids.all_way_node_ids.get(n.id());
                 if in_bbox || from_way {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
@@ -969,9 +966,7 @@ fn extract_block_pass2(
             }
             Element::Way(w) => {
                 if ids.matched_way_ids.get(w.id()) {
-                    if !bb.can_add_way() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
                     refs_buf.clear();
@@ -983,9 +978,7 @@ fn extract_block_pass2(
             }
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
-                    if !bb.can_add_relation() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_relation_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
                     members_buf.clear();
@@ -1143,9 +1136,7 @@ fn extract_block_pass3(
                 let from_way = ids.all_way_node_ids.get(id);
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
@@ -1165,9 +1156,7 @@ fn extract_block_pass3(
                 let from_way = ids.all_way_node_ids.get(id);
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
@@ -1185,9 +1174,7 @@ fn extract_block_pass3(
                 let in_matched = ids.matched_way_ids.get(w.id());
                 let in_extra = ids.extra_way_ids.get(w.id());
                 if in_matched || in_extra {
-                    if !bb.can_add_way() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
                     refs_buf.clear();
@@ -1203,9 +1190,7 @@ fn extract_block_pass3(
             }
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
-                    if !bb.can_add_relation() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_relation_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
                     members_buf.clear();

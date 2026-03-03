@@ -8,6 +8,7 @@ use super::id_set_dense::IdSetDense;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, TypeFilter,
+    ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
@@ -291,9 +292,7 @@ fn filter_block_parallel(
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 if element_matches(expressions, &tags_buf, true, false, false) {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
                         dn.id(),
@@ -309,9 +308,7 @@ fn filter_block_parallel(
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 if element_matches(expressions, &tags_buf, true, false, false) {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
                         n.id(),
@@ -327,9 +324,7 @@ fn filter_block_parallel(
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 if element_matches(expressions, &tags_buf, false, true, false) {
-                    if !bb.can_add_way() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
@@ -341,9 +336,7 @@ fn filter_block_parallel(
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 if element_matches(expressions, &tags_buf, false, false, true) {
-                    if !bb.can_add_relation() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_relation_capacity_local(bb, output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
@@ -452,9 +445,7 @@ fn filter_block_pass2(
                 let direct = ids.matched_node_ids.get(dn.id());
                 let from_way = ids.way_dep_node_ids.get(dn.id());
                 if direct || from_way {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
@@ -466,9 +457,7 @@ fn filter_block_pass2(
                 let direct = ids.matched_node_ids.get(n.id());
                 let from_way = ids.way_dep_node_ids.get(n.id());
                 if direct || from_way {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
@@ -478,9 +467,7 @@ fn filter_block_pass2(
             }
             Element::Way(w) => {
                 if ids.matched_way_ids.get(w.id()) {
-                    if !bb.can_add_way() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
                     refs_buf.clear();
@@ -492,9 +479,7 @@ fn filter_block_pass2(
             }
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
-                    if !bb.can_add_relation() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_relation_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
                     members_buf.clear();

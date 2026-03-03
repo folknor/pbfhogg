@@ -30,8 +30,9 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
 use super::{
-    build_output_header, flush_local, flush_passthrough_buf, read_raw_frame, require_indexdata,
-    writer_from_header_bytes, RawBlobFrame,
+    build_output_header, ensure_node_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, flush_local, flush_passthrough_buf, read_raw_frame,
+    require_indexdata, writer_from_header_bytes, RawBlobFrame,
 };
 
 use super::{Result, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
@@ -464,36 +465,6 @@ fn ensure_relation_capacity(
 ) -> Result<()> {
     if !bb.can_add_relation() {
         flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-fn ensure_node_capacity_local(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
-) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_local(bb, output)?;
-    }
-    Ok(())
-}
-
-fn ensure_way_capacity_local(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
-) -> Result<()> {
-    if !bb.can_add_way() {
-        flush_local(bb, output)?;
-    }
-    Ok(())
-}
-
-fn ensure_relation_capacity_local(
-    bb: &mut BlockBuilder,
-    output: &mut Vec<OwnedBlock>,
-) -> Result<()> {
-    if !bb.can_add_relation() {
-        flush_local(bb, output)?;
     }
     Ok(())
 }

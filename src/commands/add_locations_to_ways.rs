@@ -17,8 +17,9 @@ use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use super::{
-    build_output_header, drain_batch_results, flush_passthrough_buf, read_raw_frame,
-    require_indexdata, writer_from_header, RawBlobFrame,
+    build_output_header, drain_batch_results, ensure_node_capacity_local,
+    ensure_relation_capacity_local, ensure_way_capacity_local, flush_passthrough_buf,
+    read_raw_frame, require_indexdata, writer_from_header, RawBlobFrame,
 };
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
@@ -557,9 +558,7 @@ fn process_block(
                 stats.nodes_read += 1;
                 let has_tags = dn.tags().next().is_some();
                 if keep_untagged_nodes || has_tags {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
@@ -573,9 +572,7 @@ fn process_block(
                 stats.nodes_read += 1;
                 let has_tags = n.tags().next().is_some();
                 if keep_untagged_nodes || has_tags {
-                    if !bb.can_add_node() {
-                        flush_local(bb, output)?;
-                    }
+                    ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
@@ -586,9 +583,7 @@ fn process_block(
                 }
             }
             Element::Way(w) => {
-                if !bb.can_add_way() {
-                    flush_local(bb, output)?;
-                }
+                ensure_way_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
@@ -608,9 +603,7 @@ fn process_block(
                 stats.ways_written += 1;
             }
             Element::Relation(r) => {
-                if !bb.can_add_relation() {
-                    flush_local(bb, output)?;
-                }
+                ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 members_buf.clear();

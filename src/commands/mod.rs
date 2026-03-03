@@ -297,6 +297,42 @@ pub(crate) fn flush_local(
     Ok(())
 }
 
+/// Ensure the [`BlockBuilder`] has capacity for a node, flushing to local
+/// output if full. Used by rayon worker threads in parallel batch processing.
+pub(crate) fn ensure_node_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_node() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
+/// Ensure the [`BlockBuilder`] has capacity for a way, flushing to local
+/// output if full.
+pub(crate) fn ensure_way_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_way() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
+/// Ensure the [`BlockBuilder`] has capacity for a relation, flushing to local
+/// output if full.
+pub(crate) fn ensure_relation_capacity_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_relation() {
+        flush_local(bb, output)?;
+    }
+    Ok(())
+}
+
 /// Build output header bytes from an input header.
 ///
 /// Applies `configure` to the header builder, then preserves sortedness if

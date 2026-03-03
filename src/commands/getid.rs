@@ -7,7 +7,8 @@ use rayon::prelude::*;
 
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
-    for_each_primitive_block_batch, writer_from_header,
+    for_each_primitive_block_batch, writer_from_header, ensure_node_capacity_local,
+    ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -282,9 +283,7 @@ fn process_block(
 
         match &element {
             Element::DenseNode(dn) => {
-                if !bb.can_add_node() {
-                    flush_local(bb, output)?;
-                }
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn);
@@ -292,9 +291,7 @@ fn process_block(
                 nodes += 1;
             }
             Element::Node(n) => {
-                if !bb.can_add_node() {
-                    flush_local(bb, output)?;
-                }
+                ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(&n.info());
@@ -302,9 +299,7 @@ fn process_block(
                 nodes += 1;
             }
             Element::Way(w) => {
-                if !bb.can_add_way() {
-                    flush_local(bb, output)?;
-                }
+                ensure_way_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
@@ -314,9 +309,7 @@ fn process_block(
                 ways += 1;
             }
             Element::Relation(r) => {
-                if !bb.can_add_relation() {
-                    flush_local(bb, output)?;
-                }
+                ensure_relation_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 members_buf.clear();

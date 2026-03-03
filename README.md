@@ -95,7 +95,7 @@ pbfhogg sort <file> -o <out>              Sort into standard order (nodes → wa
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box (minlon,minlat,maxlon,maxlat)
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
 pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
-pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a PBF file
+pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a sorted PBF file (output stays sorted)
 pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
 pbfhogg diff <old> <new>                 Compare two PBF files (-v for verbose, -c to hide common)
 pbfhogg tags-count <file>                 Count tag key=value frequencies
@@ -171,7 +171,7 @@ Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `23862d1`):
 | complete-ways | 13.3s | **11.0s** | 1.21x |
 | smart | 14.9s | **13.4s** | 1.11x |
 
-Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium; simple's gap is structural (two passes vs osmium's single pass — the extra file read costs ~5s at this scale).
+Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium. Simple uses a single-pass fast path on sorted inputs (`Sort.Type_then_ID`) — classify and write in one file scan — and falls back to two passes on unsorted inputs. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
 
 Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `a6ebbfe`):
 

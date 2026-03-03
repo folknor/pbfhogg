@@ -10,6 +10,8 @@ pbfhogg cat → pbfhogg merge → pbfhogg add-locations-to-ways
                                       └── nidhogg (PBF ingest → query API)
 ```
 
+**`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) — a one-time fix, not a recurring step.
+
 The two downstream consumers are:
 - **elivagar** (`~/Programs/elivagar`) — vector tile generator. Reads the enriched PBF (with inline way coordinates via `Way::node_locations()`) to produce PMTiles. Pre-processing with `add-locations-to-ways` eliminates elivagar's node store (~44 GB at planet scale), dropping peak RSS from ~65-75 GB to ~15-20 GB.
 - **nidhogg** (`~/Programs/nidhogg`) — planet refresh service. Reads the planet PBF for data ingest, then merges daily OSC diffs to keep it current.

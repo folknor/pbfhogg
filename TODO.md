@@ -129,8 +129,8 @@ Full design note: `notes/add-locations-to-ways-optimization.md`
 - [ ] **P2: Consolidate duplicated transform logic.** `process_block` and
   `process_way_block` share most way logic; `process_node_block` repeats node
   filtering. Extract shared helpers that operate on reusable scratch and a mode enum.
-- [ ] **P2: Move raw-frame reader into shared internal utility.** `read_raw_frame`
-  is duplicated between merge and add-locations. Shared utility reduces divergence.
+- [x] **P2: Move raw-frame reader into shared internal utility.** `read_raw_frame`
+  now lives only in `src/commands/mod.rs`, used by both merge and add-locations.
 
 ## Performance: inspect optimizations
 
@@ -252,69 +252,26 @@ All CLI commands now beat osmium except extract --simple.
 
 Audit findings from code quality review. Ranked by effort/impact.
 
-### High value (trivial effort) — DONE
-
-All 5 items consolidated into `src/commands/mod.rs`:
-- `require_indexdata` helper (replaced 9 copy-pasted error blocks)
-- `flush_local` (replaced 6 identical functions)
-- `BATCH_SIZE` + byte-budget constants (replaced 7 local definitions)
-- `type Result<T>` alias made `pub(crate)` (replaced 13 local aliases)
-- `TypeFilter` struct with `parse`/`from_single`/`all` (replaced 4 definitions)
-
-### Medium value (moderate effort)
-
-- [~] **Batch collection loop.** Added shared
-  `for_each_primitive_block_batch` in `src/commands/mod.rs` and migrated
-  `cat`, `extract`, `getid`, `tags_filter`, and `tags_count` (completed
-  2026-03-03). Remaining bespoke loops are in `add_locations_to_ways`
-  (includes non-standard size/byte-budgeted batching).
-
-- [x] **Parallel batch drain.** Consolidated into shared
-  `drain_batch_results` in `src/commands/mod.rs` and adopted by command
-  call sites that return `(Vec<OwnedBlock>, stats)` batch results
-  (completed 2026-03-03).
-
-- [x] **`RawBlobFrame` duplication in `cat.rs`.** `cat.rs` now uses shared
-  `RawBlobFrame` + `read_raw_frame` from `src/commands/mod.rs` (completed
-  2026-03-03). Previously it defined its own
-  `RawBlobFrame` struct + `read_raw_frame` function (~45 lines) that duplicates
-  the shared version in `mod.rs:41-104`. The `mod.rs` version is a superset.
-
-- [x] **`ReorderBuffer<T>` utility.** Added shared
-  `src/reorder_buffer.rs` and migrated `writer.rs`, `uring_writer.rs`, and
-  `read/pipeline.rs` to use it (completed 2026-03-03).
+Completed: 5 high-value helpers in `mod.rs` (require_indexdata, flush_local,
+BATCH_SIZE, Result alias, TypeFilter), batch collection loop, parallel batch
+drain, RawBlobFrame consolidation, ReorderBuffer utility, CLI flag groups.
 
 Full deep-dive with 6 large consolidation opportunities (shared rewrite engine,
 ElementEmitter API, unified blob pipeline, generic merge-join core,
 dependency-closure planner, I/O mode options normalization):
 `notes/business-logic-consolidation-deep-dive-2026-03-03.md`
 
+### Remaining
+
 - [ ] **Owned element types.** `sort.rs:74-141` and `owned_elements.rs:14-39`
   both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata
   (~170 lines). Could share a base with optional extensions.
 
-- [x] **CLI flag groups.** `direct_io` / `compression` / `force` / `output`
-  now use shared clap `#[command(flatten)]` arg structs in `cli/src/main.rs`
-  and compression parsing now uses `FromStr` on `Compression` in
-  `src/write/writer.rs` (completed 2026-03-03).
-
 ## Deep-dive findings (2026-03-03)
 
-- [x] **P0 safety: data race UB in dense mmap index writer.** Fixed at commit
-  `7694f40`: replaced `copy_nonoverlapping` with `AtomicU64::store(Relaxed)` in
-  `SharedDenseWriter::insert` and paired with `AtomicU64::load(Relaxed)` in
-  `DenseMmapIndex::get`. Zero measurable overhead (+0.4% on Denmark, within noise).
-  Investigation note:
-  `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
-
-- [x] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
-  Fixed: `require_indexdata` now validates all input files, not just the first.
-
-- [x] **P1 performance: `sort` pass-1 alloc/read churn can be reduced.**
-  `build_blob_index` now skips blob payload reads for indexed blobs
-  (`reader.skip(data_size)`) and reuses a single buffer for the non-indexed
-  fallback path. On Denmark (487 MB, 7396 blobs): 29% CPU reduction in pass 1,
-  bit-identical output. At planet scale eliminates ~18 GB unnecessary reads.
+- [x] **P0 safety: data race UB in dense mmap index writer.** Fixed at `7694f40`.
+- [x] **P1 correctness/UX: `cat --type` indexdata validation.** Fixed: validates all input files.
+- [x] **P1 performance: `sort` pass-1 alloc/read churn.** Fixed at `8cf3c57` (29% CPU reduction).
 
 - [ ] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
   `merge` and `add-locations-to-ways` coalescing appends frame bytes into one
@@ -341,31 +298,6 @@ dependency-closure planner, I/O mode options normalization):
   strict correctness for all coordinates, store a separate occupancy bitmap (1
   bit/node) or reserve an impossible sentinel with explicit valid-bit tracking.
 
-- [x] **P1 pipeline guard: add duplicate-ID validation stage before add-locations-to-ways.**
-  Implemented `pbfhogg verify ids` — streaming single-pass check for monotonicity
-  and type ordering, with `--full` for duplicate detection via RoaringTreemap.
-  Also `verify refs` (wraps check-refs) and `verify all` (runs both).
-  CLI/API proposal: `notes/verify-ids-cli-api-proposal-2026-03-03.md`
+- [x] **P1 pipeline guard: `verify ids` subcommand.** Streaming monotonicity + type ordering check.
+- [x] **P2 command design: validation ownership.** Validation lives in `verify` subcommands.
 
-- [x] **P2 command design: decide validation ownership (`cat` strict mode vs new `verify`).**
-  Decided: validation lives in dedicated `verify` subcommands, not bolted onto `cat`.
-  Production pipeline: `cat` (indexdata) → `verify ids` → `check-refs` → `merge` → `add-locations-to-ways`.
-
-### Lower value (hygiene) — DONE
-
-- [x] **`FrameScratch::new()`.** Added `const fn new()`, replaced 7 struct literals.
-- [x] **`MergeOptions` and `SortOptions`.** Replaced 7-8 arg signatures with options structs.
-- [~] **`member_type_value` consolidation.** Skipped — different Unknown handling
-  semantics (lossy protobuf write vs lossless compact storage). Not actually duplicated.
-- [~] **`#[doc(hidden)]` vs `pub(crate)`.** Current pattern is correct — downstream
-  crates need `pub`, `doc(hidden)` keeps them out of API docs. No change needed.
-- [~] **`decompress_blob` near-duplication.** Skipped — fundamentally different buffer
-  management strategies (caller Vec reuse vs DecompressPool+Bytes). Abstraction
-  would add complexity to performance-critical paths.
-- [x] **Header + writer setup helper.** Consolidated into shared helpers in
-  `src/commands/mod.rs` (`build_output_header`, `writer_from_header`,
-  `writer_from_header_bytes`) and applied across command call sites.
-  (completed 2026-03-03)
-  Previously: 9 instances of read header →
-  `HeaderBuilder::from_header` → preserve sorted → build → open pipelined
-  writer. Could be a shared helper in `mod.rs`.

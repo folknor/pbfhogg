@@ -235,15 +235,20 @@ All 5 items consolidated into `src/commands/mod.rs`:
 
 ### Medium value (moderate effort)
 
-- [ ] **Batch collection loop.** The pattern of collecting `PrimitiveBlock`s into
-  a `Vec`, dispatching to rayon when full, then clearing — appears 10+ times
-  across 6 files. A `for_each_batch` helper would save ~120 lines.
+- [~] **Batch collection loop.** Added shared
+  `for_each_primitive_block_batch` in `src/commands/mod.rs` and migrated
+  `cat`, `extract`, `getid`, `tags_filter`, and `tags_count` (completed
+  2026-03-03). Remaining bespoke loops are in `add_locations_to_ways`
+  (includes non-standard size/byte-budgeted batching).
 
-- [ ] **Parallel batch drain.** The sequential "drain results, merge stats, write
-  OwnedBlocks" loop appears 7+ times across 5 files. A generic
-  `drain_batch_results` helper would save ~140-210 lines.
+- [x] **Parallel batch drain.** Consolidated into shared
+  `drain_batch_results` in `src/commands/mod.rs` and adopted by command
+  call sites that return `(Vec<OwnedBlock>, stats)` batch results
+  (completed 2026-03-03).
 
-- [ ] **`RawBlobFrame` duplication in `cat.rs`.** `cat.rs:81-127` defines its own
+- [x] **`RawBlobFrame` duplication in `cat.rs`.** `cat.rs` now uses shared
+  `RawBlobFrame` + `read_raw_frame` from `src/commands/mod.rs` (completed
+  2026-03-03). Previously it defined its own
   `RawBlobFrame` struct + `read_raw_frame` function (~45 lines) that duplicates
   the shared version in `mod.rs:41-104`. The `mod.rs` version is a superset.
 

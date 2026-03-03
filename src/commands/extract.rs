@@ -10,7 +10,10 @@ use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
-use super::{drain_batch_results, flush_local, require_indexdata, writer_from_header};
+use super::{
+    drain_batch_results, flush_local, for_each_primitive_block_batch, require_indexdata,
+    writer_from_header,
+};
 use super::id_set_dense::IdSetDense;
 
 // ---------------------------------------------------------------------------
@@ -541,17 +544,9 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         matched_relation_ids: &matched_relation_ids,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
-        if batch.len() >= BATCH_SIZE {
-            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
-    }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        process_extract_pass2_batch(batch, &ids, &mut writer, &mut stats)
+    })?;
 
     writer.flush()?;
     Ok(stats)
@@ -592,17 +587,9 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
         matched_relation_ids: &matched_relation_ids,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
-        if batch.len() >= BATCH_SIZE {
-            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
-    }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        process_extract_pass2_batch(batch, &ids, &mut writer, &mut stats)
+    })?;
 
     writer.flush()?;
     Ok(stats)
@@ -940,17 +927,9 @@ fn extract_smart(
         matched_relation_ids: &matched_relation_ids,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
-        if batch.len() >= BATCH_SIZE {
-            process_extract_pass3_batch(&batch, &ids, &mut writer, &mut stats)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        process_extract_pass3_batch(&batch, &ids, &mut writer, &mut stats)?;
-    }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        process_extract_pass3_batch(batch, &ids, &mut writer, &mut stats)
+    })?;
 
     writer.flush()?;
     Ok(stats)

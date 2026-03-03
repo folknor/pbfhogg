@@ -1,21 +1,20 @@
 //! Concatenate PBF files with optional type filtering. Equivalent to `osmium cat`.
 
-use std::io::{self, Read};
 use std::path::Path;
 
 use rayon::prelude::*;
 
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
-    writer_from_header, TypeFilter,
+    for_each_primitive_block_batch, writer_from_header, TypeFilter,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
+use crate::blob::{decode_blob_to_headerblock, BlobKind};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
-use super::{drain_batch_results, flush_local, Result, BATCH_SIZE};
+use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
 
 /// Statistics from a cat operation.
 pub struct CatStats {
@@ -69,55 +68,6 @@ pub fn cat(
 // Passthrough path: no type filter, zero decode
 // ---------------------------------------------------------------------------
 
-/// Raw blob frame: complete framed bytes for write_raw() passthrough.
-struct RawBlobFrame {
-    frame_bytes: Vec<u8>,
-    blob_type: BlobKind,
-    blob_bytes: Vec<u8>,
-    /// Byte offset of this frame in the input file (for copy_file_range).
-    #[cfg_attr(not(feature = "linux-direct-io"), allow(dead_code))]
-    file_offset: u64,
-}
-
-/// Read the next raw blob frame. Returns None at EOF.
-/// Updates `file_offset` to track position for copy_file_range.
-fn read_raw_frame<R: Read>(
-    reader: &mut R,
-    file_offset: &mut u64,
-) -> Result<Option<RawBlobFrame>> {
-    let frame_start = *file_offset;
-
-    let mut len_buf = [0u8; 4];
-    match reader.read_exact(&mut len_buf) {
-        Ok(()) => {}
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(e) => return Err(e.into()),
-    }
-    #[allow(clippy::cast_possible_truncation)]
-    let header_len = u32::from_be_bytes(len_buf) as usize;
-
-    let mut header_bytes = vec![0u8; header_len];
-    reader.read_exact(&mut header_bytes)?;
-    let (blob_type, data_size) = parse_blob_header(&header_bytes)?;
-
-    let mut blob_bytes = vec![0u8; data_size];
-    reader.read_exact(&mut blob_bytes)?;
-
-    let frame_len = 4 + header_len + data_size;
-    *file_offset += frame_len as u64;
-    let mut frame_bytes = Vec::with_capacity(frame_len);
-    frame_bytes.extend_from_slice(&len_buf);
-    frame_bytes.extend_from_slice(&header_bytes);
-    frame_bytes.extend_from_slice(&blob_bytes);
-
-    Ok(Some(RawBlobFrame {
-        frame_bytes,
-        blob_type,
-        blob_bytes,
-        file_offset: frame_start,
-    }))
-}
-
 fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool) -> Result<CatStats> {
     let single_file = files.len() == 1;
 
@@ -127,7 +77,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         let mut hdr_bytes = None;
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             if frame.blob_type == BlobKind::OsmHeader {
-                let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
+                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
                 hdr_bytes = Some(build_output_header(&header, single_file, |hb| hb)?);
                 break;
             }
@@ -287,33 +237,18 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     for file in files {
         let reader = ElementReader::open(file, direct_io)?;
         let blocks_iter = reader.with_blob_filter(blob_filter.clone()).into_blocks_pipelined();
-
-        // Collect decoded blocks into batches of BATCH_SIZE, then process
-        // each batch in parallel via rayon.
-        let mut batch: Vec<crate::PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-        for block_result in blocks_iter {
-            let block = block_result?;
-            batch.push(block);
-
-            if batch.len() >= BATCH_SIZE {
-                let (batch_blobs, batch_elements) = process_batch(
-                    &batch, &mut writer, tf.nodes, tf.ways, tf.relations,
-                )?;
-                blobs_decoded += batch_blobs;
-                elements += batch_elements;
-                batch.clear();
-            }
-        }
-
-        // Flush remaining blocks in the final partial batch
-        if !batch.is_empty() {
+        for_each_primitive_block_batch(blocks_iter, BATCH_SIZE, |batch| {
             let (batch_blobs, batch_elements) = process_batch(
-                &batch, &mut writer, tf.nodes, tf.ways, tf.relations,
+                batch,
+                &mut writer,
+                tf.nodes,
+                tf.ways,
+                tf.relations,
             )?;
             blobs_decoded += batch_blobs;
             elements += batch_elements;
-        }
+            Ok(())
+        })?;
     }
 
     writer.flush()?;

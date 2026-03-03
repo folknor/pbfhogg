@@ -5,7 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use super::{require_indexdata, TypeFilter};
+use super::{for_each_primitive_block_batch, require_indexdata, TypeFilter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
@@ -51,20 +51,11 @@ pub fn tags_count(
     let tf = TypeFilter::from_single(type_filter);
 
     let mut counts: CountMap = FxHashMap::default();
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    for block_result in reader.into_blocks_pipelined() {
-        batch.push(block_result?);
-        if batch.len() >= BATCH_SIZE {
-            let batch_counts = count_batch(&batch, tf.nodes, tf.ways, tf.relations);
-            merge_counts(&mut counts, batch_counts);
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        let batch_counts = count_batch(&batch, tf.nodes, tf.ways, tf.relations);
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        let batch_counts = count_batch(batch, tf.nodes, tf.ways, tf.relations);
         merge_counts(&mut counts, batch_counts);
-    }
+        Ok(())
+    })?;
 
     let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);

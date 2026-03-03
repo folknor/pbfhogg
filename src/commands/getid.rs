@@ -7,7 +7,7 @@ use rayon::prelude::*;
 
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
-    writer_from_header,
+    for_each_primitive_block_batch, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -165,31 +165,15 @@ fn filter_by_id(
         relations_written: 0,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        batch.push(block);
-
-        if batch.len() >= BATCH_SIZE {
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
             let (nodes, ways, relations) = process_filter_batch(
-                &batch, &mut writer, ids, include, None,
+                batch, &mut writer, ids, include, None,
             )?;
             stats.nodes_written += nodes;
             stats.ways_written += ways;
             stats.relations_written += relations;
-            batch.clear();
-        }
-    }
-
-    if !batch.is_empty() {
-        let (nodes, ways, relations) = process_filter_batch(
-            &batch, &mut writer, ids, include, None,
-        )?;
-        stats.nodes_written += nodes;
-        stats.ways_written += ways;
-        stats.relations_written += relations;
-    }
+            Ok(())
+        })?;
 
     writer.flush()?;
     Ok(stats)
@@ -239,31 +223,15 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
     let dep_ref = if dep_node_ids.is_empty() { None } else { Some(&dep_node_ids) };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        batch.push(block);
-
-        if batch.len() >= BATCH_SIZE {
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
             let (nodes, ways, relations) = process_filter_batch(
-                &batch, &mut writer, ids, true, dep_ref,
+                batch, &mut writer, ids, true, dep_ref,
             )?;
             stats.nodes_written += nodes;
             stats.ways_written += ways;
             stats.relations_written += relations;
-            batch.clear();
-        }
-    }
-
-    if !batch.is_empty() {
-        let (nodes, ways, relations) = process_filter_batch(
-            &batch, &mut writer, ids, true, dep_ref,
-        )?;
-        stats.nodes_written += nodes;
-        stats.ways_written += ways;
-        stats.relations_written += relations;
-    }
+            Ok(())
+        })?;
 
     writer.flush()?;
     Ok(stats)

@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use super::id_set_dense::IdSetDense;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
-    writer_from_header, TypeFilter,
+    for_each_primitive_block_batch, writer_from_header, TypeFilter,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
@@ -380,18 +380,9 @@ fn tags_filter_single_pass(
         relations_matched: 0,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    for block_result in reader.into_blocks_pipelined() {
-        batch.push(block_result?);
-        if batch.len() >= BATCH_SIZE {
-            process_filter_batch(&batch, expressions, &mut writer, &mut stats)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        process_filter_batch(&batch, expressions, &mut writer, &mut stats)?;
-    }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        process_filter_batch(batch, expressions, &mut writer, &mut stats)
+    })?;
 
     writer.flush()?;
     Ok(stats)
@@ -643,18 +634,9 @@ fn tags_filter_two_pass(
         way_dep_node_ids: &way_dep_node_ids,
     };
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
-        if batch.len() >= BATCH_SIZE {
-            process_pass2_batch(&batch, &id_sets, &mut writer, &mut stats)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        process_pass2_batch(&batch, &id_sets, &mut writer, &mut stats)?;
-    }
+    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+        process_pass2_batch(batch, &id_sets, &mut writer, &mut stats)
+    })?;
 
     writer.flush()?;
     Ok(stats)

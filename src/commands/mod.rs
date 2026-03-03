@@ -25,6 +25,7 @@ use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, Ra
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
+use crate::PrimitiveBlock;
 
 // Box<dyn Error> is intentional — commands are CLI internals, callers only display
 // errors and exit. Typed error enums would add complexity with no matching benefit.
@@ -41,6 +42,33 @@ pub(crate) const BATCH_MIN_BLOBS: usize = 8;
 
 /// Maximum blobs per batch (bounds per-batch memory).
 pub(crate) const BATCH_MAX_BLOBS: usize = 128;
+
+/// Consume `PrimitiveBlock` results in fixed-size batches.
+///
+/// Each incoming block result is propagated with `?`; successful blocks are
+/// accumulated into a reusable `Vec` and passed to `process_batch` when full,
+/// then once more for the final partial batch.
+pub(crate) fn for_each_primitive_block_batch<E>(
+    blocks: impl IntoIterator<Item = std::result::Result<PrimitiveBlock, E>>,
+    batch_size: usize,
+    mut process_batch: impl FnMut(&[PrimitiveBlock]) -> Result<()>,
+) -> Result<()>
+where
+    E: Into<Box<dyn std::error::Error>>,
+{
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(batch_size);
+    for block in blocks {
+        batch.push(block.map_err(Into::into)?);
+        if batch.len() >= batch_size {
+            process_batch(&batch)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_batch(&batch)?;
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // Element type filter

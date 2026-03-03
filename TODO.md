@@ -252,9 +252,9 @@ All 5 items consolidated into `src/commands/mod.rs`:
   `RawBlobFrame` struct + `read_raw_frame` function (~45 lines) that duplicates
   the shared version in `mod.rs:41-104`. The `mod.rs` version is a superset.
 
-- [ ] **`ReorderBuffer<T>` utility.** Identical VecDeque-based reorder logic in
-  `writer.rs:620-656`, `uring_writer.rs:710-750`, and `pipeline.rs:189-230`.
-  The uring_writer even comments "identical reorder logic." ~40 lines x 3 sites.
+- [x] **`ReorderBuffer<T>` utility.** Added shared
+  `src/reorder_buffer.rs` and migrated `writer.rs`, `uring_writer.rs`, and
+  `read/pipeline.rs` to use it (completed 2026-03-03).
 
 - [ ] **Owned element types.** `sort.rs:74-141` and `owned_elements.rs:14-39`
   both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata

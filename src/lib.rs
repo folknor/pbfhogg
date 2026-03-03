@@ -119,6 +119,7 @@ pub mod commands;
 pub mod osc;
 pub(crate) mod blob_index;
 mod error;
+pub(crate) mod reorder_buffer;
 
 // ---------------------------------------------------------------------------
 // Public API re-exports

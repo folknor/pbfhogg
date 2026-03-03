@@ -7,7 +7,7 @@ use super::blob::{BlobReader, BlobType, DecompressPool};
 use super::block::PrimitiveBlock;
 use crate::blob_index::BlobFilter;
 use crate::error::Result;
-use std::collections::VecDeque;
+use crate::reorder_buffer::ReorderBuffer;
 use std::io::Read;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -166,61 +166,22 @@ where
 
         // Stage 3: Reorder buffer on main thread — deliver blocks in file order.
         //
-        // We use a VecDeque instead of a HashMap because:
-        //   - Sequence numbers are consecutive integers (0, 1, 2, …) and we always
-        //     drain from the front in order, which is exactly what VecDeque excels at.
-        //   - The out-of-order window is bounded: at most DECODE_AHEAD items can be
-        //     in-flight, so the deque never grows larger than that.
-        //   - VecDeque stores elements contiguously in a ring buffer, giving
-        //     cache-friendly iteration and O(1) push/pop from both ends. HashMap
-        //     has hashing overhead, pointer chasing, and worse cache locality for
-        //     this access pattern.
-        //
-        // Indexing scheme:
-        //   Slot index = seq - next_seq. When seq == next_seq the item lands at
-        //   index 0 (the front). When a block arrives with seq > next_seq, we may
-        //   need to grow the deque with empty (None) slots to reach that index.
+        // Reorder by sequence number and emit only contiguous ready items.
+        // The underlying storage is VecDeque-based and bounded by DECODE_AHEAD.
         //
         // Each slot is `Option<Option<Result<PrimitiveBlock>>>`:
         //   - Outer `None`  → slot not yet filled (decode still in progress)
         //   - `Some(None)`  → slot filled, but blob was a header/unknown (skip)
         //   - `Some(Some(Ok(block)))` → decoded data block ready to deliver
         //   - `Some(Some(Err(e)))` → decode or I/O error to propagate
-        let mut next_seq: usize = 0;
-        let mut pending: VecDeque<Option<Option<Result<PrimitiveBlock>>>> =
-            VecDeque::with_capacity(DECODE_AHEAD);
+        let mut pending: ReorderBuffer<Option<Result<PrimitiveBlock>>> =
+            ReorderBuffer::with_capacity(DECODE_AHEAD);
 
         for (seq, item) in decoded_rx {
-            let slot_idx = seq - next_seq;
-
-            // Grow the deque with empty (unfilled) slots if this sequence number
-            // is beyond the current length. This happens when items arrive out of
-            // order — e.g. blob 5 finishes decoding before blob 3.
-            if slot_idx >= pending.len() {
-                pending.resize_with(slot_idx + 1, || None);
-            }
-
-            // Fill the slot. The slot must be None (unfilled) because each
-            // sequence number is unique.
-            pending[slot_idx] = Some(item);
+            pending.push(seq, item);
 
             // Drain all consecutive ready blocks from the front.
-            // We peek at front() to check if the next slot is filled, then
-            // pop_front() to take ownership. Unfilled slots (outer None) at
-            // the front mean we're still waiting for an earlier blob to
-            // finish decoding, so we stop and wait for the next channel recv.
-            loop {
-                // Check if the front slot exists and is filled (Some(_)).
-                // We can't pop directly because we need to distinguish
-                // "front is None (unfilled)" from "deque is empty".
-                let front_is_filled = pending.front().is_some_and(Option::is_some);
-                if !front_is_filled {
-                    break;
-                }
-                // Safe to unwrap: we just confirmed front is Some(Some(_)).
-                #[allow(clippy::unwrap_used)]
-                let item = pending.pop_front().unwrap().unwrap();
-                next_seq += 1;
+            while let Some(item) = pending.pop_ready() {
                 match item {
                     Some(Ok(block)) => block_fn(block)?,
                     Some(Err(e)) => return Err(e),

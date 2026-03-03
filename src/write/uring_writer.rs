@@ -13,8 +13,8 @@ use crate::write::writer::{PipelineItem, PipelinePayload, WRITE_AHEAD};
 use io_uring::opcode;
 use io_uring::types::Fixed;
 use io_uring::IoUring;
+use crate::reorder_buffer::ReorderBuffer;
 use std::alloc::{self, Layout};
-use std::collections::VecDeque;
 use std::fs::File;
 use std::io;
 use std::os::unix::fs::OpenOptionsExt;
@@ -705,32 +705,20 @@ fn uring_init_and_run(
     Ok(())
 }
 
-/// Reorder and write loop — identical reorder logic to
-/// [`super::writer::writer_thread`], but dispatches to [`UringState::write`].
+/// Reorder and write loop using the shared sequence-number reorder buffer,
+/// then dispatches to [`UringState::write`].
 fn uring_main_loop(
     rx: &Receiver<PipelineItem>,
     state: &mut UringState,
 ) -> io::Result<()> {
-    let mut next_seq: usize = 0;
-    let mut pending: VecDeque<Option<PipelinePayload>> =
-        VecDeque::with_capacity(WRITE_AHEAD);
+    let mut pending: ReorderBuffer<PipelinePayload> =
+        ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     for item in rx {
-        let slot_idx = item.seq - next_seq;
-        if slot_idx >= pending.len() {
-            pending.resize_with(slot_idx + 1, || None);
-        }
-        pending[slot_idx] = Some(item.data);
+        pending.push(item.seq, item.data);
 
         // Drain consecutive ready items from the front.
-        loop {
-            let front_is_filled = pending.front().is_some_and(Option::is_some);
-            if !front_is_filled {
-                break;
-            }
-            #[allow(clippy::unwrap_used)]
-            let payload = pending.pop_front().unwrap().unwrap();
-            next_seq += 1;
+        while let Some(payload) = pending.pop_ready() {
             match payload {
                 PipelinePayload::Bytes(result) => {
                     state.write(&result?)?;
@@ -739,7 +727,6 @@ fn uring_main_loop(
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
                     handle_copy_range_uring(state, in_fd, offset, len)?;
                 }
-            }
         }
 
         // Opportunistically reap CQEs without blocking to recycle buffers.

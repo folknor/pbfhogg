@@ -17,8 +17,8 @@ use flate2::Compress;
 use flate2::Compression as FlateCompression;
 use flate2::FlushCompress;
 use flate2::Status;
+use crate::reorder_buffer::ReorderBuffer;
 use std::cell::RefCell;
-use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
@@ -641,8 +641,8 @@ impl PbfWriter<FileWriter> {
 
 /// Writer thread: receives framed blobs and writes them in sequence order.
 ///
-/// Uses a VecDeque reorder buffer (same pattern as the read-side pipeline)
-/// to handle out-of-order arrivals from parallel rayon tasks.
+/// Uses a shared sequence-number reorder buffer to handle out-of-order
+/// arrivals from parallel rayon tasks.
 ///
 /// Specialized to `FileWriter` (not generic `W: Write`) to support
 /// `CopyRange` payloads that require `flush_and_raw_fd()`.
@@ -650,26 +650,14 @@ fn writer_thread(
     rx: std::sync::mpsc::Receiver<PipelineItem>,
     mut writer: FileWriter,
 ) -> io::Result<()> {
-    let mut next_seq: usize = 0;
-    let mut pending: VecDeque<Option<PipelinePayload>> =
-        VecDeque::with_capacity(WRITE_AHEAD);
+    let mut pending: ReorderBuffer<PipelinePayload> =
+        ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     for item in rx {
-        let slot_idx = item.seq - next_seq;
-        if slot_idx >= pending.len() {
-            pending.resize_with(slot_idx + 1, || None);
-        }
-        pending[slot_idx] = Some(item.data);
+        pending.push(item.seq, item.data);
 
         // Drain consecutive ready items from the front.
-        loop {
-            let front_is_filled = pending.front().is_some_and(Option::is_some);
-            if !front_is_filled {
-                break;
-            }
-            #[allow(clippy::unwrap_used)]
-            let payload = pending.pop_front().unwrap().unwrap();
-            next_seq += 1;
+        while let Some(payload) = pending.pop_ready() {
             match payload {
                 PipelinePayload::Bytes(result) => writer.write_all(&result?)?,
                 #[cfg(feature = "linux-direct-io")]

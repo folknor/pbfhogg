@@ -2,6 +2,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
 
@@ -67,8 +68,13 @@ impl DenseMmapIndex {
             return None;
         }
         let offset = idx * ENTRY_SIZE;
-        // Single 8-byte load: lower 32 bits = lat (LE), upper 32 bits = lon (LE).
-        let packed = u64::from_le_bytes(self.mmap[offset..offset + 8].try_into().ok()?);
+        // SAFETY: offset + 8 <= capacity * ENTRY_SIZE = mmap length.
+        // Pointer is 8-byte aligned (page-aligned base + 8*idx).
+        // Atomic load pairs with atomic stores in SharedDenseWriter::insert.
+        let packed = unsafe {
+            let ptr = self.mmap.as_ptr().add(offset).cast::<AtomicU64>();
+            (*ptr).load(Ordering::Relaxed)
+        };
         if packed == 0 {
             return None;
         }
@@ -124,10 +130,10 @@ impl DenseMmapIndex {
 
 /// Thread-safe writer for parallel dense index population.
 ///
-/// Holds a raw pointer into the `DenseMmapIndex` mmap buffer. Safe to use
-/// from multiple rayon tasks because PBF node IDs are unique: each ID maps
-/// to a disjoint 8-byte slot (`base + node_id * 8`), so no two tasks write
-/// the same memory.
+/// Holds a raw pointer into the `DenseMmapIndex` mmap buffer. Each node ID
+/// maps to a disjoint 8-byte slot (`base + node_id * 8`). All writes use
+/// `AtomicU64::store(Relaxed)`, eliminating data-race UB even if duplicate
+/// node IDs appear in the input (e.g. from corrupt or non-canonical PBFs).
 ///
 /// The caller must ensure the `DenseMmapIndex` outlives all uses of this
 /// writer. In practice, both live in `build_node_index_dense` and `par_iter`
@@ -137,14 +143,15 @@ struct SharedDenseWriter {
     capacity: usize,
 }
 
-// SAFETY: Writes target disjoint 8-byte slots keyed by unique PBF node IDs.
-// No two rayon tasks access the same offset.
+// SAFETY: All writes use atomic operations (AtomicU64 stores), eliminating
+// data-race UB. The raw pointer requires manual Send+Sync; lifetime is
+// bounded by the synchronous par_iter in build_node_index_dense.
 unsafe impl Send for SharedDenseWriter {}
 unsafe impl Sync for SharedDenseWriter {}
 
 impl SharedDenseWriter {
     /// Insert a node's coordinates. Silently ignores negative IDs and IDs
-    /// beyond capacity (same semantics as `DenseMmapIndex::insert`).
+    /// beyond capacity (same semantics as `DenseMmapIndex::get`).
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     fn insert(&self, node_id: i64, lat: i32, lon: i32) {
         if node_id < 0 {
@@ -155,12 +162,13 @@ impl SharedDenseWriter {
             return;
         }
         let offset = idx * ENTRY_SIZE;
+        let packed = (lat as u32 as u64) | ((lon as u32 as u64) << 32);
         // SAFETY: offset + 8 <= capacity * ENTRY_SIZE = mmap length.
-        // Each node ID is unique in a PBF, so no two tasks write the same slot.
+        // Pointer is 8-byte aligned (page-aligned base + 8*idx).
+        // Atomic store eliminates data-race UB even with duplicate node IDs.
         unsafe {
-            let dst = self.base.add(offset);
-            std::ptr::copy_nonoverlapping(lat.to_le_bytes().as_ptr(), dst, 4);
-            std::ptr::copy_nonoverlapping(lon.to_le_bytes().as_ptr(), dst.add(4), 4);
+            let ptr = self.base.add(offset).cast::<AtomicU64>();
+            (*ptr).store(packed, Ordering::Relaxed);
         }
     }
 }

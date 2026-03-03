@@ -317,8 +317,30 @@ Not recommended as default strategy.
   - hard ceiling <= 10% unless safety requirement mandates more.
 - No meaningful RSS increase (>200 MB) at North America scale.
 
-## Open Questions For You
+## Open Questions — Resolved (2026-03-03)
 
-1. Do you treat malformed/custom PBF inputs as in-scope for production, or only canonical snapshot artifacts?
-2. Is a small steady-state slowdown (for safety hardening) acceptable, and if so what budget (`<=3%`, `<=5%`, etc.)?
-3. Do you want a runtime mode split (`safe` vs `fast`) or a single always-safe default?
+1. **Do you treat malformed/custom PBF inputs as in-scope for production, or only canonical snapshot artifacts?**
+   Only canonical snapshots (Geofabrik/planet). This limitation must be documented
+   frankly in README.md and the project website. Custom/third-party PBFs are
+   not a supported production input.
+
+2. **Is a small steady-state slowdown (for safety hardening) acceptable, and if so what budget?**
+   Cannot answer without measuring. Implement `AtomicU64` first, benchmark on
+   Denmark (at minimum), then decide based on actual numbers.
+
+3. **Do you want a runtime mode split (`safe` vs `fast`) or a single always-safe default?**
+   Single always-safe default. No `--fast-unsafe` flag — atomic writes are the
+   only mode. If the overhead is acceptable (expected to be near-zero on x86
+   with `Relaxed` ordering on disjoint slots), there is no reason to offer an
+   unsafe alternative.
+
+## Decision: AtomicU64 (Option A)
+
+Chosen approach: replace `copy_nonoverlapping` in `SharedDenseWriter::insert`
+with `AtomicU64::store(Relaxed)` and pair with `AtomicU64::load(Relaxed)` in
+`DenseMmapIndex::get`. Removes UB by construction with no mode split.
+
+Next steps:
+1. Implement atomic slot writes and reads.
+2. Benchmark pass-1 and end-to-end on Denmark via `brokkr bench commands add-locations-to-ways`.
+3. If overhead is acceptable, ship as the only mode.

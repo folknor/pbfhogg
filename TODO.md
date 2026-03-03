@@ -121,6 +121,34 @@ Old baselines: read at `90df51f` (461 MB non-indexed), write at `def80d9`.
 
 - [ ] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Same root cause as above.
 
+## Performance: add-locations-to-ways cleanup
+
+P0 and P1 optimizations are done. P2 cleanup and future investigations remain.
+Full design note: `notes/add-locations-to-ways-optimization.md`
+
+- [ ] **P2: Consolidate duplicated transform logic.** `process_block` and
+  `process_way_block` share most way logic; `process_node_block` repeats node
+  filtering. Extract shared helpers that operate on reusable scratch and a mode enum.
+- [ ] **P2: Move raw-frame reader into shared internal utility.** `read_raw_frame`
+  is duplicated between merge and add-locations. Shared utility reduces divergence.
+
+## Performance: inspect optimizations
+
+`inspect` always does a full sequential decode even when indexdata could answer
+most questions without decompression. Multiple optimization opportunities exist.
+Full design note: `notes/inspect-optimization-opportunities.md`
+
+- [ ] **Index-only fast path for cheap modes.** When all blobs have indexdata and
+  no per-element flags are requested, use blob index metadata directly for
+  type/count/ordering — skip decompression entirely.
+- [ ] **Capability-driven scan modes.** Choose scan strategy based on requested
+  flags: `IndexOnly` (no decode), `IndexPlusNodes` (decode node blobs only for
+  tagged-node count), `FullDecode` (current behavior).
+- [ ] **`--locations` percentile optimization.** Sort `coord_counts` in place
+  instead of cloning. Consider histogram-based percentile reconstruction.
+- [ ] **Buffered `--blocks` output.** Replace per-line `println!` with buffered
+  output for large files where output volume dominates.
+
 ## Performance: CLI commands vs osmium
 
 All CLI commands now beat osmium except extract --simple.
@@ -256,6 +284,11 @@ All 5 items consolidated into `src/commands/mod.rs`:
   `src/reorder_buffer.rs` and migrated `writer.rs`, `uring_writer.rs`, and
   `read/pipeline.rs` to use it (completed 2026-03-03).
 
+Full deep-dive with 6 large consolidation opportunities (shared rewrite engine,
+ElementEmitter API, unified blob pipeline, generic merge-join core,
+dependency-closure planner, I/O mode options normalization):
+`notes/business-logic-consolidation-deep-dive-2026-03-03.md`
+
 - [ ] **Owned element types.** `sort.rs:74-141` and `owned_elements.rs:14-39`
   both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata
   (~170 lines). Could share a base with optional extensions.
@@ -332,6 +365,7 @@ All 5 items consolidated into `src/commands/mod.rs`:
   - `cat --verify-unique-ids` strict mode.
   Investigation note:
   `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
+  Full CLI/API proposal: `notes/verify-ids-cli-api-proposal-2026-03-03.md`
 
 - [ ] **P2 command design: decide validation ownership (`cat` strict mode vs new `verify`).**
   Keep one clear production recommendation in docs + brokkr workflows.

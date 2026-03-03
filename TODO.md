@@ -224,11 +224,14 @@ concrete improvements identified:
   `mod.rs` replaces the inline capacity check at 28 emission sites across
   cat, getid, tags_filter, extract, and add_locations_to_ways.
 
-- [ ] **Hoist tag/ref/member buffer Vecs into `map_init`.** In cat, getid,
-  tags_filter, and extract, the `tags_buf`, `refs_buf`, `members_buf` Vecs
-  are created inside the `map_init` closure body (re-allocated per batch).
-  Moving them into the init tuple (like add_locations_to_ways already does
-  for `refs_buf`/`locations_buf`) gives cross-batch reuse on rayon threads.
+- [x] ~~**Hoist tag/ref/member buffer Vecs into `map_init`.**~~ Investigated
+  and measured (commit `07d46f4`, Japan 2.4 GB). All three buffers can be
+  hoisted — the lifetime concern was unfounded (`clear()` before `extend()`
+  satisfies the borrow checker). However benchmarking showed **no measurable
+  improvement**: cat-way 3439→3486 ms (+1.4%), cat-relation 365→347 ms
+  (-4.9%), both within noise. The savings (~3 Vec allocations per ~8000-
+  element block, ~16K total for Japan) are negligible against decode + encode
+  + compression. **Not worth the code churn.** Left as-is.
 
 ## Deep-dive findings (2026-03-03)
 

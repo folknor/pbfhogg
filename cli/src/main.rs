@@ -138,7 +138,11 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
-    /// Compare two PBF files and show differences
+    /// Compare two PBF files and show differences.
+    ///
+    /// Uses content equality (coordinates, tags, refs, members) — not version/timestamp
+    /// ordering. This means diff output is deterministic regardless of whether metadata
+    /// is present, partial, or absent in either input.
     Diff {
         /// Old PBF file
         old: PathBuf,

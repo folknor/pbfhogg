@@ -2,6 +2,14 @@
 //!
 //! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
+//!
+//! # Design: content equality, not version ordering
+//!
+//! Unlike osmium's diff, which uses a version/timestamp comparator to order elements and
+//! can produce wrong output when inputs have mismatched metadata (osmium-tool#93), pbfhogg
+//! diff uses content equality: two elements with the same type+ID are compared field by
+//! field (coordinates, tags, refs, members). This makes diff output deterministic regardless
+//! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

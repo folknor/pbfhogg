@@ -289,6 +289,15 @@ result deletes the object even though it still exists).
   (e.g. `keys`, `vals`) is encoded as individual non-packed entries and verify whether
   we silently drop them or error. The protobuf spec says decoders "must" accept both.
 
+- [ ] **Verify sort/merge ordering with negative IDs.**
+  [osmium-tool#303](https://github.com/osmcode/osmium-tool/issues/303): osmium's sort
+  orders 0 first, then negative IDs, then positive IDs by absolute value. Their merge
+  had a bug where it used plain numeric comparison instead, causing failures on PBFs with
+  negative IDs. pbfhogg sort and merge both use plain `i64` comparison — which matches
+  osmium's *buggy* merge, not their sort. Negative IDs are uncommon in production PBFs
+  (JOSM uses them for uncommitted data) but if someone feeds us a JOSM export or custom
+  PBF, our sort output would differ from osmium's.
+
 - [ ] **Use spare latitude bit in DenseMmapIndex for tagged/untagged node flag.**
   [libosmium#395](https://github.com/osmcode/libosmium/issues/395): latitude only needs
   31 of 32 bits (range ±90° vs longitude ±180°), freeing one bit per slot. In
@@ -296,6 +305,19 @@ result deletes the object even though it still exists).
   tagged, eliminating the need for the separate `--keep-untagged-nodes` mode in
   `add-locations-to-ways`. Currently the tagged/untagged decision happens at a different
   stage — this would fold it into the index itself.
+
+- [ ] **tags-filter should preserve delete actions from OSC input.**
+  [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): when tags-filter
+  processes an OSC file, delete actions are silently dropped because they carry no tags
+  and therefore never match any filter expression. This matters for diff pipelines — if
+  you tags-filter a daily diff to extract e.g. `highway=*` changes before merging, the
+  filtered diff loses all deletes. The subsequent merge keeps stale objects that should
+  have been removed. osmium's workaround is to not use tags-filter on OSC files at all.
+  pbfhogg `tags-filter` currently only operates on PBF input, but if we add OSC support
+  (or if someone pipes `derive-changes` output through `tags-filter` in a pipeline), we
+  need a `--keep-deletes` or `--passthrough-deletes` flag to forward delete actions
+  unfiltered. Design consideration: deletes could also be auto-forwarded by default when
+  input is OSC, since dropping them is almost never what the user wants.
 
 ## Deep-dive findings (2026-03-03)
 

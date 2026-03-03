@@ -227,19 +227,27 @@ All CLI commands now beat osmium except extract --simple.
   shared thread pool architecture where pipeline decode and consumer
   parallelism use the same pool.
 
-- [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
-  commands still materialize both files via `read_elements()` in
-  `owned_elements.rs`, then sort and merge-join in memory; this is the
-  last remaining hard planet-scale OOM path.
+- [x] **P3-22 Phase 1: Streaming merge-join for diff.** Rewritten at
+  `b14a174`. `diff` now streams through both sorted PBFs in constant
+  memory (~1.1 GB RSS on Denmark vs unbounded OOM for the old approach
+  at planet scale). Uses `StreamingBlocks` cursor with block-level
+  stashing and three sequential type phases (nodes → ways → relations).
+  Requires `Sort.Type_then_ID` on both inputs.
 
-  Full design and evaluation moved to:
-  `notes/derive-changes-diff-streaming-merge-join.md`
+- [ ] **P3-22 Phase 2: Streaming merge-join for derive_changes.**
+  `derive_changes` still materializes both files via `read_elements()`
+  in `owned_elements.rs`. Port to the same streaming cursor
+  infrastructure from `stream_merge.rs`. Main complication: OSC output
+  is action-grouped (`<create>`, `<modify>`, `<delete>`), so changes
+  must be buffered by action type — memory bounded by number of changed
+  elements, not total input size.
 
-  Short version:
-  - implement streaming cursors over `into_blocks_pipelined()` with sorted-input checks
-  - do `diff` first (fully streamable output), then `derive_changes`
-    (action-grouped OSC needs bounded buffering)
-  - remove or shrink `owned_elements.rs` once both commands are ported
+  Full design note: `notes/derive-changes-diff-streaming-merge-join.md`
+
+- [ ] **P3-22 Phase 3: Cleanup owned_elements.rs.** Once both `diff`
+  and `derive_changes` use streaming cursors, `read_elements()` can be
+  removed. The owned type definitions and equality functions are still
+  needed by both commands.
 
 ## Benchmarking
 

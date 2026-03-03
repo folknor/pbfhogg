@@ -1,5 +1,26 @@
 # Streaming merge-join plan for `derive-changes` and `diff`
 
+## Status
+
+**Phase 1 (`diff`) complete** — commit `b14a174`.
+
+- `diff` rewritten to streaming merge-join over pipelined block iterators.
+- New `src/commands/stream_merge.rs` module: `StreamingBlocks` cursor with
+  block-level stashing, `fill_buffer`/`next_element` typed extraction,
+  per-type conversion functions.
+- Requires `Sort.Type_then_ID` on both inputs; actionable error if missing.
+- Denmark (465 MB, 59.1M elements): 14.65s wall, ~1.1 GB RSS (bounded by
+  pipeline decode buffers, not element count).
+- 16 integration tests (12 migrated + 4 new: unsorted rejection, empty files,
+  multi-block boundary 9000 vs 7500, type_filter=way phase skipping).
+
+**Phase 2 (`derive_changes`) not yet started.** Same streaming cursor
+infrastructure applies; main difference is action-grouped OSC output
+requiring bounded buffering by change count.
+
+**Phase 3 (cleanup) blocked on Phase 2.** `read_elements()` in
+`owned_elements.rs` still used by `derive_changes`.
+
 ## Context
 
 This note replaces the long `TODO.md` discussion for:
@@ -246,4 +267,8 @@ If action buffers exceed threshold, spill to disk.
 
 ## Recommended next move
 
-Implement **`diff` streaming first** (lower output-format complexity), then port the same streaming core to `derive_changes`.
+~~Implement **`diff` streaming first** (lower output-format complexity), then port the same streaming core to `derive_changes`.~~
+
+**Done.** `diff` streaming implemented at `b14a174`. Next: port `derive_changes`
+to use the same `StreamingBlocks` cursor from `stream_merge.rs`, buffering
+changes by action type for grouped OSC output.

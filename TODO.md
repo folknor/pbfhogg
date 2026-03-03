@@ -289,6 +289,14 @@ result deletes the object even though it still exists).
   (e.g. `keys`, `vals`) is encoded as individual non-packed entries and verify whether
   we silently drop them or error. The protobuf spec says decoders "must" accept both.
 
+- [ ] **Use spare latitude bit in DenseMmapIndex for tagged/untagged node flag.**
+  [libosmium#395](https://github.com/osmcode/libosmium/issues/395): latitude only needs
+  31 of 32 bits (range ±90° vs longitude ±180°), freeing one bit per slot. In
+  `DenseMmapIndex` (8 bytes/slot = lat+lon) this bit could store whether a node is
+  tagged, eliminating the need for the separate `--keep-untagged-nodes` mode in
+  `add-locations-to-ways`. Currently the tagged/untagged decision happens at a different
+  stage — this would fold it into the index itself.
+
 ## Deep-dive findings (2026-03-03)
 
 - [x] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**

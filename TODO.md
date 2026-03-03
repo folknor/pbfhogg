@@ -121,34 +121,6 @@ Old baselines: read at `90df51f` (461 MB non-indexed), write at `def80d9`.
 
 - [ ] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Same root cause as above.
 
-## Performance: add-locations-to-ways cleanup
-
-P0 and P1 optimizations are done. P2 cleanup and future investigations remain.
-Full design note: `notes/add-locations-to-ways-optimization.md`
-
-- [ ] **P2: Consolidate duplicated transform logic.** `process_block` and
-  `process_way_block` share most way logic; `process_node_block` repeats node
-  filtering. Extract shared helpers that operate on reusable scratch and a mode enum.
-- [x] **P2: Move raw-frame reader into shared internal utility.** `read_raw_frame`
-  now lives only in `src/commands/mod.rs`, used by both merge and add-locations.
-
-## Performance: inspect optimizations
-
-Full design note: `notes/inspect-optimization-opportunities.md`
-
-- [x] **Index-only fast path for cheap modes.** When all blobs have indexdata and
-  `--locations` is not requested, reads only blob headers and skips all
-  decompression. 36ms vs 3.9s on Denmark 473 MB (109x speedup). Falls back to
-  full decode if any blob lacks indexdata.
-- [x] **Capability-driven scan modes.** Implemented as IndexOnly (no decode,
-  header-only reads via `read_blob_header_only` + `FileReader::skip`) and
-  FullDecode (original path). IndexPlusNodes deferred — tagged_node_count is
-  simply omitted in index-only mode (acceptable trade-off).
-- [x] **`--locations` percentile optimization.** `coord_counts` sorted in place
-  instead of cloning.
-- [ ] **Buffered `--blocks` output.** Replace per-line `println!` with buffered
-  output for large files where output volume dominates.
-
 ## Performance: CLI commands vs osmium
 
 All CLI commands now beat osmium except extract --simple.

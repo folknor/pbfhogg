@@ -766,14 +766,20 @@ impl InspectReport {
     }
 
     fn print_block_table(infos: &[BlockInfo]) {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+
         let has_raw = infos.iter().any(|i| i.raw.is_some());
         if has_raw {
-            println!(
+            let _ok = writeln!(
+                out,
                 "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
                 "Block", "Type", "Elements", "Compressed", "Raw"
             );
             for info in infos {
-                println!(
+                let _ok = writeln!(
+                    out,
                     "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
                     info.number,
                     info.kind.label(),
@@ -783,12 +789,14 @@ impl InspectReport {
                 );
             }
         } else {
-            println!(
+            let _ok = writeln!(
+                out,
                 "{:>6}  {:12}{:>8}  {:>10}",
                 "Block", "Type", "Elements", "Compressed"
             );
             for info in infos {
-                println!(
+                let _ok = writeln!(
+                    out,
                     "{:>6}  {:12}{:>8}  {:>10}",
                     info.number,
                     info.kind.label(),

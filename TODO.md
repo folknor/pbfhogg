@@ -300,20 +300,12 @@ dependency-closure planner, I/O mode options normalization):
 
 ## Deep-dive findings (2026-03-03)
 
-- [ ] **P0 safety: potential data race UB in dense mmap index writer.**
-  `add_locations_to_ways.rs` parallel index population uses `SharedDenseWriter`
-  with raw pointer writes and `unsafe impl Send + Sync` (see
-  `src/commands/add_locations_to_ways.rs`, `SharedDenseWriter::insert`).
-  This is only sound if each node ID is written exactly once globally.
-  If duplicate node IDs appear (corrupt input, non-standard snapshots, future
-  command reuse), two rayon threads can write the same slot concurrently, which
-  is a Rust data race (UB), even if bytes happen to be equal.
-  Detailed investigation and mitigation options:
+- [x] **P0 safety: data race UB in dense mmap index writer.** Fixed at commit
+  `7694f40`: replaced `copy_nonoverlapping` with `AtomicU64::store(Relaxed)` in
+  `SharedDenseWriter::insert` and paired with `AtomicU64::load(Relaxed)` in
+  `DenseMmapIndex::get`. Zero measurable overhead (+0.4% on Denmark, within noise).
+  Investigation note:
   `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
-  Fix options:
-  1) shard + local maps/vecs then merge serially,
-  2) atomic packed writes (`AtomicU64`) for slot updates,
-  3) fallback to sequential insert path with optional `--strict` duplicate check.
 
 - [ ] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
   `cat()` currently calls `require_indexdata` for `files.first()` only

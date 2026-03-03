@@ -253,9 +253,11 @@ dependency-closure planner, I/O mode options normalization):
 
 ### Remaining
 
-- [ ] **Owned element types.** `sort.rs:74-141` and `owned_elements.rs:14-39`
-  both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata
-  (~170 lines). Could share a base with optional extensions.
+- [x] **Owned element types.** `sort.rs` and `owned_elements.rs` define
+  separate `OwnedNode`/`OwnedWay`/`OwnedRelation` — intentionally kept
+  separate (sort needs full 6-field `OwnedMetadata`, diff/derive only needs
+  `version: Option<i32>`). Consolidated the one identical type: `OwnedMember`
+  is now shared from `owned_elements.rs`.
 
 ## Deep-dive findings (2026-03-03)
 

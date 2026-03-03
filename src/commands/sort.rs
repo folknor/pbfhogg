@@ -23,6 +23,8 @@ use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{Element, MemberId};
 
+use super::owned_elements::OwnedMember;
+
 use super::{build_output_header, require_indexdata, Result, writer_from_header_bytes};
 
 /// Statistics from a sort operation.
@@ -113,11 +115,6 @@ impl PartialOrd for OwnedWay {
 }
 impl Ord for OwnedWay {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
-}
-
-struct OwnedMember {
-    id: MemberId,
-    role: String,
 }
 
 struct OwnedRelation {

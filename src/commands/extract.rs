@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, BlockType, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
@@ -488,6 +488,14 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 /// - Nodes: bbox containment → set `bbox_node_ids`
 /// - Ways: any ref in `bbox_node_ids` → set `matched_way_ids`
 /// - Relations: matched node/way member → set `matched_relation_ids`
+///
+/// Returns `true` if any element in the block matched (the block should be
+/// included in the write batch). Returns `false` if the block is empty for
+/// this extract — callers can skip it to avoid parsing elements with full
+/// metadata in the write path.
+///
+/// Uses `block_type()` (1 byte per group) to branch by type phase,
+/// eliminating dead match arms in the hot inner loop for sorted PBFs.
 fn classify_block_simple(
     block: &PrimitiveBlock,
     region: &Region,
@@ -495,31 +503,80 @@ fn classify_block_simple(
     bbox_node_ids: &mut IdSetDense,
     matched_way_ids: &mut IdSetDense,
     matched_relation_ids: &mut IdSetDense,
-) {
-    for element in block.elements_skip_metadata() {
-        match &element {
-            Element::DenseNode(dn) => {
-                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
-                    bbox_node_ids.set(dn.id());
+) -> bool {
+    let mut matched = false;
+    match block.block_type() {
+        BlockType::DenseNodes | BlockType::Nodes => {
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(dn.id());
+                        matched = true;
+                    }
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(n.id());
+                        matched = true;
+                    }
+                    _ => {}
                 }
             }
-            Element::Node(n) => {
-                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
-                    bbox_node_ids.set(n.id());
-                }
-            }
-            Element::Way(w) => {
-                if w.refs().any(|r| bbox_node_ids.get(r)) {
+        }
+        BlockType::Ways => {
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element
+                    && w.refs().any(|r| bbox_node_ids.get(r))
+                {
                     matched_way_ids.set(w.id());
+                    matched = true;
                 }
             }
-            Element::Relation(r) => {
-                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
+        }
+        BlockType::Relations => {
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
                     matched_relation_ids.set(r.id());
+                    matched = true;
+                }
+            }
+        }
+        BlockType::Mixed | BlockType::Empty => {
+            // Fallback for unsorted/mixed blocks — check all element types.
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(dn.id());
+                        matched = true;
+                    }
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(n.id());
+                        matched = true;
+                    }
+                    Element::Way(w) if w.refs().any(|r| bbox_node_ids.get(r)) => {
+                        matched_way_ids.set(w.id());
+                        matched = true;
+                    }
+                    Element::Relation(r)
+                        if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) =>
+                    {
+                        matched_relation_ids.set(r.id());
+                        matched = true;
+                    }
+                    _ => {}
                 }
             }
         }
     }
+    matched
 }
 
 fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
@@ -548,7 +605,8 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let mut matched_relation_ids = IdSetDense::new();
 
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let reader = ElementReader::open(input, direct_io)?;
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(spatial_blob_filter(&bbox_int));
     for block in reader.into_blocks_pipelined() {
         let block = block?;
         classify_block_simple(
@@ -614,7 +672,8 @@ fn extract_simple_single_pass(
     let mut matched_relation_ids = IdSetDense::new();
     let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
 
-    let reader = ElementReader::open(input, direct_io)?;
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(spatial_blob_filter(&bbox_int));
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
         hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
@@ -624,10 +683,13 @@ fn extract_simple_single_pass(
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        classify_block_simple(
+        let has_matches = classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
         );
+        if !has_matches {
+            continue;
+        }
         batch.push(block);
 
         if batch.len() >= BATCH_SIZE {

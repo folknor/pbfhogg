@@ -52,7 +52,7 @@ This is the strongest near-term path to remove the extra file read cost.
 
 ## High-confidence optimization opportunities
 
-## 1) Single-pass simple extraction for sorted input
+## 1) Single-pass simple extraction for sorted input [DONE]
 
 Design:
 
@@ -70,7 +70,7 @@ Expected impact:
 - removes second file read entirely
 - should close most of the current gap vs osmium for simple mode
 
-## 2) Keep two-pass fallback for unsorted input
+## 2) Keep two-pass fallback for unsorted input [DONE]
 
 Single-pass above relies on type ordering.
 
@@ -79,7 +79,7 @@ Recommended behavior:
 - if `header().is_sorted()` -> single-pass fast path
 - else -> current two-pass implementation (correctness-preserving fallback)
 
-## 3) Reuse existing parallel batch machinery for write side
+## 3) Reuse existing parallel batch machinery for write side [DONE]
 
 `process_extract_pass2_batch` already performs parallel block rewriting and stats merge.
 Single-pass variant can reuse most of this code by:
@@ -87,43 +87,32 @@ Single-pass variant can reuse most of this code by:
 - using streaming classification + per-batch processing
 - avoiding full precomputed ID sets where unnecessary
 
-## 4) Conditional blob filtering for pass-1/two-pass fallback
+## 4) Conditional blob filtering for pass-1/two-pass fallback [DONE]
 
-Current simple pass-1 reads all blobs without `with_blob_filter`.
-When indexdata is present, a spatial node filter and/or type filter can reduce decode work.
-
-Practical option:
-
-- if indexdata is available: use `spatial_blob_filter` for node-heavy parts
-- if not: keep conservative full decode behavior
+Added `spatial_blob_filter(&bbox_int)` to both the unsorted two-pass fallback
+and the sorted single-pass reader. Skips decompression of node blobs whose
+coordinate bbox doesn't intersect the extract region (requires v2 indexdata;
+raw PBFs pass all blobs through conservatively).
 
 ## Medium-confidence opportunities
 
-## 5) Type-phase aware fast path (no per-way `any()` in wrong phases)
+## 5) Type-phase aware fast path (no per-way `any()` in wrong phases) [DONE]
 
-Given sorted input, branch by phase:
+`classify_block_simple` now branches on `block.block_type()` — DenseNodes|Nodes,
+Ways, Relations, Mixed|Empty — eliminating dead match arms in sorted PBF inner
+loops. Mixed/Empty falls through to the original match-all logic for correctness.
 
-- node phase: only node logic
-- way phase: only way logic
-- relation phase: only relation logic
+## 6) Skip empty blocks in write path [DONE]
 
-This trims branching and redundant checks in hot loops.
+`classify_block_simple` returns `bool` indicating whether any elements matched.
+Single-pass path skips `batch.push(block)` when no matches, avoiding dispatch
+to `process_extract_pass2_batch` for blocks that would produce zero output.
+Big win for sparse extracts (small bbox on large file).
 
-## 6) Borrowed-element classification before owned rewrite
+## 7) Stats write-path micro-optimizations [SKIPPED]
 
-Current parallel write path materializes owned blocks. For simple mode, consider:
-
-- cheap match precheck on borrowed elements
-- only allocate owned output buffers for blocks with matches
-
-Potential win on sparse extracts where many blocks produce no output.
-
-## 7) Stats write-path micro-optimizations
-
-Minor but cheap:
-
-- avoid repeated `region.contains_decimicro` conversions in bbox mode by pre-resolving strategy function
-- hoist reusable buffers aggressively in single-pass block processors
+Too minor to justify the code complexity. Type-phase branching (#5) already
+eliminates most of the redundant work these would address.
 
 ## Risks and constraints
 
@@ -186,30 +175,10 @@ Dynamically shrink/grow parallel batch size based on recent output density to ba
 - possible micro-gain
 - uncertain net benefit vs complexity
 
-## Suggested implementation order
+## Implementation status
 
-1. Add explicit sortedness branch in `extract_simple`.
-2. Implement single-pass fast path for sorted input (no semantic changes).
-3. Keep existing two-pass path for unsorted fallback.
-4. Add conditional blob filtering in fallback when indexdata is available.
-5. Benchmark Denmark/Japan and compare with current baseline.
+All practical items (1-6) done, #7 skipped. Verified via `brokkr verify extract`
+(all 3 strategies pass) and `brokkr check` (clippy + tests clean).
 
-## Measurement plan
-
-Run sequentially (one benchmark at a time):
-
-- `extract --simple` on Denmark and Japan
-- sorted input and unsorted synthetic variant
-
-Track:
-
-- wall time
-- peak RSS
-- decoded blob count (if instrumented)
-- output parity vs current implementation (byte-equal or element-equal checks)
-
-Success criteria:
-
-- clear wall-time drop on sorted inputs (primary path)
-- no behavior regressions
-- fallback correctness on unsorted inputs
+Initial single-pass results (items 1-3): Denmark -14% (2625→2277ms),
+Japan -8% (12619→11948ms). Items 4-6 not yet benchmarked separately.

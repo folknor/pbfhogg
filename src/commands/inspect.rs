@@ -1,6 +1,6 @@
 //! Inspect PBF file: comprehensive metadata, block breakdown, ordering analysis.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use super::{read_blob_header_only, read_raw_frame};
@@ -625,8 +625,12 @@ fn classify_block(has_nodes: bool, has_ways: bool, has_relations: bool) -> Block
 // ---------------------------------------------------------------------------
 
 impl InspectReport {
+    /// Print the full inspect report.
+    ///
+    /// `block_limit`: `None` = no block detail, `Some(0)` = distribution stats
+    /// + full listing, `Some(N)` = distribution stats + first/last N blocks.
     #[allow(clippy::cast_precision_loss)]
-    pub fn print_report(&mut self) {
+    pub fn print_report(&mut self, block_limit: Option<usize>) {
         self.print_header();
         println!();
         self.print_blocks_summary();
@@ -637,7 +641,10 @@ impl InspectReport {
 
         if let Some(ref infos) = self.accum.block_infos {
             println!();
-            Self::print_block_table(infos);
+            Self::print_block_distribution(infos);
+            let limit = block_limit.unwrap_or(0);
+            println!();
+            Self::print_block_table(infos, limit);
         }
         if let Some((n, w, r)) = self.id_range_tuple() {
             println!();
@@ -765,28 +772,57 @@ impl InspectReport {
         }
     }
 
-    fn print_block_table(infos: &[BlockInfo]) {
-        use std::io::Write;
+    /// Print per-type distribution stats (min/max/median/p99) for block
+    /// element counts and compressed sizes.
+    #[allow(clippy::cast_precision_loss)]
+    fn print_block_distribution(infos: &[BlockInfo]) {
+        println!("Block distribution:");
+        for kind in [BlockKind::Nodes, BlockKind::Ways, BlockKind::Relations, BlockKind::Mixed] {
+            let mut elements: Vec<u64> = infos
+                .iter()
+                .filter(|i| i.kind == kind)
+                .map(|i| i.elements)
+                .collect();
+            if elements.is_empty() {
+                continue;
+            }
+            elements.sort_unstable();
+            let mut sizes: Vec<u64> = infos
+                .iter()
+                .filter(|i| i.kind == kind)
+                .map(|i| i.compressed as u64)
+                .collect();
+            sizes.sort_unstable();
+
+            println!("  {}", kind.label());
+            print_distribution_line("    elements/block:", &elements, false);
+            print_distribution_line("    bytes/block:   ", &sizes, true);
+        }
+    }
+
+    /// Print the per-block table with optional head/tail limiting.
+    ///
+    /// `limit`: 0 = show all blocks, N = show first N and last N blocks.
+    fn print_block_table(infos: &[BlockInfo], limit: usize) {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
 
         let has_raw = infos.iter().any(|i| i.raw.is_some());
+        let truncate = limit > 0 && limit * 2 < infos.len();
+
         if has_raw {
             let _ok = writeln!(
                 out,
                 "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
                 "Block", "Type", "Elements", "Compressed", "Raw"
             );
-            for info in infos {
-                let _ok = writeln!(
-                    out,
-                    "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
-                    info.number,
-                    info.kind.label(),
-                    info.elements,
-                    format_size(info.compressed as u64),
-                    format_size(info.raw.unwrap_or(0) as u64)
-                );
+            if truncate {
+                write_block_rows_raw(&mut out, &infos[..limit]);
+                let omitted = infos.len() - limit * 2;
+                let _ok = writeln!(out, "   ...  ({omitted} blocks omitted)");
+                write_block_rows_raw(&mut out, &infos[infos.len() - limit..]);
+            } else {
+                write_block_rows_raw(&mut out, infos);
             }
         } else {
             let _ok = writeln!(
@@ -794,15 +830,13 @@ impl InspectReport {
                 "{:>6}  {:12}{:>8}  {:>10}",
                 "Block", "Type", "Elements", "Compressed"
             );
-            for info in infos {
-                let _ok = writeln!(
-                    out,
-                    "{:>6}  {:12}{:>8}  {:>10}",
-                    info.number,
-                    info.kind.label(),
-                    info.elements,
-                    format_size(info.compressed as u64)
-                );
+            if truncate {
+                write_block_rows_compressed(&mut out, &infos[..limit]);
+                let omitted = infos.len() - limit * 2;
+                let _ok = writeln!(out, "   ...  ({omitted} blocks omitted)");
+                write_block_rows_compressed(&mut out, &infos[infos.len() - limit..]);
+            } else {
+                write_block_rows_compressed(&mut out, infos);
             }
         }
     }
@@ -862,6 +896,64 @@ impl InspectReport {
             _ => None,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Block table row helpers (free functions to avoid cognitive_complexity in methods)
+// ---------------------------------------------------------------------------
+
+fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[BlockInfo]) {
+    for info in infos {
+        let _ok = writeln!(
+            out,
+            "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
+            info.number,
+            info.kind.label(),
+            info.elements,
+            format_size(info.compressed as u64),
+            format_size(info.raw.unwrap_or(0) as u64)
+        );
+    }
+}
+
+fn write_block_rows_compressed(out: &mut impl std::io::Write, infos: &[BlockInfo]) {
+    for info in infos {
+        let _ok = writeln!(
+            out,
+            "{:>6}  {:12}{:>8}  {:>10}",
+            info.number,
+            info.kind.label(),
+            info.elements,
+            format_size(info.compressed as u64)
+        );
+    }
+}
+
+/// Print a distribution line (min/max/median/p99) for a sorted slice of values.
+///
+/// `label` is printed as-is (should include leading whitespace and trailing colon).
+/// `is_bytes` controls formatting: `true` uses `format_size`, `false` uses `format_number`.
+#[allow(clippy::cast_precision_loss)]
+fn print_distribution_line(label: &str, sorted: &[u64], is_bytes: bool) {
+    let fmt = if is_bytes { format_size } else { format_number };
+    let len = sorted.len();
+    let min = sorted[0];
+    let max = sorted[len - 1];
+    if len == 1 {
+        println!("{label} {}", fmt(min));
+        return;
+    }
+    let median = sorted[len / 2];
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
+    let p99 = sorted[p99_idx.min(len - 1)];
+    println!(
+        "{label} min {}  max {}  median {}  p99 {}",
+        fmt(min),
+        fmt(max),
+        fmt(median),
+        fmt(p99),
+    );
 }
 
 /// Standard ordering: at most one run each of [Nodes, Ways, Relations] in that order.

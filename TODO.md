@@ -121,6 +121,27 @@ Old baselines: read at `90df51f` (461 MB non-indexed), write at `def80d9`.
 
 - [ ] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Same root cause as above.
 
+## Inspect: `--blocks` improvements
+
+Current `--blocks` dumps one line per block — unusable at planet scale (~300K
+blocks). The per-type summary (block counts + sizes) is already shown without
+`--blocks`; these items fill the gap between that and the raw dump.
+
+- [x] **Per-type distribution stats.** Show min/max/median/p99 for
+  elements-per-block and compressed size, grouped by block type. Computed from
+  the existing `Vec<BlockInfo>` — no new data collection needed. Always useful,
+  replaces the raw dump as the default `--blocks` output.
+- [x] **Head/tail limiting (`--blocks=N`).** Show first N and last N blocks
+  instead of the full listing. Good for "what does the start/end look like?"
+  without drowning in output. Change `--blocks` from bool to optional integer.
+- [ ] **Machine-readable output (`--json`).** JSON output for piping to `jq`
+  or other tools. Makes the raw per-block listing useful for scripting even at
+  scale. Scope: inspect-only initially, could extend to other commands later.
+- [ ] **Anomaly highlighting.** Only show blocks that deviate from the norm —
+  unusually small (partial batches), unusually large, or mixed-type blocks.
+  These are the interesting ones when debugging a PBF. Requires defining
+  "anomalous" thresholds (e.g. <50% or >150% of median elements for type).
+
 ## Performance: CLI commands vs osmium
 
 All CLI commands now beat osmium except extract --simple.

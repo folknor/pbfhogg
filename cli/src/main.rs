@@ -249,9 +249,9 @@ enum Command {
     Inspect {
         /// Input PBF file
         file: PathBuf,
-        /// Dump every block with type, element count, compressed/raw size
-        #[arg(long)]
-        blocks: bool,
+        /// Show per-block distribution stats and optional block listing
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        blocks: Option<usize>,
         /// Show min/max element IDs per type and monotonicity
         #[arg(long)]
         id_ranges: bool,
@@ -991,13 +991,15 @@ fn run_add_locations_to_ways(
 
 fn run_inspect(
     path: &std::path::Path,
-    blocks: bool,
+    blocks: Option<usize>,
     id_ranges: bool,
     locations: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut report = pbfhogg::inspect::inspect(path, blocks, id_ranges, locations, direct_io)?;
-    report.print_report();
+    let mut report = pbfhogg::inspect::inspect(
+        path, blocks.is_some(), id_ranges, locations, direct_io,
+    )?;
+    report.print_report(blocks);
     Ok(())
 }
 

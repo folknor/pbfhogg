@@ -444,7 +444,7 @@ impl From<i32> for MemberType {
 }
 
 /// A typed relation member reference combining element type and ID.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[non_exhaustive]
 pub enum MemberId {
     Node(i64),

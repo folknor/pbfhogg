@@ -277,12 +277,9 @@ dependency-closure planner, I/O mode options normalization):
   Investigation/design note:
   `notes/passthrough-coalescing-memcpy-investigation-2026-03-03.md`
 
-- [ ] **P2 performance: verbose relation member diff is O(n^2).**
-  `diff.rs::write_member_diff` checks membership with nested `.iter().any(...)`
-  for removed and added members (`src/commands/diff.rs`), which is quadratic in
-  relation member count.
-  For very large relations and verbose mode, this can dominate runtime.
-  Optimize with temporary hash sets/maps keyed by `(member_type, id, role)`.
+- [x] **P2 performance: verbose relation member diff is O(n^2).**
+  Replaced nested `.iter().any()` with `HashSet<(MemberId, &str)>` lookups.
+  Added `Hash` derive to `MemberId`.
 
 - [ ] **P2 correctness edge case: Null Island ambiguity in dense index sentinel.**
   `DenseMmapIndex` uses `(0,0)` as "unset", so valid node coordinates at exactly

@@ -4,7 +4,7 @@
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -465,18 +465,19 @@ fn member_type_str(mt: MemberType) -> &'static str {
     }
 }
 
-fn member_matches(a: &OwnedMember, b: &OwnedMember) -> bool {
-    a.id == b.id && a.role == b.role
-}
-
 fn write_member_diff(
     output: &mut dyn Write,
     old_members: &[OwnedMember],
     new_members: &[OwnedMember],
 ) -> Result<()> {
+    let new_set: HashSet<(crate::MemberId, &str)> =
+        new_members.iter().map(|m| (m.id, m.role.as_str())).collect();
+    let old_set: HashSet<(crate::MemberId, &str)> =
+        old_members.iter().map(|m| (m.id, m.role.as_str())).collect();
+
     // Removed members (in old but not in new)
     for old_m in old_members {
-        if !new_members.iter().any(|nm| member_matches(old_m, nm)) {
+        if !new_set.contains(&(old_m.id, old_m.role.as_str())) {
             writeln!(
                 output,
                 "  -member {}/{} \"{}\"",
@@ -488,7 +489,7 @@ fn write_member_diff(
     }
     // Added members (in new but not in old)
     for new_m in new_members {
-        if !old_members.iter().any(|om| member_matches(om, new_m)) {
+        if !old_set.contains(&(new_m.id, new_m.role.as_str())) {
             writeln!(
                 output,
                 "  +member {}/{} \"{}\"",

@@ -307,13 +307,8 @@ dependency-closure planner, I/O mode options normalization):
   Investigation note:
   `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
 
-- [ ] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
-  `cat()` currently calls `require_indexdata` for `files.first()` only
-  (`src/commands/cat.rs`). For multi-input cat, later files without indexdata
-  bypass the intended guard (unless caught indirectly), which is inconsistent
-  with the user-facing error contract.
-  Fix: validate all input files (or explicitly document first-file-only behavior,
-  which is probably surprising and undesirable).
+- [x] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
+  Fixed: `require_indexdata` now validates all input files, not just the first.
 
 - [ ] **P1 performance: `sort` pass-1 alloc/read churn can be reduced.**
   `build_blob_index` allocates `Vec<u8>` blob payload per blob and reads full
@@ -349,23 +344,15 @@ dependency-closure planner, I/O mode options normalization):
   strict correctness for all coordinates, store a separate occupancy bitmap (1
   bit/node) or reserve an impossible sentinel with explicit valid-bit tracking.
 
-- [ ] **P1 pipeline guard: add duplicate-ID validation stage before add-locations-to-ways.**
-  For production ingest (`cat -> merge -> add-locations-to-ways`), add an
-  explicit preflight that fails on duplicate IDs (at least nodes; ideally all
-  types). `check-refs` does not catch duplicates. Consider:
-  - `pbfhogg verify ids` (new command; preferred separation of concerns), or
-  - `cat --verify-unique-ids` strict mode.
-  Investigation note:
-  `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
-  Full CLI/API proposal: `notes/verify-ids-cli-api-proposal-2026-03-03.md`
+- [x] **P1 pipeline guard: add duplicate-ID validation stage before add-locations-to-ways.**
+  Implemented `pbfhogg verify ids` — streaming single-pass check for monotonicity
+  and type ordering, with `--full` for duplicate detection via RoaringTreemap.
+  Also `verify refs` (wraps check-refs) and `verify all` (runs both).
+  CLI/API proposal: `notes/verify-ids-cli-api-proposal-2026-03-03.md`
 
-- [ ] **P2 command design: decide validation ownership (`cat` strict mode vs new `verify`).**
-  Keep one clear production recommendation in docs + brokkr workflows.
-  Candidate baseline:
-  1) `cat` for indexdata normalization,
-  2) `verify ids` for uniqueness/sortedness guarantees,
-  3) `check-refs` for referential integrity,
-  4) `merge` and `add-locations-to-ways`.
+- [x] **P2 command design: decide validation ownership (`cat` strict mode vs new `verify`).**
+  Decided: validation lives in dedicated `verify` subcommands, not bolted onto `cat`.
+  Production pipeline: `cat` (indexdata) → `verify ids` → `check-refs` → `merge` → `add-locations-to-ways`.
 
 ### Lower value (hygiene) — DONE
 

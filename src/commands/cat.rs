@@ -51,8 +51,8 @@ pub fn cat(
     force: bool,
 ) -> Result<CatStats> {
     if type_filter.is_some() {
-        if let Some(first) = files.first() {
-            require_indexdata(first, direct_io, force,
+        for file in files {
+            require_indexdata(file, direct_io, force,
                 "input PBF has no blob-level indexdata. Without indexdata, the type \
                  filter is a no-op — all blobs are decompressed (significantly slower).")?;
         }

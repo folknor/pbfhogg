@@ -15,6 +15,8 @@ pub(crate) mod owned_elements;
 pub mod sort;
 pub mod tags_count;
 pub mod tags_filter;
+#[cfg(feature = "commands")]
+pub mod verify_ids;
 
 use std::io::Read;
 use std::path::Path;

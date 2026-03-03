@@ -294,6 +294,11 @@ enum Command {
         #[command(flatten)]
         io: DirectIoArg,
     },
+    /// Verify PBF file integrity
+    Verify {
+        #[command(subcommand)]
+        command: VerifyCommand,
+    },
     /// Benchmark: count elements using a single read mode (emits kv to stderr)
     BenchRead {
         /// Input PBF file
@@ -327,6 +332,73 @@ enum Command {
         /// I/O mode: buffered, uring, uring-sqpoll
         #[arg(long, default_value = "buffered")]
         io_mode: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum VerifyCommand {
+    /// Check ID uniqueness and ordering
+    Ids {
+        /// Input PBF file
+        file: PathBuf,
+        /// Full duplicate detection via bitmap (slower, more memory, works on unsorted files)
+        #[arg(long)]
+        full: bool,
+        /// Filter by element type (comma-separated: node, way, relation)
+        #[arg(short = 't', long = "type")]
+        type_filter: Option<String>,
+        /// Stop after N violations (0 = unlimited)
+        #[arg(long, default_value = "100")]
+        max_errors: usize,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Exit-code only, no output
+        #[arg(long, conflicts_with = "json")]
+        quiet: bool,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
+    /// Validate referential integrity (wraps check-refs)
+    Refs {
+        /// Input PBF file
+        file: PathBuf,
+        /// Also check relation member references
+        #[arg(long)]
+        check_relations: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Exit-code only, no output
+        #[arg(long, conflicts_with = "json")]
+        quiet: bool,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
+    /// Run all verification checks (IDs + referential integrity)
+    All {
+        /// Input PBF file
+        file: PathBuf,
+        /// Full duplicate detection for ID check
+        #[arg(long)]
+        full: bool,
+        /// Filter by element type for ID check (comma-separated: node, way, relation)
+        #[arg(short = 't', long = "type")]
+        type_filter: Option<String>,
+        /// Stop after N violations per check
+        #[arg(long, default_value = "100")]
+        max_errors: usize,
+        /// Also check relation member references
+        #[arg(long)]
+        check_relations: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Exit-code only, no output
+        #[arg(long, conflicts_with = "json")]
+        quiet: bool,
+        #[command(flatten)]
+        io: DirectIoArg,
     },
 }
 
@@ -493,6 +565,17 @@ fn main() {
             force.force,
         ),
         Command::IsIndexed { file, io } => run_is_indexed(&file, io.direct_io),
+        Command::Verify { command } => match command {
+            VerifyCommand::Ids { file, full, type_filter, max_errors, json, quiet, io } => {
+                run_verify_ids(&file, full, type_filter.as_deref(), max_errors, json, quiet, io.direct_io)
+            }
+            VerifyCommand::Refs { file, check_relations, json, quiet, io } => {
+                run_verify_refs(&file, check_relations, json, quiet, io.direct_io)
+            }
+            VerifyCommand::All { file, full, type_filter, max_errors, check_relations, json, quiet, io } => {
+                run_verify_all(&file, full, type_filter.as_deref(), max_errors, check_relations, json, quiet, io.direct_io)
+            }
+        },
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
         Command::BenchWrite { file, compression, writer } => run_bench_write(&file, &compression, &writer),
         Command::BenchMerge { base, changes, output, compression, io_mode } => {
@@ -511,6 +594,158 @@ fn run_is_indexed(path: &std::path::Path, direct_io: bool) -> Result<(), Box<dyn
         println!("indexed");
     } else {
         println!("not indexed");
+        process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_verify_ids(
+    path: &std::path::Path,
+    full: bool,
+    type_filter: Option<&str>,
+    max_errors: usize,
+    json: bool,
+    quiet: bool,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pbfhogg::verify_ids::VerifyIdsOptions;
+
+    let opts = VerifyIdsOptions { full, type_filter, max_errors, direct_io };
+    let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
+
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("input.osm.pbf");
+    if json {
+        println!("{}", report.to_json(file_name)?);
+    } else if !quiet {
+        report.print_human(file_name);
+    }
+
+    if !report.passed {
+        process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_verify_refs(
+    path: &std::path::Path,
+    check_relations: bool,
+    json: bool,
+    quiet: bool,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
+
+    if json {
+        let value = serde_json::json!({
+            "node_count": result.node_count,
+            "way_count": result.way_count,
+            "relation_count": result.relation_count,
+            "missing_node_refs": result.missing_node_refs,
+            "missing_way_refs": result.missing_way_refs,
+            "missing_node_members": result.missing_node_members,
+            "missing_relation_members": result.missing_relation_members,
+            "passed": result.is_valid(),
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if !quiet {
+        println!(
+            "Elements: {} nodes, {} ways, {} relations",
+            result.node_count, result.way_count, result.relation_count
+        );
+        if result.missing_node_refs > 0 {
+            println!("Missing node refs in ways: {}", result.missing_node_refs);
+        }
+        if check_relations {
+            if result.missing_way_refs > 0 {
+                println!("Missing way refs in relations: {}", result.missing_way_refs);
+            }
+            if result.missing_node_members > 0 {
+                println!("Missing node members in relations: {}", result.missing_node_members);
+            }
+            if result.missing_relation_members > 0 {
+                println!("Missing relation members: {}", result.missing_relation_members);
+            }
+        }
+        if result.is_valid() {
+            println!("Referential integrity: OK");
+        } else {
+            println!(
+                "Referential integrity: FAILED ({} missing references)",
+                result.total_missing()
+            );
+        }
+    }
+
+    if !result.is_valid() {
+        process::exit(1);
+    }
+    Ok(())
+}
+
+fn run_verify_all(
+    path: &std::path::Path,
+    full: bool,
+    type_filter: Option<&str>,
+    max_errors: usize,
+    check_relations: bool,
+    json: bool,
+    quiet: bool,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use pbfhogg::verify_ids::VerifyIdsOptions;
+
+    // Run ID check
+    let opts = VerifyIdsOptions { full, type_filter, max_errors, direct_io };
+    let ids_report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
+
+    // Run ref check
+    let refs_result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
+
+    let all_passed = ids_report.passed && refs_result.is_valid();
+    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("input.osm.pbf");
+
+    if json {
+        let value = serde_json::json!({
+            "ids": serde_json::from_str::<serde_json::Value>(&ids_report.to_json(file_name)?)?,
+            "refs": {
+                "node_count": refs_result.node_count,
+                "way_count": refs_result.way_count,
+                "relation_count": refs_result.relation_count,
+                "missing_node_refs": refs_result.missing_node_refs,
+                "missing_way_refs": refs_result.missing_way_refs,
+                "missing_node_members": refs_result.missing_node_members,
+                "missing_relation_members": refs_result.missing_relation_members,
+                "passed": refs_result.is_valid(),
+            },
+            "passed": all_passed,
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+    } else if !quiet {
+        ids_report.print_human(file_name);
+        println!();
+        println!("---");
+        println!();
+        println!(
+            "Elements: {} nodes, {} ways, {} relations",
+            refs_result.node_count, refs_result.way_count, refs_result.relation_count
+        );
+        if refs_result.is_valid() {
+            println!("Referential integrity: OK");
+        } else {
+            println!(
+                "Referential integrity: FAILED ({} missing references)",
+                refs_result.total_missing()
+            );
+        }
+        println!();
+        if all_passed {
+            println!("All checks: PASSED");
+        } else {
+            println!("All checks: FAILED");
+        }
+    }
+
+    if !all_passed {
         process::exit(1);
     }
     Ok(())

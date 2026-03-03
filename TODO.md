@@ -228,6 +228,172 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
+## Correctness: same-version delete semantics (libosmium#403)
+
+**Context:** [libosmium#403](https://github.com/osmcode/libosmium/issues/403) documents a
+behavior change in libosmium 2.22 that broke Geofabrik's diff-apply workflow. The root cause
+is commit [cff8ff42](https://github.com/osmcode/libosmium/commit/cff8ff428287aaf501ddb0928a479d014dd5fdd9)
+which changed `object_order_type_id_reverse_version` to order visible objects before deleted
+ones when type+id+version+timestamp all match. This was done to fix [osmium-tool#282](https://github.com/osmcode/osmium-tool/issues/282)
+(merging extract diffs was order-dependent), but it broke the more common case of applying
+diffs where a delete has the same version as the existing object.
+
+**The core issue is undefined behavior in the OSM data model.** As woodpeck (Geofabrik)
+notes: "applying a `<delete>` operation with the same version number as an already-present
+object does not have a well-defined outcome." There is no spec governing what happens when
+a delete has the same version as the existing object — every tool resolves this by convention,
+not by contract. Geofabrik's entire planet-scale pipeline relies on this undefined behavior
+(delete-wins-on-same-version) because it worked for years across libosmium, osmosis, and
+osmconvert. The osmium developers themselves recognized the ambiguity: osmium-tool already
+has `--increment-version` on `derive-changes` as an escape hatch. Geofabrik chose not to use
+it because the old convention held everywhere — until libosmium 2.22 changed the convention
+to fix a different edge case.
+
+**The tension — two conflicting conventions for the same undefined edge:**
+- **Applying diffs** (Geofabrik workflow): delete should win on same version → old behavior
+- **Merging extract diffs** ([osmium-tool#282](https://github.com/osmcode/osmium-tool/issues/282)):
+  when overlapping extracts produce a delete in one and modify in the other for the same
+  version, the modify should win → new behavior
+
+The libosmium maintainer (joto) concluded the old behavior is correct for the primary use
+case and created a PR to revert. The merge-extract fix was incomplete anyway — lonvia showed
+that overlapping extracts still produce spurious deletions regardless of sort order (an object
+moves out of extract A into extract B: A's diff has a delete, B's diff has nothing, merged
+result deletes the object even though it still exists).
+
+**pbfhogg status — not affected by design:**
+- `merge` uses ID-based lookup into a `CompactDiffOverlay` with separate
+  `deleted_nodes/ways/relations` HashSets, not version-based sort comparison. A delete in the
+  OSC always wins over the base element regardless of version — there is no sort comparator
+  tiebreaker involved. This means pbfhogg has **defined** behavior where the OSM data model
+  has undefined behavior: the diff is authoritative, period. See `merge.rs:409-434`.
+- `derive-changes` emits deletes with the **same version** as the old element (matches
+  osmium's default, no `--increment-version` equivalent). See `derive_changes.rs:344-427`.
+- `diff` compares elements by content, not version ordering. Not affected.
+
+- [ ] **Add `--increment-version` flag for `derive-changes`.** When set, bump the version
+  of deleted elements by 1 in the output OSC. This sidesteps the undefined-behavior edge
+  entirely — the delete has a strictly higher version, so every tool agrees it wins. osmium-
+  tool has this flag. Not needed for pbfhogg's own pipeline (our merge doesn't consult
+  versions), but necessary for interop when other tools consume pbfhogg-generated diffs.
+  Given that libosmium's convention on the undefined edge has now changed *and been reverted*
+  within a single release cycle, producing unambiguous diffs is the only robust strategy.
+
+## Upstream issue scan (2026-03-03)
+
+Surveyed open/recent issues across libosmium, osmium-tool, osmosis, and OSM-binary.
+Items below are relevant to pbfhogg — either as bugs we might share, features worth
+noting, or design decisions that inform our approach.
+
+### libosmium
+
+- **#405: Signed char sign-extension rejects BlobHeaders > 127 bytes.** (open, 2026-03-03)
+  `get_size_in_network_byte_order()` uses `const char*` + `static_cast<uint32_t>()`,
+  which sign-extends bytes ≥ 0x80 on platforms where `char` is signed. Any PBF with
+  a BlobHeader > 127 bytes is rejected. **pbfhogg is not affected** — Rust's `u8` is
+  always unsigned, and our blob header size parsing in `blob.rs` reads `u32` via
+  `read_u32::<BigEndian>()`. However, this confirms that PBFs with large BlobHeaders
+  (e.g. from indexdata) are a real interop hazard — libosmium can't read them until
+  this is fixed. Filed by us.
+
+- **#389: Non-packed encoding of packed repeated fields.** (closed via #400, 2026-01-06)
+  Protobuf-net (C#) emits single-element packed fields as non-packed. libosmium's
+  hand-rolled parser assumes packed encoding and silently drops the data (tags lost).
+  joto's fix handles the single-value non-packed case but not the general multi-value
+  case. **pbfhogg**: our wire parser (`PackedIter` in protohoggr) also assumes packed
+  encoding for repeated fields. We should verify our behavior on non-packed input.
+  - [ ] **Test pbfhogg reader with non-packed single-value repeated fields.** Create
+    a minimal PBF where a packed repeated field (e.g. `keys`, `vals`) is encoded as
+    individual non-packed field entries. Verify whether our parser silently drops them
+    (like libosmium pre-fix) or errors. If it drops, decide whether to fix — the spec
+    says packed is the canonical encoding but decoders "must" accept both.
+
+- **#402: Write to buffer instead of file descriptor.** (open, joto, 2026-02-10)
+  libosmium can only write to fd, not in-memory buffer. **pbfhogg already supports
+  this** — `PbfWriter::new(writer)` accepts any `Write` impl including `Vec<u8>`.
+  No action needed.
+
+- **#393: Generates invalid multipolygon.** (open, joto, 2025-08-24)
+  Broken relation input produces invalid multipolygon geometry in libosmium's area
+  assembler. Not relevant to pbfhogg — we don't do geometry assembly.
+
+- **#395: Use extra bit in Location.** (closed, joto, 2026-01-18)
+  Latitude only needs 31 of 32 bits, freeing one bit for metadata (e.g. tagged/untagged
+  node flag). Interesting for `add-locations-to-ways` DenseMmapIndex — we currently use
+  8 bytes per slot (lat+lon). A tagged-node bit could eliminate the separate
+  `--keep-untagged-nodes` pass, but would require changing the index format.
+
+- **#151: Optimizing the node location store.** (open, joto, 2016)
+  `sparse_mmap_array` is slow due to binary search over cache-hostile data. Ideas:
+  separate ID/location arrays, compact lookup table, linear scan near target, mini-cache
+  for locality. **pbfhogg's `DenseMmapIndex`** uses direct indexing (O(1) lookup, 8
+  bytes/slot) which avoids all of these problems — no binary search at all. Our approach
+  trades virtual memory (128 GB mmap) for zero lookup overhead. Confirms our design choice.
+
+### osmium-tool
+
+- **#303: Merge ID comparison mismatch with sort.** (closed PR, 2025-12-20)
+  `osmium merge` used plain numeric ID comparison while `osmium sort` uses a comparator
+  that orders 0 first, then negative IDs, then positive IDs by absolute value. Merging
+  files with negative IDs failed. **pbfhogg**: our merge uses `i64` comparison directly.
+  Negative IDs are uncommon in production PBFs (used by JOSM for uncommitted data) but
+  if we ever need to handle them, we should check our sort/merge ordering.
+
+- **#258: Roaring bitmap for extract memory.** (open, 2022-12-14)
+  User suggests roaring bitmaps to reduce extract memory usage. osmium uses
+  `id_set<IdType>` backed by a sorted vector — O(n) memory, O(log n) lookup.
+  **pbfhogg already uses roaring** (`roaring::RoaringBitmap`) for extract, but our
+  primary ID set is `IdSetDense` (chunked sparse bitset, O(1) set/get). For the
+  extract use case, `IdSetDense` is better than roaring for dense ID ranges (which
+  OSM node IDs are). The osmium issue confirms external demand for this optimization.
+
+- **#234: Extract and check-refs use too much RAM with high node IDs.** (open, 2021-11-08)
+  Custom PBF with numerically high node IDs causes osmium's dense node location store
+  to allocate enormous arrays. **pbfhogg**: `DenseMmapIndex` uses anonymous mmap with
+  128 GB virtual address space — high IDs only increase virtual size, not RSS (pages
+  are demand-faulted). `IdSetDense` uses 512-element chunks, so sparse high IDs waste
+  at most one 64-byte chunk per populated region. We handle this case well by design.
+
+- **#240: Warn when locations on ways would be lost.** (open, joto, 2022-01-30)
+  If input PBF has locations on ways but output format doesn't preserve them, the data
+  is silently lost. **pbfhogg**: our writer always preserves way node locations if
+  present in the input `BlockBuilder` data. However, format conversions (if we ever
+  support XML/OPL output) would need this warning. Low priority — PBF-only for now.
+
+- **#205: fileinfo show PBF blob compression.** (open, 2021-01-06)
+  `osmium fileinfo` reports "Compression: none" for PBFs even when blobs use zlib.
+  **pbfhogg `inspect`** already reports per-blob compression type. No action needed.
+
+- **#298: tags-filter with OSC — keep delete actions.** (open, 2025-10-05)
+  When using tags-filter on OSC files, delete actions are dropped because they have no
+  tags. User wants an option to pass through deletes. Interesting edge case — if pbfhogg
+  ever supports OSC tags-filter, we'd face the same issue. Low priority.
+
+- **#93: Diff output order with mismatched metadata.** (open, 2018-03-14)
+  When input files have different metadata attributes (one has timestamps, other doesn't),
+  diff output order is wrong because the version comparator uses timestamps as tiebreaker.
+  With missing timestamps, the tiebreaker is `Timestamp(0)` which changes the ordering.
+  Same family of issues as libosmium#403 — undefined behavior in version comparison when
+  metadata is incomplete. **pbfhogg `diff`** compares by content equality, not version
+  ordering, so we're not affected.
+
+### osmosis
+
+- **#150: Duplicate node update crashes with --simplify-change.** (open, 2024-08-06)
+  Daily planet diff contained node ID `10767916505` appearing twice with same version 21.
+  Osmosis's `SortedHistoryChangePipeValidator` rejects this as unsorted. This is a real-
+  world example of same-version duplicates in production diffs — same family as
+  libosmium#403. **pbfhogg merge** handles this correctly via ID-based overlay (last
+  write wins within the OSC, duplicates are naturally deduplicated).
+
+### OSM-binary (PBF spec)
+
+- **#80: Unable to distinguish valid stream end from broken stream.** (open, 2024-04-19)
+  Java PBF reader throws `EOFException` both at normal EOF and mid-stream truncation —
+  callers can't distinguish complete from partial reads. **pbfhogg**: our `BlobReader`
+  returns `None` at EOF and `Err` on truncation (incomplete blob header or data). We
+  handle this correctly.
+
 ## Deep-dive findings (2026-03-03)
 
 - [x] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**

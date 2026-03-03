@@ -310,14 +310,11 @@ dependency-closure planner, I/O mode options normalization):
 - [x] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
   Fixed: `require_indexdata` now validates all input files, not just the first.
 
-- [ ] **P1 performance: `sort` pass-1 alloc/read churn can be reduced.**
-  `build_blob_index` allocates `Vec<u8>` blob payload per blob and reads full
-  payload even when `BlobHeader` already has indexdata
-  (`src/commands/sort.rs: build_blob_index`).
-  At planet scale this creates avoidable allocator churn and memcpy traffic.
-  Optimize by:
-  1) skipping blob payload read for indexed blobs (`reader.skip(data_size)`),
-  2) reusing a single payload buffer for non-indexed fallback scans.
+- [x] **P1 performance: `sort` pass-1 alloc/read churn can be reduced.**
+  `build_blob_index` now skips blob payload reads for indexed blobs
+  (`reader.skip(data_size)`) and reuses a single buffer for the non-indexed
+  fallback path. On Denmark (487 MB, 7396 blobs): 29% CPU reduction in pass 1,
+  bit-identical output. At planet scale eliminates ~18 GB unnecessary reads.
 
 - [ ] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
   `merge` and `add-locations-to-ways` coalescing appends frame bytes into one

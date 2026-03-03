@@ -271,6 +271,8 @@ fn build_blob_index(
     let mut header: Option<crate::HeaderBlock> = None;
     let mut file_offset: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut blob_buf: Vec<u8> = Vec::new();
 
     loop {
         let frame_start = file_offset;
@@ -285,40 +287,47 @@ fn build_blob_index(
         #[allow(clippy::cast_possible_truncation)]
         let header_len = u32::from_be_bytes(len_buf) as usize;
 
-        // Read BlobHeader
-        let mut header_bytes = vec![0u8; header_len];
-        reader.read_exact(&mut header_bytes)?;
+        // Read BlobHeader (reuse buffer)
+        header_buf.resize(header_len, 0);
+        reader.read_exact(&mut header_buf)?;
 
         let (blob_type, data_size, raw_index, tagdata) =
-            parse_blob_header_with_index(&header_bytes)?;
+            parse_blob_header_with_index(&header_buf)?;
         let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
         let has_indexdata = index.is_some();
-
-        // Read Blob bytes
-        let mut blob_bytes = vec![0u8; data_size];
-        reader.read_exact(&mut blob_bytes)?;
 
         let frame_len = (4 + header_len + data_size) as u64;
         file_offset += frame_len;
 
         match &blob_type {
-            BlobKind::OsmHeader
-                if header.is_none() =>
-            {
-                header = Some(decode_blob_to_headerblock(&blob_bytes)?);
+            BlobKind::OsmHeader if header.is_none() => {
+                blob_buf.resize(data_size, 0);
+                reader.read_exact(&mut blob_buf)?;
+                header = Some(decode_blob_to_headerblock(&blob_buf)?);
+            }
+            BlobKind::OsmData if has_indexdata => {
+                // Indexdata already in BlobHeader — skip blob payload entirely
+                reader.skip(data_size as u64)?;
+                #[allow(clippy::unwrap_used)]
+                entries.push(BlobEntry {
+                    file_offset: frame_start,
+                    frame_len,
+                    index: index.unwrap(),
+                    has_indexdata,
+                    tagdata,
+                });
             }
             BlobKind::OsmData => {
-                let blob_index = if let Some(idx) = index {
-                    idx
-                } else {
-                    decompress_blob_data_into(&blob_bytes, &mut decompress_buf)?;
-                    scan_block_ids(&decompress_buf).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "failed to scan block IDs",
-                        )
-                    })?
-                };
+                // No indexdata — must decompress and scan for element IDs
+                blob_buf.resize(data_size, 0);
+                reader.read_exact(&mut blob_buf)?;
+                decompress_blob_data_into(&blob_buf, &mut decompress_buf)?;
+                let blob_index = scan_block_ids(&decompress_buf).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "failed to scan block IDs",
+                    )
+                })?;
                 entries.push(BlobEntry {
                     file_offset: frame_start,
                     frame_len,
@@ -327,7 +336,10 @@ fn build_blob_index(
                     tagdata,
                 });
             }
-            _ => {}
+            _ => {
+                // Unknown or duplicate header blob — skip payload
+                reader.skip(data_size as u64)?;
+            }
         }
     }
 

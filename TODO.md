@@ -308,6 +308,8 @@ All 5 items consolidated into `src/commands/mod.rs`:
   Consider segmented passthrough buffers (`Vec<Vec<u8>>` + vectored write or
   writer-side chunk API) to eliminate large memcpy overhead on rewrite-light
   workloads.
+  Investigation/design note:
+  `notes/passthrough-coalescing-memcpy-investigation-2026-03-03.md`
 
 - [ ] **P2 performance: verbose relation member diff is O(n^2).**
   `diff.rs::write_member_diff` checks membership with nested `.iter().any(...)`

@@ -16,7 +16,12 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 
 - `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`).
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
-- `brokkr run [args]` — build release CLI and run with passthrough args (e.g., `brokkr run inspect tests/test.osm.pbf`).
+- `brokkr run [options] [-- args]` — build release CLI and run passthrough command args. Supports machine-readable timing:
+  - `--time` prints key=value timing output
+  - `--json` prints structured JSON timing output
+  - `--runs N` repeats execution N times (summary stats include min/median/p95)
+  - `--no-build` skips build and runs an already-built binary (fails clearly if missing)
+  - examples: `brokkr run --time -- --help`, `brokkr run --json --runs 5 --no-build -- --version`
 - `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (4 modes: sequential, parallel, pipelined, blobreader). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench write [--dataset name] [--variant V] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite. Default variant: indexed.
 - `brokkr bench merge [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite. Default variant: indexed.

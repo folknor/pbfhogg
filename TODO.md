@@ -217,7 +217,7 @@ Full deep-dive with 6 large consolidation opportunities reviewed and rejected
 (see `notes/consolidation-review-{1..6}-*.md` for detailed reports). Two small
 concrete improvements identified:
 
-- [ ] **Promote `ensure_*_capacity_local` to `mod.rs`.** Merge already has
+- [x] **Promote `ensure_*_capacity_local` to `mod.rs`.** Merge already has
   `ensure_node_capacity_local`, `ensure_way_capacity_local`,
   `ensure_relation_capacity_local` (3-line helpers wrapping the
   `if !bb.can_add_*() { flush_local(...) }` pattern). Promoting these to

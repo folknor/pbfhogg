@@ -263,6 +263,42 @@ pub(crate) fn flush_block(
     Ok(())
 }
 
+/// Ensure the [`BlockBuilder`] has capacity for a node, flushing to the writer
+/// if full. Used by sequential output paths (merge, sort).
+pub(crate) fn ensure_node_capacity(
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !bb.can_add_node() {
+        flush_block(bb, writer)?;
+    }
+    Ok(())
+}
+
+/// Ensure the [`BlockBuilder`] has capacity for a way, flushing to the writer
+/// if full.
+pub(crate) fn ensure_way_capacity(
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !bb.can_add_way() {
+        flush_block(bb, writer)?;
+    }
+    Ok(())
+}
+
+/// Ensure the [`BlockBuilder`] has capacity for a relation, flushing to the
+/// writer if full.
+pub(crate) fn ensure_relation_capacity(
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    if !bb.can_add_relation() {
+        flush_block(bb, writer)?;
+    }
+    Ok(())
+}
+
 /// Drain parallel batch results: write blocks to the writer, merge stats via closure.
 ///
 /// Each result is `(Vec<OwnedBlock>, S)` where `S` is a per-block stats type.

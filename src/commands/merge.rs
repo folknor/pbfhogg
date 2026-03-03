@@ -433,41 +433,10 @@ fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> boo
     false
 }
 
-use super::{dense_node_raw_metadata, element_raw_metadata, flush_block};
-
-// ---------------------------------------------------------------------------
-// Block flushing helpers
-// ---------------------------------------------------------------------------
-
-fn ensure_node_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-fn ensure_way_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_way() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
-
-fn ensure_relation_capacity(
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    if !bb.can_add_relation() {
-        flush_block(bb, writer)?;
-    }
-    Ok(())
-}
+use super::{
+    dense_node_raw_metadata, element_raw_metadata, ensure_node_capacity, ensure_relation_capacity,
+    ensure_way_capacity, flush_block,
+};
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, no metadata)

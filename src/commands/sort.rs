@@ -25,7 +25,10 @@ use crate::{Element, MemberId};
 
 use super::owned_elements::OwnedMember;
 
-use super::{build_output_header, require_indexdata, Result, writer_from_header_bytes};
+use super::{
+    build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
+    flush_block, require_indexdata, Result, writer_from_header_bytes,
+};
 
 /// Statistics from a sort operation.
 pub struct SortStats {
@@ -637,9 +640,7 @@ fn write_single_node(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if !bb.can_add_node() {
-        flush_block(bb, writer)?;
-    }
+    ensure_node_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = node
         .tags
         .iter()
@@ -655,9 +656,7 @@ fn write_single_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if !bb.can_add_way() {
-        flush_block(bb, writer)?;
-    }
+    ensure_way_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = way
         .tags
         .iter()
@@ -673,9 +672,7 @@ fn write_single_relation(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if !bb.can_add_relation() {
-        flush_block(bb, writer)?;
-    }
+    ensure_relation_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = rel
         .tags
         .iter()
@@ -811,4 +808,3 @@ fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
     })
 }
 
-use super::flush_block;

@@ -1,12 +1,14 @@
 //! Inspect PBF file: comprehensive metadata, block breakdown, ordering analysis.
 
+use std::io::Read;
 use std::path::Path;
 
-use super::read_raw_frame;
+use super::{read_blob_header_only, read_raw_frame};
 use crate::blob::{
     decode_blob_to_headerblock, decompress_blob_data_into, parse_primitive_block_from_bytes,
     BlobKind,
 };
+use crate::blob_index::ElemKind;
 use crate::file_reader::FileReader;
 use crate::Element;
 
@@ -40,6 +42,14 @@ impl BlockKind {
             Self::Ways => "ways",
             Self::Relations => "relations",
             Self::Mixed => "mixed",
+        }
+    }
+
+    fn from_elem_kind(kind: ElemKind) -> Self {
+        match kind {
+            ElemKind::Node => Self::Nodes,
+            ElemKind::Way => Self::Ways,
+            ElemKind::Relation => Self::Relations,
         }
     }
 
@@ -84,7 +94,7 @@ struct BlockInfo {
     kind: BlockKind,
     elements: u64,
     compressed: usize,
-    raw: usize,
+    raw: Option<usize>,
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +132,23 @@ impl TypeIdRange {
         }
         self.prev_id = id;
         self.count += 1;
+    }
+
+    /// Update from a blob's aggregated ID range (index-only mode).
+    /// Monotonicity is checked at inter-blob granularity: each blob's min_id
+    /// must exceed the previous blob's max_id for the same element type.
+    fn update_from_blob(&mut self, blob_min: i64, blob_max: i64, blob_count: u64) {
+        if blob_min < self.min_id {
+            self.min_id = blob_min;
+        }
+        if blob_max > self.max_id {
+            self.max_id = blob_max;
+        }
+        if self.count > 0 && blob_min <= self.prev_id {
+            self.monotonic = false;
+        }
+        self.prev_id = blob_max;
+        self.count += blob_count;
     }
 
     fn has_data(&self) -> bool {
@@ -257,12 +284,11 @@ impl BlockAccum {
 }
 
 // ---------------------------------------------------------------------------
-// Main report struct
+// Header metadata from OsmHeader blob
 // ---------------------------------------------------------------------------
 
-pub struct InspectReport {
-    file_name: String,
-    file_size: u64,
+#[derive(Default)]
+struct HeaderMeta {
     writing_program: Option<String>,
     required_features: Vec<String>,
     optional_features: Vec<String>,
@@ -270,6 +296,16 @@ pub struct InspectReport {
     replication_timestamp: Option<i64>,
     replication_sequence: Option<i64>,
     replication_url: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Main report struct
+// ---------------------------------------------------------------------------
+
+pub struct InspectReport {
+    file_name: String,
+    file_size: u64,
+    header_meta: HeaderMeta,
     is_indexed: bool,
     total_blocks: u64,
     accum: BlockAccum,
@@ -288,6 +324,177 @@ pub fn inspect(
     show_locations: bool,
     direct_io: bool,
 ) -> Result<InspectReport> {
+    // Index-only fast path: skip decompression when all blobs have indexdata.
+    // --locations requires per-way element data, so it always needs full decode.
+    if !show_locations
+        && let Some(report) =
+            try_index_only_scan(path, show_blocks, show_id_ranges, direct_io)?
+    {
+        return Ok(report);
+    }
+
+    full_decode_scan(path, show_blocks, show_id_ranges, show_locations, direct_io)
+}
+
+// ---------------------------------------------------------------------------
+// Index-only scan: reads frame headers, skips blob data entirely
+// ---------------------------------------------------------------------------
+
+/// Attempt an index-only scan. Returns `None` if any OsmData blob lacks indexdata,
+/// signalling the caller to fall back to full decode.
+fn try_index_only_scan(
+    path: &Path,
+    show_blocks: bool,
+    show_id_ranges: bool,
+    direct_io: bool,
+) -> Result<Option<InspectReport>> {
+    let meta = std::fs::metadata(path)?;
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+
+    let mut reader = FileReader::open(path, direct_io)?;
+    let mut offset = 0u64;
+    let mut header_meta = HeaderMeta::default();
+
+    let mut accum = BlockAccum::new(show_blocks);
+    let mut block_number = 0u32;
+    let mut state = ScanState::new(show_id_ranges, false);
+    let mut total_data_blobs = 0u64;
+
+    while let Some(info) = read_blob_header_only(&mut reader, &mut offset)? {
+        match info.blob_type {
+            BlobKind::OsmHeader => {
+                let mut blob_bytes = vec![0u8; info.data_size];
+                reader.read_exact(&mut blob_bytes)?;
+                offset += info.data_size as u64;
+                let header = decode_blob_to_headerblock(&blob_bytes)?;
+                header_meta = extract_header_metadata(&header);
+            }
+            BlobKind::OsmData => {
+                total_data_blobs += 1;
+                let Some(index) = info.index else {
+                    return Ok(None); // fallback to full decode
+                };
+                block_number += 1;
+                accumulate_from_index(
+                    &index, &info, block_number, &mut state, &mut accum,
+                );
+                reader.skip(info.data_size as u64)?;
+                offset += info.data_size as u64;
+            }
+            BlobKind::Unknown(_) => {
+                reader.skip(info.data_size as u64)?;
+                offset += info.data_size as u64;
+            }
+        }
+    }
+
+    Ok(Some(InspectReport {
+        file_name,
+        file_size: meta.len(),
+        header_meta,
+        is_indexed: true,
+        total_blocks: total_data_blobs,
+        accum,
+        state,
+    }))
+}
+
+/// Update accumulators from a single blob's index metadata (no decompression).
+fn accumulate_from_index(
+    index: &crate::blob_index::BlobIndex,
+    info: &super::BlobHeaderInfo,
+    block_number: u32,
+    state: &mut ScanState,
+    accum: &mut BlockAccum,
+) {
+    let kind = BlockKind::from_elem_kind(index.kind);
+
+    // Element counts
+    match index.kind {
+        ElemKind::Node => state.node_count += index.count,
+        ElemKind::Way => state.way_count += index.count,
+        ElemKind::Relation => state.relation_count += index.count,
+    }
+
+    // ID ranges (inter-blob monotonicity)
+    let ids = match index.kind {
+        ElemKind::Node => &mut state.node_ids,
+        ElemKind::Way => &mut state.way_ids,
+        ElemKind::Relation => &mut state.relation_ids,
+    };
+    if let Some(ids) = ids {
+        ids.update_from_blob(index.min_id, index.max_id, index.count);
+    }
+
+    // Per-type stats
+    let stats = match kind {
+        BlockKind::Nodes => &mut accum.node_type,
+        BlockKind::Ways => &mut accum.way_type,
+        BlockKind::Relations => &mut accum.relation_type,
+        BlockKind::Mixed => &mut accum.mixed_type,
+    };
+    stats.block_count += 1;
+    stats.frame_bytes += info.frame_size as u64;
+    stats.element_count += index.count;
+
+    // Ordering segments
+    if let Some(last) = accum.segments.last_mut().filter(|s| s.kind == kind) {
+        last.last_block = block_number;
+    } else {
+        accum.segments.push(OrderingSegment {
+            kind,
+            first_block: block_number,
+            last_block: block_number,
+        });
+    }
+
+    // Per-block detail
+    if let Some(ref mut infos) = accum.block_infos {
+        infos.push(BlockInfo {
+            number: block_number,
+            kind,
+            elements: index.count,
+            compressed: info.data_size,
+            raw: None,
+        });
+    }
+}
+
+/// Extract header metadata fields from a parsed `HeaderBlock`.
+fn extract_header_metadata(header: &crate::HeaderBlock) -> HeaderMeta {
+    HeaderMeta {
+        writing_program: header.writing_program().map(String::from),
+        required_features: header
+            .required_features()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        optional_features: header
+            .optional_features()
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        bbox: header.bbox().map(|bb| (bb.left, bb.bottom, bb.right, bb.top)),
+        replication_timestamp: header.osmosis_replication_timestamp(),
+        replication_sequence: header.osmosis_replication_sequence_number(),
+        replication_url: header.osmosis_replication_base_url().map(String::from),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Full decode scan (original path)
+// ---------------------------------------------------------------------------
+
+fn full_decode_scan(
+    path: &Path,
+    show_blocks: bool,
+    show_id_ranges: bool,
+    show_locations: bool,
+    direct_io: bool,
+) -> Result<InspectReport> {
     let meta = std::fs::metadata(path)?;
     let file_name = path
         .file_name()
@@ -297,15 +504,7 @@ pub fn inspect(
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
     let mut decompress_buf = Vec::new();
-
-    // Header metadata
-    let mut writing_program = None;
-    let mut required_features = Vec::new();
-    let mut optional_features = Vec::new();
-    let mut bbox = None;
-    let mut replication_timestamp = None;
-    let mut replication_sequence = None;
-    let mut replication_url = None;
+    let mut header_meta = HeaderMeta::default();
 
     // Indexdata tracking
     let mut indexed_blobs = 0u64;
@@ -319,23 +518,7 @@ pub fn inspect(
         match frame.blob_type {
             BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                writing_program = header.writing_program().map(String::from);
-                required_features = header
-                    .required_features()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
-                optional_features = header
-                    .optional_features()
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect();
-                if let Some(bb) = header.bbox() {
-                    bbox = Some((bb.left, bb.bottom, bb.right, bb.top));
-                }
-                replication_timestamp = header.osmosis_replication_timestamp();
-                replication_sequence = header.osmosis_replication_sequence_number();
-                replication_url = header.osmosis_replication_base_url().map(String::from);
+                header_meta = extract_header_metadata(&header);
             }
             BlobKind::OsmData => {
                 total_data_blobs += 1;
@@ -354,13 +537,7 @@ pub fn inspect(
     Ok(InspectReport {
         file_name,
         file_size: meta.len(),
-        writing_program,
-        required_features,
-        optional_features,
-        bbox,
-        replication_timestamp,
-        replication_sequence,
-        replication_url,
+        header_meta,
         is_indexed,
         total_blocks: total_data_blobs,
         accum,
@@ -427,7 +604,7 @@ fn scan_data_blob(
             kind,
             elements: block_elements,
             compressed: compressed_size,
-            raw: raw_size,
+            raw: Some(raw_size),
         });
     }
 
@@ -449,7 +626,7 @@ fn classify_block(has_nodes: bool, has_ways: bool, has_relations: bool) -> Block
 
 impl InspectReport {
     #[allow(clippy::cast_precision_loss)]
-    pub fn print_report(&self) {
+    pub fn print_report(&mut self) {
         self.print_header();
         println!();
         self.print_blocks_summary();
@@ -466,7 +643,7 @@ impl InspectReport {
             println!();
             Self::print_id_ranges(n, w, r);
         }
-        if let Some(ref stats) = self.state.loc_stats {
+        if let Some(ref mut stats) = self.state.loc_stats {
             println!();
             Self::print_locations(stats);
         }
@@ -474,15 +651,16 @@ impl InspectReport {
 
     fn print_header(&self) {
         println!("File:     {} ({})", self.file_name, format_size(self.file_size));
-        if let Some(ref prog) = self.writing_program {
+        if let Some(ref prog) = self.header_meta.writing_program {
             println!("Program:  {prog}");
         }
 
         // Combine features, skip boilerplate (OsmSchema-V0.6, DenseNodes)
         let features: Vec<&str> = self
+            .header_meta
             .required_features
             .iter()
-            .chain(self.optional_features.iter())
+            .chain(self.header_meta.optional_features.iter())
             .map(String::as_str)
             .filter(|f| *f != "OsmSchema-V0.6" && *f != "DenseNodes")
             .collect();
@@ -490,19 +668,20 @@ impl InspectReport {
             println!("Features: {}", features.join(", "));
         }
 
-        if let Some((left, bottom, right, top)) = self.bbox {
+        if let Some((left, bottom, right, top)) = self.header_meta.bbox {
             println!("Bbox:     {left},{bottom},{right},{top}");
         }
 
-        if self.replication_sequence.is_some() || self.replication_timestamp.is_some() {
+        let hm = &self.header_meta;
+        if hm.replication_sequence.is_some() || hm.replication_timestamp.is_some() {
             let mut parts = Vec::new();
-            if let Some(seq) = self.replication_sequence {
+            if let Some(seq) = hm.replication_sequence {
                 parts.push(format!("seq {seq}"));
             }
-            if let Some(ts) = self.replication_timestamp {
+            if let Some(ts) = hm.replication_timestamp {
                 parts.push(format!("timestamp {ts}"));
             }
-            if let Some(ref url) = self.replication_url {
+            if let Some(ref url) = hm.replication_url {
                 parts.push(url.clone());
             }
             println!("Repl:     {}", parts.join(", "));
@@ -587,19 +766,36 @@ impl InspectReport {
     }
 
     fn print_block_table(infos: &[BlockInfo]) {
-        println!(
-            "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
-            "Block", "Type", "Elements", "Compressed", "Raw"
-        );
-        for info in infos {
+        let has_raw = infos.iter().any(|i| i.raw.is_some());
+        if has_raw {
             println!(
                 "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
-                info.number,
-                info.kind.label(),
-                info.elements,
-                format_size(info.compressed as u64),
-                format_size(info.raw as u64)
+                "Block", "Type", "Elements", "Compressed", "Raw"
             );
+            for info in infos {
+                println!(
+                    "{:>6}  {:12}{:>8}  {:>10}  {:>10}",
+                    info.number,
+                    info.kind.label(),
+                    info.elements,
+                    format_size(info.compressed as u64),
+                    format_size(info.raw.unwrap_or(0) as u64)
+                );
+            }
+        } else {
+            println!(
+                "{:>6}  {:12}{:>8}  {:>10}",
+                "Block", "Type", "Elements", "Compressed"
+            );
+            for info in infos {
+                println!(
+                    "{:>6}  {:12}{:>8}  {:>10}",
+                    info.number,
+                    info.kind.label(),
+                    info.elements,
+                    format_size(info.compressed as u64)
+                );
+            }
         }
     }
 
@@ -618,7 +814,7 @@ impl InspectReport {
     }
 
     #[allow(clippy::cast_precision_loss)]
-    fn print_locations(stats: &LocationStats) {
+    fn print_locations(stats: &mut LocationStats) {
         let total = stats.with_locations + stats.without_locations;
         if total == 0 {
             println!("Locations: no ways in file");
@@ -640,14 +836,14 @@ impl InspectReport {
         );
 
         if !stats.coord_counts.is_empty() {
-            let mut sorted = stats.coord_counts.clone();
-            sorted.sort_unstable();
-            let min = sorted[0];
-            let max = sorted[sorted.len() - 1];
-            let median = sorted[sorted.len() / 2];
+            stats.coord_counts.sort_unstable();
+            let len = stats.coord_counts.len();
+            let min = stats.coord_counts[0];
+            let max = stats.coord_counts[len - 1];
+            let median = stats.coord_counts[len / 2];
             #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let p99_idx = ((sorted.len() as f64 - 1.0) * 0.99) as usize;
-            let p99 = sorted[p99_idx.min(sorted.len() - 1)];
+            let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
+            let p99 = stats.coord_counts[p99_idx.min(len - 1)];
             println!("Coords per way:         min {min}, max {max}, median {median}, p99 {p99}");
         }
     }

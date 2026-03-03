@@ -184,6 +184,57 @@ pub(crate) fn read_raw_frame<R: Read>(
     }))
 }
 
+/// Parsed blob header without the blob data payload.
+///
+/// Used by the index-only inspect path. The caller must either read
+/// or skip `data_size` bytes from the reader after receiving this.
+pub(crate) struct BlobHeaderInfo {
+    pub blob_type: BlobKind,
+    pub data_size: usize,
+    pub index: Option<BlobIndex>,
+    /// Total frame size: 4 + header_len + data_size.
+    pub frame_size: usize,
+}
+
+/// Read the next blob header without reading the blob data payload.
+///
+/// Returns `None` at EOF. Updates `file_offset` past the header only.
+/// The caller must either:
+/// - Read `data_size` bytes (e.g. for OsmHeader blobs)
+/// - Skip `data_size` bytes via `reader.skip()` (for index-only mode)
+///
+/// and then advance `*file_offset += data_size as u64`.
+#[allow(clippy::cast_possible_truncation)]
+pub(crate) fn read_blob_header_only(
+    reader: &mut FileReader,
+    file_offset: &mut u64,
+) -> Result<Option<BlobHeaderInfo>> {
+    let mut len_buf = [0u8; 4];
+    match reader.read_exact(&mut len_buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
+    let header_len = u32::from_be_bytes(len_buf) as usize;
+
+    let mut header_bytes = vec![0u8; header_len];
+    reader.read_exact(&mut header_bytes)?;
+
+    let (blob_type, data_size, raw_index, _tagdata) =
+        parse_blob_header_with_index(&header_bytes)?;
+    let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
+
+    *file_offset += (4 + header_len) as u64;
+    let frame_size = 4 + header_len + data_size;
+
+    Ok(Some(BlobHeaderInfo {
+        blob_type,
+        data_size,
+        index,
+        frame_size,
+    }))
+}
+
 /// Flush coalesced passthrough bytes as a single `write_raw_owned` (move, no copy).
 pub(crate) fn flush_passthrough_buf(
     buf: &mut Vec<u8>,

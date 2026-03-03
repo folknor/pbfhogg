@@ -134,18 +134,18 @@ Full design note: `notes/add-locations-to-ways-optimization.md`
 
 ## Performance: inspect optimizations
 
-`inspect` always does a full sequential decode even when indexdata could answer
-most questions without decompression. Multiple optimization opportunities exist.
 Full design note: `notes/inspect-optimization-opportunities.md`
 
-- [ ] **Index-only fast path for cheap modes.** When all blobs have indexdata and
-  no per-element flags are requested, use blob index metadata directly for
-  type/count/ordering — skip decompression entirely.
-- [ ] **Capability-driven scan modes.** Choose scan strategy based on requested
-  flags: `IndexOnly` (no decode), `IndexPlusNodes` (decode node blobs only for
-  tagged-node count), `FullDecode` (current behavior).
-- [ ] **`--locations` percentile optimization.** Sort `coord_counts` in place
-  instead of cloning. Consider histogram-based percentile reconstruction.
+- [x] **Index-only fast path for cheap modes.** When all blobs have indexdata and
+  `--locations` is not requested, reads only blob headers and skips all
+  decompression. 36ms vs 3.9s on Denmark 473 MB (109x speedup). Falls back to
+  full decode if any blob lacks indexdata.
+- [x] **Capability-driven scan modes.** Implemented as IndexOnly (no decode,
+  header-only reads via `read_blob_header_only` + `FileReader::skip`) and
+  FullDecode (original path). IndexPlusNodes deferred — tagged_node_count is
+  simply omitted in index-only mode (acceptable trade-off).
+- [x] **`--locations` percentile optimization.** `coord_counts` sorted in place
+  instead of cloning.
 - [ ] **Buffered `--blocks` output.** Replace per-line `println!` with buffered
   output for large files where output volume dominates.
 

@@ -105,7 +105,7 @@ pbfhogg removeid <file> -o <out> <ids>    Remove elements by ID
 pbfhogg node-stats <file>                 Analyze node coordinate statistics for FOR compression sizing
 ```
 
-Inspect does a full single-pass scan, decompressing every blob to report block breakdown by type (DenseNodes/Ways/Relations/Mixed) with compressed sizes, element counts with tagged node count, and **ordering analysis** — whether the file follows the standard nodes → ways → relations layout or has non-standard interleaving (with block ranges). Optional flags: `--blocks` dumps a per-block table with element counts and compressed/raw sizes, `--id-ranges` shows min/max element IDs per type with monotonicity checks, and `--locations` reports locations-on-ways diagnostics (coverage percentage, coords-per-way percentiles).
+Inspect reports block breakdown by type (DenseNodes/Ways/Relations/Mixed) with compressed sizes, element counts with tagged node count, and **ordering analysis** — whether the file follows the standard nodes → ways → relations layout or has non-standard interleaving (with block ranges). On indexed PBFs, inspect uses an **index-only fast path** that reads only blob headers and skips all decompression — completing in ~36ms on a 473 MB file vs ~4s for full decode (109x speedup). Falls back to full decode on non-indexed PBFs or when `--locations` is requested. Optional flags: `--blocks` dumps a per-block table with element counts and compressed/raw sizes, `--id-ranges` shows min/max element IDs per type with monotonicity checks, and `--locations` reports locations-on-ways diagnostics (coverage percentage, coords-per-way percentiles).
 
 Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
 
@@ -147,10 +147,11 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark (487 MB, 59M elements, commit `23862d1`, add-locations `46f7388`):
+CLI commands — Denmark (487 MB, 59M elements, commit `23862d1`, add-locations `46f7388`, inspect `fc76dfb`):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
+| inspect (indexdata) | **0.036s** | — | **109x** vs full decode |
 | sort (sorted, indexdata) | **0.14s** | 11.6s | **83x** |
 | merge (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
 | tags-filter w/highway=primary -R | **0.24s** | 0.56s | **2.3x** |

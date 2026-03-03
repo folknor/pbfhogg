@@ -996,7 +996,7 @@ fn run_inspect(
     locations: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let report = pbfhogg::inspect::inspect(path, blocks, id_ranges, locations, direct_io)?;
+    let mut report = pbfhogg::inspect::inspect(path, blocks, id_ranges, locations, direct_io)?;
     report.print_report();
     Ok(())
 }

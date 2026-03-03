@@ -586,7 +586,7 @@ fn extract_element_id(msg: &[u8]) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 /// Tag key index version.
-const TAG_INDEX_VERSION: u8 = 0x01;
+pub(crate) const TAG_INDEX_VERSION: u8 = 0x01;
 
 /// Per-blob tag key index: the set of unique tag keys present in a blob.
 ///
@@ -601,11 +601,6 @@ pub(crate) struct TagIndex {
 }
 
 impl TagIndex {
-    /// Create a `TagIndex` from pre-sorted unique tag key byte strings.
-    pub(crate) fn from_keys(keys: Vec<Box<[u8]>>) -> Self {
-        TagIndex { keys }
-    }
-
     /// Serialize to the tag index wire format.
     ///
     /// Format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) + key bytes].

@@ -239,6 +239,8 @@ pub struct BlockBuilder {
 
     // Tag key string table indices (for pre-computed tagdata, avoids scan_block_tags rescan).
     tag_key_indices: FxHashSet<u32>,
+    // Scratch buffer for sorting tag key indices during tagdata serialization.
+    tag_key_scratch: Vec<u32>,
     // Pre-serialized tagdata from the last encode_block() call.
     last_tagdata: Option<Vec<u8>>,
 
@@ -322,6 +324,7 @@ impl BlockBuilder {
             max_lon: i32::MIN,
 
             tag_key_indices: FxHashSet::default(),
+            tag_key_scratch: Vec::new(),
             last_tagdata: None,
 
             // Pre-allocate dense node vectors to the max block size (8000).
@@ -588,17 +591,13 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-        // Track tag key indices before encode_way (StringTable::add is idempotent)
-        for &(key, _) in tags {
-            let key_idx = self.string_table.add(key);
-            self.tag_key_indices.insert(key_idx);
-        }
         encode_way(
             &mut self.string_table,
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
             &mut self.info_scratch,
+            &mut self.tag_key_indices,
             id,
             tags,
             refs,
@@ -628,11 +627,6 @@ impl BlockBuilder {
             "cannot add way: block full or wrong type"
         );
         self.block_type = Some(BlockType::Ways);
-        // Track tag key indices before encode (StringTable::add is idempotent)
-        for &(key, _) in tags {
-            let key_idx = self.string_table.add(key);
-            self.tag_key_indices.insert(key_idx);
-        }
         encode_way_with_locations(
             &mut self.string_table,
             &mut self.group_buf,
@@ -641,6 +635,7 @@ impl BlockBuilder {
             &mut self.packed_lat_scratch,
             &mut self.packed_lon_scratch,
             &mut self.info_scratch,
+            &mut self.tag_key_indices,
             id,
             tags,
             refs,
@@ -667,17 +662,13 @@ impl BlockBuilder {
             "cannot add relation: block full or wrong type"
         );
         self.block_type = Some(BlockType::Relations);
-        // Track tag key indices before encode (StringTable::add is idempotent)
-        for &(key, _) in tags {
-            let key_idx = self.string_table.add(key);
-            self.tag_key_indices.insert(key_idx);
-        }
         encode_relation(
             &mut self.string_table,
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
             &mut self.info_scratch,
+            &mut self.tag_key_indices,
             id,
             tags,
             members,
@@ -903,18 +894,40 @@ impl BlockBuilder {
             }
         }
 
-        // Build tagdata from tracked tag key indices
+        // Build tagdata from tracked tag key indices.
+        // Sort indices by their string table byte content and serialize directly,
+        // avoiding per-key Box<[u8]> allocations and the TagIndex intermediary.
+        // Wire format: version (u8) + key_count (u16 LE) + repeated [key_len (u16 LE) + key bytes].
         self.last_tagdata = if self.tag_key_indices.is_empty() {
             None
         } else {
-            let mut keys: Vec<Box<[u8]>> = self.tag_key_indices.iter()
-                .filter_map(|&idx| {
-                    let s = &self.string_table.strings[idx as usize];
-                    if s.is_empty() { None } else { Some(s.as_bytes().into()) }
-                })
-                .collect();
-            keys.sort();
-            Some(crate::blob_index::TagIndex::from_keys(keys).serialize())
+            self.tag_key_scratch.clear();
+            self.tag_key_scratch.extend(
+                self.tag_key_indices.iter()
+                    .copied()
+                    .filter(|&idx| !self.string_table.strings[idx as usize].is_empty()),
+            );
+            self.tag_key_scratch.sort_by(|&a, &b| {
+                self.string_table.strings[a as usize]
+                    .as_bytes()
+                    .cmp(self.string_table.strings[b as usize].as_bytes())
+            });
+            let total: usize = 3 + self.tag_key_scratch.iter()
+                .map(|&idx| 2 + self.string_table.strings[idx as usize].len())
+                .sum::<usize>();
+            let mut buf = Vec::with_capacity(total);
+            buf.push(crate::blob_index::TAG_INDEX_VERSION);
+            #[allow(clippy::cast_possible_truncation)]
+            let count = self.tag_key_scratch.len() as u16;
+            buf.extend_from_slice(&count.to_le_bytes());
+            for &idx in &self.tag_key_scratch {
+                let key = self.string_table.strings[idx as usize].as_bytes();
+                #[allow(clippy::cast_possible_truncation)]
+                let key_len = key.len() as u16;
+                buf.extend_from_slice(&key_len.to_le_bytes());
+                buf.extend_from_slice(key);
+            }
+            Some(buf)
         };
 
         self.reset();
@@ -1137,6 +1150,7 @@ fn encode_way(
     elem: &mut Vec<u8>,
     packed: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
+    tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
     tags: &[(&str, &str)],
     refs: &[i64],
@@ -1151,7 +1165,9 @@ fn encode_way(
     if !tags.is_empty() {
         packed.clear();
         for &(key, _) in tags {
-            encode_varint(packed, u64::from(string_table.add(key)));
+            let key_idx = string_table.add(key);
+            tag_key_indices.insert(key_idx);
+            encode_varint(packed, u64::from(key_idx));
         }
         encode_bytes_field(elem, 2, packed);
 
@@ -1196,6 +1212,7 @@ fn encode_way_with_locations(
     packed_lats: &mut Vec<u8>,
     packed_lons: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
+    tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
     tags: &[(&str, &str)],
     refs: &[i64],
@@ -1208,7 +1225,9 @@ fn encode_way_with_locations(
     if !tags.is_empty() {
         packed_refs.clear();
         for &(key, _) in tags {
-            encode_varint(packed_refs, u64::from(string_table.add(key)));
+            let key_idx = string_table.add(key);
+            tag_key_indices.insert(key_idx);
+            encode_varint(packed_refs, u64::from(key_idx));
         }
         encode_bytes_field(elem, 2, packed_refs);
 
@@ -1285,6 +1304,7 @@ fn encode_relation(
     elem: &mut Vec<u8>,
     packed: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
+    tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
     tags: &[(&str, &str)],
     members: &[MemberData<'_>],
@@ -1296,7 +1316,9 @@ fn encode_relation(
     if !tags.is_empty() {
         packed.clear();
         for &(key, _) in tags {
-            encode_varint(packed, u64::from(string_table.add(key)));
+            let key_idx = string_table.add(key);
+            tag_key_indices.insert(key_idx);
+            encode_varint(packed, u64::from(key_idx));
         }
         encode_bytes_field(elem, 2, packed);
 

@@ -200,8 +200,12 @@ impl WireBlobHeader {
     /// When `parse_tagdata` is `false`, field 4 (tagdata) is skipped instead of
     /// allocated. Most read paths don't need tagdata — only tag-filtered reads
     /// and merge/sort passthrough use it.
+    ///
+    /// When `parse_indexdata` is `false`, field 2 (indexdata) is skipped instead
+    /// of copied. Hot read paths that never call `Blob::index()` (e.g.
+    /// `par_map_reduce`, unfiltered pipeline) can skip the 42-byte per-blob copy.
     #[hotpath::measure]
-    pub fn parse(data: &[u8], parse_tagdata: bool) -> Result<Self> {
+    pub fn parse(data: &[u8], parse_tagdata: bool, parse_indexdata: bool) -> Result<Self> {
         use super::wire::Cursor;
         let mut cursor = Cursor::new(data);
         let mut blob_type = BlobKind::Unknown(String::new());
@@ -223,7 +227,7 @@ impl WireBlobHeader {
                         ),
                     };
                 }
-                2 => {
+                2 if parse_indexdata => {
                     // indexdata: bytes (len-delimited) — accept v1 (26) or v2 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
                     let len = bytes.len();
@@ -523,6 +527,10 @@ pub struct BlobReader<R: Read + Send> {
     /// When `true`, `WireBlobHeader::parse` allocates tagdata (field 4).
     /// Only needed for tag-filtered reads and merge/sort passthrough.
     parse_tagdata: bool,
+    /// When `true`, `WireBlobHeader::parse` copies indexdata (field 2).
+    /// Default `true` for compatibility. Disabled in hot paths that never
+    /// call `Blob::index()` (par_map_reduce, unfiltered pipeline).
+    parse_indexdata: bool,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -549,6 +557,7 @@ impl<R: Read + Send> BlobReader<R> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
+            parse_indexdata: true,
         }
     }
 
@@ -564,6 +573,15 @@ impl<R: Read + Send> BlobReader<R> {
     /// Only needed for tag-filtered reads and merge/sort passthrough.
     pub(crate) fn set_parse_tagdata(&mut self, enable: bool) {
         self.parse_tagdata = enable;
+    }
+
+    /// Enable or disable indexdata parsing (BlobHeader field 2).
+    ///
+    /// When enabled (default), `WireBlobHeader::parse` copies the 42-byte
+    /// indexdata per blob. Disable on hot paths that never call `Blob::index()`
+    /// to skip the per-blob copy.
+    pub(crate) fn set_parse_indexdata(&mut self, enable: bool) {
+        self.parse_indexdata = enable;
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -614,7 +632,7 @@ impl<R: Read + Send> BlobReader<R> {
             return self.handle_error(e.into());
         }
 
-        let header = match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata) {
+        let header = match WireBlobHeader::parse(&self.header_buf, self.parse_tagdata, self.parse_indexdata) {
             Ok(header) => header,
             Err(e) => {
                 return self.handle_error(e)
@@ -658,6 +676,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
+            parse_indexdata: true,
         })
     }
 
@@ -674,6 +693,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
+            parse_indexdata: true,
         })
     }
 
@@ -686,6 +706,7 @@ impl BlobReader<FileReader> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
+            parse_indexdata: true,
         })
     }
 }
@@ -757,6 +778,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             last_blob_ok: true,
             header_buf: Vec::new(),
             parse_tagdata: false,
+            parse_indexdata: true,
         })
     }
 
@@ -907,7 +929,7 @@ impl BlobReader<BufReader<File>> {
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
 pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
-    let header = WireBlobHeader::parse(header_bytes, false)?;
+    let header = WireBlobHeader::parse(header_bytes, false, false)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,
@@ -926,7 +948,7 @@ pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
 pub fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {
-    let header = WireBlobHeader::parse(header_bytes, true)?;
+    let header = WireBlobHeader::parse(header_bytes, true, true)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
             size: header.datasize,

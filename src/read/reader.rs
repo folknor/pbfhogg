@@ -365,7 +365,7 @@ impl<R: Read + Send> ElementReader<R> {
     //   expose per-bridge granularity controls. The mutex is fundamental to
     //   how par_bridge adapts a sequential iterator.
     //
-    pub fn par_map_reduce<MP, RD, ID, T>(self, map_op: MP, identity: ID, reduce_op: RD) -> Result<T>
+    pub fn par_map_reduce<MP, RD, ID, T>(mut self, map_op: MP, identity: ID, reduce_op: RD) -> Result<T>
     where
         MP: for<'a> Fn(Element<'a>) -> T + Sync + Send,
         RD: Fn(T, T) -> T + Sync + Send,
@@ -376,6 +376,8 @@ impl<R: Read + Send> ElementReader<R> {
         // Blobs are still compressed at this stage (~16-64KB each), so the Vec
         // holds only the compressed data. The header blob was already consumed
         // at construction time, so only data and unknown blobs remain.
+        // Skip indexdata parsing — par_map_reduce never calls blob.index().
+        self.blob_iter.set_parse_indexdata(false);
         let blobs = collect_osm_data_blobs(self.blob_iter)?;
 
         // Phase 2: Parallel decode + map + reduce with zero lock contention.

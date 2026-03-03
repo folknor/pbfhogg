@@ -665,9 +665,9 @@ fn process_batch(
 // Passthrough coalescing
 // ---------------------------------------------------------------------------
 
-/// Accumulate raw passthrough bytes into a coalescing buffer.
-fn coalesce_passthrough(frame: &mut RawBlobFrame, buf: &mut Vec<u8>) {
-    buf.extend_from_slice(&std::mem::take(&mut frame.frame_bytes));
+/// Accumulate raw passthrough frames into a chunk list (no memcpy).
+fn coalesce_passthrough(frame: &mut RawBlobFrame, chunks: &mut Vec<Vec<u8>>) {
+    chunks.push(std::mem::take(&mut frame.frame_bytes));
 }
 
 // ---------------------------------------------------------------------------
@@ -778,7 +778,7 @@ fn write_output_passthrough(
     let mut batch_bytes: usize = 0;
     // Coalescing buffer for non-copy-range passthrough (without linux-direct-io,
     // or when copy_file_range is incompatible with O_DIRECT output).
-    let mut passthrough_buf: Vec<u8> = Vec::new();
+    let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
 
     while let Some(header) = read_blob_header(&mut reader, &mut file_offset)? {
         if header.blob_type != BlobKind::OsmData {
@@ -798,7 +798,7 @@ fn write_output_passthrough(
             if !batch.is_empty() {
                 #[cfg(feature = "linux-direct-io")]
                 copy_range.flush(&mut writer)?;
-                flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                 let batch_stats = process_slot_batch(
                     &batch, &mut writer, node_index, keep_untagged_nodes,
                 )?;
@@ -832,12 +832,12 @@ fn write_output_passthrough(
             #[cfg(feature = "linux-direct-io")]
             if !use_copy_range {
                 let mut frame = read_blob_data(&mut reader, header, &mut file_offset)?;
-                coalesce_passthrough(&mut frame, &mut passthrough_buf);
+                coalesce_passthrough(&mut frame, &mut passthrough_chunks);
             }
             #[cfg(not(feature = "linux-direct-io"))]
             {
                 let mut frame = read_blob_data(&mut reader, header, &mut file_offset)?;
-                coalesce_passthrough(&mut frame, &mut passthrough_buf);
+                coalesce_passthrough(&mut frame, &mut passthrough_chunks);
             }
         } else {
             // Flush any pending copy range before decoding — the next passthrough
@@ -845,7 +845,7 @@ fn write_output_passthrough(
             // between break contiguity).
             #[cfg(feature = "linux-direct-io")]
             copy_range.flush(&mut writer)?;
-            flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+            flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
             // Decode: read full frame, classify into batch slot.
             let frame = read_blob_data(&mut reader, header, &mut file_offset)?;
             stats.blobs_decoded += 1;
@@ -863,7 +863,7 @@ fn write_output_passthrough(
         {
             #[cfg(feature = "linux-direct-io")]
             copy_range.flush(&mut writer)?;
-            flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+            flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
             let batch_stats = process_slot_batch(
                 &batch, &mut writer, node_index, keep_untagged_nodes,
             )?;
@@ -882,7 +882,7 @@ fn write_output_passthrough(
     }
     #[cfg(feature = "linux-direct-io")]
     copy_range.flush(&mut writer)?;
-    flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+    flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
 
     writer.flush()?;
     Ok(stats)

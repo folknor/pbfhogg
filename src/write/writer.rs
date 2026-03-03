@@ -105,6 +105,9 @@ impl FromStr for Compression {
 pub(crate) enum PipelinePayload {
     /// Framed blob bytes ready to write.
     Bytes(io::Result<Vec<u8>>),
+    /// Multiple framed blob chunks, written sequentially. Avoids
+    /// concatenating passthrough frames into a single Vec.
+    ByteChunks(Vec<Vec<u8>>),
     /// Kernel-space copy from input fd (avoids userspace copy for passthrough).
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
@@ -486,6 +489,32 @@ impl<W: Write> PbfWriter<W> {
         }
     }
 
+    /// Write multiple pre-framed raw blob chunks without concatenating them.
+    ///
+    /// Like [`write_raw_owned`](Self::write_raw_owned) but accepts a list of
+    /// owned chunks. The writer thread writes each chunk sequentially.
+    /// Used by passthrough coalescers to avoid `extend_from_slice` memcpy.
+    pub fn write_raw_chunks(&mut self, chunks: Vec<Vec<u8>>) -> io::Result<()> {
+        if let Some(ref mut pipeline) = self.pipeline {
+            let seq = pipeline.seq;
+            pipeline.seq += 1;
+            pipeline
+                .tx
+                .send(PipelineItem {
+                    seq,
+                    data: PipelinePayload::ByteChunks(chunks),
+                })
+                .map_err(|_| io::Error::other("writer thread terminated"))?;
+            Ok(())
+        } else {
+            let w = self.writer_mut();
+            for chunk in &chunks {
+                w.write_all(chunk)?;
+            }
+            Ok(())
+        }
+    }
+
     /// Flush the underlying writer.
     ///
     /// In pipelined mode, this joins the writer thread and propagates any
@@ -660,6 +689,11 @@ fn writer_thread(
         while let Some(payload) = pending.pop_ready() {
             match payload {
                 PipelinePayload::Bytes(result) => writer.write_all(&result?)?,
+                PipelinePayload::ByteChunks(chunks) => {
+                    for chunk in &chunks {
+                        writer.write_all(chunk)?;
+                    }
+                }
                 #[cfg(feature = "linux-direct-io")]
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
                     let out_fd = writer

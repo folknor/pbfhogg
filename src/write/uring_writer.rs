@@ -723,6 +723,11 @@ fn uring_main_loop(
                 PipelinePayload::Bytes(result) => {
                     state.write(&result?)?;
                 }
+                PipelinePayload::ByteChunks(chunks) => {
+                    for chunk in &chunks {
+                        state.write(chunk)?;
+                    }
+                }
                 #[cfg(feature = "linux-direct-io")]
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
                     handle_copy_range_uring(state, in_fd, offset, len)?;

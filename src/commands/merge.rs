@@ -1103,7 +1103,7 @@ pub fn merge(
     // and flushes them as a single write_raw_owned (move, no copy) to the
     // pipelined writer. At ~92% passthrough (Denmark), this collapses thousands
     // of individual channel sends into far fewer.
-    let mut passthrough_buf: Vec<u8> = Vec::new();
+    let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
 
     loop {
         let batch_bytes = collect_batch(&frame_rx, &ranges, &mut batch);
@@ -1217,7 +1217,7 @@ pub fn merge(
             if let Some(prev) = last_type
                 && prev != blob_kind
             {
-                flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                 flush_remaining_upserts(
                     prev, blob_kind, &ranges, &diff,
                     &mut cursors, &mut bb, &mut writer, &mut stats,
@@ -1228,7 +1228,7 @@ pub fn merge(
             // Gap creates: emit upserts with ID < this blob's min_id
             let has_gap = has_gap_creates(blob_kind, min_id, &ranges, &cursors);
             if has_gap {
-                flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                 emit_gap_creates(
                     blob_kind, min_id, &ranges,
                     &diff, &mut cursors, &mut bb, &mut writer, &mut stats,
@@ -1246,7 +1246,7 @@ pub fn merge(
                     if use_copy_range {
                         // copy_file_range path: flush coalesced buffer first,
                         // then do kernel-space copy (can't coalesce across copy_file_range)
-                        flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                        flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                         writer.write_raw_copy(
                             input_fd,
                             batch[i].file_offset,
@@ -1257,13 +1257,13 @@ pub fn merge(
                     if !use_copy_range {
                         coalesce_passthrough(
                             &mut batch[i], index, *has_indexdata,
-                            &mut passthrough_buf,
+                            &mut passthrough_chunks,
                         )?;
                     }
                     #[cfg(not(feature = "linux-direct-io"))]
                     coalesce_passthrough(
                         &mut batch[i], index, *has_indexdata,
-                        &mut passthrough_buf,
+                        &mut passthrough_chunks,
                     )?;
 
                     if matches!(slot, BatchSlot::Passthrough { has_indexdata: true, .. }) {
@@ -1293,7 +1293,7 @@ pub fn merge(
                             result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
                         );
                     }
-                    flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+                    flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                     let mut output = received[*job_index]
                         .take()
                         .ok_or("rewrite output missing")?;
@@ -1327,7 +1327,7 @@ pub fn merge(
         }
 
         // Flush any remaining coalesced passthrough bytes at batch boundary
-        flush_passthrough_buf(&mut passthrough_buf, &mut writer)?;
+        flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
         #[cfg(feature = "hotpath")]
         {
             let elapsed = phase34_start.elapsed();
@@ -1463,11 +1463,10 @@ fn coalesce_passthrough(
     frame: &mut RawBlobFrame,
     index: &BlobIndex,
     has_indexdata: bool,
-    buf: &mut Vec<u8>,
+    chunks: &mut Vec<Vec<u8>>,
 ) -> Result<()> {
     if has_indexdata {
-        let bytes = std::mem::take(&mut frame.frame_bytes);
-        buf.extend_from_slice(&bytes);
+        chunks.push(std::mem::take(&mut frame.frame_bytes));
     } else {
         let indexdata = index.serialize();
         let reframed = crate::write::writer::reframe_raw_with_index(
@@ -1475,7 +1474,7 @@ fn coalesce_passthrough(
             &indexdata,
             frame.tagdata.as_deref(),
         )?;
-        buf.extend_from_slice(&reframed);
+        chunks.push(reframed);
     }
     Ok(())
 }

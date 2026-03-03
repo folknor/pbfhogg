@@ -23,12 +23,35 @@ the flush triggers exactly once (at the way→relation boundary) — zero cost. 
 unsorted input with interleaved blob types, every decode→passthrough transition
 triggers a batch flush, producing many small batches with worse rayon amortization.
 
-- [ ] **Measure unsorted impact.** Generate an unsorted indexed PBF (e.g.
-  shuffle blob order in a Denmark PBF) and benchmark add-locations-to-ways
-  vs the sorted variant. If the difference is measurable, consider a smarter
-  approach: track interleaved decode/passthrough segments and flush them in
-  input order at batch boundaries, preserving large batches while maintaining
-  correct output ordering.
+- [x] **Measure unsorted impact.** Measured at commit `34672c9` using
+  `examples/shuffle_blobs.rs` (deterministic Fisher-Yates, seed 42) on
+  Denmark indexed PBF (464 MB, 7396 blobs).
+
+  **Default mode** (untagged nodes dropped): no measurable impact.
+  Only 6 relation blobs are passthrough out of 7396 total, so shuffling
+  creates at most 6 extra batch flushes — negligible.
+
+  | Input | min (ms) | median (ms) | passthrough | decoded |
+  |---|---|---|---|---|
+  | Sorted | 5991 | 6475 | 6 | 7390 |
+  | Shuffled | 5313 | 5435 | 6 | 7390 |
+
+  **`--keep-untagged-nodes` mode**: **2.25x regression** (median 5.8s → 13.1s).
+  Node blobs (6562) become passthrough, creating ~6500 decode↔passthrough
+  transitions that each force a batch flush. The decode batch (828 way blobs)
+  is fragmented into thousands of tiny batches with terrible rayon amortization.
+
+  | Input | min (ms) | median (ms) | passthrough | decoded |
+  |---|---|---|---|---|
+  | Sorted | 5650 | 5807 | 6568 | 828 |
+  | Shuffled | 7702 | 13053 | 6568 | 828 |
+
+  **Conclusion**: the regression only affects `--keep-untagged-nodes` on
+  unsorted input. Production use (`add-locations-to-ways` in the planet
+  refresh pipeline) always uses sorted PBFs and drops untagged nodes, so
+  this is not a practical concern. If unsorted+keep-nodes becomes a real
+  use case, the fix is to buffer interleaved decode/passthrough segments
+  and flush them in input order at batch boundaries.
 
 ## Performance: parallelism (low priority)
 
@@ -205,47 +228,14 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
-## Code quality: duplicated business logic
-
-Audit findings from code quality review. Ranked by effort/impact.
-
-Completed: 5 high-value helpers in `mod.rs` (require_indexdata, flush_local,
-BATCH_SIZE, Result alias, TypeFilter), batch collection loop, parallel batch
-drain, RawBlobFrame consolidation, ReorderBuffer utility, CLI flag groups.
-
-Full deep-dive with 6 large consolidation opportunities reviewed and rejected
-(see `notes/consolidation-review-{1..6}-*.md` for detailed reports). Two small
-concrete improvements identified:
-
-- [x] **Promote `ensure_*_capacity_local` to `mod.rs`.** Merge already has
-  `ensure_node_capacity_local`, `ensure_way_capacity_local`,
-  `ensure_relation_capacity_local` (3-line helpers wrapping the
-  `if !bb.can_add_*() { flush_local(...) }` pattern). Promoting these to
-  `mod.rs` replaces the inline capacity check at 28 emission sites across
-  cat, getid, tags_filter, extract, and add_locations_to_ways.
-
-- [x] ~~**Hoist tag/ref/member buffer Vecs into `map_init`.**~~ Investigated
-  and measured (commit `07d46f4`, Japan 2.4 GB). All three buffers can be
-  hoisted — the lifetime concern was unfounded (`clear()` before `extend()`
-  satisfies the borrow checker). However benchmarking showed **no measurable
-  improvement**: cat-way 3439→3486 ms (+1.4%), cat-relation 365→347 ms
-  (-4.9%), both within noise. The savings (~3 Vec allocations per ~8000-
-  element block, ~16K total for Japan) are negligible against decode + encode
-  + compression. **Not worth the code churn.** Left as-is.
-
 ## Deep-dive findings (2026-03-03)
 
-- [ ] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
-  `merge` and `add-locations-to-ways` coalescing appends frame bytes into one
-  `Vec<u8>` (`extend_from_slice`) before `write_raw_owned`, so "passthrough"
-  still copies bytes in userspace when copy-file-range path is unavailable.
-  See `src/commands/merge.rs::coalesce_passthrough` and
-  `src/commands/add_locations_to_ways.rs::coalesce_passthrough`.
-  Consider segmented passthrough buffers (`Vec<Vec<u8>>` + vectored write or
-  writer-side chunk API) to eliminate large memcpy overhead on rewrite-light
-  workloads.
-  Investigation/design note:
-  `notes/passthrough-coalescing-memcpy-investigation-2026-03-03.md`
+- [x] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
+  Fixed: coalescers now collect `Vec<Vec<u8>>` chunks instead of concatenating
+  into a single `Vec<u8>`. New `PipelinePayload::ByteChunks` variant and
+  `write_raw_chunks` API let the writer thread drain chunks sequentially.
+  Verified identical output via `brokkr verify merge` and
+  `brokkr verify add-locations-to-ways`.
 
 - [ ] **P2 correctness edge case: Null Island ambiguity in dense index sentinel.**
   `DenseMmapIndex` uses `(0,0)` as "unset", so valid node coordinates at exactly

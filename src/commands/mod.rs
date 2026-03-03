@@ -236,13 +236,13 @@ pub(crate) fn read_blob_header_only(
     }))
 }
 
-/// Flush coalesced passthrough bytes as a single `write_raw_owned` (move, no copy).
+/// Flush coalesced passthrough chunks as a single `write_raw_chunks` (move, no copy).
 pub(crate) fn flush_passthrough_buf(
-    buf: &mut Vec<u8>,
+    chunks: &mut Vec<Vec<u8>>,
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
-    if !buf.is_empty() {
-        writer.write_raw_owned(std::mem::take(buf))?;
+    if !chunks.is_empty() {
+        writer.write_raw_chunks(std::mem::take(chunks))?;
     }
     Ok(())
 }

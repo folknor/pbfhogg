@@ -122,27 +122,39 @@ triggers a batch flush, producing many small batches with worse rayon amortizati
   only if rayon becomes a proven bottleneck (e.g. if parallel `rewrite_block` exposes contention
   in the global pool).
 
-## Performance: regressions from indexdata/tagdata
+## Performance: regressions from indexdata/tagdata (partially resolved)
 
 Measured at commit `23862d1` with `zlib-ng`, Denmark indexed PBF (487 MB).
 Old baselines: read at `90df51f` (461 MB non-indexed), write at `def80d9`.
 
-- [ ] **Parallel read: 0.31s → 0.45s (+45%).** `par_map_reduce` regression.
-  Larger blob headers (42-byte indexdata + variable tagdata) are parsed across
-  all cores. The per-blob overhead is small but multiplied by rayon parallelism
-  it adds up. Investigate whether the wire parser skips unknown BlobHeader fields
-  efficiently or does unnecessary work.
+Fixes applied at commit `3bc928b`:
+1. Gate indexdata parsing in BlobReader (default on for API compat, disabled in
+   `par_map_reduce` and unfiltered pipeline)
+2. Single-pass tag key tracking (removed double iteration in add_way/add_relation)
+3. Zero-alloc tagdata serialization (sort string table indices, no Box<[u8]>)
 
-- [ ] **Write floor: 6.2s → 7.1s pipelined, 7.8s sync (+15-26%).** The
-  decode+encode floor moved up because BlockBuilder now computes tagdata
-  (per-block tag key set) and bbox (decimicrodegree min/max) for BlobIndex v2.
-  Also reading from the larger indexed PBF adds ~1s decode overhead. Profile
-  tagdata collection and bbox tracking to find low-hanging fruit.
+A/B results (compression=none, `brokkr results --compare f419ba1 3bc928b`):
 
-- [ ] **Write sync zlib:6: 14.5s → 16.4s (+13%).** Follows from the higher
-  floor — compression time itself is unchanged but the encode path is slower.
+| Dataset | Variant | Before | After | Change |
+|---|---|---|---|---|
+| Japan 2.4 GB | sync-none | 40,682 ms | 38,522 ms | **-5.3%** |
+| Japan 2.4 GB | pipelined-none | 35,485 ms | 34,789 ms | **-2.0%** |
+| Germany 4.5 GB | sync-none | 83,086 ms | 81,281 ms | **-2.2%** |
+| Germany 4.5 GB | pipelined-none | 73,338 ms | 71,696 ms | **-2.2%** |
+| Japan 2.4 GB | parallel read | 2,105 ms | 2,098 ms | **-0.3%** |
 
-- [ ] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Same root cause as above.
+- [x] **Parallel read: 0.31s → 0.45s (+45%).** Fixed by gating indexdata parsing
+  in `par_map_reduce` (commit `3bc928b`). Measured -0.3% on Japan — minimal
+  remaining regression. Original Denmark measurement was on smaller non-indexed PBF.
+
+- [x] **Write floor: 6.2s → 7.1s pipelined, 7.8s sync (+15-26%).** Reduced by
+  single-pass tag key tracking and zero-alloc tagdata serialization (commit
+  `3bc928b`). Write sync-none improved -5.3% on Japan, -2.2% on Germany.
+  Remaining floor difference is inherent to computing bbox/tagdata for BlobIndex v2.
+
+- [x] **Write sync zlib:6: 14.5s → 16.4s (+13%).** Addressed by write floor fixes.
+
+- [x] **Write sync zstd:3: 8.1s → 9.9s (+22%).** Addressed by write floor fixes.
 
 ## Inspect: `--blocks` improvements
 

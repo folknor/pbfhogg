@@ -144,18 +144,12 @@ blocks). The per-type summary (block counts + sizes) is already shown without
 
 ## Performance: CLI commands vs osmium
 
-All CLI commands now beat osmium except extract --simple.
-
-- [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower on
-  Denmark, 1.70x on Japan. The gap is structural: 2 passes vs osmium's 1.
-  The extra file read costs ~1.3s on Denmark, ~5s on Japan.
-  Full investigation/design note:
+- [x] **Extract simple: single-pass for sorted inputs.** For PBFs with
+  `Sort.Type_then_ID`, classify + write in one file pass. Blocks are
+  classified sequentially (populating ID sets), then dispatched in batches
+  for parallel writing via `process_extract_pass2_batch`. Unsorted inputs
+  fall back to the existing two-pass code. Design note:
   `notes/extract-simple-optimization-opportunities.md`
-  - [ ] **Single-pass simple with parallel inline writing.** Stream through
-    the pipelined reader, collect + filter matching elements per block, batch
-    matched blocks for parallel writing via rayon. Eliminates the second file
-    read. Challenge: the collection consumer (which is sequential) and the
-    write dispatch (which needs rayon) must coexist in the same pass.
 
 ## Before crates.io publish
 

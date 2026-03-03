@@ -5,7 +5,8 @@ mod common;
 use common::{
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
     way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
-    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+    read_header, write_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation,
+    TestWay,
 };
 use pbfhogg::extract::{extract, parse_bbox, parse_geojson, ExtractStrategy, PolygonRings, Region};
 use pbfhogg::writer::Compression;
@@ -570,4 +571,153 @@ fn spatial_filter_skips_distant_blobs() {
     assert_eq!(stats.nodes_in_bbox, 10);
     // Stockholm (11-20) and Berlin (21-30) nodes should not appear
     assert!(ids.iter().all(|&id| id <= 10), "no non-Copenhagen nodes should be present");
+}
+
+// ---------------------------------------------------------------------------
+// Single-pass sorted tests — verify that the sorted fast path produces
+// identical results to the two-pass unsorted path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn simple_sorted_filters_nodes_by_bbox() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 3]);
+    assert_eq!(stats.nodes_in_bbox, 2);
+    assert_eq!(stats.nodes_from_ways, 0);
+}
+
+#[test]
+fn simple_sorted_includes_ways_with_nodes_in_bbox() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(way_ids(&c), vec![10, 12]);
+    assert_eq!(stats.ways_written, 2);
+}
+
+#[test]
+fn simple_sorted_does_not_add_extra_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &[]);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 3]);
+    assert_eq!(stats.nodes_from_ways, 0);
+}
+
+#[test]
+fn simple_sorted_includes_relations() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert_eq!(stats.relations_written, 1);
+}
+
+#[test]
+fn simple_sorted_includes_relations_with_matched_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let relations = vec![TestRelation {
+        id: 200,
+        members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+        tags: vec![("type", "multipolygon")],
+    }];
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &relations);
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![200]);
+    assert_eq!(stats.relations_written, 1);
+}
+
+#[test]
+fn simple_sorted_empty_extract() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let bbox = parse_bbox("0.0,0.0,1.0,1.0").expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert!(c.nodes.is_empty());
+    assert!(c.ways.is_empty());
+    assert!(c.relations.is_empty());
+    assert_eq!(stats.nodes_in_bbox, 0);
+    assert_eq!(stats.ways_written, 0);
+}
+
+#[test]
+fn simple_sorted_output_declares_sorted() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    let bbox = parse_bbox(BBOX_STR).expect("parse bbox");
+    let region = Region::Bbox(bbox);
+    extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+
+    let header = read_header(&output);
+    assert!(header.is_sorted(), "output should declare Sort.Type_then_ID");
+}
+
+#[test]
+fn simple_sorted_polygon_filters_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+
+    let region = test_polygon_region();
+    let stats = extract(&input, &output, &region, ExtractStrategy::Simple, Compression::default(), false, true).expect("extract");
+    let c = read_all_elements(&output);
+
+    assert_eq!(node_ids(&c), vec![1, 3]);
+    assert_eq!(stats.nodes_in_bbox, 2);
 }

@@ -850,6 +850,13 @@ fn compress_zlib(
 ///
 /// BlobHeader fields: type (string, field 1), indexdata (bytes, field 2),
 /// datasize (int32, field 3), tagdata (bytes, field 4).
+///
+/// **libosmium compat note:** libosmium 2.23.0 has a signed-char sign-extension
+/// bug in `get_size_in_network_byte_order` that rejects any BlobHeader > 127
+/// bytes. With indexdata (42 bytes) + tagdata (variable), rewritten blobs
+/// routinely exceed this. Filed as <https://github.com/osmcode/libosmium/issues/405>.
+/// Not a problem for pbfhogg's own reader or the production pipeline — only
+/// affects users who open pbfhogg-generated PBFs with osmium-tool.
 fn encode_blob_header_into(
     blob_type: &str,
     datasize: i32,

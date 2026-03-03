@@ -479,10 +479,60 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 }
 
 // ---------------------------------------------------------------------------
-// Simple strategy (two passes: streaming collection + parallel write)
+// Simple strategy (single pass for sorted inputs, two-pass fallback for unsorted)
 // ---------------------------------------------------------------------------
 
+/// Classify elements in a single block for simple extract (populate ID sets).
+///
+/// Iterates elements without metadata (faster) and marks matching IDs:
+/// - Nodes: bbox containment → set `bbox_node_ids`
+/// - Ways: any ref in `bbox_node_ids` → set `matched_way_ids`
+/// - Relations: matched node/way member → set `matched_relation_ids`
+fn classify_block_simple(
+    block: &PrimitiveBlock,
+    region: &Region,
+    bbox_int: &BboxInt,
+    bbox_node_ids: &mut IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+) {
+    for element in block.elements_skip_metadata() {
+        match &element {
+            Element::DenseNode(dn) => {
+                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
+                    bbox_node_ids.set(dn.id());
+                }
+            }
+            Element::Node(n) => {
+                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
+                    bbox_node_ids.set(n.id());
+                }
+            }
+            Element::Way(w) => {
+                if w.refs().any(|r| bbox_node_ids.get(r)) {
+                    matched_way_ids.set(w.id());
+                }
+            }
+            Element::Relation(r) => {
+                if relation_has_matched_member(r, bbox_node_ids, matched_way_ids) {
+                    matched_relation_ids.set(r.id());
+                }
+            }
+        }
+    }
+}
+
 fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+    // Check if input is sorted — if so, classify + write in a single file pass.
+    let reader = ElementReader::open(input, direct_io)?;
+    let is_sorted = reader.header().is_sorted();
+    drop(reader);
+
+    if is_sorted {
+        return extract_simple_single_pass(input, output, region, compression, direct_io);
+    }
+
+    // --- Unsorted fallback: two passes (collect IDs, then write) ---
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -493,7 +543,6 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
         strategy: "simple",
     };
 
-    // --- Pass 1: Streaming collection (pipelined decode, sequential consumer) ---
     let mut bbox_node_ids = IdSetDense::new();
     let mut matched_way_ids = IdSetDense::new();
     let mut matched_relation_ids = IdSetDense::new();
@@ -502,34 +551,13 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let reader = ElementReader::open(input, direct_io)?;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    if region.contains_decimicro(&bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) {
-                        bbox_node_ids.set(dn.id());
-                    }
-                }
-                Element::Node(n) => {
-                    if region.contains_decimicro(&bbox_int, n.decimicro_lat(), n.decimicro_lon()) {
-                        bbox_node_ids.set(n.id());
-                    }
-                }
-                Element::Way(w) => {
-                    if w.refs().any(|r| bbox_node_ids.get(r)) {
-                        matched_way_ids.set(w.id());
-                    }
-                }
-                Element::Relation(r) => {
-                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                        matched_relation_ids.set(r.id());
-                    }
-                }
-            }
-        }
+        classify_block_simple(
+            &block, region, &bbox_int,
+            &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
+        );
     }
 
-    // --- Pass 2: Parallel write (same pattern as complete-ways) ---
-    let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
+    let all_way_node_ids = IdSetDense::new();
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
@@ -547,6 +575,81 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
         process_extract_pass2_batch(batch, &ids, &mut writer, &mut stats)
     })?;
+
+    writer.flush()?;
+    Ok(stats)
+}
+
+/// Single-pass simple extract for sorted inputs.
+///
+/// For PBFs with `Sort.Type_then_ID`, classification and writing happen in one
+/// file pass. Blocks arrive in type order (nodes → ways → relations), so by
+/// the time ways appear, all bbox node IDs are known; by the time relations
+/// appear, all matched way IDs are known.
+///
+/// Each batch of blocks is classified sequentially (populating ID sets), then
+/// dispatched for parallel writing via `process_extract_pass2_batch`. The
+/// pipeline (dedicated rayon pool) runs concurrently with the parallel write
+/// (global rayon pool) without contention.
+fn extract_simple_single_pass(
+    input: &Path,
+    output: &Path,
+    region: &Region,
+    compression: Compression,
+    direct_io: bool,
+) -> Result<ExtractStats> {
+    let mut stats = ExtractStats {
+        nodes_in_bbox: 0,
+        nodes_from_ways: 0,
+        nodes_from_relations: 0,
+        ways_written: 0,
+        ways_from_relations: 0,
+        relations_written: 0,
+        strategy: "simple",
+    };
+
+    let bbox_int = BboxInt::from_bbox(region.bbox());
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let mut matched_relation_ids = IdSetDense::new();
+    let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
+
+    let reader = ElementReader::open(input, direct_io)?;
+    let bbox = region.bbox();
+    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            .sorted()
+    })?;
+
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        classify_block_simple(
+            &block, region, &bbox_int,
+            &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
+        );
+        batch.push(block);
+
+        if batch.len() >= BATCH_SIZE {
+            let ids = ExtractPass2IdSets {
+                bbox_node_ids: &bbox_node_ids,
+                all_way_node_ids: &all_way_node_ids,
+                matched_way_ids: &matched_way_ids,
+                matched_relation_ids: &matched_relation_ids,
+            };
+            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        let ids = ExtractPass2IdSets {
+            bbox_node_ids: &bbox_node_ids,
+            all_way_node_ids: &all_way_node_ids,
+            matched_way_ids: &matched_way_ids,
+            matched_relation_ids: &matched_relation_ids,
+        };
+        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+    }
 
     writer.flush()?;
     Ok(stats)

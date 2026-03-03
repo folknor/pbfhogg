@@ -14,12 +14,22 @@
 - 16 integration tests (12 migrated + 4 new: unsorted rejection, empty files,
   multi-block boundary 9000 vs 7500, type_filter=way phase skipping).
 
-**Phase 2 (`derive_changes`) not yet started.** Same streaming cursor
-infrastructure applies; main difference is action-grouped OSC output
-requiring bounded buffering by change count.
+**Phase 2 (`derive_changes`) complete.**
 
-**Phase 3 (cleanup) blocked on Phase 2.** `read_elements()` in
-`owned_elements.rs` still used by `derive_changes`.
+- Ported to same `StreamingBlocks` cursor from `stream_merge.rs`.
+- `MergeElement` trait + `classify`/`streaming_merge_phase` generic loop.
+- Changes buffered by action type (`Changes` struct) for grouped OSC output.
+- Memory bounded by number of changed elements, not total input size.
+- Requires `Sort.Type_then_ID` on both inputs (errors with guidance to sort).
+- 11 integration tests (10 existing migrated to sorted PBFs + 1 new
+  unsorted rejection test).
+
+**Phase 3 (cleanup) complete.**
+
+- Removed `read_elements()`, `ReadResult`, and `take_*` clone helpers
+  from `owned_elements.rs` (no remaining callers).
+- Kept: owned type definitions, equality functions, coordinate helpers
+  (used by both `diff` and `derive_changes` via `stream_merge.rs`).
 
 ## Context
 
@@ -269,6 +279,5 @@ If action buffers exceed threshold, spill to disk.
 
 ~~Implement **`diff` streaming first** (lower output-format complexity), then port the same streaming core to `derive_changes`.~~
 
-**Done.** `diff` streaming implemented at `b14a174`. Next: port `derive_changes`
-to use the same `StreamingBlocks` cursor from `stream_merge.rs`, buffering
-changes by action type for grouped OSC output.
+**Done.** Both `diff` and `derive_changes` now use streaming merge-join.
+`owned_elements.rs` cleaned up (dead code removed).

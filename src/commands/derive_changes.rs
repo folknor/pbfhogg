@@ -1,5 +1,9 @@
 //! Generate an OSC diff from two PBF snapshots. Equivalent to `osmium derive-changes`.
+//!
+//! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
+//! Requires both inputs to declare `Sort.Type_then_ID`.
 
+use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -9,18 +13,22 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use super::owned_elements::{
-    from_decimicro, format_coord, nodes_equal, read_elements, relations_equal, take_node,
-    take_relation, take_way, ways_equal, OwnedNode, OwnedRelation, OwnedWay,
+    from_decimicro, format_coord, nodes_equal, relations_equal, ways_equal, OwnedNode,
+    OwnedRelation, OwnedWay,
 };
-use crate::MemberType;
-
-use super::Result;
+use super::stream_merge::{
+    convert_node, convert_relation, convert_way, is_node_block, is_relation_block, is_way_block,
+    next_element, StreamingBlocks,
+};
+use super::{require_sorted, Result};
+use crate::{BlockType, Element, ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
 /// Statistics from a derive-changes operation.
+#[derive(Debug)]
 pub struct DeriveChangesStats {
     pub creates: u64,
     pub modifies: u64,
@@ -43,46 +51,62 @@ impl DeriveChangesStats {
 
 /// Generate an OSC diff from two sorted PBF snapshots.
 ///
-/// Reads both files into memory, performs a merge-join by (type, id),
-/// and writes differences as gzipped OsmChange XML.
-#[hotpath::measure]
-/// Generate an OSC diff from two PBF snapshots.
+/// Streams through both files using pipelined block iterators and performs
+/// a merge-join by (type, id). Changes are buffered by action type and
+/// written as gzipped OsmChange XML. Memory is bounded by the number of
+/// changed elements, not total input size.
 ///
-/// **Note:** Both PBFs are loaded entirely into memory as owned Vecs.
-/// This works for country-scale extracts but will OOM on planet-scale
-/// (~80 GB) files. A streaming approach would require sorted inputs
-/// and a merge-join algorithm.
+/// Requires both inputs to declare `Sort.Type_then_ID` — returns an
+/// actionable error if either is unsorted.
+#[hotpath::measure]
 pub fn derive_changes(
     old_path: &Path,
     new_path: &Path,
     output: &Path,
     direct_io: bool,
 ) -> Result<DeriveChangesStats> {
-    let mut old = read_elements(old_path, direct_io, None)?;
-    let mut new = read_elements(new_path, direct_io, None)?;
+    // Open readers and verify sorted headers.
+    let old_reader = ElementReader::open(old_path, direct_io)?;
+    let new_reader = ElementReader::open(new_path, direct_io)?;
 
-    // Ensure sorted by ID
-    old.nodes.sort_by_key(|n| n.id);
-    old.ways.sort_by_key(|w| w.id);
-    old.relations.sort_by_key(|r| r.id);
-    new.nodes.sort_by_key(|n| n.id);
-    new.ways.sort_by_key(|w| w.id);
-    new.relations.sort_by_key(|r| r.id);
+    require_sorted(old_reader.header(), old_path, "Old PBF")?;
+    require_sorted(new_reader.header(), new_path, "New PBF")?;
 
-    // Collect changes
+    // Build streaming cursors — two concurrent pipelined decoders.
+    let mut old_src = StreamingBlocks::new(old_reader.into_blocks_pipelined());
+    let mut new_src = StreamingBlocks::new(new_reader.into_blocks_pipelined());
+
+    // Collect changes by action type.
     let mut creates = Changes::new();
     let mut modifies = Changes::new();
     let mut deletes = Changes::new();
 
-    merge_join_nodes(&old.nodes, &new.nodes, &mut creates, &mut modifies, &mut deletes);
-    merge_join_ways(&old.ways, &new.ways, &mut creates, &mut modifies, &mut deletes);
-    merge_join_relations(
-        &old.relations,
-        &new.relations,
-        &mut creates,
-        &mut modifies,
-        &mut deletes,
-    );
+    // Phase 1: Nodes
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_merge_phase::<OwnedNode>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            &mut creates.nodes, &mut modifies.nodes, &mut deletes.nodes,
+        )?;
+    }
+
+    // Phase 2: Ways
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_merge_phase::<OwnedWay>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            &mut creates.ways, &mut modifies.ways, &mut deletes.ways,
+        )?;
+    }
+
+    // Phase 3: Relations
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        streaming_merge_phase::<OwnedRelation>(
+            &mut old_src, &mut ob, &mut new_src, &mut nb,
+            &mut creates.relations, &mut modifies.relations, &mut deletes.relations,
+        )?;
+    }
 
     let stats = DeriveChangesStats {
         creates: (creates.nodes.len() + creates.ways.len() + creates.relations.len()) as u64,
@@ -120,126 +144,125 @@ impl Changes {
 }
 
 // ---------------------------------------------------------------------------
-// Merge-join
+// MergeElement trait — per-type accessors for the generic merge-join
 // ---------------------------------------------------------------------------
 
-fn merge_join_nodes(
-    old: &[OwnedNode],
-    new: &[OwnedNode],
-    creates: &mut Changes,
-    modifies: &mut Changes,
-    deletes: &mut Changes,
-) {
-    let mut oi = 0;
-    let mut ni = 0;
+trait MergeElement: Sized {
+    fn id(&self) -> i64;
+    fn is_block_type(bt: BlockType) -> bool;
+    fn equal(a: &Self, b: &Self) -> bool;
+    fn convert(element: &Element<'_>) -> Option<Self>;
+}
 
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                // In old only → delete
-                deletes.nodes.push(take_node(&old[oi]));
-                oi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                // In new only → create
-                creates.nodes.push(take_node(&new[ni]));
-                ni += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                // In both → check if modified
-                if !nodes_equal(&old[oi], &new[ni]) {
-                    modifies.nodes.push(take_node(&new[ni]));
+impl MergeElement for OwnedNode {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { nodes_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
+}
+
+impl MergeElement for OwnedWay {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { ways_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
+}
+
+impl MergeElement for OwnedRelation {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { relations_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming merge-join
+// ---------------------------------------------------------------------------
+
+/// Classification of a merge-join step.
+enum MergeAction {
+    /// Both cursors exhausted.
+    Done,
+    /// Element exists only in old file — delete.
+    Delete,
+    /// Element exists only in new file — create.
+    Create,
+    /// Element exists in both files but differs — modify (new version wins).
+    Modify,
+    /// Element exists in both files and is identical — skip.
+    Equal,
+}
+
+/// Classify the next merge-join action by comparing current elements.
+///
+/// Borrows both options immutably; the caller acts on the returned action
+/// after the borrows end, enabling ownership transfer.
+fn classify<T: MergeElement>(old: &Option<T>, new: &Option<T>) -> MergeAction {
+    match (old, new) {
+        (None, None) => MergeAction::Done,
+        (Some(_), None) => MergeAction::Delete,
+        (None, Some(_)) => MergeAction::Create,
+        (Some(o), Some(n)) => match o.id().cmp(&n.id()) {
+            Ordering::Less => MergeAction::Delete,
+            Ordering::Greater => MergeAction::Create,
+            Ordering::Equal => {
+                if T::equal(o, n) {
+                    MergeAction::Equal
+                } else {
+                    MergeAction::Modify
                 }
-                oi += 1;
-                ni += 1;
             }
-        }
-    }
-
-    // Remaining old → deletes
-    for o in &old[oi..] {
-        deletes.nodes.push(take_node(o));
-    }
-    // Remaining new → creates
-    for n in &new[ni..] {
-        creates.nodes.push(take_node(n));
+        },
     }
 }
 
-fn merge_join_ways(
-    old: &[OwnedWay],
-    new: &[OwnedWay],
-    creates: &mut Changes,
-    modifies: &mut Changes,
-    deletes: &mut Changes,
-) {
-    let mut oi = 0;
-    let mut ni = 0;
+/// Run one type phase of the streaming merge-join, collecting changes.
+///
+/// Pulls elements from both cursors and classifies each pair. Creates,
+/// modifies, and deletes are pushed into the corresponding output Vecs.
+/// Equal elements are dropped (no output).
+fn streaming_merge_phase<T: MergeElement>(
+    old_src: &mut StreamingBlocks,
+    old_buf: &mut Vec<T>,
+    new_src: &mut StreamingBlocks,
+    new_buf: &mut Vec<T>,
+    creates: &mut Vec<T>,
+    modifies: &mut Vec<T>,
+    deletes: &mut Vec<T>,
+) -> Result<()> {
+    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
 
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                deletes.ways.push(take_way(&old[oi]));
-                oi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                creates.ways.push(take_way(&new[ni]));
-                ni += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                if !ways_equal(&old[oi], &new[ni]) {
-                    modifies.ways.push(take_way(&new[ni]));
+    loop {
+        match classify(&old_elem, &new_elem) {
+            MergeAction::Done => break,
+            MergeAction::Delete => {
+                if let Some(o) = old_elem.take() {
+                    deletes.push(o);
                 }
-                oi += 1;
-                ni += 1;
+                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+            }
+            MergeAction::Create => {
+                if let Some(n) = new_elem.take() {
+                    creates.push(n);
+                }
+                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+            }
+            MergeAction::Modify => {
+                old_elem.take();
+                if let Some(n) = new_elem.take() {
+                    modifies.push(n);
+                }
+                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+            }
+            MergeAction::Equal => {
+                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
         }
     }
-
-    for o in &old[oi..] {
-        deletes.ways.push(take_way(o));
-    }
-    for n in &new[ni..] {
-        creates.ways.push(take_way(n));
-    }
-}
-
-fn merge_join_relations(
-    old: &[OwnedRelation],
-    new: &[OwnedRelation],
-    creates: &mut Changes,
-    modifies: &mut Changes,
-    deletes: &mut Changes,
-) {
-    let mut oi = 0;
-    let mut ni = 0;
-
-    while oi < old.len() && ni < new.len() {
-        match old[oi].id.cmp(&new[ni].id) {
-            std::cmp::Ordering::Less => {
-                deletes.relations.push(take_relation(&old[oi]));
-                oi += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                creates.relations.push(take_relation(&new[ni]));
-                ni += 1;
-            }
-            std::cmp::Ordering::Equal => {
-                if !relations_equal(&old[oi], &new[ni]) {
-                    modifies.relations.push(take_relation(&new[ni]));
-                }
-                oi += 1;
-                ni += 1;
-            }
-        }
-    }
-
-    for o in &old[oi..] {
-        deletes.relations.push(take_relation(o));
-    }
-    for n in &new[ni..] {
-        creates.relations.push(take_relation(n));
-    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

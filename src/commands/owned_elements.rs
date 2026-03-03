@@ -1,10 +1,6 @@
 //! Shared owned element types used by derive_changes and diff commands.
 
-use std::path::Path;
-
-use crate::{BlobDecode, BlobFilter, BlobReader, Element, MemberId};
-
-use super::Result;
+use crate::MemberId;
 
 // ---------------------------------------------------------------------------
 // Owned element types — Vec fields are not converted to Box<[T]> because these
@@ -36,114 +32,6 @@ pub(crate) struct OwnedRelation {
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) members: Vec<OwnedMember>,
     pub(crate) version: Option<i32>,
-}
-
-// ---------------------------------------------------------------------------
-// Reading PBF into owned vectors
-// ---------------------------------------------------------------------------
-
-pub(crate) struct ReadResult {
-    pub(crate) nodes: Vec<OwnedNode>,
-    pub(crate) ways: Vec<OwnedWay>,
-    pub(crate) relations: Vec<OwnedRelation>,
-}
-
-pub(crate) fn read_elements(
-    input: &Path,
-    direct_io: bool,
-    filter: Option<&BlobFilter>,
-) -> Result<ReadResult> {
-    let reader = BlobReader::open(input, direct_io)?;
-    let mut nodes: Vec<OwnedNode> = Vec::new();
-    let mut ways: Vec<OwnedWay> = Vec::new();
-    let mut relations: Vec<OwnedRelation> = Vec::new();
-
-    let want_nodes = filter.as_ref().is_none_or(|f| f.want_nodes);
-    let want_ways = filter.as_ref().is_none_or(|f| f.want_ways);
-    let want_relations = filter.as_ref().is_none_or(|f| f.want_relations);
-
-    for blob in reader {
-        let blob = blob?;
-        // Skip blob decompression if indexdata says it's an irrelevant type.
-        if let Some(f) = filter
-            && let Some(idx) = blob.index()
-            && !f.wants(idx.kind)
-        {
-            continue;
-        }
-        match blob.decode()? {
-            BlobDecode::OsmHeader(_) => {}
-            BlobDecode::OsmData(block) => {
-                for element in block.elements() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            if !want_nodes { continue; }
-                            nodes.push(OwnedNode {
-                                id: dn.id(),
-                                decimicro_lat: dn.decimicro_lat(),
-                                decimicro_lon: dn.decimicro_lon(),
-                                tags: dn
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                version: dn.info().map(crate::dense::DenseNodeInfo::version),
-                            });
-                        }
-                        Element::Node(n) => {
-                            if !want_nodes { continue; }
-                            nodes.push(OwnedNode {
-                                id: n.id(),
-                                decimicro_lat: n.decimicro_lat(),
-                                decimicro_lon: n.decimicro_lon(),
-                                tags: n
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                version: n.info().version(),
-                            });
-                        }
-                        Element::Way(w) => {
-                            if !want_ways { continue; }
-                            ways.push(OwnedWay {
-                                id: w.id(),
-                                tags: w
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                refs: w.refs().collect(),
-                                version: w.info().version(),
-                            });
-                        }
-                        Element::Relation(r) => {
-                            if !want_relations { continue; }
-                            relations.push(OwnedRelation {
-                                id: r.id(),
-                                tags: r
-                                    .tags()
-                                    .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                                    .collect(),
-                                members: r
-                                    .members()
-                                    .map(|m| OwnedMember {
-                                        id: m.id,
-                                        role: m.role().unwrap_or("").to_owned(),
-                                    })
-                                    .collect(),
-                                version: r.info().version(),
-                            });
-                        }
-                    }
-                }
-            }
-            BlobDecode::Unknown(_) => {}
-        }
-    }
-
-    Ok(ReadResult {
-        nodes,
-        ways,
-        relations,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -195,41 +83,3 @@ pub(crate) fn format_coord(buf: &mut String, deg: f64) {
     buf.truncate(trimmed.len());
 }
 
-// ---------------------------------------------------------------------------
-// Clone helpers (owned types don't derive Clone to keep it explicit)
-// ---------------------------------------------------------------------------
-
-pub(crate) fn take_node(n: &OwnedNode) -> OwnedNode {
-    OwnedNode {
-        id: n.id,
-        decimicro_lat: n.decimicro_lat,
-        decimicro_lon: n.decimicro_lon,
-        tags: n.tags.clone(),
-        version: n.version,
-    }
-}
-
-pub(crate) fn take_way(w: &OwnedWay) -> OwnedWay {
-    OwnedWay {
-        id: w.id,
-        tags: w.tags.clone(),
-        refs: w.refs.clone(),
-        version: w.version,
-    }
-}
-
-pub(crate) fn take_relation(r: &OwnedRelation) -> OwnedRelation {
-    OwnedRelation {
-        id: r.id,
-        tags: r.tags.clone(),
-        members: r
-            .members
-            .iter()
-            .map(|m| OwnedMember {
-                id: m.id,
-                role: m.role.clone(),
-            })
-            .collect(),
-        version: r.version,
-    }
-}

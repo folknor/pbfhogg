@@ -5,7 +5,7 @@ mod common;
 use common::{
     node_ids_with_coords as node_ids, read_all_elements_with_coords as read_all_elements,
     way_ids_with_coords as way_ids, relation_ids_with_coords as relation_ids,
-    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
+    write_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
 };
 use pbfhogg::MemberId;
 use pbfhogg::derive_changes::derive_changes;
@@ -31,8 +31,8 @@ fn identical_files_no_changes() {
         TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
     ];
 
-    write_test_pbf(&old, &nodes, &ways, &[]);
-    write_test_pbf(&new, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&old, &nodes, &ways, &[]);
+    write_test_pbf_sorted(&new, &nodes, &ways, &[]);
 
     let stats = derive_changes(&old, &new, &osc, false).expect("derive");
     assert_eq!(stats.creates, 0);
@@ -47,13 +47,13 @@ fn create_only() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -76,7 +76,7 @@ fn delete_only() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
@@ -85,7 +85,7 @@ fn delete_only() {
         &[TestWay { id: 10, refs: vec![1, 2], tags: vec![] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
@@ -105,13 +105,13 @@ fn modify_node_coords() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 150_000_000, lon: 250_000_000, tags: vec![] }],
         &[],
@@ -131,13 +131,13 @@ fn modify_node_tags() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "old")] }],
         &[],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "new")] }],
         &[],
@@ -155,13 +155,13 @@ fn modify_way_refs() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[],
         &[TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[],
         &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
@@ -179,7 +179,7 @@ fn modify_relation_members() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[],
         &[],
@@ -189,7 +189,7 @@ fn modify_relation_members() {
             tags: vec![("type", "route")],
         }],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[],
         &[],
@@ -214,7 +214,7 @@ fn mixed_create_modify_delete() {
     let new = dir.path().join("new.osm.pbf");
     let osc = dir.path().join("changes.osc.gz");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
@@ -224,7 +224,7 @@ fn mixed_create_modify_delete() {
         &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")] }, // modified tag
@@ -251,7 +251,7 @@ fn roundtrip_with_merge() {
     let osc = dir.path().join("changes.osc.gz");
     let result = dir.path().join("result.osm.pbf");
 
-    write_test_pbf(
+    write_test_pbf_sorted(
         &old,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
@@ -263,7 +263,7 @@ fn roundtrip_with_merge() {
         ],
         &[],
     );
-    write_test_pbf(
+    write_test_pbf_sorted(
         &new,
         &[
             TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "ONE")] },
@@ -309,4 +309,39 @@ fn roundtrip_with_merge() {
     }
 
     assert_eq!(relation_ids(&result_contents), relation_ids(&new_contents));
+}
+
+#[test]
+fn unsorted_input_rejected() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+
+    // Write old without sorted header, new with sorted header.
+    write_test_pbf(
+        &old,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    let err = derive_changes(&old, &new, &osc, false)
+        .expect_err("should reject unsorted input");
+    let msg = err.to_string();
+    assert!(msg.contains("not sorted"), "error should mention 'not sorted', got: {msg}");
+    assert!(
+        msg.contains("Sort.Type_then_ID"),
+        "error should mention Sort.Type_then_ID, got: {msg}",
+    );
+    assert!(
+        msg.contains("pbfhogg sort"),
+        "error should mention 'pbfhogg sort', got: {msg}",
+    );
 }

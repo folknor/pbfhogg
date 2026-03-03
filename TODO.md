@@ -227,20 +227,15 @@ All CLI commands now beat osmium except extract --simple.
   stashing and three sequential type phases (nodes → ways → relations).
   Requires `Sort.Type_then_ID` on both inputs.
 
-- [ ] **P3-22 Phase 2: Streaming merge-join for derive_changes.**
-  `derive_changes` still materializes both files via `read_elements()`
-  in `owned_elements.rs`. Port to the same streaming cursor
-  infrastructure from `stream_merge.rs`. Main complication: OSC output
-  is action-grouped (`<create>`, `<modify>`, `<delete>`), so changes
-  must be buffered by action type — memory bounded by number of changed
-  elements, not total input size.
+- [x] **P3-22 Phase 2: Streaming merge-join for derive_changes.**
+  Ported to streaming cursors from `stream_merge.rs`. Memory bounded
+  by changed element count, not total input size. Requires
+  `Sort.Type_then_ID` on both inputs.
 
-  Full design note: `notes/derive-changes-diff-streaming-merge-join.md`
-
-- [ ] **P3-22 Phase 3: Cleanup owned_elements.rs.** Once both `diff`
-  and `derive_changes` use streaming cursors, `read_elements()` can be
-  removed. The owned type definitions and equality functions are still
-  needed by both commands.
+- [x] **P3-22 Phase 3: Cleanup owned_elements.rs.** Removed
+  `read_elements()`, `ReadResult`, and `take_*` clone helpers.
+  Owned type definitions and equality functions retained (used by
+  both `diff` and `derive_changes` via `stream_merge.rs`).
 
 ## Benchmarking
 

@@ -29,7 +29,10 @@ use crate::osc::{parse_osc_file, CompactDiffOverlay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
-use super::{flush_local, flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame};
+use super::{
+    build_output_header, flush_local, flush_passthrough_buf, read_raw_frame, require_indexdata,
+    writer_from_header_bytes, RawBlobFrame,
+};
 
 use super::{Result, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
@@ -625,10 +628,9 @@ fn write_base_relation_local(
 // Header handling
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::redundant_closure_for_method_calls)]
 fn build_header_bytes(header: &crate::HeaderBlock) -> Result<Vec<u8>> {
-    Ok(crate::block_builder::HeaderBuilder::from_header(header)
-        .sorted()
-        .build()?)
+    build_output_header(header, false, |hb| hb.sorted())
 }
 
 /// Read the OSMHeader blob from a base PBF and return rebuilt header bytes.
@@ -1124,32 +1126,14 @@ pub fn merge(
     let header_bytes = read_header(base_pbf, direct_io)?;
 
     // Step 4: Create pipelined writer
-    let mut writer = if io_uring {
-        #[cfg(feature = "linux-io-uring")]
-        {
-            PbfWriter::to_path_uring(output_pbf, compression, &header_bytes, sqpoll)?
-        }
-        #[cfg(not(feature = "linux-io-uring"))]
-        {
-            let _ = sqpoll;
-            return Err("--io-uring requires the linux-io-uring feature".into());
-        }
-    } else if direct_io {
-        #[cfg(feature = "linux-direct-io")]
-        {
-            PbfWriter::to_path_direct(
-                output_pbf,
-                compression,
-                &header_bytes,
-            )?
-        }
-        #[cfg(not(feature = "linux-direct-io"))]
-        {
-            return Err("--direct-io requires the linux-direct-io feature".into());
-        }
-    } else {
-        PbfWriter::to_path(output_pbf, compression, &header_bytes)?
-    };
+    let mut writer = writer_from_header_bytes(
+        output_pbf,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        sqpoll,
+    )?;
 
     // Step 5: Spawn reader thread with read-ahead
     let (reader_thread, frame_rx) = spawn_reader_thread(base_pbf, direct_io);

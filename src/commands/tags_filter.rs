@@ -7,9 +7,9 @@ use rayon::prelude::*;
 use super::id_set_dense::IdSetDense;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
-    TypeFilter,
+    writer_from_header, TypeFilter,
 };
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -372,12 +372,7 @@ fn tags_filter_single_pass(
         Some(filter) => reader.with_blob_filter(filter),
         None => reader,
     };
-    let mut hb = HeaderBuilder::from_header(reader.header());
-    if reader.header().is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -639,12 +634,7 @@ fn tags_filter_two_pass(
     } else {
         reader
     };
-    let mut hb = HeaderBuilder::from_header(reader.header());
-    if reader.header().is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,

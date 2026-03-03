@@ -21,10 +21,10 @@ use std::path::Path;
 
 use crate::blob::{parse_blob_header_with_index, BlobKind};
 use crate::blob_index::BlobIndex;
-use crate::block_builder::{BlockBuilder, Metadata, OwnedBlock, RawMetadata};
+use crate::block_builder::{BlockBuilder, HeaderBuilder, Metadata, OwnedBlock, RawMetadata};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
-use crate::writer::PbfWriter;
+use crate::writer::{Compression, PbfWriter};
 
 // Box<dyn Error> is intentional — commands are CLI internals, callers only display
 // errors and exit. Typed error enums would add complexity with no matching benefit.
@@ -213,6 +213,67 @@ pub(crate) fn flush_local(
         output.push(triple);
     }
     Ok(())
+}
+
+/// Build output header bytes from an input header.
+///
+/// Applies `configure` to the header builder, then preserves sortedness if
+/// requested and if the input header is sorted.
+pub(crate) fn build_output_header(
+    header: &crate::HeaderBlock,
+    preserve_sorted: bool,
+    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
+) -> Result<Vec<u8>> {
+    let mut hb = configure(HeaderBuilder::from_header(header));
+    if preserve_sorted && header.is_sorted() {
+        hb = hb.sorted();
+    }
+    Ok(hb.build()?)
+}
+
+/// Open a pipelined writer from an input header.
+pub(crate) fn writer_from_header(
+    output: &Path,
+    compression: Compression,
+    header: &crate::HeaderBlock,
+    preserve_sorted: bool,
+    configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
+) -> Result<PbfWriter<FileWriter>> {
+    let header_bytes = build_output_header(header, preserve_sorted, configure)?;
+    Ok(PbfWriter::to_path(output, compression, &header_bytes)?)
+}
+
+/// Open an output writer from prebuilt header bytes with optional direct-io/io_uring modes.
+pub(crate) fn writer_from_header_bytes(
+    output: &Path,
+    compression: Compression,
+    header_bytes: &[u8],
+    direct_io: bool,
+    io_uring: bool,
+    sqpoll: bool,
+) -> Result<PbfWriter<FileWriter>> {
+    if io_uring {
+        #[cfg(feature = "linux-io-uring")]
+        {
+            Ok(PbfWriter::to_path_uring(output, compression, header_bytes, sqpoll)?)
+        }
+        #[cfg(not(feature = "linux-io-uring"))]
+        {
+            let _ = sqpoll;
+            Err("--io-uring requires the linux-io-uring feature".into())
+        }
+    } else if direct_io {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            Ok(PbfWriter::to_path_direct(output, compression, header_bytes)?)
+        }
+        #[cfg(not(feature = "linux-direct-io"))]
+        {
+            Err("--direct-io requires the linux-direct-io feature".into())
+        }
+    } else {
+        Ok(PbfWriter::to_path(output, compression, header_bytes)?)
+    }
 }
 
 /// Extract [`Metadata`] from an [`Info`](crate::Info) (Node/Way/Relation).

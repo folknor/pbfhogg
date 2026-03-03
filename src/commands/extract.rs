@@ -4,13 +4,13 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
-use super::{drain_batch_results, flush_local, require_indexdata};
+use super::{drain_batch_results, flush_local, require_indexdata, writer_from_header};
 use super::id_set_dense::IdSetDense;
 
 // ---------------------------------------------------------------------------
@@ -529,11 +529,10 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let header_bytes = HeaderBuilder::from_header(reader.header())
-        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        .sorted()
-        .build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            .sorted()
+    })?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -581,11 +580,10 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let header_bytes = HeaderBuilder::from_header(reader.header())
-        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        .sorted()
-        .build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            .sorted()
+    })?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -928,11 +926,10 @@ fn extract_smart(
     // --- Pass 3: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let header_bytes = HeaderBuilder::from_header(reader.header())
-        .bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-        .sorted()
-        .build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            .sorted()
+    })?;
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &bbox_node_ids,

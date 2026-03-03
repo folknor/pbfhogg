@@ -10,13 +10,14 @@ use crate::blob::{
     parse_primitive_block_from_bytes_owned, BlobKind, DecompressPool, WireBlob,
 };
 use crate::blob_index::{BlobIndex, ElemKind};
-use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use super::{
-    drain_batch_results, flush_passthrough_buf, read_raw_frame, require_indexdata, RawBlobFrame,
+    build_output_header, drain_batch_results, flush_passthrough_buf, read_raw_frame,
+    require_indexdata, writer_from_header, RawBlobFrame,
 };
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
@@ -467,12 +468,13 @@ fn write_output_decode_all(
     };
 
     let reader = ElementReader::open(input, direct_io)?;
-    let mut hb = HeaderBuilder::from_header(reader.header()).optional_feature("LocationsOnWays");
-    if reader.header().is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        reader.header(),
+        true,
+        |hb| hb.optional_feature("LocationsOnWays"),
+    )?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
 
@@ -724,13 +726,11 @@ fn read_header_raw<R: Read>(
     while let Some(frame) = read_raw_frame(reader, file_offset)? {
         if frame.blob_type == BlobKind::OsmHeader {
             let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-            let mut hb = HeaderBuilder::from_header(&header)
-                .optional_feature("LocationsOnWays");
             let sorted = header.is_sorted();
-            if sorted {
-                hb = hb.sorted();
-            }
-            return Ok((hb.build()?, sorted));
+            let header_bytes = build_output_header(&header, true, |hb| {
+                hb.optional_feature("LocationsOnWays")
+            })?;
+            return Ok((header_bytes, sorted));
         }
     }
     Err("no OSMHeader blob found".into())
@@ -951,5 +951,3 @@ fn process_slot_batch(
 
     Ok(total)
 }
-
-

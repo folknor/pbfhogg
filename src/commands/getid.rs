@@ -7,8 +7,9 @@ use rayon::prelude::*;
 
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
+    writer_from_header,
 };
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, OwnedBlock};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
@@ -157,12 +158,7 @@ fn filter_by_id(
     } else {
         reader
     };
-    let mut hb = HeaderBuilder::from_header(reader.header());
-    if reader.header().is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -239,12 +235,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         true,
         !ids.relation_ids.is_empty(),
     ));
-    let mut hb = HeaderBuilder::from_header(reader.header());
-    if reader.header().is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
 
     let dep_ref = if dep_node_ids.is_empty() { None } else { Some(&dep_node_ids) };
 

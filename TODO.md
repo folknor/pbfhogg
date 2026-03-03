@@ -128,6 +128,8 @@ All CLI commands now beat osmium except extract --simple.
 - [ ] **Extract simple: remaining gap vs osmium.** Simple is 1.47x slower on
   Denmark, 1.70x on Japan. The gap is structural: 2 passes vs osmium's 1.
   The extra file read costs ~1.3s on Denmark, ~5s on Japan.
+  Full investigation/design note:
+  `notes/extract-simple-optimization-opportunities.md`
   - [ ] **Single-pass simple with parallel inline writing.** Stream through
     the pipelined reader, collect + filter matching elements per block, batch
     matched blocks for parallel writing via rayon. Eliminates the second file
@@ -198,82 +200,18 @@ All CLI commands now beat osmium except extract --simple.
   parallelism use the same pool.
 
 - [ ] **P3-22: Streaming merge-join for derive_changes / diff.** Both
-  commands load entire PBFs into memory via `read_elements()` →
-  `ReadResult { nodes: Vec<OwnedNode>, ways: Vec<OwnedWay>,
-  relations: Vec<OwnedRelation> }` (in `owned_elements.rs`). At planet
-  scale (~8.5B nodes, ~1B ways, ~100M relations), each file materializes
-  to ~2 TB of owned elements. Both files = ~4 TB. Instant OOM.
+  commands still materialize both files via `read_elements()` in
+  `owned_elements.rs`, then sort and merge-join in memory; this is the
+  last remaining hard planet-scale OOM path.
 
-  **Current flow (both commands identical):**
-  1. `read_elements(old)` → Vec of all owned nodes/ways/relations
-  2. `read_elements(new)` → same
-  3. Sort each Vec by ID (redundant if input is already sorted)
-  4. Two-pointer merge-join per element type
-  5. Emit output (OSC XML for derive_changes, text diff for diff)
+  Full design and evaluation moved to:
+  `notes/derive-changes-diff-streaming-merge-join.md`
 
-  The merge-join logic itself (steps 4-5) is already streaming — classic
-  two-pointer advancing whichever side has the lower ID. The problem is
-  purely in steps 1-3: bulk materialization.
-
-  **Streaming approach:**
-  Use `into_blocks_pipelined()` on both input files simultaneously. Each
-  returns `Iterator<Item = Result<PrimitiveBlock>>`. PBF blobs are
-  type-homogeneous (one element type per blob) and sorted by type then ID
-  when `is_sorted()` is true. Advance whichever iterator has the lower
-  current element ID, comparing elements across the two streams.
-
-  Memory would drop from ~4 TB to ~2 blocks (~2-3 MB). The two-pointer
-  join logic from `merge_join_nodes`/`merge_join_ways`/`merge_join_relations`
-  in `derive_changes.rs` can be reused almost verbatim — it just needs to
-  pull elements from block iterators instead of slices.
-
-  **Complication: block boundaries.** Elements within a block are sorted,
-  but the merge-join cursor can sit partway through a block. Need a
-  peekable element iterator that tracks position within the current block
-  and advances to the next block when exhausted. Sort.rs has a similar
-  pattern in `sweep_merge_nodes` (lines 494-531) — it walks blobs in ID
-  order and flushes from a BinaryHeap when elements are guaranteed in
-  final position. The two-file case is simpler: no heap needed, just two
-  cursors.
-
-  **Complication: requiring sorted inputs.** Current code sorts after
-  loading. The streaming version must require pre-sorted inputs (which is
-  the standard case — `cat` produces sorted PBFs, Geofabrik downloads are
-  sorted). Add a check on `header().is_sorted()` and error if not. This
-  also eliminates the in-memory sort step.
-
-  **Complication: output format.** `derive_changes` writes OSC XML grouped
-  by action (all creates, then all modifies, then all deletes). Streaming
-  produces changes interleaved by ID order, not grouped by action. Options:
-  (a) buffer the `Changes` struct (only changed elements, not the full
-  file — typically <1% of elements for a daily diff), (b) write changes
-  in encounter order (non-standard but valid OSC), (c) three-pass streaming
-  (one pass per action type — 3x I/O but constant memory). Option (a) is
-  likely fine: a daily planet diff touches ~1M elements, so the `Changes`
-  Vecs would be ~200 MB, not terabytes.
-
-  **Complication: diff verbose mode.** `diff` in verbose mode calls
-  `write_node_details`/`write_way_details`/`write_relation_details` which
-  need both old and new elements simultaneously for comparison. This works
-  naturally with streaming — when IDs match, both elements are in hand.
-
-  **Files to change:**
-  - `src/commands/derive_changes.rs` — replace `read_elements` + sort + join
-    with streaming block iterators
-  - `src/commands/diff.rs` — same transformation
-  - `src/commands/owned_elements.rs` — can likely be deleted entirely once
-    both consumers are streaming (check if anything else imports it)
-  - `sort.rs` owns its own `OwnedNode`/`OwnedWay`/`OwnedRelation` — the
-    code quality item about shared owned element types (below) becomes
-    relevant if we want a shared streaming merge-join primitive
-
-  **Priority:** Low — neither command is used at planet scale in the
-  nidhogg production pipeline (merge handles the planet refresh). But
-  this is the only remaining planet-scale OOM in the codebase. Every other
-  command either streams (cat, sort, merge, node_stats, inspect, cat,
-  tags_count) or uses bounded/sublinear structures (check_refs uses
-  RoaringTreemap ~4 GB, extract/tags_filter use IdSetDense bitsets ~1-6 GB,
-  add-locations-to-ways uses file-backed mmap).
+  Short version:
+  - implement streaming cursors over `into_blocks_pipelined()` with sorted-input checks
+  - do `diff` first (fully streamable output), then `derive_changes`
+    (action-grouped OSC needs bounded buffering)
+  - remove or shrink `owned_elements.rs` once both commands are ported
 
 ## Benchmarking
 
@@ -317,10 +255,84 @@ All 5 items consolidated into `src/commands/mod.rs`:
   both define `OwnedNode`/`OwnedWay`/`OwnedRelation` with different metadata
   (~170 lines). Could share a base with optional extensions.
 
-- [ ] **CLI flag groups.** `direct_io` on 15 subcommands, `compression` on 9,
-  `force` on 9, `output` on 9 in `cli/src/main.rs`. Use clap
-  `#[command(flatten)]` with shared structs. Also `parse_compression` should be
-  a `FromStr` impl on `Compression`.
+- [x] **CLI flag groups.** `direct_io` / `compression` / `force` / `output`
+  now use shared clap `#[command(flatten)]` arg structs in `cli/src/main.rs`
+  and compression parsing now uses `FromStr` on `Compression` in
+  `src/write/writer.rs` (completed 2026-03-03).
+
+## Deep-dive findings (2026-03-03)
+
+- [ ] **P0 safety: potential data race UB in dense mmap index writer.**
+  `add_locations_to_ways.rs` parallel index population uses `SharedDenseWriter`
+  with raw pointer writes and `unsafe impl Send + Sync` (see
+  `src/commands/add_locations_to_ways.rs`, `SharedDenseWriter::insert`).
+  This is only sound if each node ID is written exactly once globally.
+  If duplicate node IDs appear (corrupt input, non-standard snapshots, future
+  command reuse), two rayon threads can write the same slot concurrently, which
+  is a Rust data race (UB), even if bytes happen to be equal.
+  Detailed investigation and mitigation options:
+  `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
+  Fix options:
+  1) shard + local maps/vecs then merge serially,
+  2) atomic packed writes (`AtomicU64`) for slot updates,
+  3) fallback to sequential insert path with optional `--strict` duplicate check.
+
+- [ ] **P1 correctness/UX: `cat --type` validates indexdata only on first input file.**
+  `cat()` currently calls `require_indexdata` for `files.first()` only
+  (`src/commands/cat.rs`). For multi-input cat, later files without indexdata
+  bypass the intended guard (unless caught indirectly), which is inconsistent
+  with the user-facing error contract.
+  Fix: validate all input files (or explicitly document first-file-only behavior,
+  which is probably surprising and undesirable).
+
+- [ ] **P1 performance: `sort` pass-1 alloc/read churn can be reduced.**
+  `build_blob_index` allocates `Vec<u8>` blob payload per blob and reads full
+  payload even when `BlobHeader` already has indexdata
+  (`src/commands/sort.rs: build_blob_index`).
+  At planet scale this creates avoidable allocator churn and memcpy traffic.
+  Optimize by:
+  1) skipping blob payload read for indexed blobs (`reader.skip(data_size)`),
+  2) reusing a single payload buffer for non-indexed fallback scans.
+
+- [ ] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
+  `merge` and `add-locations-to-ways` coalescing appends frame bytes into one
+  `Vec<u8>` (`extend_from_slice`) before `write_raw_owned`, so "passthrough"
+  still copies bytes in userspace when copy-file-range path is unavailable.
+  See `src/commands/merge.rs::coalesce_passthrough` and
+  `src/commands/add_locations_to_ways.rs::coalesce_passthrough`.
+  Consider segmented passthrough buffers (`Vec<Vec<u8>>` + vectored write or
+  writer-side chunk API) to eliminate large memcpy overhead on rewrite-light
+  workloads.
+
+- [ ] **P2 performance: verbose relation member diff is O(n^2).**
+  `diff.rs::write_member_diff` checks membership with nested `.iter().any(...)`
+  for removed and added members (`src/commands/diff.rs`), which is quadratic in
+  relation member count.
+  For very large relations and verbose mode, this can dominate runtime.
+  Optimize with temporary hash sets/maps keyed by `(member_type, id, role)`.
+
+- [ ] **P2 correctness edge case: Null Island ambiguity in dense index sentinel.**
+  `DenseMmapIndex` uses `(0,0)` as "unset", so valid node coordinates at exactly
+  `0,0` are treated as missing (currently documented as acceptable). If we want
+  strict correctness for all coordinates, store a separate occupancy bitmap (1
+  bit/node) or reserve an impossible sentinel with explicit valid-bit tracking.
+
+- [ ] **P1 pipeline guard: add duplicate-ID validation stage before add-locations-to-ways.**
+  For production ingest (`cat -> merge -> add-locations-to-ways`), add an
+  explicit preflight that fails on duplicate IDs (at least nodes; ideally all
+  types). `check-refs` does not catch duplicates. Consider:
+  - `pbfhogg verify ids` (new command; preferred separation of concerns), or
+  - `cat --verify-unique-ids` strict mode.
+  Investigation note:
+  `notes/add-locations-to-ways-dense-index-safety-investigation-2026-03-03.md`
+
+- [ ] **P2 command design: decide validation ownership (`cat` strict mode vs new `verify`).**
+  Keep one clear production recommendation in docs + brokkr workflows.
+  Candidate baseline:
+  1) `cat` for indexdata normalization,
+  2) `verify ids` for uniqueness/sortedness guarantees,
+  3) `check-refs` for referential integrity,
+  4) `merge` and `add-locations-to-ways`.
 
 ### Lower value (hygiene) — DONE
 
@@ -333,6 +345,10 @@ All 5 items consolidated into `src/commands/mod.rs`:
 - [~] **`decompress_blob` near-duplication.** Skipped — fundamentally different buffer
   management strategies (caller Vec reuse vs DecompressPool+Bytes). Abstraction
   would add complexity to performance-critical paths.
-- [ ] **Header + writer setup helper.** 9 instances of read header →
+- [x] **Header + writer setup helper.** Consolidated into shared helpers in
+  `src/commands/mod.rs` (`build_output_header`, `writer_from_header`,
+  `writer_from_header_bytes`) and applied across command call sites.
+  (completed 2026-03-03)
+  Previously: 9 instances of read header →
   `HeaderBuilder::from_header` → preserve sorted → build → open pipelined
   writer. Could be a shared helper in `mod.rs`.

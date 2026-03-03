@@ -21,6 +21,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::mpsc::{sync_channel, SyncSender};
 use std::thread::JoinHandle;
 
@@ -53,6 +54,50 @@ pub enum Compression {
 impl Default for Compression {
     fn default() -> Self {
         Compression::Zlib(6)
+    }
+}
+
+/// Parse error for [`Compression`] string specs.
+#[derive(Debug, Clone)]
+pub struct ParseCompressionError(String);
+
+impl std::fmt::Display for ParseCompressionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseCompressionError {}
+
+impl FromStr for Compression {
+    type Err = ParseCompressionError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "none" => Ok(Self::None),
+            "zlib" => Ok(Self::default()),
+            "zstd" => Ok(Self::Zstd(3)),
+            _ if s.starts_with("zlib:") => {
+                let level: u32 = s[5..]
+                    .parse()
+                    .map_err(|_| ParseCompressionError(format!("invalid zlib level: {s}")))?;
+                if level > 9 {
+                    return Err(ParseCompressionError(format!(
+                        "zlib level must be 0-9, got {level}"
+                    )));
+                }
+                Ok(Self::Zlib(level))
+            }
+            _ if s.starts_with("zstd:") => {
+                let level: i32 = s[5..]
+                    .parse()
+                    .map_err(|_| ParseCompressionError(format!("invalid zstd level: {s}")))?;
+                Ok(Self::Zstd(level))
+            }
+            _ => Err(ParseCompressionError(format!(
+                "unknown compression: {s} (expected none, zlib, zlib:LEVEL, zstd, zstd:LEVEL)"
+            ))),
+        }
     }
 }
 

@@ -5,8 +5,11 @@ use std::path::Path;
 
 use rayon::prelude::*;
 
-use super::{dense_node_metadata, element_metadata, require_indexdata, TypeFilter};
-use crate::block_builder::{BlockBuilder, HeaderBuilder, MemberData, OwnedBlock};
+use super::{
+    build_output_header, dense_node_metadata, element_metadata, require_indexdata,
+    writer_from_header, TypeFilter,
+};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, parse_blob_header, BlobKind};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
@@ -125,11 +128,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             if frame.blob_type == BlobKind::OsmHeader {
                 let header = decode_blob_to_headerblock(&frame.blob_bytes)?;
-                let mut hb = HeaderBuilder::from_header(&header);
-                if single_file && header.is_sorted() {
-                    hb = hb.sorted();
-                }
-                hdr_bytes = Some(hb.build()?);
+                hdr_bytes = Some(build_output_header(&header, single_file, |hb| hb)?);
                 break;
             }
         }
@@ -278,13 +277,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
     // -----------------------------------------------------------------------
     let first_reader = ElementReader::open(files[0], direct_io)?;
     let header = first_reader.header().clone();
-    let mut hb = HeaderBuilder::from_header(&header);
-    if single_file && header.is_sorted() {
-        hb = hb.sorted();
-    }
-    let header_bytes = hb.build()?;
-
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = writer_from_header(output, compression, &header, single_file, |hb| hb)?;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
@@ -384,4 +377,3 @@ fn process_batch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-

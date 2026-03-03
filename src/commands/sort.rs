@@ -17,13 +17,13 @@ use crate::blob::{
     parse_blob_header_with_index, BlobKind,
 };
 use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
-use crate::block_builder::{HeaderBuilder, BlockBuilder, MemberData, Metadata};
+use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{Element, MemberId};
 
-use super::{require_indexdata, Result};
+use super::{build_output_header, require_indexdata, Result, writer_from_header_bytes};
 
 /// Statistics from a sort operation.
 pub struct SortStats {
@@ -181,29 +181,16 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
 
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing sorted output...");
-    let header_bytes = HeaderBuilder::from_header(&header).sorted().build()?;
-    let mut writer = if io_uring {
-        #[cfg(feature = "linux-io-uring")]
-        {
-            PbfWriter::to_path_uring(output, compression, &header_bytes, sqpoll)?
-        }
-        #[cfg(not(feature = "linux-io-uring"))]
-        {
-            let _ = sqpoll;
-            return Err("--io-uring requires the linux-io-uring feature".into());
-        }
-    } else if direct_io {
-        #[cfg(feature = "linux-direct-io")]
-        {
-            PbfWriter::to_path_direct(output, compression, &header_bytes)?
-        }
-        #[cfg(not(feature = "linux-direct-io"))]
-        {
-            return Err("--direct-io requires the linux-direct-io feature".into());
-        }
-    } else {
-        PbfWriter::to_path(output, compression, &header_bytes)?
-    };
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    let header_bytes = build_output_header(&header, false, |hb| hb.sorted())?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        compression,
+        &header_bytes,
+        direct_io,
+        io_uring,
+        sqpoll,
+    )?;
 
     // Open input for random-access reads
     let mut input_file = File::open(input)?;

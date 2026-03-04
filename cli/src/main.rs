@@ -276,6 +276,9 @@ enum Command {
         /// Show locations-on-ways diagnostics
         #[arg(long)]
         locations: bool,
+        /// Show only anomalous blocks (<50% or >150% of median, plus mixed blocks)
+        #[arg(long)]
+        anomalies: bool,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -565,8 +568,8 @@ fn main() {
             io.direct_io,
             force.force,
         ),
-        Command::Inspect { file, blocks, id_ranges, locations, json, io } => {
-            run_inspect(&file, blocks, id_ranges, locations, json, io.direct_io)
+        Command::Inspect { file, blocks, id_ranges, locations, anomalies, json, io } => {
+            run_inspect(&file, blocks, id_ranges, locations, anomalies, json, io.direct_io)
         }
         Command::NodeStats { file, io, force } => run_node_stats(&file, io.direct_io, force.force),
         Command::Merge {
@@ -1026,17 +1029,24 @@ fn run_inspect(
     blocks: Option<usize>,
     id_ranges: bool,
     locations: bool,
+    anomalies: bool,
     json: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let show_blocks = blocks.is_some() || anomalies;
+    let block_limit = if anomalies && blocks.is_none() {
+        Some(0)
+    } else {
+        blocks
+    };
     let mut report = pbfhogg::inspect::inspect(
-        path, blocks.is_some(), id_ranges, locations, direct_io,
+        path, show_blocks, id_ranges, locations, direct_io,
     )?;
     if json {
-        let value = report.to_json(blocks);
+        let value = report.to_json_filtered(block_limit, anomalies);
         println!("{value}");
     } else {
-        report.print_report(blocks);
+        report.print_report_filtered(block_limit, anomalies);
     }
     Ok(())
 }

@@ -167,10 +167,12 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   scale. Scope: inspect-only initially, could extend to other commands later.
   Implemented: `inspect --json` with schema_version=1, deterministic keys,
   explicit nulls for absent sections, compact output. Honors `--blocks N` limit.
-- [ ] **Anomaly highlighting.** Only show blocks that deviate from the norm —
+- [x] **Anomaly highlighting.** Only show blocks that deviate from the norm —
   unusually small (partial batches), unusually large, or mixed-type blocks.
   These are the interesting ones when debugging a PBF. Requires defining
   "anomalous" thresholds (e.g. <50% or >150% of median elements for type).
+  Implemented as `inspect --anomalies` (works with or without `--blocks`), with
+  the same filter available in JSON mode via `--json --anomalies`.
 
 ## Before crates.io publish
 

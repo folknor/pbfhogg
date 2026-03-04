@@ -1,6 +1,8 @@
 mod common;
 
 use common::{TestNode, TestRelation, TestWay};
+use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::writer::{Compression, PbfWriter};
 
 fn write_simple_pbf(path: &std::path::Path) {
     common::write_test_pbf(
@@ -18,6 +20,23 @@ fn write_simple_pbf(path: &std::path::Path) {
             TestRelation { id: 100, members: vec![], tags: vec![("type", "route")] },
         ],
     );
+}
+
+fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
+    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let mut writer = PbfWriter::to_path(path, Compression::default(), &header).expect("create writer");
+    let mut bb = BlockBuilder::new();
+    let mut next_id: i64 = 1;
+    for &count in blocks {
+        for _ in 0..count {
+            bb.add_node(next_id, 500_000_000, 100_000_000, &[], None);
+            next_id += 1;
+        }
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
 }
 
 #[test]
@@ -164,4 +183,23 @@ fn inspect_json_combined_flags() {
     ] {
         assert!(obj.contains_key(*key), "missing key: {key}");
     }
+}
+
+#[test]
+fn inspect_json_blocks_anomalies_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("anomalies.osm.pbf");
+    // Three node blocks with element counts [100, 100, 10].
+    // Median=100, so the 10-element block is anomalously small (<50% of median).
+    write_nodes_blocks(&input, &[100, 100, 10]);
+
+    let report = pbfhogg::inspect::inspect(&input, true, false, false, false)
+        .expect("inspect");
+    let json = report.to_json_filtered(Some(0), true);
+
+    assert!(json["blocks_detail"].is_array());
+    let detail = json["blocks_detail"].as_array().expect("value");
+    assert_eq!(detail.len(), 1);
+    assert_eq!(detail[0]["type"], "nodes");
+    assert_eq!(detail[0]["elements"], 10);
 }

@@ -631,6 +631,11 @@ impl InspectReport {
     /// + full listing, `Some(N)` = distribution stats + first/last N blocks.
     #[allow(clippy::cast_precision_loss)]
     pub fn print_report(&mut self, block_limit: Option<usize>) {
+        self.print_report_filtered(block_limit, false);
+    }
+
+    /// Print the inspect report with optional anomalies-only block detail.
+    pub fn print_report_filtered(&mut self, block_limit: Option<usize>, anomalies_only: bool) {
         self.print_header();
         println!();
         self.print_blocks_summary();
@@ -643,8 +648,16 @@ impl InspectReport {
             println!();
             Self::print_block_distribution(infos);
             let limit = block_limit.unwrap_or(0);
+            let selected: Vec<&BlockInfo> = if anomalies_only {
+                anomaly_blocks(infos)
+            } else {
+                infos.iter().collect()
+            };
             println!();
-            Self::print_block_table(infos, limit);
+            if anomalies_only {
+                println!("Block anomalies:");
+            }
+            Self::print_block_table_refs(&selected, limit);
         }
         if let Some((n, w, r)) = self.id_range_tuple() {
             println!();
@@ -803,7 +816,7 @@ impl InspectReport {
     /// Print the per-block table with optional head/tail limiting.
     ///
     /// `limit`: 0 = show all blocks, N = show first N and last N blocks.
-    fn print_block_table(infos: &[BlockInfo], limit: usize) {
+    fn print_block_table_refs(infos: &[&BlockInfo], limit: usize) {
         let stdout = std::io::stdout();
         let mut out = std::io::BufWriter::new(stdout.lock());
 
@@ -902,6 +915,15 @@ impl InspectReport {
     /// `block_limit`: `None` = no `blocks_detail` field, `Some(0)` = full listing,
     /// `Some(N)` = first N + last N blocks.
     pub fn to_json(&self, block_limit: Option<usize>) -> serde_json::Value {
+        self.to_json_filtered(block_limit, false)
+    }
+
+    /// Serialize the inspect report to JSON with optional anomalies-only block detail.
+    pub fn to_json_filtered(
+        &self,
+        block_limit: Option<usize>,
+        anomalies_only: bool,
+    ) -> serde_json::Value {
         let hm = &self.header_meta;
 
         let bbox = hm.bbox.map(|(left, bottom, right, top)| {
@@ -948,7 +970,7 @@ impl InspectReport {
                 "standard": is_standard_ordering(&self.accum.segments),
             },
             "id_ranges": id_ranges_json(&self.state),
-            "blocks_detail": blocks_detail_json(block_limit, &self.accum.block_infos),
+            "blocks_detail": blocks_detail_json(block_limit, &self.accum.block_infos, anomalies_only),
             "locations": locations_json(&self.state.loc_stats),
         })
     }
@@ -984,15 +1006,26 @@ fn id_ranges_json(state: &ScanState) -> serde_json::Value {
 fn blocks_detail_json(
     block_limit: Option<usize>,
     block_infos: &Option<Vec<BlockInfo>>,
+    anomalies_only: bool,
 ) -> serde_json::Value {
     let (Some(limit), Some(infos)) = (block_limit, block_infos) else {
         return serde_json::Value::Null;
     };
-    let truncate = limit > 0 && limit * 2 < infos.len();
-    let iter: Box<dyn Iterator<Item = &BlockInfo>> = if truncate {
-        Box::new(infos[..limit].iter().chain(infos[infos.len() - limit..].iter()))
+    let selected: Vec<&BlockInfo> = if anomalies_only {
+        anomaly_blocks(infos)
     } else {
-        Box::new(infos.iter())
+        infos.iter().collect()
+    };
+    let truncate = limit > 0 && limit * 2 < selected.len();
+    let iter: Box<dyn Iterator<Item = &BlockInfo>> = if truncate {
+        Box::new(
+            selected[..limit]
+                .iter()
+                .copied()
+                .chain(selected[selected.len() - limit..].iter().copied()),
+        )
+    } else {
+        Box::new(selected.iter().copied())
     };
     let arr: Vec<serde_json::Value> = iter
         .map(|info| serde_json::json!({
@@ -1004,6 +1037,45 @@ fn blocks_detail_json(
         }))
         .collect();
     serde_json::Value::Array(arr)
+}
+
+fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<&BlockInfo> {
+    let nodes = median_elements_for_kind(infos, BlockKind::Nodes);
+    let ways = median_elements_for_kind(infos, BlockKind::Ways);
+    let relations = median_elements_for_kind(infos, BlockKind::Relations);
+
+    infos
+        .iter()
+        .filter(|info| {
+            if info.kind == BlockKind::Mixed {
+                return true;
+            }
+            let median = match info.kind {
+                BlockKind::Nodes => nodes,
+                BlockKind::Ways => ways,
+                BlockKind::Relations => relations,
+                BlockKind::Mixed => None,
+            };
+            let Some(median) = median else {
+                return false;
+            };
+            // Anomalous if block is <50% or >150% of the per-type median.
+            info.elements.saturating_mul(2) < median || info.elements > median.saturating_mul(3) / 2
+        })
+        .collect()
+}
+
+fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64> {
+    let mut values: Vec<u64> = infos
+        .iter()
+        .filter(|info| info.kind == kind)
+        .map(|info| info.elements)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    Some(values[values.len() / 2])
 }
 
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -1036,7 +1108,7 @@ fn locations_json(loc_stats: &Option<LocationStats>) -> serde_json::Value {
 // Block table row helpers (free functions to avoid cognitive_complexity in methods)
 // ---------------------------------------------------------------------------
 
-fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[BlockInfo]) {
+fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[&BlockInfo]) {
     for info in infos {
         let _ok = writeln!(
             out,
@@ -1050,7 +1122,7 @@ fn write_block_rows_raw(out: &mut impl std::io::Write, infos: &[BlockInfo]) {
     }
 }
 
-fn write_block_rows_compressed(out: &mut impl std::io::Write, infos: &[BlockInfo]) {
+fn write_block_rows_compressed(out: &mut impl std::io::Write, infos: &[&BlockInfo]) {
     for info in infos {
         let _ok = writeln!(
             out,

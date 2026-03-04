@@ -492,3 +492,115 @@ fn passthrough_keep_untagged_nodes() {
     assert_eq!(stats.nodes_dropped, 0);
     assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
 }
+
+#[test]
+fn drop_untagged_keeps_relation_member_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![(MemberId::Node(2), "label")],
+        tags: vec![("type", "site")],
+    }];
+
+    write_test_pbf(&input, &nodes, &ways, &relations);
+    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true).expect("add locations");
+
+    assert_eq!(stats.nodes_read, 2);
+    assert_eq!(stats.nodes_written, 2);
+    assert_eq!(stats.nodes_dropped, 0);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut node_ids: Vec<i64> = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => node_ids.push(dn.id()),
+                    Element::Node(n) => node_ids.push(n.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(node_ids.contains(&1));
+    assert!(node_ids.contains(&2), "untagged relation-member node was dropped");
+}
+
+#[test]
+fn passthrough_drop_untagged_keeps_relation_member_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    let nodes = vec![
+        TestNode {
+            id: 1,
+            lat: 550_000_000,
+            lon: 120_000_000,
+            tags: vec![("name", "tagged")],
+        },
+        TestNode {
+            id: 2,
+            lat: 551_000_000,
+            lon: 121_000_000,
+            tags: vec![],
+        },
+    ];
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1],
+        tags: vec![("highway", "service")],
+    }];
+    let relations = vec![TestRelation {
+        id: 100,
+        members: vec![(MemberId::Node(2), "label")],
+        tags: vec![("type", "site")],
+    }];
+
+    write_test_pbf_indexed(&input, &nodes, &ways, &relations);
+    let stats = add_locations_to_ways(&input, &output, false, Compression::default(), false, true).expect("add locations");
+
+    assert_eq!(stats.nodes_read, 2);
+    assert_eq!(stats.nodes_written, 2);
+    assert_eq!(stats.nodes_dropped, 0);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut node_ids: Vec<i64> = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => node_ids.push(dn.id()),
+                    Element::Node(n) => node_ids.push(n.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    assert!(node_ids.contains(&1));
+    assert!(node_ids.contains(&2), "untagged relation-member node was dropped");
+}

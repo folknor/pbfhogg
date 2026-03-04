@@ -299,11 +299,13 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   PBF with embedded way-node coordinates is cat'd or sorted, the locations are silently
   lost. Same open bug in osmium.
 
-- [ ] **add-locations-to-ways: preserve untagged relation-member nodes.**
+- [x] **add-locations-to-ways: preserve untagged relation-member nodes.**
   [osmium-tool#239](https://github.com/osmcode/osmium-tool/issues/239): untagged nodes
   that are relation members are dropped along with all other untagged nodes. Fixing
-  requires an extra pass over relations to collect member node IDs. Same limitation in
-  osmium. Low priority.
+  requires an extra pass over relations to collect member node IDs. Implemented via a
+  relation-only prepass feeding an `IdSetDense`; node retention now keeps tagged nodes,
+  `--keep-untagged-nodes`, and relation-member nodes in both decode-all and indexdata
+  passthrough paths.
 
 ## Missing commands (osmium-tool parity)
 

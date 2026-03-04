@@ -14,13 +14,14 @@ use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     build_output_header, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_passthrough_buf,
     read_raw_frame, require_indexdata, writer_from_header, RawBlobFrame,
 };
+use super::id_set_dense::IdSetDense;
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
 
@@ -381,7 +382,21 @@ pub fn add_locations_to_ways(
          decompressed and re-encoded (significantly slower).")?;
     let scratch_dir = output.parent().unwrap_or(Path::new("."));
     let index = build_node_index(input, direct_io, scratch_dir)?;
-    write_output_checked(input, output, &index, keep_untagged_nodes, compression, direct_io, indexdata_present)
+    let relation_member_node_ids = if keep_untagged_nodes {
+        None
+    } else {
+        Some(collect_relation_member_node_ids(input, direct_io)?)
+    };
+    write_output_checked(
+        input,
+        output,
+        &index,
+        keep_untagged_nodes,
+        relation_member_node_ids.as_ref(),
+        compression,
+        direct_io,
+        indexdata_present,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -427,6 +442,28 @@ fn build_node_index_dense(
     Ok(index)
 }
 
+/// Collect all node IDs referenced by relation members.
+fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_relations());
+    let mut member_node_ids = IdSetDense::new();
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements_skip_metadata() {
+            if let Element::Relation(r) = element {
+                for member in r.members() {
+                    if let MemberId::Node(id) = member.id
+                        && id >= 0
+                    {
+                        member_node_ids.set(id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(member_node_ids)
+}
+
 /// Parallel insert for one batch of blocks into the dense mmap index.
 fn index_batch_dense(batch: &[PrimitiveBlock], writer: &SharedDenseWriter) {
     batch.par_iter().for_each(|block| {
@@ -454,14 +491,31 @@ fn write_output_checked(
     output: &Path,
     index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
     indexdata_present: bool,
 ) -> Result<Stats> {
     if indexdata_present {
-        write_output_passthrough(input, output, index, keep_untagged_nodes, compression, direct_io)
+        write_output_passthrough(
+            input,
+            output,
+            index,
+            keep_untagged_nodes,
+            relation_member_node_ids,
+            compression,
+            direct_io,
+        )
     } else {
-        write_output_decode_all(input, output, index, keep_untagged_nodes, compression, direct_io)
+        write_output_decode_all(
+            input,
+            output,
+            index,
+            keep_untagged_nodes,
+            relation_member_node_ids,
+            compression,
+            direct_io,
+        )
     }
 }
 
@@ -474,6 +528,7 @@ fn write_output_decode_all(
     output: &Path,
     index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
 ) -> Result<Stats> {
@@ -504,7 +559,11 @@ fn write_output_decode_all(
 
         if batch.len() >= BATCH_SIZE {
             let batch_stats = process_batch(
-                &batch, &mut writer, index, keep_untagged_nodes,
+                &batch,
+                &mut writer,
+                index,
+                keep_untagged_nodes,
+                relation_member_node_ids,
             )?;
             merge_stats(&mut stats, &batch_stats);
             batch.clear();
@@ -513,7 +572,11 @@ fn write_output_decode_all(
 
     if !batch.is_empty() {
         let batch_stats = process_batch(
-            &batch, &mut writer, index, keep_untagged_nodes,
+            &batch,
+            &mut writer,
+            index,
+            keep_untagged_nodes,
+            relation_member_node_ids,
         )?;
         merge_stats(&mut stats, &batch_stats);
     }
@@ -547,6 +610,7 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
@@ -569,7 +633,10 @@ fn process_block(
             Element::DenseNode(dn) => {
                 stats.nodes_read += 1;
                 let has_tags = dn.tags().next().is_some();
-                if keep_untagged_nodes || has_tags {
+                if keep_untagged_nodes
+                    || has_tags
+                    || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
+                {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
@@ -583,7 +650,10 @@ fn process_block(
             Element::Node(n) => {
                 stats.nodes_read += 1;
                 let has_tags = n.tags().next().is_some();
-                if keep_untagged_nodes || has_tags {
+                if keep_untagged_nodes
+                    || has_tags
+                    || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
+                {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
@@ -639,6 +709,7 @@ fn process_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
 ) -> Result<Stats> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
     let results: Vec<BatchResult> = batch
@@ -648,7 +719,12 @@ fn process_batch(
             |(bb, refs_buf, locations_buf), block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let block_stats = process_block(
-                    block, bb, &mut output, index, keep_untagged_nodes,
+                    block,
+                    bb,
+                    &mut output,
+                    index,
+                    keep_untagged_nodes,
+                    relation_member_node_ids,
                     refs_buf, locations_buf,
                 )?;
                 flush_local(bb, &mut output)?;
@@ -755,6 +831,7 @@ fn write_output_passthrough(
     output: &Path,
     node_index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
 ) -> Result<Stats> {
@@ -812,7 +889,11 @@ fn write_output_passthrough(
                 copy_range.flush(&mut writer)?;
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                 let batch_stats = process_slot_batch(
-                    &batch, &mut writer, node_index, keep_untagged_nodes,
+                    &batch,
+                    &mut writer,
+                    node_index,
+                    keep_untagged_nodes,
+                    relation_member_node_ids,
                 )?;
                 merge_stats(&mut stats, &batch_stats);
                 batch.clear();
@@ -877,7 +958,11 @@ fn write_output_passthrough(
             copy_range.flush(&mut writer)?;
             flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
             let batch_stats = process_slot_batch(
-                &batch, &mut writer, node_index, keep_untagged_nodes,
+                &batch,
+                &mut writer,
+                node_index,
+                keep_untagged_nodes,
+                relation_member_node_ids,
             )?;
             merge_stats(&mut stats, &batch_stats);
             batch.clear();
@@ -888,7 +973,11 @@ fn write_output_passthrough(
     // Flush remaining decode batch, then passthrough.
     if !batch.is_empty() {
         let batch_stats = process_slot_batch(
-            &batch, &mut writer, node_index, keep_untagged_nodes,
+            &batch,
+            &mut writer,
+            node_index,
+            keep_untagged_nodes,
+            relation_member_node_ids,
         )?;
         merge_stats(&mut stats, &batch_stats);
     }
@@ -910,6 +999,7 @@ fn process_slot_batch(
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     node_index: &DenseMmapIndex,
     keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
 ) -> Result<Stats> {
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
 
@@ -939,7 +1029,12 @@ fn process_slot_batch(
                     .map_err(|e| e.to_string())?;
 
                 let block_stats = process_block(
-                    &block, bb, output, node_index, keep_untagged_nodes,
+                    &block,
+                    bb,
+                    output,
+                    node_index,
+                    keep_untagged_nodes,
+                    relation_member_node_ids,
                     refs_buf, locations_buf,
                 )?;
 

@@ -896,6 +896,140 @@ impl InspectReport {
             _ => None,
         }
     }
+
+    /// Serialize the inspect report to a JSON value.
+    ///
+    /// `block_limit`: `None` = no `blocks_detail` field, `Some(0)` = full listing,
+    /// `Some(N)` = first N + last N blocks.
+    pub fn to_json(&self, block_limit: Option<usize>) -> serde_json::Value {
+        let hm = &self.header_meta;
+
+        let bbox = hm.bbox.map(|(left, bottom, right, top)| {
+            serde_json::json!({ "left": left, "bottom": bottom, "right": right, "top": top })
+        });
+
+        let header = serde_json::json!({
+            "writing_program": hm.writing_program,
+            "required_features": hm.required_features,
+            "optional_features": hm.optional_features,
+            "bbox": bbox,
+            "replication": {
+                "sequence": hm.replication_sequence,
+                "timestamp": hm.replication_timestamp,
+                "url": hm.replication_url,
+            },
+        });
+
+        let sequence: Vec<&str> = self.accum.segments.iter()
+            .map(|s| s.kind.short_label()).collect();
+
+        serde_json::json!({
+            "schema_version": 1,
+            "file": self.file_name,
+            "file_size": self.file_size,
+            "header": header,
+            "indexed": self.is_indexed,
+            "blocks": {
+                "total": self.total_blocks,
+                "nodes": type_stats_json(&self.accum.node_type),
+                "ways": type_stats_json(&self.accum.way_type),
+                "relations": type_stats_json(&self.accum.relation_type),
+                "mixed": type_stats_json(&self.accum.mixed_type),
+            },
+            "elements": {
+                "nodes": self.state.node_count,
+                "tagged_nodes": self.state.tagged_node_count,
+                "ways": self.state.way_count,
+                "relations": self.state.relation_count,
+                "total": self.state.node_count + self.state.way_count + self.state.relation_count,
+            },
+            "ordering": {
+                "sequence": sequence,
+                "standard": is_standard_ordering(&self.accum.segments),
+            },
+            "id_ranges": id_ranges_json(&self.state),
+            "blocks_detail": blocks_detail_json(block_limit, &self.accum.block_infos),
+            "locations": locations_json(&self.state.loc_stats),
+        })
+    }
+}
+
+fn type_stats_json(ts: &TypeStats) -> serde_json::Value {
+    serde_json::json!({
+        "count": ts.block_count,
+        "compressed_bytes": ts.frame_bytes,
+        "elements": ts.element_count,
+    })
+}
+
+fn id_range_json(r: &TypeIdRange) -> serde_json::Value {
+    if r.has_data() {
+        serde_json::json!({ "min": r.min_id, "max": r.max_id, "monotonic": r.monotonic, "count": r.count })
+    } else {
+        serde_json::Value::Null
+    }
+}
+
+fn id_ranges_json(state: &ScanState) -> serde_json::Value {
+    match (&state.node_ids, &state.way_ids, &state.relation_ids) {
+        (Some(n), Some(w), Some(r)) => serde_json::json!({
+            "nodes": id_range_json(n),
+            "ways": id_range_json(w),
+            "relations": id_range_json(r),
+        }),
+        _ => serde_json::Value::Null,
+    }
+}
+
+fn blocks_detail_json(
+    block_limit: Option<usize>,
+    block_infos: &Option<Vec<BlockInfo>>,
+) -> serde_json::Value {
+    let (Some(limit), Some(infos)) = (block_limit, block_infos) else {
+        return serde_json::Value::Null;
+    };
+    let truncate = limit > 0 && limit * 2 < infos.len();
+    let iter: Box<dyn Iterator<Item = &BlockInfo>> = if truncate {
+        Box::new(infos[..limit].iter().chain(infos[infos.len() - limit..].iter()))
+    } else {
+        Box::new(infos.iter())
+    };
+    let arr: Vec<serde_json::Value> = iter
+        .map(|info| serde_json::json!({
+            "number": info.number,
+            "type": info.kind.short_label(),
+            "elements": info.elements,
+            "compressed_bytes": info.compressed,
+            "raw_bytes": info.raw,
+        }))
+        .collect();
+    serde_json::Value::Array(arr)
+}
+
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn locations_json(loc_stats: &Option<LocationStats>) -> serde_json::Value {
+    let Some(stats) = loc_stats else {
+        return serde_json::Value::Null;
+    };
+    let coords_per_way = if stats.coord_counts.is_empty() {
+        serde_json::Value::Null
+    } else {
+        let mut sorted = stats.coord_counts.clone();
+        sorted.sort_unstable();
+        let len = sorted.len();
+        let p99_idx = ((len as f64 - 1.0) * 0.99) as usize;
+        serde_json::json!({
+            "min": sorted[0],
+            "max": sorted[len - 1],
+            "median": sorted[len / 2],
+            "p99": sorted[p99_idx.min(len - 1)],
+        })
+    };
+    serde_json::json!({
+        "with_locations": stats.with_locations,
+        "without_locations": stats.without_locations,
+        "coords_per_way": coords_per_way,
+    })
 }
 
 // ---------------------------------------------------------------------------

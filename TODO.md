@@ -162,9 +162,11 @@ Current `--blocks` dumps one line per block — unusable at planet scale (~300K
 blocks). The per-type summary (block counts + sizes) is already shown without
 `--blocks`; these items fill the gap between that and the raw dump.
 
-- [ ] **Machine-readable output (`--json`).** JSON output for piping to `jq`
+- [x] **Machine-readable output (`--json`).** JSON output for piping to `jq`
   or other tools. Makes the raw per-block listing useful for scripting even at
   scale. Scope: inspect-only initially, could extend to other commands later.
+  Implemented: `inspect --json` with schema_version=1, deterministic keys,
+  explicit nulls for absent sections, compact output. Honors `--blocks N` limit.
 - [ ] **Anomaly highlighting.** Only show blocks that deviate from the norm —
   unusually small (partial batches), unusually large, or mixed-type blocks.
   These are the interesting ones when debugging a PBF. Requires defining
@@ -272,12 +274,12 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   `visible` field. Relevant for any future command that writes PBF from OSC or history
   data.
 
-- [ ] **Report all duplicate IDs in validation, not just the first.**
+- [x] **Report all duplicate IDs in validation, not just the first.**
   [libosmium#349](https://github.com/osmcode/libosmium/issues/349): libosmium's
-  `CheckOrder` handler throws on the first duplicate ID. For data quality auditing,
-  reporting all duplicates is more useful. If pbfhogg's `check-refs` or sort commands
-  detect duplicates, they should collect and report all of them rather than stopping at
-  the first.
+  `CheckOrder` handler throws on the first duplicate ID. pbfhogg's `verify ids --full`
+  already collects all duplicates (capped by `--max-errors`, default 100, 0=unlimited)
+  and reports `total_violations` even when individual entries are capped. `check-refs`
+  intentionally does not detect duplicates — ID uniqueness is `verify ids`'s job.
 
 - [ ] **tags-filter: resolve matched relation members.**
   [osmium-tool#215](https://github.com/osmcode/osmium-tool/issues/215): when a relation

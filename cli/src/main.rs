@@ -262,6 +262,9 @@ enum Command {
         /// Show locations-on-ways diagnostics
         #[arg(long)]
         locations: bool,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -545,8 +548,8 @@ fn main() {
             io.direct_io,
             force.force,
         ),
-        Command::Inspect { file, blocks, id_ranges, locations, io } => {
-            run_inspect(&file, blocks, id_ranges, locations, io.direct_io)
+        Command::Inspect { file, blocks, id_ranges, locations, json, io } => {
+            run_inspect(&file, blocks, id_ranges, locations, json, io.direct_io)
         }
         Command::NodeStats { file, io, force } => run_node_stats(&file, io.direct_io, force.force),
         Command::Merge {
@@ -996,12 +999,18 @@ fn run_inspect(
     blocks: Option<usize>,
     id_ranges: bool,
     locations: bool,
+    json: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut report = pbfhogg::inspect::inspect(
         path, blocks.is_some(), id_ranges, locations, direct_io,
     )?;
-    report.print_report(blocks);
+    if json {
+        let value = report.to_json(blocks);
+        println!("{value}");
+    } else {
+        report.print_report(blocks);
+    }
     Ok(())
 }
 

@@ -29,7 +29,7 @@ osmium-tool installed version as of 2026-03-04.
 | `sort` | `sort` | Have it |
 | `tags-count` | `tags-count` | Have it |
 | `tags-filter` | `tags-filter` | Have it |
-| `time-filter` | — | Missing. In TODO |
+| `time-filter` | `time-filter` | Have it |
 
 ## pbfhogg-only commands (no osmium equivalent)
 
@@ -49,8 +49,6 @@ osmium-tool installed version as of 2026-03-04.
   combines N sorted PBFs, not base+diff. Used for recombining extracts.
 - **`merge-changes`** — merge multiple OSC files with optional `--simplify`.
   Already in TODO.md with upstream refs.
-- **`time-filter`** — filter history PBF to snapshot at a timestamp. Already in
-  TODO.md.
 
 ### Medium priority (useful but not pipeline-critical)
 

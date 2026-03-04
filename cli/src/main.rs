@@ -263,6 +263,19 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
+    /// Filter history PBF to a snapshot at a timestamp
+    TimeFilter {
+        /// Input history PBF file
+        file: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Snapshot cutoff timestamp (UNIX seconds or RFC3339 UTC: YYYY-MM-DDTHH:MM:SSZ)
+        timestamp: String,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
     /// Inspect PBF file: metadata, block breakdown, ordering analysis
     Inspect {
         /// Input PBF file
@@ -567,6 +580,13 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+        ),
+        Command::TimeFilter { file, output, timestamp, compression, io } => run_time_filter(
+            &file,
+            &output.output,
+            &timestamp,
+            &compression.compression,
+            io.direct_io,
         ),
         Command::Inspect { file, blocks, id_ranges, locations, anomalies, json, io } => {
             run_inspect(&file, blocks, id_ranges, locations, anomalies, json, io.direct_io)
@@ -1022,6 +1042,106 @@ fn run_add_locations_to_ways(
     )?;
     stats.print_summary();
     Ok(())
+}
+
+fn run_time_filter(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    timestamp: &str,
+    compression: &str,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let cutoff = parse_timestamp(timestamp)?;
+    let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn parse_timestamp(input: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    if let Ok(value) = input.parse::<i64>() {
+        return Ok(value);
+    }
+    parse_rfc3339_utc(input).map_err(Into::into)
+}
+
+fn parse_rfc3339_utc(input: &str) -> Result<i64, String> {
+    if input.len() != 20 {
+        return Err("timestamp must be UNIX seconds or YYYY-MM-DDTHH:MM:SSZ".to_owned());
+    }
+
+    let bytes = input.as_bytes();
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+    {
+        return Err("timestamp must be UNIX seconds or YYYY-MM-DDTHH:MM:SSZ".to_owned());
+    }
+
+    let year = parse_i32(input, 0, 4)?;
+    let month = parse_u32(input, 5, 7)?;
+    let day = parse_u32(input, 8, 10)?;
+    let hour = parse_u32(input, 11, 13)?;
+    let minute = parse_u32(input, 14, 16)?;
+    let second = parse_u32(input, 17, 19)?;
+
+    if !(1..=12).contains(&month) {
+        return Err("invalid month in timestamp".to_owned());
+    }
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err("invalid time in timestamp".to_owned());
+    }
+
+    let max_day = days_in_month(year, month);
+    if day == 0 || day > max_day {
+        return Err("invalid day in timestamp".to_owned());
+    }
+
+    let days = days_from_civil(year, month, day);
+    Ok(days * 86_400 + i64::from(hour) * 3_600 + i64::from(minute) * 60 + i64::from(second))
+}
+
+fn parse_i32(s: &str, start: usize, end: usize) -> Result<i32, String> {
+    s[start..end]
+        .parse::<i32>()
+        .map_err(|_| "invalid numeric timestamp component".to_owned())
+}
+
+fn parse_u32(s: &str, start: usize, end: usize) -> Result<u32, String> {
+    s[start..end]
+        .parse::<u32>()
+        .map_err(|_| "invalid numeric timestamp component".to_owned())
+}
+
+fn is_leap_year(year: i32) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
+}
+
+// Gregorian civil date to days since Unix epoch (1970-01-01).
+fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
+    let mut y = i64::from(year);
+    let m = i64::from(month);
+    let d = i64::from(day);
+    y -= if m <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
 }
 
 fn run_inspect(

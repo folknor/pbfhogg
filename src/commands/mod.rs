@@ -17,6 +17,7 @@ pub(crate) mod stream_merge;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod tags_filter_osc;
+pub mod time_filter;
 #[cfg(feature = "commands")]
 pub mod verify_ids;
 

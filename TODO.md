@@ -324,7 +324,10 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   [osmosis#72](https://github.com/openstreetmap/osmosis/issues/72) (simplification
   must not merge distinct action types with same ID).
 
-- [ ] **`time-filter`** — filter history PBF to a snapshot at a given timestamp.
-  Relevant upstream:
-  [osmium-tool#285](https://github.com/osmcode/osmium-tool/issues/285) (output header
-  timestamp must reflect the filter cutoff, not the original file).
+- [x] **`time-filter`** — filter history PBF to a snapshot at a given timestamp.
+  Implemented as a streaming sorted-input command (`pbfhogg time-filter`) that keeps
+  the latest version per object with `timestamp <= cutoff`, omits objects whose snapshot
+  version is deleted (`visible=false`), and sets output header replication timestamp to
+  the cutoff. Addresses upstream behavior noted in
+  [osmium-tool#285](https://github.com/osmcode/osmium-tool/issues/285) (header timestamp
+  must reflect filter cutoff).

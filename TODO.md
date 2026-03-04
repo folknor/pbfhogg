@@ -226,11 +226,18 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
-- [ ] **Benchmark OSM ID ordering overhead.** `osm_id_cmp` / `osm_id_key` replaced
+- [x] **Benchmark OSM ID ordering overhead.** `osm_id_cmp` / `osm_id_key` replaced
   plain `i64::cmp` in sort, merge, diff, and derive-changes. For positive-only IDs
   (all production PBFs), the extra tuple construction should be optimized away, but
   verify with A/B benchmarks on Denmark and Japan:
-  `brokkr bench read`, `brokkr bench merge`, `brokkr bench commands sort`
+  `brokkr bench read`, `brokkr bench merge`, `brokkr bench commands sort`.
+  Measured 2026-03-04 vs pre-change baseline (`7a4aa88` -> `8e797c1`) on Denmark
+  indexed PBF (487 MB):
+  - `bench read`: sequential +3.4%, blobreader +3.1%, parallel -1.3%, pipelined -0.4%
+  - `bench merge`: buffered+none +5.3%, buffered+zlib +0.3%
+  - `bench commands sort`: +2.9%
+  Conclusion: no clear systematic regression from canonical ID ordering; observed
+  deltas are small and mixed in direction.
 
 ## Design guidance we're already following
   - libosmium#250 — Comparison without timestamp. Only matters if we ever add version+timestamp ordering. Currently N/A since merge is ID-based.

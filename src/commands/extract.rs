@@ -825,22 +825,116 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1: sequential element processing on pipelined decode output
+// Pass 1 ID collection helpers
 // ---------------------------------------------------------------------------
-//
-// Pass 1 processes elements sequentially on the main thread while the pipeline
-// handles I/O and decompression in parallel. This is optimal because:
-//
-// - The pipeline's dedicated rayon pool already parallelizes the expensive work
-//   (zlib decompression + protobuf parsing).
-// - Element processing (bbox checks, bitset inserts) is fast per-element.
-// - Adding rayon par_iter() for element processing causes thread pool contention
-//   with the pipeline's decode pool, resulting in 14x regression at Denmark scale.
-//
-// At planet scale, way matching becomes cache-miss-heavy (~500ns/way for 800M ways)
-// and could benefit from parallelism. That would require a shared thread pool
-// architecture (single rayon pool for both decode and element processing) to
-// avoid contention.
+
+fn merge_way_batch_parallel(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &mut IdSetDense,
+    all_way_node_ids: &mut IdSetDense,
+) {
+    let partials: Vec<(Vec<i64>, Vec<i64>)> = batch
+        .par_iter()
+        .map(|block| {
+            let mut local_way_ids: Vec<i64> = Vec::new();
+            let mut local_node_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element
+                    && w.refs().any(|r| bbox_node_ids.get(r))
+                {
+                    local_way_ids.push(w.id());
+                    local_node_ids.extend(w.refs());
+                }
+            }
+            (local_way_ids, local_node_ids)
+        })
+        .collect();
+
+    for (way_ids, node_ids) in partials {
+        for id in way_ids {
+            matched_way_ids.set(id);
+        }
+        for id in node_ids {
+            all_way_node_ids.set(id);
+        }
+    }
+}
+
+fn merge_relation_batch_parallel(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+) {
+    let partials: Vec<Vec<i64>> = batch
+        .par_iter()
+        .map(|block| {
+            let mut local_relation_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
+                    local_relation_ids.push(r.id());
+                }
+            }
+            local_relation_ids
+        })
+        .collect();
+
+    for relation_ids in partials {
+        for id in relation_ids {
+            matched_relation_ids.set(id);
+        }
+    }
+}
+
+fn merge_relation_batch_smart_parallel(
+    batch: &[PrimitiveBlock],
+    bbox_node_ids: &IdSetDense,
+    matched_way_ids: &IdSetDense,
+    matched_relation_ids: &mut IdSetDense,
+    extra_way_ids: &mut IdSetDense,
+    extra_node_ids: &mut IdSetDense,
+) {
+    let partials: Vec<(Vec<i64>, Vec<i64>, Vec<i64>)> = batch
+        .par_iter()
+        .map(|block| {
+            let mut local_relation_ids: Vec<i64> = Vec::new();
+            let mut local_extra_way_ids: Vec<i64> = Vec::new();
+            let mut local_extra_node_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
+                    local_relation_ids.push(r.id());
+                    if is_smart_relation(r) {
+                        for m in r.members() {
+                            match m.id {
+                                MemberId::Way(id) => local_extra_way_ids.push(id),
+                                MemberId::Node(id) => local_extra_node_ids.push(id),
+                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                            }
+                        }
+                    }
+                }
+            }
+            (local_relation_ids, local_extra_way_ids, local_extra_node_ids)
+        })
+        .collect();
+
+    for (relation_ids, way_ids, node_ids) in partials {
+        for id in relation_ids {
+            matched_relation_ids.set(id);
+        }
+        for id in way_ids {
+            extra_way_ids.set(id);
+        }
+        for id in node_ids {
+            extra_node_ids.set(id);
+        }
+    }
+}
 
 /// Collect pass 1 ID sets for the complete-ways strategy.
 ///
@@ -861,37 +955,195 @@ fn collect_pass1(
     let mut matched_relation_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
+    let is_sorted = reader.header().is_sorted();
     let filter = spatial_blob_filter(bbox_int);
-    for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
-        let block = block_result?;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn)
-                    if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                {
-                    bbox_node_ids.set(dn.id());
-                }
-                Element::Node(n)
-                    if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                {
-                    bbox_node_ids.set(n.id());
-                }
-                Element::Way(w)
-                    if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                {
-                    matched_way_ids.set(w.id());
-                    for r in w.refs() {
-                        all_way_node_ids.set(r);
+    if !is_sorted {
+        for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
+            let block = block_result?;
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(dn.id());
                     }
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(n.id());
+                    }
+                    Element::Way(w)
+                        if w.refs().any(|r| bbox_node_ids.get(r)) =>
+                    {
+                        matched_way_ids.set(w.id());
+                        for r in w.refs() {
+                            all_way_node_ids.set(r);
+                        }
+                    }
+                    Element::Relation(r)
+                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
+                    {
+                        matched_relation_ids.set(r.id());
+                    }
+                    _ => {}
                 }
-                Element::Relation(r)
-                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                {
-                    matched_relation_ids.set(r.id());
-                }
-                _ => {}
             }
         }
+        return Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids));
+    }
+
+    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for block_result in reader
+        .with_blob_filter(filter)
+        .decode_threads(1)
+        .into_blocks_pipelined()
+    {
+        let block = block_result?;
+        match block.block_type() {
+            BlockType::DenseNodes | BlockType::Nodes => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                    );
+                    relation_batch.clear();
+                }
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(dn.id());
+                        }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(n.id());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            BlockType::Ways => {
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                    );
+                    relation_batch.clear();
+                }
+                way_batch.push(block);
+                if way_batch.len() >= BATCH_SIZE {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+            }
+            BlockType::Relations => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                relation_batch.push(block);
+                if relation_batch.len() >= BATCH_SIZE {
+                    merge_relation_batch_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                    );
+                    relation_batch.clear();
+                }
+            }
+            BlockType::Mixed | BlockType::Empty => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                    );
+                    relation_batch.clear();
+                }
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(dn.id());
+                        }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(n.id());
+                        }
+                        Element::Way(w)
+                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
+                        {
+                            matched_way_ids.set(w.id());
+                            for r in w.refs() {
+                                all_way_node_ids.set(r);
+                            }
+                        }
+                        Element::Relation(r)
+                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
+                        {
+                            matched_relation_ids.set(r.id());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if !way_batch.is_empty() {
+        merge_way_batch_parallel(
+            &way_batch,
+            &bbox_node_ids,
+            &mut matched_way_ids,
+            &mut all_way_node_ids,
+        );
+    }
+    if !relation_batch.is_empty() {
+        merge_relation_batch_parallel(
+            &relation_batch,
+            &bbox_node_ids,
+            &matched_way_ids,
+            &mut matched_relation_ids,
+        );
     }
 
     Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids))
@@ -915,46 +1167,230 @@ fn collect_pass1_smart(
     let mut extra_node_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
+    let is_sorted = reader.header().is_sorted();
     let filter = spatial_blob_filter(bbox_int);
-    for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
-        let block = block_result?;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn)
-                    if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                {
-                    bbox_node_ids.set(dn.id());
-                }
-                Element::Node(n)
-                    if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                {
-                    bbox_node_ids.set(n.id());
-                }
-                Element::Way(w)
-                    if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                {
-                    matched_way_ids.set(w.id());
-                    for r in w.refs() {
-                        all_way_node_ids.set(r);
+    if !is_sorted {
+        for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
+            let block = block_result?;
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(dn.id());
                     }
-                }
-                Element::Relation(r)
-                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                {
-                    matched_relation_ids.set(r.id());
-                    if is_smart_relation(r) {
-                        for m in r.members() {
-                            match m.id {
-                                MemberId::Way(id) => extra_way_ids.set(id),
-                                MemberId::Node(id) => extra_node_ids.set(id),
-                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                    {
+                        bbox_node_ids.set(n.id());
+                    }
+                    Element::Way(w)
+                        if w.refs().any(|r| bbox_node_ids.get(r)) =>
+                    {
+                        matched_way_ids.set(w.id());
+                        for r in w.refs() {
+                            all_way_node_ids.set(r);
+                        }
+                    }
+                    Element::Relation(r)
+                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
+                    {
+                        matched_relation_ids.set(r.id());
+                        if is_smart_relation(r) {
+                            for m in r.members() {
+                                match m.id {
+                                    MemberId::Way(id) => extra_way_ids.set(id),
+                                    MemberId::Node(id) => extra_node_ids.set(id),
+                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                }
                             }
                         }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
+        return Ok((
+            bbox_node_ids,
+            matched_way_ids,
+            all_way_node_ids,
+            matched_relation_ids,
+            extra_way_ids,
+            extra_node_ids,
+        ));
+    }
+
+    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for block_result in reader
+        .with_blob_filter(filter)
+        .decode_threads(1)
+        .into_blocks_pipelined()
+    {
+        let block = block_result?;
+        match block.block_type() {
+            BlockType::DenseNodes | BlockType::Nodes => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_smart_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                        &mut extra_way_ids,
+                        &mut extra_node_ids,
+                    );
+                    relation_batch.clear();
+                }
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(dn.id());
+                        }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(n.id());
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            BlockType::Ways => {
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_smart_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                        &mut extra_way_ids,
+                        &mut extra_node_ids,
+                    );
+                    relation_batch.clear();
+                }
+                way_batch.push(block);
+                if way_batch.len() >= BATCH_SIZE {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+            }
+            BlockType::Relations => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                relation_batch.push(block);
+                if relation_batch.len() >= BATCH_SIZE {
+                    merge_relation_batch_smart_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                        &mut extra_way_ids,
+                        &mut extra_node_ids,
+                    );
+                    relation_batch.clear();
+                }
+            }
+            BlockType::Mixed | BlockType::Empty => {
+                if !way_batch.is_empty() {
+                    merge_way_batch_parallel(
+                        &way_batch,
+                        &bbox_node_ids,
+                        &mut matched_way_ids,
+                        &mut all_way_node_ids,
+                    );
+                    way_batch.clear();
+                }
+                if !relation_batch.is_empty() {
+                    merge_relation_batch_smart_parallel(
+                        &relation_batch,
+                        &bbox_node_ids,
+                        &matched_way_ids,
+                        &mut matched_relation_ids,
+                        &mut extra_way_ids,
+                        &mut extra_node_ids,
+                    );
+                    relation_batch.clear();
+                }
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(dn.id());
+                        }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            bbox_node_ids.set(n.id());
+                        }
+                        Element::Way(w)
+                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
+                        {
+                            matched_way_ids.set(w.id());
+                            for r in w.refs() {
+                                all_way_node_ids.set(r);
+                            }
+                        }
+                        Element::Relation(r)
+                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
+                        {
+                            matched_relation_ids.set(r.id());
+                            if is_smart_relation(r) {
+                                for m in r.members() {
+                                    match m.id {
+                                        MemberId::Way(id) => extra_way_ids.set(id),
+                                        MemberId::Node(id) => extra_node_ids.set(id),
+                                        MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    if !way_batch.is_empty() {
+        merge_way_batch_parallel(
+            &way_batch,
+            &bbox_node_ids,
+            &mut matched_way_ids,
+            &mut all_way_node_ids,
+        );
+    }
+    if !relation_batch.is_empty() {
+        merge_relation_batch_smart_parallel(
+            &relation_batch,
+            &bbox_node_ids,
+            &matched_way_ids,
+            &mut matched_relation_ids,
+            &mut extra_way_ids,
+            &mut extra_node_ids,
+        );
     }
 
     Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids, extra_way_ids, extra_node_ids))

@@ -203,19 +203,16 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   pool. pbfhogg's IO submission rate (hundreds/sec of 256KB writes) is the opposite
   of sqpoll's sweet spot (500K+ small random IOPS).
 
-- [ ] **P2-13: Extract pass 1 parallel fold for IdSetDense.** Would give
-  ~2-4x speedup on pass 1 (~170s → ~50-85s at planet scale). Attempted and
-  reverted (`b67aa96`) — `par_iter` on the consumer side contends with the
-  pipeline's dedicated rayon decode pool, causing 14x regression at Denmark
-  scale. `IdSetDense::merge()` exists but is `#[allow(dead_code)]`. Needs a
-  shared thread pool architecture where pipeline decode and consumer
-  parallelism use the same pool.
-  2026-03-04 follow-up attempt (phase-split pass1 with parallel `IdSetDense`
-  fold) was also reverted: Denmark `bench commands extract` regressed from
-  ~2.8-3.0s to ~33-43s for `extract-complete`/`extract-smart` due repeated
-  heavy set merges and extra pass overhead. Keep this item open for a proper
-  shared-pool design (decode + fold on one scheduler) rather than multi-pass
-  or per-batch set fan-in.
+- [x] **P2-13: Extract pass 1 parallel fold for IdSetDense.**
+  Implemented a sorted-input pass1 fast path with phase-batched parallel fold
+  (ways/relations) using lightweight per-block ID vectors and sequential
+  `IdSetDense::set` fan-in, avoiding expensive per-thread `IdSetDense` merges.
+  To avoid decode/fold pool contention, pass1 uses `decode_threads(1)` while
+  running fold on the global rayon pool. Unsorted inputs keep the previous
+  single-pass sequential logic for correctness.
+  Denmark `bench commands extract` (2026-03-04, dirty-tree runs):
+  - `extract-complete`: ~2860 ms -> ~2470-2500 ms (about 13% faster)
+  - `extract-smart`: ~3023 ms -> ~2738-2743 ms (about 9% faster)
 
 ## Benchmarking
 

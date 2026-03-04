@@ -59,6 +59,13 @@ pub fn cat(
         }
     }
 
+    // Check first file — if it has LocationsOnWays, coordinates are lost
+    // through re-encoding (cat doesn't preserve way lat/lon fields).
+    {
+        let reader = crate::ElementReader::open(files[0], direct_io)?;
+        super::warn_locations_on_ways_loss(reader.header());
+    }
+
     match type_filter {
         None => cat_passthrough(files, output, compression, direct_io),
         Some(filter) => cat_filtered(files, output, filter, compression, direct_io),

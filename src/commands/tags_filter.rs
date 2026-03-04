@@ -255,6 +255,11 @@ pub fn tags_filter(
         "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
          filters are no-ops — all blobs are decompressed (significantly slower).")?;
 
+    {
+        let reader = crate::ElementReader::open(input, direct_io)?;
+        super::warn_locations_on_ways_loss(reader.header());
+    }
+
     let expressions = parse_expressions(expression_strs)?;
     if omit_referenced {
         tags_filter_single_pass(input, output, &expressions, compression, direct_io)

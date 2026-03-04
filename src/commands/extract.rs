@@ -458,6 +458,10 @@ pub fn extract(
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op — all blobs are decompressed (significantly slower).")?;
     }
+    {
+        let reader = crate::ElementReader::open(input, direct_io)?;
+        super::warn_locations_on_ways_loss(reader.header());
+    }
     match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, compression, direct_io),
         ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, compression, direct_io),

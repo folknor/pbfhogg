@@ -572,6 +572,7 @@ fn write_base_relation_local(
 
 #[allow(clippy::redundant_closure_for_method_calls)]
 fn build_header_bytes(header: &crate::HeaderBlock) -> Result<Vec<u8>> {
+    super::warn_locations_on_ways_loss(header);
     build_output_header(header, false, |hb| hb.sorted())
 }
 

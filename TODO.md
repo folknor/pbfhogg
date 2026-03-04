@@ -258,7 +258,7 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   wrong. Fix: in `WireInfo` / `WireDenseInfo` parsing, map -1 to None for version and
   changeset fields.
 
-- [ ] **Check `LocationsOnWays` header before add-locations-to-ways.**
+- [x] **Check `LocationsOnWays` header before add-locations-to-ways.**
   [libosmium#199](https://github.com/osmcode/libosmium/issues/199): if the input PBF
   already has inline way-node coordinates (indicated by `LocationsOnWays` in
   `optional_features`), `add-locations-to-ways` should warn or skip rather than
@@ -291,7 +291,7 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   produce incorrect results. osmium fixed this with antimeridian polygon splitting in
   PR #229.
 
-- [ ] **Warn when LocationsOnWays data is lost through cat/sort/merge.**
+- [x] **Warn when LocationsOnWays data is lost through cat/sort/merge.**
   [osmium-tool#240](https://github.com/osmcode/osmium-tool/issues/240):
   `build_output_header` doesn't propagate optional features from the input header. If a
   PBF with embedded way-node coordinates is cat'd or sorted, the locations are silently

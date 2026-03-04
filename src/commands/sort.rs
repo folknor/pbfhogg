@@ -166,6 +166,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
     // Pass 1: Build blob index
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(input, direct_io)?;
+    super::warn_locations_on_ways_loss(&header);
     eprintln!("  {} OSMData blobs indexed", entries.len());
 
     // Sort by (type_order, min_id)

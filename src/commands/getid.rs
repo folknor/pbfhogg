@@ -123,6 +123,11 @@ pub fn getid(
          based on requested ID types is a no-op — all blobs are decompressed \
          (significantly slower).")?;
 
+    {
+        let reader = crate::ElementReader::open(input, direct_io)?;
+        super::warn_locations_on_ways_loss(reader.header());
+    }
+
     if add_referenced {
         getid_with_refs(input, output, ids, compression, direct_io)
     } else {
@@ -133,6 +138,10 @@ pub fn getid(
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
 pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
+    {
+        let reader = crate::ElementReader::open(input, direct_io)?;
+        super::warn_locations_on_ways_loss(reader.header());
+    }
     filter_by_id(input, output, ids, false, compression, direct_io)
 }
 

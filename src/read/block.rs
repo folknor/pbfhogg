@@ -210,6 +210,17 @@ impl HeaderBlock {
             .iter()
             .any(|f| f == Self::SORT_TYPE_THEN_ID)
     }
+
+    /// PBF optional feature string indicating ways contain inline node coordinates.
+    pub const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
+
+    /// Returns `true` if the header declares `LocationsOnWays`.
+    pub fn has_locations_on_ways(&self) -> bool {
+        self.header
+            .optional_features
+            .iter()
+            .any(|f| f == Self::LOCATIONS_ON_WAYS)
+    }
 }
 
 /// A bounding box that is usually included in a [`HeaderBlock`].

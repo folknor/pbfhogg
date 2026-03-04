@@ -369,6 +369,17 @@ pub(crate) fn ensure_relation_capacity_local(
     Ok(())
 }
 
+/// Warn if the input header declares `LocationsOnWays` — inline way-node
+/// coordinates are not propagated through re-encoding.
+pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {
+    if header.has_locations_on_ways() {
+        eprintln!(
+            "Warning: input PBF has LocationsOnWays (inline way-node coordinates). \
+             These will not be preserved in the output."
+        );
+    }
+}
+
 /// Build output header bytes from an input header.
 ///
 /// Applies `configure` to the header builder, then preserves sortedness if

@@ -6,7 +6,7 @@ use common::{
     read_all_elements_with_coords, read_header, write_test_pbf, PbfContentsWithCoords, TestNode,
     TestRelation, TestWay,
 };
-use pbfhogg::block_builder::{self, BlockBuilder};
+use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::sort::SortOptions;
 use pbfhogg::writer::{Compression, PbfWriter};
 
@@ -346,4 +346,67 @@ fn sort_many_overlapping_blobs() {
     }
 
     assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+}
+
+#[test]
+fn sort_preserves_historical_information_feature() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("history-input.osm.pbf");
+    let output = dir.path().join("history-output.osm.pbf");
+
+    let file = std::fs::File::create(&input).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .historical()
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    bb.add_node(
+        2,
+        20_000_000,
+        20_000_000,
+        &[],
+        Some(&Metadata {
+            version: 2,
+            timestamp: 1_700_000_000,
+            changeset: 10,
+            uid: 1,
+            user: "u",
+            visible: false,
+        }),
+    );
+    bb.add_node(
+        1,
+        10_000_000,
+        10_000_000,
+        &[],
+        Some(&Metadata {
+            version: 1,
+            timestamp: 1_700_000_001,
+            changeset: 11,
+            uid: 1,
+            user: "u",
+            visible: true,
+        }),
+    );
+    if let Some(bytes) = bb.take().expect("take") {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+    writer.flush().expect("flush");
+
+    pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &SortOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true },
+    )
+    .expect("sort");
+
+    let header = read_header(&output);
+    assert!(
+        header.has_historical_information(),
+        "output header must declare HistoricalInformation",
+    );
 }

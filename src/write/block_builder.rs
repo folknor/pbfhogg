@@ -1445,6 +1445,7 @@ pub struct HeaderBuilder<'a> {
     replication_sequence_number: Option<i64>,
     replication_base_url: Option<&'a str>,
     optional_features: Vec<&'a str>,
+    historical_information: bool,
     sorted: bool,
     writing_program: &'a str,
 }
@@ -1468,6 +1469,7 @@ impl<'a> HeaderBuilder<'a> {
             replication_sequence_number: None,
             replication_base_url: None,
             optional_features: Vec::new(),
+            historical_information: false,
             sorted: false,
             writing_program: "pbfhogg",
         }
@@ -1488,6 +1490,7 @@ impl<'a> HeaderBuilder<'a> {
         hb.replication_timestamp = header.osmosis_replication_timestamp();
         hb.replication_sequence_number = header.osmosis_replication_sequence_number();
         hb.replication_base_url = header.osmosis_replication_base_url();
+        hb.historical_information = header.has_historical_information();
         hb
     }
 
@@ -1536,6 +1539,15 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
+    /// Declare that element history metadata (`visible`) may be present.
+    ///
+    /// This adds required feature `HistoricalInformation` to the header.
+    #[must_use]
+    pub fn historical(mut self) -> Self {
+        self.historical_information = true;
+        self
+    }
+
     /// Override the writing program name (default: `"pbfhogg"`).
     #[must_use]
     pub fn writing_program(mut self, program: &'a str) -> Self {
@@ -1572,6 +1584,9 @@ impl<'a> HeaderBuilder<'a> {
         // Field 4: required_features (repeated string)
         encode_bytes_field(&mut buf, 4, b"OsmSchema-V0.6");
         encode_bytes_field(&mut buf, 4, b"DenseNodes");
+        if self.historical_information {
+            encode_bytes_field(&mut buf, 4, crate::HeaderBlock::HISTORICAL_INFORMATION.as_bytes());
+        }
 
         // Field 5: optional_features (repeated string)
         if self.sorted {

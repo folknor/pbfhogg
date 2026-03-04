@@ -214,12 +214,25 @@ impl HeaderBlock {
     /// PBF optional feature string indicating ways contain inline node coordinates.
     pub const LOCATIONS_ON_WAYS: &str = "LocationsOnWays";
 
+    /// PBF required feature string indicating history metadata (`visible`) may
+    /// be present on elements.
+    pub const HISTORICAL_INFORMATION: &str = "HistoricalInformation";
+
     /// Returns `true` if the header declares `LocationsOnWays`.
     pub fn has_locations_on_ways(&self) -> bool {
         self.header
             .optional_features
             .iter()
             .any(|f| f == Self::LOCATIONS_ON_WAYS)
+    }
+
+    /// Returns `true` if the header declares `HistoricalInformation` as a
+    /// required feature.
+    pub fn has_historical_information(&self) -> bool {
+        self.header
+            .required_features
+            .iter()
+            .any(|f| f == Self::HISTORICAL_INFORMATION)
     }
 }
 

@@ -266,13 +266,11 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   `optional_features`), `add-locations-to-ways` should warn or skip rather than
   building a full node location index for redundant work.
 
-- [ ] **Set history header flags when writing PBF from history-carrying input.**
-  [libosmium#366](https://github.com/osmcode/libosmium/issues/366): when output may
-  contain deleted elements (`visible=false`), the PBF header should include
-  `HistoricalInformation` as a required feature and set
-  `has_multiple_object_versions=true`. Without these, consuming tools may ignore the
-  `visible` field. Relevant for any future command that writes PBF from OSC or history
-  data.
+- [x] **Set history header flags when writing PBF from history-carrying input.**
+  [libosmium#366](https://github.com/osmcode/libosmium/issues/366): `HeaderBuilder` now
+  supports `HistoricalInformation` as a required feature via `.historical()`, and
+  `HeaderBuilder::from_header()` preserves this flag from input headers so rewrite
+  commands keep history semantics when `visible=false` data may be present.
 
 - [x] **Report all duplicate IDs in validation, not just the first.**
   [libosmium#349](https://github.com/osmcode/libosmium/issues/349): libosmium's

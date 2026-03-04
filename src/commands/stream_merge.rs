@@ -159,7 +159,10 @@ pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
             decimicro_lat: dn.decimicro_lat(),
             decimicro_lon: dn.decimicro_lon(),
             tags: dn.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
-            version: dn.info().map(crate::dense::DenseNodeInfo::version),
+            version: dn
+                .info()
+                .map(crate::dense::DenseNodeInfo::version)
+                .filter(|&v| v != -1),
         }),
         Element::Node(n) => Some(OwnedNode {
             id: n.id(),

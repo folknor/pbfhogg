@@ -48,6 +48,42 @@ hot path is acceptable, or whether a fallback re-parse on finding nothing is bet
 - `WireDenseNodes::parse()` — fields 1 (ids), 8 (lats), 9 (lons), 10 (keys_vals)
 - `WireDenseInfo::parse()` — fields 1 (versions), 2 (timestamps), 3 (changesets), 4 (uids), 5 (user_sids), 6 (visibles)
 
+## Osmosis -1 sentinel for absent metadata
+
+**Status:** Fixed. Normalization split across parse-time and write-time boundaries.
+
+**Context:** Osmosis writes `-1` for version and changeset when metadata is absent
+([libosmium#247](https://github.com/osmcode/libosmium/issues/247)). The protobuf
+default for these fields is 0, but Osmosis explicitly encodes -1 as a sentinel
+meaning "no data." Without normalization, pbfhogg round-trips `-1` as a real version
+number, which is semantically wrong — downstream tools may interpret it as a genuine
+historical version.
+
+**Fix strategy — two-tier normalization:**
+
+1. **Non-dense elements (Node, Way, Relation):** Normalized at parse time in
+   `WireInfo::parse` (`src/read/wire.rs`). After the field loop, `version == Some(-1)`
+   and `changeset == Some(-1)` are mapped to `None`. This covers both the library API
+   and all command paths with zero additional overhead — the parse loop is already
+   branchy, and two comparisons on values in registers are invisible.
+
+2. **Dense nodes:** Normalized at write/conversion boundaries only. `DenseNodeInfo`
+   stores `version: i32` and `changeset: i64` as plain non-optional values decoded
+   from packed arrays in the dense node iterator — the tightest loop in the library
+   (~8 billion iterations for planet). Changing these to `Option` would add per-element
+   overhead on a path where every nanosecond matters. Instead, the four conversion
+   sites that bridge dense reads to writes guard against -1:
+   - `dense_node_metadata` and `dense_node_raw_metadata` in `src/commands/mod.rs`
+   - `read_dense_node` in `src/commands/sort.rs`
+   - `convert_node` in `src/commands/stream_merge.rs`
+
+**Consequence for library users:** Code consuming the public `DenseNodeInfo` API
+directly (not through pbfhogg's commands) will still observe raw `-1` values from
+Osmosis-generated PBFs. This is documented on the `DenseNodeInfo` struct. Library
+users who need to handle Osmosis input should check for `-1` themselves. The tradeoff
+is accepted: the dense iterator is too hot to add branches for a single producer's
+non-standard encoding.
+
 ## Null Island ambiguity in dense mmap index
 
 **Status:** Known, accepted. Documented in code.

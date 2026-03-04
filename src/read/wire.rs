@@ -505,6 +505,16 @@ impl WireInfo {
             }
         }
 
+        // Osmosis writes -1 for version and changeset when metadata is absent
+        // (protobuf default is 0). Map these sentinels to None so downstream
+        // code treats them as genuinely absent rather than real values.
+        if info.version == Some(-1) {
+            info.version = None;
+        }
+        if info.changeset == Some(-1) {
+            info.changeset = None;
+        }
+
         Ok(info)
     }
 }

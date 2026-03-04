@@ -233,7 +233,16 @@ impl<'a> Iterator for DenseNodeIter<'a> {
     }
 }
 
-/// Optional metadata with non-geographic information about a dense node
+/// Optional metadata with non-geographic information about a dense node.
+///
+/// **Osmosis sentinel values:** Osmosis writes -1 for version and changeset
+/// when metadata is absent. These fields use plain `i32`/`i64` (not `Option`)
+/// because they are decoded from packed arrays in the dense node hot path —
+/// changing to `Option` would add overhead to the tightest loop in the library.
+/// The -1 sentinel is instead normalized at write/conversion boundaries
+/// (see `dense_node_metadata`, `dense_node_raw_metadata`, sort's
+/// `read_dense_node`, and `stream_merge::convert_node`). Non-dense elements
+/// normalize -1 → None directly in `WireInfo::parse`. See CORRECTNESS.md.
 #[derive(Clone, Debug)]
 pub struct DenseNodeInfo<'a> {
     block: &'a WireBlock<'static>,

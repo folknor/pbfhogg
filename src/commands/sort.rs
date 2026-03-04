@@ -705,10 +705,13 @@ fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
         metadata: dn.info().and_then(|info| {
+            if info.version() == -1 {
+                return None;
+            }
             Some(OwnedMetadata {
                 version: info.version(),
                 timestamp: info.milli_timestamp() / 1000,
-                changeset: info.changeset(),
+                changeset: if info.changeset() == -1 { 0 } else { info.changeset() },
                 uid: info.uid(),
                 user: info.user().ok()?.to_owned(),
                 visible: info.visible(),

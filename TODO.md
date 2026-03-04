@@ -246,6 +246,11 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   verify with A/B benchmarks on Denmark and Japan:
   `brokkr bench read`, `brokkr bench merge`, `brokkr bench commands sort`
 
+## Design guidance we're already following
+  - libosmium#250 — Comparison without timestamp. Only matters if we ever add version+timestamp ordering. Currently N/A since merge is ID-based.
+  - libosmium#325 — Selective node caching = multi-pass. Already the pattern in add-locations-to-ways.
+  - libosmium#326 — TagsFilter OR semantics. osmium uses OR, rejected AND PR. pbfhogg's tags-filter already uses OR.
+  - libosmium#309 — Geometry recursion diagnostics. pbfhogg doesn't do geometry assembly.
 
 ## Upstream issues with action items (2026-03-03)
 
@@ -262,3 +267,75 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   subcommand — filters creates/modifies by tag expressions, forwards all deletes
   unconditionally. ~170 lines, no base PBF needed. Design and implementation plan
   in `notes/tags-filter-osc-support.md`.
+
+- [ ] **Map version=-1 and changeset=-1 to None during PBF parsing.**
+  [libosmium#247](https://github.com/osmcode/libosmium/issues/247): Osmosis writes -1
+  for version and changeset when metadata is absent (protobuf default value). pbfhogg
+  currently stores these as literal `Some(-1)` instead of `None`. Round-tripping an
+  Osmosis-generated PBF preserves -1 as a real version number, which is semantically
+  wrong. Fix: in `WireInfo` / `WireDenseInfo` parsing, map -1 to None for version and
+  changeset fields.
+
+- [ ] **Check `LocationsOnWays` header before add-locations-to-ways.**
+  [libosmium#199](https://github.com/osmcode/libosmium/issues/199): if the input PBF
+  already has inline way-node coordinates (indicated by `LocationsOnWays` in
+  `optional_features`), `add-locations-to-ways` should warn or skip rather than
+  building a full node location index for redundant work.
+
+- [ ] **Set history header flags when writing PBF from history-carrying input.**
+  [libosmium#366](https://github.com/osmcode/libosmium/issues/366): when output may
+  contain deleted elements (`visible=false`), the PBF header should include
+  `HistoricalInformation` as a required feature and set
+  `has_multiple_object_versions=true`. Without these, consuming tools may ignore the
+  `visible` field. Relevant for any future command that writes PBF from OSC or history
+  data.
+
+- [ ] **Report all duplicate IDs in validation, not just the first.**
+  [libosmium#349](https://github.com/osmcode/libosmium/issues/349): libosmium's
+  `CheckOrder` handler throws on the first duplicate ID. For data quality auditing,
+  reporting all duplicates is more useful. If pbfhogg's `check-refs` or sort commands
+  detect duplicates, they should collect and report all of them rather than stopping at
+  the first.
+
+- [ ] **tags-filter: resolve matched relation members.**
+  [osmium-tool#215](https://github.com/osmcode/osmium-tool/issues/215): when a relation
+  matches (without `-R`), pbfhogg does not pull in its member ways, nodes, or
+  sub-relations. Worse than osmium's original bug (which only missed sub-relations).
+
+- [ ] **extract: antimeridian polygon handling.**
+  [osmium-tool#220](https://github.com/osmcode/osmium-tool/issues/220),
+  [#226](https://github.com/osmcode/osmium-tool/issues/226): no polygon splitting for
+  regions crossing the 180th meridian. Extracts of Alaska, Russia, Fiji etc. will
+  produce incorrect results. osmium fixed this with antimeridian polygon splitting in
+  PR #229.
+
+- [ ] **Warn when LocationsOnWays data is lost through cat/sort/merge.**
+  [osmium-tool#240](https://github.com/osmcode/osmium-tool/issues/240):
+  `build_output_header` doesn't propagate optional features from the input header. If a
+  PBF with embedded way-node coordinates is cat'd or sorted, the locations are silently
+  lost. Same open bug in osmium.
+
+- [ ] **add-locations-to-ways: preserve untagged relation-member nodes.**
+  [osmium-tool#239](https://github.com/osmcode/osmium-tool/issues/239): untagged nodes
+  that are relation members are dropped along with all other untagged nodes. Fixing
+  requires an extra pass over relations to collect member node IDs. Same limitation in
+  osmium. Low priority.
+
+## Missing commands (osmium-tool parity)
+
+- [ ] **`merge-changes`** — merge multiple OSC files, optionally simplifying
+  (keep only latest version per object). Relevant upstream:
+  [osmium-tool#262](https://github.com/osmcode/osmium-tool/issues/262) (duplicate IDs
+  from broken input),
+  [#282](https://github.com/osmcode/osmium-tool/issues/282) (same-version delete
+  ambiguity with overlapping extracts),
+  [osmosis#150](https://github.com/openstreetmap/osmosis/issues/150) (duplicate
+  same-version updates abort simplify),
+  [osmosis#72](https://github.com/openstreetmap/osmosis/issues/72) (simplification
+  must not merge distinct action types with same ID).
+
+- [ ] **`time-filter`** — filter history PBF to a snapshot at a given timestamp.
+  Relevant upstream:
+  [osmium-tool#285](https://github.com/osmcode/osmium-tool/issues/285) (output header
+  timestamp must reflect the filter cutoff, not the original file).
+

@@ -151,8 +151,8 @@ file = "greater-london-20260225-seq4704.osc.gz"
 sha256 = "66c9ae6b9dada026f49e6afbdc22cebf586d15a024d8b122872810793ef91624"
 
 [dm6]
-data = "/fast/pbfhogg/data"
-scratch = "/fast/pbfhogg/scratch"
+data = "data"
+scratch = "data/bench-tmp"
 target = "target"
 
 [dm6.drives]

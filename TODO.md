@@ -240,56 +240,6 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
-## Correctness: same-version delete semantics (libosmium#403)
-
-**Context:** [libosmium#403](https://github.com/osmcode/libosmium/issues/403) documents a
-behavior change in libosmium 2.22 that broke Geofabrik's diff-apply workflow. The root cause
-is commit [cff8ff42](https://github.com/osmcode/libosmium/commit/cff8ff428287aaf501ddb0928a479d014dd5fdd9)
-which changed `object_order_type_id_reverse_version` to order visible objects before deleted
-ones when type+id+version+timestamp all match. This was done to fix [osmium-tool#282](https://github.com/osmcode/osmium-tool/issues/282)
-(merging extract diffs was order-dependent), but it broke the more common case of applying
-diffs where a delete has the same version as the existing object.
-
-**The core issue is undefined behavior in the OSM data model.** As woodpeck (Geofabrik)
-notes: "applying a `<delete>` operation with the same version number as an already-present
-object does not have a well-defined outcome." There is no spec governing what happens when
-a delete has the same version as the existing object — every tool resolves this by convention,
-not by contract. Geofabrik's entire planet-scale pipeline relies on this undefined behavior
-(delete-wins-on-same-version) because it worked for years across libosmium, osmosis, and
-osmconvert. The osmium developers themselves recognized the ambiguity: osmium-tool already
-has `--increment-version` on `derive-changes` as an escape hatch. Geofabrik chose not to use
-it because the old convention held everywhere — until libosmium 2.22 changed the convention
-to fix a different edge case.
-
-**The tension — two conflicting conventions for the same undefined edge:**
-- **Applying diffs** (Geofabrik workflow): delete should win on same version → old behavior
-- **Merging extract diffs** ([osmium-tool#282](https://github.com/osmcode/osmium-tool/issues/282)):
-  when overlapping extracts produce a delete in one and modify in the other for the same
-  version, the modify should win → new behavior
-
-The libosmium maintainer (joto) concluded the old behavior is correct for the primary use
-case and created a PR to revert. The merge-extract fix was incomplete anyway — lonvia showed
-that overlapping extracts still produce spurious deletions regardless of sort order (an object
-moves out of extract A into extract B: A's diff has a delete, B's diff has nothing, merged
-result deletes the object even though it still exists).
-
-**pbfhogg status — not affected by design:**
-- `merge` uses ID-based lookup into a `CompactDiffOverlay` with separate
-  `deleted_nodes/ways/relations` HashSets, not version-based sort comparison. A delete in the
-  OSC always wins over the base element regardless of version — there is no sort comparator
-  tiebreaker involved. This means pbfhogg has **defined** behavior where the OSM data model
-  has undefined behavior: the diff is authoritative, period. See `merge.rs:409-434`.
-- `derive-changes` emits deletes with the **same version** as the old element (matches
-  osmium's default, no `--increment-version` equivalent). See `derive_changes.rs:344-427`.
-- `diff` compares elements by content, not version ordering. Not affected.
-
-- [ ] **Add `--increment-version` flag for `derive-changes`.** When set, bump the version
-  of deleted elements by 1 in the output OSC. This sidesteps the undefined-behavior edge
-  entirely — the delete has a strictly higher version, so every tool agrees it wins. osmium-
-  tool has this flag. Not needed for pbfhogg's own pipeline (our merge doesn't consult
-  versions), but necessary for interop when other tools consume pbfhogg-generated diffs.
-  Given that libosmium's convention on the undefined edge has now changed *and been reverted*
-  within a single release cycle, producing unambiguous diffs is the only robust strategy.
 
 ## Upstream issues with action items (2026-03-03)
 

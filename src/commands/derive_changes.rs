@@ -64,6 +64,7 @@ pub fn derive_changes(
     new_path: &Path,
     output: &Path,
     direct_io: bool,
+    increment_version: bool,
 ) -> Result<DeriveChangesStats> {
     // Open readers and verify sorted headers.
     let old_reader = ElementReader::open(old_path, direct_io)?;
@@ -114,7 +115,7 @@ pub fn derive_changes(
         deletes: (deletes.nodes.len() + deletes.ways.len() + deletes.relations.len()) as u64,
     };
 
-    write_osc(output, &creates, &modifies, &deletes)?;
+    write_osc(output, &creates, &modifies, &deletes, increment_version)?;
 
     Ok(stats)
 }
@@ -274,6 +275,7 @@ fn write_osc(
     creates: &Changes,
     modifies: &Changes,
     deletes: &Changes,
+    increment_version: bool,
 ) -> Result<()> {
     let file = File::create(output)?;
     let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
@@ -322,13 +324,13 @@ fn write_osc(
     if !deletes.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
         for node in &deletes.nodes {
-            write_delete_node(&mut writer, node)?;
+            write_delete_node(&mut writer, node, increment_version)?;
         }
         for way in &deletes.ways {
-            write_delete_element(&mut writer, "way", way.id, way.version)?;
+            write_delete_element(&mut writer, "way", way.id, way.version, increment_version)?;
         }
         for rel in &deletes.relations {
-            write_delete_element(&mut writer, "relation", rel.id, rel.version)?;
+            write_delete_element(&mut writer, "relation", rel.id, rel.version, increment_version)?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }
@@ -427,11 +429,16 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
     Ok(())
 }
 
-fn write_delete_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode) -> Result<()> {
+fn write_delete_node<W: Write>(
+    writer: &mut Writer<W>,
+    node: &OwnedNode,
+    increment_version: bool,
+) -> Result<()> {
     let mut elem = BytesStart::new("node");
     let id_str = node.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(v) = node.version {
+    let version = maybe_increment_version(node.version, increment_version);
+    if let Some(v) = version {
         let v_str = v.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
@@ -444,16 +451,26 @@ fn write_delete_element<W: Write>(
     tag_name: &str,
     id: i64,
     version: Option<i32>,
+    increment_version: bool,
 ) -> Result<()> {
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
+    let version = maybe_increment_version(version, increment_version);
     if let Some(v) = version {
         let v_str = v.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
     Ok(())
+}
+
+fn maybe_increment_version(version: Option<i32>, increment: bool) -> Option<i32> {
+    if increment {
+        version.map(|v| v.saturating_add(1))
+    } else {
+        version
+    }
 }
 
 fn write_tags<W: Write>(writer: &mut Writer<W>, tags: &[(String, String)]) -> Result<()> {

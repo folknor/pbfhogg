@@ -166,6 +166,9 @@ enum Command {
         old: PathBuf,
         /// New PBF file
         new: PathBuf,
+        /// Bump version of deleted elements by 1 in the output OSC
+        #[arg(long)]
+        increment_version: bool,
         #[command(flatten)]
         output: OutputArg,
         #[command(flatten)]
@@ -474,8 +477,8 @@ fn main() {
             type_filter,
             io,
         } => run_diff(&old, &new, suppress_common, verbose, type_filter.as_deref(), io.direct_io),
-        Command::DeriveChanges { old, new, output, io } => {
-            run_derive_changes(&old, &new, &output.output, io.direct_io)
+        Command::DeriveChanges { old, new, increment_version, output, io } => {
+            run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version)
         }
         Command::Getid {
             file,
@@ -904,8 +907,9 @@ fn run_derive_changes(
     new: &std::path::Path,
     output: &std::path::Path,
     direct_io: bool,
+    increment_version: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::derive_changes::derive_changes(old, new, output, direct_io)?;
+    let stats = pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version)?;
     stats.print_summary();
     Ok(())
 }

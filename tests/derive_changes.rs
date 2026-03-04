@@ -8,8 +8,11 @@ use common::{
     write_test_pbf, write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
 };
 use pbfhogg::MemberId;
+use pbfhogg::block_builder::{self, BlockBuilder, Metadata};
 use pbfhogg::derive_changes::derive_changes;
 use pbfhogg::merge::{merge, MergeOptions};
+use pbfhogg::writer::{Compression, PbfWriter};
+use std::io::Read;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +37,7 @@ fn identical_files_no_changes() {
     write_test_pbf_sorted(&old, &nodes, &ways, &[]);
     write_test_pbf_sorted(&new, &nodes, &ways, &[]);
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -63,7 +66,7 @@ fn create_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 2); // node 2 + way 10
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 0);
@@ -92,7 +95,7 @@ fn delete_only() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 0);
     assert_eq!(stats.deletes, 2); // node 2 + way 10
@@ -118,7 +121,7 @@ fn modify_node_coords() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 0);
     assert_eq!(stats.modifies, 1);
     assert_eq!(stats.deletes, 0);
@@ -144,7 +147,7 @@ fn modify_node_tags() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -168,7 +171,7 @@ fn modify_way_refs() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -203,7 +206,7 @@ fn modify_relation_members() {
         }],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.modifies, 1);
 }
 
@@ -236,7 +239,7 @@ fn mixed_create_modify_delete() {
         &[],
     );
 
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 1);  // node 4
     assert_eq!(stats.modifies, 2); // node 1 + way 10
     assert_eq!(stats.deletes, 1);  // node 3
@@ -277,7 +280,7 @@ fn roundtrip_with_merge() {
     );
 
     // Derive changes
-    let stats = derive_changes(&old, &new, &osc, false).expect("derive");
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
     assert_eq!(stats.creates, 1);  // node 5
     assert_eq!(stats.modifies, 2); // node 1 (tags) + way 10 (refs + tags)
     assert_eq!(stats.deletes, 1);  // node 3
@@ -332,7 +335,7 @@ fn unsorted_input_rejected() {
         &[],
     );
 
-    let err = derive_changes(&old, &new, &osc, false)
+    let err = derive_changes(&old, &new, &osc, false, false)
         .expect_err("should reject unsorted input");
     let msg = err.to_string();
     assert!(msg.contains("not sorted"), "error should mention 'not sorted', got: {msg}");
@@ -344,4 +347,105 @@ fn unsorted_input_rejected() {
         msg.contains("pbfhogg sort"),
         "error should mention 'pbfhogg sort', got: {msg}",
     );
+}
+
+/// Read gzipped OSC file and return the decompressed XML string.
+fn read_osc(path: &std::path::Path) -> String {
+    let file = std::fs::File::open(path).expect("open osc");
+    let mut gz = flate2::read::GzDecoder::new(file);
+    let mut xml = String::new();
+    gz.read_to_string(&mut xml).expect("decompress osc");
+    xml
+}
+
+/// Write a sorted PBF with version metadata on each element.
+fn write_versioned_pbf(
+    path: &std::path::Path,
+    nodes: &[(i64, i32, i32, i32)], // (id, lat, lon, version)
+    ways: &[(i64, Vec<i64>, i32)],  // (id, refs, version)
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+    for &(id, lat, lon, ver) in nodes {
+        let meta = Metadata {
+            version: ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true,
+        };
+        bb.add_node(id, lat, lon, &[], Some(&meta));
+    }
+    if !bb.is_empty() {
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    for (id, refs, ver) in ways {
+        let meta = Metadata {
+            version: *ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true,
+        };
+        bb.add_way(*id, &[], refs, Some(&meta));
+    }
+    if !bb.is_empty() {
+        if let Some(bytes) = bb.take().expect("take") {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+    }
+    writer.flush().expect("flush");
+}
+
+#[test]
+fn increment_version_bumps_delete_versions() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+
+    // Old has node 1 (v3), node 2 (v5), way 10 (v2).
+    // New has only node 1 (v3) — node 2 and way 10 are deleted.
+    write_versioned_pbf(&old, &[
+        (1, 100_000_000, 200_000_000, 3),
+        (2, 110_000_000, 210_000_000, 5),
+    ], &[
+        (10, vec![1, 2], 2),
+    ]);
+    write_versioned_pbf(&new, &[
+        (1, 100_000_000, 200_000_000, 3),
+    ], &[]);
+
+    let stats = derive_changes(&old, &new, &osc, false, true).expect("derive");
+    assert_eq!(stats.deletes, 2); // node 2 + way 10
+
+    let xml = read_osc(&osc);
+    // Node 2 should have version="6" (was 5, incremented)
+    assert!(xml.contains(r#"id="2"#), "should contain node id=2");
+    assert!(xml.contains(r#"version="6""#), "node 2 version should be 6, got:\n{xml}");
+    // Way 10 should have version="3" (was 2, incremented)
+    assert!(xml.contains(r#"id="10"#), "should contain way id=10");
+    assert!(xml.contains(r#"version="3""#), "way 10 version should be 3, got:\n{xml}");
+}
+
+#[test]
+fn no_increment_version_preserves_delete_versions() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+
+    write_versioned_pbf(&old, &[
+        (1, 100_000_000, 200_000_000, 3),
+        (2, 110_000_000, 210_000_000, 5),
+    ], &[]);
+    write_versioned_pbf(&new, &[
+        (1, 100_000_000, 200_000_000, 3),
+    ], &[]);
+
+    let stats = derive_changes(&old, &new, &osc, false, false).expect("derive");
+    assert_eq!(stats.deletes, 1);
+
+    let xml = read_osc(&osc);
+    // Node 2 should have version="5" (unchanged)
+    assert!(xml.contains(r#"version="5""#), "node 2 version should be 5, got:\n{xml}");
 }

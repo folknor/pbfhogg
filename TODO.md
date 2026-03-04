@@ -242,13 +242,9 @@ blocks). The per-type summary (block counts + sizes) is already shown without
 
 ## Upstream issues with action items (2026-03-03)
 
-- [ ] **Use spare latitude bit in DenseMmapIndex for tagged/untagged node flag.**
-  [libosmium#395](https://github.com/osmcode/libosmium/issues/395): latitude only needs
-  31 of 32 bits (range ±90° vs longitude ±180°), freeing one bit per slot. In
-  `DenseMmapIndex` (8 bytes/slot = lat+lon) this bit could store whether a node is
-  tagged, eliminating the need for the separate `--keep-untagged-nodes` mode in
-  `add-locations-to-ways`. Currently the tagged/untagged decision happens at a different
-  stage — this would fold it into the index itself.
+- [x] **Use spare latitude bit in DenseMmapIndex for tagged/untagged node flag.**
+  Investigated and benchmarked on Denmark (`add-locations-to-ways`): no pipeline win
+  in current architecture (extra index lookups/regression), so this is parked for now.
 
 - [x] **tags-filter should preserve delete actions from OSC input.**
   [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): implemented as

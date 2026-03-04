@@ -199,10 +199,60 @@ fn polygon_contains(polygons: &[PolygonRings], px: f64, py: f64) -> bool {
 
 /// Check if a single polygon (exterior + holes) contains the point.
 fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
-    if !point_in_ring(px, py, &poly.exterior) {
+    if !point_in_ring_with_antimeridian(px, py, &poly.exterior) {
         return false;
     }
-    !poly.holes.iter().any(|hole| point_in_ring(px, py, hole))
+    !poly
+        .holes
+        .iter()
+        .any(|hole| point_in_ring_with_antimeridian(px, py, hole))
+}
+
+/// Point-in-ring that handles rings crossing the antimeridian.
+fn point_in_ring_with_antimeridian(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
+    if !ring_crosses_antimeridian(ring) {
+        return point_in_ring(px, py, ring);
+    }
+
+    let unwrapped = unwrap_ring_longitudes(ring);
+    point_in_ring(px, py, &unwrapped)
+        || point_in_ring(px + 360.0, py, &unwrapped)
+        || point_in_ring(px - 360.0, py, &unwrapped)
+}
+
+/// Detect whether any ring segment crosses the antimeridian.
+fn ring_crosses_antimeridian(ring: &[(f64, f64)]) -> bool {
+    if ring.len() < 2 {
+        return false;
+    }
+    ring.windows(2)
+        .any(|segment| (segment[1].0 - segment[0].0).abs() > 180.0)
+}
+
+/// Unwrap longitudes into a continuous sequence to avoid +/-180 discontinuity.
+fn unwrap_ring_longitudes(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut out = Vec::with_capacity(ring.len());
+    if ring.is_empty() {
+        return out;
+    }
+
+    let (first_lon, first_lat) = ring[0];
+    out.push((first_lon, first_lat));
+    let mut prev_unwrapped_lon = first_lon;
+
+    for &(lon, lat) in &ring[1..] {
+        let mut adjusted = lon;
+        while adjusted - prev_unwrapped_lon > 180.0 {
+            adjusted -= 360.0;
+        }
+        while adjusted - prev_unwrapped_lon < -180.0 {
+            adjusted += 360.0;
+        }
+        out.push((adjusted, lat));
+        prev_unwrapped_lon = adjusted;
+    }
+
+    out
 }
 
 /// Ray-casting point-in-polygon test.
@@ -349,8 +399,12 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
     let mut max_lon = f64::MIN;
     let mut max_lat = f64::MIN;
     let mut found_any = false;
+    let mut crosses_antimeridian = false;
 
     for poly in polygons {
+        if ring_crosses_antimeridian(&poly.exterior) {
+            crosses_antimeridian = true;
+        }
         for &(lon, lat) in &poly.exterior {
             found_any = true;
             if lon < min_lon {
@@ -370,6 +424,11 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
 
     if !found_any {
         return Err("no exterior ring vertices found for bounding box".into());
+    }
+
+    if crosses_antimeridian {
+        min_lon = -180.0;
+        max_lon = 180.0;
     }
 
     Ok(Bbox {
@@ -1404,6 +1463,21 @@ mod tests {
         assert!(!point_in_ring(0.0, 0.0, &[(0.0, 0.0), (1.0, 1.0)]));
     }
 
+    #[test]
+    fn point_in_ring_antimeridian() {
+        // Rectangle crossing the dateline.
+        let ring = vec![
+            (179.0, 10.0),
+            (-179.0, 10.0),
+            (-179.0, 12.0),
+            (179.0, 12.0),
+            (179.0, 10.0),
+        ];
+        assert!(point_in_ring_with_antimeridian(179.5, 11.0, &ring));
+        assert!(point_in_ring_with_antimeridian(-179.5, 11.0, &ring));
+        assert!(!point_in_ring_with_antimeridian(0.0, 11.0, &ring));
+    }
+
     // -----------------------------------------------------------------------
     // Region::Polygon tests
     // -----------------------------------------------------------------------
@@ -1494,6 +1568,31 @@ mod tests {
         };
         // lat=0, lon=0 -- outside bbox
         assert!(!region.contains(0.0, 0.0));
+    }
+
+    #[test]
+    fn polygon_region_antimeridian_contains() {
+        let region = Region::Polygon {
+            polygons: vec![PolygonRings {
+                exterior: vec![
+                    (179.0, 10.0),
+                    (-179.0, 10.0),
+                    (-179.0, 12.0),
+                    (179.0, 12.0),
+                    (179.0, 10.0),
+                ],
+                holes: vec![],
+            }],
+            bbox: Bbox {
+                min_lon: -180.0,
+                min_lat: 10.0,
+                max_lon: 180.0,
+                max_lat: 12.0,
+            },
+        };
+        assert!(region.contains(11.0, 179.5));
+        assert!(region.contains(11.0, -179.5));
+        assert!(!region.contains(11.0, 0.0));
     }
 
     // -----------------------------------------------------------------------
@@ -1624,6 +1723,25 @@ mod tests {
         assert!((b.min_lat - 0.0).abs() < 1e-9);
         assert!((b.max_lon - 7.0).abs() < 1e-9);
         assert!((b.max_lat - 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_geojson_antimeridian_polygon() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "type": "Polygon",
+            "coordinates": [
+                [[179.0, 10.0], [-179.0, 10.0], [-179.0, 12.0], [179.0, 12.0], [179.0, 10.0]]
+            ]
+        }"#;
+        let path = write_temp_geojson(&dir, "antimeridian.geojson", json);
+        let region = parse_geojson(&path).unwrap();
+        assert!(region.contains(11.0, 179.5));
+        assert!(region.contains(11.0, -179.5));
+        assert!(!region.contains(11.0, 0.0));
+        let b = region.bbox();
+        assert!((b.min_lon + 180.0).abs() < 1e-9);
+        assert!((b.max_lon - 180.0).abs() < 1e-9);
     }
 
     #[test]

@@ -285,12 +285,13 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   nested member relations transitively (cycle-safe), and node refs of included ways are
   pulled in. `-R` behavior is unchanged (direct matches only).
 
-- [ ] **extract: antimeridian polygon handling.**
+- [x] **extract: antimeridian polygon handling.**
   [osmium-tool#220](https://github.com/osmcode/osmium-tool/issues/220),
   [#226](https://github.com/osmcode/osmium-tool/issues/226): no polygon splitting for
   regions crossing the 180th meridian. Extracts of Alaska, Russia, Fiji etc. will
-  produce incorrect results. osmium fixed this with antimeridian polygon splitting in
-  PR #229.
+  produce incorrect results. `extract` now handles antimeridian crossings in point-in-
+  polygon checks (ring unwrapping + shifted longitude probes), and avoids bbox false-
+  rejects by widening crossing-polygon lon bbox to `[-180, 180]`.
 
 - [x] **Warn when LocationsOnWays data is lost through cat/sort/merge.**
   [osmium-tool#240](https://github.com/osmcode/osmium-tool/issues/240):

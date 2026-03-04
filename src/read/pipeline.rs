@@ -32,10 +32,26 @@ fn should_skip_blob(filter: &BlobFilter, blob: &super::blob::Blob) -> bool {
 }
 
 /// Number of raw blobs the I/O thread can read ahead.
-const READ_AHEAD: usize = 16;
+pub(crate) const DEFAULT_READ_AHEAD: usize = 16;
 
 /// Number of decoded blocks that can be in-flight before backpressure stalls decode.
-const DECODE_AHEAD: usize = 32;
+pub(crate) const DEFAULT_DECODE_AHEAD: usize = 32;
+
+/// Runtime-tunable pipeline buffering configuration.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PipelineConfig {
+    pub(crate) read_ahead: usize,
+    pub(crate) decode_ahead: usize,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            read_ahead: DEFAULT_READ_AHEAD,
+            decode_ahead: DEFAULT_DECODE_AHEAD,
+        }
+    }
+}
 
 /// Runs a three-stage pipeline over a PBF file:
 ///
@@ -50,6 +66,7 @@ const DECODE_AHEAD: usize = 32;
 pub(crate) fn run_pipeline<R, F>(
     mut blob_reader: BlobReader<R>,
     decode_thread_count: Option<usize>,
+    pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
     mut block_fn: F,
 ) -> Result<()>
@@ -67,8 +84,8 @@ where
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
     let blob_filter = blob_filter.map(Arc::new);
-    let (raw_tx, raw_rx) = sync_channel::<RawItem>(READ_AHEAD);
-    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(DECODE_AHEAD);
+    let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead.max(1));
+    let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead.max(1));
 
     std::thread::scope(|scope| {
         // Stage 1: Sequential I/O reader thread
@@ -170,7 +187,7 @@ where
         // Stage 3: Reorder buffer on main thread — deliver blocks in file order.
         //
         // Reorder by sequence number and emit only contiguous ready items.
-        // The underlying storage is VecDeque-based and bounded by DECODE_AHEAD.
+        // The underlying storage is VecDeque-based and bounded by decode_ahead.
         //
         // Each slot is `Option<Option<Result<PrimitiveBlock>>>`:
         //   - Outer `None`  → slot not yet filled (decode still in progress)
@@ -178,7 +195,7 @@ where
         //   - `Some(Some(Ok(block)))` → decoded data block ready to deliver
         //   - `Some(Some(Err(e)))` → decode or I/O error to propagate
         let mut pending: ReorderBuffer<Option<Result<PrimitiveBlock>>> =
-            ReorderBuffer::with_capacity(DECODE_AHEAD);
+            ReorderBuffer::with_capacity(pipeline_config.decode_ahead.max(1));
 
         for (seq, item) in decoded_rx {
             pending.push(seq, item);

@@ -4,6 +4,7 @@ use super::blob::{Blob, BlobDecode, BlobReader, BlobType};
 use super::block::{HeaderBlock, PrimitiveBlock};
 use super::elements::Element;
 use super::file_reader::FileReader;
+use super::pipeline::PipelineConfig;
 use crate::blob_index::BlobFilter;
 use crate::error::{new_error, ErrorKind, Result};
 use rayon::prelude::*;
@@ -24,6 +25,7 @@ pub struct ElementReader<R: Read + Send> {
     blob_iter: BlobReader<R>,
     header: HeaderBlock,
     decode_threads: Option<usize>,
+    pipeline_config: PipelineConfig,
     blob_filter: Option<BlobFilter>,
 }
 
@@ -50,7 +52,13 @@ impl<R: Read + Send> ElementReader<R> {
     pub fn new(reader: R) -> Result<ElementReader<R>> {
         let mut blob_iter = BlobReader::new(reader);
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header, decode_threads: None, blob_filter: None })
+        Ok(ElementReader {
+            blob_iter,
+            header,
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
     }
 
     /// Sets a blob-type filter for the pipelined reader.
@@ -75,6 +83,22 @@ impl<R: Read + Send> ElementReader<R> {
     /// for the I/O reader and the consumer). The minimum is clamped to 1.
     pub fn decode_threads(mut self, n: usize) -> Self {
         self.decode_threads = Some(n.max(1));
+        self
+    }
+
+    /// Sets Stage 1 pipeline read-ahead depth (raw blobs buffered between I/O and decode).
+    ///
+    /// Defaults to 16. Values <1 are clamped to 1.
+    pub fn read_ahead(mut self, n: usize) -> Self {
+        self.pipeline_config.read_ahead = n.max(1);
+        self
+    }
+
+    /// Sets Stage 2 pipeline decode-ahead depth (decoded blocks buffered before reorder).
+    ///
+    /// Defaults to 32. Values <1 are clamped to 1.
+    pub fn decode_ahead(mut self, n: usize) -> Self {
+        self.pipeline_config.decode_ahead = n.max(1);
         self
     }
 
@@ -203,7 +227,13 @@ impl<R: Read + Send> ElementReader<R> {
     where
         F: FnMut(PrimitiveBlock) -> Result<()>,
     {
-        super::pipeline::run_pipeline(self.blob_iter, self.decode_threads, self.blob_filter, f)
+        super::pipeline::run_pipeline(
+            self.blob_iter,
+            self.decode_threads,
+            self.pipeline_config,
+            self.blob_filter,
+            f,
+        )
     }
 
     /// Returns an iterator of decoded [`PrimitiveBlock`]s from the pipelined reader.
@@ -228,16 +258,23 @@ impl<R: Read + Send> ElementReader<R> {
         let (tx, rx) = sync_channel(BLOCK_QUEUE);
         let blob_iter = self.blob_iter;
         let decode_threads = self.decode_threads;
+        let pipeline_config = self.pipeline_config;
         let blob_filter = self.blob_filter;
 
         let handle = std::thread::spawn(move || {
-            let result = super::pipeline::run_pipeline(blob_iter, decode_threads, blob_filter, |block| {
-                tx.send(Ok(block)).map_err(|_| {
-                    new_error(ErrorKind::Io(std::io::Error::other(
-                        "pipeline consumer dropped",
-                    )))
-                })
-            });
+            let result = super::pipeline::run_pipeline(
+                blob_iter,
+                decode_threads,
+                pipeline_config,
+                blob_filter,
+                |block| {
+                    tx.send(Ok(block)).map_err(|_| {
+                        new_error(ErrorKind::Io(std::io::Error::other(
+                            "pipeline consumer dropped",
+                        )))
+                    })
+                },
+            );
             if let Err(e) = result {
                 // Deliver the error as the last iterator item.
                 // Ignore send failure — consumer may have already dropped.
@@ -419,7 +456,13 @@ impl ElementReader<FileReader> {
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut blob_iter = BlobReader::from_path(path)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header, decode_threads: None, blob_filter: None })
+        Ok(ElementReader {
+            blob_iter,
+            header,
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
     }
 
     /// Open a file for reading with O_DIRECT (bypasses page cache).
@@ -434,7 +477,13 @@ impl ElementReader<FileReader> {
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let mut blob_iter = BlobReader::open(path, direct)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header, decode_threads: None, blob_filter: None })
+        Ok(ElementReader {
+            blob_iter,
+            header,
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
     }
 }
 

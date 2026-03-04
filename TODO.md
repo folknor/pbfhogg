@@ -55,7 +55,7 @@ triggers a batch flush, producing many small batches with worse rayon amortizati
 
 ## Performance: parallelism (low priority)
 
-- [ ] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
+- [x] `pipeline.rs:14-18` — `READ_AHEAD=16` / `DECODE_AHEAD=32` are hardcoded.
   `READ_AHEAD` bounds the `sync_channel` between the I/O thread (Stage 1) and
   the rayon decode pool (Stage 2) — the I/O thread blocks when 16 compressed
   blobs are buffered. `DECODE_AHEAD` bounds the channel between the decode pool
@@ -73,11 +73,9 @@ triggers a batch flush, producing many small batches with worse rayon amortizati
   decode buffers so cumulative alloc is near-zero (vs 10.2 GB naive for Denmark,
   ~1.7 TB for planet).
 
-  Making these configurable would require a pipeline config struct on the public
-  `for_each_pipelined` API. Hotpath profiling (Denmark through Japan) shows the
-  pipeline is balanced at all tested scales — I/O thread doesn't stall, rayon
-  workers are barely loaded, main thread is the bottleneck. **Low priority** —
-  configure when someone reports a problem on a memory-constrained system.
+  Implemented via `ElementReader::read_ahead()` / `ElementReader::decode_ahead()`
+  backed by a runtime `PipelineConfig`; defaults remain 16/32 so existing callers
+  are unchanged.
 
 - [ ] **Rayon alternatives for slice-based parallelism** — Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
@@ -192,16 +190,10 @@ blocks). The per-type summary (block counts + sizes) is already shown without
 
 ## Code TODOs
 
-- [ ] `src/indexed.rs:42` — `relation_ids` field in `IdRanges` is populated but
-  unused. `IndexedReader` only has `read_ways_and_deps` (2-pass: filter ways →
-  fetch dependent nodes) and `for_each_node`. A `read_relations_and_deps` would
-  need 3+ passes: pass 1 filter relations → collect member way/node/relation IDs;
-  pass 2 fetch member ways → collect their node refs; pass 3 fetch all dependent
-  nodes. Recursive relation members (relations containing relations) add another
-  pass or fixpoint loop. The `relations_available()` method is already written
-  but commented out (line 80-89). The field and method are zero-cost as-is —
-  park until a concrete consumer exists (e.g. extract --smart, or a library user
-  doing relation-based filtering).
+- [x] `src/read/indexed.rs` — remove unused relation ID range tracking in
+  `IdRanges`. `IndexedReader` currently provides way+dependency and node-focused
+  paths only; relation min/max ranges were populated but never consumed. Removed
+  the dead field and relation-range scan work from `update_element_id_ranges`.
 
 ## Performance review
 

@@ -43,9 +43,6 @@ enum RangeIncluded {
 pub struct IdRanges {
     node_ids: Option<RangeInclusive<i64>>,
     way_ids: Option<RangeInclusive<i64>>,
-    // Not yet used — needs a read_relations_and_deps method or third pass.
-    #[allow(dead_code)]
-    relation_ids: Option<RangeInclusive<i64>>,
 }
 
 /// A part of the index that stores information about a specific blob.
@@ -78,17 +75,6 @@ impl BlobInfo {
             None => ElementsAvailable::Unknown,
         }
     }
-
-    /*
-    /// Is there at least one relation in this blob?
-    fn relations_available(&self) -> ElementsAvailable {
-        match self.id_ranges {
-            Some(IdRanges {relation_ids: Some(_), ..}) => ElementsAvailable::Yes,
-            Some(IdRanges {relation_ids: None, ..}) => ElementsAvailable::No,
-            None => ElementsAvailable::Unknown,
-        }
-    }
-    */
 
     /// Compute if the range of node IDs of this blob (min and max ID value) is included in the
     /// given set of IDs with at least one ID inside of this range.
@@ -206,9 +192,6 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
         let mut max_node_id: Option<i64> = None;
         let mut min_way_id: Option<i64> = None;
         let mut max_way_id: Option<i64> = None;
-        let mut min_relation_id: Option<i64> = None;
-        let mut max_relation_id: Option<i64> = None;
-
         // Check each primitive group
         for group in block.groups() {
             let check_min_max = |id, min_id: &mut Option<i64>, max_id: &mut Option<i64>| {
@@ -225,9 +208,6 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
             for way in group.ways() {
                 check_min_max(way.id(), &mut min_way_id, &mut max_way_id);
             }
-            for relation in group.relations() {
-                check_min_max(relation.id(), &mut min_relation_id, &mut max_relation_id);
-            }
         }
 
         let to_range = |min_id, max_id| -> Option<RangeInclusive<i64>> {
@@ -241,7 +221,6 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
         info.id_ranges = Some(IdRanges {
             node_ids: to_range(min_node_id, max_node_id),
             way_ids: to_range(min_way_id, max_way_id),
-            relation_ids: to_range(min_relation_id, max_relation_id),
         });
     }
 

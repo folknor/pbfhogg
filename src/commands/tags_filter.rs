@@ -12,7 +12,7 @@ use super::{
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
@@ -209,25 +209,44 @@ fn element_matches(
 
 /// Statistics from a tags-filter operation.
 pub struct TagsFilterStats {
+    /// Directly tag-matched nodes.
     pub nodes_matched: u64,
+    /// Nodes included because they are referenced by directly matched ways.
     pub nodes_from_ways: u64,
+    /// Nodes included through relation-member dependency expansion.
+    pub nodes_from_relations: u64,
+    /// Directly tag-matched ways.
     pub ways_matched: u64,
+    /// Ways included through relation-member dependency expansion.
+    pub ways_from_relations: u64,
+    /// Directly tag-matched relations.
     pub relations_matched: u64,
+    /// Relations included through transitive relation-member closure.
+    pub relations_from_relations: u64,
 }
 
 impl TagsFilterStats {
     pub fn print_summary(&self) {
         let total = self.nodes_matched
             + self.nodes_from_ways
+            + self.nodes_from_relations
             + self.ways_matched
-            + self.relations_matched;
+            + self.ways_from_relations
+            + self.relations_matched
+            + self.relations_from_relations;
         eprintln!(
-            "Wrote {total} elements: {} nodes ({} direct + {} from ways), {} ways, {} relations",
-            self.nodes_matched + self.nodes_from_ways,
+            "Wrote {total} elements: {} nodes ({} direct + {} from ways + {} from relations), \
+             {} ways ({} direct + {} from relations), {} relations ({} direct + {} from relations)",
+            self.nodes_matched + self.nodes_from_ways + self.nodes_from_relations,
             self.nodes_matched,
             self.nodes_from_ways,
+            self.nodes_from_relations,
             self.ways_matched,
+            self.ways_matched,
+            self.ways_from_relations,
             self.relations_matched,
+            self.relations_matched,
+            self.relations_from_relations,
         );
     }
 }
@@ -284,8 +303,11 @@ fn filter_block_parallel(
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_matched: 0,
+        ways_from_relations: 0,
         relations_matched: 0,
+        relations_from_relations: 0,
     };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
@@ -374,8 +396,11 @@ fn tags_filter_single_pass(
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_matched: 0,
+        ways_from_relations: 0,
         relations_matched: 0,
+        relations_from_relations: 0,
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
@@ -422,9 +447,12 @@ fn process_filter_batch(
 /// Read-only ID sets for Pass 2, shared across rayon threads.
 struct Pass2IdSets<'a> {
     matched_node_ids: &'a IdSetDense,
-    matched_way_ids: &'a IdSetDense,
-    matched_relation_ids: &'a IdSetDense,
+    direct_way_ids: &'a IdSetDense,
+    included_way_ids: &'a IdSetDense,
+    direct_relation_ids: &'a IdSetDense,
+    included_relation_ids: &'a IdSetDense,
     way_dep_node_ids: &'a IdSetDense,
+    relation_dep_node_ids: &'a IdSetDense,
 }
 
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
@@ -437,8 +465,11 @@ fn filter_block_pass2(
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_matched: 0,
+        ways_from_relations: 0,
         relations_matched: 0,
+        relations_from_relations: 0,
     };
     let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
@@ -449,29 +480,43 @@ fn filter_block_pass2(
             Element::DenseNode(dn) => {
                 let direct = ids.matched_node_ids.get(dn.id());
                 let from_way = ids.way_dep_node_ids.get(dn.id());
-                if direct || from_way {
+                let from_relation = ids.relation_dep_node_ids.get(dn.id());
+                if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
-                    if direct { stats.nodes_matched += 1; } else { stats.nodes_from_ways += 1; }
+                    if direct {
+                        stats.nodes_matched += 1;
+                    } else if from_way {
+                        stats.nodes_from_ways += 1;
+                    } else {
+                        stats.nodes_from_relations += 1;
+                    }
                 }
             }
             Element::Node(n) => {
                 let direct = ids.matched_node_ids.get(n.id());
                 let from_way = ids.way_dep_node_ids.get(n.id());
-                if direct || from_way {
+                let from_relation = ids.relation_dep_node_ids.get(n.id());
+                if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
-                    if direct { stats.nodes_matched += 1; } else { stats.nodes_from_ways += 1; }
+                    if direct {
+                        stats.nodes_matched += 1;
+                    } else if from_way {
+                        stats.nodes_from_ways += 1;
+                    } else {
+                        stats.nodes_from_relations += 1;
+                    }
                 }
             }
             Element::Way(w) => {
-                if ids.matched_way_ids.get(w.id()) {
+                if ids.included_way_ids.get(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
@@ -479,11 +524,15 @@ fn filter_block_pass2(
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
                     bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
-                    stats.ways_matched += 1;
+                    if ids.direct_way_ids.get(w.id()) {
+                        stats.ways_matched += 1;
+                    } else {
+                        stats.ways_from_relations += 1;
+                    }
                 }
             }
             Element::Relation(r) => {
-                if ids.matched_relation_ids.get(r.id()) {
+                if ids.included_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
@@ -494,7 +543,11 @@ fn filter_block_pass2(
                     }));
                     let meta = element_metadata(&r.info());
                     bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
-                    stats.relations_matched += 1;
+                    if ids.direct_relation_ids.get(r.id()) {
+                        stats.relations_matched += 1;
+                    } else {
+                        stats.relations_from_relations += 1;
+                    }
                 }
             }
         }
@@ -526,8 +579,11 @@ fn process_pass2_batch(
     drain_batch_results(results, writer, |s| {
         stats.nodes_matched += s.nodes_matched;
         stats.nodes_from_ways += s.nodes_from_ways;
+        stats.nodes_from_relations += s.nodes_from_relations;
         stats.ways_matched += s.ways_matched;
+        stats.ways_from_relations += s.ways_from_relations;
         stats.relations_matched += s.relations_matched;
+        stats.relations_from_relations += s.relations_from_relations;
     })?;
     Ok(())
 }
@@ -547,8 +603,11 @@ fn tags_filter_two_pass(
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
+        nodes_from_relations: 0,
         ways_matched: 0,
+        ways_from_relations: 0,
         relations_matched: 0,
+        relations_from_relations: 0,
     };
 
     // --- Pass 1: Collect match results and way dependencies ---
@@ -556,9 +615,14 @@ fn tags_filter_two_pass(
     // IdSetDense: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
     // No sort/dedup step needed between passes (bitset deduplicates inherently).
     let mut matched_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
+    let mut direct_way_ids = IdSetDense::new();
+    let mut included_way_ids = IdSetDense::new();
+    let mut direct_relation_ids = IdSetDense::new();
+    let mut included_relation_ids = IdSetDense::new();
     let mut way_dep_node_ids = IdSetDense::new();
+    let mut relation_dep_node_ids = IdSetDense::new();
+    let mut has_included_way = false;
+    let mut has_included_relation = false;
 
     // Pass 1: skip blob types that no expression targets.
     let reader = ElementReader::open(input, direct_io)?;
@@ -589,7 +653,10 @@ fn tags_filter_two_pass(
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
                     if element_matches(expressions, &tags_buf, false, true, false) {
-                        matched_way_ids.set(w.id());
+                        direct_way_ids.set(w.id());
+                        if set_if_absent(&mut included_way_ids, w.id()) {
+                            has_included_way = true;
+                        }
                         for r in w.refs() {
                             way_dep_node_ids.set(r);
                         }
@@ -599,19 +666,45 @@ fn tags_filter_two_pass(
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
                     if element_matches(expressions, &tags_buf, false, false, true) {
-                        matched_relation_ids.set(r.id());
+                        direct_relation_ids.set(r.id());
+                        if set_if_absent(&mut included_relation_ids, r.id()) {
+                            has_included_relation = true;
+                        }
                     }
                 }
             }
         }
     }
 
+    // Expand relation-member closure:
+    // - matched relation -> include member nodes/ways/relations
+    // - member relations recurse transitively (cycle-safe via set membership)
+    let closure = collect_relation_member_closure(
+        input,
+        direct_io,
+        &mut included_relation_ids,
+        &mut included_way_ids,
+        &mut relation_dep_node_ids,
+    )?;
+    has_included_way |= closure.has_way;
+    has_included_relation |= closure.has_relation;
+
+    // Any included way (direct match or pulled from relation members) contributes node deps.
+    collect_way_node_dependencies(
+        input,
+        direct_io,
+        &included_way_ids,
+        Some(&direct_way_ids),
+        &mut relation_dep_node_ids,
+    )?;
+
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
     let reader = ElementReader::open(input, direct_io)?;
-    let reader = if let Some(filter) = blob_filter_from_expressions(expressions) {
-        // Ensure nodes are always included — matched ways pull in referenced nodes.
-        reader.with_blob_filter(BlobFilter::new(true, filter.want_ways, filter.want_relations))
+    let reader = if blob_filter_from_expressions(expressions).is_some() {
+        // Nodes are always needed for dependency expansion.
+        // Ways/relations are included when either directly matched or pulled via relation closure.
+        reader.with_blob_filter(BlobFilter::new(true, has_included_way, has_included_relation))
     } else {
         reader
     };
@@ -619,9 +712,12 @@ fn tags_filter_two_pass(
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,
-        matched_way_ids: &matched_way_ids,
-        matched_relation_ids: &matched_relation_ids,
+        direct_way_ids: &direct_way_ids,
+        included_way_ids: &included_way_ids,
+        direct_relation_ids: &direct_relation_ids,
+        included_relation_ids: &included_relation_ids,
         way_dep_node_ids: &way_dep_node_ids,
+        relation_dep_node_ids: &relation_dep_node_ids,
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
@@ -635,6 +731,108 @@ fn tags_filter_two_pass(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Set an ID in the dense set and return whether it was newly inserted.
+fn set_if_absent(set: &mut IdSetDense, id: i64) -> bool {
+    if set.get(id) {
+        return false;
+    }
+    set.set(id);
+    true
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct RelationClosureSummary {
+    has_way: bool,
+    has_relation: bool,
+}
+
+/// Expand relation membership transitively for default tags-filter mode.
+///
+/// Starts from already-included relation IDs and repeatedly scans relation blobs:
+/// included relation -> include member nodes/ways/relations.
+/// Recursion terminates when no new relation IDs are discovered.
+fn collect_relation_member_closure(
+    input: &Path,
+    direct_io: bool,
+    included_relation_ids: &mut IdSetDense,
+    included_way_ids: &mut IdSetDense,
+    relation_dep_node_ids: &mut IdSetDense,
+) -> Result<RelationClosureSummary> {
+    let mut summary = RelationClosureSummary::default();
+
+    loop {
+        let mut added_relations = 0_u64;
+        let reader = ElementReader::open(input, direct_io)?
+            .with_blob_filter(BlobFilter::only_relations());
+
+        for block in reader.into_blocks_pipelined() {
+            let block = block?;
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element {
+                    if !included_relation_ids.get(r.id()) {
+                        continue;
+                    }
+                    summary.has_relation = true;
+                    for member in r.members() {
+                        match member.id {
+                            MemberId::Node(id) => {
+                                relation_dep_node_ids.set(id);
+                            }
+                            MemberId::Way(id) => {
+                                if set_if_absent(included_way_ids, id) {
+                                    summary.has_way = true;
+                                }
+                            }
+                            MemberId::Relation(id) => {
+                                if set_if_absent(included_relation_ids, id) {
+                                    added_relations += 1;
+                                }
+                            }
+                            MemberId::Unknown(..) => {}
+                        }
+                    }
+                }
+            }
+        }
+
+        if added_relations == 0 {
+            break;
+        }
+    }
+
+    Ok(summary)
+}
+
+/// Scan all way blobs and add node refs for ways selected for output.
+fn collect_way_node_dependencies(
+    input: &Path,
+    direct_io: bool,
+    included_way_ids: &IdSetDense,
+    skip_way_ids: Option<&IdSetDense>,
+    relation_dep_node_ids: &mut IdSetDense,
+) -> Result<()> {
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::new(false, true, false));
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements_skip_metadata() {
+            if let Element::Way(w) = &element
+                && included_way_ids.get(w.id())
+            {
+                if let Some(skip) = skip_way_ids
+                    && skip.get(w.id())
+                {
+                    continue;
+                }
+                for node_id in w.refs() {
+                    relation_dep_node_ids.set(node_id);
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 
 // ---------------------------------------------------------------------------

@@ -281,10 +281,11 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   and reports `total_violations` even when individual entries are capped. `check-refs`
   intentionally does not detect duplicates — ID uniqueness is `verify ids`'s job.
 
-- [ ] **tags-filter: resolve matched relation members.**
-  [osmium-tool#215](https://github.com/osmcode/osmium-tool/issues/215): when a relation
-  matches (without `-R`), pbfhogg does not pull in its member ways, nodes, or
-  sub-relations. Worse than osmium's original bug (which only missed sub-relations).
+- [x] **tags-filter: resolve matched relation members.**
+  [osmium-tool#215](https://github.com/osmcode/osmium-tool/issues/215): implemented for
+  default mode (without `-R`). Matched relations now resolve member ways, nodes, and
+  nested member relations transitively (cycle-safe), and node refs of included ways are
+  pulled in. `-R` behavior is unchanged (direct matches only).
 
 - [ ] **extract: antimeridian polygon handling.**
   [osmium-tool#220](https://github.com/osmcode/osmium-tool/issues/220),
@@ -322,4 +323,3 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   Relevant upstream:
   [osmium-tool#285](https://github.com/osmcode/osmium-tool/issues/285) (output header
   timestamp must reflect the filter cutoff, not the original file).
-

@@ -5,8 +5,9 @@ mod common;
 use common::{
     node_ids_id_only as node_ids, read_all_elements_id_only as read_all_elements,
     way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
-    write_test_pbf, TestNode, TestRelation, TestWay,
+    write_test_pbf, TestMember, TestNode, TestRelation, TestWay,
 };
+use pbfhogg::MemberId;
 use pbfhogg::tags_filter::tags_filter;
 use pbfhogg::writer::Compression;
 use tempfile::TempDir;
@@ -351,4 +352,147 @@ fn multiple_expressions_or_semantics() {
 
     assert_eq!(node_ids(&c), vec![1, 2]);
     assert_eq!(stats.nodes_matched, 2);
+}
+
+#[test]
+fn relation_match_includes_member_way_and_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] }, // unrelated
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+            TestWay { id: 11, refs: vec![3], tags: vec![] }, // unrelated
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    let stats = tags_filter(&input, &output, &exprs(&["type=multipolygon"]), false, Compression::default(), false, true)
+        .expect("filter");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert_eq!(way_ids(&c), vec![10]);
+    assert_eq!(node_ids(&c), vec![1, 2]);
+    assert_eq!(stats.relations_matched, 1);
+    assert_eq!(stats.ways_matched, 0);
+    assert_eq!(stats.ways_from_relations, 1);
+    assert_eq!(stats.nodes_from_ways, 0);
+    assert_eq!(stats.nodes_from_relations, 2);
+}
+
+#[test]
+fn relation_match_includes_nested_relation_members() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Relation(200), role: "" }],
+                tags: vec![("type", "route")],
+            },
+            TestRelation {
+                id: 200,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![],
+            },
+        ],
+    );
+
+    let _stats = tags_filter(&input, &output, &exprs(&["type=route"]), false, Compression::default(), false, true)
+        .expect("filter");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![100, 200]);
+    assert_eq!(way_ids(&c), vec![10]);
+    assert_eq!(node_ids(&c), vec![1, 2]);
+}
+
+#[test]
+fn relation_cycle_terminates_and_includes_each_once() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[],
+        &[],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Relation(200), role: "" }],
+                tags: vec![("type", "route")],
+            },
+            TestRelation {
+                id: 200,
+                members: vec![TestMember { id: MemberId::Relation(100), role: "" }],
+                tags: vec![],
+            },
+        ],
+    );
+
+    let _stats = tags_filter(&input, &output, &exprs(&["type=route"]), false, Compression::default(), false, true)
+        .expect("filter");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![100, 200]);
+}
+
+#[test]
+fn omit_referenced_does_not_expand_relation_members() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    let stats = tags_filter(&input, &output, &exprs(&["type=multipolygon"]), true, Compression::default(), false, true)
+        .expect("filter");
+    let c = read_all_elements(&output);
+
+    assert_eq!(relation_ids(&c), vec![100]);
+    assert!(way_ids(&c).is_empty());
+    assert!(node_ids(&c).is_empty());
+    assert_eq!(stats.relations_matched, 1);
 }

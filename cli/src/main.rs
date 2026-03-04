@@ -116,13 +116,17 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
-    /// Filter elements by tag expressions
+    /// Filter elements by tag expressions.
+    ///
+    /// Default mode (without `-R`) resolves relation members transitively:
+    /// matched relations pull in member ways, member nodes, nested member
+    /// relations, and node refs of included ways.
     TagsFilter {
         /// Input PBF file
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Omit referenced objects (faster, single pass)
+        /// Omit referenced objects (faster, single pass, direct matches only)
         #[arg(short = 'R', long = "omit-referenced")]
         omit_referenced: bool,
         /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")

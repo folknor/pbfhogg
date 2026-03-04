@@ -324,6 +324,17 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
+    /// Merge multiple OSC files into one OSC file
+    MergeChanges {
+        /// Input OSC files (.osc.gz)
+        #[arg(required = true)]
+        changes: Vec<PathBuf>,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Keep only the last change per object (type + id)
+        #[arg(long)]
+        simplify: bool,
+    },
     /// Check if a PBF file has blob-level indexdata
     IsIndexed {
         /// Input PBF file
@@ -448,16 +459,24 @@ fn main() {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::CheckRefs { file, check_relations, io } => {
-            run_check_refs(&file, check_relations, io.direct_io)
-        }
+        Command::CheckRefs {
+            file,
+            check_relations,
+            io,
+        } => run_check_refs(&file, check_relations, io.direct_io),
         Command::TagsCount {
             file,
             min_count,
             type_filter,
             force,
             io,
-        } => run_tags_count(&file, min_count, type_filter.as_deref(), io.direct_io, force.force),
+        } => run_tags_count(
+            &file,
+            min_count,
+            type_filter.as_deref(),
+            io.direct_io,
+            force.force,
+        ),
         Command::Cat {
             files,
             output,
@@ -473,7 +492,14 @@ fn main() {
             io.direct_io,
             force.force,
         ),
-        Command::Sort { file, output, compression, io, uring, force } => run_sort(
+        Command::Sort {
+            file,
+            output,
+            compression,
+            io,
+            uring,
+            force,
+        } => run_sort(
             &file,
             &output.output,
             &compression.compression,
@@ -498,9 +524,11 @@ fn main() {
             io.direct_io,
             force.force,
         ),
-        Command::TagsFilterOsc { changes, output, expressions } => {
-            run_tags_filter_osc(&changes, &output.output, &expressions)
-        }
+        Command::TagsFilterOsc {
+            changes,
+            output,
+            expressions,
+        } => run_tags_filter_osc(&changes, &output.output, &expressions),
         Command::Diff {
             old,
             new,
@@ -508,10 +536,21 @@ fn main() {
             verbose,
             type_filter,
             io,
-        } => run_diff(&old, &new, suppress_common, verbose, type_filter.as_deref(), io.direct_io),
-        Command::DeriveChanges { old, new, increment_version, output, io } => {
-            run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version)
-        }
+        } => run_diff(
+            &old,
+            &new,
+            suppress_common,
+            verbose,
+            type_filter.as_deref(),
+            io.direct_io,
+        ),
+        Command::DeriveChanges {
+            old,
+            new,
+            increment_version,
+            output,
+            io,
+        } => run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version),
         Command::Getid {
             file,
             output,
@@ -581,16 +620,36 @@ fn main() {
             io.direct_io,
             force.force,
         ),
-        Command::TimeFilter { file, output, timestamp, compression, io } => run_time_filter(
+        Command::TimeFilter {
+            file,
+            output,
+            timestamp,
+            compression,
+            io,
+        } => run_time_filter(
             &file,
             &output.output,
             &timestamp,
             &compression.compression,
             io.direct_io,
         ),
-        Command::Inspect { file, blocks, id_ranges, locations, anomalies, json, io } => {
-            run_inspect(&file, blocks, id_ranges, locations, anomalies, json, io.direct_io)
-        }
+        Command::Inspect {
+            file,
+            blocks,
+            id_ranges,
+            locations,
+            anomalies,
+            json,
+            io,
+        } => run_inspect(
+            &file,
+            blocks,
+            id_ranges,
+            locations,
+            anomalies,
+            json,
+            io.direct_io,
+        ),
         Command::NodeStats { file, io, force } => run_node_stats(&file, io.direct_io, force.force),
         Command::Merge {
             base,
@@ -609,23 +668,70 @@ fn main() {
             uring.io_uring,
             force.force,
         ),
+        Command::MergeChanges {
+            changes,
+            output,
+            simplify,
+        } => run_merge_changes(&changes, &output.output, simplify),
         Command::IsIndexed { file, io } => run_is_indexed(&file, io.direct_io),
         Command::Verify { command } => match command {
-            VerifyCommand::Ids { file, full, type_filter, max_errors, json, quiet, io } => {
-                run_verify_ids(&file, full, type_filter.as_deref(), max_errors, json, quiet, io.direct_io)
-            }
-            VerifyCommand::Refs { file, check_relations, json, quiet, io } => {
-                run_verify_refs(&file, check_relations, json, quiet, io.direct_io)
-            }
-            VerifyCommand::All { file, full, type_filter, max_errors, check_relations, json, quiet, io } => {
-                run_verify_all(&file, full, type_filter.as_deref(), max_errors, check_relations, json, quiet, io.direct_io)
-            }
+            VerifyCommand::Ids {
+                file,
+                full,
+                type_filter,
+                max_errors,
+                json,
+                quiet,
+                io,
+            } => run_verify_ids(
+                &file,
+                full,
+                type_filter.as_deref(),
+                max_errors,
+                json,
+                quiet,
+                io.direct_io,
+            ),
+            VerifyCommand::Refs {
+                file,
+                check_relations,
+                json,
+                quiet,
+                io,
+            } => run_verify_refs(&file, check_relations, json, quiet, io.direct_io),
+            VerifyCommand::All {
+                file,
+                full,
+                type_filter,
+                max_errors,
+                check_relations,
+                json,
+                quiet,
+                io,
+            } => run_verify_all(
+                &file,
+                full,
+                type_filter.as_deref(),
+                max_errors,
+                check_relations,
+                json,
+                quiet,
+                io.direct_io,
+            ),
         },
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
-        Command::BenchWrite { file, compression, writer } => run_bench_write(&file, &compression, &writer),
-        Command::BenchMerge { base, changes, output, compression, io_mode } => {
-            run_bench_merge(&base, &changes, &output.output, &compression, &io_mode)
-        }
+        Command::BenchWrite {
+            file,
+            compression,
+            writer,
+        } => run_bench_write(&file, &compression, &writer),
+        Command::BenchMerge {
+            base,
+            changes,
+            output,
+            compression,
+            io_mode,
+        } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
     };
 
     if let Err(e) = result {
@@ -634,7 +740,10 @@ fn main() {
     }
 }
 
-fn run_is_indexed(path: &std::path::Path, direct_io: bool) -> Result<(), Box<dyn std::error::Error>> {
+fn run_is_indexed(
+    path: &std::path::Path,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     if pbfhogg::has_indexdata(path, direct_io)? {
         println!("indexed");
     } else {
@@ -655,10 +764,18 @@ fn run_verify_ids(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use pbfhogg::verify_ids::VerifyIdsOptions;
 
-    let opts = VerifyIdsOptions { full, type_filter, max_errors, direct_io };
+    let opts = VerifyIdsOptions {
+        full,
+        type_filter,
+        max_errors,
+        direct_io,
+    };
     let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
 
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("input.osm.pbf");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("input.osm.pbf");
     if json {
         println!("{}", report.to_json(file_name)?);
     } else if !quiet {
@@ -705,10 +822,16 @@ fn run_verify_refs(
                 println!("Missing way refs in relations: {}", result.missing_way_refs);
             }
             if result.missing_node_members > 0 {
-                println!("Missing node members in relations: {}", result.missing_node_members);
+                println!(
+                    "Missing node members in relations: {}",
+                    result.missing_node_members
+                );
             }
             if result.missing_relation_members > 0 {
-                println!("Missing relation members: {}", result.missing_relation_members);
+                println!(
+                    "Missing relation members: {}",
+                    result.missing_relation_members
+                );
             }
         }
         if result.is_valid() {
@@ -740,14 +863,22 @@ fn run_verify_all(
     use pbfhogg::verify_ids::VerifyIdsOptions;
 
     // Run ID check
-    let opts = VerifyIdsOptions { full, type_filter, max_errors, direct_io };
+    let opts = VerifyIdsOptions {
+        full,
+        type_filter,
+        max_errors,
+        direct_io,
+    };
     let ids_report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
 
     // Run ref check
     let refs_result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
 
     let all_passed = ids_report.passed && refs_result.is_valid();
-    let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("input.osm.pbf");
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("input.osm.pbf");
 
     if json {
         let value = serde_json::json!({
@@ -813,10 +944,7 @@ fn run_check_refs(
     }
     if check_relations {
         if result.missing_way_refs > 0 {
-            println!(
-                "Missing way refs in relations: {}",
-                result.missing_way_refs
-            );
+            println!("Missing way refs in relations: {}", result.missing_way_refs);
         }
         if result.missing_node_members > 0 {
             println!(
@@ -886,7 +1014,12 @@ fn run_sort(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let opts = pbfhogg::sort::SortOptions { compression, direct_io, io_uring, force };
+    let opts = pbfhogg::sort::SortOptions {
+        compression,
+        direct_io,
+        io_uring,
+        force,
+    };
     let stats = pbfhogg::sort::sort(file, output, &opts)?;
     stats.print_summary();
     Ok(())
@@ -902,7 +1035,15 @@ fn run_tags_filter(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, compression, direct_io, force)?;
+    let stats = pbfhogg::tags_filter::tags_filter(
+        file,
+        output,
+        expressions,
+        omit_referenced,
+        compression,
+        direct_io,
+        force,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -956,7 +1097,8 @@ fn run_derive_changes(
     direct_io: bool,
     increment_version: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version)?;
+    let stats =
+        pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version)?;
     stats.print_summary();
     Ok(())
 }
@@ -973,7 +1115,15 @@ fn run_getid(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, ids)?;
-    let stats = pbfhogg::getid::getid(file, output, &id_set, add_referenced, compression, direct_io, force)?;
+    let stats = pbfhogg::getid::getid(
+        file,
+        output,
+        &id_set,
+        add_referenced,
+        compression,
+        direct_io,
+        force,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -1023,7 +1173,15 @@ fn run_extract(
         (None, None) => return Err("one of --bbox or --polygon is required".into()),
         (Some(_), Some(_)) => return Err("--bbox and --polygon are mutually exclusive".into()),
     };
-    let stats = pbfhogg::extract::extract(file, output, &region, strategy, compression, direct_io, force)?;
+    let stats = pbfhogg::extract::extract(
+        file,
+        output,
+        &region,
+        strategy,
+        compression,
+        direct_io,
+        force,
+    )?;
     stats.print_summary();
     Ok(())
 }
@@ -1038,7 +1196,12 @@ fn run_add_locations_to_ways(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
-        file, output, keep_untagged_nodes, compression, direct_io, force,
+        file,
+        output,
+        keep_untagged_nodes,
+        compression,
+        direct_io,
+        force,
     )?;
     stats.print_summary();
     Ok(())
@@ -1159,9 +1322,7 @@ fn run_inspect(
     } else {
         blocks
     };
-    let mut report = pbfhogg::inspect::inspect(
-        path, show_blocks, id_ranges, locations, direct_io,
-    )?;
+    let mut report = pbfhogg::inspect::inspect(path, show_blocks, id_ranges, locations, direct_io)?;
     if json {
         let value = report.to_json_filtered(block_limit, anomalies);
         println!("{value}");
@@ -1191,8 +1352,24 @@ fn run_merge(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let opts = pbfhogg::merge::MergeOptions { compression, direct_io, io_uring, force };
+    let opts = pbfhogg::merge::MergeOptions {
+        compression,
+        direct_io,
+        io_uring,
+        force,
+    };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_merge_changes(
+    changes: &[PathBuf],
+    output: &std::path::Path,
+    simplify: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let inputs: Vec<&std::path::Path> = changes.iter().map(AsRef::as_ref).collect();
+    let stats = pbfhogg::merge_changes::merge_changes(&inputs, output, simplify)?;
     stats.print_summary();
     Ok(())
 }
@@ -1220,7 +1397,9 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
             let start = Instant::now();
             let (nodes, ways, rels) = reader.par_map_reduce(
                 |el| match el {
-                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => (1u64, 0u64, 0u64),
+                    pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                        (1u64, 0u64, 0u64)
+                    }
                     pbfhogg::Element::Way(_) => (0, 1, 0),
                     pbfhogg::Element::Relation(_) => (0, 0, 1),
                     _ => (0, 0, 0),
@@ -1256,7 +1435,9 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
                 if let pbfhogg::BlobDecode::OsmData(block) = blob.decode()? {
                     for el in block.elements() {
                         match el {
-                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => nodes += 1,
+                            pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
+                                nodes += 1
+                            }
                             pbfhogg::Element::Way(_) => ways += 1,
                             pbfhogg::Element::Relation(_) => rels += 1,
                             _ => {}
@@ -1266,7 +1447,12 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
             }
             (start.elapsed().as_millis(), nodes, ways, rels)
         }
-        other => return Err(format!("unknown read mode: {other} (expected: sequential, parallel, pipelined, blobreader)").into()),
+        other => {
+            return Err(format!(
+                "unknown read mode: {other} (expected: sequential, parallel, pipelined, blobreader)"
+            )
+            .into())
+        }
     };
 
     eprintln!("elapsed_ms={elapsed_ms}");
@@ -1280,8 +1466,8 @@ fn bench_write_loop<W: std::io::Write>(
     path: &std::path::Path,
     writer: &mut pbfhogg::writer::PbfWriter<W>,
 ) -> Result<(u64, u64, u64), Box<dyn std::error::Error>> {
-    use std::io::BufReader;
     use pbfhogg::block_builder::{BlockBuilder, MemberData};
+    use std::io::BufReader;
 
     let reader = pbfhogg::BlobReader::new(BufReader::new(std::fs::File::open(path)?));
     let mut bb = BlockBuilder::new();
@@ -1332,10 +1518,13 @@ fn bench_write_loop<W: std::io::Write>(
                             }
                         }
                         let tags: Vec<_> = r.tags().collect();
-                        let members: Vec<_> = r.members().map(|m| MemberData {
-                            id: m.id,
-                            role: m.role().ok().unwrap_or_default(),
-                        }).collect();
+                        let members: Vec<_> = r
+                            .members()
+                            .map(|m| MemberData {
+                                id: m.id,
+                                role: m.role().ok().unwrap_or_default(),
+                            })
+                            .collect();
                         bb.add_relation(r.id(), &tags, &members, None);
                         rels += 1;
                     }
@@ -1357,8 +1546,8 @@ fn run_bench_write(
     compression: &str,
     writer_mode: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use std::time::Instant;
     use pbfhogg::block_builder::HeaderBuilder;
+    use std::time::Instant;
 
     let compression: Compression = compression.parse()?;
     let header_bytes = HeaderBuilder::new().build()?;
@@ -1386,7 +1575,9 @@ fn run_bench_write(
             let elapsed_ms = start.elapsed().as_millis();
             (elapsed_ms, nodes, ways, rels)
         }
-        other => return Err(format!("unknown writer mode: {other} (expected: sync, pipelined)").into()),
+        other => {
+            return Err(format!("unknown writer mode: {other} (expected: sync, pipelined)").into());
+        }
     };
 
     eprintln!("elapsed_ms={elapsed_ms}");
@@ -1430,13 +1621,20 @@ fn run_bench_merge(
     let io_uring = match io_mode {
         "buffered" => false,
         "uring" => true,
-        other => return Err(format!("unknown I/O mode: {other} (expected: buffered, uring)").into()),
+        other => {
+            return Err(format!("unknown I/O mode: {other} (expected: buffered, uring)").into());
+        }
     };
 
     let _ = std::fs::remove_file(output);
 
     let start = Instant::now();
-    let opts = pbfhogg::merge::MergeOptions { compression, direct_io: false, io_uring, force: true };
+    let opts = pbfhogg::merge::MergeOptions {
+        compression,
+        direct_io: false,
+        io_uring,
+        force: true,
+    };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     let elapsed_ms = start.elapsed().as_millis();
 

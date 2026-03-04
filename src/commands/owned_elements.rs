@@ -7,6 +7,7 @@ use crate::MemberId;
 // are low-volume types (derive_changes/diff output), not hot-path allocations.
 // ---------------------------------------------------------------------------
 
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedNode {
     pub(crate) id: i64,
     pub(crate) decimicro_lat: i32,
@@ -15,6 +16,7 @@ pub(crate) struct OwnedNode {
     pub(crate) version: Option<i32>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedWay {
     pub(crate) id: i64,
     pub(crate) tags: Vec<(String, String)>,
@@ -22,11 +24,13 @@ pub(crate) struct OwnedWay {
     pub(crate) version: Option<i32>,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedMember {
     pub(crate) id: MemberId,
     pub(crate) role: String,
 }
 
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedRelation {
     pub(crate) id: i64,
     pub(crate) tags: Vec<(String, String)>,
@@ -39,9 +43,7 @@ pub(crate) struct OwnedRelation {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn nodes_equal(a: &OwnedNode, b: &OwnedNode) -> bool {
-    a.decimicro_lat == b.decimicro_lat
-        && a.decimicro_lon == b.decimicro_lon
-        && a.tags == b.tags
+    a.decimicro_lat == b.decimicro_lat && a.decimicro_lon == b.decimicro_lon && a.tags == b.tags
 }
 
 pub(crate) fn ways_equal(a: &OwnedWay, b: &OwnedWay) -> bool {
@@ -82,4 +84,3 @@ pub(crate) fn format_coord(buf: &mut String, deg: f64) {
     let trimmed = buf.trim_end_matches('0').trim_end_matches('.');
     buf.truncate(trimmed.len());
 }
-

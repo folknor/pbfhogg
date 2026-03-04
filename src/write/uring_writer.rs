@@ -253,9 +253,6 @@ impl UringState {
         // Safety: the SQE references a registered buffer (buf_idx) and a
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
-        //
-        // With sqpoll, submit() returns without a syscall, so SQ entries
-        // accumulate. If the SQ is full, wait for the kernel to drain it.
         self.push_sqe(&sqe)?;
         self.ring
             .submitter()
@@ -271,9 +268,9 @@ impl UringState {
     /// Register the input file descriptor at `IN_FD_IDX` for `ReadFixed` CopyRange.
     ///
     /// Only registers on the first call; subsequent calls are no-ops.
-    /// Drains all in-flight SQEs first — with sqpoll, the kernel polling thread
-    /// may hold references to the file table during I/O processing. The stall
-    /// is bounded by the header write (1 partial buffer, <1ms for merge).
+    /// Drains all in-flight SQEs first — the kernel may hold references to the
+    /// file table during I/O processing. The stall is bounded by the header
+    /// write (1 partial buffer, <1ms for merge).
     #[cfg(feature = "linux-direct-io")]
     fn register_input_fd(&mut self, in_fd: std::os::unix::io::RawFd) -> io::Result<()> {
         if self.input_fd_registered {
@@ -337,10 +334,6 @@ impl UringState {
 
         // Safety: both SQEs reference registered buffers and registered fds.
         // The buffer will not be touched until both CQEs are reaped.
-        //
-        // With sqpoll, submit() returns without a syscall when the kernel thread
-        // is active, so SQ entries accumulate faster than the kernel drains them.
-        // If the SQ is full, wait for the kernel to consume entries before pushing.
         self.push_sqe_pair(&read_sqe, &write_sqe)?;
         self.ring
             .submitter()
@@ -376,10 +369,6 @@ impl UringState {
     }
 
     /// Push a single SQE to the submission queue, waiting for SQ space if full.
-    ///
-    /// With sqpoll, the kernel polling thread drains the SQ asynchronously.
-    /// If we push faster than it drains, the SQ fills up. Instead of failing,
-    /// call `squeue_wait()` to block until the kernel frees SQ entries.
     fn push_sqe(&mut self, sqe: &io_uring::squeue::Entry) -> io::Result<()> {
         // Safety: SQE references registered buffers/fds, validated by callers.
         unsafe {
@@ -404,9 +393,7 @@ impl UringState {
     /// Push a linked SQE pair (ReadFixed + WriteFixed) to the submission queue.
     ///
     /// Both SQEs must be pushed in the same `SubmissionQueue` scope to ensure
-    /// the IO_LINK chain is visible to the kernel atomically. If we dropped the
-    /// queue between pushes, the kernel polling thread could see a broken link
-    /// (first SQE with IO_LINK but no linked successor).
+    /// the IO_LINK chain is visible to the kernel atomically.
     fn push_sqe_pair(
         &mut self,
         first: &io_uring::squeue::Entry,
@@ -579,9 +566,8 @@ pub(crate) fn uring_writer_thread(
     path: PathBuf,
     framed_header: Vec<u8>,
     init_tx: SyncSender<io::Result<()>>,
-    sqpoll: bool,
 ) -> io::Result<()> {
-    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx, sqpoll);
+    let result = uring_init_and_run(&rx, &path, &framed_header, &init_tx);
     if let Err(ref e) = result {
         eprintln!("[uring_writer] error: {e}");
     }
@@ -598,26 +584,16 @@ fn uring_init_and_run(
     path: &std::path::Path,
     framed_header: &[u8],
     init_tx: &SyncSender<io::Result<()>>,
-    sqpoll: bool,
 ) -> io::Result<()> {
     // Step 1: Allocate buffer pool.
     let pool = AlignedBufferPool::new(NUM_BUFS, BUF_SIZE)?;
     let iovecs = pool.iovecs();
 
     // Step 2: Create io_uring ring.
-    // SQ polling (`setup_sqpoll`) creates a kernel thread that polls the SQ,
-    // eliminating `io_uring_enter` syscalls. The thread sleeps after idle_ms
-    // of inactivity. Requires Linux 5.12+ for unprivileged use.
     let mut builder = IoUring::builder();
     builder.setup_clamp();
-    if sqpoll {
-        const SQPOLL_IDLE_MS: u32 = 2000;
-        builder.setup_sqpoll(SQPOLL_IDLE_MS);
-    }
     // Ring depth: 2× buffer count for linked ReadFixed+WriteFixed pairs, plus
-    // headroom for standalone writes. With sqpoll, submit() returns without a
-    // syscall so SQ entries accumulate — the extra headroom prevents SQ full
-    // stalls on burst CopyRange sequences.
+    // headroom for standalone writes.
     let ring_depth = u32::from(NUM_BUFS) * 4;
     let ring = builder
         .build(ring_depth)

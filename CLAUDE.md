@@ -122,4 +122,4 @@ Zlib backend is hardcoded to `zlib-rs` (pure Rust, no C compiler, faster than zl
 **Write:** pipelined zlib 4m27s, pipelined none/zstd ~4m20s, sync zlib 14m34s.
 **Merge** (645K-change daily diff, 303K passthrough / 19.6K rewritten blobs):
 buffered+zlib 17.3s, uring+zlib 15.2s, buffered+none 14.9s, **uring+none 11.9s**.
-All merge variants under 600 MB RSS. io_uring wins 12-20% at this scale (page cache overflow). sqpoll adds no benefit.
+All merge variants under 600 MB RSS. io_uring wins 12-20% at this scale (page cache overflow).

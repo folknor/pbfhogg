@@ -55,9 +55,6 @@ struct UringArg {
     /// Use io_uring for output I/O (requires linux-io-uring feature)
     #[arg(long)]
     io_uring: bool,
-    /// Use SQ polling for io_uring (requires --io-uring)
-    #[arg(long, requires = "io_uring")]
-    sqpoll: bool,
 }
 
 #[derive(Subcommand)]
@@ -336,7 +333,7 @@ enum Command {
         /// Compression spec (e.g. none, zlib, zstd:3)
         #[arg(long, default_value = "zlib")]
         compression: String,
-        /// I/O mode: buffered, uring, uring-sqpoll
+        /// I/O mode: buffered, uring
         #[arg(long, default_value = "buffered")]
         io_mode: String,
     },
@@ -449,7 +446,6 @@ fn main() {
             &compression.compression,
             io.direct_io,
             uring.io_uring,
-            uring.sqpoll,
             force.force,
         ),
         Command::TagsFilter {
@@ -568,7 +564,6 @@ fn main() {
             &compression.compression,
             io.direct_io,
             uring.io_uring,
-            uring.sqpoll,
             force.force,
         ),
         Command::IsIndexed { file, io } => run_is_indexed(&file, io.direct_io),
@@ -845,11 +840,10 @@ fn run_sort(
     compression: &str,
     direct_io: bool,
     io_uring: bool,
-    sqpoll: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let opts = pbfhogg::sort::SortOptions { compression, direct_io, io_uring, sqpoll, force };
+    let opts = pbfhogg::sort::SortOptions { compression, direct_io, io_uring, force };
     let stats = pbfhogg::sort::sort(file, output, &opts)?;
     stats.print_summary();
     Ok(())
@@ -1028,11 +1022,10 @@ fn run_merge(
     compression: &str,
     direct_io: bool,
     io_uring: bool,
-    sqpoll: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let opts = pbfhogg::merge::MergeOptions { compression, direct_io, io_uring, sqpoll, force };
+    let opts = pbfhogg::merge::MergeOptions { compression, direct_io, io_uring, force };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     stats.print_summary();
     Ok(())
@@ -1268,17 +1261,16 @@ fn run_bench_merge(
     use std::time::Instant;
 
     let compression: Compression = compression.parse()?;
-    let (io_uring, sqpoll) = match io_mode {
-        "buffered" => (false, false),
-        "uring" => (true, false),
-        "uring-sqpoll" => (true, true),
-        other => return Err(format!("unknown I/O mode: {other} (expected: buffered, uring, uring-sqpoll)").into()),
+    let io_uring = match io_mode {
+        "buffered" => false,
+        "uring" => true,
+        other => return Err(format!("unknown I/O mode: {other} (expected: buffered, uring)").into()),
     };
 
     let _ = std::fs::remove_file(output);
 
     let start = Instant::now();
-    let opts = pbfhogg::merge::MergeOptions { compression, direct_io: false, io_uring, sqpoll, force: true };
+    let opts = pbfhogg::merge::MergeOptions { compression, direct_io: false, io_uring, force: true };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     let elapsed_ms = start.elapsed().as_millis();
 

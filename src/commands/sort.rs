@@ -152,14 +152,13 @@ pub struct SortOptions {
     pub compression: Compression,
     pub direct_io: bool,
     pub io_uring: bool,
-    pub sqpoll: bool,
     pub force: bool,
 }
 
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats> {
-    let SortOptions { compression, direct_io, io_uring, sqpoll, force } = *opts;
+    let SortOptions { compression, direct_io, io_uring, force } = *opts;
     require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to scan element IDs (significantly slower).")?;
@@ -191,7 +190,6 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
         &header_bytes,
         direct_io,
         io_uring,
-        sqpoll,
     )?;
 
     // Open input for random-access reads

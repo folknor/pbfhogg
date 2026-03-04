@@ -404,16 +404,14 @@ pub(crate) fn writer_from_header_bytes(
     header_bytes: &[u8],
     direct_io: bool,
     io_uring: bool,
-    sqpoll: bool,
 ) -> Result<PbfWriter<FileWriter>> {
     if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {
-            Ok(PbfWriter::to_path_uring(output, compression, header_bytes, sqpoll)?)
+            Ok(PbfWriter::to_path_uring(output, compression, header_bytes)?)
         }
         #[cfg(not(feature = "linux-io-uring"))]
         {
-            let _ = sqpoll;
             Err("--io-uring requires the linux-io-uring feature".into())
         }
     } else if direct_io {

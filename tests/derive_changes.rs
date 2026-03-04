@@ -288,7 +288,7 @@ fn roundtrip_with_merge() {
     // Apply changes back to old → should produce equivalent of new
     merge(&old, &osc, &result, &MergeOptions {
         compression: pbfhogg::writer::Compression::default(),
-        direct_io: false, io_uring: false, sqpoll: false, force: true,
+        direct_io: false, io_uring: false, force: true,
     }).expect("merge");
 
     let result_contents = read_all_elements(&result);

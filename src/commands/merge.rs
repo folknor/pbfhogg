@@ -1012,7 +1012,6 @@ pub struct MergeOptions {
     pub compression: Compression,
     pub direct_io: bool,
     pub io_uring: bool,
-    pub sqpoll: bool,
     pub force: bool,
 }
 
@@ -1024,7 +1023,7 @@ pub fn merge(
     output_pbf: &Path,
     opts: &MergeOptions,
 ) -> Result<MergeStats> {
-    let MergeOptions { compression, direct_io, io_uring, sqpoll, force } = *opts;
+    let MergeOptions { compression, direct_io, io_uring, force } = *opts;
     require_indexdata(base_pbf, direct_io, force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).")?;
@@ -1074,7 +1073,6 @@ pub fn merge(
         &header_bytes,
         direct_io,
         io_uring,
-        sqpoll,
     )?;
 
     // Step 5: Spawn reader thread with read-ahead

@@ -31,6 +31,16 @@ non-packed single-element fields is protobuf-net (C#), which is rarely used for 
 data. libosmium had the same bug ([libosmium#389](https://github.com/osmcode/libosmium/issues/389))
 for years before anyone noticed.
 
+**Fix approach (if ever needed):** For each packed repeated field, add an alternative
+match arm for `WIRE_VARINT` that reads a single value. Length-delimited repeated fields
+(like string table entries) already work since non-packed and packed use the same wire
+type — the fix is only needed for numeric repeated fields (varint, sint32, sint64, etc).
+Multiple non-packed entries for the same field should accumulate, not overwrite — repeated
+varint fields need to append to a buffer rather than storing a single slice. libosmium's
+fix (PR #400) handles only the single-value case; a general fix should handle multiple
+non-packed entries. The key performance question is whether checking both wire types in the
+hot path is acceptable, or whether a fallback re-parse on finding nothing is better.
+
 **Affected parsers:**
 - `WireNode::parse()` — fields 2 (keys), 3 (vals)
 - `WireWay::parse()` — fields 2 (keys), 3 (vals), 8 (refs), 9 (lats), 10 (lons)

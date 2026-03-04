@@ -258,14 +258,7 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   stage — this would fold it into the index itself.
 
 - [ ] **tags-filter should preserve delete actions from OSC input.**
-  [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): when tags-filter
-  processes an OSC file, delete actions are silently dropped because they carry no tags
-  and therefore never match any filter expression. This matters for diff pipelines — if
-  you tags-filter a daily diff to extract e.g. `highway=*` changes before merging, the
-  filtered diff loses all deletes. The subsequent merge keeps stale objects that should
-  have been removed. osmium's workaround is to not use tags-filter on OSC files at all.
-  pbfhogg `tags-filter` currently only operates on PBF input, but if we add OSC support
-  (or if someone pipes `derive-changes` output through `tags-filter` in a pipeline), we
-  need a `--keep-deletes` or `--passthrough-deletes` flag to forward delete actions
-  unfiltered. Design consideration: deletes could also be auto-forwarded by default when
-  input is OSC, since dropping them is almost never what the user wants.
+  [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): new `tags-filter-osc`
+  subcommand — filters creates/modifies by tag expressions, forwards all deletes
+  unconditionally. ~170 lines, no base PBF needed. Design and implementation plan
+  in `notes/tags-filter-osc-support.md`.

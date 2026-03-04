@@ -99,7 +99,7 @@ impl PartialOrd for OwnedNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedNode {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
 }
 
 struct OwnedWay {
@@ -117,7 +117,7 @@ impl PartialOrd for OwnedWay {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedWay {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
 }
 
 struct OwnedRelation {
@@ -135,7 +135,7 @@ impl PartialOrd for OwnedRelation {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedRelation {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { self.id.cmp(&other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,7 +170,9 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
     eprintln!("  {} OSMData blobs indexed", entries.len());
 
     // Sort by (type_order, min_id)
-    entries.sort_by_key(|e| (type_order(e.index.kind), e.index.min_id));
+    entries.sort_by_key(|e| {
+        (type_order(e.index.kind), super::blob_osm_first_key(e.index.min_id, e.index.max_id))
+    });
 
     // Detect overlaps
     let overlaps = detect_overlaps(&entries);
@@ -371,7 +373,8 @@ fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
     let mut overlaps = vec![false; entries.len()];
     for i in 0..entries.len().saturating_sub(1) {
         if entries[i].index.kind == entries[i + 1].index.kind
-            && entries[i].index.max_id >= entries[i + 1].index.min_id
+            && super::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
+                >= super::blob_osm_first_key(entries[i + 1].index.min_id, entries[i + 1].index.max_id)
         {
             overlaps[i] = true;
             overlaps[i + 1] = true;
@@ -502,7 +505,7 @@ fn sweep_merge_nodes(
 
     for entry in entries {
         // Flush elements guaranteed in final position: ID < this blob's min_id
-        flush_heap_below(&mut heap, entry.index.min_id, |node| {
+        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |node| {
             write_single_node(&node, bb, writer)?;
             stats.nodes += 1;
             Ok(())
@@ -540,7 +543,7 @@ fn sweep_merge_ways(
     let mut frame_buf: Vec<u8> = Vec::new();
 
     for entry in entries {
-        flush_heap_below(&mut heap, entry.index.min_id, |way| {
+        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |way| {
             write_single_way(&way, bb, writer)?;
             stats.ways += 1;
             Ok(())
@@ -574,7 +577,7 @@ fn sweep_merge_rels(
     let mut frame_buf: Vec<u8> = Vec::new();
 
     for entry in entries {
-        flush_heap_below(&mut heap, entry.index.min_id, |rel| {
+        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |rel| {
             write_single_relation(&rel, bb, writer)?;
             stats.relations += 1;
             Ok(())
@@ -606,7 +609,7 @@ fn flush_heap_below<T: Ord>(
 where
     T: HasId,
 {
-    while heap.peek().map_or(false, |Reverse(e)| e.id() < below) {
+    while heap.peek().map_or(false, |Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt()) {
         if let Some(Reverse(element)) = heap.pop() {
             emit(element)?;
         }

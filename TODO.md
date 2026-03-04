@@ -240,25 +240,14 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   decode+write (cat --type), and allocations. Run:
   `brokkr profile --dataset germany`
 
+- [ ] **Benchmark OSM ID ordering overhead.** `osm_id_cmp` / `osm_id_key` replaced
+  plain `i64::cmp` in sort, merge, diff, and derive-changes. For positive-only IDs
+  (all production PBFs), the extra tuple construction should be optimized away, but
+  verify with A/B benchmarks on Denmark and Japan:
+  `brokkr bench read`, `brokkr bench merge`, `brokkr bench commands sort`
+
 
 ## Upstream issues with action items (2026-03-03)
-
-- [ ] **Test reader with non-packed single-value repeated fields.**
-  [libosmium#389](https://github.com/osmcode/libosmium/issues/389): Protobuf-net (C#)
-  emits single-element packed fields as non-packed. libosmium's hand-rolled parser
-  silently dropped the data (tags lost). Our wire parser (`PackedIter` in protohoggr)
-  also assumes packed encoding. Create a minimal PBF where a packed repeated field
-  (e.g. `keys`, `vals`) is encoded as individual non-packed entries and verify whether
-  we silently drop them or error. The protobuf spec says decoders "must" accept both.
-
-- [ ] **Verify sort/merge ordering with negative IDs.**
-  [osmium-tool#303](https://github.com/osmcode/osmium-tool/issues/303): osmium's sort
-  orders 0 first, then negative IDs, then positive IDs by absolute value. Their merge
-  had a bug where it used plain numeric comparison instead, causing failures on PBFs with
-  negative IDs. pbfhogg sort and merge both use plain `i64` comparison — which matches
-  osmium's *buggy* merge, not their sort. Negative IDs are uncommon in production PBFs
-  (JOSM uses them for uncommitted data) but if someone feeds us a JOSM export or custom
-  PBF, our sort output would differ from osmium's.
 
 - [ ] **Use spare latitude bit in DenseMmapIndex for tagged/untagged node flag.**
   [libosmium#395](https://github.com/osmcode/libosmium/issues/395): latitude only needs
@@ -280,18 +269,3 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   need a `--keep-deletes` or `--passthrough-deletes` flag to forward delete actions
   unfiltered. Design consideration: deletes could also be auto-forwarded by default when
   input is OSC, since dropping them is almost never what the user wants.
-
-## Deep-dive findings (2026-03-03)
-
-- [x] **P1 performance: passthrough coalescing currently memcpy-copies full frames.**
-  Fixed: coalescers now collect `Vec<Vec<u8>>` chunks instead of concatenating
-  into a single `Vec<u8>`. New `PipelinePayload::ByteChunks` variant and
-  `write_raw_chunks` API let the writer thread drain chunks sequentially.
-  Verified identical output via `brokkr verify merge` and
-  `brokkr verify add-locations-to-ways`.
-
-- [ ] **P2 correctness edge case: Null Island ambiguity in dense index sentinel.**
-  `DenseMmapIndex` uses `(0,0)` as "unset", so valid node coordinates at exactly
-  `0,0` are treated as missing (currently documented as acceptable). If we want
-  strict correctness for all coordinates, store a separate occupancy bitmap (1
-  bit/node) or reserve an impossible sentinel with explicit valid-bit tracking.

@@ -203,7 +203,7 @@ fn classify<T: MergeElement>(old: &Option<T>, new: &Option<T>) -> MergeAction {
         (None, None) => MergeAction::Done,
         (Some(_), None) => MergeAction::Delete,
         (None, Some(_)) => MergeAction::Create,
-        (Some(o), Some(n)) => match o.id().cmp(&n.id()) {
+        (Some(o), Some(n)) => match super::osm_id_cmp(o.id(), n.id()) {
             Ordering::Less => MergeAction::Delete,
             Ordering::Greater => MergeAction::Create,
             Ordering::Equal => {

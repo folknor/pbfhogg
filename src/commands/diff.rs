@@ -240,7 +240,7 @@ fn streaming_diff_phase<T: DiffElement>(
             }
             (Some(o), Some(n)) => {
                 emit_matched_pair(o, n, output, opts, stats, &write_details)?;
-                match o.id().cmp(&n.id()) {
+                match super::osm_id_cmp(o.id(), n.id()) {
                     Ordering::Less => {
                         old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                     }

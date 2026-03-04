@@ -257,7 +257,7 @@ impl DiffRanges {
             .chain(diff.deleted_nodes.iter())
             .copied()
             .collect();
-        node_ids.sort_unstable();
+        node_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         node_ids.dedup();
 
         let mut way_ids: Vec<i64> = diff
@@ -265,7 +265,7 @@ impl DiffRanges {
             .chain(diff.deleted_ways.iter())
             .copied()
             .collect();
-        way_ids.sort_unstable();
+        way_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         way_ids.dedup();
 
         let mut rel_ids: Vec<i64> = diff
@@ -273,19 +273,19 @@ impl DiffRanges {
             .chain(diff.deleted_relations.iter())
             .copied()
             .collect();
-        rel_ids.sort_unstable();
+        rel_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         rel_ids.dedup();
 
         let mut node_upserts: Vec<i64> = diff.node_ids().copied().collect();
-        node_upserts.sort_unstable();
+        node_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         node_upserts.dedup();
 
         let mut way_upserts: Vec<i64> = diff.way_ids().copied().collect();
-        way_upserts.sort_unstable();
+        way_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         way_upserts.dedup();
 
         let mut rel_upserts: Vec<i64> = diff.relation_ids().copied().collect();
-        rel_upserts.sort_unstable();
+        rel_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
         rel_upserts.dedup();
 
         Self {
@@ -313,9 +313,11 @@ impl DiffRanges {
         if ids.is_empty() {
             return false;
         }
-        // Binary search for the first ID >= min_id
-        let pos = ids.partition_point(|&id| id < min_id);
-        pos < ids.len() && ids[pos] <= max_id
+        // Binary search for the first ID >= blob's OSM-first in OSM order
+        let first = super::blob_osm_first_key(min_id, max_id);
+        let last = super::blob_osm_last_key(min_id, max_id);
+        let pos = ids.partition_point(|&id| super::osm_id_key(id) < first);
+        pos < ids.len() && super::osm_id_key(ids[pos]) <= last
     }
 
     /// Return the sorted upsert (create/modify) IDs for a given element kind.
@@ -757,7 +759,7 @@ fn rewrite_block_parallel(
         };
 
         // Emit creates (upsert IDs not in base block) before this element
-        while upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] < elem_id {
+        while upsert_cursor < inline_upserts.len() && super::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats)?;
@@ -1144,10 +1146,12 @@ pub fn merge(
                     slots.push(BatchSlot::FalsePositive { index, has_indexdata });
                 }
                 ClassifyResult::NeedsRewrite(block, index) => {
-                    // Binary search for inline upserts in [min_id, max_id]
+                    // Binary search for inline upserts in blob's OSM-order range
                     let upserts = ranges.upserts(index.kind);
-                    let start = upserts.partition_point(|&id| id < index.min_id);
-                    let end = upserts[start..].partition_point(|&id| id <= index.max_id) + start;
+                    let first = super::blob_osm_first_key(index.min_id, index.max_id);
+                    let last = super::blob_osm_last_key(index.min_id, index.max_id);
+                    let start = upserts.partition_point(|&id| super::osm_id_key(id) < first);
+                    let end = upserts[start..].partition_point(|&id| super::osm_id_key(id) <= last) + start;
 
                     let job_idx = rewrite_jobs.len();
                     rewrite_jobs.push(RewriteJob {
@@ -1225,12 +1229,13 @@ pub fn merge(
             }
             last_type = Some(blob_kind);
 
-            // Gap creates: emit upserts with ID < this blob's min_id
-            let has_gap = has_gap_creates(blob_kind, min_id, &ranges, &cursors);
+            // Gap creates: emit upserts before this blob in OSM order
+            let osm_first = super::blob_osm_first_id(min_id, max_id);
+            let has_gap = has_gap_creates(blob_kind, osm_first, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
                 emit_gap_creates(
-                    blob_kind, min_id, &ranges,
+                    blob_kind, osm_first, &ranges,
                     &diff, &mut cursors, &mut bb, &mut writer, &mut stats,
                 )?;
                 flush_block(&mut bb, &mut writer)?;
@@ -1307,9 +1312,10 @@ pub fn merge(
                     stats.blobs_rewritten += 1;
                     // output dropped here — RewriteOutput freed immediately
 
-                    // Advance cursor past max_id (inline upserts handled by rewrite)
+                    // Advance cursor past blob's OSM-last (inline upserts handled by rewrite)
+                    let last = super::blob_osm_last_key(min_id, max_id);
                     let (cursor, upserts) = cursors.get_mut(blob_kind, &ranges);
-                    while *cursor < upserts.len() && upserts[*cursor] <= max_id {
+                    while *cursor < upserts.len() && super::osm_id_key(upserts[*cursor]) <= last {
                         *cursor += 1;
                     }
                 }
@@ -1449,7 +1455,7 @@ fn emit_gap_creates(
     stats: &mut MergeStats,
 ) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
-    while *cursor < upserts.len() && upserts[*cursor] < min_id {
+    while *cursor < upserts.len() && super::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
         emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats)?;
         *cursor += 1;
     }
@@ -1487,5 +1493,5 @@ fn has_gap_creates(
     cursors: &UpsertCursors,
 ) -> bool {
     let (cursor, upserts) = cursors.get(blob_kind, ranges);
-    cursor < upserts.len() && upserts[cursor] < min_id
+    cursor < upserts.len() && super::osm_id_cmp(upserts[cursor], min_id).is_lt()
 }

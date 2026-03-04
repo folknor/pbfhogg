@@ -246,11 +246,11 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   `add-locations-to-ways`. Currently the tagged/untagged decision happens at a different
   stage — this would fold it into the index itself.
 
-- [ ] **tags-filter should preserve delete actions from OSC input.**
-  [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): new `tags-filter-osc`
-  subcommand — filters creates/modifies by tag expressions, forwards all deletes
-  unconditionally. ~170 lines, no base PBF needed. Design and implementation plan
-  in `notes/tags-filter-osc-support.md`.
+- [x] **tags-filter should preserve delete actions from OSC input.**
+  [osmium-tool#298](https://github.com/osmcode/osmium-tool/issues/298): implemented as
+  `tags-filter-osc` subcommand. Filters `create`/`modify` by tag expressions (OR
+  semantics, same syntax as `tags-filter`) and forwards all `delete` actions
+  unconditionally.
 
 - [x] **Map version=-1 and changeset=-1 to None during PBF parsing.**
   [libosmium#247](https://github.com/osmcode/libosmium/issues/247): Osmosis writes -1

@@ -139,6 +139,16 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
+    /// Filter OSC changes by tag expressions; always preserve deletes.
+    TagsFilterOsc {
+        /// Input OSC change file (.osc.gz)
+        changes: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
+        #[arg(required = true)]
+        expressions: Vec<String>,
+    },
     /// Compare two PBF files and show differences.
     ///
     /// Uses content equality (coordinates, tags, refs, members) — not version/timestamp
@@ -472,6 +482,9 @@ fn main() {
             io.direct_io,
             force.force,
         ),
+        Command::TagsFilterOsc { changes, output, expressions } => {
+            run_tags_filter_osc(&changes, &output.output, &expressions)
+        }
         Command::Diff {
             old,
             new,
@@ -867,6 +880,16 @@ fn run_tags_filter(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let stats = pbfhogg::tags_filter::tags_filter(file, output, expressions, omit_referenced, compression, direct_io, force)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_tags_filter_osc(
+    changes: &std::path::Path,
+    output: &std::path::Path,
+    expressions: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let stats = pbfhogg::tags_filter_osc::tags_filter_osc(changes, output, expressions)?;
     stats.print_summary();
     Ok(())
 }

@@ -210,6 +210,12 @@ blocks). The per-type summary (block counts + sizes) is already shown without
   scale. `IdSetDense::merge()` exists but is `#[allow(dead_code)]`. Needs a
   shared thread pool architecture where pipeline decode and consumer
   parallelism use the same pool.
+  2026-03-04 follow-up attempt (phase-split pass1 with parallel `IdSetDense`
+  fold) was also reverted: Denmark `bench commands extract` regressed from
+  ~2.8-3.0s to ~33-43s for `extract-complete`/`extract-smart` due repeated
+  heavy set merges and extra pass overhead. Keep this item open for a proper
+  shared-pool design (decode + fold on one scheduler) rather than multi-pass
+  or per-batch set fan-in.
 
 ## Benchmarking
 

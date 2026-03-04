@@ -48,3 +48,24 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   same-version updates abort simplify),
   [osmosis#72](https://github.com/openstreetmap/osmosis/issues/72) (simplification
   must not merge distinct action types with same ID).
+- [ ] **`merge` (multi-PBF)** — merge multiple sorted PBF inputs into one output,
+  deduplicating by highest version per object (distinct from `merge` apply-changes).
+- [ ] **`getparents`** — reverse lookup: given IDs, emit ways/relations referencing
+  them (`--id-file`, optional `--add-self`).
+- [ ] **`renumber`** — reassign IDs (node/way/relation), with stable mapping and
+  configurable start IDs.
+
+## Missing flags on existing commands (osmium parity)
+
+- [ ] **`add-locations-to-ways --ignore-missing-nodes`** — optionally continue instead
+  of failing when a way references missing node coordinates.
+- [ ] **`add-locations-to-ways --keep-member-nodes`** — keep untagged nodes that are
+  relation members (align with osmium behavior for complete relation geometry).
+- [ ] **`derive-changes --keep-details`** — include tags/refs/members on deleted
+  objects in generated OSC.
+- [x] **`diff --quiet`** — exit-code-only mode for CI/scripts without full textual diff.
+- [x] **`diff --output <file>`** — write diff report to file instead of stdout.
+- [ ] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a
+  default object type.
+- [ ] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
+  keep non-matching + required references).

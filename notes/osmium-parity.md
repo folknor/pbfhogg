@@ -117,8 +117,8 @@ osmium-tool installed version as of 2026-03-04.
 | `--ignore-changeset` | — | Missing |
 | `--ignore-uid` | — | Missing |
 | `--ignore-user` | — | Missing |
-| `-q, --quiet` | — | Missing (exit code only) |
-| `-o, --output` | — | Missing (diff to file, not just stdout summary) |
+| `-q, --quiet` | `-q, --quiet` | Have it |
+| `-o, --output` | `-o, --output` | Have it |
 | `-s, --summary` | — | Missing (summary on stderr) |
 
 ### `extract`

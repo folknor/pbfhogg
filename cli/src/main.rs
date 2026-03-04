@@ -165,6 +165,12 @@ enum Command {
         /// Show detailed changes for modified elements
         #[arg(short = 'v', long)]
         verbose: bool,
+        /// Exit-code only, suppress diff output and summary
+        #[arg(short = 'q', long, conflicts_with = "output")]
+        quiet: bool,
+        /// Write diff output to file instead of stdout
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
@@ -534,6 +540,8 @@ fn main() {
             new,
             suppress_common,
             verbose,
+            quiet,
+            output,
             type_filter,
             io,
         } => run_diff(
@@ -541,6 +549,8 @@ fn main() {
             &new,
             suppress_common,
             verbose,
+            quiet,
+            output.as_deref(),
             type_filter.as_deref(),
             io.direct_io,
         ),
@@ -1073,17 +1083,34 @@ fn run_diff(
     new: &std::path::Path,
     suppress_common: bool,
     verbose: bool,
+    quiet: bool,
+    output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
         type_filter: type_filter.map(String::from),
     };
-    let mut stdout = std::io::stdout().lock();
-    let stats = pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?;
-    stats.print_summary();
+    let stats = if quiet {
+        let mut sink = std::io::sink();
+        pbfhogg::diff::diff(old, new, &mut sink, &options, direct_io)?
+    } else if let Some(path) = output_path {
+        let file = std::fs::File::create(path)?;
+        let mut out = std::io::BufWriter::new(file);
+        let stats = pbfhogg::diff::diff(old, new, &mut out, &options, direct_io)?;
+        out.flush()?;
+        stats
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?
+    };
+    if !quiet {
+        stats.print_summary();
+    }
     if stats.has_differences() {
         process::exit(1);
     }

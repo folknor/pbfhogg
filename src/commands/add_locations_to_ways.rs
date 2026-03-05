@@ -486,6 +486,7 @@ fn index_batch_dense(batch: &[PrimitiveBlock], writer: &SharedDenseWriter) {
 // ---------------------------------------------------------------------------
 
 
+#[allow(clippy::too_many_arguments)]
 fn write_output_checked(
     input: &Path,
     output: &Path,
@@ -604,6 +605,7 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
+#[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,

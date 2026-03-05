@@ -179,7 +179,8 @@ fn inspect_json_combined_flags() {
     let obj = json.as_object().expect("value");
     for key in &[
         "schema_version", "file", "file_size", "header", "indexed",
-        "blocks", "elements", "ordering", "id_ranges", "blocks_detail", "locations",
+        "blocks", "elements", "ordering", "id_ranges", "anomalies_only",
+        "blocks_detail", "locations",
     ] {
         assert!(obj.contains_key(*key), "missing key: {key}");
     }
@@ -197,9 +198,11 @@ fn inspect_json_blocks_anomalies_only() {
         .expect("inspect");
     let json = report.to_json_filtered(Some(0), true);
 
+    assert!(json["anomalies_only"].as_bool().expect("bool"));
     assert!(json["blocks_detail"].is_array());
     let detail = json["blocks_detail"].as_array().expect("value");
     assert_eq!(detail.len(), 1);
     assert_eq!(detail[0]["type"], "nodes");
     assert_eq!(detail[0]["elements"], 10);
+    assert_eq!(detail[0]["anomaly"], "small");
 }

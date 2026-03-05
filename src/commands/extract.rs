@@ -943,6 +943,7 @@ fn merge_relation_batch_smart_parallel(
 /// - `matched_way_ids`: ways referencing at least one bbox node
 /// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
 /// - `matched_relation_ids`: relations with matched node/way members
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn collect_pass1(
     input: &Path,
     region: &Region,
@@ -1153,6 +1154,7 @@ fn collect_pass1(
 ///
 /// Same as [`collect_pass1`] but additionally collects extra way and node IDs
 /// from multipolygon/boundary relations for complete geometry inclusion.
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn collect_pass1_smart(
     input: &Path,
     region: &Region,

@@ -2,7 +2,6 @@
 
 ## Needs review
 
-- `8e797c1` inspect: add anomaly highlighting mode
 - `f41ff7a` docs: record OSM ID ordering benchmark results
 - `dbeae8e` read: make pipeline buffering configurable
 - `3b496c4` docs: record P2-13 extract pass1 regression attempt

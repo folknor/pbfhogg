@@ -647,17 +647,20 @@ impl InspectReport {
         if let Some(ref infos) = self.accum.block_infos {
             println!();
             Self::print_block_distribution(infos);
-            let limit = block_limit.unwrap_or(0);
-            let selected: Vec<&BlockInfo> = if anomalies_only {
-                anomaly_blocks(infos)
-            } else {
-                infos.iter().collect()
-            };
             println!();
             if anomalies_only {
-                println!("Block anomalies:");
+                let selected = anomaly_blocks(infos);
+                println!(
+                    "Block anomalies ({} of {} — <50% or >150% of per-type median):",
+                    selected.len(),
+                    infos.len()
+                );
+                Self::print_block_table_with_reason(&selected);
+            } else {
+                let selected: Vec<&BlockInfo> = infos.iter().collect();
+                let limit = block_limit.unwrap_or(0);
+                Self::print_block_table_refs(&selected, limit);
             }
-            Self::print_block_table_refs(&selected, limit);
         }
         if let Some((n, w, r)) = self.id_range_tuple() {
             println!();
@@ -854,6 +857,51 @@ impl InspectReport {
         }
     }
 
+    /// Print block table with an anomaly reason column (no truncation).
+    fn print_block_table_with_reason(infos: &[(&BlockInfo, &str)]) {
+        let stdout = std::io::stdout();
+        let mut out = std::io::BufWriter::new(stdout.lock());
+
+        let has_raw = infos.iter().any(|(i, _)| i.raw.is_some());
+
+        if has_raw {
+            let _ok = writeln!(
+                out,
+                "{:>6}  {:12}{:>8}  {:>10}  {:>10}  Reason",
+                "Block", "Type", "Elements", "Compressed", "Raw"
+            );
+            for (info, reason) in infos {
+                let _ok = writeln!(
+                    out,
+                    "{:>6}  {:12}{:>8}  {:>10}  {:>10}  {}",
+                    info.number,
+                    info.kind.label(),
+                    info.elements,
+                    format_size(info.compressed as u64),
+                    format_size(info.raw.unwrap_or(0) as u64),
+                    reason
+                );
+            }
+        } else {
+            let _ok = writeln!(
+                out,
+                "{:>6}  {:12}{:>8}  {:>10}  Reason",
+                "Block", "Type", "Elements", "Compressed"
+            );
+            for (info, reason) in infos {
+                let _ok = writeln!(
+                    out,
+                    "{:>6}  {:12}{:>8}  {:>10}  {}",
+                    info.number,
+                    info.kind.label(),
+                    info.elements,
+                    format_size(info.compressed as u64),
+                    reason
+                );
+            }
+        }
+    }
+
     fn print_id_ranges(node_ids: &TypeIdRange, way_ids: &TypeIdRange, rel_ids: &TypeIdRange) {
         for (label, ids) in [("Nodes:", node_ids), ("Ways:", way_ids), ("Relations:", rel_ids)] {
             if ids.has_data() {
@@ -970,6 +1018,7 @@ impl InspectReport {
                 "standard": is_standard_ordering(&self.accum.segments),
             },
             "id_ranges": id_ranges_json(&self.state),
+            "anomalies_only": anomalies_only,
             "blocks_detail": blocks_detail_json(block_limit, &self.accum.block_infos, anomalies_only),
             "locations": locations_json(&self.state.loc_stats),
         })
@@ -1011,11 +1060,22 @@ fn blocks_detail_json(
     let (Some(limit), Some(infos)) = (block_limit, block_infos) else {
         return serde_json::Value::Null;
     };
-    let selected: Vec<&BlockInfo> = if anomalies_only {
-        anomaly_blocks(infos)
-    } else {
-        infos.iter().collect()
-    };
+    if anomalies_only {
+        let selected = anomaly_blocks(infos);
+        let arr: Vec<serde_json::Value> = selected
+            .iter()
+            .map(|(info, reason)| serde_json::json!({
+                "number": info.number,
+                "type": info.kind.short_label(),
+                "elements": info.elements,
+                "compressed_bytes": info.compressed,
+                "raw_bytes": info.raw,
+                "anomaly": reason,
+            }))
+            .collect();
+        return serde_json::Value::Array(arr);
+    }
+    let selected: Vec<&BlockInfo> = infos.iter().collect();
     let truncate = limit > 0 && limit * 2 < selected.len();
     let iter: Box<dyn Iterator<Item = &BlockInfo>> = if truncate {
         Box::new(
@@ -1039,16 +1099,16 @@ fn blocks_detail_json(
     serde_json::Value::Array(arr)
 }
 
-fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<&BlockInfo> {
+fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<(&BlockInfo, &'static str)> {
     let nodes = median_elements_for_kind(infos, BlockKind::Nodes);
     let ways = median_elements_for_kind(infos, BlockKind::Ways);
     let relations = median_elements_for_kind(infos, BlockKind::Relations);
 
     infos
         .iter()
-        .filter(|info| {
+        .filter_map(|info| {
             if info.kind == BlockKind::Mixed {
-                return true;
+                return Some((info, "mixed"));
             }
             let median = match info.kind {
                 BlockKind::Nodes => nodes,
@@ -1056,11 +1116,15 @@ fn anomaly_blocks(infos: &[BlockInfo]) -> Vec<&BlockInfo> {
                 BlockKind::Relations => relations,
                 BlockKind::Mixed => None,
             };
-            let Some(median) = median else {
-                return false;
-            };
+            let median = median?;
             // Anomalous if block is <50% or >150% of the per-type median.
-            info.elements.saturating_mul(2) < median || info.elements > median.saturating_mul(3) / 2
+            if info.elements.saturating_mul(2) < median {
+                Some((info, "small"))
+            } else if info.elements > median.saturating_mul(3) / 2 {
+                Some((info, "large"))
+            } else {
+                None
+            }
         })
         .collect()
 }

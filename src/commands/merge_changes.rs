@@ -255,8 +255,11 @@ fn handle_start_like(
             if kind == ElemKind::Node {
                 let lat = parse_f64_attr_optional(e, b"lat").unwrap_or(0.0);
                 let lon = parse_f64_attr_optional(e, b"lon").unwrap_or(0.0);
-                elem.decimicro_lat = (lat * 1e7).round() as i32;
-                elem.decimicro_lon = (lon * 1e7).round() as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    elem.decimicro_lat = (lat * 1e7).round() as i32;
+                    elem.decimicro_lon = (lon * 1e7).round() as i32;
+                }
             }
 
             if is_empty || *section == Section::Delete {
@@ -276,31 +279,31 @@ fn handle_start_like(
             }
         }
         b"nd" => {
-            if let Some(cur) = current {
-                if cur.kind == ElemKind::Way {
-                    let rf = parse_i64_attr(e, b"ref")?;
-                    cur.refs.push(rf);
-                }
+            if let Some(cur) = current
+                && cur.kind == ElemKind::Way
+            {
+                let rf = parse_i64_attr(e, b"ref")?;
+                cur.refs.push(rf);
             }
         }
         b"member" => {
-            if let Some(cur) = current {
-                if cur.kind == ElemKind::Relation {
-                    let ref_id = parse_i64_attr(e, b"ref")?;
-                    let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
-                    let member_id = match parse_str_attr(e, b"type")?.as_str() {
-                        "node" => MemberId::Node(ref_id),
-                        "way" => MemberId::Way(ref_id),
-                        "relation" => MemberId::Relation(ref_id),
-                        other => {
-                            return Err(format!("unknown relation member type '{other}'").into());
-                        }
-                    };
-                    cur.members.push(OwnedMember {
-                        id: member_id,
-                        role,
-                    });
-                }
+            if let Some(cur) = current
+                && cur.kind == ElemKind::Relation
+            {
+                let ref_id = parse_i64_attr(e, b"ref")?;
+                let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
+                let member_id = match parse_str_attr(e, b"type")?.as_str() {
+                    "node" => MemberId::Node(ref_id),
+                    "way" => MemberId::Way(ref_id),
+                    "relation" => MemberId::Relation(ref_id),
+                    other => {
+                        return Err(format!("unknown relation member type '{other}'").into());
+                    }
+                };
+                cur.members.push(OwnedMember {
+                    id: member_id,
+                    role,
+                });
             }
         }
         _ => {}
@@ -386,14 +389,14 @@ fn parse_str_attr(e: &BytesStart<'_>, name: &[u8]) -> Result<String> {
 fn parse_str_attr_optional(e: &BytesStart<'_>, name: &[u8]) -> Option<String> {
     for attr in e.attributes().flatten() {
         if attr.key == QName(name) {
-            return attr.unescape_value().ok().map(|v| v.into_owned());
+            return attr.unescape_value().ok().map(std::borrow::Cow::into_owned);
         }
     }
     None
 }
 
 enum OscWriter {
-    Gz(Writer<GzEncoder<io::BufWriter<File>>>),
+    Gz(Box<Writer<GzEncoder<io::BufWriter<File>>>>),
     Plain(Writer<io::BufWriter<File>>),
 }
 
@@ -403,11 +406,11 @@ impl OscWriter {
         let buf = io::BufWriter::new(file);
         let is_gz = output.to_str().is_some_and(|s| s.ends_with(".gz"));
         if is_gz {
-            Ok(Self::Gz(Writer::new_with_indent(
+            Ok(Self::Gz(Box::new(Writer::new_with_indent(
                 GzEncoder::new(buf, flate2::Compression::fast()),
                 b' ',
                 2,
-            )))
+            ))))
         } else {
             Ok(Self::Plain(Writer::new_with_indent(buf, b' ', 2)))
         }
@@ -498,15 +501,15 @@ fn parse_osc_streaming(
             Ok(Event::End(ref e)) => match e.name().as_ref() {
                 b"create" | b"modify" | b"delete" => section = Section::None,
                 b"node" | b"way" | b"relation" => {
-                    if let Some(elem) = current.take() {
-                        if let Some(action) = section.as_action() {
-                            let change = Change {
-                                action,
-                                element: elem.into_change_element(),
-                            };
-                            emit_change(writer, open_action, &change)?;
-                            *count += 1;
-                        }
+                    if let Some(elem) = current.take()
+                        && let Some(action) = section.as_action()
+                    {
+                        let change = Change {
+                            action,
+                            element: elem.into_change_element(),
+                        };
+                        emit_change(writer, open_action, &change)?;
+                        *count += 1;
                     }
                 }
                 _ => {}
@@ -547,8 +550,11 @@ fn handle_start_like_streaming(
             if kind == ElemKind::Node {
                 let lat = parse_f64_attr_optional(e, b"lat").unwrap_or(0.0);
                 let lon = parse_f64_attr_optional(e, b"lon").unwrap_or(0.0);
-                elem.decimicro_lat = (lat * 1e7).round() as i32;
-                elem.decimicro_lon = (lon * 1e7).round() as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                {
+                    elem.decimicro_lat = (lat * 1e7).round() as i32;
+                    elem.decimicro_lon = (lon * 1e7).round() as i32;
+                }
             }
 
             if is_empty || *section == Section::Delete {
@@ -573,31 +579,31 @@ fn handle_start_like_streaming(
             }
         }
         b"nd" => {
-            if let Some(cur) = current {
-                if cur.kind == ElemKind::Way {
-                    let rf = parse_i64_attr(e, b"ref")?;
-                    cur.refs.push(rf);
-                }
+            if let Some(cur) = current
+                && cur.kind == ElemKind::Way
+            {
+                let rf = parse_i64_attr(e, b"ref")?;
+                cur.refs.push(rf);
             }
         }
         b"member" => {
-            if let Some(cur) = current {
-                if cur.kind == ElemKind::Relation {
-                    let ref_id = parse_i64_attr(e, b"ref")?;
-                    let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
-                    let member_id = match parse_str_attr(e, b"type")?.as_str() {
-                        "node" => MemberId::Node(ref_id),
-                        "way" => MemberId::Way(ref_id),
-                        "relation" => MemberId::Relation(ref_id),
-                        other => {
-                            return Err(format!("unknown relation member type '{other}'").into());
-                        }
-                    };
-                    cur.members.push(OwnedMember {
-                        id: member_id,
-                        role,
-                    });
-                }
+            if let Some(cur) = current
+                && cur.kind == ElemKind::Relation
+            {
+                let ref_id = parse_i64_attr(e, b"ref")?;
+                let role = parse_str_attr_optional(e, b"role").unwrap_or_default();
+                let member_id = match parse_str_attr(e, b"type")?.as_str() {
+                    "node" => MemberId::Node(ref_id),
+                    "way" => MemberId::Way(ref_id),
+                    "relation" => MemberId::Relation(ref_id),
+                    other => {
+                        return Err(format!("unknown relation member type '{other}'").into());
+                    }
+                };
+                cur.members.push(OwnedMember {
+                    id: member_id,
+                    role,
+                });
             }
         }
         _ => {}

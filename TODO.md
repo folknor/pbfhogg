@@ -96,5 +96,26 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   default object type.
 - [ ] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file instead
   of a text file. Useful in scripted pipelines.
+- [ ] **`cat --clean`** — strip version/changeset/timestamp/uid/user metadata.
+  Useful for anonymizing data or reducing file size.
+- [ ] **`check-refs --show-ids`** — show IDs of missing objects. Without this
+  you know refs are broken but not which ones.
+- [ ] **`diff --ignore-changeset/uid/user`** — ignore specific metadata fields
+  when comparing. Essential when diffing files from different sources.
+- [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
+  uses this to cut the planet into 200+ regional extracts in one pass.
+- [ ] **`extract --set-bounds`** — write bbox to output header. Downstream
+  tools read the header bbox.
+- [ ] **`inspect -e` (extended)** — full-scan mode producing element counts,
+  timestamp range, data bbox, ordering check, ID ranges, buffer stats, and
+  metadata attribute coverage in one pass. We have pieces across `--blocks`
+  and `--id-ranges` but no unified extended view.
+- [ ] **`inspect -g`** — get a specific value for scripting
+  (e.g. `inspect -g header.bbox`).
+- [ ] **`tags-count -M` (max-count)** — upper bound filter, paired with
+  existing `--min-count`.
+- [ ] **`tags-count -s` (sort)** — sort order (count-asc/desc, name-asc/desc).
+- [ ] **`tags-count -e` / `tags-filter -e`** — read expressions from file.
+  Useful for complex filter sets.
 - [ ] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
   keep non-matching + required references).

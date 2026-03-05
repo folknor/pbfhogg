@@ -259,7 +259,7 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Keep untagged nodes in output (default: drop them)
+        /// Keep all untagged nodes in output (default: drop untagged nodes unless referenced by a relation)
         #[arg(long)]
         keep_untagged_nodes: bool,
         #[command(flatten)]

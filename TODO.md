@@ -2,7 +2,6 @@
 
 ## Needs review
 
-- `65ca703` add-locations-to-ways: keep relation-member nodes
 - `8e797c1` inspect: add anomaly highlighting mode
 - `f41ff7a` docs: record OSM ID ordering benchmark results
 - `dbeae8e` read: make pipeline buffering configurable
@@ -70,8 +69,9 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 - [ ] **`add-locations-to-ways --ignore-missing-nodes`** — optionally continue instead
   of failing when a way references missing node coordinates.
-- [ ] **`add-locations-to-ways --keep-member-nodes`** — keep untagged nodes that are
-  relation members (align with osmium behavior for complete relation geometry).
+- [x] **Relation-member nodes preserved by default** — untagged nodes referenced
+  by relation members are always kept when dropping untagged nodes. No flag needed
+  (osmium requires `--keep-member-nodes`; pbfhogg does this unconditionally).
 - [ ] **`derive-changes --keep-details`** — include tags/refs/members on deleted
   objects in generated OSC.
 - [x] **`diff --quiet`** — exit-code-only mode for CI/scripts without full textual diff.

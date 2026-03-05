@@ -8,7 +8,6 @@
 - `dbeae8e` read: make pipeline buffering configurable
 - `3b496c4` docs: record P2-13 extract pass1 regression attempt
 - `37b7c19` extract: speed up sorted pass1 ID collection
-- `c946d54` add time-filter snapshot command
 - `300fdee` clean stale investigation notes and update TODO
 - `6f1c9fa` diff: add --quiet and --output flags
 

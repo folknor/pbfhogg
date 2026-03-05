@@ -1,5 +1,17 @@
 # pbfhogg TODO
 
+## Needs review
+
+- `65ca703` add-locations-to-ways: keep relation-member nodes
+- `8e797c1` inspect: add anomaly highlighting mode
+- `f41ff7a` docs: record OSM ID ordering benchmark results
+- `dbeae8e` read: make pipeline buffering configurable
+- `3b496c4` docs: record P2-13 extract pass1 regression attempt
+- `37b7c19` extract: speed up sorted pass1 ID collection
+- `c946d54` add time-filter snapshot command
+- `300fdee` clean stale investigation notes and update TODO
+- `6f1c9fa` diff: add --quiet and --output flags
+
 ## Important: ignored tests
 
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` — it roundtrips the entire

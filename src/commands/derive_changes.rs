@@ -13,8 +13,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use super::owned_elements::{
-    from_decimicro, format_coord, nodes_equal, relations_equal, ways_equal, OwnedNode,
-    OwnedRelation, OwnedWay,
+    from_decimicro, format_coord, nodes_equal, relations_equal, ways_equal, OwnedMetadata,
+    OwnedNode, OwnedRelation, OwnedWay,
 };
 use super::stream_merge::{
     convert_node, convert_relation, convert_way, is_node_block, is_relation_block, is_way_block,
@@ -324,13 +324,13 @@ fn write_osc(
     if !deletes.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
         for node in &deletes.nodes {
-            write_delete_node(&mut writer, node, increment_version)?;
+            write_delete_element(&mut writer, "node", node.id, node.metadata.as_ref(), increment_version)?;
         }
         for way in &deletes.ways {
-            write_delete_element(&mut writer, "way", way.id, way.version, increment_version)?;
+            write_delete_element(&mut writer, "way", way.id, way.metadata.as_ref(), increment_version)?;
         }
         for rel in &deletes.relations {
-            write_delete_element(&mut writer, "relation", rel.id, rel.version, increment_version)?;
+            write_delete_element(&mut writer, "relation", rel.id, rel.metadata.as_ref(), increment_version)?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }
@@ -353,9 +353,8 @@ fn write_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode) -> Result<()> 
     elem.push_attribute(("id", id_str.as_str()));
     elem.push_attribute(("lat", lat_str.as_str()));
     elem.push_attribute(("lon", coord_buf.as_str()));
-    if let Some(v) = node.version {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    if let Some(meta) = &node.metadata {
+        meta.push_attrs(&mut elem);
     }
 
     if node.tags.is_empty() {
@@ -372,9 +371,8 @@ fn write_way<W: Write>(writer: &mut Writer<W>, way: &OwnedWay) -> Result<()> {
     let mut elem = BytesStart::new("way");
     let id_str = way.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(v) = way.version {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    if let Some(meta) = &way.metadata {
+        meta.push_attrs(&mut elem);
     }
 
     if way.refs.is_empty() && way.tags.is_empty() {
@@ -397,9 +395,8 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
     let mut elem = BytesStart::new("relation");
     let id_str = rel.id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    if let Some(v) = rel.version {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
+    if let Some(meta) = &rel.metadata {
+        meta.push_attrs(&mut elem);
     }
 
     if rel.members.is_empty() && rel.tags.is_empty() {
@@ -429,48 +426,27 @@ fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Resu
     Ok(())
 }
 
-fn write_delete_node<W: Write>(
-    writer: &mut Writer<W>,
-    node: &OwnedNode,
-    increment_version: bool,
-) -> Result<()> {
-    let mut elem = BytesStart::new("node");
-    let id_str = node.id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    let version = maybe_increment_version(node.version, increment_version);
-    if let Some(v) = version {
-        let v_str = v.to_string();
-        elem.push_attribute(("version", v_str.as_str()));
-    }
-    writer.write_event(Event::Empty(elem))?;
-    Ok(())
-}
-
 fn write_delete_element<W: Write>(
     writer: &mut Writer<W>,
     tag_name: &str,
     id: i64,
-    version: Option<i32>,
+    metadata: Option<&OwnedMetadata>,
     increment_version: bool,
 ) -> Result<()> {
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
     elem.push_attribute(("id", id_str.as_str()));
-    let version = maybe_increment_version(version, increment_version);
-    if let Some(v) = version {
-        let v_str = v.to_string();
+    if let Some(meta) = metadata {
+        let version = if increment_version {
+            meta.version.saturating_add(1)
+        } else {
+            meta.version
+        };
+        let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
     Ok(())
-}
-
-fn maybe_increment_version(version: Option<i32>, increment: bool) -> Option<i32> {
-    if increment {
-        version.map(|v| v.saturating_add(1))
-    } else {
-        version
-    }
 }
 
 fn write_tags<W: Write>(writer: &mut Writer<W>, tags: &[(String, String)]) -> Result<()> {

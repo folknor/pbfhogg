@@ -464,7 +464,7 @@ fn finalize_current(
                 decimicro_lat: cur.decimicro_lat,
                 decimicro_lon: cur.decimicro_lon,
                 tags: cur.tags,
-                version: None,
+                metadata: None,
             });
         }
         (Section::Create, ElemKind::Way) => {
@@ -473,7 +473,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 refs: cur.refs,
-                version: None,
+                metadata: None,
             });
         }
         (Section::Create, ElemKind::Relation) => {
@@ -482,7 +482,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 members: cur.members,
-                version: None,
+                metadata: None,
             });
         }
         (Section::Modify, ElemKind::Node) => {
@@ -492,7 +492,7 @@ fn finalize_current(
                 decimicro_lat: cur.decimicro_lat,
                 decimicro_lon: cur.decimicro_lon,
                 tags: cur.tags,
-                version: None,
+                metadata: None,
             });
         }
         (Section::Modify, ElemKind::Way) => {
@@ -501,7 +501,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 refs: cur.refs,
-                version: None,
+                metadata: None,
             });
         }
         (Section::Modify, ElemKind::Relation) => {
@@ -510,7 +510,7 @@ fn finalize_current(
                 id: cur.id,
                 tags: cur.tags,
                 members: cur.members,
-                version: None,
+                metadata: None,
             });
         }
         _ => {}

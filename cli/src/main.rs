@@ -332,7 +332,7 @@ enum Command {
     },
     /// Merge multiple OSC files into one OSC file
     MergeChanges {
-        /// Input OSC files (.osc.gz)
+        /// Input OSC files (.osc or .osc.gz)
         #[arg(required = true)]
         changes: Vec<PathBuf>,
         #[command(flatten)]

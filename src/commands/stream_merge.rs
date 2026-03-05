@@ -7,7 +7,7 @@
 
 use crate::{BlockType, Element, PipelinedBlocks, PrimitiveBlock};
 
-use super::owned_elements::{OwnedMember, OwnedNode, OwnedRelation, OwnedWay};
+use super::owned_elements::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
 use super::Result;
 
 // ---------------------------------------------------------------------------
@@ -159,17 +159,18 @@ pub(crate) fn convert_node(element: &Element<'_>) -> Option<OwnedNode> {
             decimicro_lat: dn.decimicro_lat(),
             decimicro_lon: dn.decimicro_lon(),
             tags: dn.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
-            version: dn
+            metadata: dn
                 .info()
                 .map(crate::dense::DenseNodeInfo::version)
-                .filter(|&v| v != -1),
+                .filter(|&v| v != -1)
+                .map(OwnedMetadata::version_only),
         }),
         Element::Node(n) => Some(OwnedNode {
             id: n.id(),
             decimicro_lat: n.decimicro_lat(),
             decimicro_lon: n.decimicro_lon(),
             tags: n.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
-            version: n.info().version(),
+            metadata: n.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     }
@@ -181,7 +182,7 @@ pub(crate) fn convert_way(element: &Element<'_>) -> Option<OwnedWay> {
             id: w.id(),
             tags: w.tags().map(|(k, v)| (k.to_owned(), v.to_owned())).collect(),
             refs: w.refs().collect(),
-            version: w.info().version(),
+            metadata: w.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     }
@@ -199,7 +200,7 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> Option<OwnedRelation> {
                     role: m.role().unwrap_or("").to_owned(),
                 })
                 .collect(),
-            version: r.info().version(),
+            metadata: r.info().version().map(OwnedMetadata::version_only),
         }),
         _ => None,
     }

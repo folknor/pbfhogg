@@ -8,12 +8,55 @@ use crate::MemberId;
 // ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
+pub(crate) struct OwnedMetadata {
+    pub(crate) version: i32,
+    pub(crate) timestamp: String,
+    pub(crate) changeset: String,
+    pub(crate) uid: String,
+    pub(crate) user: String,
+    pub(crate) visible: String,
+}
+
+impl OwnedMetadata {
+    pub(crate) fn version_only(version: i32) -> Self {
+        Self {
+            version,
+            timestamp: String::new(),
+            changeset: String::new(),
+            uid: String::new(),
+            user: String::new(),
+            visible: String::new(),
+        }
+    }
+
+    pub(crate) fn push_attrs(&self, elem: &mut quick_xml::events::BytesStart<'_>) {
+        let v = self.version.to_string();
+        elem.push_attribute(("version", v.as_str()));
+        if !self.timestamp.is_empty() {
+            elem.push_attribute(("timestamp", self.timestamp.as_str()));
+        }
+        if !self.changeset.is_empty() {
+            elem.push_attribute(("changeset", self.changeset.as_str()));
+        }
+        if !self.uid.is_empty() {
+            elem.push_attribute(("uid", self.uid.as_str()));
+        }
+        if !self.user.is_empty() {
+            elem.push_attribute(("user", self.user.as_str()));
+        }
+        if !self.visible.is_empty() {
+            elem.push_attribute(("visible", self.visible.as_str()));
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct OwnedNode {
     pub(crate) id: i64,
     pub(crate) decimicro_lat: i32,
     pub(crate) decimicro_lon: i32,
     pub(crate) tags: Vec<(String, String)>,
-    pub(crate) version: Option<i32>,
+    pub(crate) metadata: Option<OwnedMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -21,7 +64,7 @@ pub(crate) struct OwnedWay {
     pub(crate) id: i64,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) refs: Vec<i64>,
-    pub(crate) version: Option<i32>,
+    pub(crate) metadata: Option<OwnedMetadata>,
 }
 
 #[derive(Clone, Debug)]
@@ -35,7 +78,7 @@ pub(crate) struct OwnedRelation {
     pub(crate) id: i64,
     pub(crate) tags: Vec<(String, String)>,
     pub(crate) members: Vec<OwnedMember>,
-    pub(crate) version: Option<i32>,
+    pub(crate) metadata: Option<OwnedMetadata>,
 }
 
 // ---------------------------------------------------------------------------

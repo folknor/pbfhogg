@@ -85,7 +85,7 @@ trait DiffElement: Sized {
 
 impl DiffElement for OwnedNode {
     fn id(&self) -> i64 { self.id }
-    fn version(&self) -> Option<i32> { self.version }
+    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'n' }
     fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
     fn equal(&self, other: &Self) -> bool { nodes_equal(self, other) }
@@ -94,7 +94,7 @@ impl DiffElement for OwnedNode {
 
 impl DiffElement for OwnedWay {
     fn id(&self) -> i64 { self.id }
-    fn version(&self) -> Option<i32> { self.version }
+    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'w' }
     fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
     fn equal(&self, other: &Self) -> bool { ways_equal(self, other) }
@@ -103,7 +103,7 @@ impl DiffElement for OwnedWay {
 
 impl DiffElement for OwnedRelation {
     fn id(&self) -> i64 { self.id }
-    fn version(&self) -> Option<i32> { self.version }
+    fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'r' }
     fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
     fn equal(&self, other: &Self) -> bool { relations_equal(self, other) }

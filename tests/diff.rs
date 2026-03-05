@@ -25,6 +25,9 @@ fn default_options() -> DiffOptions {
         suppress_common: false,
         verbose: false,
         type_filter: None,
+        ignore_changeset: false,
+        ignore_uid: false,
+        ignore_user: false,
     }
 }
 
@@ -360,6 +363,7 @@ fn verbose_shows_tag_details() {
         suppress_common: true,
         verbose: true,
         type_filter: None,
+        ..default_options()
     };
     let (text, stats) = run_diff(&old, &new, &opts);
 
@@ -401,6 +405,7 @@ fn verbose_shows_coordinate_details() {
         suppress_common: true,
         verbose: true,
         type_filter: None,
+        ..default_options()
     };
     let (text, stats) = run_diff(&old, &new, &opts);
 
@@ -440,6 +445,7 @@ fn type_filter_restricts_output() {
         suppress_common: true,
         verbose: false,
         type_filter: Some("node".to_string()),
+        ..default_options()
     };
     let (text, _stats) = run_diff(&old, &new, &opts);
 
@@ -592,6 +598,7 @@ fn type_filter_way_skips_phases() {
         suppress_common: false,
         verbose: false,
         type_filter: Some("way".to_string()),
+        ..default_options()
     };
     let (text, stats) = run_diff(&old, &new, &opts);
 

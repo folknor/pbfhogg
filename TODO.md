@@ -104,7 +104,7 @@ constraints before designing the consolidated API.
   run ALTW before merge.
 - [ ] **`derive-changes --update-timestamp`** — set delete timestamp to current
   time. May be used in replication pipelines.
-- [ ] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a
+- [x] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a
   default object type.
 - [ ] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file instead
   of a text file. Useful in scripted pipelines.
@@ -112,8 +112,10 @@ constraints before designing the consolidated API.
   Useful for anonymizing data or reducing file size.
 - [ ] **`check-refs --show-ids`** — show IDs of missing objects. Without this
   you know refs are broken but not which ones.
-- [ ] **`diff --ignore-changeset/uid/user`** — ignore specific metadata fields
+- [x] **`diff --ignore-changeset/uid/user`** — ignore specific metadata fields
   when comparing. Essential when diffing files from different sources.
+  Note: currently implemented as compatibility flags; pbfhogg diff already uses
+  content equality and does not compare these metadata fields.
 - [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
   uses this to cut the planet into 200+ regional extracts in one pass.
 - [ ] **`extract --set-bounds`** — write bbox to output header. Downstream

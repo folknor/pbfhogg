@@ -28,19 +28,48 @@ pub struct IdSet {
     pub relation_ids: BTreeSet<i64>,
 }
 
+/// Element type used as default when parsing bare numeric IDs.
+#[derive(Clone, Copy)]
+pub enum DefaultType {
+    Node,
+    Way,
+    Relation,
+}
+
+impl DefaultType {
+    fn prefix(self) -> char {
+        match self {
+            Self::Node => 'n',
+            Self::Way => 'w',
+            Self::Relation => 'r',
+        }
+    }
+}
 
 /// Parse an ID spec like "n123", "w456", "r789".
 // String errors are intentional — shows the bad input value, which is more helpful
 // for CLI users than the underlying ParseIntError.
-fn parse_id_spec(spec: &str) -> Result<(char, i64)> {
+fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
     if spec.len() < 2 {
+        if let Some(default) = default_type {
+            let id: i64 = spec
+                .parse()
+                .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
+            return Ok((default.prefix(), id));
+        }
         return Err(format!("invalid ID spec: {spec:?} (expected n/w/r prefix + number)").into());
     }
     let prefix = spec.as_bytes()[0];
+    if !matches!(prefix, b'n' | b'w' | b'r')
+        && let Some(default) = default_type
+    {
+        let id: i64 = spec
+            .parse()
+            .map_err(|_| format!("invalid ID spec: {spec:?} (bad number)"))?;
+        return Ok((default.prefix(), id));
+    }
     if !matches!(prefix, b'n' | b'w' | b'r') {
-        return Err(
-            format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into(),
-        );
+        return Err(format!("invalid ID spec: {spec:?} (expected prefix 'n', 'w', or 'r')").into());
     }
     let id: i64 = spec[1..]
         .parse()
@@ -50,13 +79,21 @@ fn parse_id_spec(spec: &str) -> Result<(char, i64)> {
 
 /// Parse ID specs from command-line arguments.
 pub fn parse_ids(specs: &[String]) -> Result<IdSet> {
+    parse_ids_with_default_type(specs, None)
+}
+
+/// Parse ID specs from command-line arguments with optional default element type for bare IDs.
+pub fn parse_ids_with_default_type(
+    specs: &[String],
+    default_type: Option<DefaultType>,
+) -> Result<IdSet> {
     let mut set = IdSet {
         node_ids: BTreeSet::new(),
         way_ids: BTreeSet::new(),
         relation_ids: BTreeSet::new(),
     };
     for spec in specs {
-        let (prefix, id) = parse_id_spec(spec)?;
+        let (prefix, id) = parse_id_spec(spec, default_type)?;
         match prefix {
             'n' => set.node_ids.insert(id),
             'w' => set.way_ids.insert(id),
@@ -69,6 +106,14 @@ pub fn parse_ids(specs: &[String]) -> Result<IdSet> {
 
 /// Parse ID specs from a file (one per line, blank lines and `#` comments skipped).
 pub fn parse_ids_from_file(path: &Path) -> Result<IdSet> {
+    parse_ids_from_file_with_default_type(path, None)
+}
+
+/// Parse ID specs from file with optional default element type for bare IDs.
+pub fn parse_ids_from_file_with_default_type(
+    path: &Path,
+    default_type: Option<DefaultType>,
+) -> Result<IdSet> {
     let contents = std::fs::read_to_string(path)?;
     let specs: Vec<String> = contents
         .lines()
@@ -76,7 +121,7 @@ pub fn parse_ids_from_file(path: &Path) -> Result<IdSet> {
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .map(ToString::to_string)
         .collect();
-    parse_ids(&specs)
+    parse_ids_with_default_type(&specs, default_type)
 }
 
 // ---------------------------------------------------------------------------
@@ -396,51 +441,51 @@ mod tests {
 
     #[test]
     fn parse_node_id() {
-        let (prefix, id) = parse_id_spec("n123").unwrap();
+        let (prefix, id) = parse_id_spec("n123", None).unwrap();
         assert_eq!(prefix, 'n');
         assert_eq!(id, 123);
     }
 
     #[test]
     fn parse_way_id() {
-        let (prefix, id) = parse_id_spec("w456").unwrap();
+        let (prefix, id) = parse_id_spec("w456", None).unwrap();
         assert_eq!(prefix, 'w');
         assert_eq!(id, 456);
     }
 
     #[test]
     fn parse_relation_id() {
-        let (prefix, id) = parse_id_spec("r789").unwrap();
+        let (prefix, id) = parse_id_spec("r789", None).unwrap();
         assert_eq!(prefix, 'r');
         assert_eq!(id, 789);
     }
 
     #[test]
     fn parse_large_id() {
-        let (prefix, id) = parse_id_spec("n9876543210").unwrap();
+        let (prefix, id) = parse_id_spec("n9876543210", None).unwrap();
         assert_eq!(prefix, 'n');
         assert_eq!(id, 9_876_543_210);
     }
 
     #[test]
     fn parse_invalid_prefix() {
-        assert!(parse_id_spec("x123").is_err());
+        assert!(parse_id_spec("x123", None).is_err());
     }
 
     #[test]
     fn parse_missing_number() {
-        assert!(parse_id_spec("n").is_err());
+        assert!(parse_id_spec("n", None).is_err());
     }
 
     #[test]
     fn parse_bad_number() {
-        assert!(parse_id_spec("nabc").is_err());
+        assert!(parse_id_spec("nabc", None).is_err());
     }
 
     #[test]
     fn parse_too_short() {
-        assert!(parse_id_spec("n").is_err());
-        assert!(parse_id_spec("").is_err());
+        assert!(parse_id_spec("n", None).is_err());
+        assert!(parse_id_spec("", None).is_err());
     }
 
     #[test]
@@ -453,6 +498,31 @@ mod tests {
         assert_eq!(set.node_ids, BTreeSet::from([1, 2]));
         assert_eq!(set.way_ids, BTreeSet::from([10]));
         assert_eq!(set.relation_ids, BTreeSet::from([100]));
+    }
+
+    #[test]
+    fn parse_bare_id_with_default_type_node() {
+        let (prefix, id) = parse_id_spec("42", Some(DefaultType::Node)).unwrap();
+        assert_eq!(prefix, 'n');
+        assert_eq!(id, 42);
+    }
+
+    #[test]
+    fn parse_ids_bare_with_default_type_way() {
+        let specs: Vec<String> = vec!["1", "2", "w10", "r100"]
+            .into_iter()
+            .map(ToString::to_string)
+            .collect();
+        let set = parse_ids_with_default_type(&specs, Some(DefaultType::Way)).unwrap();
+        assert_eq!(set.node_ids, BTreeSet::new());
+        assert_eq!(set.way_ids, BTreeSet::from([1, 2, 10]));
+        assert_eq!(set.relation_ids, BTreeSet::from([100]));
+    }
+
+    #[test]
+    fn parse_ids_bare_without_default_type_errors() {
+        let specs: Vec<String> = vec!["123".to_string()];
+        assert!(parse_ids_with_default_type(&specs, None).is_err());
     }
 
 }

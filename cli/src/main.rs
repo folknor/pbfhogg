@@ -12,7 +12,7 @@ static GLOBAL: mimalloc_crate::MiMalloc = mimalloc_crate::MiMalloc;
 use std::path::PathBuf;
 use std::process;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::writer::Compression;
 
 #[derive(Parser)]
@@ -55,6 +55,13 @@ struct UringArg {
     /// Use io_uring for output I/O (requires linux-io-uring feature)
     #[arg(long)]
     io_uring: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum DefaultTypeArg {
+    Node,
+    Way,
+    Relation,
 }
 
 #[derive(Subcommand)]
@@ -174,6 +181,15 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Ignore changeset metadata when diffing (already ignored by content-equality mode)
+        #[arg(long)]
+        ignore_changeset: bool,
+        /// Ignore uid metadata when diffing (already ignored by content-equality mode)
+        #[arg(long)]
+        ignore_uid: bool,
+        /// Ignore user metadata when diffing (already ignored by content-equality mode)
+        #[arg(long)]
+        ignore_user: bool,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -203,6 +219,9 @@ enum Command {
         /// Read IDs from file instead of arguments
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
+        /// Default type for bare numeric IDs: node, way, relation
+        #[arg(long = "default-type", value_enum)]
+        default_type: Option<DefaultTypeArg>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
         #[command(flatten)]
@@ -221,6 +240,9 @@ enum Command {
         /// Read IDs from file instead of arguments
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
+        /// Default type for bare numeric IDs: node, way, relation
+        #[arg(long = "default-type", value_enum)]
+        default_type: Option<DefaultTypeArg>,
         /// Element IDs (e.g. n123 w456 r789)
         ids: Vec<String>,
         #[command(flatten)]
@@ -543,6 +565,9 @@ fn main() {
             quiet,
             output,
             type_filter,
+            ignore_changeset,
+            ignore_uid,
+            ignore_user,
             io,
         } => run_diff(
             &old,
@@ -552,6 +577,9 @@ fn main() {
             quiet,
             output.as_deref(),
             type_filter.as_deref(),
+            ignore_changeset,
+            ignore_uid,
+            ignore_user,
             io.direct_io,
         ),
         Command::DeriveChanges {
@@ -566,6 +594,7 @@ fn main() {
             output,
             add_referenced,
             id_file,
+            default_type,
             ids,
             compression,
             force,
@@ -575,6 +604,7 @@ fn main() {
             &output.output,
             add_referenced,
             id_file.as_deref(),
+            default_type,
             &ids,
             &compression.compression,
             io.direct_io,
@@ -584,6 +614,7 @@ fn main() {
             file,
             output,
             id_file,
+            default_type,
             ids,
             compression,
             io,
@@ -591,6 +622,7 @@ fn main() {
             &file,
             &output.output,
             id_file.as_deref(),
+            default_type,
             &ids,
             &compression.compression,
             io.direct_io,
@@ -1070,11 +1102,17 @@ fn run_tags_filter_osc(
 
 fn resolve_ids(
     id_file: Option<&std::path::Path>,
+    default_type: Option<DefaultTypeArg>,
     ids: &[String],
 ) -> Result<pbfhogg::getid::IdSet, Box<dyn std::error::Error>> {
+    let default_type = default_type.map(|kind| match kind {
+        DefaultTypeArg::Node => pbfhogg::getid::DefaultType::Node,
+        DefaultTypeArg::Way => pbfhogg::getid::DefaultType::Way,
+        DefaultTypeArg::Relation => pbfhogg::getid::DefaultType::Relation,
+    });
     match id_file {
-        Some(path) => pbfhogg::getid::parse_ids_from_file(path),
-        None => pbfhogg::getid::parse_ids(ids),
+        Some(path) => pbfhogg::getid::parse_ids_from_file_with_default_type(path, default_type),
+        None => pbfhogg::getid::parse_ids_with_default_type(ids, default_type),
     }
 }
 
@@ -1086,6 +1124,9 @@ fn run_diff(
     quiet: bool,
     output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
+    ignore_changeset: bool,
+    ignore_uid: bool,
+    ignore_user: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
@@ -1094,6 +1135,9 @@ fn run_diff(
         suppress_common,
         verbose,
         type_filter: type_filter.map(String::from),
+        ignore_changeset,
+        ignore_uid,
+        ignore_user,
     };
     let stats = if quiet {
         let mut sink = std::io::sink();
@@ -1135,13 +1179,14 @@ fn run_getid(
     output: &std::path::Path,
     add_referenced: bool,
     id_file: Option<&std::path::Path>,
+    default_type: Option<DefaultTypeArg>,
     ids: &[String],
     compression: &str,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let id_set = resolve_ids(id_file, ids)?;
+    let id_set = resolve_ids(id_file, default_type, ids)?;
     let stats = pbfhogg::getid::getid(
         file,
         output,
@@ -1159,12 +1204,13 @@ fn run_removeid(
     file: &std::path::Path,
     output: &std::path::Path,
     id_file: Option<&std::path::Path>,
+    default_type: Option<DefaultTypeArg>,
     ids: &[String],
     compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let id_set = resolve_ids(id_file, ids)?;
+    let id_set = resolve_ids(id_file, default_type, ids)?;
     let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io)?;
     stats.print_summary();
     Ok(())

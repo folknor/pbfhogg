@@ -80,10 +80,10 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `-n, --keep-untagged-nodes` | `--keep-untagged-nodes` | Have it |
-| `-i, --index-type` | — | Missing (hardcoded DenseMmapIndex) |
-| `--index-type-neg` | — | Missing |
-| `--keep-member-nodes` | — | N/A (always-on, see CORRECTNESS.md) |
-| `--ignore-missing-nodes` | — | Missing (currently errors on missing nodes) |
+| `-i, --index-type` | — | N/A (DenseMmapIndex only, by design) |
+| `--index-type-neg` | — | N/A (DenseMmapIndex only, by design) |
+| `--keep-member-nodes` | — | N/A (always-on, see DEVIATIONS.md) |
+| `--ignore-missing-nodes` | — | N/A (always-on, see DEVIATIONS.md) |
 
 ### `cat`
 
@@ -91,7 +91,7 @@ osmium-tool installed version as of 2026-03-04.
 |---|---|---|
 | `-t, --object-type` | `-t, --type` | Have it |
 | `-c, --clean` | — | Missing (strip version/changeset/timestamp/uid/user) |
-| `--buffer-data` | — | Missing (buffer all before writing) |
+| `--buffer-data` | — | N/A (pipelined writer handles this differently) |
 
 ### `check-refs`
 
@@ -105,7 +105,7 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `--increment-version` | `--increment-version` | Have it |
-| `--keep-details` | — | Missing (keep tags/refs on deleted objects) |
+| `--keep-details` | — | N/A (niche, only useful for debugging deleted objects) |
 | `--update-timestamp` | — | Missing (set delete timestamp to current time) |
 
 ### `diff`
@@ -129,7 +129,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-p, --polygon` | `-p, --polygon` | Have it |
 | `-s, --strategy` | `--simple`, `--smart` | Have it (different syntax) |
 | `-c, --config` | — | Missing (multi-extract from config file) |
-| `-H, --with-history` | — | Missing |
+| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `--set-bounds` | — | Missing (write bbox to output header) |
 | `--clean` | — | Missing |
 | `-S, --option` | — | Missing (strategy-specific options) |
@@ -141,7 +141,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-r, --add-referenced` | `-r, --add-referenced` | Have it |
 | `-i, --id-file` | `-i, --id-file` | Have it |
 | `-I, --id-osm-file` | — | Missing (read IDs from OSM file) |
-| `-H, --with-history` | — | Missing |
+| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `-t, --remove-tags` | — | Missing |
 | `--verbose-ids` | — | Missing |
 | `--default-type` | — | Missing (default type for bare numeric IDs) |
@@ -151,8 +151,8 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | (base + changes) | base + changes | Have it |
-| `--redact` | — | Missing |
-| `-H, --with-history` | — | Missing |
+| `--redact` | — | N/A (requires history file support) |
+| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `--locations-on-ways` | — | Missing |
 
 ### `removeid`
@@ -196,8 +196,8 @@ No missing flags. osmium sort has no command-specific options either.
 | `--locations` | `--locations` | Have it |
 | `-e, --extended` | — | Missing |
 | `-g, --get` | — | Missing (get specific value) |
-| `-j, --json` | — | Missing (TODO: inspect --json) |
-| `-c, --crc` | — | Missing |
+| `-j, --json` | `--json` | Have it |
+| `-c, --crc` | — | N/A (niche, not useful for PBF processing) |
 
 ## Common flags pbfhogg does not have
 

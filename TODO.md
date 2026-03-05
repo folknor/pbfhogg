@@ -77,16 +77,24 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Missing flags on existing commands (osmium parity)
 
-- [ ] **`add-locations-to-ways --ignore-missing-nodes`** — optionally continue instead
-  of failing when a way references missing node coordinates.
+- [x] **`add-locations-to-ways --ignore-missing-nodes`** — not needed. pbfhogg
+  already tolerates missing nodes by default (substitutes `(0, 0)`, reports count
+  in summary). See DEVIATIONS.md.
 - [x] **Relation-member nodes preserved by default** — untagged nodes referenced
   by relation members are always kept when dropping untagged nodes. No flag needed
   (osmium requires `--keep-member-nodes`; pbfhogg does this unconditionally).
-- [ ] **`derive-changes --keep-details`** — include tags/refs/members on deleted
-  objects in generated OSC.
+- [x] **`derive-changes --keep-details`** — won't implement. Niche flag only
+  useful for debugging deleted objects.
 - [x] **`diff --quiet`** — exit-code-only mode for CI/scripts without full textual diff.
 - [x] **`diff --output <file>`** — write diff report to file instead of stdout.
+- [ ] **`merge --locations-on-ways`** — preserve existing way-node locations
+  during apply-changes merge. Likely used in Geofabrik/AWS pipelines that
+  run ALTW before merge.
+- [ ] **`derive-changes --update-timestamp`** — set delete timestamp to current
+  time. May be used in replication pipelines.
 - [ ] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a
   default object type.
+- [ ] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file instead
+  of a text file. Useful in scripted pipelines.
 - [ ] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
   keep non-matching + required references).

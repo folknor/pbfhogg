@@ -1,6 +1,8 @@
 # pbfhogg correctness notes
 
-Known deviations from specifications and edge cases that are accepted by design.
+Parser/encoder edge cases and data representation limits that are accepted by
+design. For intentional behavioral differences from osmium-tool, see
+DEVIATIONS.md.
 
 ## Non-packed repeated fields (protobuf spec violation)
 
@@ -83,26 +85,6 @@ Osmosis-generated PBFs. This is documented on the `DenseNodeInfo` struct. Librar
 users who need to handle Osmosis input should check for `-1` themselves. The tradeoff
 is accepted: the dense iterator is too hot to add branches for a single producer's
 non-standard encoding.
-
-## add-locations-to-ways: relation-member nodes always preserved
-
-**Status:** Intentional deviation from osmium.
-
-**Context:** When `add-locations-to-ways` drops untagged nodes (the default), nodes
-referenced as relation members are unconditionally kept. osmium requires an explicit
-`--keep-member-nodes` flag for this behavior — without it, untagged relation-member
-nodes are silently dropped, breaking relation geometry.
-
-**Why always-on:** Dropping relation-member nodes is virtually never desired. It
-breaks multipolygon boundaries, route relations, and any relation that references
-nodes directly. osmium's opt-in flag is widely considered a footgun. The cost of the
-extra relation-scanning pass is negligible (relation blobs are a small fraction of
-the file, filtered via `BlobFilter::only_relations()`).
-
-**Implementation:** A third pass scans relation blobs to collect node IDs referenced
-as members into an `IdSetDense` bitset. During the write pass, untagged nodes are
-kept if they appear in this set. The pass is skipped entirely when
-`--keep-untagged-nodes` is set (all nodes are kept anyway).
 
 ## Null Island ambiguity in dense mmap index
 

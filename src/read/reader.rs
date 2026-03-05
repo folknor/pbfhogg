@@ -94,7 +94,11 @@ impl<R: Read + Send> ElementReader<R> {
         self
     }
 
-    /// Sets Stage 2 pipeline decode-ahead depth (decoded blocks buffered before reorder).
+    /// Sets Stage 2 pipeline decode-ahead depth.
+    ///
+    /// Controls both the channel capacity between the decode pool and the
+    /// reorder buffer, and the reorder buffer's own capacity. Lower values
+    /// reduce memory usage; higher values absorb decode-time variance.
     ///
     /// Defaults to 32. Values <1 are clamped to 1.
     pub fn decode_ahead(mut self, n: usize) -> Self {
@@ -470,7 +474,13 @@ impl ElementReader<FileReader> {
     pub fn from_path_direct<P: AsRef<Path>>(path: P) -> Result<Self> {
         let mut blob_iter = BlobReader::from_path_direct(path)?;
         let header = read_header_blob(&mut blob_iter)?;
-        Ok(ElementReader { blob_iter, header, decode_threads: None, blob_filter: None })
+        Ok(ElementReader {
+            blob_iter,
+            header,
+            decode_threads: None,
+            pipeline_config: PipelineConfig::default(),
+            blob_filter: None,
+        })
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.

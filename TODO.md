@@ -3,7 +3,6 @@
 ## Needs review
 
 - `f41ff7a` docs: record OSM ID ordering benchmark results
-- `dbeae8e` read: make pipeline buffering configurable
 - `3b496c4` docs: record P2-13 extract pass1 regression attempt
 - `37b7c19` extract: speed up sorted pass1 ID collection
 - `300fdee` clean stale investigation notes and update TODO

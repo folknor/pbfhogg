@@ -82,7 +82,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-n, --keep-untagged-nodes` | `--keep-untagged-nodes` | Have it |
 | `-i, --index-type` | — | Missing (hardcoded DenseMmapIndex) |
 | `--index-type-neg` | — | Missing |
-| `--keep-member-nodes` | — | Missing (TODO: osmium-tool#239) |
+| `--keep-member-nodes` | — | N/A (always-on, see CORRECTNESS.md) |
 | `--ignore-missing-nodes` | — | Missing (currently errors on missing nodes) |
 
 ### `cat`

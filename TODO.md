@@ -46,6 +46,18 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   decode+write (`cat --type`), and allocations. Run:
   `brokkr profile --dataset germany`
 
+## CLI consolidation (post-parity)
+
+After reaching osmium feature parity, consolidate the CLI surface. Candidates:
+- Unify `merge` (apply-changes), `merge` (multi-PBF), and `merge-changes` under
+  one `merge` command with subcommands or mode flags.
+- Fold `inspect`, `is-indexed`, `node-stats`, and `verify` into a single
+  `inspect` command with subcommands.
+- Review whether `getid`/`removeid` should be one command with `--invert`.
+
+Do this after implementation, not before — need to understand the implementation
+constraints before designing the consolidated API.
+
 ## Release prep
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)

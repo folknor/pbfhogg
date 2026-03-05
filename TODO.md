@@ -1,12 +1,5 @@
 # pbfhogg TODO
 
-## Needs review
-
-- `f41ff7a` docs: record OSM ID ordering benchmark results
-- `3b496c4` docs: record P2-13 extract pass1 regression attempt
-- `300fdee` clean stale investigation notes and update TODO
-- `6f1c9fa` diff: add --quiet and --output flags
-
 ## Important: ignored tests
 
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` — it roundtrips the entire

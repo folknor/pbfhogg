@@ -235,7 +235,6 @@ struct ScanState {
     total_violations: u64,
     max_errors: usize,
     type_filter: TypeFilter,
-    full: bool,
     node_ids: Option<RoaringTreemap>,
     way_ids: Option<RoaringTreemap>,
     relation_ids: Option<RoaringTreemap>,
@@ -256,7 +255,6 @@ impl ScanState {
             total_violations: 0,
             max_errors: opts.max_errors,
             type_filter,
-            full: opts.full,
             node_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
             way_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
             relation_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
@@ -361,12 +359,12 @@ fn check_duplicate(
     elem_type: &'static str,
     id: i64,
 ) {
-    if let Some(set) = set.as_mut() {
-        if !set.insert(id.cast_unsigned()) {
-            *total_violations += 1;
-            if violations.len() < max_errors {
-                violations.push(IdViolation::Duplicate { elem_type, id });
-            }
+    if let Some(set) = set.as_mut()
+        && !set.insert(id.cast_unsigned())
+    {
+        *total_violations += 1;
+        if violations.len() < max_errors {
+            violations.push(IdViolation::Duplicate { elem_type, id });
         }
     }
 }

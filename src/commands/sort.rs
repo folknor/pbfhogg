@@ -21,7 +21,7 @@ use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
-use crate::{Element, MemberId};
+use crate::Element;
 
 use super::owned_elements::OwnedMember;
 
@@ -600,15 +600,12 @@ fn sweep_merge_rels(
 }
 
 /// Flush all elements from the min-heap whose ID is below `below`.
-fn flush_heap_below<T: Ord>(
+fn flush_heap_below<T: Ord + HasId>(
     heap: &mut BinaryHeap<Reverse<T>>,
     below: i64,
     mut emit: impl FnMut(T) -> Result<()>,
-) -> Result<()>
-where
-    T: HasId,
-{
-    while heap.peek().map_or(false, |Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt()) {
+) -> Result<()> {
+    while heap.peek().is_some_and(|Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt()) {
         if let Some(Reverse(element)) = heap.pop() {
             emit(element)?;
         }

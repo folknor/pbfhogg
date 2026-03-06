@@ -403,7 +403,7 @@ impl<W: Write> PbfWriter<W> {
     /// [`BlockBuilder::take_owned`](crate::block_builder::BlockBuilder::take_owned)
     /// instead of rescanning the serialized bytes.
     #[hotpath::measure]
-    pub fn write_primitive_block_owned(
+    pub(crate) fn write_primitive_block_owned(
         &mut self,
         block_bytes: Vec<u8>,
         index: blob_index::BlobIndex,

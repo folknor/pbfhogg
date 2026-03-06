@@ -928,7 +928,7 @@ impl BlobReader<BufReader<File>> {
 ///
 /// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
 /// Returns: `(blob_type, data_size)`.
-pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
+pub(crate) fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
     let header = WireBlobHeader::parse(header_bytes, false, false)?;
     if header.datasize < 0 {
         return Err(new_blob_error(BlobError::InvalidDataSize {
@@ -945,7 +945,7 @@ pub fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
 /// The indexdata, when present, contains blob-level metadata (element type,
 /// ID range, count, and optionally spatial bbox) that allows merge to classify
 /// blobs without decompression. The tagdata contains per-blob tag key metadata.
-pub fn parse_blob_header_with_index(
+pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {
     let header = WireBlobHeader::parse(header_bytes, true, true)?;

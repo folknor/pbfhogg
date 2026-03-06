@@ -514,10 +514,10 @@ impl UpsertCursors {
 /// + ~5× rewrite output estimate).
 fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> usize {
     let raw = frame.frame_bytes.len();
-    if let Some(ref idx) = frame.index {
-        if !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id) {
-            return raw;
-        }
+    if let Some(ref idx) = frame.index
+        && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
+    {
+        return raw;
     }
     raw * 21
 }
@@ -1410,8 +1410,9 @@ pub fn merge(
 
         // Phase 2.5: Extract node coordinates for --locations-on-ways.
         // Must complete BEFORE Phase 3 spawns way rewrites that read the index.
-        if let Some(ref mut idx) = loc_index {
-            if !idx.all_found() {
+        if let Some(ref mut idx) = loc_index
+            && !idx.all_found()
+        {
                 // First pass: extract from rewrite blobs (already parsed, cheap)
                 for slot in &slots {
                     let blob_index = match slot {
@@ -1491,7 +1492,6 @@ pub fn merge(
                     }
                     stats.loc_node_blobs_scanned += passthrough_scan.len() as u64;
                 }
-            }
         }
 
         // Snapshot the location index for rewrite tasks that need it (way blobs).

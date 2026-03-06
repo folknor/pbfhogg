@@ -998,7 +998,7 @@ impl BlockBuilder {
     /// The total allocation is the same as `take()` + `to_vec()` but the
     /// `memcpy` is eliminated.
     #[hotpath::measure]
-    pub fn take_owned(&mut self) -> io::Result<Option<OwnedBlock>> {
+    pub(crate) fn take_owned(&mut self) -> io::Result<Option<OwnedBlock>> {
         if let Some(index) = self.encode_block()? {
             let tagdata = self.last_tagdata.take();
             Ok(Some((std::mem::take(&mut self.encode_buf), index, tagdata)))

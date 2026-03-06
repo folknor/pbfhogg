@@ -724,3 +724,108 @@ fn simple_sorted_polygon_filters_nodes() {
     assert_eq!(node_ids(&c), vec![1, 3]);
     assert_eq!(stats.nodes_in_bbox, 2);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-extract (--config) integration tests
+// ---------------------------------------------------------------------------
+
+use pbfhogg::extract::{extract_multi, parse_extract_config, ExtractSlot};
+
+#[test]
+fn multi_extract_two_bbox_regions() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let out_a = dir.path().join("a.osm.pbf");
+    let out_b = dir.path().join("b.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &test_ways(), &test_relations());
+
+    // Extract A: Copenhagen area (nodes 1, 3)
+    let bbox_a = parse_bbox("12.4,55.6,12.7,55.8").expect("bbox_a");
+    // Extract B: far east area (node 4)
+    let bbox_b = parse_bbox("13.5,55.5,14.5,55.9").expect("bbox_b");
+
+    let slots = vec![
+        ExtractSlot {
+            region: Region::Bbox(bbox_a),
+            output: out_a.clone(),
+        },
+        ExtractSlot {
+            region: Region::Bbox(bbox_b),
+            output: out_b.clone(),
+        },
+    ];
+
+    let all_stats = extract_multi(
+        &input,
+        &slots,
+        ExtractStrategy::Simple,
+        true,
+        &CleanAttrs::default(),
+        Compression::default(),
+        false,
+        true,
+    )
+    .expect("extract_multi");
+
+    assert_eq!(all_stats.len(), 2);
+
+    // Extract A: nodes 1, 3 in bbox; ways 10, 12 match; relation 100 matches
+    let ca = read_all_elements(&out_a);
+    assert_eq!(node_ids(&ca), vec![1, 3]);
+    assert_eq!(way_ids(&ca), vec![10, 12]);
+    assert_eq!(relation_ids(&ca), vec![100]);
+    assert_eq!(all_stats[0].nodes_in_bbox, 2);
+
+    // Extract B: node 4 in bbox; way 11 refs [2,4] — only node 4 is in B's bbox
+    // so way 11 matches. Relation 101 has member node 4.
+    let cb = read_all_elements(&out_b);
+    assert_eq!(node_ids(&cb), vec![4]);
+    assert_eq!(way_ids(&cb), vec![11]);
+    assert_eq!(relation_ids(&cb), vec![101]);
+    assert_eq!(all_stats[1].nodes_in_bbox, 1);
+}
+
+#[test]
+fn multi_extract_from_config_file() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+
+    write_test_pbf_sorted(&input, &test_nodes(), &[], &[]);
+
+    let config_json = format!(
+        r#"{{
+            "directory": "{}",
+            "extracts": [
+                {{ "output": "copenhagen.osm.pbf", "bbox": [12.4, 55.6, 12.7, 55.8] }},
+                {{ "output": "east.osm.pbf", "bbox": [13.5, 55.5, 14.5, 55.9] }}
+            ]
+        }}"#,
+        dir.path().display()
+    );
+    let config_path = dir.path().join("config.json");
+    std::fs::write(&config_path, &config_json).expect("write config");
+
+    let (_, slots) = parse_extract_config(&config_path).expect("parse config");
+    assert_eq!(slots.len(), 2);
+
+    let all_stats = extract_multi(
+        &input,
+        &slots,
+        ExtractStrategy::Simple,
+        false,
+        &CleanAttrs::default(),
+        Compression::default(),
+        false,
+        true,
+    )
+    .expect("extract_multi");
+
+    let ca = read_all_elements(&slots[0].output);
+    assert_eq!(node_ids(&ca), vec![1, 3]);
+    assert_eq!(all_stats[0].nodes_in_bbox, 2);
+
+    let cb = read_all_elements(&slots[1].output);
+    assert_eq!(node_ids(&cb), vec![4]);
+    assert_eq!(all_stats[1].nodes_in_bbox, 1);
+}

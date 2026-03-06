@@ -95,11 +95,12 @@ constraints before designing the consolidated API.
   same-version updates abort simplify),
   [osmosis#72](https://github.com/openstreetmap/osmosis/issues/72) (simplification
   must not merge distinct action types with same ID).
-- [ ] **`merge` (multi-PBF)** — merge multiple sorted PBF inputs into one output,
-  deduplicating by highest version per object (distinct from `merge` apply-changes).
-- [ ] **`getparents`** — reverse lookup: given IDs, emit ways/relations referencing
+- [x] **`merge` (multi-PBF)** — merge multiple sorted PBF inputs into one output,
+  deduplicating exact duplicates. Implemented as `merge-pbf` with blob-level
+  passthrough for non-overlapping blobs and sweep merge with dedup for overlaps.
+- [x] **`getparents`** — reverse lookup: given IDs, emit ways/relations referencing
   them (`--id-file`, optional `--add-self`).
-- [ ] **`renumber`** — reassign IDs (node/way/relation), with stable mapping and
+- [x] **`renumber`** — reassign IDs (node/way/relation), with stable mapping and
   configurable start IDs.
 
 ## Missing flags on existing commands (osmium parity)
@@ -107,8 +108,23 @@ constraints before designing the consolidated API.
 - [x] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file.
   Scans all elements, collects top-level IDs (no member/ref IDs).
   Additive with CLI args and `--id-file`.
-- [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
-  uses this to cut the planet into 200+ regional extracts in one pass.
+- [x] **`extract --config`** — multi-extract from JSON config file. Geofabrik uses
+  this to cut the planet into 200+ regional extracts in one pass.
+  **Config format:** top-level `directory` (optional) + `extracts` array (max 500).
+  Each extract has `output` (filename), geometry (one of `bbox` array/object,
+  `polygon` inline/file, `multipolygon` inline/file), optional `description` and
+  `output_header`. Polygon files support GeoJSON, .poly, and OSM formats.
+  **Algorithm:** single pass per strategy shared across ALL extracts — for each
+  element, loop over all extracts and test geometry membership. Pass count depends
+  on strategy (1=simple, 2=complete, 3=smart), not extract count.
+  **All extracts use the same strategy** (no per-extract strategy choice).
+  Overlapping extracts fully supported (element written to all matching outputs).
+  **Memory:** O(max_node_id × num_extracts) — scales linearly with extract count.
+  Osmium recommends staging (large regions first, then subdivide) for many extracts.
+  **Scope:** large feature — needs JSON config parsing, multi-writer output,
+  per-extract ID sets, polygon file parsers (GeoJSON/poly/OSM). Consider whether
+  the single-pass multi-extract pattern fits pbfhogg's existing extract architecture
+  (currently single-extract with parallel batch processing).
 - [x] **`inspect -e` (extended)** — full-scan mode producing timestamp range,
   data bbox, objects ordered, and metadata attribute coverage (version,
   timestamp, changeset, uid, user). Auto-enables `--id-ranges`.

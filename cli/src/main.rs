@@ -339,14 +339,21 @@ enum Command {
     Extract {
         /// Input PBF file
         file: PathBuf,
-        #[command(flatten)]
-        output: OutputArg,
+        /// Output file (required for single extract, omit with --config)
+        #[arg(short, long, required_unless_present = "config")]
+        output: Option<PathBuf>,
         /// Bounding box: minlon,minlat,maxlon,maxlat
-        #[arg(short = 'b', long, group = "area")]
+        #[arg(short = 'b', long, group = "area", conflicts_with = "config")]
         bbox: Option<String>,
         /// Polygon GeoJSON file
-        #[arg(short = 'p', long, group = "area")]
+        #[arg(short = 'p', long, group = "area", conflicts_with = "config")]
         polygon: Option<PathBuf>,
+        /// Multi-extract JSON config file
+        #[arg(short = 'c', long, conflicts_with_all = ["bbox", "polygon", "output"])]
+        config: Option<PathBuf>,
+        /// Output directory override (only with --config)
+        #[arg(short = 'd', long, requires = "config")]
+        directory: Option<PathBuf>,
         /// Simple strategy (single pass, may have dangling refs)
         #[arg(short = 's', long, conflicts_with = "smart")]
         simple: bool,
@@ -827,6 +834,8 @@ fn main() {
             output,
             bbox,
             polygon,
+            config,
+            directory,
             simple,
             smart,
             set_bounds,
@@ -834,18 +843,36 @@ fn main() {
             compression,
             force,
             io,
-        } => run_extract(
-            &file,
-            &output.output,
-            bbox.as_deref(),
-            polygon.as_deref(),
-            extract_strategy(simple, smart),
-            set_bounds,
-            &clean,
-            &compression.compression,
-            io.direct_io,
-            force.force,
-        ),
+        } => {
+            if let Some(config_path) = config.as_deref() {
+                run_extract_config(
+                    &file,
+                    config_path,
+                    directory.as_deref(),
+                    extract_strategy(simple, smart),
+                    set_bounds,
+                    &clean,
+                    &compression.compression,
+                    io.direct_io,
+                    force.force,
+                )
+            } else if let Some(output) = output.as_ref() {
+                run_extract(
+                    &file,
+                    output,
+                    bbox.as_deref(),
+                    polygon.as_deref(),
+                    extract_strategy(simple, smart),
+                    set_bounds,
+                    &clean,
+                    &compression.compression,
+                    io.direct_io,
+                    force.force,
+                )
+            } else {
+                Err("--output is required without --config".into())
+            }
+        }
         Command::AddLocationsToWays {
             file,
             output,
@@ -1701,6 +1728,56 @@ fn run_extract(
         force,
     )?;
     stats.print_summary();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_extract_config(
+    file: &std::path::Path,
+    config_path: &std::path::Path,
+    directory_override: Option<&std::path::Path>,
+    strategy: pbfhogg::extract::ExtractStrategy,
+    set_bounds: bool,
+    clean_attrs: &[String],
+    compression: &str,
+    direct_io: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let clean = parse_clean_attrs(clean_attrs)?;
+    let (config_dir, mut slots) = pbfhogg::extract::parse_extract_config(config_path)?;
+
+    // If -d/--directory is given on CLI, override the config's directory
+    if let Some(dir) = directory_override {
+        let config_parent = config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let old_dir = config_dir
+            .as_deref()
+            .unwrap_or(config_parent);
+        for slot in &mut slots {
+            // Re-resolve output relative to new directory
+            if let Ok(relative) = slot.output.strip_prefix(old_dir) {
+                slot.output = dir.join(relative);
+            }
+        }
+    }
+
+    eprintln!("Multi-extract: {} extracts from config", slots.len());
+    let all_stats = pbfhogg::extract::extract_multi(
+        file,
+        &slots,
+        strategy,
+        set_bounds,
+        &clean,
+        compression,
+        direct_io,
+        force,
+    )?;
+    for (i, stats) in all_stats.iter().enumerate() {
+        eprint!("  [{}] {} — ", i + 1, slots[i].output.display());
+        stats.print_summary();
+    }
     Ok(())
 }
 

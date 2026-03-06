@@ -114,7 +114,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-b, --bbox` | `-b, --bbox` | Have it |
 | `-p, --polygon` | `-p, --polygon` | Have it |
 | `-s, --strategy` | `--simple`, `--smart` | Have it (different syntax) |
-| `-c, --config` | — | Missing (multi-extract from config file) |
+| `-c, --config` | `-c, --config` | Have it (JSON config, bbox/polygon/polygon_file per extract, -d directory override) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `--set-bounds` | `--set-bounds` | Have it (opt-in, writes bbox to output header) |
 | `--clean` | `--clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |

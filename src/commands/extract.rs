@@ -441,6 +441,216 @@ fn bbox_from_polygons(polygons: &[PolygonRings]) -> Result<Bbox> {
 }
 
 // ---------------------------------------------------------------------------
+// Config file parsing (multi-extract)
+// ---------------------------------------------------------------------------
+
+/// A single extract slot parsed from a config file.
+pub struct ExtractSlot {
+    pub region: Region,
+    pub output: std::path::PathBuf,
+}
+
+/// Parse a multi-extract JSON config file.
+///
+/// Returns `(directory, extracts)` where `directory` is the optional output
+/// directory from the config and `extracts` is the list of extract slots.
+///
+/// Config format:
+/// ```json
+/// {
+///   "directory": "/output",
+///   "extracts": [
+///     { "output": "denmark.osm.pbf", "bbox": [8.09, 54.80, 12.69, 57.73] },
+///     { "output": "berlin.osm.pbf", "polygon": { "type": "Polygon", "coordinates": [...] } },
+///     { "output": "hamburg.osm.pbf", "polygon_file": "hamburg.geojson" }
+///   ]
+/// }
+/// ```
+pub fn parse_extract_config(
+    config_path: &Path,
+) -> Result<(Option<std::path::PathBuf>, Vec<ExtractSlot>)> {
+    let data = std::fs::read_to_string(config_path)?;
+    let value: serde_json::Value = serde_json::from_str(&data)?;
+
+    let directory = value
+        .get("directory")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from);
+
+    let extracts_arr = value
+        .get("extracts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("config must have an 'extracts' array")?;
+
+    if extracts_arr.is_empty() {
+        return Err("'extracts' array must not be empty".into());
+    }
+    if extracts_arr.len() > 500 {
+        return Err(format!("too many extracts: {} (max 500)", extracts_arr.len()).into());
+    }
+
+    let config_dir = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."));
+
+    let resolve_dir = directory.as_deref().unwrap_or(config_dir);
+
+    let mut slots = Vec::with_capacity(extracts_arr.len());
+    let mut output_paths: Vec<std::path::PathBuf> = Vec::with_capacity(extracts_arr.len());
+
+    for (i, entry) in extracts_arr.iter().enumerate() {
+        let output_name = entry
+            .get("output")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("extract[{i}] missing 'output' field"))?;
+
+        let output_path = resolve_dir.join(output_name);
+        if output_paths.contains(&output_path) {
+            return Err(format!("duplicate output path: {}", output_path.display()).into());
+        }
+        output_paths.push(output_path.clone());
+
+        let region = parse_extract_geometry(entry, i, config_dir)?;
+        slots.push(ExtractSlot {
+            region,
+            output: output_path,
+        });
+    }
+
+    Ok((directory, slots))
+}
+
+/// Parse the geometry for a single extract entry in a config file.
+fn parse_extract_geometry(
+    entry: &serde_json::Value,
+    index: usize,
+    config_dir: &Path,
+) -> Result<Region> {
+    let has_bbox = entry.get("bbox").is_some();
+    let has_polygon = entry.get("polygon").is_some();
+    let has_polygon_file = entry.get("polygon_file").is_some();
+
+    let geo_count = usize::from(has_bbox) + usize::from(has_polygon) + usize::from(has_polygon_file);
+    if geo_count == 0 {
+        return Err(format!(
+            "extract[{index}] must have exactly one of 'bbox', 'polygon', or 'polygon_file'"
+        )
+        .into());
+    }
+    if geo_count > 1 {
+        return Err(format!(
+            "extract[{index}] has multiple geometry fields; use exactly one of 'bbox', 'polygon', or 'polygon_file'"
+        )
+        .into());
+    }
+
+    if has_bbox {
+        let arr = entry
+            .get("bbox")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| format!("extract[{index}] 'bbox' must be an array"))?;
+        if arr.len() != 4 {
+            return Err(format!(
+                "extract[{index}] 'bbox' must have 4 elements, got {}",
+                arr.len()
+            )
+            .into());
+        }
+        let min_lon = arr[0]
+            .as_f64()
+            .ok_or_else(|| format!("extract[{index}] bbox[0] must be a number"))?;
+        let min_lat = arr[1]
+            .as_f64()
+            .ok_or_else(|| format!("extract[{index}] bbox[1] must be a number"))?;
+        let max_lon = arr[2]
+            .as_f64()
+            .ok_or_else(|| format!("extract[{index}] bbox[2] must be a number"))?;
+        let max_lat = arr[3]
+            .as_f64()
+            .ok_or_else(|| format!("extract[{index}] bbox[3] must be a number"))?;
+        if min_lon >= max_lon {
+            return Err(format!(
+                "extract[{index}] bbox min_lon ({min_lon}) must be less than max_lon ({max_lon})"
+            )
+            .into());
+        }
+        if min_lat >= max_lat {
+            return Err(format!(
+                "extract[{index}] bbox min_lat ({min_lat}) must be less than max_lat ({max_lat})"
+            )
+            .into());
+        }
+        return Ok(Region::Bbox(Bbox {
+            min_lon,
+            min_lat,
+            max_lon,
+            max_lat,
+        }));
+    }
+
+    if has_polygon {
+        let geom = entry
+            .get("polygon")
+            .ok_or_else(|| format!("extract[{index}] missing 'polygon'"))?;
+        let geometry = extract_geometry(geom)?;
+        let geo_type = geometry
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("extract[{index}] polygon missing 'type' field"))?;
+        let coords = geometry
+            .get("coordinates")
+            .ok_or_else(|| format!("extract[{index}] polygon missing 'coordinates' field"))?;
+        let polygons = parse_geometry_by_type(geo_type, coords)?;
+        let bbox = bbox_from_polygons(&polygons)?;
+        return Ok(Region::Polygon { polygons, bbox });
+    }
+
+    // has_polygon_file
+    let file_str = entry
+        .get("polygon_file")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("extract[{index}] 'polygon_file' must be a string"))?;
+    let polygon_path = config_dir.join(file_str);
+    parse_geojson(&polygon_path)
+}
+
+/// Run multiple extracts from a parsed config, calling [`extract`] for each slot.
+#[allow(clippy::too_many_arguments)]
+pub fn extract_multi(
+    input: &Path,
+    slots: &[ExtractSlot],
+    strategy: ExtractStrategy,
+    set_bounds: bool,
+    clean: &CleanAttrs,
+    compression: Compression,
+    direct_io: bool,
+    force: bool,
+) -> Result<Vec<ExtractStats>> {
+    let mut all_stats = Vec::with_capacity(slots.len());
+    for (i, slot) in slots.iter().enumerate() {
+        eprintln!(
+            "[{}/{}] Extracting to {}",
+            i + 1,
+            slots.len(),
+            slot.output.display()
+        );
+        let stats = extract(
+            input,
+            &slot.output,
+            &slot.region,
+            strategy,
+            set_bounds,
+            clean,
+            compression,
+            direct_io,
+            force,
+        )?;
+        all_stats.push(stats);
+    }
+    Ok(all_stats)
+}
+
+// ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------
 
@@ -2219,5 +2429,157 @@ mod tests {
         }"#;
         let path = write_temp_geojson(&dir, "point.geojson", json);
         assert!(parse_geojson(&path).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Config file parsing tests
+    // -----------------------------------------------------------------------
+
+    fn write_temp_json(dir: &TempDir, name: &str, content: &str) -> std::path::PathBuf {
+        let path = dir.path().join(name);
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(content.as_bytes()).unwrap();
+        path
+    }
+
+    #[test]
+    fn config_bbox_extracts() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [
+                { "output": "a.osm.pbf", "bbox": [8.0, 54.0, 13.0, 58.0] },
+                { "output": "b.osm.pbf", "bbox": [0.0, 0.0, 5.0, 5.0] }
+            ]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        let (directory, slots) = parse_extract_config(&path).unwrap();
+        assert!(directory.is_none());
+        assert_eq!(slots.len(), 2);
+        assert!(slots[0].output.ends_with("a.osm.pbf"));
+        assert!(slots[1].output.ends_with("b.osm.pbf"));
+        // First extract should contain Copenhagen area
+        assert!(slots[0].region.contains(55.6, 12.5));
+        assert!(!slots[0].region.contains(1.0, 1.0));
+        // Second extract should contain (1,1)
+        assert!(slots[1].region.contains(1.0, 1.0));
+        assert!(!slots[1].region.contains(55.6, 12.5));
+    }
+
+    #[test]
+    fn config_with_directory() {
+        let dir = TempDir::new().unwrap();
+        let outdir = dir.path().join("out");
+        std::fs::create_dir(&outdir).unwrap();
+        let json = format!(
+            r#"{{
+                "directory": "{}",
+                "extracts": [
+                    {{ "output": "test.osm.pbf", "bbox": [0.0, 0.0, 1.0, 1.0] }}
+                ]
+            }}"#,
+            outdir.display()
+        );
+        let path = write_temp_json(&dir, "config.json", &json);
+        let (directory, slots) = parse_extract_config(&path).unwrap();
+        assert!(directory.is_some());
+        assert_eq!(slots[0].output, outdir.join("test.osm.pbf"));
+    }
+
+    #[test]
+    fn config_inline_polygon() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [{
+                "output": "poly.osm.pbf",
+                "polygon": {
+                    "type": "Polygon",
+                    "coordinates": [
+                        [[10.0, 50.0], [12.0, 50.0], [12.0, 52.0], [10.0, 52.0], [10.0, 50.0]]
+                    ]
+                }
+            }]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        let (_, slots) = parse_extract_config(&path).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0].region.contains(51.0, 11.0));
+        assert!(!slots[0].region.contains(53.0, 11.0));
+    }
+
+    #[test]
+    fn config_polygon_file() {
+        let dir = TempDir::new().unwrap();
+        let geojson = r#"{
+            "type": "Polygon",
+            "coordinates": [
+                [[10.0, 50.0], [12.0, 50.0], [12.0, 52.0], [10.0, 52.0], [10.0, 50.0]]
+            ]
+        }"#;
+        write_temp_geojson(&dir, "area.geojson", geojson);
+        let json = r#"{
+            "extracts": [{
+                "output": "from_file.osm.pbf",
+                "polygon_file": "area.geojson"
+            }]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        let (_, slots) = parse_extract_config(&path).unwrap();
+        assert_eq!(slots.len(), 1);
+        assert!(slots[0].region.contains(51.0, 11.0));
+    }
+
+    #[test]
+    fn config_no_geometry_fails() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [{ "output": "bad.osm.pbf" }]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        assert!(parse_extract_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_duplicate_output_fails() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [
+                { "output": "same.osm.pbf", "bbox": [0.0, 0.0, 1.0, 1.0] },
+                { "output": "same.osm.pbf", "bbox": [2.0, 2.0, 3.0, 3.0] }
+            ]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        assert!(parse_extract_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_empty_extracts_fails() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{ "extracts": [] }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        assert!(parse_extract_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_missing_output_fails() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [{ "bbox": [0.0, 0.0, 1.0, 1.0] }]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        assert!(parse_extract_config(&path).is_err());
+    }
+
+    #[test]
+    fn config_multiple_geometry_fails() {
+        let dir = TempDir::new().unwrap();
+        let json = r#"{
+            "extracts": [{
+                "output": "bad.osm.pbf",
+                "bbox": [0.0, 0.0, 1.0, 1.0],
+                "polygon": { "type": "Polygon", "coordinates": [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]] }
+            }]
+        }"#;
+        let path = write_temp_json(&dir, "config.json", json);
+        assert!(parse_extract_config(&path).is_err());
     }
 }

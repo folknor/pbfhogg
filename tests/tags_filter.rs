@@ -22,6 +22,7 @@ fn run_filter(
         expression_strs,
         omit_referenced,
         invert: false,
+        remove_tags: false,
         compression: Compression::default(),
         direct_io: false,
         force: true,

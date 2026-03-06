@@ -186,7 +186,7 @@ No missing flags. osmium sort has no command-specific options either.
 | expressions (positional) | expressions (positional) | Have it |
 | `-e, --expressions` | `-e, --expressions` | Have it (one per line, `#` comments, additive with CLI args) |
 | `-i, --invert-match` | `-i, --invert-match` | Have it (inverts match: keep non-matching, exclude matching) |
-| `-t, --remove-tags` | — | Missing (remove tags from non-matching) |
+| `-t, --remove-tags` | `-t, --remove-tags` | Have it (strips tags from referenced-only objects, use without -R) |
 
 ### `inspect` (fileinfo)
 

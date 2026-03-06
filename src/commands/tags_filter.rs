@@ -140,6 +140,9 @@ pub struct TagsFilterOptions<'a> {
     pub expression_strs: &'a [String],
     pub omit_referenced: bool,
     pub invert: bool,
+    /// Strip tags from referenced objects not directly matched by expressions.
+    /// Only meaningful without `-R` (two-pass mode with reference expansion).
+    pub remove_tags: bool,
     pub compression: Compression,
     pub direct_io: bool,
     pub force: bool,
@@ -172,7 +175,7 @@ pub fn tags_filter(
     if opts.omit_referenced {
         tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io)
     } else {
-        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io)
+        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io)
     }
 }
 
@@ -356,6 +359,7 @@ struct Pass2IdSets<'a> {
 fn filter_block_pass2(
     block: &PrimitiveBlock,
     ids: &Pass2IdSets<'_>,
+    remove_tags: bool,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<TagsFilterStats, String> {
@@ -381,7 +385,9 @@ fn filter_block_pass2(
                 if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
-                    tags_buf.extend(dn.tags());
+                    if !remove_tags || direct {
+                        tags_buf.extend(dn.tags());
+                    }
                     let meta = dense_node_metadata(dn);
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                     if direct {
@@ -400,7 +406,9 @@ fn filter_block_pass2(
                 if direct || from_way || from_relation {
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
-                    tags_buf.extend(n.tags());
+                    if !remove_tags || direct {
+                        tags_buf.extend(n.tags());
+                    }
                     let meta = element_metadata(&n.info());
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                     if direct {
@@ -416,12 +424,15 @@ fn filter_block_pass2(
                 if ids.included_way_ids.get(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
                     tags_buf.clear();
-                    tags_buf.extend(w.tags());
+                    let direct = ids.direct_way_ids.get(w.id());
+                    if !remove_tags || direct {
+                        tags_buf.extend(w.tags());
+                    }
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
                     bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
-                    if ids.direct_way_ids.get(w.id()) {
+                    if direct {
                         stats.ways_matched += 1;
                     } else {
                         stats.ways_from_relations += 1;
@@ -432,7 +443,10 @@ fn filter_block_pass2(
                 if ids.included_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
                     tags_buf.clear();
-                    tags_buf.extend(r.tags());
+                    let direct = ids.direct_relation_ids.get(r.id());
+                    if !remove_tags || direct {
+                        tags_buf.extend(r.tags());
+                    }
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
@@ -440,7 +454,7 @@ fn filter_block_pass2(
                     }));
                     let meta = element_metadata(&r.info());
                     bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
-                    if ids.direct_relation_ids.get(r.id()) {
+                    if direct {
                         stats.relations_matched += 1;
                     } else {
                         stats.relations_from_relations += 1;
@@ -456,6 +470,7 @@ fn filter_block_pass2(
 fn process_pass2_batch(
     batch: &[PrimitiveBlock],
     ids: &Pass2IdSets<'_>,
+    remove_tags: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TagsFilterStats,
 ) -> Result<()> {
@@ -466,7 +481,7 @@ fn process_pass2_batch(
             BlockBuilder::new,
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = filter_block_pass2(block, ids, bb, &mut output)?;
+                let block_stats = filter_block_pass2(block, ids, remove_tags, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },
@@ -495,6 +510,7 @@ fn tags_filter_two_pass(
     output: &Path,
     expressions: &[Expression],
     invert: bool,
+    remove_tags: bool,
     compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
@@ -627,7 +643,7 @@ fn tags_filter_two_pass(
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_pass2_batch(batch, &id_sets, &mut writer, &mut stats)
+        process_pass2_batch(batch, &id_sets, remove_tags, &mut writer, &mut stats)
     })?;
 
     writer.flush()?;

@@ -157,6 +157,9 @@ enum Command {
         /// Invert match: exclude matching objects, keep non-matching
         #[arg(short = 'i', long = "invert-match")]
         invert_match: bool,
+        /// Remove tags from referenced objects not directly matched (use without -R)
+        #[arg(short = 't', long = "remove-tags")]
+        remove_tags: bool,
         /// Read filter expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
         expressions_file: Option<PathBuf>,
@@ -621,6 +624,7 @@ fn main() {
             output,
             omit_referenced,
             invert_match,
+            remove_tags,
             expressions_file,
             expressions,
             compression,
@@ -633,6 +637,7 @@ fn main() {
             &expressions,
             omit_referenced,
             invert_match,
+            remove_tags,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -1225,6 +1230,7 @@ fn run_tags_filter(
     expressions: &[String],
     omit_referenced: bool,
     invert_match: bool,
+    remove_tags: bool,
     compression: &str,
     direct_io: bool,
     force: bool,
@@ -1234,10 +1240,14 @@ fn run_tags_filter(
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
+    if remove_tags && omit_referenced {
+        eprintln!("Warning! With -R/--omit-referenced use of -t/--remove-tags isn't doing anything.");
+    }
     let opts = pbfhogg::tags_filter::TagsFilterOptions {
         expression_strs: &all_expressions,
         omit_referenced,
         invert: invert_match,
+        remove_tags,
         compression,
         direct_io,
         force,

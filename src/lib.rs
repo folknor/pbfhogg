@@ -166,8 +166,9 @@ pub(crate) use write::file_writer;
 pub use commands::has_indexdata;
 #[doc(hidden)]
 pub use commands::{
-    add_locations_to_ways, cat, derive_changes, diff, getid, inspect, merge, merge_changes,
-    node_stats, sort, tag_expr, tags_count, tags_filter, tags_filter_osc, time_filter,
+    add_locations_to_ways, cat, derive_changes, diff, getid, getparents, inspect, merge,
+    merge_changes, node_stats, sort, tag_expr, tags_count, tags_filter, tags_filter_osc,
+    time_filter,
 };
 #[cfg(feature = "commands")]
 #[doc(hidden)]

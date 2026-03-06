@@ -274,6 +274,31 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
+    /// Find ways/relations referencing given IDs (reverse lookup)
+    Getparents {
+        /// Input PBF file
+        file: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Also include the queried objects themselves in the output
+        #[arg(short = 's', long = "add-self")]
+        add_self: bool,
+        /// Read IDs from text file (one per line, e.g. n123)
+        #[arg(short = 'i', long = "id-file")]
+        id_file: Option<PathBuf>,
+        /// Read IDs from an OSM/PBF file (all element IDs are collected)
+        #[arg(short = 'I', long = "id-osm-file")]
+        id_osm_file: Option<PathBuf>,
+        /// Default type for bare numeric IDs: node, way, relation
+        #[arg(long = "default-type", value_enum)]
+        default_type: Option<DefaultTypeArg>,
+        /// Element IDs (e.g. n123 w456 r789)
+        ids: Vec<String>,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
     /// Remove elements by ID
     Removeid {
         /// Input PBF file
@@ -709,6 +734,27 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+        ),
+        Command::Getparents {
+            file,
+            output,
+            add_self,
+            id_file,
+            id_osm_file,
+            default_type,
+            ids,
+            compression,
+            io,
+        } => run_getparents(
+            &file,
+            &output.output,
+            add_self,
+            id_file.as_deref(),
+            id_osm_file.as_deref(),
+            default_type,
+            &ids,
+            &compression.compression,
+            io.direct_io,
         ),
         Command::Removeid {
             file,
@@ -1463,6 +1509,25 @@ fn run_getid(
         print_missing_ids(output, &id_set, direct_io)?;
     }
 
+    Ok(())
+}
+
+fn run_getparents(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    add_self: bool,
+    id_file: Option<&std::path::Path>,
+    id_osm_file: Option<&std::path::Path>,
+    default_type: Option<DefaultTypeArg>,
+    ids: &[String],
+    compression: &str,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
+    let opts = pbfhogg::getparents::GetparentsOptions { add_self };
+    let stats = pbfhogg::getparents::getparents(file, output, &id_set, &opts, compression, direct_io)?;
+    stats.print_summary();
     Ok(())
 }
 

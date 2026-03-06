@@ -19,7 +19,7 @@ osmium-tool installed version as of 2026-03-04.
 | `extract` | `extract` | Have it |
 | `fileinfo` | `inspect` | Different name, different approach |
 | `getid` | `getid` | Have it |
-| `getparents` | — | Missing (reverse lookup: find ways/relations referencing an ID) |
+| `getparents` | `getparents` | Have it |
 | `merge` | — | Missing (merge multiple sorted PBFs with dedup by version) |
 | `merge-changes` | `--simplify` | Implemented (`merge-changes`, plus optional simplification by last change per object) |
 | `query-locations-index` | — | Missing (paired with create-locations-index) |
@@ -55,9 +55,6 @@ osmium-tool installed version as of 2026-03-04.
   base (default 1,1,1). Useful for anonymizing data, reducing ID space for
   testing, and preparing data for tools that struggle with high IDs. Flags:
   `--start-id`, `--object-type`, `--index-directory` (persist renumbering map).
-- **`getparents`** — reverse lookup: given node/way/relation IDs, find all
-  ways and relations that reference them. Flags: `--add-self` (include the
-  queried objects themselves), `--id-file`, `--id-osm-file`.
 - **`export`** — export to GeoJSON, GeoJSONSeq, or PG text format. Large scope:
   geometry assembly, index types, config file, attribute selection. Probably
   out of scope for pbfhogg's core mission.
@@ -144,6 +141,15 @@ osmium-tool installed version as of 2026-03-04.
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `-t, --remove-tags` | `-t, --remove-tags` | Have it (strips tags from referenced-only nodes, use with -r) |
 | `--verbose-ids` | `--verbose-ids` | Have it (prints requested IDs and reports missing) |
+| `--default-type` | `--default-type` | Have it |
+
+### `getparents`
+
+| osmium flag | pbfhogg | Status |
+|---|---|---|
+| `--add-self` | `--add-self` | Have it |
+| `-i, --id-file` | `-i, --id-file` | Have it |
+| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it |
 | `--default-type` | `--default-type` | Have it |
 
 ### `merge` (apply-changes)

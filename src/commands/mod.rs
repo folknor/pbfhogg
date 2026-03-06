@@ -7,6 +7,7 @@ pub mod diff;
 #[cfg(feature = "commands")]
 pub mod extract;
 pub mod getid;
+pub mod getparents;
 pub mod inspect;
 pub(crate) mod id_set_dense;
 pub mod merge;

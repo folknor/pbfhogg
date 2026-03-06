@@ -37,6 +37,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr profile [--dataset name] [--variant V] [--osc-seq SEQ]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite. Default variant: indexed.
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
+- `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps.
 
 Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored).
 

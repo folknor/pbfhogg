@@ -178,6 +178,15 @@ Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `23862d1`):
 
 Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium. Simple uses a single-pass fast path on sorted inputs (`Sort.Type_then_ID`) — classify and write in one file scan — and falls back to two passes on unsorted inputs. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
 
+Merge with `--locations-on-ways` — Denmark (501 MB with LocationsOnWays, daily diff, commit `e7bbfa2`):
+
+| Pipeline | pbfhogg | osmium | speedup |
+|----------|---------|--------|---------|
+| merge `--locations-on-ways` | **3.9s** | 8.3s | **2.1x** |
+| merge + ALTW (separate) | 2.7s + 6.5s = 9.2s | 4.3s + 9.5s = 13.8s | — |
+
+The `--locations-on-ways` flag replaces a two-step pipeline (merge then add-locations-to-ways) with a single command. Surviving base ways forward raw coordinate bytes without decode; OSC ways look up node coordinates from a sparse index. Zero overhead when the flag is off.
+
 Merge at scale — single-pass 4-phase batch pipeline with O(log n) inline upsert assignment, reader thread read-ahead, and passthrough coalescing (commit `a6ebbfe`):
 
 | Dataset | Config | Time | vs osmium |

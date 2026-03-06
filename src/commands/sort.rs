@@ -17,14 +17,16 @@ use crate::blob::{
     parse_blob_header_with_index, BlobKind,
 };
 use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
-use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::block_builder::BlockBuilder;
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::Element;
 
-use super::owned_elements::OwnedMember;
-
+use super::elements_pbf::{
+    read_dense_node, read_node, read_relation, read_way, write_single_node, write_single_relation,
+    write_single_way, OwnedNode, OwnedRelation, OwnedWay,
+};
 use super::{
     build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
     flush_block, require_indexdata, HeaderOverrides, Result, writer_from_header_bytes,
@@ -66,76 +68,6 @@ struct BlobEntry {
     has_indexdata: bool,
     /// Per-blob tag key data from BlobHeader field 4, preserved for passthrough.
     tagdata: Option<Box<[u8]>>,
-}
-
-// ---------------------------------------------------------------------------
-// Owned element types (needed for overlap-run decode + re-encode).
-// Vec fields are not converted to Box<[T]> — these are transient (decoded,
-// sorted, re-encoded per overlap run), not long-lived allocations.
-// ---------------------------------------------------------------------------
-
-struct OwnedMetadata {
-    version: i32,
-    timestamp: i64,
-    changeset: i64,
-    uid: i32,
-    user: String,
-    visible: bool,
-}
-
-struct OwnedNode {
-    id: i64,
-    decimicro_lat: i32,
-    decimicro_lon: i32,
-    tags: Vec<(String, String)>,
-    metadata: Option<OwnedMetadata>,
-}
-
-impl PartialEq for OwnedNode {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
-}
-impl Eq for OwnedNode {}
-impl PartialOrd for OwnedNode {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
-}
-impl Ord for OwnedNode {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
-}
-
-struct OwnedWay {
-    id: i64,
-    tags: Vec<(String, String)>,
-    refs: Vec<i64>,
-    metadata: Option<OwnedMetadata>,
-}
-
-impl PartialEq for OwnedWay {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
-}
-impl Eq for OwnedWay {}
-impl PartialOrd for OwnedWay {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
-}
-impl Ord for OwnedWay {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
-}
-
-struct OwnedRelation {
-    id: i64,
-    tags: Vec<(String, String)>,
-    members: Vec<OwnedMember>,
-    metadata: Option<OwnedMetadata>,
-}
-
-impl PartialEq for OwnedRelation {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
-}
-impl Eq for OwnedRelation {}
-impl PartialOrd for OwnedRelation {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
-}
-impl Ord for OwnedRelation {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
 }
 
 // ---------------------------------------------------------------------------
@@ -630,183 +562,4 @@ impl HasId for OwnedRelation {
     fn id(&self) -> i64 { self.id }
 }
 
-// ---------------------------------------------------------------------------
-// Write single elements via BlockBuilder
-// ---------------------------------------------------------------------------
-
-fn write_single_node(
-    node: &OwnedNode,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    ensure_node_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = node
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let meta = owned_to_metadata(node.metadata.as_ref());
-    bb.add_node(node.id, node.decimicro_lat, node.decimicro_lon, &tags, meta.as_ref());
-    Ok(())
-}
-
-fn write_single_way(
-    way: &OwnedWay,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    ensure_way_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = way
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let meta = owned_to_metadata(way.metadata.as_ref());
-    bb.add_way(way.id, &tags, &way.refs, meta.as_ref());
-    Ok(())
-}
-
-fn write_single_relation(
-    rel: &OwnedRelation,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-) -> Result<()> {
-    ensure_relation_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = rel
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let members: Vec<MemberData<'_>> = rel
-        .members
-        .iter()
-        .map(|m| MemberData { id: m.id, role: &m.role })
-        .collect();
-    let meta = owned_to_metadata(rel.metadata.as_ref());
-    bb.add_relation(rel.id, &tags, &members, meta.as_ref());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Element readers (borrow → owned for overlap-run decode)
-// ---------------------------------------------------------------------------
-
-fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
-    OwnedNode {
-        id: dn.id(),
-        decimicro_lat: dn.decimicro_lat(),
-        decimicro_lon: dn.decimicro_lon(),
-        tags: dn
-            .tags()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect(),
-        metadata: dn.info().and_then(|info| {
-            if info.version() == -1 {
-                return None;
-            }
-            Some(OwnedMetadata {
-                version: info.version(),
-                timestamp: info.milli_timestamp() / 1000,
-                changeset: if info.changeset() == -1 { 0 } else { info.changeset() },
-                uid: info.uid(),
-                user: info.user().ok()?.to_owned(),
-                visible: info.visible(),
-            })
-        }),
-    }
-}
-
-fn read_node(n: &crate::Node<'_>) -> OwnedNode {
-    let info = n.info();
-    OwnedNode {
-        id: n.id(),
-        decimicro_lat: n.decimicro_lat(),
-        decimicro_lon: n.decimicro_lon(),
-        tags: n
-            .tags()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
-}
-
-fn read_way(w: &crate::Way<'_>) -> OwnedWay {
-    let info = w.info();
-    OwnedWay {
-        id: w.id(),
-        tags: w
-            .tags()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect(),
-        refs: w.refs().collect(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
-}
-
-fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
-    let info = r.info();
-    OwnedRelation {
-        id: r.id(),
-        tags: r
-            .tags()
-            .map(|(k, v)| (k.to_owned(), v.to_owned()))
-            .collect(),
-        members: r
-            .members()
-            .map(|m| OwnedMember {
-                id: m.id,
-                role: m.role().unwrap_or("").to_owned(),
-            })
-            .collect(),
-        metadata: info.version().map(|v| OwnedMetadata {
-            version: v,
-            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
-            changeset: info.changeset().unwrap_or(0),
-            uid: info.uid().unwrap_or(0),
-            user: info
-                .user()
-                .and_then(std::result::Result::ok)
-                .unwrap_or("")
-                .to_owned(),
-            visible: info.visible(),
-        }),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
-    meta.map(|m| Metadata {
-        version: m.version,
-        timestamp: m.timestamp,
-        changeset: m.changeset,
-        uid: m.uid,
-        user: &m.user,
-        visible: m.visible,
-    })
-}
 

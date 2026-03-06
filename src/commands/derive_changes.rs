@@ -12,7 +12,7 @@ use flate2::write::GzEncoder;
 use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
-use super::owned_elements::{
+use super::elements_xml::{
     from_decimicro, format_coord, nodes_equal, relations_equal, ways_equal, OwnedMetadata,
     OwnedNode, OwnedRelation, OwnedWay,
 };

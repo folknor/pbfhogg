@@ -5,8 +5,11 @@
 
 use std::path::Path;
 
+use super::elements_pbf::{
+    OwnedElement, owned_to_metadata, read_dense_node, read_node, read_way, read_relation,
+};
 use super::{HeaderOverrides, Result, require_sorted, warn_locations_on_ways_loss, writer_from_header};
-use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::block_builder::BlockBuilder;
 use crate::writer::Compression;
 use crate::{DenseNode, Element, ElementReader, Node, Relation, Way};
 
@@ -45,74 +48,6 @@ struct PendingGroup {
     latest: Option<OwnedElement>,
 }
 
-enum OwnedElement {
-    Node(OwnedNode),
-    Way(OwnedWay),
-    Relation(OwnedRelation),
-}
-
-struct OwnedNode {
-    id: i64,
-    lat: i32,
-    lon: i32,
-    tags: Vec<(String, String)>,
-    metadata: Option<OwnedMetadata>,
-}
-
-struct OwnedWay {
-    id: i64,
-    tags: Vec<(String, String)>,
-    refs: Vec<i64>,
-    metadata: Option<OwnedMetadata>,
-}
-
-struct OwnedRelation {
-    id: i64,
-    tags: Vec<(String, String)>,
-    members: Vec<OwnedMember>,
-    metadata: Option<OwnedMetadata>,
-}
-
-struct OwnedMember {
-    id: crate::MemberId,
-    role: String,
-}
-
-struct OwnedMetadata {
-    version: i32,
-    timestamp: i64,
-    changeset: i64,
-    uid: i32,
-    user: String,
-    visible: bool,
-}
-
-impl OwnedMetadata {
-    fn as_borrowed(&self) -> Metadata<'_> {
-        Metadata {
-            version: self.version,
-            timestamp: self.timestamp,
-            changeset: self.changeset,
-            uid: self.uid,
-            user: &self.user,
-            visible: self.visible,
-        }
-    }
-}
-
-impl OwnedElement {
-    fn metadata(&self) -> Option<&OwnedMetadata> {
-        match self {
-            Self::Node(n) => n.metadata.as_ref(),
-            Self::Way(w) => w.metadata.as_ref(),
-            Self::Relation(r) => r.metadata.as_ref(),
-        }
-    }
-
-    fn visible(&self) -> bool {
-        self.metadata().is_none_or(|m| m.visible)
-    }
-}
 
 /// Filter history PBF to a snapshot at `cutoff_timestamp` (UNIX seconds).
 ///
@@ -214,8 +149,8 @@ fn write_owned_element(
             {
                 writer.write_primitive_block(bytes)?;
             }
-            let meta = n.metadata.as_ref().map(OwnedMetadata::as_borrowed);
-            bb.add_node(n.id, n.lat, n.lon, &n.tags_as_pairs(), meta.as_ref());
+            let meta = owned_to_metadata(n.metadata.as_ref());
+            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, &n.tags_as_pairs(), meta.as_ref());
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
@@ -223,7 +158,7 @@ fn write_owned_element(
             {
                 writer.write_primitive_block(bytes)?;
             }
-            let meta = w.metadata.as_ref().map(OwnedMetadata::as_borrowed);
+            let meta = owned_to_metadata(w.metadata.as_ref());
             bb.add_way(w.id, &w.tags_as_pairs(), &w.refs, meta.as_ref());
         }
         OwnedElement::Relation(r) => {
@@ -232,7 +167,7 @@ fn write_owned_element(
             {
                 writer.write_primitive_block(bytes)?;
             }
-            let meta = r.metadata.as_ref().map(OwnedMetadata::as_borrowed);
+            let meta = owned_to_metadata(r.metadata.as_ref());
             let members = r.members_as_data();
             bb.add_relation(r.id, &r.tags_as_pairs(), &members, meta.as_ref());
         }
@@ -267,97 +202,9 @@ fn relation_timestamp(r: &Relation<'_>) -> i64 {
 
 fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
     match element {
-        Element::DenseNode(dn) => OwnedElement::Node(OwnedNode {
-            id: dn.id(),
-            lat: dn.decimicro_lat(),
-            lon: dn.decimicro_lon(),
-            tags: dn
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-            metadata: super::dense_node_metadata(dn).map(owned_metadata),
-        }),
-        Element::Node(n) => OwnedElement::Node(OwnedNode {
-            id: n.id(),
-            lat: n.decimicro_lat(),
-            lon: n.decimicro_lon(),
-            tags: n
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-            metadata: super::element_metadata(&n.info()).map(owned_metadata),
-        }),
-        Element::Way(w) => OwnedElement::Way(OwnedWay {
-            id: w.id(),
-            tags: w
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-            refs: w.refs().collect(),
-            metadata: super::element_metadata(&w.info()).map(owned_metadata),
-        }),
-        Element::Relation(r) => OwnedElement::Relation(OwnedRelation {
-            id: r.id(),
-            tags: r
-                .tags()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
-                .collect(),
-            members: r
-                .members()
-                .map(|m| OwnedMember {
-                    id: m.id,
-                    role: m.role().unwrap_or("").to_owned(),
-                })
-                .collect(),
-            metadata: super::element_metadata(&r.info()).map(owned_metadata),
-        }),
-    }
-}
-
-fn owned_metadata(meta: Metadata<'_>) -> OwnedMetadata {
-    OwnedMetadata {
-        version: meta.version,
-        timestamp: meta.timestamp,
-        changeset: meta.changeset,
-        uid: meta.uid,
-        user: meta.user.to_owned(),
-        visible: meta.visible,
-    }
-}
-
-impl OwnedNode {
-    fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-}
-
-impl OwnedWay {
-    fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-}
-
-impl OwnedRelation {
-    fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-
-    fn members_as_data(&self) -> Vec<MemberData<'_>> {
-        self.members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: &m.role,
-            })
-            .collect()
+        Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)),
+        Element::Node(n) => OwnedElement::Node(read_node(n)),
+        Element::Way(w) => OwnedElement::Way(read_way(w)),
+        Element::Relation(r) => OwnedElement::Relation(read_relation(r)),
     }
 }

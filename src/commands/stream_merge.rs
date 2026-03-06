@@ -7,7 +7,7 @@
 
 use crate::{BlockType, Element, PipelinedBlocks, PrimitiveBlock};
 
-use super::owned_elements::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
+use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
 use super::Result;
 
 // ---------------------------------------------------------------------------

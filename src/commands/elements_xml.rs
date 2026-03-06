@@ -1,4 +1,7 @@
-//! Shared owned element types used by derive_changes and diff commands.
+//! XML-oriented owned element types for derive_changes, diff, merge_changes, and tags_filter_osc.
+//!
+//! Metadata fields are String-typed for direct XML attribute output.
+//! See `elements_pbf` for the PBF-oriented variant with native types.
 
 use crate::MemberId;
 

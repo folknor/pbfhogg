@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
-use super::owned_elements::{
+use super::elements_xml::{
     format_coord, from_decimicro, nodes_equal, relations_equal, ways_equal, OwnedMember,
     OwnedNode, OwnedRelation, OwnedWay,
 };

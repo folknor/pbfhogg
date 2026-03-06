@@ -14,7 +14,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, Event};
 use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
-use super::owned_elements::{
+use super::elements_xml::{
     format_coord, from_decimicro, OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
 };
 use super::Result;

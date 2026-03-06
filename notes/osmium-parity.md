@@ -8,36 +8,35 @@ osmium-tool installed version as of 2026-03-04.
 | osmium command | pbfhogg equivalent | Notes |
 |---|---|---|
 | `add-locations-to-ways` | `add-locations-to-ways` | Have it |
-| `apply-changes` | `merge` | Different name, same operation |
+| `apply-changes` | `apply-changes` | Have it |
 | `cat` | `cat` | Have it |
 | `changeset-filter` | — | Missing (niche) |
-| `check-refs` | `check-refs` | Have it |
+| `check-refs` | `check --refs` | Have it (consolidated into `check`) |
 | `create-locations-index` | — | Missing (pbfhogg builds indexes in-memory) |
-| `derive-changes` | `derive-changes` | Have it |
+| `derive-changes` | `diff --format osc` | Have it (consolidated into `diff`) |
 | `diff` | `diff` | Have it |
 | `export` | — | Missing (GeoJSON/GeoJSONSeq/PG) |
 | `extract` | `extract` | Have it |
 | `fileinfo` | `inspect` | Different name, different approach |
 | `getid` | `getid` | Have it |
 | `getparents` | `getparents` | Have it |
-| `merge` | `merge-pbf` | Have it (different name) |
-| `merge-changes` | `--simplify` | Implemented (`merge-changes`, plus optional simplification by last change per object) |
+| `merge` | `cat --dedupe` | Have it (consolidated into `cat`) |
+| `merge-changes` | `merge-changes` | Have it (with `--simplify` for dedup) |
 | `query-locations-index` | — | Missing (paired with create-locations-index) |
-| `removeid` | `removeid` | Have it |
+| `removeid` | `getid --invert` | Have it (consolidated into `getid`) |
 | `renumber` | `renumber` | Have it |
 | `show` | — | Missing (pretty-print to terminal with pager) |
 | `sort` | `sort` | Have it |
-| `tags-count` | `tags-count` | Have it |
-| `tags-filter` | `tags-filter` | Have it |
+| `tags-count` | `inspect tags` | Have it (consolidated into `inspect`) |
+| `tags-filter` | `tags-filter` | Have it (also handles OSC via `--input-kind osc`) |
 | `time-filter` | `time-filter` | Have it |
 
 ## pbfhogg-only commands (no osmium equivalent)
 
-- `is-indexed` — check if PBF has blob-level indexdata
-- `node-stats` — coordinate statistics for FOR compression sizing
-- `verify ids` — ID uniqueness and ordering validation
-- `verify refs` — referential integrity (wraps check-refs with JSON/quiet modes)
-- `verify all` — run all verification checks
+- `inspect --indexed` — check if PBF has blob-level indexdata
+- `inspect --nodes` — coordinate statistics for FOR compression sizing
+- `check --ids` — ID uniqueness and ordering validation
+- `check` (no flags) — run all verification checks (IDs + refs)
 - `bench-read` / `bench-write` / `bench-merge` — internal benchmarking harnesses
 
 ## Missing commands
@@ -79,14 +78,14 @@ osmium-tool installed version as of 2026-03-04.
 | `-c, --clean` | `-c, --clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |
 | `--buffer-data` | — | N/A (pipelined writer handles this differently) |
 
-### `check-refs`
+### `check-refs` (pbfhogg: `check --refs`)
 
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `-r, --check-relations` | `--check-relations` | Have it |
 | `-i, --show-ids` | `--show-ids` | Have it (format: `n123 in w456`, each occurrence, stdout) |
 
-### `derive-changes`
+### `derive-changes` (pbfhogg: `diff --format osc`)
 
 | osmium flag | pbfhogg | Status |
 |---|---|---|
@@ -150,7 +149,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-i, --index-directory` | — | Missing (in-memory only, no persistent index) |
 | `--show-index` | — | Missing |
 
-### `merge` (apply-changes)
+### `merge` (pbfhogg: `apply-changes`)
 
 | osmium flag | pbfhogg | Status |
 |---|---|---|
@@ -159,7 +158,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `--locations-on-ways` | `--locations-on-ways` | Have it |
 
-### `removeid`
+### `removeid` (pbfhogg: `getid --invert`)
 
 | osmium flag | pbfhogg | Status |
 |---|---|---|
@@ -171,7 +170,7 @@ osmium-tool installed version as of 2026-03-04.
 
 No missing flags. osmium sort has no command-specific options either.
 
-### `tags-count`
+### `tags-count` (pbfhogg: `inspect tags`)
 
 | osmium flag | pbfhogg | Status |
 |---|---|---|
@@ -211,7 +210,7 @@ These appear on nearly every osmium command but have no pbfhogg equivalent:
 - **`-F, --input-format`** — osmium supports PBF, XML, OPL, O5M. pbfhogg is
   PBF-only (by design).
 - **`-f, --output-format`** — same. pbfhogg outputs PBF only (except
-  derive-changes which outputs OSC).
+  `diff --format osc` and `merge-changes` which output OSC).
 - **`-v, --verbose`** — osmium has per-command verbose mode. pbfhogg has no
   verbosity control.
 - **`--progress / --no-progress`** — progress bars. pbfhogg has none.

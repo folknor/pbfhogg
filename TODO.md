@@ -51,27 +51,22 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   `build_from_diff` already correctly excludes deleted ways (they're removed
   from `way_index` by the OSC parser).
 
-- [ ] **Update nidhogg merge call to use `locations_on_ways: true`** —
-  nidhogg currently calls `merge` without the flag. Once the enriched PBF is
-  bootstrapped, enable the flag to eliminate ALTW from the recurring pipeline.
-  File: `~/Programs/nidhogg/src/merge.rs`.
-
 - [ ] **Run Germany full profiling suite** (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (`tags-count`, `check-refs`),
   decode+write (`cat --type`), and allocations. Run:
   `brokkr profile --dataset germany`
 
-## CLI consolidation (post-parity)
+## CLI consolidation (post-parity) — DONE
 
-After reaching osmium feature parity, consolidate the CLI surface. Candidates:
-- Unify `merge` (apply-changes), `merge` (multi-PBF), and `merge-changes` under
-  one `merge` command with subcommands or mode flags.
-- Fold `inspect`, `is-indexed`, `node-stats`, and `verify` into a single
-  `inspect` command with subcommands.
-- Review whether `getid`/`removeid` should be one command with `--invert`.
-
-Do this after implementation, not before — need to understand the implementation
-constraints before designing the consolidated API.
+Completed. 22 commands consolidated to 14. See `notes/cli-redesign.md` for design
+and `notes/cli-reference.md` for the final surface. Key changes:
+- `inspect` absorbs `is-indexed` (`--indexed`), `node-stats` (`--nodes`), `tags-count` (`inspect tags`)
+- `check` absorbs `check-refs` (`--refs`) and `verify` (`--ids`)
+- `diff` absorbs `derive-changes` (`--format osc`)
+- `cat` absorbs `merge-pbf` (`--dedupe`)
+- `tags-filter` absorbs `tags-filter-osc` (`--input-kind osc`)
+- `getid` absorbs `removeid` (`--invert`)
+- `merge` renamed to `apply-changes`
 
 ## Release prep
 
@@ -83,57 +78,3 @@ constraints before designing the consolidated API.
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
 
-## Missing commands (osmium-tool parity)
-
-- [x] **`merge-changes`** — merge multiple OSC files, optionally simplifying
-  (keep only the last change per object by type+id; later input files win). Relevant upstream:
-  [osmium-tool#262](https://github.com/osmcode/osmium-tool/issues/262) (duplicate IDs
-  from broken input),
-  [#282](https://github.com/osmcode/osmium-tool/issues/282) (same-version delete
-  ambiguity with overlapping extracts),
-  [osmosis#150](https://github.com/openstreetmap/osmosis/issues/150) (duplicate
-  same-version updates abort simplify),
-  [osmosis#72](https://github.com/openstreetmap/osmosis/issues/72) (simplification
-  must not merge distinct action types with same ID).
-- [x] **`merge` (multi-PBF)** — merge multiple sorted PBF inputs into one output,
-  deduplicating exact duplicates. Implemented as `merge-pbf` with blob-level
-  passthrough for non-overlapping blobs and sweep merge with dedup for overlaps.
-- [x] **`getparents`** — reverse lookup: given IDs, emit ways/relations referencing
-  them (`--id-file`, optional `--add-self`).
-- [x] **`renumber`** — reassign IDs (node/way/relation), with stable mapping and
-  configurable start IDs.
-
-## Missing flags on existing commands (osmium parity)
-
-- [x] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file.
-  Scans all elements, collects top-level IDs (no member/ref IDs).
-  Additive with CLI args and `--id-file`.
-- [x] **`extract --config`** — multi-extract from JSON config file. Geofabrik uses
-  this to cut the planet into 200+ regional extracts in one pass.
-  **Config format:** top-level `directory` (optional) + `extracts` array (max 500).
-  Each extract has `output` (filename), geometry (one of `bbox` array/object,
-  `polygon` inline/file, `multipolygon` inline/file), optional `description` and
-  `output_header`. Polygon files support GeoJSON, .poly, and OSM formats.
-  **Algorithm:** single pass per strategy shared across ALL extracts — for each
-  element, loop over all extracts and test geometry membership. Pass count depends
-  on strategy (1=simple, 2=complete, 3=smart), not extract count.
-  **All extracts use the same strategy** (no per-extract strategy choice).
-  Overlapping extracts fully supported (element written to all matching outputs).
-  **Memory:** O(max_node_id × num_extracts) — scales linearly with extract count.
-  Osmium recommends staging (large regions first, then subdivide) for many extracts.
-  **Scope:** large feature — needs JSON config parsing, multi-writer output,
-  per-extract ID sets, polygon file parsers (GeoJSON/poly/OSM). Consider whether
-  the single-pass multi-extract pattern fits pbfhogg's existing extract architecture
-  (currently single-extract with parallel batch processing).
-- [x] **`inspect -e` (extended)** — full-scan mode producing timestamp range,
-  data bbox, objects ordered, and metadata attribute coverage (version,
-  timestamp, changeset, uid, user). Auto-enables `--id-ranges`.
-- [x] **`inspect -g`** — get a specific value by dot-path key for scripting
-  (e.g. `inspect -g header.bbox`, `inspect -g data.timestamp.first`).
-  Auto-enables `-e` for `data.*` and `metadata.*` keys.
-- [x] **`tags-count -e` / `tags-filter -e`** — read expressions from file.
-  Additive with CLI args (CLI first, file second). `#` comments, blank lines
-  ignored. Also added optional positional expressions to `tags-count`.
-- [x] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
-  keep non-matching + required references). Blob-level filtering disabled in
-  invert mode since non-matching blobs must be kept.

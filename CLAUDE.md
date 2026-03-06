@@ -25,7 +25,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (4 modes: sequential, parallel, pipelined, blobreader). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench write [--dataset name] [--variant V] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite. Default variant: indexed.
 - `brokkr bench merge [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite. Default variant: indexed.
-- `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (19 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
+- `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (25 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench extract [--dataset name] [--variant V] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan. Default variant: indexed.
 - `brokkr bench allocator [--dataset name] [--variant V] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs. Default variant: indexed.
 - `brokkr bench blob-filter [--dataset name] [--indexed-variant V] [--raw-variant V] [--runs N]` — indexdata vs non-indexdata performance comparison. Default variants: indexed + raw.
@@ -52,7 +52,7 @@ brokkr run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.o
 ```
 There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
 
-`merge`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `tags-count --type`, and `node-stats` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `is-indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
+`apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, and `inspect --nodes` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 
 ## Verify subcommands
 

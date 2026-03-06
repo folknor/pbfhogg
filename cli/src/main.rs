@@ -71,6 +71,18 @@ struct HeaderOverrideArg {
 }
 
 #[derive(Clone, Copy, ValueEnum)]
+enum DiffFormat {
+    Text,
+    Osc,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum InputKind {
+    Pbf,
+    Osc,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
 enum DefaultTypeArg {
     Node,
     Way,
@@ -79,45 +91,6 @@ enum DefaultTypeArg {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Validate referential integrity
-    CheckRefs {
-        /// Input PBF file
-        file: PathBuf,
-        /// Also check relation member references
-        #[arg(long)]
-        check_relations: bool,
-        /// Show IDs of missing objects
-        #[arg(long)]
-        show_ids: bool,
-        #[command(flatten)]
-        io: DirectIoArg,
-    },
-    /// Count tag key=value frequencies
-    TagsCount {
-        /// Input PBF file
-        file: PathBuf,
-        /// Only show tags with at least this many occurrences
-        #[arg(long, default_value = "1")]
-        min_count: u64,
-        /// Only show tags with at most this many occurrences
-        #[arg(short = 'M', long)]
-        max_count: Option<u64>,
-        /// Sort order: count-desc (default), count-asc, name-asc, name-desc
-        #[arg(short = 's', long, default_value = "count-desc")]
-        sort: String,
-        /// Read tag expressions from file (one per line, # comments)
-        #[arg(short = 'e', long = "expressions")]
-        expressions_file: Option<PathBuf>,
-        /// Tag filter expressions (e.g. "highway", "amenity", "w/building=yes")
-        expressions: Vec<String>,
-        /// Filter by element type: node, way, or relation
-        #[arg(short = 't', long = "type")]
-        type_filter: Option<String>,
-        #[command(flatten)]
-        io: DirectIoArg,
-        #[command(flatten)]
-        force: ForceArg,
-    },
     /// Concatenate PBF files with optional type filtering
     Cat {
         /// Input PBF files
@@ -132,10 +105,15 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        /// Sorted k-way merge with dedup by (type, id). Requires sorted inputs.
+        #[arg(long)]
+        dedupe: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
         #[command(flatten)]
@@ -179,11 +157,18 @@ enum Command {
     /// Default mode (without `-R`) resolves relation members transitively:
     /// matched relations pull in member ways, member nodes, nested member
     /// relations, and node refs of included ways.
+    ///
+    /// With `--input-kind osc`, filters an OSC change file instead, always
+    /// preserving deletes. PBF-only flags (`-R`, `-i`, `-t`) are not valid
+    /// in OSC mode.
     TagsFilter {
-        /// Input PBF file
+        /// Input file (PBF or OSC)
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
+        /// Input kind override: pbf or osc (autodetect from extension by default)
+        #[arg(long = "input-kind")]
+        input_kind: Option<InputKind>,
         /// Omit referenced objects (faster, single pass, direct matches only)
         #[arg(short = 'R', long = "omit-referenced")]
         omit_referenced: bool,
@@ -206,18 +191,6 @@ enum Command {
         force: ForceArg,
         #[command(flatten)]
         header: HeaderOverrideArg,
-    },
-    /// Filter OSC changes by tag expressions; always preserve deletes.
-    TagsFilterOsc {
-        /// Input OSC change file (.osc.gz)
-        changes: PathBuf,
-        #[command(flatten)]
-        output: OutputArg,
-        /// Read filter expressions from file (one per line, # comments)
-        #[arg(short = 'e', long = "expressions")]
-        expressions_file: Option<PathBuf>,
-        /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
-        expressions: Vec<String>,
     },
     /// Compare two PBF files and show differences.
     ///
@@ -256,40 +229,38 @@ enum Command {
         /// Ignore user metadata when diffing (already ignored by content-equality mode)
         #[arg(long)]
         ignore_user: bool,
-        #[command(flatten)]
-        io: DirectIoArg,
-    },
-    /// Generate OSC diff from two PBF snapshots
-    DeriveChanges {
-        /// Old PBF file
-        old: PathBuf,
-        /// New PBF file
-        new: PathBuf,
-        /// Bump version of deleted elements by 1 in the output OSC
+        /// Output format: text (default) or osc
+        #[arg(long, default_value = "text")]
+        format: DiffFormat,
+        /// Bump version of deleted elements by 1 (--format osc only)
         #[arg(long)]
         increment_version: bool,
-        /// Set delete timestamp to current time
+        /// Set delete timestamp to current time (--format osc only)
         #[arg(long)]
         update_timestamp: bool,
         #[command(flatten)]
-        output: OutputArg,
-        #[command(flatten)]
         io: DirectIoArg,
     },
-    /// Extract elements by ID
+    /// Extract or remove elements by ID
+    ///
+    /// By default, keeps only the listed IDs. With `--invert`, removes the
+    /// listed IDs and keeps everything else.
     Getid {
         /// Input PBF file
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
+        /// Invert selection: remove listed IDs instead of keeping them
+        #[arg(long)]
+        invert: bool,
         /// Include referenced nodes of matching ways (two-pass)
-        #[arg(short = 'r', long = "add-referenced")]
+        #[arg(short = 'r', long = "add-referenced", conflicts_with = "invert")]
         add_referenced: bool,
         /// Remove tags from referenced objects not explicitly requested (use with -r)
-        #[arg(short = 't', long = "remove-tags")]
+        #[arg(short = 't', long = "remove-tags", conflicts_with = "invert")]
         remove_tags: bool,
         /// Print requested IDs and report which were not found
-        #[arg(long)]
+        #[arg(long, conflicts_with = "invert")]
         verbose_ids: bool,
         /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
@@ -320,30 +291,6 @@ enum Command {
         /// Also include the queried objects themselves in the output
         #[arg(short = 's', long = "add-self")]
         add_self: bool,
-        /// Read IDs from text file (one per line, e.g. n123)
-        #[arg(short = 'i', long = "id-file")]
-        id_file: Option<PathBuf>,
-        /// Read IDs from an OSM/PBF file (all element IDs are collected)
-        #[arg(short = 'I', long = "id-osm-file")]
-        id_osm_file: Option<PathBuf>,
-        /// Default type for bare numeric IDs: node, way, relation
-        #[arg(long = "default-type", value_enum)]
-        default_type: Option<DefaultTypeArg>,
-        /// Element IDs (e.g. n123 w456 r789)
-        ids: Vec<String>,
-        #[command(flatten)]
-        compression: CompressionArg,
-        #[command(flatten)]
-        io: DirectIoArg,
-        #[command(flatten)]
-        header: HeaderOverrideArg,
-    },
-    /// Remove elements by ID
-    Removeid {
-        /// Input PBF file
-        file: PathBuf,
-        #[command(flatten)]
-        output: OutputArg,
         /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
@@ -437,9 +384,19 @@ enum Command {
         header: HeaderOverrideArg,
     },
     /// Inspect PBF file: metadata, block breakdown, ordering analysis
+    #[command(subcommand_negates_reqs = true)]
     Inspect {
+        #[command(subcommand)]
+        subcommand: Option<InspectCommand>,
         /// Input PBF file
-        file: PathBuf,
+        #[arg(required_unless_present = "subcommand")]
+        file: Option<PathBuf>,
+        /// Check if PBF has blob-level indexdata (exit code 0/1)
+        #[arg(long)]
+        indexed: bool,
+        /// Analyze node coordinate statistics for FOR compression sizing
+        #[arg(long)]
+        nodes: bool,
         /// Show per-block distribution stats and optional block listing
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         blocks: Option<usize>,
@@ -463,18 +420,11 @@ enum Command {
         json: bool,
         #[command(flatten)]
         io: DirectIoArg,
-    },
-    /// Analyze node coordinate statistics for FOR compression sizing
-    NodeStats {
-        /// Input PBF file
-        file: PathBuf,
-        #[command(flatten)]
-        io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
     },
     /// Apply OSC diffs to a PBF file
-    Merge {
+    ApplyChanges {
         /// Base PBF file
         base: PathBuf,
         /// OSC diff file (.osc.gz)
@@ -496,24 +446,6 @@ enum Command {
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
-    /// Merge multiple sorted PBF files into one, deduplicating exact duplicates
-    MergePbf {
-        /// Input PBF files (must be sorted)
-        #[arg(required = true)]
-        inputs: Vec<PathBuf>,
-        #[command(flatten)]
-        output: OutputArg,
-        #[command(flatten)]
-        compression: CompressionArg,
-        #[command(flatten)]
-        io: DirectIoArg,
-        #[command(flatten)]
-        uring: UringArg,
-        #[command(flatten)]
-        force: ForceArg,
-        #[command(flatten)]
-        header: HeaderOverrideArg,
-    },
     /// Merge multiple OSC files into one OSC file
     MergeChanges {
         /// Input OSC files (.osc or .osc.gz)
@@ -525,17 +457,39 @@ enum Command {
         #[arg(long)]
         simplify: bool,
     },
-    /// Check if a PBF file has blob-level indexdata
-    IsIndexed {
+    /// Validate PBF file integrity (IDs + referential integrity)
+    Check {
         /// Input PBF file
         file: PathBuf,
+        /// Check ID uniqueness and ordering
+        #[arg(long)]
+        ids: bool,
+        /// Check referential integrity
+        #[arg(long)]
+        refs: bool,
+        /// Also check relation member references (requires --refs)
+        #[arg(long, requires = "refs")]
+        check_relations: bool,
+        /// Show IDs of missing objects (requires --refs)
+        #[arg(long, requires = "refs")]
+        show_ids: bool,
+        /// Full duplicate detection via bitmap (requires --ids)
+        #[arg(long, requires = "ids")]
+        full: bool,
+        /// Filter by element type for ID check (comma-separated: node, way, relation)
+        #[arg(short = 't', long = "type")]
+        type_filter: Option<String>,
+        /// Stop after N violations per check (0 = unlimited)
+        #[arg(long, default_value = "100")]
+        max_errors: usize,
+        /// Machine-readable JSON output
+        #[arg(long)]
+        json: bool,
+        /// Exit-code only, no output
+        #[arg(long, conflicts_with = "json")]
+        quiet: bool,
         #[command(flatten)]
         io: DirectIoArg,
-    },
-    /// Verify PBF file integrity
-    Verify {
-        #[command(subcommand)]
-        command: VerifyCommand,
     },
     /// Benchmark: count elements using a single read mode (emits kv to stderr)
     BenchRead {
@@ -573,75 +527,44 @@ enum Command {
     },
 }
 
+
 #[derive(Subcommand)]
-enum VerifyCommand {
-    /// Check ID uniqueness and ordering
-    Ids {
+enum InspectCommand {
+    /// Count tag key=value frequencies
+    Tags {
         /// Input PBF file
         file: PathBuf,
-        /// Full duplicate detection via bitmap (slower, more memory, works on unsorted files)
-        #[arg(long)]
-        full: bool,
-        /// Filter by element type (comma-separated: node, way, relation)
+        /// Only show tags with at least this many occurrences
+        #[arg(long, default_value = "1")]
+        min_count: u64,
+        /// Only show tags with at most this many occurrences
+        #[arg(short = 'M', long)]
+        max_count: Option<u64>,
+        /// Sort order: count-desc (default), count-asc, name-asc, name-desc
+        #[arg(short = 's', long, default_value = "count-desc")]
+        sort: String,
+        /// Read tag expressions from file (one per line, # comments)
+        #[arg(short = 'e', long = "expressions")]
+        expressions_file: Option<PathBuf>,
+        /// Tag filter expressions (e.g. "highway", "amenity", "w/building=yes")
+        expressions: Vec<String>,
+        /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
-        /// Stop after N violations (0 = unlimited)
-        #[arg(long, default_value = "100")]
-        max_errors: usize,
-        /// Machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-        /// Exit-code only, no output
-        #[arg(long, conflicts_with = "json")]
-        quiet: bool,
-        #[command(flatten)]
-        io: DirectIoArg,
-    },
-    /// Validate referential integrity (wraps check-refs)
-    Refs {
-        /// Input PBF file
-        file: PathBuf,
-        /// Also check relation member references
-        #[arg(long)]
-        check_relations: bool,
-        /// Machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-        /// Exit-code only, no output
-        #[arg(long, conflicts_with = "json")]
-        quiet: bool,
-        #[command(flatten)]
-        io: DirectIoArg,
-    },
-    /// Run all verification checks (IDs + referential integrity)
-    All {
-        /// Input PBF file
-        file: PathBuf,
-        /// Full duplicate detection for ID check
-        #[arg(long)]
-        full: bool,
-        /// Filter by element type for ID check (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type")]
-        type_filter: Option<String>,
-        /// Stop after N violations per check
-        #[arg(long, default_value = "100")]
-        max_errors: usize,
-        /// Also check relation member references
-        #[arg(long)]
-        check_relations: bool,
-        /// Machine-readable JSON output
-        #[arg(long)]
-        json: bool,
-        /// Exit-code only, no output
-        #[arg(long, conflicts_with = "json")]
-        quiet: bool,
-        #[command(flatten)]
-        io: DirectIoArg,
     },
 }
 
 /// Combine CLI positional expressions with expressions read from a file.
 /// CLI expressions come first, then file expressions (additive, matching osmium).
+fn detect_input_kind(path: &std::path::Path) -> InputKind {
+    let name = path.to_string_lossy();
+    if name.ends_with(".osc") || name.ends_with(".osc.gz") || name.ends_with(".osc.bz2") {
+        InputKind::Osc
+    } else {
+        InputKind::Pbf
+    }
+}
+
 fn combine_expressions(
     file: Option<&std::path::Path>,
     cli_args: &[String],
@@ -663,52 +586,42 @@ fn main() {
     let cli = Cli::parse();
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> { match cli.command {
-        Command::CheckRefs {
-            file,
-            check_relations,
-            show_ids,
-            io,
-        } => run_check_refs(&file, check_relations, show_ids, io.direct_io),
-        Command::TagsCount {
-            file,
-            min_count,
-            max_count,
-            sort,
-            expressions_file,
-            expressions,
-            type_filter,
-            force,
-            io,
-        } => run_tags_count(
-            &file,
-            min_count,
-            max_count,
-            &sort,
-            expressions_file.as_deref(),
-            &expressions,
-            type_filter.as_deref(),
-            io.direct_io,
-            force.force,
-        ),
         Command::Cat {
             files,
             output,
             clean,
             type_filter,
+            dedupe,
             compression,
-            force,
             io,
+            uring,
+            force,
             header,
-        } => run_cat(
-            &files,
-            &output.output,
-            type_filter.as_deref(),
-            &clean,
-            &compression.compression,
-            io.direct_io,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
+        } => {
+            let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
+            if dedupe {
+                run_merge_pbf(
+                    &files,
+                    &output.output,
+                    &compression.compression,
+                    io.direct_io,
+                    uring.io_uring,
+                    force.force,
+                    &overrides,
+                )
+            } else {
+                run_cat(
+                    &files,
+                    &output.output,
+                    type_filter.as_deref(),
+                    &clean,
+                    &compression.compression,
+                    io.direct_io,
+                    force.force,
+                    &overrides,
+                )
+            }
+        }
         Command::Sort {
             file,
             output,
@@ -744,6 +657,7 @@ fn main() {
         Command::TagsFilter {
             file,
             output,
+            input_kind,
             omit_referenced,
             invert_match,
             remove_tags,
@@ -753,25 +667,36 @@ fn main() {
             force,
             io,
             header,
-        } => run_tags_filter(
-            &file,
-            &output.output,
-            expressions_file.as_deref(),
-            &expressions,
-            omit_referenced,
-            invert_match,
-            remove_tags,
-            &compression.compression,
-            io.direct_io,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::TagsFilterOsc {
-            changes,
-            output,
-            expressions_file,
-            expressions,
-        } => run_tags_filter_osc(&changes, &output.output, expressions_file.as_deref(), &expressions),
+        } => {
+            let kind = input_kind.unwrap_or_else(|| detect_input_kind(&file));
+            match kind {
+                InputKind::Osc => {
+                    if omit_referenced {
+                        return Err("-R/--omit-referenced is not valid in OSC mode".into());
+                    }
+                    if invert_match {
+                        return Err("-i/--invert-match is not valid in OSC mode".into());
+                    }
+                    if remove_tags {
+                        return Err("-t/--remove-tags is not valid in OSC mode".into());
+                    }
+                    run_tags_filter_osc(&file, &output.output, expressions_file.as_deref(), &expressions)
+                }
+                InputKind::Pbf => run_tags_filter(
+                    &file,
+                    &output.output,
+                    expressions_file.as_deref(),
+                    &expressions,
+                    omit_referenced,
+                    invert_match,
+                    remove_tags,
+                    &compression.compression,
+                    io.direct_io,
+                    force.force,
+                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                ),
+            }
+        }
         Command::Diff {
             old,
             new,
@@ -784,32 +709,45 @@ fn main() {
             ignore_changeset,
             ignore_uid,
             ignore_user,
-            io,
-        } => run_diff(
-            &old,
-            &new,
-            suppress_common,
-            verbose,
-            summary,
-            quiet,
-            output.as_deref(),
-            type_filter.as_deref(),
-            ignore_changeset,
-            ignore_uid,
-            ignore_user,
-            io.direct_io,
-        ),
-        Command::DeriveChanges {
-            old,
-            new,
+            format,
             increment_version,
             update_timestamp,
-            output,
             io,
-        } => run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version, update_timestamp),
+        } => match format {
+            DiffFormat::Osc => {
+                let output = output.ok_or("--output is required with --format osc")?;
+                if suppress_common || verbose || summary || quiet || type_filter.is_some() {
+                    return Err("--suppress-common, --verbose, --summary, --quiet, and --type are not valid with --format osc".into());
+                }
+                run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp)
+            }
+            DiffFormat::Text => {
+                if increment_version {
+                    return Err("--increment-version is only valid with --format osc".into());
+                }
+                if update_timestamp {
+                    return Err("--update-timestamp is only valid with --format osc".into());
+                }
+                run_diff(
+                    &old,
+                    &new,
+                    suppress_common,
+                    verbose,
+                    summary,
+                    quiet,
+                    output.as_deref(),
+                    type_filter.as_deref(),
+                    ignore_changeset,
+                    ignore_uid,
+                    ignore_user,
+                    io.direct_io,
+                )
+            }
+        },
         Command::Getid {
             file,
             output,
+            invert,
             add_referenced,
             remove_tags,
             verbose_ids,
@@ -821,21 +759,37 @@ fn main() {
             force,
             io,
             header,
-        } => run_getid(
-            &file,
-            &output.output,
-            add_referenced,
-            remove_tags,
-            verbose_ids,
-            id_file.as_deref(),
-            id_osm_file.as_deref(),
-            default_type,
-            &ids,
-            &compression.compression,
-            io.direct_io,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
+        } => {
+            if invert {
+                run_removeid(
+                    &file,
+                    &output.output,
+                    id_file.as_deref(),
+                    id_osm_file.as_deref(),
+                    default_type,
+                    &ids,
+                    &compression.compression,
+                    io.direct_io,
+                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                )
+            } else {
+                run_getid(
+                    &file,
+                    &output.output,
+                    add_referenced,
+                    remove_tags,
+                    verbose_ids,
+                    id_file.as_deref(),
+                    id_osm_file.as_deref(),
+                    default_type,
+                    &ids,
+                    &compression.compression,
+                    io.direct_io,
+                    force.force,
+                    &HeaderOverrides::parse(header.generator, &header.output_headers)?,
+                )
+            }
+        }
         Command::Getparents {
             file,
             output,
@@ -851,27 +805,6 @@ fn main() {
             &file,
             &output.output,
             add_self,
-            id_file.as_deref(),
-            id_osm_file.as_deref(),
-            default_type,
-            &ids,
-            &compression.compression,
-            io.direct_io,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
-        Command::Removeid {
-            file,
-            output,
-            id_file,
-            id_osm_file,
-            default_type,
-            ids,
-            compression,
-            io,
-            header,
-        } => run_removeid(
-            &file,
-            &output.output,
             id_file.as_deref(),
             id_osm_file.as_deref(),
             default_type,
@@ -961,7 +894,10 @@ fn main() {
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Inspect {
+            subcommand,
             file,
+            indexed,
+            nodes,
             blocks,
             id_ranges,
             locations,
@@ -970,19 +906,48 @@ fn main() {
             get,
             json,
             io,
-        } => run_inspect(
-            &file,
-            blocks,
-            id_ranges,
-            locations,
-            anomalies,
-            extended,
-            get.as_deref(),
-            json,
-            io.direct_io,
-        ),
-        Command::NodeStats { file, io, force } => run_node_stats(&file, io.direct_io, force.force),
-        Command::Merge {
+            force,
+        } => {
+            if let Some(InspectCommand::Tags {
+                file: tags_file,
+                min_count,
+                max_count,
+                sort,
+                expressions_file,
+                expressions,
+                type_filter,
+            }) = subcommand
+            {
+                run_tags_count(
+                    &tags_file,
+                    min_count,
+                    max_count,
+                    &sort,
+                    expressions_file.as_deref(),
+                    &expressions,
+                    type_filter.as_deref(),
+                    io.direct_io,
+                    force.force,
+                )
+            } else {
+                let file = file.ok_or("Input PBF file is required")?;
+                run_inspect(
+                    &file,
+                    indexed,
+                    nodes,
+                    blocks,
+                    id_ranges,
+                    locations,
+                    anomalies,
+                    extended,
+                    get.as_deref(),
+                    json,
+                    io.direct_io,
+                    force.force,
+                )
+            }
+        }
+        Command::ApplyChanges {
             base,
             changes,
             output,
@@ -992,7 +957,7 @@ fn main() {
             uring,
             locations_on_ways,
             header,
-        } => run_merge(
+        } => run_apply_changes(
             &base,
             &changes,
             &output.output,
@@ -1003,74 +968,36 @@ fn main() {
             locations_on_ways,
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
-        Command::MergePbf {
-            inputs,
-            output,
-            compression,
-            io,
-            uring,
-            force,
-            header,
-        } => run_merge_pbf(
-            &inputs,
-            &output.output,
-            &compression.compression,
-            io.direct_io,
-            uring.io_uring,
-            force.force,
-            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
-        ),
         Command::MergeChanges {
             changes,
             output,
             simplify,
         } => run_merge_changes(&changes, &output.output, simplify),
-        Command::IsIndexed { file, io } => run_is_indexed(&file, io.direct_io),
-        Command::Verify { command } => match command {
-            VerifyCommand::Ids {
-                file,
-                full,
-                type_filter,
-                max_errors,
-                json,
-                quiet,
-                io,
-            } => run_verify_ids(
-                &file,
-                full,
-                type_filter.as_deref(),
-                max_errors,
-                json,
-                quiet,
-                io.direct_io,
-            ),
-            VerifyCommand::Refs {
-                file,
-                check_relations,
-                json,
-                quiet,
-                io,
-            } => run_verify_refs(&file, check_relations, json, quiet, io.direct_io),
-            VerifyCommand::All {
-                file,
-                full,
-                type_filter,
-                max_errors,
-                check_relations,
-                json,
-                quiet,
-                io,
-            } => run_verify_all(
-                &file,
-                full,
-                type_filter.as_deref(),
-                max_errors,
-                check_relations,
-                json,
-                quiet,
-                io.direct_io,
-            ),
-        },
+        Command::Check {
+            file,
+            ids,
+            refs,
+            check_relations,
+            show_ids,
+            full,
+            type_filter,
+            max_errors,
+            json,
+            quiet,
+            io,
+        } => run_check(
+            &file,
+            ids,
+            refs,
+            check_relations,
+            show_ids,
+            full,
+            type_filter.as_deref(),
+            max_errors,
+            json,
+            quiet,
+            io.direct_io,
+        ),
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
         Command::BenchWrite {
             file,
@@ -1092,247 +1019,111 @@ fn main() {
     }
 }
 
-fn run_is_indexed(
+fn run_check(
     path: &std::path::Path,
-    direct_io: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if pbfhogg::has_indexdata(path, direct_io)? {
-        println!("indexed");
-    } else {
-        println!("not indexed");
-        process::exit(1);
-    }
-    Ok(())
-}
-
-fn run_verify_ids(
-    path: &std::path::Path,
-    full: bool,
-    type_filter: Option<&str>,
-    max_errors: usize,
-    json: bool,
-    quiet: bool,
-    direct_io: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use pbfhogg::verify_ids::VerifyIdsOptions;
-
-    let opts = VerifyIdsOptions {
-        full,
-        type_filter,
-        max_errors,
-        direct_io,
-    };
-    let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
-
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("input.osm.pbf");
-    if json {
-        println!("{}", report.to_json(file_name)?);
-    } else if !quiet {
-        report.print_human(file_name);
-    }
-
-    if !report.passed {
-        process::exit(1);
-    }
-    Ok(())
-}
-
-fn run_verify_refs(
-    path: &std::path::Path,
-    check_relations: bool,
-    json: bool,
-    quiet: bool,
-    direct_io: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let result = pbfhogg::check_refs::check_refs(path, check_relations, false, direct_io)?;
-
-    if json {
-        let value = serde_json::json!({
-            "node_count": result.node_count,
-            "way_count": result.way_count,
-            "relation_count": result.relation_count,
-            "missing_node_refs": result.missing_node_refs,
-            "missing_way_refs": result.missing_way_refs,
-            "missing_node_members": result.missing_node_members,
-            "missing_relation_members": result.missing_relation_members,
-            "passed": result.is_valid(),
-        });
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if !quiet {
-        println!(
-            "Elements: {} nodes, {} ways, {} relations",
-            result.node_count, result.way_count, result.relation_count
-        );
-        if result.missing_node_refs > 0 {
-            println!("Missing node refs in ways: {}", result.missing_node_refs);
-        }
-        if check_relations {
-            if result.missing_way_refs > 0 {
-                println!("Missing way refs in relations: {}", result.missing_way_refs);
-            }
-            if result.missing_node_members > 0 {
-                println!(
-                    "Missing node members in relations: {}",
-                    result.missing_node_members
-                );
-            }
-            if result.missing_relation_members > 0 {
-                println!(
-                    "Missing relation members: {}",
-                    result.missing_relation_members
-                );
-            }
-        }
-        if result.is_valid() {
-            println!("Referential integrity: OK");
-        } else {
-            println!(
-                "Referential integrity: FAILED ({} missing references)",
-                result.total_missing()
-            );
-        }
-    }
-
-    if !result.is_valid() {
-        process::exit(1);
-    }
-    Ok(())
-}
-
-fn run_verify_all(
-    path: &std::path::Path,
-    full: bool,
-    type_filter: Option<&str>,
-    max_errors: usize,
-    check_relations: bool,
-    json: bool,
-    quiet: bool,
-    direct_io: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use pbfhogg::verify_ids::VerifyIdsOptions;
-
-    // Run ID check
-    let opts = VerifyIdsOptions {
-        full,
-        type_filter,
-        max_errors,
-        direct_io,
-    };
-    let ids_report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
-
-    // Run ref check
-    let refs_result = pbfhogg::check_refs::check_refs(path, check_relations, false, direct_io)?;
-
-    let all_passed = ids_report.passed && refs_result.is_valid();
-    let file_name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("input.osm.pbf");
-
-    if json {
-        let value = serde_json::json!({
-            "ids": serde_json::from_str::<serde_json::Value>(&ids_report.to_json(file_name)?)?,
-            "refs": {
-                "node_count": refs_result.node_count,
-                "way_count": refs_result.way_count,
-                "relation_count": refs_result.relation_count,
-                "missing_node_refs": refs_result.missing_node_refs,
-                "missing_way_refs": refs_result.missing_way_refs,
-                "missing_node_members": refs_result.missing_node_members,
-                "missing_relation_members": refs_result.missing_relation_members,
-                "passed": refs_result.is_valid(),
-            },
-            "passed": all_passed,
-        });
-        println!("{}", serde_json::to_string_pretty(&value)?);
-    } else if !quiet {
-        ids_report.print_human(file_name);
-        println!();
-        println!("---");
-        println!();
-        println!(
-            "Elements: {} nodes, {} ways, {} relations",
-            refs_result.node_count, refs_result.way_count, refs_result.relation_count
-        );
-        if refs_result.is_valid() {
-            println!("Referential integrity: OK");
-        } else {
-            println!(
-                "Referential integrity: FAILED ({} missing references)",
-                refs_result.total_missing()
-            );
-        }
-        println!();
-        if all_passed {
-            println!("All checks: PASSED");
-        } else {
-            println!("All checks: FAILED");
-        }
-    }
-
-    if !all_passed {
-        process::exit(1);
-    }
-    Ok(())
-}
-
-fn run_check_refs(
-    path: &std::path::Path,
+    ids: bool,
+    refs: bool,
     check_relations: bool,
     show_ids: bool,
+    full: bool,
+    type_filter: Option<&str>,
+    max_errors: usize,
+    json: bool,
+    quiet: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = pbfhogg::check_refs::check_refs(path, check_relations, show_ids, direct_io)?;
+    // Default: run both checks when neither --ids nor --refs specified
+    let run_ids = ids || !refs;
+    let run_refs = refs || !ids;
 
-    // Missing reference IDs to stdout (osmium compat)
-    for mref in &result.missing_refs {
-        println!(
-            "{}{} in {}{}",
-            mref.missing_type, mref.missing_id,
-            mref.referencing_type, mref.referencing_id,
-        );
-    }
+    let mut failed = false;
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("input.osm.pbf");
 
-    // Summary to stderr (osmium compat)
-    eprintln!(
-        "Elements: {} nodes, {} ways, {} relations",
-        result.node_count, result.way_count, result.relation_count
-    );
-
-    if result.missing_node_refs > 0 {
-        eprintln!("Missing node refs in ways: {}", result.missing_node_refs);
-    }
-    if check_relations {
-        if result.missing_way_refs > 0 {
-            eprintln!("Missing way refs in relations: {}", result.missing_way_refs);
+    if run_ids {
+        use pbfhogg::verify_ids::VerifyIdsOptions;
+        let opts = VerifyIdsOptions {
+            full,
+            type_filter,
+            max_errors,
+            direct_io,
+        };
+        let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
+        if json {
+            println!("{}", report.to_json(file_name)?);
+        } else if !quiet {
+            report.print_human(file_name);
         }
-        if result.missing_node_members > 0 {
-            eprintln!(
-                "Missing node members in relations: {}",
-                result.missing_node_members
+        if !report.passed {
+            failed = true;
+        }
+    }
+
+    if run_refs {
+        let result = pbfhogg::check_refs::check_refs(path, check_relations, show_ids, direct_io)?;
+
+        if show_ids {
+            for mref in &result.missing_refs {
+                println!(
+                    "{}{} in {}{}",
+                    mref.missing_type, mref.missing_id,
+                    mref.referencing_type, mref.referencing_id,
+                );
+            }
+        }
+
+        if json {
+            let value = serde_json::json!({
+                "node_count": result.node_count,
+                "way_count": result.way_count,
+                "relation_count": result.relation_count,
+                "missing_node_refs": result.missing_node_refs,
+                "missing_way_refs": result.missing_way_refs,
+                "missing_node_members": result.missing_node_members,
+                "missing_relation_members": result.missing_relation_members,
+                "passed": result.is_valid(),
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else if !quiet {
+            if run_ids {
+                println!();
+                println!("---");
+                println!();
+            }
+            println!(
+                "Elements: {} nodes, {} ways, {} relations",
+                result.node_count, result.way_count, result.relation_count
             );
+            if result.missing_node_refs > 0 {
+                println!("Missing node refs in ways: {}", result.missing_node_refs);
+            }
+            if check_relations {
+                if result.missing_way_refs > 0 {
+                    println!("Missing way refs in relations: {}", result.missing_way_refs);
+                }
+                if result.missing_node_members > 0 {
+                    println!("Missing node members in relations: {}", result.missing_node_members);
+                }
+                if result.missing_relation_members > 0 {
+                    println!("Missing relation members: {}", result.missing_relation_members);
+                }
+            }
+            if result.is_valid() {
+                println!("Referential integrity: OK");
+            } else {
+                println!("Referential integrity: FAILED ({} missing references)", result.total_missing());
+            }
         }
-        if result.missing_relation_members > 0 {
-            eprintln!(
-                "Missing relation members: {}",
-                result.missing_relation_members
-            );
+        if !result.is_valid() {
+            failed = true;
         }
     }
 
-    if result.is_valid() {
-        eprintln!("Referential integrity: OK");
-    } else {
-        eprintln!(
-            "Referential integrity: FAILED ({} missing references)",
-            result.total_missing()
-        );
+    if failed {
         process::exit(1);
     }
-
     Ok(())
 }
 
@@ -1982,6 +1773,8 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
 
 fn run_inspect(
     path: &std::path::Path,
+    indexed: bool,
+    nodes: bool,
     blocks: Option<usize>,
     id_ranges: bool,
     locations: bool,
@@ -1990,7 +1783,35 @@ fn run_inspect(
     get: Option<&str>,
     json: bool,
     direct_io: bool,
+    force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // --indexed only: quick check without full inspect
+    let has_other_flags = extended
+        || id_ranges
+        || locations
+        || anomalies
+        || nodes
+        || blocks.is_some()
+        || get.is_some()
+        || json;
+    if indexed && !has_other_flags {
+        let has_index = pbfhogg::has_indexdata(path, direct_io)?;
+        if has_index {
+            println!("Indexed: yes");
+        } else {
+            println!("Indexed: no");
+            process::exit(1);
+        }
+        return Ok(());
+    }
+
+    // --nodes only: run node stats without full inspect
+    if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() && !json {
+        let report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
+        report.print_report();
+        return Ok(());
+    }
+
     if get.is_some() && json {
         return Err("--get and --json cannot be used together".into());
     }
@@ -2007,6 +1828,25 @@ fn run_inspect(
     };
     let mut report =
         pbfhogg::inspect::inspect(path, show_blocks, id_ranges, locations, extended, direct_io)?;
+
+    // --indexed combined with other flags: check and report, set exit code
+    let mut exit_not_indexed = false;
+    if indexed {
+        let has_index = pbfhogg::has_indexdata(path, direct_io)?;
+        if !has_index {
+            exit_not_indexed = true;
+        }
+        if !json {
+            println!("Indexed: {}", if has_index { "yes" } else { "no" });
+        }
+    }
+
+    // --nodes combined with other flags: run node stats and print
+    if nodes {
+        let node_report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
+        node_report.print_report();
+    }
+
     if let Some(key) = get {
         match report.get_value(key) {
             Some(val) => println!("{val}"),
@@ -2018,20 +1858,14 @@ fn run_inspect(
     } else {
         report.print_report_filtered(block_limit, anomalies);
     }
+
+    if exit_not_indexed {
+        process::exit(1);
+    }
     Ok(())
 }
 
-fn run_node_stats(
-    path: &std::path::Path,
-    direct_io: bool,
-    force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
-    report.print_report();
-    Ok(())
-}
-
-fn run_merge(
+fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
     output: &std::path::Path,

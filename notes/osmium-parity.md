@@ -174,7 +174,7 @@ These osmium flags have no pbfhogg equivalent:
 | `-v, --verbose` | No per-command verbosity control |
 | `--progress` / `--no-progress` | No progress bars |
 | `-O, --overwrite` | pbfhogg always overwrites |
-| `--fsync` | Not offered |
+| `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
 | `-i, --index-type` | `add-locations-to-ways` uses DenseMmapIndex only |

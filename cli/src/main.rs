@@ -467,17 +467,17 @@ enum Command {
         /// Check referential integrity
         #[arg(long)]
         refs: bool,
-        /// Also check relation member references (requires --refs)
-        #[arg(long, requires = "refs")]
+        /// Also check relation member references (use with --refs)
+        #[arg(long)]
         check_relations: bool,
-        /// Show IDs of missing objects (requires --refs)
-        #[arg(long, requires = "refs")]
+        /// Show IDs of missing objects (use with --refs)
+        #[arg(long)]
         show_ids: bool,
-        /// Full duplicate detection via bitmap (requires --ids)
-        #[arg(long, requires = "ids")]
+        /// Full duplicate detection via bitmap (use with --ids)
+        #[arg(long)]
         full: bool,
         /// Filter by element type for ID check (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type", requires = "ids")]
+        #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
         /// Stop after N violations per check (0 = unlimited)
         #[arg(long, default_value = "100")]
@@ -558,8 +558,6 @@ enum InspectCommand {
     },
 }
 
-/// Combine CLI positional expressions with expressions read from a file.
-/// CLI expressions come first, then file expressions (additive, matching osmium).
 fn detect_input_kind(path: &std::path::Path) -> InputKind {
     // Content sniffing: read first bytes to distinguish PBF from OSC
     if let Ok(kind) = sniff_input_kind(path) {
@@ -578,9 +576,12 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut buf = [0u8; 4];
-    let n = file.read(&mut buf)?;
-    if n < 2 {
-        return Err(std::io::Error::new(std::io::ErrorKind::Other, "too small"));
+    match file.read_exact(&mut buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other, "too small"));
+        }
+        Err(e) => return Err(e),
     }
     // Gzip magic (1f 8b) — PBF is never gzip-wrapped, so this is OSC (.osc.gz)
     if buf[0] == 0x1f && buf[1] == 0x8b {
@@ -591,15 +592,15 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
         return Ok(InputKind::Osc);
     }
     // PBF: first 4 bytes are big-endian u32 blob header size (typically 13-50)
-    if n >= 4 {
-        let size = u32::from_be_bytes(buf);
-        if size > 0 && size < 1000 {
-            return Ok(InputKind::Pbf);
-        }
+    let size = u32::from_be_bytes(buf);
+    if size > 0 && size < 1000 {
+        return Ok(InputKind::Pbf);
     }
     Err(std::io::Error::new(std::io::ErrorKind::Other, "ambiguous"))
 }
 
+/// Combine CLI positional expressions with expressions read from a file.
+/// CLI expressions come first, then file expressions (additive, matching osmium).
 fn combine_expressions(
     file: Option<&std::path::Path>,
     cli_args: &[String],
@@ -651,6 +652,9 @@ fn main() {
                     &overrides,
                 )
             } else {
+                if uring.io_uring {
+                    return Err("--io-uring is only valid with --dedupe".into());
+                }
                 run_cat(
                     &files,
                     &output.output,
@@ -757,8 +761,20 @@ fn main() {
         } => match format {
             DiffFormat::Osc => {
                 let output = output.ok_or("--output is required with --format osc")?;
-                if suppress_common || verbose || summary || quiet || type_filter.is_some() {
-                    return Err("--suppress-common, --verbose, --summary, --quiet, and --type are not valid with --format osc".into());
+                if suppress_common {
+                    return Err("--suppress-common is not valid with --format osc".into());
+                }
+                if verbose {
+                    return Err("--verbose is not valid with --format osc".into());
+                }
+                if summary {
+                    return Err("--summary is not valid with --format osc".into());
+                }
+                if quiet {
+                    return Err("--quiet is not valid with --format osc".into());
+                }
+                if type_filter.is_some() {
+                    return Err("--type is not valid with --format osc".into());
                 }
                 run_derive_changes(&old, &new, &output, io.direct_io, increment_version, update_timestamp)
             }
@@ -1079,6 +1095,24 @@ fn run_check(
     let run_ids = ids || !refs;
     let run_refs = refs || !ids;
 
+    // Validate flags that only apply to one check mode
+    if !run_ids {
+        if full {
+            return Err("--full requires --ids (or omit --refs to run both checks)".into());
+        }
+        if type_filter.is_some() {
+            return Err("--type requires --ids (or omit --refs to run both checks)".into());
+        }
+    }
+    if !run_refs {
+        if check_relations {
+            return Err("--check-relations requires --refs (or omit --ids to run both checks)".into());
+        }
+        if show_ids {
+            return Err("--show-ids requires --refs (or omit --ids to run both checks)".into());
+        }
+    }
+
     let mut failed = false;
     let file_name = path
         .file_name()
@@ -1117,8 +1151,7 @@ fn run_check(
     if json {
         let mut combined = serde_json::Map::new();
         if let Some(ref report) = ids_report {
-            let ids_json: serde_json::Value = serde_json::from_str(&report.to_json(file_name)?)?;
-            combined.insert("ids".to_string(), ids_json);
+            combined.insert("ids".to_string(), report.to_json_value(file_name));
         }
         if let Some(ref result) = refs_result {
             let mut refs_obj = serde_json::json!({
@@ -1877,8 +1910,12 @@ fn run_inspect(
         return Ok(());
     }
 
+    if nodes && json {
+        return Err("--nodes and --json cannot be used together (node stats have no JSON output)".into());
+    }
+
     // --nodes only: run node stats without full inspect
-    if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() && !json {
+    if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() {
         let report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
         report.print_report();
         return Ok(());

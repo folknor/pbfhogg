@@ -74,11 +74,11 @@ pbfhogg check [OPTIONS] <FILE>
 |------|-------------|
 | `--ids` | Check ID uniqueness and ordering only |
 | `--refs` | Check referential integrity only |
-| `--full` | Full duplicate detection via bitmap (slower, more memory; requires `--ids`) |
-| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; requires `--ids`) |
+| `--full` | Full duplicate detection via bitmap (slower, more memory; applies to ID check) |
+| `-t, --type <TYPE>` | Filter by element type (comma-separated: node, way, relation; applies to ID check) |
 | `--max-errors <N>` | Stop after N violations (0 = unlimited) [default: 100] |
-| `--check-relations` | Also check relation member references (requires `--refs`) |
-| `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (requires `--refs`) |
+| `--check-relations` | Also check relation member references (applies to ref check) |
+| `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
 | `--json` | Machine-readable JSON output |
 | `-q, --quiet` | Exit-code only, no output |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

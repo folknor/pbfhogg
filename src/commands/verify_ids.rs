@@ -76,12 +76,12 @@ pub struct VerifyIdsReport {
 }
 
 impl VerifyIdsReport {
-    /// Serialize the report as JSON.
-    pub fn to_json(&self, file_name: &str) -> Result<String> {
+    /// Build the report as a JSON value.
+    pub fn to_json_value(&self, file_name: &str) -> serde_json::Value {
         let violations_json: Vec<serde_json::Value> =
             self.violations.iter().map(violation_to_json).collect();
 
-        let value = serde_json::json!({
+        serde_json::json!({
             "file": file_name,
             "header_sorted": self.header_sorted,
             "indexed": self.indexed,
@@ -93,8 +93,12 @@ impl VerifyIdsReport {
             "passed": self.passed,
             "total_violations": self.total_violations,
             "violations": violations_json,
-        });
-        Ok(serde_json::to_string_pretty(&value)?)
+        })
+    }
+
+    /// Serialize the report as a JSON string.
+    pub fn to_json(&self, file_name: &str) -> Result<String> {
+        Ok(serde_json::to_string_pretty(&self.to_json_value(file_name))?)
     }
 
     /// Print a human-readable summary to stdout.

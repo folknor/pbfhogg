@@ -959,7 +959,7 @@ pub(crate) fn parse_blob_header_with_index(
 }
 
 /// Decode raw Blob protobuf bytes into a [`PrimitiveBlock`].
-pub fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
+pub(crate) fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::PrimitiveBlock> {
     let blob = WireBlob::parse_slice(blob_bytes)?;
     decompress_blob(&blob, None).and_then(crate::PrimitiveBlock::new)
 }
@@ -970,7 +970,7 @@ pub fn decode_blob_to_primitiveblock(blob_bytes: &[u8]) -> Result<crate::Primiti
 /// allocating a new `Vec` each time. For loops that decompress many blobs,
 /// this avoids repeated large allocations -- the buffer grows to high-water
 /// mark and stays there.
-pub fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+pub(crate) fn decompress_blob_data_into(blob_bytes: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     let blob = WireBlob::parse_slice(blob_bytes)?;
     decompress_parsed_blob_into(&blob, buf)
 }
@@ -1017,7 +1017,7 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
 /// This variant accepts `&[u8]` for convenience but must copy the bytes
 /// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
 /// [`parse_primitive_block_from_bytes_owned`] to avoid the copy.
-pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBlock> {
+pub(crate) fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBlock> {
     crate::PrimitiveBlock::new(Bytes::copy_from_slice(raw))
 }
 
@@ -1031,7 +1031,7 @@ pub fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBl
 /// existing `parse_primitive_block_from_bytes` which already has
 /// `from_bytes` in its name. The `_owned` suffix signals that this
 /// variant takes ownership of the buffer.
-pub fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
+pub(crate) fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
     crate::PrimitiveBlock::new(raw.clone())
 }
 
@@ -1040,7 +1040,7 @@ pub fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::Prim
 /// This variant accepts `&[u8]` for convenience but must copy the bytes
 /// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
 /// [`decode_blob_to_headerblock_from_bytes`] to avoid the copy.
-pub fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBlock> {
+pub(crate) fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBlock> {
     decode_blob_to_headerblock_from_bytes(&Bytes::copy_from_slice(blob_bytes))
 }
 
@@ -1049,7 +1049,7 @@ pub fn decode_blob_to_headerblock(blob_bytes: &[u8]) -> Result<crate::HeaderBloc
 /// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
 /// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
 /// O(1).
-pub fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
+pub(crate) fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Result<crate::HeaderBlock> {
     let blob = WireBlob::parse(blob_bytes)?;
     let raw = decompress_blob(&blob, None)?;
     crate::HeaderBlock::parse_from_bytes(&raw)

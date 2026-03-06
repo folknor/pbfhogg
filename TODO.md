@@ -70,11 +70,26 @@ and `notes/cli-reference.md` for the final surface. Key changes:
 
 ## Release prep
 
+### crates.io blockers
+
+- [ ] **Publish `protohoggr` first** — currently `path = "../protohoggr"` only. Add `version = "0.2"` alongside the path dep so crates.io resolves it. Publish protohoggr before pbfhogg.
+- [ ] **Add `version` to CLI path dep** — `cli/Cargo.toml` needs `version = "0.2"` on the `pbfhogg` dep if we publish pbfhogg-cli too (or skip publishing the CLI crate).
+- [x] **Add `readme` field** — added to root `Cargo.toml` (CLI has no README, skipped).
+- [x] **Add `rust-version`** — set to `1.85` (edition 2024 minimum) in both Cargo.toml files.
+- [x] **`hotpath` dep** — must stay unconditional; `#[hotpath::measure]` attributes are used throughout library code and need the crate present to compile. When the `hotpath` feature is off (default), proc macros expand to nothing — zero runtime cost.
+
+### Public API cleanup
+
+- [x] **Audit wildcard re-exports** — replaced all 6 wildcard `pub use` with explicit named re-exports (42 types). Downgraded 6 internal blob.rs free functions from `pub` to `pub(crate)`.
+- [x] **`commands` module visibility** — keeping `#[doc(hidden)] pub`. CLI crate depends on these as a separate package so `pub(crate)` won't work. Feature-gating adds complexity for no compile-time benefit (heavy deps already gated). Standard Rust convention (serde, tokio do the same).
+- [ ] **Clarify license** — README mentions MIT but only Apache-2.0 is declared. Pick one story.
+
+### Other
+
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
-- [ ] Publish to crates.io
+- [ ] Add a CHANGELOG.md before first tagged release
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
-- [ ] Add a CHANGELOG.md before first tagged release
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)
 - [ ] Host via GitHub Pages
 

@@ -25,9 +25,9 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (4 modes: sequential, parallel, pipelined, blobreader). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench write [--dataset name] [--variant V] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite. Default variant: indexed.
 - `brokkr bench merge [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite. Default variant: indexed.
-- `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (25 commands, external timing). Use `all` for full suite. `diff` and `derive-changes` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
+- `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (27 commands, external timing). Use `all` for full suite. `diff` and `diff-osc` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
 - `brokkr bench extract [--dataset name] [--variant V] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan. Default variant: indexed.
-- `brokkr bench allocator [--dataset name] [--variant V] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check-refs. Default variant: indexed.
+- `brokkr bench allocator [--dataset name] [--variant V] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check --refs. Default variant: indexed.
 - `brokkr bench blob-filter [--dataset name] [--indexed-variant V] [--raw-variant V] [--runs N]` — indexdata vs non-indexdata performance comparison. Default variants: indexed + raw.
 - `brokkr bench planetiler [--dataset name] [--variant V] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR. Default variant: indexed.
 - `brokkr bench all [--dataset name] [--variant V] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines. Default variant: indexed.
@@ -62,11 +62,11 @@ Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconve
 - `brokkr verify cat [--dataset name] [--variant V]` — cat with type filters vs osmium cat
 - `brokkr verify extract [--dataset name] [--variant V] [--bbox bbox]` — bbox extract (simple/complete/smart) vs osmium extract
 - `brokkr verify tags-filter [--dataset name] [--variant V]` — tags-filter with 3 expressions vs osmium
-- `brokkr verify getid-removeid [--dataset name] [--variant V]` — getid/removeid vs osmium getid
+- `brokkr verify getid-removeid [--dataset name] [--variant V]` — getid/getid --invert vs osmium getid
 - `brokkr verify add-locations-to-ways [--dataset name] [--variant V]` — add-locations-to-ways vs osmium
-- `brokkr verify check-refs [--dataset name] [--variant V]` — check-refs vs osmium check-refs
-- `brokkr verify merge [--dataset name] [--variant V] [--osc-seq SEQ]` — merge vs osmium/osmosis/osmconvert
-- `brokkr verify derive-changes [--dataset name] [--variant V] [--osc-seq SEQ]` — derive-changes roundtrip vs osmium
+- `brokkr verify check-refs [--dataset name] [--variant V]` — check --refs vs osmium check-refs
+- `brokkr verify merge [--dataset name] [--variant V] [--osc-seq SEQ]` — apply-changes vs osmium/osmosis/osmconvert
+- `brokkr verify derive-changes [--dataset name] [--variant V] [--osc-seq SEQ]` — diff --format osc roundtrip vs osmium
 - `brokkr verify diff [--dataset name] [--variant V] [--osc-seq SEQ]` — diff summary vs osmium diff
 - `brokkr verify all [--dataset name] [--variant V] [--osc-seq SEQ] [--bbox bbox]` — run all verify commands sequentially
 

@@ -124,35 +124,32 @@ pub(crate) mod reorder_buffer;
 // ---------------------------------------------------------------------------
 // Public API re-exports
 //
-// We use TWO complementary re-export strategies here, and both are required:
-//
-// 1. **Wildcard item-level re-exports** (`pub use read::blob::*`, etc.)
-//    These flatten every public type into the crate root so external consumers
-//    get the cleanest possible API surface:
+// 1. **Explicit item-level re-exports** flatten selected types into the crate
+//    root so external consumers get a clean API:
 //      use pbfhogg::{Element, BlobReader, PrimitiveBlock};
 //
-// 2. **Named module-level re-exports** (`pub use read::blob`, etc.)
-//    These create short `crate::blob`, `crate::block_builder`, `crate::writer`
-//    module paths that are used extensively throughout the crate's own source:
-//      - Code imports in commands/*.rs  (e.g. `use crate::block_builder::BlockBuilder`)
-//      - Code imports in write/*.rs     (e.g. `use crate::elements::MemberId`)
-//      - Code imports in read/*.rs      (e.g. `crate::blob::Blob` in pipeline.rs)
-//      - Doc links in read/*.rs         (e.g. `[`PrimitiveBlock`](crate::block::PrimitiveBlock)`)
-//    Without these, every internal `use crate::blob::...` would need to become
-//    `use crate::read::blob::...`, affecting 15+ files across the crate.
-//
-// The two strategies do NOT conflict: wildcard re-exports provide `pbfhogg::Blob`
-// while module re-exports provide `pbfhogg::blob::Blob`. No public names collide
-// across the read sub-modules, so the wildcards merge cleanly.
+// 2. **Named module-level re-exports** create short `crate::blob`,
+//    `crate::block_builder`, `crate::writer` paths used throughout the crate.
 // ---------------------------------------------------------------------------
 
-// Wildcard re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
-pub use read::blob::*;
-pub use read::block::*;
-pub use read::dense::*;
-pub use read::elements::*;
-pub use read::indexed::*;
-pub use read::reader::*;
+// Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
+pub use read::blob::{
+    Blob, BlobDecode, BlobHeader, BlobReader, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE,
+    MAX_BLOB_MESSAGE_SIZE,
+};
+pub use read::block::{
+    BlockElementsIter, BlockType, GroupIter, GroupNodeIter, GroupRelationIter, GroupWayIter,
+    HeaderBBox, HeaderBlock, PrimitiveBlock, PrimitiveGroup,
+};
+pub use read::dense::{
+    DenseNode, DenseNodeInfo, DenseNodeInfoIter, DenseNodeIter, DenseRawTagIter, DenseTagIter,
+};
+pub use read::elements::{
+    Element, Info, MemberId, MemberType, Node, RawTagIter, RelMember, RelMemberIter, Relation,
+    TagIter, Way, WayNodeLocation, WayNodeLocationsIter, WayRefIter,
+};
+pub use read::indexed::{IdRanges, IndexedReader};
+pub use read::reader::{ElementReader, PipelinedBlocks};
 pub use blob_index::{BlobBbox, BlobFilter};
 pub use error::{BlobError, Error, ErrorKind, Result};
 

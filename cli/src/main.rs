@@ -477,7 +477,7 @@ enum Command {
         #[arg(long, requires = "ids")]
         full: bool,
         /// Filter by element type for ID check (comma-separated: node, way, relation)
-        #[arg(short = 't', long = "type")]
+        #[arg(short = 't', long = "type", requires = "ids")]
         type_filter: Option<String>,
         /// Stop after N violations per check (0 = unlimited)
         #[arg(long, default_value = "100")]
@@ -551,18 +551,53 @@ enum InspectCommand {
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
+        #[command(flatten)]
+        io: DirectIoArg,
+        #[command(flatten)]
+        force: ForceArg,
     },
 }
 
 /// Combine CLI positional expressions with expressions read from a file.
 /// CLI expressions come first, then file expressions (additive, matching osmium).
 fn detect_input_kind(path: &std::path::Path) -> InputKind {
+    // Content sniffing: read first bytes to distinguish PBF from OSC
+    if let Ok(kind) = sniff_input_kind(path) {
+        return kind;
+    }
+    // Fall back to extension
     let name = path.to_string_lossy();
     if name.ends_with(".osc") || name.ends_with(".osc.gz") || name.ends_with(".osc.bz2") {
         InputKind::Osc
     } else {
         InputKind::Pbf
     }
+}
+
+fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 4];
+    let n = file.read(&mut buf)?;
+    if n < 2 {
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "too small"));
+    }
+    // Gzip magic (1f 8b) — PBF is never gzip-wrapped, so this is OSC (.osc.gz)
+    if buf[0] == 0x1f && buf[1] == 0x8b {
+        return Ok(InputKind::Osc);
+    }
+    // XML starts with '<' — this is OSC (.osc)
+    if buf[0] == b'<' {
+        return Ok(InputKind::Osc);
+    }
+    // PBF: first 4 bytes are big-endian u32 blob header size (typically 13-50)
+    if n >= 4 {
+        let size = u32::from_be_bytes(buf);
+        if size > 0 && size < 1000 {
+            return Ok(InputKind::Pbf);
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::Other, "ambiguous"))
 }
 
 fn combine_expressions(
@@ -600,6 +635,12 @@ fn main() {
         } => {
             let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
             if dedupe {
+                if type_filter.is_some() {
+                    return Err("--type is not valid with --dedupe".into());
+                }
+                if !clean.is_empty() {
+                    return Err("--clean is not valid with --dedupe".into());
+                }
                 run_merge_pbf(
                     &files,
                     &output.output,
@@ -916,6 +957,8 @@ fn main() {
                 expressions_file,
                 expressions,
                 type_filter,
+                io: tags_io,
+                force: tags_force,
             }) = subcommand
             {
                 run_tags_count(
@@ -926,8 +969,8 @@ fn main() {
                     expressions_file.as_deref(),
                     &expressions,
                     type_filter.as_deref(),
-                    io.direct_io,
-                    force.force,
+                    tags_io.direct_io,
+                    tags_force.force,
                 )
             } else {
                 let file = file.ok_or("Input PBF file is required")?;
@@ -1042,7 +1085,8 @@ fn run_check(
         .and_then(|n| n.to_str())
         .unwrap_or("input.osm.pbf");
 
-    if run_ids {
+    // Run checks and collect results
+    let ids_report = if run_ids {
         use pbfhogg::verify_ids::VerifyIdsOptions;
         let opts = VerifyIdsOptions {
             full,
@@ -1051,31 +1095,33 @@ fn run_check(
             direct_io,
         };
         let report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
-        if json {
-            println!("{}", report.to_json(file_name)?);
-        } else if !quiet {
-            report.print_human(file_name);
-        }
         if !report.passed {
             failed = true;
         }
-    }
+        Some(report)
+    } else {
+        None
+    };
 
-    if run_refs {
+    let refs_result = if run_refs {
         let result = pbfhogg::check_refs::check_refs(path, check_relations, show_ids, direct_io)?;
-
-        if show_ids {
-            for mref in &result.missing_refs {
-                println!(
-                    "{}{} in {}{}",
-                    mref.missing_type, mref.missing_id,
-                    mref.referencing_type, mref.referencing_id,
-                );
-            }
+        if !result.is_valid() {
+            failed = true;
         }
+        Some(result)
+    } else {
+        None
+    };
 
-        if json {
-            let value = serde_json::json!({
+    // Output
+    if json {
+        let mut combined = serde_json::Map::new();
+        if let Some(ref report) = ids_report {
+            let ids_json: serde_json::Value = serde_json::from_str(&report.to_json(file_name)?)?;
+            combined.insert("ids".to_string(), ids_json);
+        }
+        if let Some(ref result) = refs_result {
+            let mut refs_obj = serde_json::json!({
                 "node_count": result.node_count,
                 "way_count": result.way_count,
                 "relation_count": result.relation_count,
@@ -1085,9 +1131,35 @@ fn run_check(
                 "missing_relation_members": result.missing_relation_members,
                 "passed": result.is_valid(),
             });
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        } else if !quiet {
-            if run_ids {
+            if show_ids {
+                let details: Vec<_> = result.missing_refs.iter().map(|mref| {
+                    serde_json::json!({
+                        "missing": format!("{}{}", mref.missing_type, mref.missing_id),
+                        "referenced_by": format!("{}{}", mref.referencing_type, mref.referencing_id),
+                    })
+                }).collect();
+                if let Some(m) = refs_obj.as_object_mut() {
+                    m.insert("missing_details".to_string(), serde_json::Value::Array(details));
+                }
+            }
+            combined.insert("refs".to_string(), refs_obj);
+        }
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(combined))?);
+    } else if !quiet {
+        if let Some(ref report) = ids_report {
+            report.print_human(file_name);
+        }
+        if let Some(ref result) = refs_result {
+            if show_ids {
+                for mref in &result.missing_refs {
+                    println!(
+                        "{}{} in {}{}",
+                        mref.missing_type, mref.missing_id,
+                        mref.referencing_type, mref.referencing_id,
+                    );
+                }
+            }
+            if ids_report.is_some() {
                 println!();
                 println!("---");
                 println!();
@@ -1115,9 +1187,6 @@ fn run_check(
             } else {
                 println!("Referential integrity: FAILED ({} missing references)", result.total_missing());
             }
-        }
-        if !result.is_valid() {
-            failed = true;
         }
     }
 
@@ -1792,14 +1861,17 @@ fn run_inspect(
         || anomalies
         || nodes
         || blocks.is_some()
-        || get.is_some()
-        || json;
+        || get.is_some();
     if indexed && !has_other_flags {
         let has_index = pbfhogg::has_indexdata(path, direct_io)?;
-        if has_index {
+        if json {
+            println!("{}", serde_json::json!({"indexed": has_index}));
+        } else if has_index {
             println!("Indexed: yes");
         } else {
             println!("Indexed: no");
+        }
+        if !has_index {
             process::exit(1);
         }
         return Ok(());
@@ -1853,7 +1925,12 @@ fn run_inspect(
             None => return Err(format!("unknown key: {key}").into()),
         }
     } else if json {
-        let value = report.to_json_filtered(block_limit, anomalies);
+        let mut value = report.to_json_filtered(block_limit, anomalies);
+        if indexed {
+            if let serde_json::Value::Object(ref mut map) = value {
+                map.insert("indexed".to_string(), serde_json::Value::Bool(!exit_not_indexed));
+            }
+        }
         println!("{value}");
     } else {
         report.print_report_filtered(block_limit, anomalies);

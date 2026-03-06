@@ -38,7 +38,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
 
-Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs.
+Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored).
 
 ## Scripts
 

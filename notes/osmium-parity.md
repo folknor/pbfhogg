@@ -1,224 +1,220 @@
-# osmium-tool feature parity tracker
+# Migrating from osmium-tool to pbfhogg
 
-Comparison of osmium-tool commands and flags against pbfhogg. Based on
-osmium-tool installed version as of 2026-03-04.
+This guide maps osmium-tool commands and flags to their pbfhogg equivalents.
+If you're already familiar with osmium, you should feel at home — most commands
+have the same names and flags, with a few consolidations that reduce the total
+command count.
 
-## Command mapping
+## Quick reference
 
-| osmium command | pbfhogg equivalent | Notes |
-|---|---|---|
-| `add-locations-to-ways` | `add-locations-to-ways` | Have it |
-| `apply-changes` | `apply-changes` | Have it |
-| `cat` | `cat` | Have it |
-| `changeset-filter` | — | Missing (niche) |
-| `check-refs` | `check --refs` | Have it (consolidated into `check`) |
-| `create-locations-index` | — | Missing (pbfhogg builds indexes in-memory) |
-| `derive-changes` | `diff --format osc` | Have it (consolidated into `diff`) |
-| `diff` | `diff` | Have it |
-| `export` | — | Missing (GeoJSON/GeoJSONSeq/PG) |
-| `extract` | `extract` | Have it |
-| `fileinfo` | `inspect` | Different name, different approach |
-| `getid` | `getid` | Have it |
-| `getparents` | `getparents` | Have it |
-| `merge` | `cat --dedupe` | Have it (consolidated into `cat`) |
-| `merge-changes` | `merge-changes` | Have it (with `--simplify` for dedup) |
-| `query-locations-index` | — | Missing (paired with create-locations-index) |
-| `removeid` | `getid --invert` | Have it (consolidated into `getid`) |
-| `renumber` | `renumber` | Have it |
-| `show` | — | Missing (pretty-print to terminal with pager) |
-| `sort` | `sort` | Have it |
-| `tags-count` | `inspect tags` | Have it (consolidated into `inspect`) |
-| `tags-filter` | `tags-filter` | Have it (also handles OSC via `--input-kind osc`) |
-| `time-filter` | `time-filter` | Have it |
+| osmium | pbfhogg | What changed |
+|--------|---------|--------------|
+| `cat` | `cat` | Same |
+| `sort` | `sort` | Same |
+| `extract` | `extract` | `--strategy` replaced by `--simple` / `--smart` flags |
+| `tags-filter` | `tags-filter` | Also handles OSC input (see below) |
+| `getid` | `getid` | Same |
+| `getparents` | `getparents` | Same |
+| `renumber` | `renumber` | Same |
+| `add-locations-to-ways` | `add-locations-to-ways` | Same |
+| `time-filter` | `time-filter` | Same |
+| `diff` | `diff` | Same |
+| `apply-changes` | `apply-changes` | Same |
+| `merge-changes` | `merge-changes` | Same |
+| `fileinfo` | `inspect` | Different name, more capabilities |
+| `check-refs` | `check --refs` | Consolidated into `check` |
+| `merge` | `cat --dedupe` | Consolidated into `cat` |
+| `derive-changes` | `diff --format osc` | Consolidated into `diff` |
+| `removeid` | `getid --invert` | Consolidated into `getid` |
+| `tags-count` | `inspect tags` | Consolidated into `inspect` |
 
-## pbfhogg-only commands (no osmium equivalent)
+## Consolidated commands
 
-- `inspect --indexed` — check if PBF has blob-level indexdata
-- `inspect --nodes` — coordinate statistics for FOR compression sizing
-- `check --ids` — ID uniqueness and ordering validation
-- `check` (no flags) — run all verification checks (IDs + refs)
-- `bench-read` / `bench-write` / `bench-merge` — internal benchmarking harnesses
+pbfhogg merges several osmium commands that do closely related things. The
+underlying functionality is identical — only the CLI entrypoint changed.
 
-## Missing commands
+### check-refs is now `check`
 
-### Medium priority (useful but not pipeline-critical)
+pbfhogg's `check` command validates both ID integrity and referential integrity
+in a single pass by default.
 
-- **`export`** — export to GeoJSON, GeoJSONSeq, or PG text format. Large scope:
-  geometry assembly, index types, config file, attribute selection. Probably
-  out of scope for pbfhogg's core mission.
+```
+# osmium
+osmium check-refs input.pbf
+osmium check-refs -r input.pbf
 
-### Low priority
+# pbfhogg
+pbfhogg check input.pbf                          # runs both ID + ref checks
+pbfhogg check input.pbf --refs                   # ref check only (same as osmium check-refs)
+pbfhogg check input.pbf --refs --check-relations # same as osmium check-refs -r
+pbfhogg check input.pbf --refs --show-ids        # show missing refs (n123 in w456)
+pbfhogg check input.pbf --ids                    # ID uniqueness/ordering only
+pbfhogg check input.pbf --json                   # machine-readable output
+```
 
-- **`changeset-filter`** — filter changeset files by user, time, bbox, etc.
-  Changesets are a niche use case outside core PBF processing.
-- **`create-locations-index` / `query-locations-index`** — build and query
-  persistent on-disk node location indexes. pbfhogg builds indexes in-memory
-  (DenseMmapIndex). Only needed if external tools want to share a node index.
-- **`show`** — pretty-print PBF contents to terminal via pager. `inspect`
-  covers the metadata case; element-level display would need OPL or debug
-  format output.
+### removeid is now `getid --invert`
 
-## Missing flags on existing commands
+```
+# osmium
+osmium removeid -o out.pbf input.pbf n123 w456
 
-### `add-locations-to-ways`
+# pbfhogg
+pbfhogg getid --invert -o out.pbf input.pbf n123 w456
+```
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-n, --keep-untagged-nodes` | `--keep-untagged-nodes` | Have it |
-| `-i, --index-type` | — | N/A (DenseMmapIndex only, by design) |
-| `--index-type-neg` | — | N/A (DenseMmapIndex only, by design) |
-| `--keep-member-nodes` | — | N/A (always-on, see DEVIATIONS.md) |
-| `--ignore-missing-nodes` | — | N/A (always-on, see DEVIATIONS.md) |
+All ID source flags (`-i`, `-I`, `--default-type`) work in both normal and
+inverted mode. The getid-only flags (`-r`, `-t`, `--verbose-ids`) are not
+available with `--invert`.
 
-### `cat`
+### derive-changes is now `diff --format osc`
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-t, --object-type` | `-t, --type` | Have it |
-| `-c, --clean` | `-c, --clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |
-| `--buffer-data` | — | N/A (pipelined writer handles this differently) |
+```
+# osmium
+osmium derive-changes old.pbf new.pbf -o changes.osc
 
-### `check-refs` (pbfhogg: `check --refs`)
+# pbfhogg
+pbfhogg diff --format osc old.pbf new.pbf -o changes.osc
+pbfhogg diff --format osc old.pbf new.pbf -o changes.osc --increment-version
+pbfhogg diff --format osc old.pbf new.pbf -o changes.osc --update-timestamp
+```
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-r, --check-relations` | `--check-relations` | Have it |
-| `-i, --show-ids` | `--show-ids` | Have it (format: `n123 in w456`, each occurrence, stdout) |
+Text diff (the default `--format text`) and OSC diff have separate flag sets.
+Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are rejected with `--format osc`,
+and vice versa for `--increment-version` / `--update-timestamp`.
 
-### `derive-changes` (pbfhogg: `diff --format osc`)
+### merge is now `cat --dedupe`
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `--increment-version` | `--increment-version` | Have it |
-| `--keep-details` | — | N/A (niche, only useful for debugging deleted objects) |
-| `--update-timestamp` | `--update-timestamp` | Have it (sets delete timestamp to current wall-clock time) |
+osmium's `merge` (sorted k-way merge with dedup) is `cat --dedupe` in pbfhogg.
+Plain `cat` remains concatenation without dedup, just like osmium's `cat`.
 
-### `diff`
+```
+# osmium
+osmium merge -o merged.pbf a.pbf b.pbf c.pbf
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-c, --suppress-common` | `-c, --suppress-common` | Have it |
-| `-t, --object-type` | `-t, --type` | Have it |
-| `--ignore-changeset` | `--ignore-changeset` | Have it (compatibility flag, already ignored by default) |
-| `--ignore-uid` | `--ignore-uid` | Have it (compatibility flag, already ignored by default) |
-| `--ignore-user` | `--ignore-user` | Have it (compatibility flag, already ignored by default) |
-| `-q, --quiet` | `-q, --quiet` | Have it |
-| `-o, --output` | `-o, --output` | Have it |
-| `-s, --summary` | `-s, --summary` | Have it (left/right/same/different counts on stderr) |
+# pbfhogg
+pbfhogg cat --dedupe -o merged.pbf a.pbf b.pbf c.pbf
+```
 
-### `extract`
+All inputs must be sorted. Unsorted input is a hard error — run `pbfhogg sort`
+first if needed.
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-b, --bbox` | `-b, --bbox` | Have it |
-| `-p, --polygon` | `-p, --polygon` | Have it |
-| `-s, --strategy` | `--simple`, `--smart` | Have it (different syntax) |
-| `-c, --config` | `-c, --config` | Have it (JSON config, bbox/polygon/polygon_file per extract, -d directory override) |
-| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `--set-bounds` | `--set-bounds` | Have it (opt-in, writes bbox to output header) |
-| `--clean` | `--clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |
-| `-S, --option` | — | Missing (strategy-specific options) |
+### tags-count is now `inspect tags`
 
-### `getid`
+```
+# osmium
+osmium tags-count input.pbf highway
+osmium tags-count -t way -s count-desc --min-count 100 input.pbf
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-r, --add-referenced` | `-r, --add-referenced` | Have it |
-| `-i, --id-file` | `-i, --id-file` | Have it |
-| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it (scans all element IDs, additive with -i and CLI args) |
-| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `-t, --remove-tags` | `-t, --remove-tags` | Have it (strips tags from referenced-only nodes, use with -r) |
-| `--verbose-ids` | `--verbose-ids` | Have it (prints requested IDs and reports missing) |
-| `--default-type` | `--default-type` | Have it |
+# pbfhogg
+pbfhogg inspect tags input.pbf highway
+pbfhogg inspect tags input.pbf -t way -s count-desc --min-count 100
+```
 
-### `getparents`
+### tags-filter-osc is now `tags-filter --input-kind osc`
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `--add-self` | `--add-self` | Have it |
-| `-i, --id-file` | `-i, --id-file` | Have it |
-| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it |
-| `--default-type` | `--default-type` | Have it |
+pbfhogg auto-detects OSC vs PBF input by content sniffing and file extension,
+so in most cases you don't need to specify `--input-kind` at all.
 
-### `renumber`
+```
+# osmium (separate command)
+osmium tags-filter -o out.osc changes.osc.gz highway=primary
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-s, --start-id` | `-s, --start-id` | Have it (single value or comma-separated node,way,relation) |
-| `-t, --object-type` | — | Missing (renumber all types always) |
-| `-i, --index-directory` | — | Missing (in-memory only, no persistent index) |
-| `--show-index` | — | Missing |
+# pbfhogg (same command, auto-detected)
+pbfhogg tags-filter -o out.osc changes.osc.gz highway=primary
 
-### `merge` (pbfhogg: `apply-changes`)
+# explicit override if needed
+pbfhogg tags-filter --input-kind osc -o out.osc changes.osc.gz highway=primary
+```
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| (base + changes) | base + changes | Have it |
-| `--redact` | — | N/A (requires history file support) |
-| `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `--locations-on-ways` | `--locations-on-ways` | Have it |
+OSC mode always preserves deletes. PBF-only flags (`-R`, `-i`, `-t`) are
+rejected in OSC mode.
 
-### `removeid` (pbfhogg: `getid --invert`)
+### fileinfo is now `inspect`
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-i, --id-file` | `-i, --id-file` | Have it |
-| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it (scans all element IDs, additive with -i and CLI args) |
-| `--default-type` | `--default-type` | Have it |
+```
+# osmium
+osmium fileinfo input.pbf
+osmium fileinfo -e input.pbf
+osmium fileinfo -g header.bbox input.pbf
+osmium fileinfo -j input.pbf
 
-### `sort`
+# pbfhogg
+pbfhogg inspect input.pbf
+pbfhogg inspect -e input.pbf
+pbfhogg inspect -g header.bbox input.pbf
+pbfhogg inspect --json input.pbf
+```
 
-No missing flags. osmium sort has no command-specific options either.
+pbfhogg's `inspect` also includes capabilities not in osmium:
 
-### `tags-count` (pbfhogg: `inspect tags`)
+- `--indexed` — check if a PBF has blob-level indexdata (exit code 0/1)
+- `--nodes` — coordinate statistics for compression analysis
+- `--anomalies` — highlight unusual blocks
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-t, --object-type` | `-t, --type` | Have it |
-| `-m, --min-count` | `--min-count` | Have it |
-| `-e, --expressions` | `-e, --expressions` | Have it (one per line, `#` comments, additive with CLI args) |
-| `-M, --max-count` | `-M, --max-count` | Have it |
-| `-s, --sort` | `-s, --sort` | Have it (count-desc/asc, name-asc/desc, plus shortcuts) |
-| expressions (positional) | expressions (positional) | Have it (optional key/value filter, same syntax as tags-filter) |
+## Flag differences
 
-### `tags-filter`
+Most flags are identical between osmium and pbfhogg. Here are the differences
+worth knowing about.
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `-R, --omit-referenced` | `-R, --omit-referenced` | Have it |
-| expressions (positional) | expressions (positional) | Have it |
-| `-e, --expressions` | `-e, --expressions` | Have it (one per line, `#` comments, additive with CLI args) |
-| `-i, --invert-match` | `-i, --invert-match` | Have it (inverts match: keep non-matching, exclude matching) |
-| `-t, --remove-tags` | `-t, --remove-tags` | Have it (strips tags from referenced-only objects, use without -R) |
+### Different flag names
 
-### `inspect` (fileinfo)
+| osmium | pbfhogg | Commands |
+|--------|---------|----------|
+| `-t, --object-type` | `-t, --type` | cat, diff, inspect tags, check |
+| `--strategy simple\|complete_ways\|smart` | `--simple` / `--smart` (default: complete) | extract |
 
-| osmium flag | pbfhogg | Status |
-|---|---|---|
-| `--blocks` | `--blocks` | Have it |
-| `--id-ranges` | `--id-ranges` | Have it |
-| `--locations` | `--locations` | Have it |
-| `-e, --extended` | `-e, --extended` | Have it (timestamp range, data bbox, objects ordered, metadata coverage; auto-enables --id-ranges) |
-| `-g, --get` | `-g, --get` | Have it (dot-path key accessor for scripting; auto-enables -e for data.*/metadata.* keys) |
-| `-j, --json` | `--json` | Have it |
-| `-c, --crc` | — | N/A (niche, not useful for PBF processing) |
+### Flags pbfhogg doesn't have
 
-## Common flags pbfhogg does not have
+These osmium flags have no pbfhogg equivalent:
 
-These appear on nearly every osmium command but have no pbfhogg equivalent:
+| Flag | Reason |
+|------|--------|
+| `-F, --input-format` | pbfhogg is PBF-only by design |
+| `-f, --output-format` | PBF output only (except `diff --format osc` and `merge-changes`) |
+| `-v, --verbose` | No per-command verbosity control |
+| `--progress` / `--no-progress` | No progress bars |
+| `-O, --overwrite` | pbfhogg always overwrites |
+| `--fsync` | Not offered |
+| `-H, --with-history` | Current-snapshot tool, no history file support |
+| `--buffer-data` | Pipelined writer handles buffering internally |
+| `-i, --index-type` | `add-locations-to-ways` uses DenseMmapIndex only |
 
-- **`-F, --input-format`** — osmium supports PBF, XML, OPL, O5M. pbfhogg is
-  PBF-only (by design).
-- **`-f, --output-format`** — same. pbfhogg outputs PBF only (except
-  `diff --format osc` and `merge-changes` which output OSC).
-- **`-v, --verbose`** — osmium has per-command verbose mode. pbfhogg has no
-  verbosity control.
-- **`--progress / --no-progress`** — progress bars. pbfhogg has none.
-- **`--fsync`** — call fsync after writing. pbfhogg does not offer this.
-- **`-O, --overwrite`** — osmium refuses to overwrite by default. pbfhogg
-  always overwrites.
-- **`--generator`** — set generator string in output header. **Have it.**
-- **`--output-header`** — set output header fields (osmosis_replication_timestamp,
-  osmosis_replication_sequence_number, osmosis_replication_base_url). **Have it.**
-  Note: osmium also supports `sorting` and `xml_josm_upload` keys, and a `!` suffix
-  to copy values from the input header. pbfhogg supports the three replication fields only.
+### Flags only pbfhogg has
+
+| Flag | Commands | Purpose |
+|------|----------|---------|
+| `--force` | Most commands | Run without indexdata (slower fallback) |
+| `--direct-io` | Most commands | Bypass page cache via O_DIRECT |
+| `--io-uring` | apply-changes, cat --dedupe, sort | io_uring output I/O |
+| `--compression` | Most write commands | `none`, `zlib` (default), `zstd`, with optional level (`zlib:9`) |
+| `--generator` | Most write commands | Set writing program name in output header |
+| `--output-header` | Most write commands | Set replication header fields |
+| `--json` | inspect, check | Machine-readable output |
+
+## Commands pbfhogg doesn't have
+
+| osmium command | Status |
+|----------------|--------|
+| `export` | Not planned. GeoJSON/PG export is outside pbfhogg's scope. |
+| `changeset-filter` | Not planned. Changeset processing is a niche use case. |
+| `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
+| `show` | Not planned. `inspect` covers metadata; element-level display not implemented. |
+
+## Indexdata
+
+pbfhogg can embed blob-level indexdata into PBF files, enabling fast
+passthrough for commands like `apply-changes`, `sort`, and `extract`. This
+has no osmium equivalent.
+
+To create an indexed PBF:
+
+```
+pbfhogg cat input.pbf --type node,way,relation -o indexed.pbf
+```
+
+Commands that benefit from indexdata will error if it's missing. Use `--force`
+to run anyway (slower). Check if a file is indexed:
+
+```
+pbfhogg inspect --indexed input.pbf    # exit code 0 = indexed, 1 = not
+```

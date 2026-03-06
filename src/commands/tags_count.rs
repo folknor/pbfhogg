@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
+use super::tag_expr::{tag_matches, parse_expressions, Expression};
 use super::{for_each_primitive_block_batch, require_indexdata, TypeFilter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
@@ -32,43 +33,58 @@ pub enum TagCountSort {
     NameDesc,
 }
 
+/// Options for `tags_count`.
+pub struct TagCountOptions<'a> {
+    pub min_count: u64,
+    pub max_count: Option<u64>,
+    pub sort: TagCountSort,
+    pub expressions: &'a [String],
+    pub type_filter: Option<&'a str>,
+    pub direct_io: bool,
+    pub force: bool,
+}
+
 /// Count tag key=value frequencies in a PBF file.
 ///
 /// If `type_filter` is set, only count tags on elements of that type
 /// ("node", "way", or "relation"). Results are sorted by count descending,
 /// then by key, then by value. Entries below `min_count` are excluded.
 ///
+/// If `expressions` is non-empty, only tags matching at least one
+/// expression are counted (same syntax as `tags-filter`).
+///
 /// Element processing is parallelized: each rayon thread accumulates a
 /// local `FxHashMap`, then thread-local maps are merged via reduce.
 #[hotpath::measure]
 pub fn tags_count(
     path: &Path,
-    min_count: u64,
-    max_count: Option<u64>,
-    sort: TagCountSort,
-    type_filter: Option<&str>,
-    direct_io: bool,
-    force: bool,
+    opts: &TagCountOptions<'_>,
 ) -> Result<Vec<TagCount>> {
-    if type_filter.is_some() {
-        require_indexdata(path, direct_io, force,
+    if opts.type_filter.is_some() {
+        require_indexdata(path, opts.direct_io, opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, the type filter \
              is a no-op — all blobs are decompressed (significantly slower).")?;
     }
 
-    let reader = ElementReader::open(path, direct_io)?;
-    let reader = match type_filter {
+    let expressions = if opts.expressions.is_empty() {
+        None
+    } else {
+        Some(parse_expressions(opts.expressions)?)
+    };
+
+    let reader = ElementReader::open(path, opts.direct_io)?;
+    let reader = match opts.type_filter {
         Some("node") => reader.with_blob_filter(BlobFilter::only_nodes()),
         Some("way") => reader.with_blob_filter(BlobFilter::only_ways()),
         Some("relation") => reader.with_blob_filter(BlobFilter::only_relations()),
         _ => reader,
     };
 
-    let tf = TypeFilter::from_single(type_filter);
+    let tf = TypeFilter::from_single(opts.type_filter);
 
     let mut counts: CountMap = FxHashMap::default();
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        let batch_counts = count_batch(batch, tf.nodes, tf.ways, tf.relations);
+        let batch_counts = count_batch(batch, tf.nodes, tf.ways, tf.relations, &expressions);
         merge_counts(&mut counts, batch_counts);
         Ok(())
     })?;
@@ -77,7 +93,7 @@ pub fn tags_count(
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
     for (key, inner) in counts {
         for (value, count) in inner {
-            if count >= min_count && max_count.is_none_or(|max| count <= max) {
+            if count >= opts.min_count && opts.max_count.is_none_or(|max| count <= max) {
                 results.push(TagCount {
                     key: key.clone(),
                     value,
@@ -87,7 +103,7 @@ pub fn tags_count(
         }
     }
 
-    results.sort_by(|a, b| match sort {
+    results.sort_by(|a, b| match opts.sort {
         TagCountSort::CountDesc => b
             .count
             .cmp(&a.count)
@@ -119,17 +135,31 @@ fn count_batch(
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
+    expressions: &Option<Vec<Expression>>,
 ) -> CountMap {
     batch
         .par_iter()
         .fold(
             FxHashMap::default,
             |mut local: CountMap, block| {
-                count_block_tags(&mut local, block, filter_node, filter_way, filter_relation);
+                count_block_tags(&mut local, block, filter_node, filter_way, filter_relation, expressions);
                 local
             },
         )
         .reduce(FxHashMap::default, merge_two_maps)
+}
+
+/// Check if a tag matches any expression (respecting the element's type).
+fn matches_expression(expressions: &[Expression], key: &str, value: &str, is_node: bool, is_way: bool, is_relation: bool) -> bool {
+    for expr in expressions {
+        let type_ok = (is_node && expr.type_filter.nodes)
+            || (is_way && expr.type_filter.ways)
+            || (is_relation && expr.type_filter.relations);
+        if type_ok && tag_matches(&expr.matcher, key, value) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Count tags from a single block into a local map.
@@ -139,6 +169,7 @@ fn count_block_tags(
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
+    expressions: &Option<Vec<Expression>>,
 ) {
     for element in block.elements() {
         let dominated = match &element {
@@ -150,25 +181,39 @@ fn count_block_tags(
             continue;
         }
 
+        let (is_node, is_way, is_relation) = match &element {
+            Element::DenseNode(_) | Element::Node(_) => (true, false, false),
+            Element::Way(_) => (false, true, false),
+            Element::Relation(_) => (false, false, true),
+        };
+
         match &element {
             Element::DenseNode(dn) => {
                 for (k, v) in dn.tags() {
-                    increment_tag(counts, k, v);
+                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                        increment_tag(counts, k, v);
+                    }
                 }
             }
             Element::Node(n) => {
                 for (k, v) in n.tags() {
-                    increment_tag(counts, k, v);
+                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                        increment_tag(counts, k, v);
+                    }
                 }
             }
             Element::Way(w) => {
                 for (k, v) in w.tags() {
-                    increment_tag(counts, k, v);
+                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                        increment_tag(counts, k, v);
+                    }
                 }
             }
             Element::Relation(r) => {
                 for (k, v) in r.tags() {
-                    increment_tag(counts, k, v);
+                    if expressions.as_ref().is_none_or(|e| matches_expression(e, k, v, is_node, is_way, is_relation)) {
+                        increment_tag(counts, k, v);
+                    }
                 }
             }
         }

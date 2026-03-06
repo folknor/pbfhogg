@@ -173,9 +173,10 @@ No missing flags. osmium sort has no command-specific options either.
 |---|---|---|
 | `-t, --object-type` | `-t, --type` | Have it |
 | `-m, --min-count` | `--min-count` | Have it |
-| `-e, --expressions` | — | Missing (read expressions from file) |
+| `-e, --expressions` | `-e, --expressions` | Have it (one per line, `#` comments, additive with CLI args) |
 | `-M, --max-count` | `-M, --max-count` | Have it |
 | `-s, --sort` | `-s, --sort` | Have it (count-desc/asc, name-asc/desc, plus shortcuts) |
+| expressions (positional) | expressions (positional) | Have it (optional key/value filter, same syntax as tags-filter) |
 
 ### `tags-filter`
 
@@ -183,7 +184,7 @@ No missing flags. osmium sort has no command-specific options either.
 |---|---|---|
 | `-R, --omit-referenced` | `-R, --omit-referenced` | Have it |
 | expressions (positional) | expressions (positional) | Have it |
-| `-e, --expressions` | — | Missing (read from file) |
+| `-e, --expressions` | `-e, --expressions` | Have it (one per line, `#` comments, additive with CLI args) |
 | `-i, --invert-match` | — | Missing (exclude matching objects) |
 | `-t, --remove-tags` | — | Missing (remove tags from non-matching) |
 

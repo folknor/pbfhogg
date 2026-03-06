@@ -92,6 +92,11 @@ enum Command {
         /// Sort order: count-desc (default), count-asc, name-asc, name-desc
         #[arg(short = 's', long, default_value = "count-desc")]
         sort: String,
+        /// Read tag expressions from file (one per line, # comments)
+        #[arg(short = 'e', long = "expressions")]
+        expressions_file: Option<PathBuf>,
+        /// Tag filter expressions (e.g. "highway", "amenity", "w/building=yes")
+        expressions: Vec<String>,
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
@@ -149,8 +154,10 @@ enum Command {
         /// Omit referenced objects (faster, single pass, direct matches only)
         #[arg(short = 'R', long = "omit-referenced")]
         omit_referenced: bool,
+        /// Read filter expressions from file (one per line, # comments)
+        #[arg(short = 'e', long = "expressions")]
+        expressions_file: Option<PathBuf>,
         /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
-        #[arg(required = true)]
         expressions: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,
@@ -165,8 +172,10 @@ enum Command {
         changes: PathBuf,
         #[command(flatten)]
         output: OutputArg,
+        /// Read filter expressions from file (one per line, # comments)
+        #[arg(short = 'e', long = "expressions")]
+        expressions_file: Option<PathBuf>,
         /// Tag filter expressions (e.g. "highway=primary", "amenity", "w/building=yes")
-        #[arg(required = true)]
         expressions: Vec<String>,
     },
     /// Compare two PBF files and show differences.
@@ -501,6 +510,20 @@ enum VerifyCommand {
     },
 }
 
+/// Combine CLI positional expressions with expressions read from a file.
+/// CLI expressions come first, then file expressions (additive, matching osmium).
+fn combine_expressions(
+    file: Option<&std::path::Path>,
+    cli_args: &[String],
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let mut all = cli_args.to_vec();
+    if let Some(path) = file {
+        let from_file = pbfhogg::tag_expr::read_expressions_file(path)?;
+        all.extend(from_file);
+    }
+    Ok(all)
+}
+
 fn main() {
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50, 95, 99])
@@ -521,6 +544,8 @@ fn main() {
             min_count,
             max_count,
             sort,
+            expressions_file,
+            expressions,
             type_filter,
             force,
             io,
@@ -529,6 +554,8 @@ fn main() {
             min_count,
             max_count,
             &sort,
+            expressions_file.as_deref(),
+            &expressions,
             type_filter.as_deref(),
             io.direct_io,
             force.force,
@@ -569,6 +596,7 @@ fn main() {
             file,
             output,
             omit_referenced,
+            expressions_file,
             expressions,
             compression,
             force,
@@ -576,6 +604,7 @@ fn main() {
         } => run_tags_filter(
             &file,
             &output.output,
+            expressions_file.as_deref(),
             &expressions,
             omit_referenced,
             &compression.compression,
@@ -585,8 +614,9 @@ fn main() {
         Command::TagsFilterOsc {
             changes,
             output,
+            expressions_file,
             expressions,
-        } => run_tags_filter_osc(&changes, &output.output, &expressions),
+        } => run_tags_filter_osc(&changes, &output.output, expressions_file.as_deref(), &expressions),
         Command::Diff {
             old,
             new,
@@ -872,7 +902,7 @@ fn run_verify_refs(
     quiet: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
+    let result = pbfhogg::check_refs::check_refs(path, check_relations, false, direct_io)?;
 
     if json {
         let value = serde_json::json!({
@@ -949,7 +979,7 @@ fn run_verify_all(
     let ids_report = pbfhogg::verify_ids::verify_ids(path, &opts)?;
 
     // Run ref check
-    let refs_result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
+    let refs_result = pbfhogg::check_refs::check_refs(path, check_relations, false, direct_io)?;
 
     let all_passed = ids_report.passed && refs_result.is_valid();
     let file_name = path
@@ -1066,6 +1096,8 @@ fn run_tags_count(
     min_count: u64,
     max_count: Option<u64>,
     sort_str: &str,
+    expressions_file: Option<&std::path::Path>,
+    expressions: &[String],
     type_filter: Option<&str>,
     direct_io: bool,
     force: bool,
@@ -1077,7 +1109,17 @@ fn run_tags_count(
         "name-desc" => pbfhogg::tags_count::TagCountSort::NameDesc,
         _ => return Err(format!("unknown sort order: {sort_str} (expected count-desc, count-asc, name-asc, name-desc)").into()),
     };
-    let results = pbfhogg::tags_count::tags_count(path, min_count, max_count, sort, type_filter, direct_io, force)?;
+    let all_expressions = combine_expressions(expressions_file, expressions)?;
+    let opts = pbfhogg::tags_count::TagCountOptions {
+        min_count,
+        max_count,
+        sort,
+        expressions: &all_expressions,
+        type_filter,
+        direct_io,
+        force,
+    };
+    let results = pbfhogg::tags_count::tags_count(path, &opts)?;
 
     for entry in &results {
         println!("{}\t{}\t{}", entry.count, entry.key, entry.value);
@@ -1139,6 +1181,7 @@ fn run_sort(
 fn run_tags_filter(
     file: &std::path::Path,
     output: &std::path::Path,
+    expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     omit_referenced: bool,
     compression: &str,
@@ -1146,10 +1189,14 @@ fn run_tags_filter(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
+    let all_expressions = combine_expressions(expressions_file, expressions)?;
+    if all_expressions.is_empty() {
+        return Err("no filter expressions provided (use positional args or -e FILE)".into());
+    }
     let stats = pbfhogg::tags_filter::tags_filter(
         file,
         output,
-        expressions,
+        &all_expressions,
         omit_referenced,
         compression,
         direct_io,
@@ -1162,9 +1209,14 @@ fn run_tags_filter(
 fn run_tags_filter_osc(
     changes: &std::path::Path,
     output: &std::path::Path,
+    expressions_file: Option<&std::path::Path>,
     expressions: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let stats = pbfhogg::tags_filter_osc::tags_filter_osc(changes, output, expressions)?;
+    let all_expressions = combine_expressions(expressions_file, expressions)?;
+    if all_expressions.is_empty() {
+        return Err("no filter expressions provided (use positional args or -e FILE)".into());
+    }
+    let stats = pbfhogg::tags_filter_osc::tags_filter_osc(changes, output, &all_expressions)?;
     stats.print_summary();
     Ok(())
 }

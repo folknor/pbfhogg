@@ -15,6 +15,7 @@ pub mod node_stats;
 pub(crate) mod owned_elements;
 pub mod sort;
 pub(crate) mod stream_merge;
+pub mod tag_expr;
 pub mod tags_count;
 pub mod tags_filter;
 pub mod tags_filter_osc;

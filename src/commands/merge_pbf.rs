@@ -271,7 +271,7 @@ pub fn merge_pbf(
     // Open all input files for random access
     let mut files: Vec<File> = inputs
         .iter()
-        .map(|p| File::open(p))
+        .map(File::open)
         .collect::<io::Result<_>>()?;
 
     let mut stats = MergePbfStats {

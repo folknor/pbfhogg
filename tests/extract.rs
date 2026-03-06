@@ -1,4 +1,5 @@
 //! Extract (bbox) correctness tests.
+#![cfg(feature = "commands")]
 
 mod common;
 

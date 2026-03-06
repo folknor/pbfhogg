@@ -1,3 +1,5 @@
+#![cfg(feature = "commands")]
+
 mod common;
 
 use common::{TestNode, TestRelation, TestWay};

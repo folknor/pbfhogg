@@ -50,7 +50,7 @@ license.workspace = true
 edition.workspace = true
 repository.workspace = true
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.87"
 keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
 

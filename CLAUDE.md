@@ -14,7 +14,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
 Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install --path ~/Programs/brokkr`. Invoked as `brokkr` from the project root (reads `./brokkr.toml` for project detection).
 
-- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`).
+- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`). Supports `--features` and `--no-default-features`.
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `brokkr run [options] [-- args]` — build release CLI and run passthrough command args. Supports machine-readable timing:
   - `--time` prints key=value timing output

@@ -925,20 +925,6 @@ impl BlobReader<BufReader<File>> {
 // ---------------------------------------------------------------------------
 
 /// Parse raw blob frame bytes into a BlobHeader type and Blob payload size.
-///
-/// Input: the raw bytes after the 4-byte header length prefix (i.e. just the BlobHeader bytes).
-/// Returns: `(blob_type, data_size)`.
-pub(crate) fn parse_blob_header(header_bytes: &[u8]) -> Result<(BlobKind, usize)> {
-    let header = WireBlobHeader::parse(header_bytes, false, false)?;
-    if header.datasize < 0 {
-        return Err(new_blob_error(BlobError::InvalidDataSize {
-            size: header.datasize,
-        }));
-    }
-    #[allow(clippy::cast_sign_loss)]
-    Ok((header.blob_type, header.datasize as usize))
-}
-
 /// Parse a BlobHeader and extract optional `indexdata` and `tagdata` fields.
 ///
 /// Returns `(blob_type, data_size, optional_indexdata, optional_tagdata)`.

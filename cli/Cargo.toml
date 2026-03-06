@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 description = "Command-line OpenStreetMap PBF toolkit"
 readme = "README.md"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [[bin]]
 name = "pbfhogg"

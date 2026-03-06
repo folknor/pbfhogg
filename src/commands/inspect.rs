@@ -1252,11 +1252,13 @@ impl InspectReport {
     ///
     /// `block_limit`: `None` = no `blocks_detail` field, `Some(0)` = full listing,
     /// `Some(N)` = first N + last N blocks.
+    #[cfg(feature = "commands")]
     pub fn to_json(&self, block_limit: Option<usize>) -> serde_json::Value {
         self.to_json_filtered(block_limit, false)
     }
 
     /// Serialize the inspect report to JSON with optional anomalies-only block detail.
+    #[cfg(feature = "commands")]
     pub fn to_json_filtered(
         &self,
         block_limit: Option<usize>,
@@ -1322,6 +1324,7 @@ impl InspectReport {
     }
 }
 
+#[cfg(feature = "commands")]
 fn type_stats_json(ts: &TypeStats) -> serde_json::Value {
     serde_json::json!({
         "count": ts.block_count,
@@ -1330,6 +1333,7 @@ fn type_stats_json(ts: &TypeStats) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "commands")]
 fn id_range_json(r: &TypeIdRange) -> serde_json::Value {
     if r.has_data() {
         serde_json::json!({ "min": r.min_id, "max": r.max_id, "monotonic": r.monotonic, "count": r.count })
@@ -1338,6 +1342,7 @@ fn id_range_json(r: &TypeIdRange) -> serde_json::Value {
     }
 }
 
+#[cfg(feature = "commands")]
 fn id_ranges_json(state: &ScanState) -> serde_json::Value {
     match (&state.node_ids, &state.way_ids, &state.relation_ids) {
         (Some(n), Some(w), Some(r)) => serde_json::json!({
@@ -1350,6 +1355,7 @@ fn id_ranges_json(state: &ScanState) -> serde_json::Value {
 }
 
 #[allow(clippy::cast_precision_loss)]
+#[cfg(feature = "commands")]
 fn extended_json(ext: &ExtendedStats) -> serde_json::Value {
     let bbox = if ext.data_bbox.has_data() {
         let bb = &ext.data_bbox;
@@ -1379,6 +1385,7 @@ fn extended_json(ext: &ExtendedStats) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "commands")]
 fn metadata_json(m: &MetadataCoverage) -> serde_json::Value {
     serde_json::json!({
         "all_objects": {
@@ -1398,6 +1405,7 @@ fn metadata_json(m: &MetadataCoverage) -> serde_json::Value {
     })
 }
 
+#[cfg(feature = "commands")]
 fn blocks_detail_json(
     block_limit: Option<usize>,
     block_infos: &Option<Vec<BlockInfo>>,
@@ -1488,6 +1496,7 @@ fn median_elements_for_kind(infos: &[BlockInfo], kind: BlockKind) -> Option<u64>
     Some(values[values.len() / 2])
 }
 
+#[cfg(feature = "commands")]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn locations_json(loc_stats: &Option<LocationStats>) -> serde_json::Value {
     let Some(stats) = loc_stats else {

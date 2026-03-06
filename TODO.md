@@ -56,18 +56,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   decode+write (`cat --type`), and allocations. Run:
   `brokkr profile --dataset germany`
 
-## CLI consolidation (post-parity) — DONE
-
-Completed. 22 commands consolidated to 14. See `notes/cli-redesign.md` for design
-and `notes/cli-reference.md` for the final surface. Key changes:
-- `inspect` absorbs `is-indexed` (`--indexed`), `node-stats` (`--nodes`), `tags-count` (`inspect tags`)
-- `check` absorbs `check-refs` (`--refs`) and `verify` (`--ids`)
-- `diff` absorbs `derive-changes` (`--format osc`)
-- `cat` absorbs `merge-pbf` (`--dedupe`)
-- `tags-filter` absorbs `tags-filter-osc` (`--input-kind osc`)
-- `getid` absorbs `removeid` (`--invert`)
-- `merge` renamed to `apply-changes`
-
 ## Release prep
 
 ### crates.io blockers

@@ -109,12 +109,12 @@ constraints before designing the consolidated API.
   Additive with CLI args and `--id-file`.
 - [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
   uses this to cut the planet into 200+ regional extracts in one pass.
-- [ ] **`inspect -e` (extended)** — full-scan mode producing element counts,
-  timestamp range, data bbox, ordering check, ID ranges, buffer stats, and
-  metadata attribute coverage in one pass. We have pieces across `--blocks`
-  and `--id-ranges` but no unified extended view.
-- [ ] **`inspect -g`** — get a specific value for scripting
-  (e.g. `inspect -g header.bbox`).
+- [x] **`inspect -e` (extended)** — full-scan mode producing timestamp range,
+  data bbox, objects ordered, and metadata attribute coverage (version,
+  timestamp, changeset, uid, user). Auto-enables `--id-ranges`.
+- [x] **`inspect -g`** — get a specific value by dot-path key for scripting
+  (e.g. `inspect -g header.bbox`, `inspect -g data.timestamp.first`).
+  Auto-enables `-e` for `data.*` and `metadata.*` keys.
 - [x] **`tags-count -e` / `tags-filter -e`** — read expressions from file.
   Additive with CLI args (CLI first, file second). `#` comments, blank lines
   ignored. Also added optional positional expressions to `tags-count`.

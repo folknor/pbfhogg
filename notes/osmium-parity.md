@@ -195,8 +195,8 @@ No missing flags. osmium sort has no command-specific options either.
 | `--blocks` | `--blocks` | Have it |
 | `--id-ranges` | `--id-ranges` | Have it |
 | `--locations` | `--locations` | Have it |
-| `-e, --extended` | — | Missing (full scan: element counts, timestamp range, data bbox, ordering, ID ranges, buffer stats, metadata coverage) |
-| `-g, --get` | — | Missing (get specific value) |
+| `-e, --extended` | `-e, --extended` | Have it (timestamp range, data bbox, objects ordered, metadata coverage; auto-enables --id-ranges) |
+| `-g, --get` | `-g, --get` | Have it (dot-path key accessor for scripting; auto-enables -e for data.*/metadata.* keys) |
 | `-j, --json` | `--json` | Have it |
 | `-c, --crc` | — | N/A (niche, not useful for PBF processing) |
 

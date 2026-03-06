@@ -354,6 +354,12 @@ enum Command {
         /// Show only anomalous blocks (<50% or >150% of median, plus mixed blocks)
         #[arg(long)]
         anomalies: bool,
+        /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
+        #[arg(short, long)]
+        extended: bool,
+        /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first")
+        #[arg(short, long, value_name = "KEY")]
+        get: Option<String>,
         /// Machine-readable JSON output
         #[arg(long)]
         json: bool,
@@ -754,6 +760,8 @@ fn main() {
             id_ranges,
             locations,
             anomalies,
+            extended,
+            get,
             json,
             io,
         } => run_inspect(
@@ -762,6 +770,8 @@ fn main() {
             id_ranges,
             locations,
             anomalies,
+            extended,
+            get.as_deref(),
             json,
             io.direct_io,
         ),
@@ -1536,17 +1546,33 @@ fn run_inspect(
     id_ranges: bool,
     locations: bool,
     anomalies: bool,
+    extended: bool,
+    get: Option<&str>,
     json: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if get.is_some() && json {
+        return Err("--get and --json cannot be used together".into());
+    }
+    // --get with data.* keys requires --extended
+    let extended = extended
+        || get
+            .as_ref()
+            .is_some_and(|k| k.starts_with("data.") || k.starts_with("metadata."));
     let show_blocks = blocks.is_some() || anomalies;
     let block_limit = if anomalies && blocks.is_none() {
         Some(0)
     } else {
         blocks
     };
-    let mut report = pbfhogg::inspect::inspect(path, show_blocks, id_ranges, locations, direct_io)?;
-    if json {
+    let mut report =
+        pbfhogg::inspect::inspect(path, show_blocks, id_ranges, locations, extended, direct_io)?;
+    if let Some(key) = get {
+        match report.get_value(key) {
+            Some(val) => println!("{val}"),
+            None => return Err(format!("unknown key: {key}").into()),
+        }
+    } else if json {
         let value = report.to_json_filtered(block_limit, anomalies);
         println!("{value}");
     } else {

@@ -167,6 +167,90 @@ struct LocationStats {
 }
 
 // ---------------------------------------------------------------------------
+// Extended stats: timestamp range, data bbox, metadata coverage
+// ---------------------------------------------------------------------------
+
+struct DataBbox {
+    min_lat: i64, // nanodegrees
+    max_lat: i64,
+    min_lon: i64,
+    max_lon: i64,
+}
+
+impl DataBbox {
+    fn new() -> Self {
+        Self {
+            min_lat: i64::MAX,
+            max_lat: i64::MIN,
+            min_lon: i64::MAX,
+            max_lon: i64::MIN,
+        }
+    }
+
+    fn update(&mut self, nano_lat: i64, nano_lon: i64) {
+        self.min_lat = self.min_lat.min(nano_lat);
+        self.max_lat = self.max_lat.max(nano_lat);
+        self.min_lon = self.min_lon.min(nano_lon);
+        self.max_lon = self.max_lon.max(nano_lon);
+    }
+
+    fn has_data(&self) -> bool {
+        self.min_lat != i64::MAX
+    }
+}
+
+#[derive(Default)]
+struct MetadataCoverage {
+    total: u64,
+    has_version: u64,
+    has_timestamp: u64,
+    has_changeset: u64,
+    has_uid: u64,
+    has_user: u64,
+}
+
+impl MetadataCoverage {
+    fn all_have(&self, count: u64) -> bool {
+        self.total > 0 && count == self.total
+    }
+
+    fn some_have(&self, count: u64) -> bool {
+        count > 0
+    }
+}
+
+struct ExtendedStats {
+    min_timestamp: i64, // milliseconds since epoch
+    max_timestamp: i64,
+    data_bbox: DataBbox,
+    metadata: MetadataCoverage,
+    objects_ordered: bool,
+}
+
+impl ExtendedStats {
+    fn new() -> Self {
+        Self {
+            min_timestamp: i64::MAX,
+            max_timestamp: i64::MIN,
+            data_bbox: DataBbox::new(),
+            metadata: MetadataCoverage::default(),
+            objects_ordered: true,
+        }
+    }
+
+    fn update_timestamp(&mut self, millis: i64) {
+        if millis != 0 {
+            self.min_timestamp = self.min_timestamp.min(millis);
+            self.max_timestamp = self.max_timestamp.max(millis);
+        }
+    }
+
+    fn has_timestamps(&self) -> bool {
+        self.min_timestamp != i64::MAX
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mutable state for the scan loop, factored out to reduce cognitive complexity.
 // ---------------------------------------------------------------------------
 
@@ -181,10 +265,12 @@ struct ScanState {
     way_ids: Option<TypeIdRange>,
     relation_ids: Option<TypeIdRange>,
     loc_stats: Option<LocationStats>,
+    extended: Option<ExtendedStats>,
 }
 
 impl ScanState {
-    fn new(show_id_ranges: bool, show_locations: bool) -> Self {
+    fn new(show_id_ranges: bool, show_locations: bool, extended: bool) -> Self {
+        let show_id_ranges = show_id_ranges || extended;
         Self {
             node_count: 0,
             tagged_node_count: 0,
@@ -202,6 +288,7 @@ impl ScanState {
             } else {
                 None
             },
+            extended: if extended { Some(ExtendedStats::new()) } else { None },
         }
     }
 
@@ -254,6 +341,65 @@ impl ScanState {
                 (false, false, true)
             }
         }
+    }
+}
+
+/// Update extended stats for a single element. Separate function to avoid
+/// inflating cognitive complexity in `process_element`.
+fn update_extended_for_element(ext: &mut ExtendedStats, element: &Element<'_>) {
+    ext.metadata.total += 1;
+    match *element {
+        Element::DenseNode(ref dn) => {
+            ext.data_bbox.update(dn.nano_lat(), dn.nano_lon());
+            update_extended_dense_node(ext, dn);
+        }
+        Element::Node(ref n) => {
+            ext.data_bbox.update(n.nano_lat(), n.nano_lon());
+            update_extended_info(ext, &n.info());
+        }
+        Element::Way(ref w) => update_extended_info(ext, &w.info()),
+        Element::Relation(ref r) => update_extended_info(ext, &r.info()),
+    }
+}
+
+fn update_extended_dense_node(ext: &mut ExtendedStats, dn: &crate::DenseNode<'_>) {
+    if let Some(info) = dn.info().filter(|i| i.version() != -1) {
+        ext.metadata.has_version += 1;
+        let ts = info.milli_timestamp();
+        if ts != 0 {
+            ext.metadata.has_timestamp += 1;
+            ext.update_timestamp(ts);
+        }
+        if info.changeset() != 0 {
+            ext.metadata.has_changeset += 1;
+        }
+        if info.uid() != 0 {
+            ext.metadata.has_uid += 1;
+        }
+        if info.raw_user_sid() > 0 {
+            ext.metadata.has_user += 1;
+        }
+    }
+}
+
+fn update_extended_info(ext: &mut ExtendedStats, info: &crate::Info<'_>) {
+    if info.version().is_some() {
+        ext.metadata.has_version += 1;
+    }
+    if let Some(ts) = info.milli_timestamp()
+        && ts != 0
+    {
+        ext.metadata.has_timestamp += 1;
+        ext.update_timestamp(ts);
+    }
+    if info.changeset().is_some() {
+        ext.metadata.has_changeset += 1;
+    }
+    if info.uid().is_some() {
+        ext.metadata.has_uid += 1;
+    }
+    if info.raw_user_sid().is_some() {
+        ext.metadata.has_user += 1;
     }
 }
 
@@ -322,18 +468,20 @@ pub fn inspect(
     show_blocks: bool,
     show_id_ranges: bool,
     show_locations: bool,
+    extended: bool,
     direct_io: bool,
 ) -> Result<InspectReport> {
     // Index-only fast path: skip decompression when all blobs have indexdata.
-    // --locations requires per-way element data, so it always needs full decode.
+    // --locations and --extended require per-element data, so they need full decode.
     if !show_locations
+        && !extended
         && let Some(report) =
             try_index_only_scan(path, show_blocks, show_id_ranges, direct_io)?
     {
         return Ok(report);
     }
 
-    full_decode_scan(path, show_blocks, show_id_ranges, show_locations, direct_io)
+    full_decode_scan(path, show_blocks, show_id_ranges, show_locations, extended, direct_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -360,7 +508,7 @@ fn try_index_only_scan(
 
     let mut accum = BlockAccum::new(show_blocks);
     let mut block_number = 0u32;
-    let mut state = ScanState::new(show_id_ranges, false);
+    let mut state = ScanState::new(show_id_ranges, false, false);
     let mut total_data_blobs = 0u64;
 
     while let Some(info) = read_blob_header_only(&mut reader, &mut offset)? {
@@ -493,6 +641,7 @@ fn full_decode_scan(
     show_blocks: bool,
     show_id_ranges: bool,
     show_locations: bool,
+    extended: bool,
     direct_io: bool,
 ) -> Result<InspectReport> {
     let meta = std::fs::metadata(path)?;
@@ -512,7 +661,7 @@ fn full_decode_scan(
 
     let mut accum = BlockAccum::new(show_blocks);
     let mut block_number = 0u32;
-    let mut state = ScanState::new(show_id_ranges, show_locations);
+    let mut state = ScanState::new(show_id_ranges, show_locations, extended);
 
     while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {
         match frame.blob_type {
@@ -533,6 +682,24 @@ fn full_decode_scan(
     }
 
     let is_indexed = total_data_blobs > 0 && indexed_blobs == total_data_blobs;
+
+    // Compute objects_ordered from ordering segments + ID monotonicity.
+    if let Some(ref mut ext) = state.extended {
+        let type_ordered = is_standard_ordering(&accum.segments);
+        let ids_monotonic = state
+            .node_ids
+            .as_ref()
+            .is_none_or(|r| !r.has_data() || r.monotonic)
+            && state
+                .way_ids
+                .as_ref()
+                .is_none_or(|r| !r.has_data() || r.monotonic)
+            && state
+                .relation_ids
+                .as_ref()
+                .is_none_or(|r| !r.has_data() || r.monotonic);
+        ext.objects_ordered = type_ordered && ids_monotonic;
+    }
 
     Ok(InspectReport {
         file_name,
@@ -571,6 +738,9 @@ fn scan_data_blob(
         has_nodes |= n;
         has_ways |= w;
         has_relations |= r;
+        if let Some(ref mut ext) = state.extended {
+            update_extended_for_element(ext, &element);
+        }
     }
 
     let kind = classify_block(has_nodes, has_ways, has_relations);
@@ -665,6 +835,10 @@ impl InspectReport {
         if let Some((n, w, r)) = self.id_range_tuple() {
             println!();
             Self::print_id_ranges(n, w, r);
+        }
+        if let Some(ref ext) = self.state.extended {
+            println!();
+            Self::print_extended(ext);
         }
         if let Some(ref mut stats) = self.state.loc_stats {
             println!();
@@ -917,6 +1091,122 @@ impl InspectReport {
     }
 
     #[allow(clippy::cast_precision_loss)]
+    fn print_extended(ext: &ExtendedStats) {
+        println!(
+            "Ordered:  {}",
+            if ext.objects_ordered { "yes" } else { "no" }
+        );
+        if ext.has_timestamps() {
+            println!(
+                "Timestamps: {} .. {}",
+                format_timestamp(ext.min_timestamp),
+                format_timestamp(ext.max_timestamp)
+            );
+        }
+        if ext.data_bbox.has_data() {
+            let bb = &ext.data_bbox;
+            println!(
+                "Data bbox:  {},{},{},{}",
+                bb.min_lon as f64 * 1e-9,
+                bb.min_lat as f64 * 1e-9,
+                bb.max_lon as f64 * 1e-9,
+                bb.max_lat as f64 * 1e-9
+            );
+        }
+        let m = &ext.metadata;
+        if m.total > 0 {
+            print_metadata_line("All objects have:", m, true);
+            print_metadata_line("Some objects have:", m, false);
+        }
+    }
+
+    /// Retrieve a single value by dot-path key, for `--get` scripting.
+    ///
+    /// Returns `None` for unknown keys.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn get_value(&self, key: &str) -> Option<String> {
+        self.get_value_inner(key)
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn get_value_inner(&self, key: &str) -> Option<String> {
+        match key {
+            "file.name" => Some(self.file_name.clone()),
+            "file.size" => Some(self.file_size.to_string()),
+            "file.format" => Some("PBF".to_string()),
+            "header.bbox" => self.header_meta.bbox.map(|(l, b, r, t)| format!("{l} {b} {r} {t}")),
+            "header.writing_program" => self.header_meta.writing_program.clone(),
+            "header.replication.url" => self.header_meta.replication_url.clone(),
+            "header.replication.sequence" => {
+                self.header_meta.replication_sequence.map(|s| s.to_string())
+            }
+            "header.replication.timestamp" => {
+                self.header_meta.replication_timestamp.map(|t| t.to_string())
+            }
+            "indexed" => Some(self.is_indexed.to_string()),
+            "blocks.total" => Some(self.total_blocks.to_string()),
+            "elements.nodes" => Some(self.state.node_count.to_string()),
+            "elements.ways" => Some(self.state.way_count.to_string()),
+            "elements.relations" => Some(self.state.relation_count.to_string()),
+            "elements.total" => Some(
+                (self.state.node_count + self.state.way_count + self.state.relation_count)
+                    .to_string(),
+            ),
+            _ => self.get_extended_value(key),
+        }
+    }
+
+    fn get_extended_value(&self, key: &str) -> Option<String> {
+        let ext = self.state.extended.as_ref()?;
+        match key {
+            "data.objects_ordered" => Some(yes_no(ext.objects_ordered)),
+            "data.timestamp.first" => {
+                if ext.has_timestamps() {
+                    Some(format_timestamp(ext.min_timestamp))
+                } else {
+                    Some(String::new())
+                }
+            }
+            "data.timestamp.last" => {
+                if ext.has_timestamps() {
+                    Some(format_timestamp(ext.max_timestamp))
+                } else {
+                    Some(String::new())
+                }
+            }
+            "data.bbox" => {
+                if ext.data_bbox.has_data() {
+                    let bb = &ext.data_bbox;
+                    #[allow(clippy::cast_precision_loss)]
+                    Some(format!(
+                        "{} {} {} {}",
+                        bb.min_lon as f64 * 1e-9,
+                        bb.min_lat as f64 * 1e-9,
+                        bb.max_lon as f64 * 1e-9,
+                        bb.max_lat as f64 * 1e-9
+                    ))
+                } else {
+                    Some(String::new())
+                }
+            }
+            "data.count.nodes" => Some(self.state.node_count.to_string()),
+            "data.count.ways" => Some(self.state.way_count.to_string()),
+            "data.count.relations" => Some(self.state.relation_count.to_string()),
+            "metadata.all_objects.version" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_version))),
+            "metadata.all_objects.timestamp" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_timestamp))),
+            "metadata.all_objects.changeset" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_changeset))),
+            "metadata.all_objects.uid" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_uid))),
+            "metadata.all_objects.user" => Some(yes_no(ext.metadata.all_have(ext.metadata.has_user))),
+            "metadata.some_objects.version" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_version))),
+            "metadata.some_objects.timestamp" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_timestamp))),
+            "metadata.some_objects.changeset" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_changeset))),
+            "metadata.some_objects.uid" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_uid))),
+            "metadata.some_objects.user" => Some(yes_no(ext.metadata.some_have(ext.metadata.has_user))),
+            _ => None,
+        }
+    }
+
+    #[allow(clippy::cast_precision_loss)]
     fn print_locations(stats: &mut LocationStats) {
         let total = stats.with_locations + stats.without_locations;
         if total == 0 {
@@ -993,7 +1283,7 @@ impl InspectReport {
         let sequence: Vec<&str> = self.accum.segments.iter()
             .map(|s| s.kind.short_label()).collect();
 
-        serde_json::json!({
+        let mut json = serde_json::json!({
             "schema_version": 1,
             "file": self.file_name,
             "file_size": self.file_size,
@@ -1021,7 +1311,14 @@ impl InspectReport {
             "anomalies_only": anomalies_only,
             "blocks_detail": blocks_detail_json(block_limit, &self.accum.block_infos, anomalies_only),
             "locations": locations_json(&self.state.loc_stats),
-        })
+        });
+
+        if let Some(ref ext) = self.state.extended {
+            json["data"] = extended_json(ext);
+            json["metadata"] = metadata_json(&ext.metadata);
+        }
+
+        json
     }
 }
 
@@ -1050,6 +1347,55 @@ fn id_ranges_json(state: &ScanState) -> serde_json::Value {
         }),
         _ => serde_json::Value::Null,
     }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn extended_json(ext: &ExtendedStats) -> serde_json::Value {
+    let bbox = if ext.data_bbox.has_data() {
+        let bb = &ext.data_bbox;
+        serde_json::json!([
+            bb.min_lon as f64 * 1e-9,
+            bb.min_lat as f64 * 1e-9,
+            bb.max_lon as f64 * 1e-9,
+            bb.max_lat as f64 * 1e-9
+        ])
+    } else {
+        serde_json::Value::Null
+    };
+
+    let timestamp = if ext.has_timestamps() {
+        serde_json::json!({
+            "first": format_timestamp(ext.min_timestamp),
+            "last": format_timestamp(ext.max_timestamp),
+        })
+    } else {
+        serde_json::Value::Null
+    };
+
+    serde_json::json!({
+        "bbox": bbox,
+        "timestamp": timestamp,
+        "objects_ordered": ext.objects_ordered,
+    })
+}
+
+fn metadata_json(m: &MetadataCoverage) -> serde_json::Value {
+    serde_json::json!({
+        "all_objects": {
+            "version": m.all_have(m.has_version),
+            "timestamp": m.all_have(m.has_timestamp),
+            "changeset": m.all_have(m.has_changeset),
+            "uid": m.all_have(m.has_uid),
+            "user": m.all_have(m.has_user),
+        },
+        "some_objects": {
+            "version": m.some_have(m.has_version),
+            "timestamp": m.some_have(m.has_timestamp),
+            "changeset": m.some_have(m.has_changeset),
+            "uid": m.some_have(m.has_uid),
+            "user": m.some_have(m.has_user),
+        },
+    })
 }
 
 fn blocks_detail_json(
@@ -1285,5 +1631,68 @@ fn format_number_signed(n: i64) -> String {
     } else {
         #[allow(clippy::cast_sign_loss)]
         format_number(n as u64)
+    }
+}
+
+/// Format a millisecond epoch timestamp as ISO-8601 UTC.
+fn format_timestamp(millis: i64) -> String {
+    let secs = millis / 1000;
+    // Use manual formatting: seconds since epoch → date/time components
+    // This avoids a chrono dependency for a single formatting call.
+    const SECS_PER_DAY: i64 = 86400;
+    let days = secs.div_euclid(SECS_PER_DAY);
+    let day_secs = secs.rem_euclid(SECS_PER_DAY);
+    let h = day_secs / 3600;
+    let m = (day_secs % 3600) / 60;
+    let s = day_secs % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// Convert days since Unix epoch to (year, month, day).
+/// Algorithm from Howard Hinnant's `civil_from_days`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn days_to_ymd(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d)
+}
+
+fn yes_no(b: bool) -> String {
+    if b { "yes".to_string() } else { "no".to_string() }
+}
+
+fn print_metadata_line(label: &str, m: &MetadataCoverage, all: bool) {
+    let check = |count: u64| -> bool {
+        if all { m.all_have(count) } else { m.some_have(count) }
+    };
+    let mut attrs = Vec::new();
+    if check(m.has_version) {
+        attrs.push("version");
+    }
+    if check(m.has_timestamp) {
+        attrs.push("timestamp");
+    }
+    if check(m.has_changeset) {
+        attrs.push("changeset");
+    }
+    if check(m.has_uid) {
+        attrs.push("uid");
+    }
+    if check(m.has_user) {
+        attrs.push("user");
+    }
+    if attrs.is_empty() {
+        println!("  {label} (none)");
+    } else {
+        println!("  {label} {}", attrs.join(", "));
     }
 }

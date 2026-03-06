@@ -45,7 +45,7 @@ fn inspect_json_base() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, false, false, false, false)
+    let report = pbfhogg::inspect::inspect(&input, false, false, false, false, false)
         .expect("inspect");
     let json = report.to_json(None);
 
@@ -92,7 +92,7 @@ fn inspect_json_with_id_ranges() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, false, true, false, false)
+    let report = pbfhogg::inspect::inspect(&input, false, true, false, false, false)
         .expect("inspect");
     let json = report.to_json(None);
 
@@ -122,7 +122,7 @@ fn inspect_json_with_blocks() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false)
+    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
         .expect("inspect");
     let json = report.to_json(Some(0));
 
@@ -145,7 +145,7 @@ fn inspect_json_blocks_limit_honored() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false)
+    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
         .expect("inspect");
 
     let json_all = report.to_json(Some(0));
@@ -165,7 +165,7 @@ fn inspect_json_combined_flags() {
     let input = dir.path().join("test.osm.pbf");
     write_simple_pbf(&input);
 
-    let report = pbfhogg::inspect::inspect(&input, true, true, false, false)
+    let report = pbfhogg::inspect::inspect(&input, true, true, false, false, false)
         .expect("inspect");
     let json = report.to_json(Some(0));
 
@@ -194,7 +194,7 @@ fn inspect_json_blocks_anomalies_only() {
     // Median=100, so the 10-element block is anomalously small (<50% of median).
     write_nodes_blocks(&input, &[100, 100, 10]);
 
-    let report = pbfhogg::inspect::inspect(&input, true, false, false, false)
+    let report = pbfhogg::inspect::inspect(&input, true, false, false, false, false)
         .expect("inspect");
     let json = report.to_json_filtered(Some(0), true);
 
@@ -205,4 +205,52 @@ fn inspect_json_blocks_anomalies_only() {
     assert_eq!(detail[0]["type"], "nodes");
     assert_eq!(detail[0]["elements"], 10);
     assert_eq!(detail[0]["anomaly"], "small");
+}
+
+#[test]
+fn inspect_extended() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("test.osm.pbf");
+    write_simple_pbf(&input);
+
+    // extended=true forces full decode and collects timestamps, bbox, metadata
+    let report = pbfhogg::inspect::inspect(&input, false, false, false, true, false)
+        .expect("inspect");
+    let json = report.to_json(None);
+
+    // Extended automatically enables id_ranges
+    assert!(!json["id_ranges"].is_null());
+
+    // data section should be present
+    assert!(!json["data"].is_null());
+    assert!(json["data"]["objects_ordered"].is_boolean());
+    // bbox should be present (we have nodes with coordinates)
+    assert!(json["data"]["bbox"].is_array());
+    // metadata section
+    assert!(!json["metadata"].is_null());
+    assert!(json["metadata"]["all_objects"]["version"].is_boolean());
+    assert!(json["metadata"]["some_objects"]["version"].is_boolean());
+}
+
+#[test]
+fn inspect_get_value() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("test.osm.pbf");
+    write_simple_pbf(&input);
+
+    let report = pbfhogg::inspect::inspect(&input, false, false, false, true, false)
+        .expect("inspect");
+
+    // Basic keys
+    assert_eq!(report.get_value("file.format"), Some("PBF".to_string()));
+    assert_eq!(report.get_value("elements.total"), Some("6".to_string()));
+    assert_eq!(report.get_value("elements.nodes"), Some("3".to_string()));
+    assert_eq!(report.get_value("indexed"), Some("true".to_string()));
+
+    // Extended keys
+    assert!(report.get_value("data.objects_ordered").is_some());
+    assert!(report.get_value("metadata.all_objects.version").is_some());
+
+    // Unknown key
+    assert!(report.get_value("nonexistent.key").is_none());
 }

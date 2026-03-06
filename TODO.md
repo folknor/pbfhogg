@@ -41,6 +41,21 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
      thread since the consumer does its own parallelism. Sensible tradeoff but
      may leave the I/O thread idle waiting for the single decoder.
 
+- [x] **`merge --locations-on-ways`: parallelize Phase 2.5 blob scans** —
+  Passthrough node blob decompression dispatched to rayon pool. At Denmark
+  scale (883 blobs) the improvement is negligible (<5ms) since per-batch
+  work is already small, but should help at planet scale with larger scan
+  sets. Note: the 12,790 "needed from base" nodes that aren't found are
+  untagged nodes dropped by ALTW — they don't exist in the base PBF. This
+  is inherent to the LocationsOnWays workflow, not a bug.
+  `build_from_diff` already correctly excludes deleted ways (they're removed
+  from `way_index` by the OSC parser).
+
+- [ ] **Update nidhogg merge call to use `locations_on_ways: true`** —
+  nidhogg currently calls `merge` without the flag. Once the enriched PBF is
+  bootstrapped, enable the flag to eliminate ALTW from the recurring pipeline.
+  File: `~/Programs/nidhogg/src/merge.rs`.
+
 - [ ] **Run Germany full profiling suite** (4.5 GB, ~500M elements). Currently only
   merge timing exists — missing read baselines (`tags-count`, `check-refs`),
   decode+write (`cat --type`), and allocations. Run:

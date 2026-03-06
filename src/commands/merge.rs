@@ -1412,7 +1412,8 @@ pub fn merge(
         // Must complete BEFORE Phase 3 spawns way rewrites that read the index.
         if let Some(ref mut idx) = loc_index {
             if !idx.all_found() {
-                for (i, slot) in slots.iter().enumerate() {
+                // First pass: extract from rewrite blobs (already parsed, cheap)
+                for slot in &slots {
                     let blob_index = match slot {
                         BatchSlot::Passthrough { index, .. }
                         | BatchSlot::FalsePositive { index, .. }
@@ -1423,34 +1424,72 @@ pub fn merge(
                     {
                         continue;
                     }
-                    match slot {
-                        BatchSlot::Rewrite { job_index, .. } => {
-                            // Already parsed — extract directly
-                            let found = idx.extract_from_block(&rewrite_jobs[*job_index].block);
-                            stats.loc_nodes_from_base += found;
-                        }
-                        BatchSlot::Passthrough { .. } | BatchSlot::FalsePositive { .. } => {
-                            // Decompress and parse to extract needed coordinates
+                    if let BatchSlot::Rewrite { job_index, .. } = slot {
+                        let found = idx.extract_from_block(&rewrite_jobs[*job_index].block);
+                        stats.loc_nodes_from_base += found;
+                    }
+                }
+
+                // Second pass: parallel decompress+extract from passthrough node blobs
+                let passthrough_scan: Vec<usize> = slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, slot)| {
+                        let blob_index = match slot {
+                            BatchSlot::Passthrough { index, .. }
+                            | BatchSlot::FalsePositive { index, .. }
+                            | BatchSlot::Rewrite { index, .. } => index,
+                        };
+                        blob_index.kind == ElemKind::Node
+                            && idx.overlaps_needed(blob_index.min_id, blob_index.max_id)
+                            && !matches!(slot, BatchSlot::Rewrite { .. })
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+
+                if !passthrough_scan.is_empty() {
+                    let needed_set = &idx.needed_set;
+                    let extracted: Vec<Vec<(i64, (i32, i32))>> = passthrough_scan
+                        .par_iter()
+                        .filter_map(|&i| {
                             let mut buf = Vec::new();
-                            if let Err(e) =
-                                decompress_blob_data_into(batch[i].blob_bytes(), &mut buf)
+                            if decompress_blob_data_into(batch[i].blob_bytes(), &mut buf).is_err()
                             {
-                                eprintln!(
-                                    "Warning: failed to decompress node blob for \
-                                     location extraction: {e}"
-                                );
-                                continue;
+                                return None;
                             }
                             let bytes_owned = Bytes::from(buf);
-                            if let Ok(block) =
-                                parse_primitive_block_from_bytes_owned(&bytes_owned)
-                            {
-                                let found = idx.extract_from_block(&block);
-                                stats.loc_nodes_from_base += found;
+                            let block =
+                                parse_primitive_block_from_bytes_owned(&bytes_owned).ok()?;
+                            let mut found = Vec::new();
+                            for element in block.elements_skip_metadata() {
+                                match &element {
+                                    Element::DenseNode(dn) if needed_set.contains(&dn.id()) => {
+                                        found.push((
+                                            dn.id(),
+                                            (dn.decimicro_lat(), dn.decimicro_lon()),
+                                        ));
+                                    }
+                                    Element::Node(n) if needed_set.contains(&n.id()) => {
+                                        found.push((
+                                            n.id(),
+                                            (n.decimicro_lat(), n.decimicro_lon()),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
                             }
-                            stats.loc_node_blobs_scanned += 1;
+                            Some(found)
+                        })
+                        .collect();
+
+                    for coords in extracted {
+                        for (id, loc) in coords {
+                            idx.locations.insert(id, loc);
+                            idx.needed_set.remove(&id);
+                            stats.loc_nodes_from_base += 1;
                         }
                     }
+                    stats.loc_node_blobs_scanned += passthrough_scan.len() as u64;
                 }
             }
         }

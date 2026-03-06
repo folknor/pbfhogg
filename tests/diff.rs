@@ -24,6 +24,7 @@ fn default_options() -> DiffOptions {
     DiffOptions {
         suppress_common: false,
         verbose: false,
+        summary: false,
         type_filter: None,
         ignore_changeset: false,
         ignore_uid: false,
@@ -621,4 +622,54 @@ fn type_filter_way_skips_phases() {
     assert_eq!(stats.created, 1, "expected 1 created way");
     assert_eq!(stats.modified, 0);
     assert_eq!(stats.deleted, 0);
+}
+
+#[test]
+fn osmium_summary_format() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+
+    // Old: nodes 1,2,3 + way 10 = 4 elements
+    // New: nodes 1,2 (modified),4 + way 10 = 4 elements
+    // Common: n1, w10 = 2; Modified: n2 = 1; Deleted: n3 = 1; Created: n4 = 1
+    write_test_pbf_sorted(
+        &old,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "old")] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &new,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "new")] },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
+        ],
+        &[TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "primary")] }],
+        &[],
+    );
+
+    let (_, stats) = run_diff(&old, &new, &default_options());
+
+    // Verify the computed osmium-style counts:
+    // left = common + modified + deleted = 2 + 1 + 1 = 4
+    // right = common + modified + created = 2 + 1 + 1 = 4
+    // same = common = 2
+    // different = created + modified + deleted = 1 + 1 + 1 = 3
+    assert_eq!(stats.common, 2);
+    assert_eq!(stats.modified, 1);
+    assert_eq!(stats.deleted, 1);
+    assert_eq!(stats.created, 1);
+
+    let left = stats.common + stats.modified + stats.deleted;
+    let right = stats.common + stats.modified + stats.created;
+    let different = stats.created + stats.modified + stats.deleted;
+    assert_eq!(left, 4, "left should be total old elements");
+    assert_eq!(right, 4, "right should be total new elements");
+    assert_eq!(different, 3, "different should be total changes");
 }

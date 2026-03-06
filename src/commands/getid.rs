@@ -161,6 +161,15 @@ pub fn merge_id_sets(a: &mut IdSet, b: IdSet) {
 // Stats
 // ---------------------------------------------------------------------------
 
+/// Options for getid.
+pub struct GetidOptions {
+    /// Include referenced nodes of matching ways (two-pass).
+    pub add_referenced: bool,
+    /// Strip tags from referenced objects not explicitly requested.
+    /// Only meaningful with `add_referenced`.
+    pub remove_tags: bool,
+}
+
 /// Statistics from a getid/removeid operation.
 pub struct GetidStats {
     pub nodes_written: u64,
@@ -184,14 +193,14 @@ impl GetidStats {
 
 /// Extract elements matching the given IDs.
 ///
-/// If `add_referenced` is true, referenced nodes of matching ways are also
+/// If `opts.add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
 #[hotpath::measure]
 pub fn getid(
     input: &Path,
     output: &Path,
     ids: &IdSet,
-    add_referenced: bool,
+    opts: &GetidOptions,
     compression: Compression,
     direct_io: bool,
     force: bool,
@@ -206,10 +215,10 @@ pub fn getid(
         super::warn_locations_on_ways_loss(reader.header());
     }
 
-    if add_referenced {
-        getid_with_refs(input, output, ids, compression, direct_io)
+    if opts.add_referenced {
+        getid_with_refs(input, output, ids, opts, compression, direct_io)
     } else {
-        filter_by_id(input, output, ids, true, compression, direct_io)
+        filter_by_id(input, output, ids, true, None, compression, direct_io)
     }
 }
 
@@ -220,7 +229,7 @@ pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compressi
         let reader = crate::ElementReader::open(input, direct_io)?;
         super::warn_locations_on_ways_loss(reader.header());
     }
-    filter_by_id(input, output, ids, false, compression, direct_io)
+    filter_by_id(input, output, ids, false, None, compression, direct_io)
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +241,7 @@ fn filter_by_id(
     output: &Path,
     ids: &IdSet,
     include: bool,
+    strip_tags_ids: Option<&BTreeSet<i64>>,
     compression: Compression,
     direct_io: bool,
 ) -> Result<GetidStats> {
@@ -255,7 +265,7 @@ fn filter_by_id(
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
             let (nodes, ways, relations) = process_filter_batch(
-                batch, &mut writer, ids, include, None,
+                batch, &mut writer, ids, include, None, strip_tags_ids,
             )?;
             stats.nodes_written += nodes;
             stats.ways_written += ways;
@@ -271,7 +281,7 @@ fn filter_by_id(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
+fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions, compression: Compression, direct_io: bool) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -298,6 +308,15 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
         }
     }
 
+    // When --remove-tags is set, referenced-only nodes (not explicitly requested)
+    // get their tags stripped. Build the strip set: dep_node_ids minus explicit node_ids.
+    let strip_tags_ids = if opts.remove_tags && !dep_node_ids.is_empty() {
+        let strip: BTreeSet<i64> = dep_node_ids.difference(&ids.node_ids).copied().collect();
+        if strip.is_empty() { None } else { Some(strip) }
+    } else {
+        None
+    };
+
     // Pass 2: Write matching elements + dependent nodes (parallel batches).
     let reader = ElementReader::open(input, direct_io)?;
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
@@ -313,7 +332,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, compression: Compre
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
             let (nodes, ways, relations) = process_filter_batch(
-                batch, &mut writer, ids, true, dep_ref,
+                batch, &mut writer, ids, true, dep_ref, strip_tags_ids.as_ref(),
             )?;
             stats.nodes_written += nodes;
             stats.ways_written += ways;
@@ -341,6 +360,7 @@ fn process_block(
     ids: &IdSet,
     include: bool,
     dep_node_ids: Option<&BTreeSet<i64>>,
+    strip_tags_ids: Option<&BTreeSet<i64>>,
 ) -> std::result::Result<(u64, u64, u64), String> {
     let mut nodes: u64 = 0;
     let mut ways: u64 = 0;
@@ -371,16 +391,26 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) => {
                 ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(dn.tags());
+                let strip = strip_tags_ids.is_some_and(|s| s.contains(&dn.id()));
+                if strip {
+                    tags_buf.clear();
+                } else {
+                    tags_buf.clear();
+                    tags_buf.extend(dn.tags());
+                }
                 let meta = dense_node_metadata(dn);
                 bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                 nodes += 1;
             }
             Element::Node(n) => {
                 ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(n.tags());
+                let strip = strip_tags_ids.is_some_and(|s| s.contains(&n.id()));
+                if strip {
+                    tags_buf.clear();
+                } else {
+                    tags_buf.clear();
+                    tags_buf.extend(n.tags());
+                }
                 let meta = element_metadata(&n.info());
                 bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                 nodes += 1;
@@ -428,6 +458,7 @@ fn process_filter_batch(
     ids: &IdSet,
     include: bool,
     dep_node_ids: Option<&BTreeSet<i64>>,
+    strip_tags_ids: Option<&BTreeSet<i64>>,
 ) -> Result<(u64, u64, u64)> {
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, (u64, u64, u64)), String>;
     let results: Vec<BatchResult> = batch
@@ -437,7 +468,7 @@ fn process_filter_batch(
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let (nodes, ways, relations) = process_block(
-                    block, bb, &mut output, ids, include, dep_node_ids,
+                    block, bb, &mut output, ids, include, dep_node_ids, strip_tags_ids,
                 )?;
                 flush_local(bb, &mut output)?;
                 Ok((output, (nodes, ways, relations)))

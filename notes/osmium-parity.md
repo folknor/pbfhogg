@@ -119,7 +119,7 @@ osmium-tool installed version as of 2026-03-04.
 | `--ignore-user` | `--ignore-user` | Have it (compatibility flag, already ignored by default) |
 | `-q, --quiet` | `-q, --quiet` | Have it |
 | `-o, --output` | `-o, --output` | Have it |
-| `-s, --summary` | — | Missing (summary on stderr) |
+| `-s, --summary` | `-s, --summary` | Have it (left/right/same/different counts on stderr) |
 
 ### `extract`
 
@@ -142,8 +142,8 @@ osmium-tool installed version as of 2026-03-04.
 | `-i, --id-file` | `-i, --id-file` | Have it |
 | `-I, --id-osm-file` | `-I, --id-osm-file` | Have it (scans all element IDs, additive with -i and CLI args) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `-t, --remove-tags` | — | Missing |
-| `--verbose-ids` | — | Missing |
+| `-t, --remove-tags` | `-t, --remove-tags` | Have it (strips tags from referenced-only nodes, use with -r) |
+| `--verbose-ids` | `--verbose-ids` | Have it (prints requested IDs and reports missing) |
 | `--default-type` | `--default-type` | Have it |
 
 ### `merge` (apply-changes)

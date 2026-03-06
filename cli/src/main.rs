@@ -197,6 +197,9 @@ enum Command {
         /// Show detailed changes for modified elements
         #[arg(short = 'v', long)]
         verbose: bool,
+        /// Show summary on stderr (left/right/same/different counts)
+        #[arg(short = 's', long)]
+        summary: bool,
         /// Exit-code only, suppress diff output and summary
         #[arg(short = 'q', long, conflicts_with = "output")]
         quiet: bool,
@@ -244,6 +247,12 @@ enum Command {
         /// Include referenced nodes of matching ways (two-pass)
         #[arg(short = 'r', long = "add-referenced")]
         add_referenced: bool,
+        /// Remove tags from referenced objects not explicitly requested (use with -r)
+        #[arg(short = 't', long = "remove-tags")]
+        remove_tags: bool,
+        /// Print requested IDs and report which were not found
+        #[arg(long)]
+        verbose_ids: bool,
         /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
@@ -639,6 +648,7 @@ fn main() {
             new,
             suppress_common,
             verbose,
+            summary,
             quiet,
             output,
             type_filter,
@@ -651,6 +661,7 @@ fn main() {
             &new,
             suppress_common,
             verbose,
+            summary,
             quiet,
             output.as_deref(),
             type_filter.as_deref(),
@@ -671,6 +682,8 @@ fn main() {
             file,
             output,
             add_referenced,
+            remove_tags,
+            verbose_ids,
             id_file,
             id_osm_file,
             default_type,
@@ -682,6 +695,8 @@ fn main() {
             &file,
             &output.output,
             add_referenced,
+            remove_tags,
+            verbose_ids,
             id_file.as_deref(),
             id_osm_file.as_deref(),
             default_type,
@@ -1277,11 +1292,67 @@ fn resolve_ids(
     Ok(id_set)
 }
 
+fn print_requested_ids(ids: &pbfhogg::getid::IdSet) {
+    eprintln!("Requested IDs:");
+    if !ids.node_ids.is_empty() {
+        eprint!("  nodes:");
+        for id in &ids.node_ids {
+            eprint!(" {id}");
+        }
+        eprintln!();
+    }
+    if !ids.way_ids.is_empty() {
+        eprint!("  ways:");
+        for id in &ids.way_ids {
+            eprint!(" {id}");
+        }
+        eprintln!();
+    }
+    if !ids.relation_ids.is_empty() {
+        eprint!("  relations:");
+        for id in &ids.relation_ids {
+            eprint!(" {id}");
+        }
+        eprintln!();
+    }
+}
+
+fn print_missing_ids(
+    output: &std::path::Path,
+    requested: &pbfhogg::getid::IdSet,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Scan the output PBF to find which requested IDs are present.
+    let found = pbfhogg::getid::parse_ids_from_pbf(output, direct_io)?;
+
+    let missing_nodes: Vec<_> = requested.node_ids.difference(&found.node_ids).collect();
+    let missing_ways: Vec<_> = requested.way_ids.difference(&found.way_ids).collect();
+    let missing_rels: Vec<_> = requested.relation_ids.difference(&found.relation_ids).collect();
+
+    let total_missing = missing_nodes.len() + missing_ways.len() + missing_rels.len();
+    if total_missing == 0 {
+        eprintln!("Found all requested objects.");
+    } else {
+        eprintln!("Did not find {total_missing} object(s):");
+        for id in &missing_nodes {
+            eprintln!("  n{id}");
+        }
+        for id in &missing_ways {
+            eprintln!("  w{id}");
+        }
+        for id in &missing_rels {
+            eprintln!("  r{id}");
+        }
+    }
+    Ok(())
+}
+
 fn run_diff(
     old: &std::path::Path,
     new: &std::path::Path,
     suppress_common: bool,
     verbose: bool,
+    summary: bool,
     quiet: bool,
     output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
@@ -1295,6 +1366,7 @@ fn run_diff(
     let options = pbfhogg::diff::DiffOptions {
         suppress_common,
         verbose,
+        summary,
         type_filter: type_filter.map(String::from),
         ignore_changeset,
         ignore_uid,
@@ -1314,7 +1386,11 @@ fn run_diff(
         pbfhogg::diff::diff(old, new, &mut stdout, &options, direct_io)?
     };
     if !quiet {
-        stats.print_summary();
+        if summary {
+            stats.print_osmium_summary();
+        } else {
+            stats.print_summary();
+        }
     }
     if stats.has_differences() {
         process::exit(1);
@@ -1340,6 +1416,8 @@ fn run_getid(
     file: &std::path::Path,
     output: &std::path::Path,
     add_referenced: bool,
+    remove_tags: bool,
+    verbose_ids: bool,
     id_file: Option<&std::path::Path>,
     id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
@@ -1350,16 +1428,31 @@ fn run_getid(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
+
+    if remove_tags && !add_referenced {
+        eprintln!("Warning! Without -r/--add-referenced use of -t/--remove-tags isn't doing anything.");
+    }
+
+    if verbose_ids {
+        print_requested_ids(&id_set);
+    }
+
+    let opts = pbfhogg::getid::GetidOptions { add_referenced, remove_tags };
     let stats = pbfhogg::getid::getid(
         file,
         output,
         &id_set,
-        add_referenced,
+        &opts,
         compression,
         direct_io,
         force,
     )?;
     stats.print_summary();
+
+    if verbose_ids {
+        print_missing_ids(output, &id_set, direct_io)?;
+    }
+
     Ok(())
 }
 

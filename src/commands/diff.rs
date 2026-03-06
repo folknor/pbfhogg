@@ -37,6 +37,8 @@ pub struct DiffOptions {
     pub suppress_common: bool,
     /// Show detailed changes for modified elements.
     pub verbose: bool,
+    /// Show summary on stderr (left/right/same/different counts).
+    pub summary: bool,
     /// Comma-separated type filter (e.g. "node,way").
     pub type_filter: Option<String>,
     /// Ignore changeset metadata when comparing.
@@ -62,7 +64,7 @@ impl DiffStats {
         self.created > 0 || self.modified > 0 || self.deleted > 0
     }
 
-    /// Print summary to stderr.
+    /// Print default summary to stderr (pbfhogg format).
     pub fn print_summary(&self) {
         let total = self.created + self.modified + self.deleted;
         if total == 0 {
@@ -73,6 +75,17 @@ impl DiffStats {
                 self.created, self.modified, self.deleted, self.common,
             );
         }
+    }
+
+    /// Print osmium-compatible summary to stderr (left/right/same/different).
+    pub fn print_osmium_summary(&self) {
+        let left = self.common + self.modified + self.deleted;
+        let right = self.common + self.modified + self.created;
+        let different = self.created + self.modified + self.deleted;
+        eprintln!(
+            "Summary: left={left} right={right} same={} different={different}",
+            self.common,
+        );
     }
 }
 

@@ -8,7 +8,7 @@ use rayon::prelude::*;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
     for_each_primitive_block_batch, writer_from_header, ensure_node_capacity_local,
-    ensure_way_capacity_local, ensure_relation_capacity_local,
+    ensure_way_capacity_local, ensure_relation_capacity_local, HeaderOverrides,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_writer::FileWriter;
@@ -195,6 +195,7 @@ impl GetidStats {
 ///
 /// If `opts.add_referenced` is true, referenced nodes of matching ways are also
 /// included (two-pass). Otherwise, only exact ID matches are output.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn getid(
     input: &Path,
@@ -204,6 +205,7 @@ pub fn getid(
     compression: Compression,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
     require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
@@ -216,26 +218,27 @@ pub fn getid(
     }
 
     if opts.add_referenced {
-        getid_with_refs(input, output, ids, opts, compression, direct_io)
+        getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)
     } else {
-        filter_by_id(input, output, ids, true, None, compression, direct_io)
+        filter_by_id(input, output, ids, true, None, compression, direct_io, overrides)
     }
 }
 
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
-pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool) -> Result<GetidStats> {
+pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
     {
         let reader = crate::ElementReader::open(input, direct_io)?;
         super::warn_locations_on_ways_loss(reader.header());
     }
-    filter_by_id(input, output, ids, false, None, compression, direct_io)
+    filter_by_id(input, output, ids, false, None, compression, direct_io, overrides)
 }
 
 // ---------------------------------------------------------------------------
 // Single-pass filter (shared by getid without refs and removeid)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn filter_by_id(
     input: &Path,
     output: &Path,
@@ -244,6 +247,7 @@ fn filter_by_id(
     strip_tags_ids: Option<&BTreeSet<i64>>,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
     let reader = ElementReader::open(input, direct_io)?;
     // Skip blob types with no matching IDs (getid only — removeid needs all types).
@@ -256,7 +260,7 @@ fn filter_by_id(
     } else {
         reader
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -281,7 +285,7 @@ fn filter_by_id(
 // Two-pass getid with --add-referenced
 // ---------------------------------------------------------------------------
 
-fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions, compression: Compression, direct_io: bool) -> Result<GetidStats> {
+fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -326,7 +330,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         true,
         !ids.relation_ids.is_empty(),
     ));
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
 
     let dep_ref = if dep_node_ids.is_empty() { None } else { Some(&dep_node_ids) };
 

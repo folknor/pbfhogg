@@ -42,7 +42,7 @@ fn renumber_nodes_sequential() {
         &[],
     );
 
-    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false)
+    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
         .expect("renumber");
     let c = read_all_elements(&output);
 
@@ -70,7 +70,7 @@ fn renumber_ways_remap_refs() {
         &[],
     );
 
-    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false)
+    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
         .expect("renumber");
     let c = read_all_elements(&output);
 
@@ -108,7 +108,7 @@ fn renumber_relations_remap_members() {
         ],
     );
 
-    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false)
+    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
         .expect("renumber");
     let c = read_all_elements(&output);
 
@@ -152,7 +152,7 @@ fn custom_start_ids() {
         start_relation_id: 3000,
     };
 
-    let stats = renumber(&input, &output, &opts, Compression::default(), false)
+    let stats = renumber(&input, &output, &opts, Compression::default(), false, &pbfhogg::HeaderOverrides::default())
         .expect("renumber");
     let c = read_all_elements(&output);
 
@@ -172,7 +172,7 @@ fn empty_input() {
 
     write_test_pbf_sorted(&input, &[], &[], &[]);
 
-    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false)
+    let stats = renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
         .expect("renumber");
 
     assert_eq!(stats.nodes_written, 0);

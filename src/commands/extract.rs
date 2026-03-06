@@ -14,7 +14,7 @@ use super::{Result, BATCH_SIZE};
 use super::{
     drain_batch_results, flush_local, for_each_primitive_block_batch, require_indexdata,
     writer_from_header, ensure_node_capacity_local, ensure_way_capacity_local,
-    ensure_relation_capacity_local,
+    ensure_relation_capacity_local, HeaderOverrides,
 };
 use super::id_set_dense::IdSetDense;
 
@@ -625,6 +625,7 @@ pub fn extract_multi(
     compression: Compression,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Vec<ExtractStats>> {
     let mut all_stats = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
@@ -644,6 +645,7 @@ pub fn extract_multi(
             compression,
             direct_io,
             force,
+            overrides,
         )?;
         all_stats.push(stats);
     }
@@ -725,6 +727,7 @@ pub fn extract(
     compression: Compression,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
     if !matches!(strategy, ExtractStrategy::Simple) {
         require_indexdata(input, direct_io, force,
@@ -736,9 +739,9 @@ pub fn extract(
         super::warn_locations_on_ways_loss(reader.header());
     }
     match strategy {
-        ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io),
-        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io),
-        ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, clean, compression, direct_io),
+        ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io, overrides),
+        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io, overrides),
+        ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, clean, compression, direct_io, overrides),
     }
 }
 
@@ -857,14 +860,15 @@ fn classify_block_simple(
     matched
 }
 
-fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+#[allow(clippy::too_many_arguments)]
+fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
     // Check if input is sorted — if so, classify + write in a single file pass.
     let reader = ElementReader::open(input, direct_io)?;
     let is_sorted = reader.header().is_sorted();
     drop(reader);
 
     if is_sorted {
-        return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io);
+        return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io, overrides);
     }
 
     // --- Unsorted fallback: two passes (collect IDs, then write) ---
@@ -896,7 +900,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     let all_way_node_ids = IdSetDense::new();
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -931,6 +935,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
 /// dispatched for parallel writing via `process_extract_pass2_batch`. The
 /// pipeline (dedicated rayon pool) runs concurrently with the parallel write
 /// (global rayon pool) without contention.
+#[allow(clippy::too_many_arguments)]
 fn extract_simple_single_pass(
     input: &Path,
     output: &Path,
@@ -939,6 +944,7 @@ fn extract_simple_single_pass(
     clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -959,7 +965,7 @@ fn extract_simple_single_pass(
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(spatial_blob_filter(&bbox_int));
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -1009,7 +1015,8 @@ fn extract_simple_single_pass(
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
-fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+#[allow(clippy::too_many_arguments)]
+fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -1028,7 +1035,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -1765,6 +1772,7 @@ fn extract_smart(
     clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
@@ -1804,7 +1812,7 @@ fn extract_smart(
     // --- Pass 3: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {

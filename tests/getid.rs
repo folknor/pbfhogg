@@ -45,7 +45,7 @@ fn getid_nodes() {
     );
 
     let id_set = parse_ids(&ids(&["n1", "n3"])).expect("parse ids");
-    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -74,7 +74,7 @@ fn getid_mixed_types() {
     );
 
     let id_set = parse_ids(&ids(&["n2", "w10", "r100"])).expect("parse ids");
-    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![2]);
@@ -107,7 +107,7 @@ fn getid_add_referenced() {
 
     // Without --add-referenced: only the way
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
-    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
     assert!(node_ids(&c).is_empty());
     assert_eq!(way_ids(&c), vec![10]);
@@ -116,7 +116,7 @@ fn getid_add_referenced() {
 
     // With --add-referenced: way + its referenced nodes
     let output2 = dir.path().join("output2.osm.pbf");
-    let stats = getid(&input, &output2, &id_set, &add_ref_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output2, &id_set, &add_ref_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output2);
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
     assert_eq!(way_ids(&c), vec![10]);
@@ -142,7 +142,7 @@ fn removeid_nodes() {
     );
 
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
-    let stats = removeid(&input, &output, &id_set, Compression::default(), false).expect("removeid");
+    let stats = removeid(&input, &output, &id_set, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("removeid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -172,7 +172,7 @@ fn removeid_mixed_types() {
     );
 
     let id_set = parse_ids(&ids(&["n1", "w11", "r100"])).expect("parse ids");
-    let stats = removeid(&input, &output, &id_set, Compression::default(), false).expect("removeid");
+    let stats = removeid(&input, &output, &id_set, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("removeid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![2]);
@@ -199,7 +199,7 @@ fn getid_empty_result() {
     );
 
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
-    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert!(node_ids(&c).is_empty());
@@ -223,7 +223,7 @@ fn getid_preserves_tags() {
     );
 
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
-    getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert_eq!(c.nodes.len(), 1);
@@ -261,7 +261,7 @@ fn getid_from_id_file() {
     std::fs::write(&id_file, "# comment\nn1\nw10\n\nn3\n").expect("write id file");
 
     let id_set = pbfhogg::getid::parse_ids_from_file(&id_file).expect("parse file");
-    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &default_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 3]);
@@ -292,7 +292,7 @@ fn getid_add_referenced_plus_direct_node() {
 
     // Request node 1 directly + way 10 with refs → should get nodes 1,2,3 + way 10
     let id_set = parse_ids(&ids(&["n1", "w10"])).expect("parse ids");
-    let stats = getid(&input, &output, &id_set, &add_ref_opts(), Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &add_ref_opts(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
@@ -325,7 +325,7 @@ fn getid_remove_tags_strips_referenced_nodes() {
     // Nodes 2,3 are referenced-only → strip tags.
     let id_set = parse_ids(&ids(&["n1", "w10"])).expect("parse ids");
     let opts = GetidOptions { add_referenced: true, remove_tags: true };
-    let stats = getid(&input, &output, &id_set, &opts, Compression::default(), false, true).expect("getid");
+    let stats = getid(&input, &output, &id_set, &opts, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("getid");
 
     assert_eq!(stats.nodes_written, 3);
     assert_eq!(stats.ways_written, 1);

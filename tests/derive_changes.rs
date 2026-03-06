@@ -289,7 +289,7 @@ fn roundtrip_with_merge() {
     merge(&old, &osc, &result, &MergeOptions {
         compression: pbfhogg::writer::Compression::default(),
         direct_io: false, io_uring: false, force: true, locations_on_ways: false,
-    }).expect("merge");
+    }, &pbfhogg::HeaderOverrides::default()).expect("merge");
 
     let result_contents = read_all_elements(&result);
     let new_contents = read_all_elements(&new);

@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
-    for_each_primitive_block_batch, writer_from_header, TypeFilter,
+    for_each_primitive_block_batch, writer_from_header, HeaderOverrides, TypeFilter,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -69,6 +69,7 @@ pub fn cat(
     compression: Compression,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<CatStats> {
     if type_filter.is_some() {
         for file in files {
@@ -86,9 +87,9 @@ pub fn cat(
     }
 
     match (type_filter, clean.any()) {
-        (None, false) => cat_passthrough(files, output, compression, direct_io),
-        (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io),
-        (Some(filter), _) => cat_filtered(files, output, filter, clean, compression, direct_io),
+        (None, false) => cat_passthrough(files, output, compression, direct_io, overrides),
+        (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io, overrides),
+        (Some(filter), _) => cat_filtered(files, output, filter, clean, compression, direct_io, overrides),
     }
 }
 
@@ -96,7 +97,7 @@ pub fn cat(
 // Passthrough path: no type filter, zero decode
 // ---------------------------------------------------------------------------
 
-fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool) -> Result<CatStats> {
+fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
     let single_file = files.len() == 1;
 
     let header_bytes = {
@@ -106,7 +107,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             if frame.blob_type == BlobKind::OsmHeader {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                hdr_bytes = Some(build_output_header(&header, single_file, |hb| hb)?);
+                hdr_bytes = Some(build_output_header(&header, single_file, overrides, |hb| hb)?);
                 break;
             }
         }
@@ -240,7 +241,7 @@ fn process_block(
 use super::clean_metadata;
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<CatStats> {
+fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
     let tf = TypeFilter::parse(filter);
 
     let single_file = files.len() == 1;
@@ -251,7 +252,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     // -----------------------------------------------------------------------
     let first_reader = ElementReader::open(files[0], direct_io)?;
     let header = first_reader.header().clone();
-    let mut writer = writer_from_header(output, compression, &header, single_file, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb)?;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 

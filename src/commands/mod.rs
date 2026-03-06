@@ -387,19 +387,89 @@ pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Header overrides (--generator, --output-header)
+// ---------------------------------------------------------------------------
+
+/// Header field overrides from `--generator` and `--output-header` CLI flags.
+#[derive(Default)]
+pub struct HeaderOverrides {
+    pub generator: Option<String>,
+    pub replication_timestamp: Option<i64>,
+    pub replication_sequence_number: Option<i64>,
+    pub replication_base_url: Option<String>,
+}
+
+impl HeaderOverrides {
+    /// Parse CLI arguments into header overrides.
+    ///
+    /// `output_headers` entries have the format `key=value`. Supported keys:
+    /// `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`,
+    /// `osmosis_replication_base_url`.
+    pub fn parse(generator: Option<String>, output_headers: &[String]) -> Result<Self> {
+        let mut ov = HeaderOverrides {
+            generator,
+            ..Default::default()
+        };
+        for entry in output_headers {
+            let (key, value) = entry.split_once('=').ok_or_else(|| {
+                format!("invalid --output-header format: '{entry}' (expected key=value)")
+            })?;
+            match key {
+                "osmosis_replication_timestamp" => {
+                    ov.replication_timestamp = Some(value.parse::<i64>().map_err(|_| {
+                        format!("invalid osmosis_replication_timestamp: '{value}'")
+                    })?);
+                }
+                "osmosis_replication_sequence_number" => {
+                    ov.replication_sequence_number =
+                        Some(value.parse::<i64>().map_err(|_| {
+                            format!("invalid osmosis_replication_sequence_number: '{value}'")
+                        })?);
+                }
+                "osmosis_replication_base_url" => {
+                    ov.replication_base_url = Some(value.to_string());
+                }
+                _ => return Err(format!("unknown --output-header key: '{key}'").into()),
+            }
+        }
+        Ok(ov)
+    }
+
+    /// Apply overrides to a header builder. Called after the command-specific
+    /// configure closure so CLI flags always win.
+    pub(crate) fn apply<'a>(&'a self, mut hb: HeaderBuilder<'a>) -> HeaderBuilder<'a> {
+        if let Some(program) = &self.generator {
+            hb = hb.writing_program(program);
+        }
+        if let Some(ts) = self.replication_timestamp {
+            hb = hb.replication_timestamp(ts);
+        }
+        if let Some(seq) = self.replication_sequence_number {
+            hb = hb.replication_sequence_number(seq);
+        }
+        if let Some(url) = &self.replication_base_url {
+            hb = hb.replication_base_url(url);
+        }
+        hb
+    }
+}
+
 /// Build output header bytes from an input header.
 ///
 /// Applies `configure` to the header builder, then preserves sortedness if
-/// requested and if the input header is sorted.
+/// requested and if the input header is sorted, then applies CLI overrides.
 pub(crate) fn build_output_header(
     header: &crate::HeaderBlock,
     preserve_sorted: bool,
+    overrides: &HeaderOverrides,
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
 ) -> Result<Vec<u8>> {
     let mut hb = configure(HeaderBuilder::from_header(header));
     if preserve_sorted && header.is_sorted() {
         hb = hb.sorted();
     }
+    hb = overrides.apply(hb);
     Ok(hb.build()?)
 }
 
@@ -409,9 +479,10 @@ pub(crate) fn writer_from_header(
     compression: Compression,
     header: &crate::HeaderBlock,
     preserve_sorted: bool,
+    overrides: &HeaderOverrides,
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
 ) -> Result<PbfWriter<FileWriter>> {
-    let header_bytes = build_output_header(header, preserve_sorted, configure)?;
+    let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
     Ok(PbfWriter::to_path(output, compression, &header_bytes)?)
 }
 

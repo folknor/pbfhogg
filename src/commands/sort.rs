@@ -27,7 +27,7 @@ use super::owned_elements::OwnedMember;
 
 use super::{
     build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
-    flush_block, require_indexdata, Result, writer_from_header_bytes,
+    flush_block, require_indexdata, HeaderOverrides, Result, writer_from_header_bytes,
 };
 
 /// Statistics from a sort operation.
@@ -157,7 +157,7 @@ pub struct SortOptions {
 
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats> {
+pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderOverrides) -> Result<SortStats> {
     let SortOptions { compression, direct_io, io_uring, force } = *opts;
     require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
@@ -184,7 +184,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions) -> Result<SortStats
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing sorted output...");
     #[allow(clippy::redundant_closure_for_method_calls)]
-    let header_bytes = build_output_header(&header, false, |hb| hb.sorted())?;
+    let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
     let mut writer = writer_from_header_bytes(
         output,
         compression,

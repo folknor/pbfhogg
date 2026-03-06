@@ -218,5 +218,8 @@ These appear on nearly every osmium command but have no pbfhogg equivalent:
 - **`--fsync`** — call fsync after writing. pbfhogg does not offer this.
 - **`-O, --overwrite`** — osmium refuses to overwrite by default. pbfhogg
   always overwrites.
-- **`--generator`** — set generator string in output header.
-- **`--output-header`** — set arbitrary output header fields.
+- **`--generator`** — set generator string in output header. **Have it.**
+- **`--output-header`** — set output header fields (osmosis_replication_timestamp,
+  osmosis_replication_sequence_number, osmosis_replication_base_url). **Have it.**
+  Note: osmium also supports `sorting` and `xml_josm_upload` keys, and a `!` suffix
+  to copy values from the input header. pbfhogg supports the three replication fields only.

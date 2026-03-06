@@ -48,7 +48,7 @@ fn ways_referencing_node() {
 
     // Find ways referencing node 2
     let id_set = parse_ids(&ids(&["n2"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false).expect("getparents");
+    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
     let c = read_all_elements(&output);
 
     // Ways 10 and 11 reference node 2
@@ -91,7 +91,7 @@ fn relations_referencing_way() {
 
     // Find relations referencing way 10
     let id_set = parse_ids(&ids(&["w10"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false).expect("getparents");
+    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
     let c = read_all_elements(&output);
 
     assert_eq!(relation_ids(&c), vec![100]);
@@ -120,7 +120,7 @@ fn add_self_includes_queried_objects() {
     // Find parents of node 1 WITH --add-self
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
     let opts = GetparentsOptions { add_self: true };
-    let stats = getparents(&input, &output, &id_set, &opts, Compression::default(), false).expect("getparents");
+    let stats = getparents(&input, &output, &id_set, &opts, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
     let c = read_all_elements(&output);
 
     // Node 1 itself + way 10 (references node 1)
@@ -156,7 +156,7 @@ fn no_transitive_relations() {
     // Find parents of node 1: should find way 10 but NOT relation 100
     // (relation references way, not node directly)
     let id_set = parse_ids(&ids(&["n1"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false).expect("getparents");
+    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
     let c = read_all_elements(&output);
 
     assert_eq!(way_ids(&c), vec![10]);
@@ -184,7 +184,7 @@ fn empty_result() {
 
     // Node 999 doesn't exist — no parents found
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
-    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false).expect("getparents");
+    let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
 
     assert_eq!(stats.nodes_written, 0);
     assert_eq!(stats.ways_written, 0);

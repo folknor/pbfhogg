@@ -34,7 +34,7 @@ fn snapshot_keeps_latest_version_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 250, Compression::default(), false).expect("time-filter");
+    time_filter(&input, &output, 250, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -61,7 +61,7 @@ fn snapshot_omits_objects_deleted_at_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 350, Compression::default(), false).expect("time-filter");
+    time_filter(&input, &output, 350, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
 
     let nodes = read_nodes_with_metadata(&output);
     assert_eq!(
@@ -81,7 +81,7 @@ fn output_header_replication_timestamp_is_cutoff() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_input(&input);
-    time_filter(&input, &output, 123, Compression::default(), false).expect("time-filter");
+    time_filter(&input, &output, 123, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
 
     let header = read_header(&output);
     assert_eq!(header.osmosis_replication_timestamp(), Some(123));
@@ -184,7 +184,7 @@ fn snapshot_ways_and_relations() {
     let output = dir.path().join("snapshot.osm.pbf");
 
     write_history_with_ways_and_relations(&input);
-    time_filter(&input, &output, 250, Compression::default(), false).expect("time-filter");
+    time_filter(&input, &output, 250, Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("time-filter");
 
     let (ways, relations) = read_ways_and_relations(&output);
     assert_eq!(

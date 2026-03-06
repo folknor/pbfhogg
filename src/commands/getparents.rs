@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use super::getid::IdSet;
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local,
-    for_each_primitive_block_batch, writer_from_header,
+    for_each_primitive_block_batch, writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -51,6 +51,7 @@ pub fn getparents(
     opts: &GetparentsOptions,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
     {
         let reader = crate::ElementReader::open(input, direct_io)?;
@@ -58,7 +59,7 @@ pub fn getparents(
     }
 
     let reader = ElementReader::open(input, direct_io)?;
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
     let mut stats = GetparentsStats {
         nodes_written: 0,
         ways_written: 0,

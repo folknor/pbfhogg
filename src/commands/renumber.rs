@@ -8,7 +8,7 @@ use std::path::Path;
 
 use super::{
     dense_node_metadata, element_metadata, ensure_node_capacity, ensure_relation_capacity,
-    ensure_way_capacity, flush_block, require_sorted, writer_from_header, Result,
+    ensure_way_capacity, flush_block, require_sorted, writer_from_header, HeaderOverrides, Result,
 };
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::Compression;
@@ -50,12 +50,13 @@ pub fn renumber(
     opts: &RenumberOptions,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
     let reader = ElementReader::open(input, direct_io)?;
     require_sorted(reader.header(), input, "Input PBF")?;
     super::warn_locations_on_ways_loss(reader.header());
 
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
         hb.sorted()
     })?;
     let mut bb = BlockBuilder::new();

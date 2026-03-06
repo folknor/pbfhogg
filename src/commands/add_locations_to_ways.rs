@@ -19,7 +19,7 @@ use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
 use super::{
     build_output_header, drain_batch_results, ensure_node_capacity_local,
     ensure_relation_capacity_local, ensure_way_capacity_local, flush_passthrough_buf,
-    read_raw_frame, require_indexdata, writer_from_header, RawBlobFrame,
+    read_raw_frame, require_indexdata, writer_from_header, HeaderOverrides, RawBlobFrame,
 };
 use super::id_set_dense::IdSetDense;
 
@@ -364,6 +364,7 @@ pub fn add_locations_to_ways(
     compression: Compression,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     // Check if input already has LocationsOnWays — the coordinates will be
     // rebuilt from scratch, so warn about redundant work.
@@ -396,6 +397,7 @@ pub fn add_locations_to_ways(
         compression,
         direct_io,
         indexdata_present,
+        overrides,
     )
 }
 
@@ -496,6 +498,7 @@ fn write_output_checked(
     compression: Compression,
     direct_io: bool,
     indexdata_present: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     if indexdata_present {
         write_output_passthrough(
@@ -506,6 +509,7 @@ fn write_output_checked(
             relation_member_node_ids,
             compression,
             direct_io,
+            overrides,
         )
     } else {
         write_output_decode_all(
@@ -516,6 +520,7 @@ fn write_output_checked(
             relation_member_node_ids,
             compression,
             direct_io,
+            overrides,
         )
     }
 }
@@ -524,6 +529,7 @@ fn write_output_checked(
 // Pass 2a: Decode-all fallback (no indexdata)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn write_output_decode_all(
     input: &Path,
     output: &Path,
@@ -532,6 +538,7 @@ fn write_output_decode_all(
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     let mut stats = Stats {
         nodes_read: 0,
@@ -550,6 +557,7 @@ fn write_output_decode_all(
         compression,
         reader.header(),
         true,
+        overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
     )?;
 
@@ -813,12 +821,13 @@ impl CopyRange {
 fn read_header_raw<R: Read>(
     reader: &mut R,
     file_offset: &mut u64,
+    overrides: &HeaderOverrides,
 ) -> Result<(Vec<u8>, bool)> {
     while let Some(frame) = read_raw_frame(reader, file_offset)? {
         if frame.blob_type == BlobKind::OsmHeader {
             let header = decode_blob_to_headerblock(frame.blob_bytes())?;
             let sorted = header.is_sorted();
-            let header_bytes = build_output_header(&header, true, |hb| {
+            let header_bytes = build_output_header(&header, true, overrides, |hb| {
                 hb.optional_feature("LocationsOnWays")
             })?;
             return Ok((header_bytes, sorted));
@@ -836,6 +845,7 @@ fn write_output_passthrough(
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     let mut stats = Stats {
         nodes_read: 0,
@@ -850,7 +860,7 @@ fn write_output_passthrough(
 
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
-    let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset)?;
+    let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset, overrides)?;
     let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
 
     // Open second handle for copy_file_range (explicit offsets, thread-safe).

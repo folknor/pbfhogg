@@ -8,7 +8,7 @@ use super::id_set_dense::IdSetDense;
 use super::tag_expr::{tag_matches, parse_expressions, Expression, TagMatcher};
 use super::{
     dense_node_metadata, drain_batch_results, element_metadata, flush_local, require_indexdata,
-    for_each_primitive_block_batch, writer_from_header,
+    for_each_primitive_block_batch, writer_from_header, HeaderOverrides,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -158,6 +158,7 @@ pub fn tags_filter(
     input: &Path,
     output: &Path,
     opts: &TagsFilterOptions<'_>,
+    overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
     // Blob-level filtering can't help in invert mode (we want non-matching blobs).
     if !opts.invert {
@@ -173,9 +174,9 @@ pub fn tags_filter(
 
     let expressions = parse_expressions(opts.expression_strs)?;
     if opts.omit_referenced {
-        tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io)
+        tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io, overrides)
     } else {
-        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io)
+        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io, overrides)
     }
 }
 
@@ -280,6 +281,7 @@ fn tags_filter_single_pass(
     invert: bool,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
     // Blob-level filtering can't help in invert mode — we want non-matching blobs.
@@ -291,7 +293,7 @@ fn tags_filter_single_pass(
             None => reader,
         }
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -504,6 +506,7 @@ fn process_pass2_batch(
 // Two-pass filter (default mode, include references)
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn tags_filter_two_pass(
     input: &Path,
@@ -513,6 +516,7 @@ fn tags_filter_two_pass(
     remove_tags: bool,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
@@ -630,7 +634,7 @@ fn tags_filter_two_pass(
     } else {
         reader
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,

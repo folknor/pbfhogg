@@ -28,7 +28,8 @@ use crate::Element;
 use super::owned_elements::OwnedMember;
 use super::{
     build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
-    flush_block, require_indexdata, require_sorted, writer_from_header_bytes, Result,
+    flush_block, require_indexdata, require_sorted, writer_from_header_bytes, HeaderOverrides,
+    Result,
 };
 
 /// Statistics from a multi-PBF merge operation.
@@ -213,6 +214,7 @@ pub fn merge_pbf(
     inputs: &[&Path],
     output: &Path,
     opts: &MergePbfOptions,
+    overrides: &HeaderOverrides,
 ) -> Result<MergePbfStats> {
     if inputs.is_empty() {
         return Err("no input files specified".into());
@@ -257,7 +259,7 @@ pub fn merge_pbf(
     // Pass 2: Write in sorted order
     eprintln!("Pass 2: writing merged output...");
     #[allow(clippy::redundant_closure_for_method_calls)]
-    let header_bytes = build_output_header(&header, false, |hb| hb.sorted())?;
+    let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
     let mut writer = writer_from_header_bytes(
         output,
         opts.compression,

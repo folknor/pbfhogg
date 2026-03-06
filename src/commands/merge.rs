@@ -33,7 +33,7 @@ use crate::{Element, PrimitiveBlock};
 use super::{
     build_output_header, ensure_node_capacity_local, ensure_relation_capacity_local,
     ensure_way_capacity_local, flush_local, flush_passthrough_buf, read_raw_frame,
-    require_indexdata, writer_from_header_bytes, RawBlobFrame,
+    require_indexdata, writer_from_header_bytes, HeaderOverrides, RawBlobFrame,
 };
 
 use super::{Result, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
@@ -781,6 +781,7 @@ fn write_base_relation_local(
 fn build_header_bytes(
     header: &crate::HeaderBlock,
     locations_on_ways: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Vec<u8>> {
     if locations_on_ways {
         if !header.has_locations_on_ways() {
@@ -797,12 +798,12 @@ fn build_header_bytes(
                     .into(),
             );
         }
-        build_output_header(header, false, |hb| {
+        build_output_header(header, false, overrides, |hb| {
             hb.sorted().optional_feature("LocationsOnWays")
         })
     } else {
         super::warn_locations_on_ways_loss(header);
-        build_output_header(header, false, |hb| hb.sorted())
+        build_output_header(header, false, overrides, |hb| hb.sorted())
     }
 }
 
@@ -811,6 +812,7 @@ fn read_header(
     base_pbf: &Path,
     direct_io: bool,
     locations_on_ways: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<Vec<u8>> {
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
@@ -818,7 +820,7 @@ fn read_header(
         match read_raw_frame(&mut reader, &mut offset)? {
             Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                return build_header_bytes(&header, locations_on_ways);
+                return build_header_bytes(&header, locations_on_ways, overrides);
             }
             Some(_) => {}
             None => return Err("base PBF has no OSMHeader blob".into()),
@@ -1260,6 +1262,7 @@ pub fn merge(
     osc_file: &Path,
     output_pbf: &Path,
     opts: &MergeOptions,
+    overrides: &HeaderOverrides,
 ) -> Result<MergeStats> {
     let MergeOptions { compression, direct_io, io_uring, force, locations_on_ways } = *opts;
     require_indexdata(base_pbf, direct_io, force,
@@ -1310,7 +1313,7 @@ pub fn merge(
     };
 
     // Step 3: Read header from base PBF (for writer setup)
-    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways)?;
+    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides)?;
 
     // Step 4: Create pipelined writer
     let mut writer = writer_from_header_bytes(

@@ -52,7 +52,7 @@ fn merge_disjoint_node_files() {
     );
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3, 4]);
@@ -90,7 +90,7 @@ fn merge_overlapping_nodes_dedup() {
     );
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3, 4]);
@@ -137,7 +137,7 @@ fn merge_with_ways_and_relations() {
     );
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
@@ -165,7 +165,7 @@ fn merge_single_file() {
     );
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2]);
@@ -201,7 +201,7 @@ fn merge_three_files() {
     );
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path(), c_file.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
@@ -220,7 +220,7 @@ fn merge_empty_files() {
     write_test_pbf_sorted(&b, &[], &[], &[]);
 
     let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path()];
-    let stats = merge_pbf(&inputs, &output, &default_opts()).expect("merge_pbf");
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
 
     assert_eq!(stats.nodes, 0);
     assert_eq!(stats.ways, 0);

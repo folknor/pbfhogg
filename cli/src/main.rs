@@ -13,6 +13,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use pbfhogg::HeaderOverrides;
 use pbfhogg::writer::Compression;
 
 #[derive(Parser)]
@@ -55,6 +56,18 @@ struct UringArg {
     /// Use io_uring for output I/O (requires linux-io-uring feature)
     #[arg(long)]
     io_uring: bool,
+}
+
+#[derive(Args)]
+struct HeaderOverrideArg {
+    /// Override the writing program name in the output header
+    #[arg(long)]
+    generator: Option<String>,
+    /// Set output header fields (repeatable, format: key=value).
+    /// Supported keys: osmosis_replication_timestamp, osmosis_replication_sequence_number,
+    /// osmosis_replication_base_url
+    #[arg(long = "output-header", value_name = "KEY=VALUE")]
+    output_headers: Vec<String>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -125,6 +138,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Sort PBF into standard order (nodes → ways → relations, by ID)
     Sort {
@@ -140,6 +155,8 @@ enum Command {
         uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Renumber all element IDs sequentially, remapping cross-references
     Renumber {
@@ -154,6 +171,8 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Filter elements by tag expressions.
     ///
@@ -185,6 +204,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Filter OSC changes by tag expressions; always preserve deletes.
     TagsFilterOsc {
@@ -287,6 +308,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Find ways/relations referencing given IDs (reverse lookup)
     Getparents {
@@ -312,6 +335,8 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Remove elements by ID
     Removeid {
@@ -334,6 +359,8 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Extract elements within a geographic region (bbox or polygon)
     Extract {
@@ -373,6 +400,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Embed node coordinates in ways
     AddLocationsToWays {
@@ -389,6 +418,8 @@ enum Command {
         io: DirectIoArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Filter history PBF to a snapshot at a timestamp
     TimeFilter {
@@ -402,6 +433,8 @@ enum Command {
         compression: CompressionArg,
         #[command(flatten)]
         io: DirectIoArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Inspect PBF file: metadata, block breakdown, ordering analysis
     Inspect {
@@ -460,6 +493,8 @@ enum Command {
         /// Requires the base PBF to have LocationsOnWays and be sorted.
         #[arg(long)]
         locations_on_ways: bool,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Merge multiple sorted PBF files into one, deduplicating exact duplicates
     MergePbf {
@@ -476,6 +511,8 @@ enum Command {
         uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
+        #[command(flatten)]
+        header: HeaderOverrideArg,
     },
     /// Merge multiple OSC files into one OSC file
     MergeChanges {
@@ -625,7 +662,7 @@ fn main() {
 
     let cli = Cli::parse();
 
-    let result = match cli.command {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> { match cli.command {
         Command::CheckRefs {
             file,
             check_relations,
@@ -661,6 +698,7 @@ fn main() {
             compression,
             force,
             io,
+            header,
         } => run_cat(
             &files,
             &output.output,
@@ -669,6 +707,7 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Sort {
             file,
@@ -677,6 +716,7 @@ fn main() {
             io,
             uring,
             force,
+            header,
         } => run_sort(
             &file,
             &output.output,
@@ -684,6 +724,7 @@ fn main() {
             io.direct_io,
             uring.io_uring,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Renumber {
             file,
@@ -691,12 +732,14 @@ fn main() {
             start_id,
             compression,
             io,
+            header,
         } => run_renumber(
             &file,
             &output.output,
             &start_id,
             &compression.compression,
             io.direct_io,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::TagsFilter {
             file,
@@ -709,6 +752,7 @@ fn main() {
             compression,
             force,
             io,
+            header,
         } => run_tags_filter(
             &file,
             &output.output,
@@ -720,6 +764,7 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::TagsFilterOsc {
             changes,
@@ -775,6 +820,7 @@ fn main() {
             compression,
             force,
             io,
+            header,
         } => run_getid(
             &file,
             &output.output,
@@ -788,6 +834,7 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Getparents {
             file,
@@ -799,6 +846,7 @@ fn main() {
             ids,
             compression,
             io,
+            header,
         } => run_getparents(
             &file,
             &output.output,
@@ -809,6 +857,7 @@ fn main() {
             &ids,
             &compression.compression,
             io.direct_io,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Removeid {
             file,
@@ -819,6 +868,7 @@ fn main() {
             ids,
             compression,
             io,
+            header,
         } => run_removeid(
             &file,
             &output.output,
@@ -828,6 +878,7 @@ fn main() {
             &ids,
             &compression.compression,
             io.direct_io,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Extract {
             file,
@@ -843,7 +894,9 @@ fn main() {
             compression,
             force,
             io,
+            header,
         } => {
+            let overrides = HeaderOverrides::parse(header.generator, &header.output_headers)?;
             if let Some(config_path) = config.as_deref() {
                 run_extract_config(
                     &file,
@@ -855,6 +908,7 @@ fn main() {
                     &compression.compression,
                     io.direct_io,
                     force.force,
+                    &overrides,
                 )
             } else if let Some(output) = output.as_ref() {
                 run_extract(
@@ -868,6 +922,7 @@ fn main() {
                     &compression.compression,
                     io.direct_io,
                     force.force,
+                    &overrides,
                 )
             } else {
                 Err("--output is required without --config".into())
@@ -880,6 +935,7 @@ fn main() {
             compression,
             force,
             io,
+            header,
         } => run_add_locations_to_ways(
             &file,
             &output.output,
@@ -887,6 +943,7 @@ fn main() {
             &compression.compression,
             io.direct_io,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::TimeFilter {
             file,
@@ -894,12 +951,14 @@ fn main() {
             timestamp,
             compression,
             io,
+            header,
         } => run_time_filter(
             &file,
             &output.output,
             &timestamp,
             &compression.compression,
             io.direct_io,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::Inspect {
             file,
@@ -932,6 +991,7 @@ fn main() {
             io,
             uring,
             locations_on_ways,
+            header,
         } => run_merge(
             &base,
             &changes,
@@ -941,6 +1001,7 @@ fn main() {
             uring.io_uring,
             force.force,
             locations_on_ways,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::MergePbf {
             inputs,
@@ -949,6 +1010,7 @@ fn main() {
             io,
             uring,
             force,
+            header,
         } => run_merge_pbf(
             &inputs,
             &output.output,
@@ -956,6 +1018,7 @@ fn main() {
             io.direct_io,
             uring.io_uring,
             force.force,
+            &HeaderOverrides::parse(header.generator, &header.output_headers)?,
         ),
         Command::MergeChanges {
             changes,
@@ -1021,7 +1084,7 @@ fn main() {
             compression,
             io_mode,
         } => run_bench_merge(&base, &changes, &output.output, &compression, &io_mode),
-    };
+    } })();
 
     if let Err(e) = result {
         eprintln!("Error: {e}");
@@ -1336,11 +1399,12 @@ fn run_cat(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let clean = parse_clean_attrs(clean_attrs)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, &clean, compression, direct_io, force)?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, &clean, compression, direct_io, force, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1352,6 +1416,7 @@ fn run_sort(
     direct_io: bool,
     io_uring: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let opts = pbfhogg::sort::SortOptions {
@@ -1360,7 +1425,7 @@ fn run_sort(
         io_uring,
         force,
     };
-    let stats = pbfhogg::sort::sort(file, output, &opts)?;
+    let stats = pbfhogg::sort::sort(file, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1371,6 +1436,7 @@ fn run_renumber(
     start_id: &str,
     compression: &str,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let parts: Vec<&str> = start_id.split(',').collect();
@@ -1399,7 +1465,7 @@ fn run_renumber(
         }
         _ => return Err("--start-id must be a single value or 3 comma-separated values (node,way,relation)".into()),
     };
-    let stats = pbfhogg::renumber::renumber(file, output, &opts, compression, direct_io)?;
+    let stats = pbfhogg::renumber::renumber(file, output, &opts, compression, direct_io, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1415,6 +1481,7 @@ fn run_tags_filter(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let all_expressions = combine_expressions(expressions_file, expressions)?;
@@ -1433,7 +1500,7 @@ fn run_tags_filter(
         direct_io,
         force,
     };
-    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts)?;
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1616,6 +1683,7 @@ fn run_getid(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
@@ -1637,6 +1705,7 @@ fn run_getid(
         compression,
         direct_io,
         force,
+        overrides,
     )?;
     stats.print_summary();
 
@@ -1657,11 +1726,12 @@ fn run_getparents(
     ids: &[String],
     compression: &str,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let opts = pbfhogg::getparents::GetparentsOptions { add_self };
-    let stats = pbfhogg::getparents::getparents(file, output, &id_set, &opts, compression, direct_io)?;
+    let stats = pbfhogg::getparents::getparents(file, output, &id_set, &opts, compression, direct_io, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1675,10 +1745,11 @@ fn run_removeid(
     ids: &[String],
     compression: &str,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
-    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io)?;
+    let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1704,6 +1775,7 @@ fn run_extract(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let clean = parse_clean_attrs(clean_attrs)?;
@@ -1726,6 +1798,7 @@ fn run_extract(
         compression,
         direct_io,
         force,
+        overrides,
     )?;
     stats.print_summary();
     Ok(())
@@ -1742,6 +1815,7 @@ fn run_extract_config(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let clean = parse_clean_attrs(clean_attrs)?;
@@ -1773,6 +1847,7 @@ fn run_extract_config(
         compression,
         direct_io,
         force,
+        overrides,
     )?;
     for (i, stats) in all_stats.iter().enumerate() {
         eprint!("  [{}] {} — ", i + 1, slots[i].output.display());
@@ -1788,6 +1863,7 @@ fn run_add_locations_to_ways(
     compression: &str,
     direct_io: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
@@ -1797,6 +1873,7 @@ fn run_add_locations_to_ways(
         compression,
         direct_io,
         force,
+        overrides,
     )?;
     stats.print_summary();
     Ok(())
@@ -1808,10 +1885,11 @@ fn run_time_filter(
     timestamp: &str,
     compression: &str,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let cutoff = parse_timestamp(timestamp)?;
-    let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io)?;
+    let stats = pbfhogg::time_filter::time_filter(file, output, cutoff, compression, direct_io, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1962,6 +2040,7 @@ fn run_merge(
     io_uring: bool,
     force: bool,
     locations_on_ways: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let opts = pbfhogg::merge::MergeOptions {
@@ -1971,7 +2050,7 @@ fn run_merge(
         force,
         locations_on_ways,
     };
-    let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -1983,6 +2062,7 @@ fn run_merge_pbf(
     direct_io: bool,
     io_uring: bool,
     force: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
@@ -1992,7 +2072,7 @@ fn run_merge_pbf(
         io_uring,
         force,
     };
-    let stats = pbfhogg::merge_pbf::merge_pbf(&paths, output, &opts)?;
+    let stats = pbfhogg::merge_pbf::merge_pbf(&paths, output, &opts, overrides)?;
     stats.print_summary();
     Ok(())
 }
@@ -2270,7 +2350,7 @@ fn run_bench_merge(
         force: true,
         locations_on_ways: false,
     };
-    let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
+    let stats = pbfhogg::merge::merge(base, changes, output, &opts, &HeaderOverrides::default())?;
     let elapsed_ms = start.elapsed().as_millis();
 
     let output_mb = std::fs::metadata(output)

@@ -27,7 +27,7 @@ fn run_filter(
         direct_io: false,
         force: true,
     };
-    tags_filter(input, output, &opts).expect("filter")
+    tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
 }
 
 fn exprs(strs: &[&str]) -> Vec<String> {

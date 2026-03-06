@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use super::{Result, require_sorted, warn_locations_on_ways_loss, writer_from_header};
+use super::{HeaderOverrides, Result, require_sorted, warn_locations_on_ways_loss, writer_from_header};
 use crate::block_builder::{BlockBuilder, MemberData, Metadata};
 use crate::writer::Compression;
 use crate::{DenseNode, Element, ElementReader, Node, Relation, Way};
@@ -125,12 +125,13 @@ pub fn time_filter(
     cutoff_timestamp: i64,
     compression: Compression,
     direct_io: bool,
+    overrides: &HeaderOverrides,
 ) -> Result<TimeFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
     require_sorted(reader.header(), input, "Input history PBF")?;
     warn_locations_on_ways_loss(reader.header());
 
-    let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
         hb.replication_timestamp(cutoff_timestamp)
     })?;
     let mut bb = BlockBuilder::new();

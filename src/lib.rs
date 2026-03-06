@@ -164,6 +164,7 @@ pub use write::{block_builder, writer};
 pub(crate) use write::file_writer;
 #[doc(hidden)]
 pub use commands::has_indexdata;
+pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, getid, getparents, inspect, merge,

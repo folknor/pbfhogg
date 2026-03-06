@@ -1,0 +1,889 @@
+//! Merge multiple sorted PBF files into one. Equivalent to `osmium merge`.
+//!
+//! Two-pass blob-level merge:
+//!   Pass 1: Build blob index from all input files
+//!   Pass 2: Write in sorted order — passthrough for non-overlapping blobs,
+//!           decode + sweep merge with dedup for overlapping blobs.
+//!
+//! Exact duplicates (same type, ID, version) across input files are removed.
+//! Common when merging geographic extracts that share border elements.
+
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::Path;
+
+use crate::blob::{
+    decode_blob_to_headerblock, decode_blob_to_primitiveblock, decompress_blob_data_into,
+    parse_blob_header_with_index, BlobKind,
+};
+use crate::blob_index::{BlobIndex, ElemKind, scan_block_ids};
+use crate::block_builder::{BlockBuilder, MemberData, Metadata};
+use crate::file_reader::FileReader;
+use crate::file_writer::FileWriter;
+use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
+use crate::Element;
+
+use super::owned_elements::OwnedMember;
+use super::{
+    build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
+    flush_block, require_indexdata, require_sorted, writer_from_header_bytes, Result,
+};
+
+/// Statistics from a multi-PBF merge operation.
+pub struct MergePbfStats {
+    pub nodes: u64,
+    pub ways: u64,
+    pub relations: u64,
+    pub blobs_passthrough: u64,
+    pub blobs_rewritten: u64,
+    pub blobs_total: u64,
+    pub duplicates_removed: u64,
+}
+
+impl MergePbfStats {
+    pub fn print_summary(&self) {
+        let total = self.nodes + self.ways + self.relations;
+        eprintln!(
+            "Merged {total} elements: {} nodes, {} ways, {} relations \
+             ({} blobs: {} passthrough, {} rewritten, {} duplicates removed)",
+            self.nodes,
+            self.ways,
+            self.relations,
+            self.blobs_total,
+            self.blobs_passthrough,
+            self.blobs_rewritten,
+            self.duplicates_removed,
+        );
+    }
+}
+
+/// Options for the multi-PBF merge command.
+pub struct MergePbfOptions {
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub io_uring: bool,
+    pub force: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Blob index entry
+// ---------------------------------------------------------------------------
+
+struct BlobEntry {
+    file_offset: u64,
+    frame_len: u64,
+    index: BlobIndex,
+    has_indexdata: bool,
+    tagdata: Option<Box<[u8]>>,
+    file_index: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Owned element types for overlap-run decode + re-encode
+// ---------------------------------------------------------------------------
+
+struct OwnedMetadata {
+    version: i32,
+    timestamp: i64,
+    changeset: i64,
+    uid: i32,
+    user: String,
+    visible: bool,
+}
+
+struct OwnedNode {
+    id: i64,
+    decimicro_lat: i32,
+    decimicro_lon: i32,
+    tags: Vec<(String, String)>,
+    metadata: Option<OwnedMetadata>,
+}
+
+impl PartialEq for OwnedNode {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for OwnedNode {}
+impl PartialOrd for OwnedNode {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OwnedNode {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+    }
+}
+
+struct OwnedWay {
+    id: i64,
+    tags: Vec<(String, String)>,
+    refs: Vec<i64>,
+    metadata: Option<OwnedMetadata>,
+}
+
+impl PartialEq for OwnedWay {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for OwnedWay {}
+impl PartialOrd for OwnedWay {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OwnedWay {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+    }
+}
+
+struct OwnedRelation {
+    id: i64,
+    tags: Vec<(String, String)>,
+    members: Vec<OwnedMember>,
+    metadata: Option<OwnedMetadata>,
+}
+
+impl PartialEq for OwnedRelation {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+impl Eq for OwnedRelation {}
+impl PartialOrd for OwnedRelation {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for OwnedRelation {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+    }
+}
+
+trait HasId {
+    fn id(&self) -> i64;
+    fn version(&self) -> i32;
+}
+
+impl HasId for OwnedNode {
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn version(&self) -> i32 {
+        self.metadata.as_ref().map_or(0, |m| m.version)
+    }
+}
+
+impl HasId for OwnedWay {
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn version(&self) -> i32 {
+        self.metadata.as_ref().map_or(0, |m| m.version)
+    }
+}
+
+impl HasId for OwnedRelation {
+    fn id(&self) -> i64 {
+        self.id
+    }
+    fn version(&self) -> i32 {
+        self.metadata.as_ref().map_or(0, |m| m.version)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Merge multiple sorted PBF files into one, deduplicating exact duplicates.
+///
+/// All inputs must be sorted (Sort.Type_then_ID). Uses blob-level index for
+/// fast passthrough of non-overlapping blobs; overlapping blobs are decoded,
+/// merged, and deduped via a streaming sweep.
+#[allow(clippy::too_many_lines)]
+#[hotpath::measure]
+pub fn merge_pbf(
+    inputs: &[&Path],
+    output: &Path,
+    opts: &MergePbfOptions,
+) -> Result<MergePbfStats> {
+    if inputs.is_empty() {
+        return Err("no input files specified".into());
+    }
+
+    // Validate inputs have indexdata
+    for input in inputs {
+        require_indexdata(
+            input,
+            opts.direct_io,
+            opts.force,
+            "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
+             decompressed to scan element IDs (significantly slower).",
+        )?;
+    }
+
+    // Pass 1: Build blob index from all files
+    eprintln!("Pass 1: indexing blobs...");
+    let (header, mut entries) = build_blob_index(inputs, opts.direct_io)?;
+    super::warn_locations_on_ways_loss(&header);
+    eprintln!(
+        "  {} OSMData blobs indexed from {} files",
+        entries.len(),
+        inputs.len()
+    );
+
+    // Sort by (type, osm_id)
+    entries.sort_by_key(|e| {
+        (
+            type_order(e.index.kind),
+            super::blob_osm_first_key(e.index.min_id, e.index.max_id),
+        )
+    });
+
+    // Detect overlaps
+    let overlaps = detect_overlaps(&entries);
+    let overlap_count = overlaps.iter().filter(|&&b| b).count();
+    if overlap_count > 0 {
+        eprintln!("  {overlap_count} blobs in overlap runs (decode + merge + dedup)");
+    }
+
+    // Pass 2: Write in sorted order
+    eprintln!("Pass 2: writing merged output...");
+    #[allow(clippy::redundant_closure_for_method_calls)]
+    let header_bytes = build_output_header(&header, false, |hb| hb.sorted())?;
+    let mut writer = writer_from_header_bytes(
+        output,
+        opts.compression,
+        &header_bytes,
+        opts.direct_io,
+        opts.io_uring,
+    )?;
+
+    // Open all input files for random access
+    let mut files: Vec<File> = inputs
+        .iter()
+        .map(|p| File::open(p))
+        .collect::<io::Result<_>>()?;
+
+    let mut stats = MergePbfStats {
+        nodes: 0,
+        ways: 0,
+        relations: 0,
+        blobs_passthrough: 0,
+        blobs_rewritten: 0,
+        blobs_total: entries.len() as u64,
+        duplicates_removed: 0,
+    };
+
+    let mut bb = BlockBuilder::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    let mut i = 0;
+    while i < entries.len() {
+        if overlaps[i] {
+            let start = i;
+            while i < entries.len() && overlaps[i] {
+                i += 1;
+            }
+            write_overlap_run(
+                &entries[start..i],
+                &mut files,
+                &mut bb,
+                &mut writer,
+                &mut stats,
+            )?;
+        } else {
+            write_passthrough_blob(
+                &entries[i],
+                &mut files[entries[i].file_index],
+                &mut writer,
+                &mut frame_buf,
+            )?;
+            count_entry(&entries[i], &mut stats);
+            stats.blobs_passthrough += 1;
+            i += 1;
+        }
+    }
+
+    flush_block(&mut bb, &mut writer)?;
+    writer.flush()?;
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 1: Build blob index from multiple files
+// ---------------------------------------------------------------------------
+
+fn build_blob_index(
+    inputs: &[&Path],
+    direct_io: bool,
+) -> Result<(crate::HeaderBlock, Vec<BlobEntry>)> {
+    let mut entries = Vec::new();
+    let mut header: Option<crate::HeaderBlock> = None;
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut header_buf: Vec<u8> = Vec::new();
+    let mut blob_buf: Vec<u8> = Vec::new();
+
+    for (file_idx, input) in inputs.iter().enumerate() {
+        let mut reader = FileReader::open(input, direct_io)?;
+        let mut file_offset: u64 = 0;
+
+        loop {
+            let frame_start = file_offset;
+
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            #[allow(clippy::cast_possible_truncation)]
+            let header_len = u32::from_be_bytes(len_buf) as usize;
+
+            header_buf.resize(header_len, 0);
+            reader.read_exact(&mut header_buf)?;
+
+            let (blob_type, data_size, raw_index, tagdata) =
+                parse_blob_header_with_index(&header_buf)?;
+            let index = raw_index.as_ref().and_then(|d| BlobIndex::deserialize(d));
+            let has_indexdata = index.is_some();
+
+            let frame_len = (4 + header_len + data_size) as u64;
+            file_offset += frame_len;
+
+            match &blob_type {
+                BlobKind::OsmHeader => {
+                    blob_buf.resize(data_size, 0);
+                    reader.read_exact(&mut blob_buf)?;
+                    let hdr = decode_blob_to_headerblock(&blob_buf)?;
+                    require_sorted(&hdr, input, &format!("Input file {}", input.display()))?;
+                    if header.is_none() {
+                        header = Some(hdr);
+                    }
+                }
+                BlobKind::OsmData if has_indexdata => {
+                    reader.skip(data_size as u64)?;
+                    #[allow(clippy::unwrap_used)]
+                    entries.push(BlobEntry {
+                        file_offset: frame_start,
+                        frame_len,
+                        index: index.unwrap(),
+                        has_indexdata,
+                        tagdata,
+                        file_index: file_idx,
+                    });
+                }
+                BlobKind::OsmData => {
+                    blob_buf.resize(data_size, 0);
+                    reader.read_exact(&mut blob_buf)?;
+                    decompress_blob_data_into(&blob_buf, &mut decompress_buf)?;
+                    let blob_index = scan_block_ids(&decompress_buf).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "failed to scan block IDs")
+                    })?;
+                    entries.push(BlobEntry {
+                        file_offset: frame_start,
+                        frame_len,
+                        index: blob_index,
+                        has_indexdata,
+                        tagdata,
+                        file_index: file_idx,
+                    });
+                }
+                _ => {
+                    reader.skip(data_size as u64)?;
+                }
+            }
+        }
+    }
+
+    let header = header.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "no OSMHeader blob found in any input file")
+    })?;
+
+    Ok((header, entries))
+}
+
+// ---------------------------------------------------------------------------
+// Sort + overlap detection
+// ---------------------------------------------------------------------------
+
+fn type_order(kind: ElemKind) -> u8 {
+    match kind {
+        ElemKind::Node => 0,
+        ElemKind::Way => 1,
+        ElemKind::Relation => 2,
+    }
+}
+
+fn detect_overlaps(entries: &[BlobEntry]) -> Vec<bool> {
+    let mut overlaps = vec![false; entries.len()];
+    for i in 0..entries.len().saturating_sub(1) {
+        if entries[i].index.kind == entries[i + 1].index.kind
+            && super::blob_osm_last_key(entries[i].index.min_id, entries[i].index.max_id)
+                >= super::blob_osm_first_key(
+                    entries[i + 1].index.min_id,
+                    entries[i + 1].index.max_id,
+                )
+        {
+            overlaps[i] = true;
+            overlaps[i + 1] = true;
+        }
+    }
+    overlaps
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2: Passthrough write
+// ---------------------------------------------------------------------------
+
+fn write_passthrough_blob(
+    entry: &BlobEntry,
+    file: &mut File,
+    writer: &mut PbfWriter<FileWriter>,
+    frame_buf: &mut Vec<u8>,
+) -> Result<()> {
+    read_frame_into(file, entry, frame_buf)?;
+    if entry.has_indexdata {
+        writer.write_raw(frame_buf)?;
+    } else {
+        let blob_bytes = extract_blob_bytes(frame_buf)?;
+        let reframed = reframe_raw_with_index(
+            blob_bytes,
+            &entry.index.serialize(),
+            entry.tagdata.as_deref(),
+        )?;
+        writer.write_raw(&reframed)?;
+    }
+    Ok(())
+}
+
+fn read_frame_into(file: &mut File, entry: &BlobEntry, buf: &mut Vec<u8>) -> io::Result<()> {
+    file.seek(SeekFrom::Start(entry.file_offset))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let len = entry.frame_len as usize;
+    buf.clear();
+    buf.resize(len, 0);
+    file.read_exact(buf)?;
+    Ok(())
+}
+
+fn extract_blob_bytes(frame: &[u8]) -> Result<&[u8]> {
+    if frame.len() < 4 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too short").into());
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let header_len = u32::from_be_bytes([frame[0], frame[1], frame[2], frame[3]]) as usize;
+    let blob_start = 4 + header_len;
+    if blob_start > frame.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid header length").into());
+    }
+    Ok(&frame[blob_start..])
+}
+
+fn count_entry(entry: &BlobEntry, stats: &mut MergePbfStats) {
+    match entry.index.kind {
+        ElemKind::Node => stats.nodes += entry.index.count,
+        ElemKind::Way => stats.ways += entry.index.count,
+        ElemKind::Relation => stats.relations += entry.index.count,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2: Overlap run rewrite with dedup
+// ---------------------------------------------------------------------------
+
+fn write_overlap_run(
+    entries: &[BlobEntry],
+    files: &mut [File],
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergePbfStats,
+) -> Result<()> {
+    let kind = entries[0].index.kind;
+    match kind {
+        ElemKind::Node => sweep_merge_nodes(entries, files, bb, writer, stats),
+        ElemKind::Way => sweep_merge_ways(entries, files, bb, writer, stats),
+        ElemKind::Relation => sweep_merge_rels(entries, files, bb, writer, stats),
+    }?;
+    stats.blobs_rewritten += entries.len() as u64;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sweep merge per element type — with dedup
+// ---------------------------------------------------------------------------
+
+fn sweep_merge_nodes(
+    entries: &[BlobEntry],
+    files: &mut [File],
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergePbfStats,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<OwnedNode>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        flush_heap_below_dedup(
+            &mut heap,
+            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
+            &mut stats.duplicates_removed,
+            |node| {
+                write_single_node(&node, bb, writer)?;
+                stats.nodes += 1;
+                Ok(())
+            },
+        )?;
+
+        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
+                Element::Node(n) => heap.push(Reverse(read_node(n))),
+                _ => {}
+            }
+        }
+    }
+
+    // Drain remaining with dedup
+    while let Some(Reverse(node)) = heap.pop() {
+        let eid = node.id;
+        let ever = node.version();
+        write_single_node(&node, bb, writer)?;
+        stats.nodes += 1;
+        while heap
+            .peek()
+            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
+        {
+            heap.pop();
+            stats.duplicates_removed += 1;
+        }
+    }
+    flush_block(bb, writer)
+}
+
+fn sweep_merge_ways(
+    entries: &[BlobEntry],
+    files: &mut [File],
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergePbfStats,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<OwnedWay>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        flush_heap_below_dedup(
+            &mut heap,
+            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
+            &mut stats.duplicates_removed,
+            |way| {
+                write_single_way(&way, bb, writer)?;
+                stats.ways += 1;
+                Ok(())
+            },
+        )?;
+
+        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            if let Element::Way(w) = &element {
+                heap.push(Reverse(read_way(w)));
+            }
+        }
+    }
+
+    while let Some(Reverse(way)) = heap.pop() {
+        let eid = way.id;
+        let ever = way.version();
+        write_single_way(&way, bb, writer)?;
+        stats.ways += 1;
+        while heap
+            .peek()
+            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
+        {
+            heap.pop();
+            stats.duplicates_removed += 1;
+        }
+    }
+    flush_block(bb, writer)
+}
+
+fn sweep_merge_rels(
+    entries: &[BlobEntry],
+    files: &mut [File],
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergePbfStats,
+) -> Result<()> {
+    let mut heap: BinaryHeap<Reverse<OwnedRelation>> = BinaryHeap::new();
+    let mut frame_buf: Vec<u8> = Vec::new();
+
+    for entry in entries {
+        flush_heap_below_dedup(
+            &mut heap,
+            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
+            &mut stats.duplicates_removed,
+            |rel| {
+                write_single_relation(&rel, bb, writer)?;
+                stats.relations += 1;
+                Ok(())
+            },
+        )?;
+
+        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
+        let blob_bytes = extract_blob_bytes(&frame_buf)?;
+        let block = decode_blob_to_primitiveblock(blob_bytes)?;
+        for element in block.elements() {
+            if let Element::Relation(r) = &element {
+                heap.push(Reverse(read_relation(r)));
+            }
+        }
+    }
+
+    while let Some(Reverse(rel)) = heap.pop() {
+        let eid = rel.id;
+        let ever = rel.version();
+        write_single_relation(&rel, bb, writer)?;
+        stats.relations += 1;
+        while heap
+            .peek()
+            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
+        {
+            heap.pop();
+            stats.duplicates_removed += 1;
+        }
+    }
+    flush_block(bb, writer)
+}
+
+/// Flush elements from the min-heap whose ID is below `below`, with dedup.
+fn flush_heap_below_dedup<T: Ord + HasId>(
+    heap: &mut BinaryHeap<Reverse<T>>,
+    below: i64,
+    dedup_count: &mut u64,
+    mut emit: impl FnMut(T) -> Result<()>,
+) -> Result<()> {
+    while heap
+        .peek()
+        .is_some_and(|Reverse(e)| super::osm_id_cmp(e.id(), below).is_lt())
+    {
+        if let Some(Reverse(element)) = heap.pop() {
+            let eid = element.id();
+            let ever = element.version();
+            emit(element)?;
+            // Skip exact duplicates (same id + version)
+            while heap
+                .peek()
+                .is_some_and(|Reverse(e)| e.id() == eid && e.version() == ever)
+            {
+                heap.pop();
+                *dedup_count += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Write single elements via BlockBuilder
+// ---------------------------------------------------------------------------
+
+fn write_single_node(
+    node: &OwnedNode,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    ensure_node_capacity(bb, writer)?;
+    let tags: Vec<(&str, &str)> = node
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let meta = owned_to_metadata(node.metadata.as_ref());
+    bb.add_node(
+        node.id,
+        node.decimicro_lat,
+        node.decimicro_lon,
+        &tags,
+        meta.as_ref(),
+    );
+    Ok(())
+}
+
+fn write_single_way(
+    way: &OwnedWay,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    ensure_way_capacity(bb, writer)?;
+    let tags: Vec<(&str, &str)> = way
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let meta = owned_to_metadata(way.metadata.as_ref());
+    bb.add_way(way.id, &tags, &way.refs, meta.as_ref());
+    Ok(())
+}
+
+fn write_single_relation(
+    rel: &OwnedRelation,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+) -> Result<()> {
+    ensure_relation_capacity(bb, writer)?;
+    let tags: Vec<(&str, &str)> = rel
+        .tags
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let members: Vec<MemberData<'_>> = rel
+        .members
+        .iter()
+        .map(|m| MemberData {
+            id: m.id,
+            role: &m.role,
+        })
+        .collect();
+    let meta = owned_to_metadata(rel.metadata.as_ref());
+    bb.add_relation(rel.id, &tags, &members, meta.as_ref());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Element readers (borrow → owned for overlap-run decode)
+// ---------------------------------------------------------------------------
+
+fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
+    OwnedNode {
+        id: dn.id(),
+        decimicro_lat: dn.decimicro_lat(),
+        decimicro_lon: dn.decimicro_lon(),
+        tags: dn
+            .tags()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        metadata: dn.info().and_then(|info| {
+            if info.version() == -1 {
+                return None;
+            }
+            Some(OwnedMetadata {
+                version: info.version(),
+                timestamp: info.milli_timestamp() / 1000,
+                changeset: if info.changeset() == -1 {
+                    0
+                } else {
+                    info.changeset()
+                },
+                uid: info.uid(),
+                user: info.user().ok()?.to_owned(),
+                visible: info.visible(),
+            })
+        }),
+    }
+}
+
+fn read_node(n: &crate::Node<'_>) -> OwnedNode {
+    let info = n.info();
+    OwnedNode {
+        id: n.id(),
+        decimicro_lat: n.decimicro_lat(),
+        decimicro_lon: n.decimicro_lon(),
+        tags: n
+            .tags()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        metadata: info.version().map(|v| OwnedMetadata {
+            version: v,
+            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+            changeset: info.changeset().unwrap_or(0),
+            uid: info.uid().unwrap_or(0),
+            user: info
+                .user()
+                .and_then(std::result::Result::ok)
+                .unwrap_or("")
+                .to_owned(),
+            visible: info.visible(),
+        }),
+    }
+}
+
+fn read_way(w: &crate::Way<'_>) -> OwnedWay {
+    let info = w.info();
+    OwnedWay {
+        id: w.id(),
+        tags: w
+            .tags()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        refs: w.refs().collect(),
+        metadata: info.version().map(|v| OwnedMetadata {
+            version: v,
+            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+            changeset: info.changeset().unwrap_or(0),
+            uid: info.uid().unwrap_or(0),
+            user: info
+                .user()
+                .and_then(std::result::Result::ok)
+                .unwrap_or("")
+                .to_owned(),
+            visible: info.visible(),
+        }),
+    }
+}
+
+fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
+    let info = r.info();
+    OwnedRelation {
+        id: r.id(),
+        tags: r
+            .tags()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        members: r
+            .members()
+            .map(|m| OwnedMember {
+                id: m.id,
+                role: m.role().unwrap_or("").to_owned(),
+            })
+            .collect(),
+        metadata: info.version().map(|v| OwnedMetadata {
+            version: v,
+            timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+            changeset: info.changeset().unwrap_or(0),
+            uid: info.uid().unwrap_or(0),
+            user: info
+                .user()
+                .and_then(std::result::Result::ok)
+                .unwrap_or("")
+                .to_owned(),
+            visible: info.visible(),
+        }),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata<'_>> {
+    meta.map(|m| Metadata {
+        version: m.version,
+        timestamp: m.timestamp,
+        changeset: m.changeset,
+        uid: m.uid,
+        user: &m.user,
+        visible: m.visible,
+    })
+}

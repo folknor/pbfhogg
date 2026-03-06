@@ -20,7 +20,7 @@ osmium-tool installed version as of 2026-03-04.
 | `fileinfo` | `inspect` | Different name, different approach |
 | `getid` | `getid` | Have it |
 | `getparents` | `getparents` | Have it |
-| `merge` | — | Missing (merge multiple sorted PBFs with dedup by version) |
+| `merge` | `merge-pbf` | Have it (different name) |
 | `merge-changes` | `--simplify` | Implemented (`merge-changes`, plus optional simplification by last change per object) |
 | `query-locations-index` | — | Missing (paired with create-locations-index) |
 | `removeid` | `removeid` | Have it |
@@ -41,13 +41,6 @@ osmium-tool installed version as of 2026-03-04.
 - `bench-read` / `bench-write` / `bench-merge` — internal benchmarking harnesses
 
 ## Missing commands
-
-### High priority (pipeline workflows)
-
-- **`merge` (multi-PBF)** — merge multiple sorted PBFs into one, deduplicating
-  by highest version. osmium's `merge` is distinct from `apply-changes`: it
-  combines N sorted PBFs, not base+diff. Used for recombining extracts.
-  Already in TODO.md with upstream refs.
 
 ### Medium priority (useful but not pipeline-critical)
 

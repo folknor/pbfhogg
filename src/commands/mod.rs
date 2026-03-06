@@ -12,6 +12,7 @@ pub mod inspect;
 pub(crate) mod id_set_dense;
 pub mod merge;
 pub mod merge_changes;
+pub mod merge_pbf;
 pub mod node_stats;
 pub mod renumber;
 pub(crate) mod owned_elements;

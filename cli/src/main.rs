@@ -454,6 +454,22 @@ enum Command {
         #[arg(long)]
         locations_on_ways: bool,
     },
+    /// Merge multiple sorted PBF files into one, deduplicating exact duplicates
+    MergePbf {
+        /// Input PBF files (must be sorted)
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[command(flatten)]
+        output: OutputArg,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+        #[command(flatten)]
+        uring: UringArg,
+        #[command(flatten)]
+        force: ForceArg,
+    },
     /// Merge multiple OSC files into one OSC file
     MergeChanges {
         /// Input OSC files (.osc or .osc.gz)
@@ -898,6 +914,21 @@ fn main() {
             uring.io_uring,
             force.force,
             locations_on_ways,
+        ),
+        Command::MergePbf {
+            inputs,
+            output,
+            compression,
+            io,
+            uring,
+            force,
+        } => run_merge_pbf(
+            &inputs,
+            &output.output,
+            &compression.compression,
+            io.direct_io,
+            uring.io_uring,
+            force.force,
         ),
         Command::MergeChanges {
             changes,
@@ -1864,6 +1895,27 @@ fn run_merge(
         locations_on_ways,
     };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_merge_pbf(
+    inputs: &[PathBuf],
+    output: &std::path::Path,
+    compression: &str,
+    direct_io: bool,
+    io_uring: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let paths: Vec<&std::path::Path> = inputs.iter().map(AsRef::as_ref).collect();
+    let opts = pbfhogg::merge_pbf::MergePbfOptions {
+        compression,
+        direct_io,
+        io_uring,
+        force,
+    };
+    let stats = pbfhogg::merge_pbf::merge_pbf(&paths, output, &opts)?;
     stats.print_summary();
     Ok(())
 }

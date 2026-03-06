@@ -484,6 +484,22 @@ pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Me
         })
 }
 
+/// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
+/// are cleaned or if the input has no metadata.
+pub(crate) fn clean_metadata<'a>(meta: Option<Metadata<'a>>, clean: &cat::CleanAttrs) -> Option<Metadata<'a>> {
+    if !clean.any() {
+        return meta;
+    }
+    meta.map(|mut m| {
+        if clean.version { m.version = 0; }
+        if clean.changeset { m.changeset = 0; }
+        if clean.timestamp { m.timestamp = 0; }
+        if clean.uid { m.uid = 0; }
+        if clean.user { m.user = ""; }
+        m
+    })
+}
+
 /// Extract [`RawMetadata`] from an [`Info`](crate::Info), preserving the raw
 /// string table index for the user name.
 pub(crate) fn element_raw_metadata(info: &crate::Info<'_>) -> Option<RawMetadata> {

@@ -342,6 +342,10 @@ enum Command {
         /// Write the extract region bounding box to the output header
         #[arg(long)]
         set_bounds: bool,
+        /// Strip metadata attribute (version, timestamp, changeset, uid, user).
+        /// Can be specified multiple times, e.g. --clean changeset --clean uid
+        #[arg(long = "clean", value_name = "ATTR")]
+        clean: Vec<String>,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -783,6 +787,7 @@ fn main() {
             simple,
             smart,
             set_bounds,
+            clean,
             compression,
             force,
             io,
@@ -793,6 +798,7 @@ fn main() {
             polygon.as_deref(),
             extract_strategy(simple, smart),
             set_bounds,
+            &clean,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -1220,18 +1226,9 @@ fn run_tags_count(
     Ok(())
 }
 
-fn run_cat(
-    files: &[PathBuf],
-    output: &std::path::Path,
-    type_filter: Option<&str>,
-    clean_attrs: &[String],
-    compression: &str,
-    direct_io: bool,
-    force: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let compression: Compression = compression.parse()?;
+fn parse_clean_attrs(attrs: &[String]) -> Result<pbfhogg::cat::CleanAttrs, Box<dyn std::error::Error>> {
     let mut clean = pbfhogg::cat::CleanAttrs::default();
-    for attr in clean_attrs {
+    for attr in attrs {
         match attr.as_str() {
             "version" => clean.version = true,
             "changeset" => clean.changeset = true,
@@ -1243,6 +1240,20 @@ fn run_cat(
             ).into()),
         }
     }
+    Ok(clean)
+}
+
+fn run_cat(
+    files: &[PathBuf],
+    output: &std::path::Path,
+    type_filter: Option<&str>,
+    clean_attrs: &[String],
+    compression: &str,
+    direct_io: bool,
+    force: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let clean = parse_clean_attrs(clean_attrs)?;
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
     let stats = pbfhogg::cat::cat(&paths, output, type_filter, &clean, compression, direct_io, force)?;
     stats.print_summary();
@@ -1565,11 +1576,13 @@ fn run_extract(
     polygon_path: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
     set_bounds: bool,
+    clean_attrs: &[String],
     compression: &str,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
+    let clean = parse_clean_attrs(clean_attrs)?;
     let region = match (bbox_str, polygon_path) {
         (Some(s), None) => {
             let bbox = pbfhogg::extract::parse_bbox(s)?;
@@ -1585,6 +1598,7 @@ fn run_extract(
         &region,
         strategy,
         set_bounds,
+        &clean,
         compression,
         direct_io,
         force,

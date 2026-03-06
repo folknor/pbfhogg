@@ -128,7 +128,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-c, --config` | — | Missing (multi-extract from config file) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `--set-bounds` | `--set-bounds` | Have it (opt-in, writes bbox to output header) |
-| `--clean` | — | Missing |
+| `--clean` | `--clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |
 | `-S, --option` | — | Missing (strategy-specific options) |
 
 ### `getid`

@@ -5,6 +5,7 @@ use std::path::Path;
 use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::cat::CleanAttrs;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, BlockType, Element, ElementReader, MemberId, PrimitiveBlock};
 
@@ -510,6 +511,7 @@ pub fn extract(
     region: &Region,
     strategy: ExtractStrategy,
     set_bounds: bool,
+    clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
     force: bool,
@@ -524,9 +526,9 @@ pub fn extract(
         super::warn_locations_on_ways_loss(reader.header());
     }
     match strategy {
-        ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, compression, direct_io),
-        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, compression, direct_io),
-        ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, compression, direct_io),
+        ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io),
+        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io),
+        ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, clean, compression, direct_io),
     }
 }
 
@@ -645,14 +647,14 @@ fn classify_block_simple(
     matched
 }
 
-fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     // Check if input is sorted — if so, classify + write in a single file pass.
     let reader = ElementReader::open(input, direct_io)?;
     let is_sorted = reader.header().is_sorted();
     drop(reader);
 
     if is_sorted {
-        return extract_simple_single_pass(input, output, region, set_bounds, compression, direct_io);
+        return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io);
     }
 
     // --- Unsorted fallback: two passes (collect IDs, then write) ---
@@ -701,7 +703,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_extract_pass2_batch(batch, &ids, &mut writer, &mut stats)
+        process_extract_pass2_batch(batch, &ids, clean, &mut writer, &mut stats)
     })?;
 
     writer.flush()?;
@@ -724,6 +726,7 @@ fn extract_simple_single_pass(
     output: &Path,
     region: &Region,
     set_bounds: bool,
+    clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
@@ -774,7 +777,7 @@ fn extract_simple_single_pass(
                 matched_way_ids: &matched_way_ids,
                 matched_relation_ids: &matched_relation_ids,
             };
-            process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
             batch.clear();
         }
     }
@@ -785,7 +788,7 @@ fn extract_simple_single_pass(
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &matched_relation_ids,
         };
-        process_extract_pass2_batch(&batch, &ids, &mut writer, &mut stats)?;
+        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
     }
 
     writer.flush()?;
@@ -796,7 +799,7 @@ fn extract_simple_single_pass(
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
-fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -832,7 +835,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_extract_pass2_batch(batch, &ids, &mut writer, &mut stats)
+        process_extract_pass2_batch(batch, &ids, clean, &mut writer, &mut stats)
     })?;
 
     writer.flush()?;
@@ -1430,6 +1433,7 @@ struct ExtractPass2IdSets<'a> {
 fn extract_block_pass2(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
+    clean: &CleanAttrs,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<ExtractStats, String> {
@@ -1455,7 +1459,7 @@ fn extract_block_pass2(
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
-                    let meta = dense_node_metadata(dn);
+                    let meta = clean_metadata(dense_node_metadata(dn), clean);
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
@@ -1471,7 +1475,7 @@ fn extract_block_pass2(
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
-                    let meta = element_metadata(&n.info());
+                    let meta = clean_metadata(element_metadata(&n.info()), clean);
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
@@ -1487,7 +1491,7 @@ fn extract_block_pass2(
                     tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = clean_metadata(element_metadata(&w.info()), clean);
                     bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
                 }
@@ -1502,7 +1506,7 @@ fn extract_block_pass2(
                         id: m.id,
                         role: m.role().unwrap_or(""),
                     }));
-                    let meta = element_metadata(&r.info());
+                    let meta = clean_metadata(element_metadata(&r.info()), clean);
                     bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
@@ -1516,6 +1520,7 @@ fn extract_block_pass2(
 fn process_extract_pass2_batch(
     batch: &[PrimitiveBlock],
     ids: &ExtractPass2IdSets<'_>,
+    clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
@@ -1526,7 +1531,7 @@ fn process_extract_pass2_batch(
             BlockBuilder::new,
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass2(block, ids, bb, &mut output)?;
+                let block_stats = extract_block_pass2(block, ids, clean, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },
@@ -1547,6 +1552,7 @@ fn extract_smart(
     output: &Path,
     region: &Region,
     set_bounds: bool,
+    clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
@@ -1607,7 +1613,7 @@ fn extract_smart(
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_extract_pass3_batch(batch, &ids, &mut writer, &mut stats)
+        process_extract_pass3_batch(batch, &ids, clean, &mut writer, &mut stats)
     })?;
 
     writer.flush()?;
@@ -1633,6 +1639,7 @@ struct ExtractPass3IdSets<'a> {
 fn extract_block_pass3(
     block: &PrimitiveBlock,
     ids: &ExtractPass3IdSets<'_>,
+    clean: &CleanAttrs,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<ExtractStats, String> {
@@ -1660,7 +1667,7 @@ fn extract_block_pass3(
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
-                    let meta = dense_node_metadata(dn);
+                    let meta = clean_metadata(dense_node_metadata(dn), clean);
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
@@ -1680,7 +1687,7 @@ fn extract_block_pass3(
                     ensure_node_capacity_local(bb, output)?;
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
-                    let meta = element_metadata(&n.info());
+                    let meta = clean_metadata(element_metadata(&n.info()), clean);
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
@@ -1700,7 +1707,7 @@ fn extract_block_pass3(
                     tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
-                    let meta = element_metadata(&w.info());
+                    let meta = clean_metadata(element_metadata(&w.info()), clean);
                     bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                     if in_extra && !in_matched {
                         stats.ways_from_relations += 1;
@@ -1719,7 +1726,7 @@ fn extract_block_pass3(
                         id: m.id,
                         role: m.role().unwrap_or(""),
                     }));
-                    let meta = element_metadata(&r.info());
+                    let meta = clean_metadata(element_metadata(&r.info()), clean);
                     bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
@@ -1733,6 +1740,7 @@ fn extract_block_pass3(
 fn process_extract_pass3_batch(
     batch: &[PrimitiveBlock],
     ids: &ExtractPass3IdSets<'_>,
+    clean: &CleanAttrs,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
 ) -> Result<()> {
@@ -1743,7 +1751,7 @@ fn process_extract_pass3_batch(
             BlockBuilder::new,
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass3(block, ids, bb, &mut output)?;
+                let block_stats = extract_block_pass3(block, ids, clean, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },
@@ -1782,7 +1790,7 @@ fn is_smart_relation(r: &crate::Relation) -> bool {
 // Helpers
 // ---------------------------------------------------------------------------
 
-use super::{dense_node_metadata, element_metadata};
+use super::{clean_metadata, dense_node_metadata, element_metadata};
 
 
 // ---------------------------------------------------------------------------

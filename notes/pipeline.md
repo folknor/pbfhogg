@@ -4,11 +4,18 @@ Rust library for reading, writing, and merging OpenStreetMap PBF files. The full
 
 **Production pipeline** (runs every planet refresh cycle):
 ```
-pbfhogg cat → pbfhogg merge → pbfhogg add-locations-to-ways
+Bootstrap (once):  pbfhogg cat → pbfhogg add-locations-to-ways → enriched PBF
+Steady state:      pbfhogg merge --locations-on-ways (daily diffs)
                                       │
                                       ├── elivagar → PMTiles → nidhogg (tile serving)
                                       └── nidhogg (PBF ingest → query API)
 ```
+
+`merge --locations-on-ways` preserves and updates inline way-node coordinates
+through OSC diffs, so `add-locations-to-ways` only needs to run once to bootstrap
+the initial enriched PBF. Subsequent daily diffs maintain coordinates automatically:
+surviving base ways forward raw lat/lon bytes, OSC ways look up node coordinates
+from a sparse index built from the diff and base PBF.
 
 **`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) — a one-time fix, not a recurring step.
 
@@ -32,9 +39,10 @@ The two downstream consumers are:
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
 - **Read path**: `ElementReader::from_path()` → `.for_each_pipelined(|element| ...)` — two-pass ingest
   - File: `~/Programs/nidhogg/src/ingest/mod.rs:72-324`
-- **Merge path**: delegates entirely to `pbfhogg::merge::merge(base, osc, output, Compression::Zlib(6), false, false, false)`
+- **Merge path**: delegates entirely to `pbfhogg::merge::merge(base, osc, output, &MergeOptions { .. })`
   - File: `~/Programs/nidhogg/src/merge.rs:6`
-  - direct_io=false, io_uring=false, sqpoll=false
+  - Currently: zlib compression, no direct_io/io_uring, no locations_on_ways
+  - TODO: enable `locations_on_ways: true` once the enriched PBF is bootstrapped
 - **No direct BlockBuilder/PbfWriter usage** — nidhogg never constructs PBF blocks itself
 - Also reads PBF headers via `BlobReader::from_path()` → `.to_headerblock()` for replication state
   - File: `~/Programs/nidhogg/src/update.rs:95-114`
@@ -183,3 +191,9 @@ Two-pass algorithm that embeds node coordinates directly into way elements.
 **Merge (io_uring, North America):** zlib 15.2s, none 11.9s (-20% vs buffered)
 
 RSS under 600 MB at North America scale (18.8 GB input, 30 GB host).
+
+**Merge `--locations-on-ways` (commit `e7bbfa2`):**
+- Denmark (501 MB with LocationsOnWays): pbfhogg 3.9s vs osmium 8.3s (2.1x faster)
+- vs separate merge + ALTW pipeline: pbfhogg 2.7s + 6.5s = 9.2s → 3.9s (2.4x faster)
+- Overhead vs plain merge (flag off): +170ms at Denmark scale (475ms vs 307ms to /dev/null)
+- 883 passthrough node blobs decompressed for coordinate extraction (of 5559 total)

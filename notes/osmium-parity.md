@@ -24,7 +24,7 @@ osmium-tool installed version as of 2026-03-04.
 | `merge-changes` | `--simplify` | Implemented (`merge-changes`, plus optional simplification by last change per object) |
 | `query-locations-index` | — | Missing (paired with create-locations-index) |
 | `removeid` | `removeid` | Have it |
-| `renumber` | — | Missing (reassign IDs starting from 1) |
+| `renumber` | `renumber` | Have it |
 | `show` | — | Missing (pretty-print to terminal with pager) |
 | `sort` | `sort` | Have it |
 | `tags-count` | `tags-count` | Have it |
@@ -51,10 +51,6 @@ osmium-tool installed version as of 2026-03-04.
 
 ### Medium priority (useful but not pipeline-critical)
 
-- **`renumber`** — reassign node/way/relation IDs starting from configurable
-  base (default 1,1,1). Useful for anonymizing data, reducing ID space for
-  testing, and preparing data for tools that struggle with high IDs. Flags:
-  `--start-id`, `--object-type`, `--index-directory` (persist renumbering map).
 - **`export`** — export to GeoJSON, GeoJSONSeq, or PG text format. Large scope:
   geometry assembly, index types, config file, attribute selection. Probably
   out of scope for pbfhogg's core mission.
@@ -151,6 +147,15 @@ osmium-tool installed version as of 2026-03-04.
 | `-i, --id-file` | `-i, --id-file` | Have it |
 | `-I, --id-osm-file` | `-I, --id-osm-file` | Have it |
 | `--default-type` | `--default-type` | Have it |
+
+### `renumber`
+
+| osmium flag | pbfhogg | Status |
+|---|---|---|
+| `-s, --start-id` | `-s, --start-id` | Have it (single value or comma-separated node,way,relation) |
+| `-t, --object-type` | — | Missing (renumber all types always) |
+| `-i, --index-directory` | — | Missing (in-memory only, no persistent index) |
+| `--show-index` | — | Missing |
 
 ### `merge` (apply-changes)
 

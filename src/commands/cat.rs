@@ -15,7 +15,7 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
-use super::{drain_batch_results, flush_local, read_raw_frame, Metadata, Result, BATCH_SIZE};
+use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
 
 /// Which metadata attributes to strip via `--clean`.
 #[derive(Clone, Copy, Default)]

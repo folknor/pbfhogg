@@ -13,6 +13,7 @@ pub(crate) mod id_set_dense;
 pub mod merge;
 pub mod merge_changes;
 pub mod node_stats;
+pub mod renumber;
 pub(crate) mod owned_elements;
 pub mod sort;
 pub(crate) mod stream_merge;

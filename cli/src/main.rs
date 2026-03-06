@@ -141,6 +141,20 @@ enum Command {
         #[command(flatten)]
         force: ForceArg,
     },
+    /// Renumber all element IDs sequentially, remapping cross-references
+    Renumber {
+        /// Input PBF file (must be sorted)
+        file: PathBuf,
+        #[command(flatten)]
+        output: OutputArg,
+        /// Starting ID(s): single value or comma-separated node,way,relation
+        #[arg(short = 's', long, default_value = "1")]
+        start_id: String,
+        #[command(flatten)]
+        compression: CompressionArg,
+        #[command(flatten)]
+        io: DirectIoArg,
+    },
     /// Filter elements by tag expressions.
     ///
     /// Default mode (without `-R`) resolves relation members transitively:
@@ -647,6 +661,19 @@ fn main() {
             io.direct_io,
             uring.io_uring,
             force.force,
+        ),
+        Command::Renumber {
+            file,
+            output,
+            start_id,
+            compression,
+            io,
+        } => run_renumber(
+            &file,
+            &output.output,
+            &start_id,
+            &compression.compression,
+            io.direct_io,
         ),
         Command::TagsFilter {
             file,
@@ -1276,6 +1303,45 @@ fn run_sort(
         force,
     };
     let stats = pbfhogg::sort::sort(file, output, &opts)?;
+    stats.print_summary();
+    Ok(())
+}
+
+fn run_renumber(
+    file: &std::path::Path,
+    output: &std::path::Path,
+    start_id: &str,
+    compression: &str,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let compression: Compression = compression.parse()?;
+    let parts: Vec<&str> = start_id.split(',').collect();
+    let opts = match parts.len() {
+        1 => {
+            let id: i64 = parts[0].trim().parse()
+                .map_err(|_| format!("invalid start ID: {}", parts[0]))?;
+            pbfhogg::renumber::RenumberOptions {
+                start_node_id: id,
+                start_way_id: id,
+                start_relation_id: id,
+            }
+        }
+        3 => {
+            let node_id: i64 = parts[0].trim().parse()
+                .map_err(|_| format!("invalid node start ID: {}", parts[0]))?;
+            let way_id: i64 = parts[1].trim().parse()
+                .map_err(|_| format!("invalid way start ID: {}", parts[1]))?;
+            let rel_id: i64 = parts[2].trim().parse()
+                .map_err(|_| format!("invalid relation start ID: {}", parts[2]))?;
+            pbfhogg::renumber::RenumberOptions {
+                start_node_id: node_id,
+                start_way_id: way_id,
+                start_relation_id: rel_id,
+            }
+        }
+        _ => return Err("--start-id must be a single value or 3 comma-separated values (node,way,relation)".into()),
+    };
+    let stats = pbfhogg::renumber::renumber(file, output, &opts, compression, direct_io)?;
     stats.print_summary();
     Ok(())
 }

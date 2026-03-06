@@ -16,7 +16,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use pbfhogg::writer::Compression;
 
 #[derive(Parser)]
-#[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit")]
+#[command(name = "pbfhogg", about = "OpenStreetMap PBF toolkit", version)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -241,9 +241,12 @@ enum Command {
         /// Include referenced nodes of matching ways (two-pass)
         #[arg(short = 'r', long = "add-referenced")]
         add_referenced: bool,
-        /// Read IDs from file instead of arguments
+        /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
+        /// Read IDs from an OSM/PBF file (all element IDs are collected)
+        #[arg(short = 'I', long = "id-osm-file")]
+        id_osm_file: Option<PathBuf>,
         /// Default type for bare numeric IDs: node, way, relation
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
@@ -262,9 +265,12 @@ enum Command {
         file: PathBuf,
         #[command(flatten)]
         output: OutputArg,
-        /// Read IDs from file instead of arguments
+        /// Read IDs from text file (one per line, e.g. n123)
         #[arg(short = 'i', long = "id-file")]
         id_file: Option<PathBuf>,
+        /// Read IDs from an OSM/PBF file (all element IDs are collected)
+        #[arg(short = 'I', long = "id-osm-file")]
+        id_osm_file: Option<PathBuf>,
         /// Default type for bare numeric IDs: node, way, relation
         #[arg(long = "default-type", value_enum)]
         default_type: Option<DefaultTypeArg>,
@@ -655,6 +661,7 @@ fn main() {
             output,
             add_referenced,
             id_file,
+            id_osm_file,
             default_type,
             ids,
             compression,
@@ -665,6 +672,7 @@ fn main() {
             &output.output,
             add_referenced,
             id_file.as_deref(),
+            id_osm_file.as_deref(),
             default_type,
             &ids,
             &compression.compression,
@@ -675,6 +683,7 @@ fn main() {
             file,
             output,
             id_file,
+            id_osm_file,
             default_type,
             ids,
             compression,
@@ -683,6 +692,7 @@ fn main() {
             &file,
             &output.output,
             id_file.as_deref(),
+            id_osm_file.as_deref(),
             default_type,
             &ids,
             &compression.compression,
@@ -1223,18 +1233,32 @@ fn run_tags_filter_osc(
 
 fn resolve_ids(
     id_file: Option<&std::path::Path>,
+    id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
+    direct_io: bool,
 ) -> Result<pbfhogg::getid::IdSet, Box<dyn std::error::Error>> {
     let default_type = default_type.map(|kind| match kind {
         DefaultTypeArg::Node => pbfhogg::getid::DefaultType::Node,
         DefaultTypeArg::Way => pbfhogg::getid::DefaultType::Way,
         DefaultTypeArg::Relation => pbfhogg::getid::DefaultType::Relation,
     });
-    match id_file {
-        Some(path) => pbfhogg::getid::parse_ids_from_file_with_default_type(path, default_type),
-        None => pbfhogg::getid::parse_ids_with_default_type(ids, default_type),
+    // Start with CLI positional IDs
+    let mut id_set = pbfhogg::getid::parse_ids_with_default_type(ids, default_type)?;
+    // Merge IDs from text file
+    if let Some(path) = id_file {
+        let file_ids = pbfhogg::getid::parse_ids_from_file_with_default_type(path, default_type)?;
+        pbfhogg::getid::merge_id_sets(&mut id_set, file_ids);
     }
+    // Merge IDs from OSM/PBF file
+    if let Some(path) = id_osm_file {
+        let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io)?;
+        pbfhogg::getid::merge_id_sets(&mut id_set, pbf_ids);
+    }
+    if id_set.node_ids.is_empty() && id_set.way_ids.is_empty() && id_set.relation_ids.is_empty() {
+        return Err("no IDs specified (use positional args, -i FILE, or -I OSM-FILE)".into());
+    }
+    Ok(id_set)
 }
 
 fn run_diff(
@@ -1301,6 +1325,7 @@ fn run_getid(
     output: &std::path::Path,
     add_referenced: bool,
     id_file: Option<&std::path::Path>,
+    id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
     compression: &str,
@@ -1308,7 +1333,7 @@ fn run_getid(
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let id_set = resolve_ids(id_file, default_type, ids)?;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let stats = pbfhogg::getid::getid(
         file,
         output,
@@ -1326,13 +1351,14 @@ fn run_removeid(
     file: &std::path::Path,
     output: &std::path::Path,
     id_file: Option<&std::path::Path>,
+    id_osm_file: Option<&std::path::Path>,
     default_type: Option<DefaultTypeArg>,
     ids: &[String],
     compression: &str,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
-    let id_set = resolve_ids(id_file, default_type, ids)?;
+    let id_set = resolve_ids(id_file, id_osm_file, default_type, ids, direct_io)?;
     let stats = pbfhogg::getid::removeid(file, output, &id_set, compression, direct_io)?;
     stats.print_summary();
     Ok(())

@@ -124,6 +124,39 @@ pub fn parse_ids_from_file_with_default_type(
     parse_ids_with_default_type(&specs, default_type)
 }
 
+/// Collect all element IDs from a PBF file.
+///
+/// Reads every node, way, and relation in the file and adds its ID to the
+/// returned `IdSet`. No member or reference IDs are collected — only
+/// top-level element IDs (matching osmium's `--id-osm-file` behavior).
+pub fn parse_ids_from_pbf(path: &Path, direct_io: bool) -> Result<IdSet> {
+    let reader = ElementReader::open(path, direct_io)?;
+    let mut set = IdSet {
+        node_ids: BTreeSet::new(),
+        way_ids: BTreeSet::new(),
+        relation_ids: BTreeSet::new(),
+    };
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => { set.node_ids.insert(dn.id()); }
+                Element::Node(n) => { set.node_ids.insert(n.id()); }
+                Element::Way(w) => { set.way_ids.insert(w.id()); }
+                Element::Relation(r) => { set.relation_ids.insert(r.id()); }
+            }
+        }
+    }
+    Ok(set)
+}
+
+/// Merge two `IdSet`s together (union).
+pub fn merge_id_sets(a: &mut IdSet, b: IdSet) {
+    a.node_ids.extend(b.node_ids);
+    a.way_ids.extend(b.way_ids);
+    a.relation_ids.extend(b.relation_ids);
+}
+
 // ---------------------------------------------------------------------------
 // Stats
 // ---------------------------------------------------------------------------

@@ -140,7 +140,7 @@ osmium-tool installed version as of 2026-03-04.
 |---|---|---|
 | `-r, --add-referenced` | `-r, --add-referenced` | Have it |
 | `-i, --id-file` | `-i, --id-file` | Have it |
-| `-I, --id-osm-file` | — | Missing (read IDs from OSM file) |
+| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it (scans all element IDs, additive with -i and CLI args) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `-t, --remove-tags` | — | Missing |
 | `--verbose-ids` | — | Missing |
@@ -160,7 +160,7 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `-i, --id-file` | `-i, --id-file` | Have it |
-| `-I, --id-osm-file` | — | Missing |
+| `-I, --id-osm-file` | `-I, --id-osm-file` | Have it (scans all element IDs, additive with -i and CLI args) |
 | `--default-type` | `--default-type` | Have it |
 
 ### `sort`

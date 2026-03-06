@@ -104,8 +104,9 @@ constraints before designing the consolidated API.
 
 ## Missing flags on existing commands (osmium parity)
 
-- [ ] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file instead
-  of a text file. Useful in scripted pipelines.
+- [x] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file.
+  Scans all elements, collects top-level IDs (no member/ref IDs).
+  Additive with CLI args and `--id-file`.
 - [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
   uses this to cut the planet into 200+ regional extracts in one pass.
 - [ ] **`inspect -e` (extended)** — full-scan mode producing element counts,

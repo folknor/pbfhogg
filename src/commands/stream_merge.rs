@@ -1,9 +1,9 @@
-//! Streaming element cursor for sorted PBF merge-join operations.
+//! Streaming element cursor and merge-join for sorted PBF operations.
 //!
 //! Provides [`StreamingBlocks`] — a block-level cursor over a pipelined PBF
 //! reader that yields owned elements one at a time, handling block boundaries
-//! transparently. Used by `diff` (and later `derive_changes`) to perform
-//! streaming two-pointer merge-joins in constant memory.
+//! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
+//! over two cursors, used by `diff` and `derive_changes`.
 
 use crate::{BlockType, Element, PipelinedBlocks, PrimitiveBlock};
 
@@ -204,4 +204,104 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> Option<OwnedRelation> {
         }),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// MergeJoinElement trait — shared accessors for the generic merge-join
+// ---------------------------------------------------------------------------
+
+pub(crate) trait MergeJoinElement: Sized {
+    fn id(&self) -> i64;
+    fn is_block_type(bt: BlockType) -> bool;
+    fn equal(a: &Self, b: &Self) -> bool;
+    fn convert(element: &Element<'_>) -> Option<Self>;
+}
+
+impl MergeJoinElement for OwnedNode {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::nodes_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
+}
+
+impl MergeJoinElement for OwnedWay {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::ways_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
+}
+
+impl MergeJoinElement for OwnedRelation {
+    fn id(&self) -> i64 { self.id }
+    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
+    fn equal(a: &Self, b: &Self) -> bool { super::elements_xml::relations_equal(a, b) }
+    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
+}
+
+// ---------------------------------------------------------------------------
+// Generic streaming merge-join
+// ---------------------------------------------------------------------------
+
+/// Result of comparing one pair in the merge-join.
+pub(crate) enum MergeJoinAction<'a, T> {
+    /// Element exists only in old (deleted).
+    OldOnly(&'a T),
+    /// Element exists only in new (created).
+    NewOnly(&'a T),
+    /// Element exists in both but differs (old, new).
+    Modified(&'a T, &'a T),
+    /// Element exists in both and is identical.
+    Equal(&'a T),
+}
+
+/// Streaming two-pointer merge-join for one element type phase.
+///
+/// Pulls elements one at a time from both cursors and classifies each pair
+/// by ID comparison + content equality. The caller provides a single callback
+/// that receives a [`MergeJoinAction`] for each pair.
+pub(crate) fn merge_join_phase<T: MergeJoinElement>(
+    old_src: &mut StreamingBlocks,
+    old_buf: &mut Vec<T>,
+    new_src: &mut StreamingBlocks,
+    new_buf: &mut Vec<T>,
+    mut on_action: impl FnMut(MergeJoinAction<'_, T>) -> Result<()>,
+) -> Result<()> {
+    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+
+    loop {
+        match (&old_elem, &new_elem) {
+            (None, None) => break,
+            (Some(o), None) => {
+                on_action(MergeJoinAction::OldOnly(o))?;
+                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+            }
+            (None, Some(n)) => {
+                on_action(MergeJoinAction::NewOnly(n))?;
+                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+            }
+            (Some(o), Some(n)) => {
+                match super::osm_id_cmp(o.id(), n.id()) {
+                    std::cmp::Ordering::Less => {
+                        on_action(MergeJoinAction::OldOnly(o))?;
+                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        on_action(MergeJoinAction::NewOnly(n))?;
+                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        if T::equal(o, n) {
+                            on_action(MergeJoinAction::Equal(o))?;
+                        } else {
+                            on_action(MergeJoinAction::Modified(o, n))?;
+                        }
+                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
+                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }

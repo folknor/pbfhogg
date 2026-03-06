@@ -3,7 +3,6 @@
 //! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
-use std::cmp::Ordering;
 use std::fs::File;
 use std::io::{self, Write};
 use std::path::Path;
@@ -13,15 +12,11 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use super::elements_xml::{
-    from_decimicro, format_coord, nodes_equal, relations_equal, ways_equal, OwnedMetadata,
-    OwnedNode, OwnedRelation, OwnedWay,
+    from_decimicro, format_coord, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
 };
-use super::stream_merge::{
-    convert_node, convert_relation, convert_way, is_node_block, is_relation_block, is_way_block,
-    next_element, StreamingBlocks,
-};
+use super::stream_merge::{merge_join_phase, MergeJoinAction, StreamingBlocks};
 use super::{require_sorted, Result};
-use crate::{BlockType, Element, ElementReader, MemberType};
+use crate::{ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -86,7 +81,7 @@ pub fn derive_changes(
     // Phase 1: Nodes
     {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_merge_phase::<OwnedNode>(
+        collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.nodes, &mut modifies.nodes, &mut deletes.nodes,
         )?;
@@ -95,7 +90,7 @@ pub fn derive_changes(
     // Phase 2: Ways
     {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_merge_phase::<OwnedWay>(
+        collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.ways, &mut modifies.ways, &mut deletes.ways,
         )?;
@@ -104,7 +99,7 @@ pub fn derive_changes(
     // Phase 3: Relations
     {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_merge_phase::<OwnedRelation>(
+        collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.relations, &mut modifies.relations, &mut deletes.relations,
         )?;
@@ -146,84 +141,11 @@ impl Changes {
 }
 
 // ---------------------------------------------------------------------------
-// MergeElement trait — per-type accessors for the generic merge-join
+// Change collection via shared merge-join
 // ---------------------------------------------------------------------------
 
-trait MergeElement: Sized {
-    fn id(&self) -> i64;
-    fn is_block_type(bt: BlockType) -> bool;
-    fn equal(a: &Self, b: &Self) -> bool;
-    fn convert(element: &Element<'_>) -> Option<Self>;
-}
-
-impl MergeElement for OwnedNode {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { nodes_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
-}
-
-impl MergeElement for OwnedWay {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { ways_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
-}
-
-impl MergeElement for OwnedRelation {
-    fn id(&self) -> i64 { self.id }
-    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
-    fn equal(a: &Self, b: &Self) -> bool { relations_equal(a, b) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
-}
-
-// ---------------------------------------------------------------------------
-// Streaming merge-join
-// ---------------------------------------------------------------------------
-
-/// Classification of a merge-join step.
-enum MergeAction {
-    /// Both cursors exhausted.
-    Done,
-    /// Element exists only in old file — delete.
-    Delete,
-    /// Element exists only in new file — create.
-    Create,
-    /// Element exists in both files but differs — modify (new version wins).
-    Modify,
-    /// Element exists in both files and is identical — skip.
-    Equal,
-}
-
-/// Classify the next merge-join action by comparing current elements.
-///
-/// Borrows both options immutably; the caller acts on the returned action
-/// after the borrows end, enabling ownership transfer.
-fn classify<T: MergeElement>(old: &Option<T>, new: &Option<T>) -> MergeAction {
-    match (old, new) {
-        (None, None) => MergeAction::Done,
-        (Some(_), None) => MergeAction::Delete,
-        (None, Some(_)) => MergeAction::Create,
-        (Some(o), Some(n)) => match super::osm_id_cmp(o.id(), n.id()) {
-            Ordering::Less => MergeAction::Delete,
-            Ordering::Greater => MergeAction::Create,
-            Ordering::Equal => {
-                if T::equal(o, n) {
-                    MergeAction::Equal
-                } else {
-                    MergeAction::Modify
-                }
-            }
-        },
-    }
-}
-
-/// Run one type phase of the streaming merge-join, collecting changes.
-///
-/// Pulls elements from both cursors and classifies each pair. Creates,
-/// modifies, and deletes are pushed into the corresponding output Vecs.
-/// Equal elements are dropped (no output).
-fn streaming_merge_phase<T: MergeElement>(
+/// Run one type phase, collecting creates/modifies/deletes into Vecs.
+fn collect_changes_phase<T: super::stream_merge::MergeJoinElement + Clone>(
     old_src: &mut StreamingBlocks,
     old_buf: &mut Vec<T>,
     new_src: &mut StreamingBlocks,
@@ -232,39 +154,15 @@ fn streaming_merge_phase<T: MergeElement>(
     modifies: &mut Vec<T>,
     deletes: &mut Vec<T>,
 ) -> Result<()> {
-    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-
-    loop {
-        match classify(&old_elem, &new_elem) {
-            MergeAction::Done => break,
-            MergeAction::Delete => {
-                if let Some(o) = old_elem.take() {
-                    deletes.push(o);
-                }
-                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-            }
-            MergeAction::Create => {
-                if let Some(n) = new_elem.take() {
-                    creates.push(n);
-                }
-                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-            }
-            MergeAction::Modify => {
-                old_elem.take();
-                if let Some(n) = new_elem.take() {
-                    modifies.push(n);
-                }
-                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-            }
-            MergeAction::Equal => {
-                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-            }
+    merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
+        match action {
+            MergeJoinAction::OldOnly(o) => deletes.push(o.clone()),
+            MergeJoinAction::NewOnly(n) => creates.push(n.clone()),
+            MergeJoinAction::Modified(_o, n) => modifies.push(n.clone()),
+            MergeJoinAction::Equal(_) => {}
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------

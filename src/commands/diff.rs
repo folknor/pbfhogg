@@ -11,21 +11,18 @@
 //! field (coordinates, tags, refs, members). This makes diff output deterministic regardless
 //! of whether metadata (version, timestamp, changeset, uid) is present, partial, or absent.
 
-use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
 use super::elements_xml::{
-    format_coord, from_decimicro, nodes_equal, relations_equal, ways_equal, OwnedMember,
-    OwnedNode, OwnedRelation, OwnedWay,
+    format_coord, from_decimicro, OwnedMember, OwnedNode, OwnedRelation, OwnedWay,
 };
 use super::stream_merge::{
-    convert_node, convert_relation, convert_way, is_node_block, is_relation_block, is_way_block,
-    next_element, StreamingBlocks,
+    merge_join_phase, MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
 use super::{require_sorted, Result, TypeFilter};
-use crate::{BlobFilter, BlockType, Element, ElementReader, MemberType};
+use crate::{BlobFilter, ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -90,43 +87,27 @@ impl DiffStats {
 }
 
 // ---------------------------------------------------------------------------
-// DiffElement trait — per-type accessors for the generic merge-join
+// Per-type diff helpers
 // ---------------------------------------------------------------------------
 
-trait DiffElement: Sized {
-    fn id(&self) -> i64;
+trait DiffMeta {
     fn version(&self) -> Option<i32>;
     fn type_char() -> char;
-    fn is_block_type(bt: BlockType) -> bool;
-    fn equal(&self, other: &Self) -> bool;
-    fn convert(element: &Element<'_>) -> Option<Self>;
 }
 
-impl DiffElement for OwnedNode {
-    fn id(&self) -> i64 { self.id }
+impl DiffMeta for OwnedNode {
     fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'n' }
-    fn is_block_type(bt: BlockType) -> bool { is_node_block(bt) }
-    fn equal(&self, other: &Self) -> bool { nodes_equal(self, other) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_node(element) }
 }
 
-impl DiffElement for OwnedWay {
-    fn id(&self) -> i64 { self.id }
+impl DiffMeta for OwnedWay {
     fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'w' }
-    fn is_block_type(bt: BlockType) -> bool { is_way_block(bt) }
-    fn equal(&self, other: &Self) -> bool { ways_equal(self, other) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_way(element) }
 }
 
-impl DiffElement for OwnedRelation {
-    fn id(&self) -> i64 { self.id }
+impl DiffMeta for OwnedRelation {
     fn version(&self) -> Option<i32> { self.metadata.as_ref().map(|m| m.version) }
     fn type_char() -> char { 'r' }
-    fn is_block_type(bt: BlockType) -> bool { is_relation_block(bt) }
-    fn equal(&self, other: &Self) -> bool { relations_equal(self, other) }
-    fn convert(element: &Element<'_>) -> Option<Self> { convert_relation(element) }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,147 +165,102 @@ pub fn diff(
     // Phase 1: Nodes
     // Each phase uses local buffers — T changes between phases so they cannot
     // be shared. Allocation is negligible (one block's worth, up to 8000 elements).
+    let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
+
     if filter.nodes {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_diff_phase::<OwnedNode>(
+        run_diff_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
-            (output, options, &mut stats),
-            |out, old, new| write_node_details(out, old, new),
+            &mut ctx, write_node_details,
         )?;
     } else {
-        drain_phase::<OwnedNode>(&mut old_src)?;
-        drain_phase::<OwnedNode>(&mut new_src)?;
+        drain_phase::<OwnedNode>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 2: Ways
     if filter.ways {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_diff_phase::<OwnedWay>(
+        run_diff_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
-            (output, options, &mut stats),
-            |out, old, new| write_way_details(out, old, new),
+            &mut ctx, write_way_details,
         )?;
     } else {
-        drain_phase::<OwnedWay>(&mut old_src)?;
-        drain_phase::<OwnedWay>(&mut new_src)?;
+        drain_phase::<OwnedWay>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 3: Relations
     if filter.relations {
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        streaming_diff_phase::<OwnedRelation>(
+        run_diff_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
-            (output, options, &mut stats),
-            |out, old, new| write_relation_details(out, old, new),
+            &mut ctx, write_relation_details,
         )?;
     } else {
-        drain_phase::<OwnedRelation>(&mut old_src)?;
-        drain_phase::<OwnedRelation>(&mut new_src)?;
+        drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
     }
 
+    drop(ctx);
     Ok(stats)
 }
 
 // ---------------------------------------------------------------------------
-// Generic streaming merge-join
+// Diff phase wrappers over generic merge-join
 // ---------------------------------------------------------------------------
 
-/// Streaming two-pointer merge-join for one element type phase.
-///
-/// Pulls elements one at a time from both cursors and emits diff output
-/// immediately. Stops when both cursors return `None` (phase exhausted).
-fn streaming_diff_phase<T: DiffElement>(
+/// Context for a single diff phase (avoids too-many-arguments lint).
+struct DiffPhaseCtx<'a, W: Write> {
+    output: &'a mut W,
+    opts: &'a DiffOptions,
+    stats: &'a mut DiffStats,
+}
+
+/// Run one diff phase using the shared merge-join, emitting output immediately.
+fn run_diff_phase<T: MergeJoinElement + DiffMeta>(
     old_src: &mut StreamingBlocks,
     old_buf: &mut Vec<T>,
     new_src: &mut StreamingBlocks,
     new_buf: &mut Vec<T>,
-    ctx: (&mut impl Write, &DiffOptions, &mut DiffStats),
-    write_details: impl Fn(&mut dyn Write, &T, &T) -> Result<()>,
+    ctx: &mut DiffPhaseCtx<'_, impl Write>,
+    write_details: fn(&mut dyn Write, &T, &T) -> Result<()>,
 ) -> Result<()> {
-    let (output, opts, stats) = ctx;
-    let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-    let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-
-    loop {
-        match (&old_elem, &new_elem) {
-            (None, None) => break,
-            (Some(o), None) => {
+    let DiffPhaseCtx { output, opts, stats } = ctx;
+    merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
+        match action {
+            MergeJoinAction::OldOnly(o) => {
                 write_compact_line(output, '-', T::type_char(), o.id(), o.version())?;
                 stats.deleted += 1;
-                old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
             }
-            (None, Some(n)) => {
+            MergeJoinAction::NewOnly(n) => {
                 write_compact_line(output, '+', T::type_char(), n.id(), n.version())?;
                 stats.created += 1;
-                new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
-            (Some(o), Some(n)) => {
-                emit_matched_pair(o, n, output, opts, stats, &write_details)?;
-                match super::osm_id_cmp(o.id(), n.id()) {
-                    Ordering::Less => {
-                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                    }
-                    Ordering::Greater => {
-                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-                    }
-                    Ordering::Equal => {
-                        old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
-                        new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Emit output for a pair where both old and new are present.
-///
-/// Factored out to keep `streaming_diff_phase` under clippy's cognitive
-/// complexity threshold.
-fn emit_matched_pair<T: DiffElement>(
-    old: &T,
-    new: &T,
-    output: &mut impl Write,
-    opts: &DiffOptions,
-    stats: &mut DiffStats,
-    write_details: &impl Fn(&mut dyn Write, &T, &T) -> Result<()>,
-) -> Result<()> {
-    match old.id().cmp(&new.id()) {
-        Ordering::Less => {
-            write_compact_line(output, '-', T::type_char(), old.id(), old.version())?;
-            stats.deleted += 1;
-        }
-        Ordering::Greater => {
-            write_compact_line(output, '+', T::type_char(), new.id(), new.version())?;
-            stats.created += 1;
-        }
-        Ordering::Equal => {
-            if T::equal(old, new) {
-                if !opts.suppress_common {
-                    write_compact_line(output, ' ', T::type_char(), old.id(), old.version())?;
-                }
-                stats.common += 1;
-            } else {
-                write_modified_line(output, T::type_char(), old.id(), old.version(), new.version())?;
+            MergeJoinAction::Modified(o, n) => {
+                write_modified_line(output, T::type_char(), o.id(), o.version(), n.version())?;
                 if opts.verbose {
-                    write_details(output, old, new)?;
+                    write_details(output, o, n)?;
                 }
                 stats.modified += 1;
             }
+            MergeJoinAction::Equal(o) => {
+                if !opts.suppress_common {
+                    write_compact_line(output, ' ', T::type_char(), o.id(), o.version())?;
+                }
+                stats.common += 1;
+            }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
-/// Drain remaining elements of type `T` from a cursor without processing.
+/// Drain remaining elements of type `T` from both cursors without processing.
 ///
 /// Called to advance past a skipped phase (e.g. when type_filter excludes
-/// nodes) so the cursor is positioned for the next phase.
-fn drain_phase<T: DiffElement>(source: &mut StreamingBlocks) -> Result<()> {
-    let mut buf = Vec::new();
-    while next_element(source, &mut buf, T::is_block_type, T::convert)?.is_some() {}
-    Ok(())
+/// nodes) so the cursors are positioned for the next phase.
+fn drain_phase<T: MergeJoinElement>(
+    old_src: &mut StreamingBlocks,
+    new_src: &mut StreamingBlocks,
+) -> Result<()> {
+    merge_join_phase::<T>(old_src, &mut Vec::new(), new_src, &mut Vec::new(), |_| Ok(()))
 }
 
 // ---------------------------------------------------------------------------

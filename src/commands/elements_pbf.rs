@@ -105,16 +105,6 @@ impl OwnedMetadata {
         }
     }
 
-    pub(crate) fn from_metadata(meta: Metadata<'_>) -> Self {
-        Self {
-            version: meta.version,
-            timestamp: meta.timestamp,
-            changeset: meta.changeset,
-            uid: meta.uid,
-            user: meta.user.to_owned(),
-            visible: meta.visible,
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

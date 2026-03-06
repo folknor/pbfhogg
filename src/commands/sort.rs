@@ -28,8 +28,8 @@ use super::elements_pbf::{
     write_single_way, OwnedNode, OwnedRelation, OwnedWay,
 };
 use super::{
-    build_output_header, ensure_node_capacity, ensure_relation_capacity, ensure_way_capacity,
-    flush_block, require_indexdata, HeaderOverrides, Result, writer_from_header_bytes,
+    build_output_header, flush_block, require_indexdata, HeaderOverrides, Result,
+    writer_from_header_bytes,
 };
 
 /// Statistics from a sort operation.

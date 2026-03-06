@@ -172,6 +172,11 @@ impl DirectWriter {
         self.file.set_len(self.logical_size)?;
         Ok(())
     }
+
+    /// Fsync the underlying file to ensure durability.
+    pub(crate) fn sync_all(&self) -> io::Result<()> {
+        self.file.sync_all()
+    }
 }
 
 impl Write for DirectWriter {

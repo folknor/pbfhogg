@@ -72,9 +72,15 @@ impl Write for FileWriter {
 
     fn flush(&mut self) -> io::Result<()> {
         match self {
-            FileWriter::Buffered(w) => w.flush(),
+            FileWriter::Buffered(w) => {
+                w.flush()?;
+                w.get_ref().sync_all()
+            }
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => w.flush(),
+            FileWriter::Direct(w) => {
+                w.flush()?;
+                w.sync_all()
+            }
         }
     }
 }

@@ -15,6 +15,7 @@ use std::sync::mpsc;
 use std::sync::Arc;
 
 use rayon::prelude::*;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::blob::{
     decode_blob_to_headerblock, decompress_blob_data_into,
@@ -65,6 +66,17 @@ pub struct MergeStats {
     pub diff_heap_bytes: u64,
     /// Per-blob frame sizes in bytes for percentile computation.
     blob_sizes: Vec<u32>,
+    // -- locations-on-ways stats (only populated when flag is on) --
+    /// Total node IDs needed for OSC ways.
+    pub loc_nodes_needed: u64,
+    /// Node coordinates found in OSC (pre-seeded).
+    pub loc_nodes_from_diff: u64,
+    /// Node coordinates found in base PBF during merge.
+    pub loc_nodes_from_base: u64,
+    /// Node coordinates not found anywhere (0,0 fallback).
+    pub loc_missing: u64,
+    /// Passthrough node blobs decompressed for coordinate extraction.
+    pub loc_node_blobs_scanned: u64,
 }
 
 impl MergeStats {
@@ -86,6 +98,11 @@ impl MergeStats {
             bytes_rewritten: 0,
             diff_heap_bytes: 0,
             blob_sizes: Vec::new(),
+            loc_nodes_needed: 0,
+            loc_nodes_from_diff: 0,
+            loc_nodes_from_base: 0,
+            loc_missing: 0,
+            loc_node_blobs_scanned: 0,
         }
     }
 
@@ -149,6 +166,14 @@ impl MergeStats {
             #[allow(clippy::cast_precision_loss)]
             let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
             eprintln!("  CompactDiffOverlay heap: {mb:.1} MB");
+        }
+        if self.loc_nodes_needed > 0 {
+            eprintln!(
+                "  Locations-on-ways: {} nodes needed, {} from diff, {} from base, {} missing, {} node blobs scanned",
+                self.loc_nodes_needed, self.loc_nodes_from_diff,
+                self.loc_nodes_from_base, self.loc_missing,
+                self.loc_node_blobs_scanned,
+            );
         }
     }
 }
@@ -222,6 +247,116 @@ impl PhaseRss {
             output_max: 0,
             after_flush: 0,
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse node location index for --locations-on-ways
+// ---------------------------------------------------------------------------
+
+/// Sparse node coordinate index for maintaining LocationsOnWays through merges.
+///
+/// Only contains coordinates for nodes referenced by OSC ways. Populated in two
+/// stages: (1) pre-seeded from OSC node creates/modifications, (2) filled from
+/// base PBF during the merge pass for nodes not in the OSC.
+struct NodeLocationIndex {
+    /// Coordinates indexed by node ID (decimicrodegrees).
+    locations: FxHashMap<i64, (i32, i32)>,
+    /// Node IDs still needed from the base PBF (not found in OSC).
+    /// Sorted for range overlap checks against BlobIndex.
+    needed_sorted: Vec<i64>,
+    /// Same IDs as `needed_sorted` but as a set for O(1) membership tests.
+    needed_set: FxHashSet<i64>,
+}
+
+impl NodeLocationIndex {
+    /// Build the index from an already-parsed OSC diff.
+    ///
+    /// 1. Collects all node IDs referenced by OSC ways
+    /// 2. Seeds coordinates from OSC nodes (creates/modifications)
+    /// 3. Remaining needed IDs stored for base PBF extraction
+    fn build_from_diff(diff: &CompactDiffOverlay) -> Self {
+        // Collect all node IDs referenced by OSC ways
+        let mut all_needed: FxHashSet<i64> = FxHashSet::default();
+        for &way_id in diff.way_ids() {
+            if let Some(way) = diff.get_way(way_id) {
+                for node_id in way.refs() {
+                    all_needed.insert(node_id);
+                }
+            }
+        }
+
+        // Seed from OSC nodes
+        let mut locations: FxHashMap<i64, (i32, i32)> =
+            FxHashMap::with_capacity_and_hasher(all_needed.len(), Default::default());
+        let mut still_needed: FxHashSet<i64> = FxHashSet::default();
+
+        for &node_id in &all_needed {
+            if let Some(node) = diff.get_node(node_id) {
+                locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));
+            } else {
+                still_needed.insert(node_id);
+            }
+        }
+
+        let mut needed_sorted: Vec<i64> = still_needed.iter().copied().collect();
+        needed_sorted.sort_unstable();
+
+        let seeded = locations.len() as u64;
+        let remaining = still_needed.len() as u64;
+        let total = all_needed.len() as u64;
+        eprintln!(
+            "Locations-on-ways: {total} node IDs needed, {seeded} from diff, {remaining} from base"
+        );
+
+        Self {
+            locations,
+            needed_sorted,
+            needed_set: still_needed,
+        }
+    }
+
+    /// Check if a blob's ID range overlaps any still-needed node IDs.
+    fn overlaps_needed(&self, min_id: i64, max_id: i64) -> bool {
+        if self.needed_sorted.is_empty() {
+            return false;
+        }
+        // Find the first needed ID >= min_id
+        let start = self.needed_sorted.partition_point(|&id| id < min_id);
+        // If that ID is <= max_id, there's overlap
+        start < self.needed_sorted.len() && self.needed_sorted[start] <= max_id
+    }
+
+    /// Extract needed coordinates from a decoded PrimitiveBlock.
+    fn extract_from_block(&mut self, block: &PrimitiveBlock) -> u64 {
+        let mut found: u64 = 0;
+        for element in block.elements_skip_metadata() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    if self.needed_set.contains(&dn.id()) {
+                        self.locations
+                            .insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
+                        self.needed_set.remove(&dn.id());
+                        found += 1;
+                    }
+                }
+                Element::Node(n) => {
+                    if self.needed_set.contains(&n.id()) {
+                        self.locations
+                            .insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
+                        self.needed_set.remove(&n.id());
+                        found += 1;
+                    }
+                }
+                Element::Way(_) | Element::Relation(_) => {}
+            }
+        }
+        found
+    }
+
+    /// Check if all needed nodes have been found.
+    fn all_found(&self) -> bool {
+        self.needed_set.is_empty()
     }
 }
 
@@ -448,11 +583,27 @@ fn write_osc_way(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     way: &crate::osc::CompactWayRef<'_>,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    stats: &mut MergeStats,
 ) -> Result<()> {
     ensure_way_capacity(bb, writer)?;
     let tags: Vec<(&str, &str)> = way.tags().collect();
     let refs: Vec<i64> = way.refs().collect();
-    bb.add_way(way.id(), &tags, &refs, None);
+    if let Some(locs) = loc_map {
+        let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
+        for &node_id in &refs {
+            match locs.get(&node_id) {
+                Some(&loc) => locations.push(loc),
+                None => {
+                    stats.loc_missing += 1;
+                    locations.push((0, 0));
+                }
+            }
+        }
+        bb.add_way_with_locations(way.id(), &tags, &refs, &locations, None);
+    } else {
+        bb.add_way(way.id(), &tags, &refs, None);
+    }
     Ok(())
 }
 
@@ -543,6 +694,62 @@ fn write_base_way_local(
     Ok(())
 }
 
+/// Write a surviving base way with LocationsOnWays data preserved.
+///
+/// Like `write_base_way_local` but also forwards raw `lat_data`/`lon_data` bytes.
+fn write_base_way_local_with_locations(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    way: &crate::Way<'_>,
+    block: &PrimitiveBlock,
+) -> Result<()> {
+    ensure_way_capacity_local(bb, output)?;
+    if !bb.is_pre_seeded() {
+        flush_local(bb, output)?;
+        bb.pre_seed_string_table(block);
+    }
+    bb.add_way_raw_bytes_with_locations(
+        way.id(),
+        way.keys_data(),
+        way.vals_data(),
+        way.refs_data(),
+        way.lat_data(),
+        way.lon_data(),
+        way.info_data(),
+    );
+    Ok(())
+}
+
+/// Write an OSC way with optional LocationsOnWays coordinate lookup.
+fn write_osc_way_local(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    way: &crate::osc::CompactWayRef<'_>,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+    stats: &mut MergeStats,
+) -> Result<()> {
+    ensure_way_capacity_local(bb, output)?;
+    let tags: Vec<(&str, &str)> = way.tags().collect();
+    let refs: Vec<i64> = way.refs().collect();
+
+    if let Some(locs) = loc_map {
+        let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
+        for &node_id in &refs {
+            match locs.get(&node_id) {
+                Some(&loc) => locations.push(loc),
+                None => {
+                    stats.loc_missing += 1;
+                    locations.push((0, 0));
+                }
+            }
+        }
+        bb.add_way_with_locations(way.id(), &tags, &refs, &locations, None);
+    } else {
+        bb.add_way(way.id(), &tags, &refs, None);
+    }
+    Ok(())
+}
+
 fn write_base_relation_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
@@ -571,20 +778,47 @@ fn write_base_relation_local(
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::redundant_closure_for_method_calls)]
-fn build_header_bytes(header: &crate::HeaderBlock) -> Result<Vec<u8>> {
-    super::warn_locations_on_ways_loss(header);
-    build_output_header(header, false, |hb| hb.sorted())
+fn build_header_bytes(
+    header: &crate::HeaderBlock,
+    locations_on_ways: bool,
+) -> Result<Vec<u8>> {
+    if locations_on_ways {
+        if !header.has_locations_on_ways() {
+            return Err(
+                "merge --locations-on-ways requires the base PBF to have LocationsOnWays. \
+                 Run add-locations-to-ways first to bootstrap coordinates."
+                    .into(),
+            );
+        }
+        if !header.is_sorted() {
+            return Err(
+                "merge --locations-on-ways requires a sorted base PBF (Sort.Type_then_ID). \
+                 All nodes must precede all ways in the file."
+                    .into(),
+            );
+        }
+        build_output_header(header, false, |hb| {
+            hb.sorted().optional_feature("LocationsOnWays")
+        })
+    } else {
+        super::warn_locations_on_ways_loss(header);
+        build_output_header(header, false, |hb| hb.sorted())
+    }
 }
 
 /// Read the OSMHeader blob from a base PBF and return rebuilt header bytes.
-fn read_header(base_pbf: &Path, direct_io: bool) -> Result<Vec<u8>> {
+fn read_header(
+    base_pbf: &Path,
+    direct_io: bool,
+    locations_on_ways: bool,
+) -> Result<Vec<u8>> {
     let mut reader = FileReader::open(base_pbf, direct_io)?;
     let mut offset: u64 = 0;
     loop {
         match read_raw_frame(&mut reader, &mut offset)? {
             Some(frame) if frame.blob_type == BlobKind::OsmHeader => {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                return build_header_bytes(&header);
+                return build_header_bytes(&header, locations_on_ways);
             }
             Some(_) => {}
             None => return Err("base PBF has no OSMHeader blob".into()),
@@ -686,6 +920,7 @@ struct RewriteOutput {
 }
 
 /// Emit a single create element into the local BlockBuilder.
+#[allow(clippy::too_many_arguments)]
 fn emit_create_local(
     id: i64,
     kind: ElemKind,
@@ -693,6 +928,7 @@ fn emit_create_local(
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
     stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<()> {
     match kind {
         ElemKind::Node => {
@@ -705,10 +941,7 @@ fn emit_create_local(
         }
         ElemKind::Way => {
             if let Some(osc) = diff.get_way(id) {
-                ensure_way_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> = osc.tags().collect();
-                let refs: Vec<i64> = osc.refs().collect();
-                bb.add_way(osc.id(), &tags, &refs, None);
+                write_osc_way_local(bb, output, &osc, loc_map, stats)?;
                 stats.diff_ways += 1;
             }
         }
@@ -744,6 +977,7 @@ fn rewrite_block_parallel(
     bb: &mut BlockBuilder,
     inline_upserts: &[i64],
     kind: ElemKind,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<RewriteOutput> {
     let mut output: Vec<OwnedBlock> = Vec::new();
     let mut stats = MergeStats::new();
@@ -763,7 +997,7 @@ fn rewrite_block_parallel(
         while upsert_cursor < inline_upserts.len() && super::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
-            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats)?;
+            emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
         }
         // Skip modification IDs (handled below by normal element processing)
         if upsert_cursor < inline_upserts.len() && inline_upserts[upsert_cursor] == elem_id {
@@ -806,12 +1040,12 @@ fn rewrite_block_parallel(
                 if diff.deleted_ways.contains(&id) {
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_way(id) {
-                    ensure_way_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> = osc.tags().collect();
-                    let refs: Vec<i64> = osc.refs().collect();
-                    bb.add_way(osc.id(), &tags, &refs, None);
-
+                    write_osc_way_local(bb, &mut output, &osc, loc_map, &mut stats)?;
                     stats.diff_ways += 1;
+                } else if loc_map.is_some() {
+                    // Forward existing raw lat/lon data for LocationsOnWays
+                    write_base_way_local_with_locations(bb, &mut output, w, block)?;
+                    stats.base_ways += 1;
                 } else {
                     write_base_way_local(bb, &mut output, w, block)?;
                     stats.base_ways += 1;
@@ -846,7 +1080,7 @@ fn rewrite_block_parallel(
     while upsert_cursor < inline_upserts.len() {
         let cid = inline_upserts[upsert_cursor];
         upsert_cursor += 1;
-        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats)?;
+        emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
     }
 
     // Flush remaining elements in the BlockBuilder
@@ -959,6 +1193,7 @@ fn classify_only(
 // ---------------------------------------------------------------------------
 
 /// Emit a single create element via PbfWriter (for gap creates and trailing creates).
+#[allow(clippy::too_many_arguments)]
 fn emit_create_for_output(
     id: i64,
     kind: ElemKind,
@@ -966,6 +1201,7 @@ fn emit_create_for_output(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<()> {
     match kind {
         ElemKind::Node => {
@@ -978,7 +1214,7 @@ fn emit_create_for_output(
         }
         ElemKind::Way => {
             if let Some(osc) = diff.get_way(id) {
-                write_osc_way(bb, writer, &osc)?;
+                write_osc_way(bb, writer, &osc, loc_map, stats)?;
                 stats.diff_ways += 1;
             }
         }
@@ -1014,6 +1250,7 @@ pub struct MergeOptions {
     pub direct_io: bool,
     pub io_uring: bool,
     pub force: bool,
+    pub locations_on_ways: bool,
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
@@ -1024,7 +1261,7 @@ pub fn merge(
     output_pbf: &Path,
     opts: &MergeOptions,
 ) -> Result<MergeStats> {
-    let MergeOptions { compression, direct_io, io_uring, force } = *opts;
+    let MergeOptions { compression, direct_io, io_uring, force, locations_on_ways } = *opts;
     require_indexdata(base_pbf, direct_io, force,
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).")?;
@@ -1064,8 +1301,16 @@ pub fn merge(
         ranges.node_ids.len(), ranges.way_ids.len(), ranges.rel_ids.len(),
     );
 
+    // Step 2.5: Build sparse node location index for --locations-on-ways
+    let mut loc_index = if locations_on_ways {
+        let idx = NodeLocationIndex::build_from_diff(&diff);
+        Some(idx)
+    } else {
+        None
+    };
+
     // Step 3: Read header from base PBF (for writer setup)
-    let header_bytes = read_header(base_pbf, direct_io)?;
+    let header_bytes = read_header(base_pbf, direct_io, locations_on_ways)?;
 
     // Step 4: Create pipelined writer
     let mut writer = writer_from_header_bytes(
@@ -1163,6 +1408,64 @@ pub fn merge(
             }
         }
 
+        // Phase 2.5: Extract node coordinates for --locations-on-ways.
+        // Must complete BEFORE Phase 3 spawns way rewrites that read the index.
+        if let Some(ref mut idx) = loc_index {
+            if !idx.all_found() {
+                for (i, slot) in slots.iter().enumerate() {
+                    let blob_index = match slot {
+                        BatchSlot::Passthrough { index, .. }
+                        | BatchSlot::FalsePositive { index, .. }
+                        | BatchSlot::Rewrite { index, .. } => index,
+                    };
+                    if blob_index.kind != ElemKind::Node
+                        || !idx.overlaps_needed(blob_index.min_id, blob_index.max_id)
+                    {
+                        continue;
+                    }
+                    match slot {
+                        BatchSlot::Rewrite { job_index, .. } => {
+                            // Already parsed — extract directly
+                            let found = idx.extract_from_block(&rewrite_jobs[*job_index].block);
+                            stats.loc_nodes_from_base += found;
+                        }
+                        BatchSlot::Passthrough { .. } | BatchSlot::FalsePositive { .. } => {
+                            // Decompress and parse to extract needed coordinates
+                            let mut buf = Vec::new();
+                            if let Err(e) =
+                                decompress_blob_data_into(batch[i].blob_bytes(), &mut buf)
+                            {
+                                eprintln!(
+                                    "Warning: failed to decompress node blob for \
+                                     location extraction: {e}"
+                                );
+                                continue;
+                            }
+                            let bytes_owned = Bytes::from(buf);
+                            if let Ok(block) =
+                                parse_primitive_block_from_bytes_owned(&bytes_owned)
+                            {
+                                let found = idx.extract_from_block(&block);
+                                stats.loc_nodes_from_base += found;
+                            }
+                            stats.loc_node_blobs_scanned += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Snapshot the location index for rewrite tasks that need it (way blobs).
+        // Only clones when this batch has way rewrites and the flag is on.
+        let loc_snapshot: Option<Arc<FxHashMap<i64, (i32, i32)>>> =
+            if loc_index.is_some()
+                && rewrite_jobs.iter().any(|j| j.kind == ElemKind::Way)
+            {
+                loc_index.as_ref().map(|idx| Arc::new(idx.locations.clone()))
+            } else {
+                None
+            };
+
         // Phase 3+4: Spawn parallel rewrites, then stream output in file order.
         // Each rayon task owns its RewriteJob (including PrimitiveBlock), freeing
         // memory as soon as the task completes rather than holding all blocks until
@@ -1181,6 +1484,7 @@ pub fn merge(
             let tx = rewrite_tx.clone();
             let diff_clone = Arc::clone(&diff);
             let ranges_clone = Arc::clone(&ranges);
+            let loc_clone = if job.kind == ElemKind::Way { loc_snapshot.clone() } else { None };
             rayon::spawn(move || {
                 let mut task_bb = BlockBuilder::new();
                 let upserts = ranges_clone.upserts(job.kind);
@@ -1191,6 +1495,7 @@ pub fn merge(
                     &mut task_bb,
                     inline_slice,
                     job.kind,
+                    loc_clone.as_deref(),
                 )
                 .map_err(|e| e.to_string());
                 // job (PrimitiveBlock) dropped here — freed before other tasks finish
@@ -1221,9 +1526,10 @@ pub fn merge(
                 && prev != blob_kind
             {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+                let lm = loc_index.as_ref().map(|idx| &idx.locations);
                 flush_remaining_upserts(
                     prev, blob_kind, &ranges, &diff,
-                    &mut cursors, &mut bb, &mut writer, &mut stats,
+                    &mut cursors, &mut bb, &mut writer, &mut stats, lm,
                 )?;
             }
             last_type = Some(blob_kind);
@@ -1233,9 +1539,10 @@ pub fn merge(
             let has_gap = has_gap_creates(blob_kind, osm_first, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+                let lm = loc_index.as_ref().map(|idx| &idx.locations);
                 emit_gap_creates(
                     blob_kind, osm_first, &ranges,
-                    &diff, &mut cursors, &mut bb, &mut writer, &mut stats,
+                    &diff, &mut cursors, &mut bb, &mut writer, &mut stats, lm,
                 )?;
                 flush_block(&mut bb, &mut writer)?;
             }
@@ -1367,7 +1674,8 @@ pub fn merge(
     for &kind in types_to_flush {
         let (cursor, upserts) = cursors.get_mut(kind, &ranges);
         while *cursor < upserts.len() {
-            emit_create_for_output(upserts[*cursor], kind, &diff, &mut bb, &mut writer, &mut stats)?;
+            let lm = loc_index.as_ref().map(|idx| &idx.locations);
+            emit_create_for_output(upserts[*cursor], kind, &diff, &mut bb, &mut writer, &mut stats, lm)?;
             *cursor += 1;
         }
         flush_block(&mut bb, &mut writer)?;
@@ -1383,6 +1691,13 @@ pub fn merge(
     {
         phase_rss.after_flush = read_rss_kb();
     }
+    // Populate location stats from the index (if active)
+    if let Some(ref idx) = loc_index {
+        stats.loc_nodes_needed = idx.locations.len() as u64 + idx.needed_set.len() as u64;
+        stats.loc_nodes_from_diff =
+            stats.loc_nodes_needed - stats.loc_nodes_from_base - idx.needed_set.len() as u64;
+    }
+
     stats.print_summary();
 
     #[cfg(feature = "hotpath")]
@@ -1419,11 +1734,12 @@ fn flush_remaining_upserts(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<()> {
     // Flush remaining creates of the previous type
     let (cursor, upserts) = cursors.get_mut(prev, ranges);
     while *cursor < upserts.len() {
-        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats)?;
+        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc_map)?;
         *cursor += 1;
     }
     flush_block(bb, writer)?;
@@ -1432,7 +1748,7 @@ fn flush_remaining_upserts(
     if prev == ElemKind::Node && next == ElemKind::Relation {
         let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
         while *cursor < upserts.len() {
-            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats)?;
+            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats, loc_map)?;
             *cursor += 1;
         }
         flush_block(bb, writer)?;
@@ -1452,10 +1768,11 @@ fn emit_gap_creates(
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
     stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
 ) -> Result<()> {
     let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
     while *cursor < upserts.len() && super::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
-        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats)?;
+        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
         *cursor += 1;
     }
     Ok(())

@@ -114,9 +114,9 @@ osmium-tool installed version as of 2026-03-04.
 |---|---|---|
 | `-c, --suppress-common` | `-c, --suppress-common` | Have it |
 | `-t, --object-type` | `-t, --type` | Have it |
-| `--ignore-changeset` | — | Missing |
-| `--ignore-uid` | — | Missing |
-| `--ignore-user` | — | Missing |
+| `--ignore-changeset` | `--ignore-changeset` | Have it (compatibility flag, already ignored by default) |
+| `--ignore-uid` | `--ignore-uid` | Have it (compatibility flag, already ignored by default) |
+| `--ignore-user` | `--ignore-user` | Have it (compatibility flag, already ignored by default) |
 | `-q, --quiet` | `-q, --quiet` | Have it |
 | `-o, --output` | `-o, --output` | Have it |
 | `-s, --summary` | — | Missing (summary on stderr) |
@@ -144,7 +144,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
 | `-t, --remove-tags` | — | Missing |
 | `--verbose-ids` | — | Missing |
-| `--default-type` | — | Missing (default type for bare numeric IDs) |
+| `--default-type` | `--default-type` | Have it |
 
 ### `merge` (apply-changes)
 
@@ -153,7 +153,7 @@ osmium-tool installed version as of 2026-03-04.
 | (base + changes) | base + changes | Have it |
 | `--redact` | — | N/A (requires history file support) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `--locations-on-ways` | — | Missing |
+| `--locations-on-ways` | `--locations-on-ways` | Have it |
 
 ### `removeid`
 
@@ -161,7 +161,7 @@ osmium-tool installed version as of 2026-03-04.
 |---|---|---|
 | `-i, --id-file` | `-i, --id-file` | Have it |
 | `-I, --id-osm-file` | — | Missing |
-| `--default-type` | — | Missing |
+| `--default-type` | `--default-type` | Have it |
 
 ### `sort`
 

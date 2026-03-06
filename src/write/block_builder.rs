@@ -779,6 +779,42 @@ impl BlockBuilder {
         self.count += 1;
     }
 
+    /// Add a way using raw wire-format bytes, including LocationsOnWays data.
+    ///
+    /// Like `add_way_raw_bytes` but also passes through raw lat/lon packed field
+    /// bytes (protobuf fields 9 and 10) for LocationsOnWays preservation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn add_way_raw_bytes_with_locations(
+        &mut self,
+        id: i64,
+        keys_data: &[u8],
+        vals_data: &[u8],
+        refs_data: &[u8],
+        lat_data: &[u8],
+        lon_data: &[u8],
+        info_data: Option<&[u8]>,
+    ) {
+        assert!(
+            self.can_add_way(),
+            "cannot add way: block full or wrong type"
+        );
+        self.block_type = Some(BlockType::Ways);
+        collect_packed_varint_keys(keys_data, &mut self.tag_key_indices);
+        encode_way_raw_bytes_with_locations(
+            &mut self.group_buf,
+            &mut self.elem_scratch,
+            id,
+            keys_data,
+            vals_data,
+            refs_data,
+            lat_data,
+            lon_data,
+            info_data,
+        );
+        self.track_id(id);
+        self.count += 1;
+    }
+
     /// Add a relation using raw wire-format bytes from the input PBF.
     ///
     /// All byte slices are raw protobuf packed field content from the source
@@ -1293,6 +1329,38 @@ fn encode_way_raw_bytes(
         encode_bytes_field(elem, 4, info);
     }
     encode_bytes_field(elem, 8, refs_data);
+    encode_bytes_field(group_buf, 3, elem);
+}
+
+/// Encode a Way with LocationsOnWays raw bytes and append to `group_buf`.
+///
+/// Same as `encode_way_raw_bytes` but also writes fields 9 (lat) and 10 (lon).
+#[allow(clippy::too_many_arguments)]
+fn encode_way_raw_bytes_with_locations(
+    group_buf: &mut Vec<u8>,
+    elem: &mut Vec<u8>,
+    id: i64,
+    keys_data: &[u8],
+    vals_data: &[u8],
+    refs_data: &[u8],
+    lat_data: &[u8],
+    lon_data: &[u8],
+    info_data: Option<&[u8]>,
+) {
+    elem.clear();
+    encode_int64_field(elem, 1, id);
+    encode_bytes_field(elem, 2, keys_data);
+    encode_bytes_field(elem, 3, vals_data);
+    if let Some(info) = info_data {
+        encode_bytes_field(elem, 4, info);
+    }
+    encode_bytes_field(elem, 8, refs_data);
+    if !lat_data.is_empty() {
+        encode_bytes_field(elem, 9, lat_data);
+    }
+    if !lon_data.is_empty() {
+        encode_bytes_field(elem, 10, lon_data);
+    }
     encode_bytes_field(group_buf, 3, elem);
 }
 

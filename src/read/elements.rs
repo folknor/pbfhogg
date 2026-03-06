@@ -251,6 +251,16 @@ impl<'a> Way<'a> {
     pub(crate) fn info_data(&self) -> Option<&[u8]> {
         self.way.info_data
     }
+
+    /// Raw packed sint64 delta-encoded bytes for node latitudes (LocationsOnWays).
+    pub(crate) fn lat_data(&self) -> &[u8] {
+        self.way.lat_data
+    }
+
+    /// Raw packed sint64 delta-encoded bytes for node longitudes (LocationsOnWays).
+    pub(crate) fn lon_data(&self) -> &[u8] {
+        self.way.lon_data
+    }
 }
 
 /// An OpenStreetMap relation element (See [OSM wiki](http://wiki.openstreetmap.org/wiki/Relation)).

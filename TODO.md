@@ -99,9 +99,10 @@ constraints before designing the consolidated API.
   useful for debugging deleted objects.
 - [x] **`diff --quiet`** — exit-code-only mode for CI/scripts without full textual diff.
 - [x] **`diff --output <file>`** — write diff report to file instead of stdout.
-- [ ] **`merge --locations-on-ways`** — preserve existing way-node locations
-  during apply-changes merge. Likely used in Geofabrik/AWS pipelines that
-  run ALTW before merge.
+- [x] **`merge --locations-on-ways`** — preserve and update way-node
+  coordinates through OSC diffs. Surviving base ways forward raw lat/lon
+  bytes; OSC ways look up coordinates from a sparse node index built from
+  the diff and base PBF. Requires sorted base PBF with LocationsOnWays.
 - [ ] **`derive-changes --update-timestamp`** — set delete timestamp to current
   time. May be used in replication pipelines.
 - [x] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a

@@ -351,6 +351,10 @@ enum Command {
         uring: UringArg,
         #[command(flatten)]
         force: ForceArg,
+        /// Preserve and update way-node locations through the merge.
+        /// Requires the base PBF to have LocationsOnWays and be sorted.
+        #[arg(long)]
+        locations_on_ways: bool,
     },
     /// Merge multiple OSC files into one OSC file
     MergeChanges {
@@ -701,6 +705,7 @@ fn main() {
             force,
             io,
             uring,
+            locations_on_ways,
         } => run_merge(
             &base,
             &changes,
@@ -709,6 +714,7 @@ fn main() {
             io.direct_io,
             uring.io_uring,
             force.force,
+            locations_on_ways,
         ),
         Command::MergeChanges {
             changes,
@@ -1423,6 +1429,7 @@ fn run_merge(
     direct_io: bool,
     io_uring: bool,
     force: bool,
+    locations_on_ways: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
     let opts = pbfhogg::merge::MergeOptions {
@@ -1430,6 +1437,7 @@ fn run_merge(
         direct_io,
         io_uring,
         force,
+        locations_on_ways,
     };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     stats.print_summary();
@@ -1707,6 +1715,7 @@ fn run_bench_merge(
         direct_io: false,
         io_uring,
         force: true,
+        locations_on_ways: false,
     };
     let stats = pbfhogg::merge::merge(base, changes, output, &opts)?;
     let elapsed_ms = start.elapsed().as_millis();

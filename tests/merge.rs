@@ -83,7 +83,7 @@ fn merge_basic_create_modify_delete() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes: 1 (unchanged), 2 (modified), 4 (created). Node 3 deleted.
@@ -143,7 +143,7 @@ fn merge_create_between_existing_ids() {
   </create>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // All 5 nodes present in output.
@@ -190,7 +190,7 @@ fn merge_create_beyond_max_id() {
   </create>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
     assert_eq!(node_ids(&c), vec![1, 2, 3, 100, 200]);
     assert_eq!(c.nodes[3].3, vec![("name".to_string(), "far".to_string())]);
@@ -256,7 +256,7 @@ fn merge_multi_block_partial_rewrite() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Block 1 nodes passed through unchanged
@@ -315,7 +315,7 @@ fn merge_nodes_only_diff_ways_passthrough() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Node 2 modified
@@ -366,7 +366,7 @@ fn merge_ways_only_diff() {
   </delete>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes unchanged
@@ -421,7 +421,7 @@ fn merge_relations_only_diff() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes and ways unchanged
@@ -495,7 +495,7 @@ fn merge_all_types() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     assert_eq!(node_ids(&c), vec![1, 2, 3]);
@@ -570,7 +570,7 @@ fn merge_delete_entire_block() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
     let c = read_all_elements(&output);
 
     // Nodes 1-3 all deleted, only 10-11 survive
@@ -627,7 +627,7 @@ fn merge_stats_accuracy() {
   </delete>
 </osmChange>"#);
 
-    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
 
     assert_eq!(stats.base_nodes, 1, "node 1 passed through from base");
     assert_eq!(stats.diff_nodes, 2, "diff nodes emitted (modify node 2 + create node 4)");
@@ -709,7 +709,7 @@ fn merge_metadata_preservation() {
   </modify>
 </osmChange>"#);
 
-    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("merge");
+    merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("merge");
 
     // Read output and verify metadata on unchanged nodes.
     let reader = BlobReader::from_path(&output).expect("open pbf");
@@ -885,6 +885,282 @@ fn compare_maps<V: std::fmt::Debug + PartialEq>(
     (mismatches, extra, missing)
 }
 
+// ---------------------------------------------------------------------------
+// --locations-on-ways tests
+// ---------------------------------------------------------------------------
+
+/// Helper: write a PBF with LocationsOnWays header feature and sorted flag.
+/// Ways are written with inline node coordinates via `add_way_with_locations`.
+fn write_test_pbf_with_locations(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[(i64, Vec<i64>, Vec<(i32, i32)>, Vec<(&str, &str)>)],
+    relations: &[TestRelation],
+) {
+    let file = std::fs::File::create(path).expect("create file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+    let mut writer = PbfWriter::new(buf, Compression::default());
+    let header = block_builder::HeaderBuilder::new()
+        .sorted()
+        .optional_feature("LocationsOnWays")
+        .build()
+        .expect("build header");
+    writer.write_header(&header).expect("write header");
+
+    let mut bb = BlockBuilder::new();
+
+    for n in nodes {
+        if !bb.can_add_node()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for &(id, ref refs, ref locations, ref tags) in ways {
+        if !bb.can_add_way()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let tag_refs: Vec<(&str, &str)> = tags.iter().map(|&(k, v)| (k, v)).collect();
+        bb.add_way_with_locations(id, &tag_refs, refs, locations, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    for r in relations {
+        if !bb.can_add_relation()
+            && let Some(bytes) = bb.take().expect("take")
+        {
+            writer.write_primitive_block(bytes).expect("write block");
+        }
+        let members: Vec<block_builder::MemberData<'_>> = r
+            .members
+            .iter()
+            .map(|m| block_builder::MemberData { id: m.id, role: m.role })
+            .collect();
+        bb.add_relation(r.id, &r.tags, &members, None);
+    }
+    if !bb.is_empty()
+        && let Some(bytes) = bb.take().expect("take")
+    {
+        writer.write_primitive_block(bytes).expect("write block");
+    }
+
+    writer.flush().expect("flush");
+}
+
+/// Read way node locations from a PBF output. Returns Vec<(way_id, Vec<(lat, lon)>)>
+/// where lat/lon are in decimicrodegrees.
+fn read_way_locations(path: &Path) -> Vec<(i64, Vec<(i32, i32)>)> {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut result = Vec::new();
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w.node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    result.push((w.id(), locs));
+                }
+            }
+        }
+    }
+    result
+}
+
+/// Merge with --locations-on-ways: surviving base ways preserve their coordinates,
+/// OSC ways (modify/create) get coordinates looked up from the sparse index.
+#[test]
+fn merge_locations_on_ways_basic() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Base PBF: 3 nodes, 2 ways with coordinates.
+    // Way 10 refs [1, 2], way 20 refs [2, 3].
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![] },
+        ],
+        &[
+            (10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![("highway", "road")]),
+            (20, vec![2, 3], vec![(300_000_000, 400_000_000), (500_000_000, 600_000_000)], vec![("highway", "path")]),
+        ],
+        &[],
+    );
+
+    // OSC: modify way 10 (change refs to [1, 3]), create way 30 (refs [1, 2, 3]).
+    // Node coordinates should be looked up from base nodes.
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="3"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <create>
+    <way id="30" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <nd ref="3"/>
+      <tag k="highway" v="footway"/>
+    </way>
+  </create>
+</osmChange>"#);
+
+    let stats = merge(&base, &osc, &output, &MergeOptions {
+        compression: Compression::default(),
+        direct_io: false,
+        io_uring: false,
+        force: true,
+        locations_on_ways: true,
+    }).expect("merge");
+
+    // Check location stats
+    assert!(stats.loc_nodes_needed > 0, "should need node coords");
+    assert_eq!(stats.loc_missing, 0, "all nodes should be found");
+
+    // Read output header — should have LocationsOnWays
+    let header = common::read_header(&output);
+    assert!(header.has_locations_on_ways(), "output must have LocationsOnWays");
+
+    // Read way locations
+    let locs = read_way_locations(&output);
+    assert_eq!(locs.len(), 3, "3 ways in output");
+
+    // Way 10 (modified from OSC): refs [1, 3] → coords from base nodes
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+    assert_eq!(way10.1, vec![
+        (100_000_000, 200_000_000), // node 1
+        (500_000_000, 600_000_000), // node 3
+    ]);
+
+    // Way 20 (unchanged base way): should preserve original coordinates
+    let way20 = locs.iter().find(|(id, _)| *id == 20).expect("way 20");
+    assert_eq!(way20.1, vec![
+        (300_000_000, 400_000_000), // node 2
+        (500_000_000, 600_000_000), // node 3
+    ]);
+
+    // Way 30 (created from OSC): refs [1, 2, 3] → coords from base nodes
+    let way30 = locs.iter().find(|(id, _)| *id == 30).expect("way 30");
+    assert_eq!(way30.1, vec![
+        (100_000_000, 200_000_000), // node 1
+        (300_000_000, 400_000_000), // node 2
+        (500_000_000, 600_000_000), // node 3
+    ]);
+}
+
+/// Merge with --locations-on-ways: OSC nodes update the coordinate index.
+/// When a node is modified in the OSC, ways referencing it should get the new coordinates.
+#[test]
+fn merge_locations_on_ways_osc_node_coords() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_with_locations(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![] },
+        ],
+        &[
+            (10, vec![1, 2], vec![(100_000_000, 200_000_000), (300_000_000, 400_000_000)], vec![]),
+        ],
+        &[],
+    );
+
+    // OSC: modify node 2 (new coords) AND modify way 10 (same refs but different version)
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <modify>
+    <node id="2" lat="55.0" lon="12.0" version="2"/>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+</osmChange>"#);
+
+    merge(&base, &osc, &output, &MergeOptions {
+        compression: Compression::default(),
+        direct_io: false,
+        io_uring: false,
+        force: true,
+        locations_on_ways: true,
+    }).expect("merge");
+
+    let locs = read_way_locations(&output);
+    let way10 = locs.iter().find(|(id, _)| *id == 10).expect("way 10");
+
+    // Node 1: unchanged (from base), node 2: modified in OSC to (55.0, 12.0)
+    assert_eq!(way10.1, vec![
+        (100_000_000, 200_000_000), // node 1 from base
+        (550_000_000, 120_000_000), // node 2 from OSC (55.0°, 12.0°)
+    ]);
+}
+
+/// Merge with --locations-on-ways requires LocationsOnWays in base PBF.
+#[test]
+fn merge_locations_on_ways_requires_base_feature() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Write a normal sorted PBF (no LocationsOnWays)
+    common::write_test_pbf_sorted(
+        &base,
+        &[TestNode { id: 1, lat: 0, lon: 0, tags: vec![] }],
+        &[],
+        &[],
+    );
+
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="2" lat="1.0" lon="2.0" version="1"/>
+  </create>
+</osmChange>"#);
+
+    let result = merge(&base, &osc, &output, &MergeOptions {
+        compression: Compression::default(),
+        direct_io: false,
+        io_uring: false,
+        force: true,
+        locations_on_ways: true,
+    });
+
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail without LocationsOnWays in base"),
+    };
+    let err_msg = format!("{err}");
+    assert!(err_msg.contains("LocationsOnWays"), "error should mention LocationsOnWays: {err_msg}");
+}
+
 /// Cross-validate pbfhogg merge against osmium apply-changes on real data.
 ///
 /// Runs both tools on `data/denmark-20260220-seq4704.osm.pbf` +
@@ -930,7 +1206,7 @@ fn merge_cross_validate_osmium() {
     let diff = pbfhogg::osc::parse_osc_file(&osc).expect("parse osc");
 
     eprintln!("Running pbfhogg merge...");
-    merge(&base_pbf, &osc, &pbfhogg_out, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true }).expect("pbfhogg merge");
+    merge(&base_pbf, &osc, &pbfhogg_out, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }).expect("pbfhogg merge");
 
     eprintln!("Running osmium apply-changes...");
     let osmium_result = std::process::Command::new("osmium")

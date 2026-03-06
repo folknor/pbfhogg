@@ -95,7 +95,7 @@ pbfhogg sort <file> -o <out>              Sort into standard order (nodes → wa
 pbfhogg extract <file> -o <out> -b <bbox> Extract by bounding box (minlon,minlat,maxlon,maxlat)
 pbfhogg extract <file> -o <out> -p <geo>  Extract by GeoJSON polygon
 pbfhogg add-locations-to-ways <f> -o <o>  Embed node coordinates in ways
-pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a sorted PBF file (output stays sorted)
+pbfhogg merge <base> <changes> -o <out>   Apply OSC diff to a sorted PBF file (--locations-on-ways)
 pbfhogg derive-changes <old> <new> -o <f> Generate OSC diff from two PBF snapshots
 pbfhogg diff <old> <new>                 Compare two PBFs by content equality (-v verbose, -c hide common)
 pbfhogg tags-count <file>                 Count tag key=value frequencies
@@ -111,6 +111,8 @@ Inspect reports block breakdown by type (DenseNodes/Ways/Relations/Mixed) with c
 Extract supports three strategies: `--simple` (single pass, fast, may have dangling refs), complete-ways (default, two passes, all way nodes included), and `--smart` (three passes, completes multipolygon/boundary relations — all member ways and their nodes are included even if outside the region).
 
 Tags-filter uses OR semantics across expressions. In default mode (without `-R`), it now resolves matched relation members transitively: member ways, member nodes, and nested member relations are included (with cycle-safe recursion), and node refs of included ways are pulled in. With `-R`, only directly matched elements are emitted.
+
+Merge with `--locations-on-ways` preserves and updates inline way-node coordinates through OSC diffs, eliminating the need to re-run `add-locations-to-ways` after each merge. Requires a sorted base PBF with `LocationsOnWays` (bootstrap with `add-locations-to-ways` once). Surviving base ways forward existing coordinates as raw bytes; OSC ways look up node coordinates from a sparse index built from the diff and base PBF.
 
 Add-locations-to-ways uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID). The index is backed by a temporary file that the kernel pages in/out under memory pressure, so it works from country-scale to planet-scale without OOM.
 

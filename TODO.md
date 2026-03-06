@@ -118,5 +118,6 @@ constraints before designing the consolidated API.
 - [x] **`tags-count -e` / `tags-filter -e`** — read expressions from file.
   Additive with CLI args (CLI first, file second). `#` comments, blank lines
   ignored. Also added optional positional expressions to `tags-count`.
-- [ ] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
-  keep non-matching + required references).
+- [x] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,
+  keep non-matching + required references). Blob-level filtering disabled in
+  invert mode since non-matching blobs must be kept.

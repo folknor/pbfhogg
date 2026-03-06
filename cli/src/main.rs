@@ -154,6 +154,9 @@ enum Command {
         /// Omit referenced objects (faster, single pass, direct matches only)
         #[arg(short = 'R', long = "omit-referenced")]
         omit_referenced: bool,
+        /// Invert match: exclude matching objects, keep non-matching
+        #[arg(short = 'i', long = "invert-match")]
+        invert_match: bool,
         /// Read filter expressions from file (one per line, # comments)
         #[arg(short = 'e', long = "expressions")]
         expressions_file: Option<PathBuf>,
@@ -608,6 +611,7 @@ fn main() {
             file,
             output,
             omit_referenced,
+            invert_match,
             expressions_file,
             expressions,
             compression,
@@ -619,6 +623,7 @@ fn main() {
             expressions_file.as_deref(),
             &expressions,
             omit_referenced,
+            invert_match,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -1204,6 +1209,7 @@ fn run_tags_filter(
     expressions_file: Option<&std::path::Path>,
     expressions: &[String],
     omit_referenced: bool,
+    invert_match: bool,
     compression: &str,
     direct_io: bool,
     force: bool,
@@ -1213,15 +1219,15 @@ fn run_tags_filter(
     if all_expressions.is_empty() {
         return Err("no filter expressions provided (use positional args or -e FILE)".into());
     }
-    let stats = pbfhogg::tags_filter::tags_filter(
-        file,
-        output,
-        &all_expressions,
+    let opts = pbfhogg::tags_filter::TagsFilterOptions {
+        expression_strs: &all_expressions,
         omit_referenced,
+        invert: invert_match,
         compression,
         direct_io,
         force,
-    )?;
+    };
+    let stats = pbfhogg::tags_filter::tags_filter(file, output, &opts)?;
     stats.print_summary();
     Ok(())
 }

@@ -135,6 +135,16 @@ impl TagsFilterStats {
 // Public API
 // ---------------------------------------------------------------------------
 
+/// Options for the tags-filter command.
+pub struct TagsFilterOptions<'a> {
+    pub expression_strs: &'a [String],
+    pub omit_referenced: bool,
+    pub invert: bool,
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub force: bool,
+}
+
 /// Filter a PBF file by tag expressions.
 ///
 /// If `omit_referenced` is true (`-R` flag), only directly matching elements
@@ -144,26 +154,25 @@ impl TagsFilterStats {
 pub fn tags_filter(
     input: &Path,
     output: &Path,
-    expression_strs: &[String],
-    omit_referenced: bool,
-    compression: Compression,
-    direct_io: bool,
-    force: bool,
+    opts: &TagsFilterOptions<'_>,
 ) -> Result<TagsFilterStats> {
-    require_indexdata(input, direct_io, force,
-        "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
-         filters are no-ops — all blobs are decompressed (significantly slower).")?;
+    // Blob-level filtering can't help in invert mode (we want non-matching blobs).
+    if !opts.invert {
+        require_indexdata(input, opts.direct_io, opts.force,
+            "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
+             filters are no-ops — all blobs are decompressed (significantly slower).")?;
+    }
 
     {
-        let reader = crate::ElementReader::open(input, direct_io)?;
+        let reader = crate::ElementReader::open(input, opts.direct_io)?;
         super::warn_locations_on_ways_loss(reader.header());
     }
 
-    let expressions = parse_expressions(expression_strs)?;
-    if omit_referenced {
-        tags_filter_single_pass(input, output, &expressions, compression, direct_io)
+    let expressions = parse_expressions(opts.expression_strs)?;
+    if opts.omit_referenced {
+        tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io)
     } else {
-        tags_filter_two_pass(input, output, &expressions, compression, direct_io)
+        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io)
     }
 }
 
@@ -177,6 +186,7 @@ pub fn tags_filter(
 fn filter_block_parallel(
     block: &PrimitiveBlock,
     expressions: &[Expression],
+    invert: bool,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
 ) -> std::result::Result<TagsFilterStats, String> {
@@ -198,7 +208,7 @@ fn filter_block_parallel(
             Element::DenseNode(dn) => {
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
-                if element_matches(expressions, &tags_buf, true, false, false) {
+                if element_matches(expressions, &tags_buf, true, false, false) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(
@@ -214,7 +224,7 @@ fn filter_block_parallel(
             Element::Node(n) => {
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
-                if element_matches(expressions, &tags_buf, true, false, false) {
+                if element_matches(expressions, &tags_buf, true, false, false) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(
@@ -230,7 +240,7 @@ fn filter_block_parallel(
             Element::Way(w) => {
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
-                if element_matches(expressions, &tags_buf, false, true, false) {
+                if element_matches(expressions, &tags_buf, false, true, false) != invert {
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
@@ -242,7 +252,7 @@ fn filter_block_parallel(
             Element::Relation(r) => {
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
-                if element_matches(expressions, &tags_buf, false, false, true) {
+                if element_matches(expressions, &tags_buf, false, false, true) != invert {
                     ensure_relation_capacity_local(bb, output)?;
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
@@ -264,13 +274,19 @@ fn tags_filter_single_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    invert: bool,
     compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
-    let reader = match blob_filter_from_expressions(expressions) {
-        Some(filter) => reader.with_blob_filter(filter),
-        None => reader,
+    // Blob-level filtering can't help in invert mode — we want non-matching blobs.
+    let reader = if invert {
+        reader
+    } else {
+        match blob_filter_from_expressions(expressions) {
+            Some(filter) => reader.with_blob_filter(filter),
+            None => reader,
+        }
     };
     let mut writer = writer_from_header(output, compression, reader.header(), true, |hb| hb)?;
     let mut stats = TagsFilterStats {
@@ -284,7 +300,7 @@ fn tags_filter_single_pass(
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_filter_batch(batch, expressions, &mut writer, &mut stats)
+        process_filter_batch(batch, expressions, invert, &mut writer, &mut stats)
     })?;
 
     writer.flush()?;
@@ -295,6 +311,7 @@ fn tags_filter_single_pass(
 fn process_filter_batch(
     batch: &[PrimitiveBlock],
     expressions: &[Expression],
+    invert: bool,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TagsFilterStats,
 ) -> Result<()> {
@@ -305,7 +322,7 @@ fn process_filter_batch(
             BlockBuilder::new,
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = filter_block_parallel(block, expressions, bb, &mut output)?;
+                let block_stats = filter_block_parallel(block, expressions, invert, bb, &mut output)?;
                 flush_local(bb, &mut output)?;
                 Ok((output, block_stats))
             },
@@ -477,6 +494,7 @@ fn tags_filter_two_pass(
     input: &Path,
     output: &Path,
     expressions: &[Expression],
+    invert: bool,
     compression: Compression,
     direct_io: bool,
 ) -> Result<TagsFilterStats> {
@@ -505,10 +523,15 @@ fn tags_filter_two_pass(
     let mut has_included_relation = false;
 
     // Pass 1: skip blob types that no expression targets.
+    // In invert mode, we need all blob types since non-matching elements are kept.
     let reader = ElementReader::open(input, direct_io)?;
-    let reader = match blob_filter_from_expressions(expressions) {
-        Some(filter) => reader.with_blob_filter(filter),
-        None => reader,
+    let reader = if invert {
+        reader
+    } else {
+        match blob_filter_from_expressions(expressions) {
+            Some(filter) => reader.with_blob_filter(filter),
+            None => reader,
+        }
     };
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -518,21 +541,21 @@ fn tags_filter_two_pass(
                 Element::DenseNode(dn) => {
                     tags_buf.clear();
                     tags_buf.extend(dn.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) {
+                    if element_matches(expressions, &tags_buf, true, false, false) != invert {
                         matched_node_ids.set(dn.id());
                     }
                 }
                 Element::Node(n) => {
                     tags_buf.clear();
                     tags_buf.extend(n.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) {
+                    if element_matches(expressions, &tags_buf, true, false, false) != invert {
                         matched_node_ids.set(n.id());
                     }
                 }
                 Element::Way(w) => {
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
-                    if element_matches(expressions, &tags_buf, false, true, false) {
+                    if element_matches(expressions, &tags_buf, false, true, false) != invert {
                         direct_way_ids.set(w.id());
                         if set_if_absent(&mut included_way_ids, w.id()) {
                             has_included_way = true;
@@ -545,7 +568,7 @@ fn tags_filter_two_pass(
                 Element::Relation(r) => {
                     tags_buf.clear();
                     tags_buf.extend(r.tags());
-                    if element_matches(expressions, &tags_buf, false, false, true) {
+                    if element_matches(expressions, &tags_buf, false, false, true) != invert {
                         direct_relation_ids.set(r.id());
                         if set_if_absent(&mut included_relation_ids, r.id()) {
                             has_included_relation = true;
@@ -581,7 +604,10 @@ fn tags_filter_two_pass(
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
     let reader = ElementReader::open(input, direct_io)?;
-    let reader = if blob_filter_from_expressions(expressions).is_some() {
+    let reader = if invert {
+        // Invert mode: need all blob types (most elements are kept).
+        reader
+    } else if blob_filter_from_expressions(expressions).is_some() {
         // Nodes are always needed for dependency expansion.
         // Ways/relations are included when either directly matched or pulled via relation closure.
         reader.with_blob_filter(BlobFilter::new(true, has_included_way, has_included_relation))

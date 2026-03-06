@@ -18,6 +18,20 @@ pub struct TagCount {
     pub count: u64,
 }
 
+/// Sort order for tag count results.
+#[derive(Clone, Copy, Default)]
+pub enum TagCountSort {
+    /// Count descending (most frequent first) — default.
+    #[default]
+    CountDesc,
+    /// Count ascending (least frequent first).
+    CountAsc,
+    /// Key name ascending, then value ascending.
+    NameAsc,
+    /// Key name descending, then value descending.
+    NameDesc,
+}
+
 /// Count tag key=value frequencies in a PBF file.
 ///
 /// If `type_filter` is set, only count tags on elements of that type
@@ -30,6 +44,8 @@ pub struct TagCount {
 pub fn tags_count(
     path: &Path,
     min_count: u64,
+    max_count: Option<u64>,
+    sort: TagCountSort,
     type_filter: Option<&str>,
     direct_io: bool,
     force: bool,
@@ -61,7 +77,7 @@ pub fn tags_count(
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
     for (key, inner) in counts {
         for (value, count) in inner {
-            if count >= min_count {
+            if count >= min_count && max_count.is_none_or(|max| count <= max) {
                 results.push(TagCount {
                     key: key.clone(),
                     value,
@@ -71,11 +87,27 @@ pub fn tags_count(
         }
     }
 
-    results.sort_by(|a, b| {
-        b.count
+    results.sort_by(|a, b| match sort {
+        TagCountSort::CountDesc => b
+            .count
             .cmp(&a.count)
             .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.value.cmp(&b.value)),
+        TagCountSort::CountAsc => a
+            .count
+            .cmp(&b.count)
+            .then_with(|| a.key.cmp(&b.key))
+            .then_with(|| a.value.cmp(&b.value)),
+        TagCountSort::NameAsc => a
+            .key
+            .cmp(&b.key)
             .then_with(|| a.value.cmp(&b.value))
+            .then_with(|| b.count.cmp(&a.count)),
+        TagCountSort::NameDesc => b
+            .key
+            .cmp(&a.key)
+            .then_with(|| b.value.cmp(&a.value))
+            .then_with(|| b.count.cmp(&a.count)),
     });
 
     Ok(results)

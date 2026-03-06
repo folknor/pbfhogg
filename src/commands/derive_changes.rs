@@ -65,6 +65,7 @@ pub fn derive_changes(
     output: &Path,
     direct_io: bool,
     increment_version: bool,
+    update_timestamp: bool,
 ) -> Result<DeriveChangesStats> {
     // Open readers and verify sorted headers.
     let old_reader = ElementReader::open(old_path, direct_io)?;
@@ -115,7 +116,7 @@ pub fn derive_changes(
         deletes: (deletes.nodes.len() + deletes.ways.len() + deletes.relations.len()) as u64,
     };
 
-    write_osc(output, &creates, &modifies, &deletes, increment_version)?;
+    write_osc(output, &creates, &modifies, &deletes, increment_version, update_timestamp)?;
 
     Ok(stats)
 }
@@ -276,6 +277,7 @@ fn write_osc(
     modifies: &Changes,
     deletes: &Changes,
     increment_version: bool,
+    update_timestamp: bool,
 ) -> Result<()> {
     let file = File::create(output)?;
     let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
@@ -324,13 +326,13 @@ fn write_osc(
     if !deletes.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("delete")))?;
         for node in &deletes.nodes {
-            write_delete_element(&mut writer, "node", node.id, node.metadata.as_ref(), increment_version)?;
+            write_delete_element(&mut writer, "node", node.id, node.metadata.as_ref(), increment_version, update_timestamp)?;
         }
         for way in &deletes.ways {
-            write_delete_element(&mut writer, "way", way.id, way.metadata.as_ref(), increment_version)?;
+            write_delete_element(&mut writer, "way", way.id, way.metadata.as_ref(), increment_version, update_timestamp)?;
         }
         for rel in &deletes.relations {
-            write_delete_element(&mut writer, "relation", rel.id, rel.metadata.as_ref(), increment_version)?;
+            write_delete_element(&mut writer, "relation", rel.id, rel.metadata.as_ref(), increment_version, update_timestamp)?;
         }
         writer.write_event(Event::End(BytesEnd::new("delete")))?;
     }
@@ -432,6 +434,7 @@ fn write_delete_element<W: Write>(
     id: i64,
     metadata: Option<&OwnedMetadata>,
     increment_version: bool,
+    update_timestamp: bool,
 ) -> Result<()> {
     let mut elem = BytesStart::new(tag_name);
     let id_str = id.to_string();
@@ -444,6 +447,13 @@ fn write_delete_element<W: Write>(
         };
         let v_str = version.to_string();
         elem.push_attribute(("version", v_str.as_str()));
+    }
+    if update_timestamp {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let ts = super::format_epoch_secs(now.as_secs());
+        elem.push_attribute(("timestamp", ts.as_str()));
     }
     writer.write_event(Event::Empty(elem))?;
     Ok(())

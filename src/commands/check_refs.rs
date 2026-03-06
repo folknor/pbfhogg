@@ -8,6 +8,16 @@ use crate::{BlobFilter, Element, ElementReader, MemberId};
 
 use super::Result;
 
+/// A single missing reference entry (populated when `show_ids` is true).
+pub struct MissingRef {
+    /// The missing element, e.g. "n123".
+    pub missing_type: char,
+    pub missing_id: i64,
+    /// The element that references it, e.g. "w456".
+    pub referencing_type: char,
+    pub referencing_id: i64,
+}
+
 /// Result of a referential integrity check.
 pub struct RefCheckResult {
     pub node_count: u64,
@@ -17,6 +27,9 @@ pub struct RefCheckResult {
     pub missing_way_refs: u64,
     pub missing_node_members: u64,
     pub missing_relation_members: u64,
+    /// Every missing reference occurrence (populated when `show_ids` is true).
+    /// Not deduplicated — each occurrence is a separate entry.
+    pub missing_refs: Vec<MissingRef>,
 }
 
 impl RefCheckResult {
@@ -83,8 +96,9 @@ impl RefCheckResult {
 /// RoaringTreemap (not RoaringBitmap) is required because RoaringBitmap only
 /// supports `u32` (max ~4.3B), which cannot hold current node IDs exceeding
 /// 10 billion.
+#[allow(clippy::too_many_lines)]
 #[hotpath::measure]
-pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result<RefCheckResult> {
+pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
     let reader = ElementReader::open(path, direct_io)?;
     // Skip relation blobs when not checking relation references.
     let reader = if check_relations {
@@ -110,6 +124,9 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
     // reading completes, when the full relation_ids set is available. This
     // matches osmium's two-pass approach for relation members.
     let mut deferred_relation_refs: Vec<u64> = Vec::new();
+    let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
+
+    let mut missing_refs: Vec<MissingRef> = Vec::new();
 
     let mut result = RefCheckResult {
         node_count: 0,
@@ -119,6 +136,7 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
         missing_way_refs: 0,
         missing_node_members: 0,
         missing_relation_members: 0,
+        missing_refs: Vec::new(),
     };
 
     reader.for_each_pipelined(|element| {
@@ -140,12 +158,19 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
                 for node_ref in w.refs() {
                     if !node_ids.contains(node_ref .cast_unsigned()) {
                         missing_node_refs_set.insert(node_ref .cast_unsigned());
+                        if show_ids {
+                            missing_refs.push(MissingRef {
+                                missing_type: 'n', missing_id: node_ref,
+                                referencing_type: 'w', referencing_id: wid,
+                            });
+                        }
                     }
                 }
             }
             Element::Relation(r) => {
+                let rid = r.id();
                 if check_relations {
-                    relation_ids.insert(r.id() .cast_unsigned());
+                    relation_ids.insert(rid .cast_unsigned());
                 }
                 result.relation_count += 1;
                 if check_relations {
@@ -154,15 +179,32 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
                             MemberId::Node(id) => {
                                 if !node_ids.contains(id .cast_unsigned()) {
                                     missing_node_members_set.insert(id .cast_unsigned());
+                                    if show_ids {
+                                        missing_refs.push(MissingRef {
+                                            missing_type: 'n', missing_id: id,
+                                            referencing_type: 'r', referencing_id: rid,
+                                        });
+                                    }
                                 }
                             }
                             MemberId::Way(id) => {
                                 if !way_ids.contains(id .cast_unsigned()) {
                                     missing_way_refs_set.insert(id .cast_unsigned());
+                                    if show_ids {
+                                        missing_refs.push(MissingRef {
+                                            missing_type: 'w', missing_id: id,
+                                            referencing_type: 'r', referencing_id: rid,
+                                        });
+                                    }
                                 }
                             }
                             MemberId::Relation(id) => {
                                 deferred_relation_refs.push(id .cast_unsigned());
+                                if show_ids {
+                                    // Deferred — store relation ID for later resolution
+                                    // We store the referencing relation ID alongside
+                                    deferred_relation_ref_sources.push(rid);
+                                }
                             }
                             // Unknown member types from newer PBF producers —
                             // skip for ref-checking since we don't know what
@@ -182,12 +224,22 @@ pub fn check_refs(path: &Path, check_relations: bool, direct_io: bool) -> Result
     // Resolve deferred relation refs against the complete relation_ids set.
     // Count occurrences (not unique IDs) to match osmium semantics.
     if check_relations {
-        for &id in &deferred_relation_refs {
+        for (i, &id) in deferred_relation_refs.iter().enumerate() {
             if !relation_ids.contains(id) {
                 result.missing_relation_members += 1;
+                if show_ids {
+                    missing_refs.push(MissingRef {
+                        missing_type: 'r',
+                        missing_id: id.cast_signed(),
+                        referencing_type: 'r',
+                        referencing_id: deferred_relation_ref_sources[i],
+                    });
+                }
             }
         }
     }
+
+    result.missing_refs = missing_refs;
 
     Ok(result)
 }

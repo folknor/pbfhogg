@@ -73,6 +73,9 @@ enum Command {
         /// Also check relation member references
         #[arg(long)]
         check_relations: bool,
+        /// Show IDs of missing objects
+        #[arg(long)]
+        show_ids: bool,
         #[command(flatten)]
         io: DirectIoArg,
     },
@@ -83,6 +86,12 @@ enum Command {
         /// Only show tags with at least this many occurrences
         #[arg(long, default_value = "1")]
         min_count: u64,
+        /// Only show tags with at most this many occurrences
+        #[arg(short = 'M', long)]
+        max_count: Option<u64>,
+        /// Sort order: count-desc (default), count-asc, name-asc, name-desc
+        #[arg(short = 's', long, default_value = "count-desc")]
+        sort: String,
         /// Filter by element type: node, way, or relation
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
@@ -98,6 +107,10 @@ enum Command {
         files: Vec<PathBuf>,
         #[command(flatten)]
         output: OutputArg,
+        /// Strip metadata attribute (version, timestamp, changeset, uid, user).
+        /// Can be specified multiple times, e.g. -c changeset -c uid -c user
+        #[arg(short = 'c', long = "clean", value_name = "ATTR")]
+        clean: Vec<String>,
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
@@ -202,6 +215,9 @@ enum Command {
         /// Bump version of deleted elements by 1 in the output OSC
         #[arg(long)]
         increment_version: bool,
+        /// Set delete timestamp to current time
+        #[arg(long)]
+        update_timestamp: bool,
         #[command(flatten)]
         output: OutputArg,
         #[command(flatten)]
@@ -268,6 +284,9 @@ enum Command {
         /// Smart strategy (three passes, complete multipolygon/boundary relations)
         #[arg(long, conflicts_with = "simple")]
         smart: bool,
+        /// Write the extract region bounding box to the output header
+        #[arg(long)]
+        set_bounds: bool,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -494,17 +513,22 @@ fn main() {
         Command::CheckRefs {
             file,
             check_relations,
+            show_ids,
             io,
-        } => run_check_refs(&file, check_relations, io.direct_io),
+        } => run_check_refs(&file, check_relations, show_ids, io.direct_io),
         Command::TagsCount {
             file,
             min_count,
+            max_count,
+            sort,
             type_filter,
             force,
             io,
         } => run_tags_count(
             &file,
             min_count,
+            max_count,
+            &sort,
             type_filter.as_deref(),
             io.direct_io,
             force.force,
@@ -512,6 +536,7 @@ fn main() {
         Command::Cat {
             files,
             output,
+            clean,
             type_filter,
             compression,
             force,
@@ -520,6 +545,7 @@ fn main() {
             &files,
             &output.output,
             type_filter.as_deref(),
+            &clean,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -590,9 +616,10 @@ fn main() {
             old,
             new,
             increment_version,
+            update_timestamp,
             output,
             io,
-        } => run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version),
+        } => run_derive_changes(&old, &new, &output.output, io.direct_io, increment_version, update_timestamp),
         Command::Getid {
             file,
             output,
@@ -638,6 +665,7 @@ fn main() {
             polygon,
             simple,
             smart,
+            set_bounds,
             compression,
             force,
             io,
@@ -647,6 +675,7 @@ fn main() {
             bbox.as_deref(),
             polygon.as_deref(),
             extract_strategy(simple, smart),
+            set_bounds,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -978,30 +1007,41 @@ fn run_verify_all(
 fn run_check_refs(
     path: &std::path::Path,
     check_relations: bool,
+    show_ids: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let result = pbfhogg::check_refs::check_refs(path, check_relations, direct_io)?;
+    let result = pbfhogg::check_refs::check_refs(path, check_relations, show_ids, direct_io)?;
 
-    println!(
+    // Missing reference IDs to stdout (osmium compat)
+    for mref in &result.missing_refs {
+        println!(
+            "{}{} in {}{}",
+            mref.missing_type, mref.missing_id,
+            mref.referencing_type, mref.referencing_id,
+        );
+    }
+
+    // Summary to stderr (osmium compat)
+    eprintln!(
         "Elements: {} nodes, {} ways, {} relations",
         result.node_count, result.way_count, result.relation_count
     );
 
     if result.missing_node_refs > 0 {
-        println!("Missing node refs in ways: {}", result.missing_node_refs);
+        eprintln!("Missing node refs in ways: {}", result.missing_node_refs);
     }
     if check_relations {
         if result.missing_way_refs > 0 {
-            println!("Missing way refs in relations: {}", result.missing_way_refs);
+            eprintln!("Missing way refs in relations: {}", result.missing_way_refs);
         }
         if result.missing_node_members > 0 {
-            println!(
+            eprintln!(
                 "Missing node members in relations: {}",
                 result.missing_node_members
             );
         }
         if result.missing_relation_members > 0 {
-            println!(
+            eprintln!(
                 "Missing relation members: {}",
                 result.missing_relation_members
             );
@@ -1009,9 +1049,9 @@ fn run_check_refs(
     }
 
     if result.is_valid() {
-        println!("Referential integrity: OK");
+        eprintln!("Referential integrity: OK");
     } else {
-        println!(
+        eprintln!(
             "Referential integrity: FAILED ({} missing references)",
             result.total_missing()
         );
@@ -1024,11 +1064,20 @@ fn run_check_refs(
 fn run_tags_count(
     path: &std::path::Path,
     min_count: u64,
+    max_count: Option<u64>,
+    sort_str: &str,
     type_filter: Option<&str>,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let results = pbfhogg::tags_count::tags_count(path, min_count, type_filter, direct_io, force)?;
+    let sort = match sort_str {
+        "count-desc" | "count" => pbfhogg::tags_count::TagCountSort::CountDesc,
+        "count-asc" => pbfhogg::tags_count::TagCountSort::CountAsc,
+        "name-asc" | "name" => pbfhogg::tags_count::TagCountSort::NameAsc,
+        "name-desc" => pbfhogg::tags_count::TagCountSort::NameDesc,
+        _ => return Err(format!("unknown sort order: {sort_str} (expected count-desc, count-asc, name-asc, name-desc)").into()),
+    };
+    let results = pbfhogg::tags_count::tags_count(path, min_count, max_count, sort, type_filter, direct_io, force)?;
 
     for entry in &results {
         println!("{}\t{}\t{}", entry.count, entry.key, entry.value);
@@ -1042,13 +1091,27 @@ fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
     type_filter: Option<&str>,
+    clean_attrs: &[String],
     compression: &str,
     direct_io: bool,
     force: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
+    let mut clean = pbfhogg::cat::CleanAttrs::default();
+    for attr in clean_attrs {
+        match attr.as_str() {
+            "version" => clean.version = true,
+            "changeset" => clean.changeset = true,
+            "timestamp" => clean.timestamp = true,
+            "uid" => clean.uid = true,
+            "user" => clean.user = true,
+            other => return Err(format!(
+                "unknown clean attribute: {other} (expected version, changeset, timestamp, uid, user)"
+            ).into()),
+        }
+    }
     let paths: Vec<&std::path::Path> = files.iter().map(AsRef::as_ref).collect();
-    let stats = pbfhogg::cat::cat(&paths, output, type_filter, compression, direct_io, force)?;
+    let stats = pbfhogg::cat::cat(&paths, output, type_filter, &clean, compression, direct_io, force)?;
     stats.print_summary();
     Ok(())
 }
@@ -1173,9 +1236,10 @@ fn run_derive_changes(
     output: &std::path::Path,
     direct_io: bool,
     increment_version: bool,
+    update_timestamp: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let stats =
-        pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version)?;
+        pbfhogg::derive_changes::derive_changes(old, new, output, direct_io, increment_version, update_timestamp)?;
     stats.print_summary();
     Ok(())
 }
@@ -1238,6 +1302,7 @@ fn run_extract(
     bbox_str: Option<&str>,
     polygon_path: Option<&std::path::Path>,
     strategy: pbfhogg::extract::ExtractStrategy,
+    set_bounds: bool,
     compression: &str,
     direct_io: bool,
     force: bool,
@@ -1257,6 +1322,7 @@ fn run_extract(
         output,
         &region,
         strategy,
+        set_bounds,
         compression,
         direct_io,
         force,

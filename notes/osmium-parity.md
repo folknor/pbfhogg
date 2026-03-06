@@ -90,7 +90,7 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `-t, --object-type` | `-t, --type` | Have it |
-| `-c, --clean` | — | Missing (strip version/changeset/timestamp/uid/user) |
+| `-c, --clean` | `-c, --clean` | Have it (per-attribute: version, changeset, timestamp, uid, user) |
 | `--buffer-data` | — | N/A (pipelined writer handles this differently) |
 
 ### `check-refs`
@@ -98,7 +98,7 @@ osmium-tool installed version as of 2026-03-04.
 | osmium flag | pbfhogg | Status |
 |---|---|---|
 | `-r, --check-relations` | `--check-relations` | Have it |
-| `-i, --show-ids` | — | Missing (show IDs of missing objects) |
+| `-i, --show-ids` | `--show-ids` | Have it (format: `n123 in w456`, each occurrence, stdout) |
 
 ### `derive-changes`
 
@@ -106,7 +106,7 @@ osmium-tool installed version as of 2026-03-04.
 |---|---|---|
 | `--increment-version` | `--increment-version` | Have it |
 | `--keep-details` | — | N/A (niche, only useful for debugging deleted objects) |
-| `--update-timestamp` | — | Missing (set delete timestamp to current time) |
+| `--update-timestamp` | `--update-timestamp` | Have it (sets delete timestamp to current wall-clock time) |
 
 ### `diff`
 
@@ -130,7 +130,7 @@ osmium-tool installed version as of 2026-03-04.
 | `-s, --strategy` | `--simple`, `--smart` | Have it (different syntax) |
 | `-c, --config` | — | Missing (multi-extract from config file) |
 | `-H, --with-history` | — | N/A (current-snapshot tool, no history file support) |
-| `--set-bounds` | — | Missing (write bbox to output header) |
+| `--set-bounds` | `--set-bounds` | Have it (opt-in, writes bbox to output header) |
 | `--clean` | — | Missing |
 | `-S, --option` | — | Missing (strategy-specific options) |
 
@@ -174,8 +174,8 @@ No missing flags. osmium sort has no command-specific options either.
 | `-t, --object-type` | `-t, --type` | Have it |
 | `-m, --min-count` | `--min-count` | Have it |
 | `-e, --expressions` | — | Missing (read expressions from file) |
-| `-M, --max-count` | — | Missing |
-| `-s, --sort` | — | Missing (sort order: count-asc/desc, name-asc/desc) |
+| `-M, --max-count` | `-M, --max-count` | Have it |
+| `-s, --sort` | `-s, --sort` | Have it (count-desc/asc, name-asc/desc, plus shortcuts) |
 
 ### `tags-filter`
 

@@ -502,12 +502,14 @@ impl ExtractStats {
 // ---------------------------------------------------------------------------
 
 /// Extract elements within `region` from `input` and write to `output`.
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn extract(
     input: &Path,
     output: &Path,
     region: &Region,
     strategy: ExtractStrategy,
+    set_bounds: bool,
     compression: Compression,
     direct_io: bool,
     force: bool,
@@ -522,9 +524,9 @@ pub fn extract(
         super::warn_locations_on_ways_loss(reader.header());
     }
     match strategy {
-        ExtractStrategy::Simple => extract_simple(input, output, region, compression, direct_io),
-        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, compression, direct_io),
-        ExtractStrategy::Smart => extract_smart(input, output, region, compression, direct_io),
+        ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, compression, direct_io),
+        ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, compression, direct_io),
+        ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, compression, direct_io),
     }
 }
 
@@ -643,14 +645,14 @@ fn classify_block_simple(
     matched
 }
 
-fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     // Check if input is sorted — if so, classify + write in a single file pass.
     let reader = ElementReader::open(input, direct_io)?;
     let is_sorted = reader.header().is_sorted();
     drop(reader);
 
     if is_sorted {
-        return extract_simple_single_pass(input, output, region, compression, direct_io);
+        return extract_simple_single_pass(input, output, region, set_bounds, compression, direct_io);
     }
 
     // --- Unsorted fallback: two passes (collect IDs, then write) ---
@@ -683,8 +685,12 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, compression: Com
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
-        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            .sorted()
+        let hb = if set_bounds {
+            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        } else {
+            hb
+        };
+        hb.sorted()
     })?;
 
     let ids = ExtractPass2IdSets {
@@ -717,6 +723,7 @@ fn extract_simple_single_pass(
     input: &Path,
     output: &Path,
     region: &Region,
+    set_bounds: bool,
     compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
@@ -740,8 +747,12 @@ fn extract_simple_single_pass(
         .with_blob_filter(spatial_blob_filter(&bbox_int));
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
-        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            .sorted()
+        let hb = if set_bounds {
+            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        } else {
+            hb
+        };
+        hb.sorted()
     })?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
@@ -785,7 +796,7 @@ fn extract_simple_single_pass(
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
-fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
+fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, compression: Compression, direct_io: bool) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -805,8 +816,12 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, compressi
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
-        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            .sorted()
+        let hb = if set_bounds {
+            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        } else {
+            hb
+        };
+        hb.sorted()
     })?;
 
     let ids = ExtractPass2IdSets {
@@ -1526,11 +1541,12 @@ fn process_extract_pass2_batch(
 // Smart strategy (three passes)
 // ---------------------------------------------------------------------------
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn extract_smart(
     input: &Path,
     output: &Path,
     region: &Region,
+    set_bounds: bool,
     compression: Compression,
     direct_io: bool,
 ) -> Result<ExtractStats> {
@@ -1573,8 +1589,12 @@ fn extract_smart(
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, |hb| {
-        hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
-            .sorted()
+        let hb = if set_bounds {
+            hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+        } else {
+            hb
+        };
+        hb.sorted()
     })?;
 
     let ids = ExtractPass3IdSets {

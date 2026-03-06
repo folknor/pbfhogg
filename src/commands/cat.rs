@@ -15,7 +15,24 @@ use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
-use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
+use super::{drain_batch_results, flush_local, read_raw_frame, Metadata, Result, BATCH_SIZE};
+
+/// Which metadata attributes to strip via `--clean`.
+#[derive(Clone, Copy, Default)]
+pub struct CleanAttrs {
+    pub version: bool,
+    pub changeset: bool,
+    pub timestamp: bool,
+    pub uid: bool,
+    pub user: bool,
+}
+
+impl CleanAttrs {
+    /// True if any attribute is being cleaned.
+    pub fn any(&self) -> bool {
+        self.version || self.changeset || self.timestamp || self.uid || self.user
+    }
+}
 
 /// Statistics from a cat operation.
 pub struct CatStats {
@@ -42,11 +59,13 @@ impl CatStats {
 /// If `type_filter` is set (comma-separated: "node", "way", "relation"),
 /// only elements of matching types are included (requires full decode).
 /// Without a filter, blobs are passed through as raw bytes (zero decode).
+#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
 pub fn cat(
     files: &[&Path],
     output: &Path,
     type_filter: Option<&str>,
+    clean: &CleanAttrs,
     compression: Compression,
     direct_io: bool,
     force: bool,
@@ -66,9 +85,10 @@ pub fn cat(
         super::warn_locations_on_ways_loss(reader.header());
     }
 
-    match type_filter {
-        None => cat_passthrough(files, output, compression, direct_io),
-        Some(filter) => cat_filtered(files, output, filter, compression, direct_io),
+    match (type_filter, clean.any()) {
+        (None, false) => cat_passthrough(files, output, compression, direct_io),
+        (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io),
+        (Some(filter), _) => cat_filtered(files, output, filter, clean, compression, direct_io),
     }
 }
 
@@ -139,6 +159,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 /// into `output`. Returns the number of elements written.
 ///
 /// Called from rayon worker threads via `map_init`.
+#[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &crate::PrimitiveBlock,
     bb: &mut BlockBuilder,
@@ -146,6 +167,7 @@ fn process_block(
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
+    clean: &CleanAttrs,
 ) -> std::result::Result<u64, String> {
     let mut count: u64 = 0;
 
@@ -161,7 +183,7 @@ fn process_block(
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
-                let meta = dense_node_metadata(dn);
+                let meta = clean_metadata(dense_node_metadata(dn), clean);
                 bb.add_node(
                     dn.id(),
                     dn.decimicro_lat(),
@@ -175,7 +197,7 @@ fn process_block(
                 ensure_node_capacity_local(bb, output)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
-                let meta = element_metadata(&n.info());
+                let meta = clean_metadata(element_metadata(&n.info()), clean);
                 bb.add_node(
                     n.id(),
                     n.decimicro_lat(),
@@ -191,7 +213,7 @@ fn process_block(
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
-                let meta = element_metadata(&w.info());
+                let meta = clean_metadata(element_metadata(&w.info()), clean);
                 bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
                 count += 1;
             }
@@ -204,7 +226,7 @@ fn process_block(
                     id: m.id,
                     role: m.role().unwrap_or(""),
                 }));
-                let meta = element_metadata(&r.info());
+                let meta = clean_metadata(element_metadata(&r.info()), clean);
                 bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
                 count += 1;
             }
@@ -215,8 +237,24 @@ fn process_block(
     Ok(count)
 }
 
-#[allow(clippy::too_many_lines)]
-fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool) -> Result<CatStats> {
+/// Apply per-attribute cleaning to metadata. Returns `None` if all attributes
+/// are cleaned or if the input has no metadata.
+fn clean_metadata<'a>(meta: Option<Metadata<'a>>, clean: &CleanAttrs) -> Option<Metadata<'a>> {
+    if !clean.any() {
+        return meta;
+    }
+    meta.map(|mut m| {
+        if clean.version { m.version = 0; }
+        if clean.changeset { m.changeset = 0; }
+        if clean.timestamp { m.timestamp = 0; }
+        if clean.uid { m.uid = 0; }
+        if clean.user { m.user = ""; }
+        m
+    })
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs, compression: Compression, direct_io: bool) -> Result<CatStats> {
     let tf = TypeFilter::parse(filter);
 
     let single_file = files.len() == 1;
@@ -244,6 +282,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, compression: Compr
                 tf.nodes,
                 tf.ways,
                 tf.relations,
+                clean,
             )?;
             blobs_decoded += batch_blobs;
             elements += batch_elements;
@@ -274,6 +313,7 @@ fn process_batch(
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
+    clean: &CleanAttrs,
 ) -> Result<(u64, u64)> {
     // Parallel phase: each rayon thread processes one block, returning
     // serialized block bytes (with BlobIndex + tagdata) + element count.
@@ -286,7 +326,7 @@ fn process_batch(
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let count = process_block(
                     block, bb, &mut output,
-                    filter_node, filter_way, filter_relation,
+                    filter_node, filter_way, filter_relation, clean,
                 )?;
                 // Flush any remaining partial block from this thread's builder.
                 // The builder is reused across blocks within this batch, so we

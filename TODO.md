@@ -118,33 +118,36 @@ constraints before designing the consolidated API.
   coordinates through OSC diffs. Surviving base ways forward raw lat/lon
   bytes; OSC ways look up coordinates from a sparse node index built from
   the diff and base PBF. Requires sorted base PBF with LocationsOnWays.
-- [ ] **`derive-changes --update-timestamp`** — set delete timestamp to current
-  time. May be used in replication pipelines.
+- [x] **`derive-changes --update-timestamp`** — set delete timestamp to current
+  time. Matches osmium: only affects deleted objects.
 - [x] **`getid/removeid --default-type`** — allow bare numeric IDs by assigning a
   default object type.
 - [ ] **`getid/removeid --id-osm-file`** — read IDs from an OSM/PBF file instead
   of a text file. Useful in scripted pipelines.
-- [ ] **`cat --clean`** — strip version/changeset/timestamp/uid/user metadata.
-  Useful for anonymizing data or reducing file size.
-- [ ] **`check-refs --show-ids`** — show IDs of missing objects. Without this
-  you know refs are broken but not which ones.
+- [x] **`cat --clean`** — strip metadata per-attribute (`-c version -c changeset
+  -c timestamp -c uid -c user`). Matches osmium's per-attribute granularity:
+  cleaned attributes are set to 0/empty.
+- [x] **`check-refs --show-ids`** — show IDs of missing objects with referencing
+  element (`n123 in w456`). Matches osmium: each occurrence printed (no dedup),
+  IDs to stdout, summary to stderr.
 - [x] **`diff --ignore-changeset/uid/user`** — ignore specific metadata fields
   when comparing. Essential when diffing files from different sources.
   Note: currently implemented as compatibility flags; pbfhogg diff already uses
   content equality and does not compare these metadata fields.
 - [ ] **`extract --config`** — multi-extract from config file. Geofabrik likely
   uses this to cut the planet into 200+ regional extracts in one pass.
-- [ ] **`extract --set-bounds`** — write bbox to output header. Downstream
-  tools read the header bbox.
+- [x] **`extract --set-bounds`** — write bbox to output header. Opt-in flag
+  matching osmium (off by default).
 - [ ] **`inspect -e` (extended)** — full-scan mode producing element counts,
   timestamp range, data bbox, ordering check, ID ranges, buffer stats, and
   metadata attribute coverage in one pass. We have pieces across `--blocks`
   and `--id-ranges` but no unified extended view.
 - [ ] **`inspect -g`** — get a specific value for scripting
   (e.g. `inspect -g header.bbox`).
-- [ ] **`tags-count -M` (max-count)** — upper bound filter, paired with
+- [x] **`tags-count -M` (max-count)** — upper bound filter, paired with
   existing `--min-count`.
-- [ ] **`tags-count -s` (sort)** — sort order (count-asc/desc, name-asc/desc).
+- [x] **`tags-count -s` (sort)** — sort order (count-asc/desc, name-asc/desc).
+  Also accepts osmium shortcuts: `count` → `count-desc`, `name` → `name-asc`.
 - [ ] **`tags-count -e` / `tags-filter -e`** — read expressions from file.
   Useful for complex filter sets.
 - [ ] **`tags-filter --invert-match`** — inverse selection mode (drop matching objects,

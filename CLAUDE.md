@@ -38,7 +38,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history (stored in `$XDG_DATA_HOME/brokkr/history.db`). Every brokkr invocation is recorded with timing, exit status, project, and git context. Works from any directory.
-- `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps.
+- `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open] [--pmtiles path]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps. `--pmtiles` reuses an existing PMTiles file (implies `--from serve`). Elivagar pipeline flags (`--fanout-cap-default`, `--fanout-cap`, `--polygon-simplify-factor`, etc.) are passed through to tilegen.
 
 ### brokkr.toml
 

@@ -6,15 +6,16 @@ use rayon::prelude::*;
 
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
-    for_each_primitive_block_batch, writer_from_header, HeaderOverrides, TypeFilter,
+    for_each_primitive_block_batch_budgeted, writer_from_header, HeaderOverrides, TypeFilter,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
+    DECODE_BATCH_BYTE_BUDGET,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
 use crate::blob_index::{scan_block_ids, scan_block_tags};
 use crate::file_reader::FileReader;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader};
+use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
 use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
 
@@ -282,10 +283,25 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     // -----------------------------------------------------------------------
     // Process each input file
     // -----------------------------------------------------------------------
+    let mut batch_count: u64 = 0;
+    let mut max_batch_blocks: usize = 0;
+    let mut max_batch_bytes: usize = 0;
+    let mut total_byte_limited: u64 = 0;
     for file in files {
         let reader = ElementReader::open(file, direct_io)?;
         let blocks_iter = reader.with_blob_filter(blob_filter.clone()).into_blocks_pipelined();
-        for_each_primitive_block_batch(blocks_iter, BATCH_SIZE, |batch| {
+        for_each_primitive_block_batch_budgeted(blocks_iter, BATCH_SIZE, Some(DECODE_BATCH_BYTE_BUDGET), &mut |batch| {
+            let batch_bytes: usize = batch.iter().map(PrimitiveBlock::decompressed_size).sum();
+            batch_count += 1;
+            if batch.len() > max_batch_blocks {
+                max_batch_blocks = batch.len();
+            }
+            if batch_bytes > max_batch_bytes {
+                max_batch_bytes = batch_bytes;
+            }
+            if batch.len() < BATCH_SIZE {
+                total_byte_limited += 1;
+            }
             let (batch_blobs, batch_elements) = process_batch(
                 batch,
                 &mut writer,
@@ -299,6 +315,8 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
             Ok(())
         })?;
     }
+    eprintln!("[cat] batches: {batch_count}, max_blocks/batch: {max_batch_blocks}, max_bytes/batch: {:.1} MiB, byte-limited: {total_byte_limited}",
+        max_batch_bytes as f64 / (1024.0 * 1024.0));
 
     writer.flush()?;
 

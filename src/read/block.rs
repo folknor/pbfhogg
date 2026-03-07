@@ -397,6 +397,14 @@ impl PrimitiveBlock {
         Ok(PrimitiveBlock { buffer, block })
     }
 
+    /// Returns the size of the decompressed protobuf payload in bytes.
+    ///
+    /// This is the raw decompressed data backing this block — useful for
+    /// byte-budget accounting in batched processing pipelines.
+    pub fn decompressed_size(&self) -> usize {
+        self.buffer.len()
+    }
+
     /// Returns the element type contained in this block.
     ///
     /// Inspects only the first protobuf field tag of each group — typically a

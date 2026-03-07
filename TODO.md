@@ -149,6 +149,9 @@ overhead for ALTW because sequential readahead from page cache is faster.
 
 ### Testing
 
+See `notes/test-plan.md` for the full pre-release test matrix (feature permutations,
+I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
+
 - [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
 - [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — OOM-killed both with and without `--direct-io` (~19-22 GB written, 27.8 GB RSS at kill). The pipelined writer's rayon pool and reorder buffer accumulate too many in-flight blocks. Unlike merge, `cat` lacks adaptive byte budgeting. Works on europe (32.4 GB). Fix: add backpressure or memory-bounded batching to the cat filtered path.
 

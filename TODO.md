@@ -159,6 +159,13 @@ I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Add a CHANGELOG.md before first tagged release
+- [x] **All 4 feature permutations pass clippy + tests** (commit `a52ac80`): default,
+  `linux-direct-io`+`linux-io-uring`, `--no-default-features`, and
+  `--no-default-features`+linux features. Fixed 6 latent clippy errors in
+  `direct_reader.rs`, `uring_writer.rs`, `diff.rs`, `blob.rs` plus 2 compile
+  errors in `uring_writer.rs` (missing `VecDeque` import, unclosed delimiter).
+- [x] **io_uring runtime validated** (commit `eb60cb5`): merge bench with `--uring`
+  works correctly after compile fixes. Requires `RLIMIT_MEMLOCK >= 16 MB`.
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)

@@ -52,77 +52,61 @@ Works on europe (32.4 GB).
 
 ## Read throughput
 
-Count all elements, best of 3 runs. Commit `90df51f`, plantasjen.
+Count all elements, best of 3 runs. Commit `d387301` (multi-dataset), plantasjen.
 
-### Denmark (461 MB, 59M elements)
+| Dataset | Size | sequential | parallel | pipelined | blobreader | mmap |
+|---------|------|-----------|----------|-----------|------------|------|
+| Malta | 9 MB | 49 ms | 9 ms | 24 ms | 50 ms | 52 ms |
+| Denmark | 487 MB | 2.86s | 463 ms | 1.46s | 2.93s | 2.93s |
+| Norway | 1.4 GB | 8.4s | 1.33s | 4.9s | 8.9s | 8.8s |
+| Japan | 2.4 GB | 14.5s | 2.1s | 8.0s | 15.2s | 15.2s |
+| Germany | 4.7 GB | 26.9s | 4.2s | 13.0s | 27.8s | 27.6s |
 
-| Mode | Time |
-|------|------|
-| parallel (`par_map_reduce`) | **0.31s** |
-| pipelined (`for_each_pipelined`) | 1.3s |
-| sequential (`for_each`) | 2.8s |
-| blobreader (`BlobReader`) | 2.9s |
-
-### North America (18.8 GB, 2.58B elements, commit `a6ebbfe`)
-
-| Mode | Time |
-|------|------|
-| parallel | 22s |
-| pipelined | 57s |
-| sequential | 130s |
+North America (18.8 GB, 2.58B elements, commit `a6ebbfe`):
+parallel 22s, pipelined 57s, sequential 130s.
 
 ## Write throughput
 
 Decode all elements then write through BlockBuilder + PbfWriter to `/dev/null`.
-Commit `def80d9`, plantasjen.
+Commit `d387301` (multi-dataset), plantasjen.
 
-### Denmark (59M elements)
+| Dataset | Size | sync-none | sync-zlib:6 | sync-zstd:3 | pipelined-none | pipelined-zlib:6 | pipelined-zstd:3 |
+|---------|------|-----------|-------------|-------------|----------------|------------------|------------------|
+| Malta | 9 MB | 136 ms | 282 ms | 172 ms | 123 ms | 130 ms | 128 ms |
+| Denmark | 487 MB | 8.1s | 16.8s | 10.0s | 7.3s | 7.4s | 7.3s |
+| Norway | 1.4 GB | 21.3s | 44.0s | 25.7s | 18.9s | 19.2s | 18.9s |
+| Japan | 2.4 GB | 38.5s | 79.2s | 47.0s | 34.8s | 35.0s | 34.4s |
+| Germany | 4.7 GB | 81.3s | — | — | 71.7s | — | — |
 
-| Compression | Sync | Pipelined | Notes |
-|-------------|------|-----------|-------|
-| none | 6.2s | 6.2s | decode + wire-format serialization floor |
-| zstd:3 | 8.1s | **6.2s** | pipelined hides compression cost |
-| zlib:6 | 14.5s | **6.3s** | 2.3x speedup from parallel compression |
+With pipelined writes, all compression modes converge to the decode + wire-format
+serialization floor. Sync zlib:6 is 2.3x slower; pipelined hides the cost.
 
-### North America (2.58B elements, commit `a6ebbfe`)
-
-| Compression | Pipelined | Sync |
-|-------------|-----------|------|
-| zlib:6 | 4m27s | 14m34s |
-| none | ~4m20s | — |
-| zstd:3 | ~4m20s | — |
+North America (18.8 GB, 2.58B elements, commit `a6ebbfe`):
+pipelined zlib 4m27s, pipelined none/zstd ~4m20s, sync zlib 14m34s.
 
 ## Merge (apply-changes)
 
-### Denmark (465 MB, seq 4705, commit `a6ebbfe`)
+Best results per dataset. Commit `a6ebbfe` (NA), `a65a198` (multi-region),
+`e7bbfa2` (Denmark latest). Plantasjen.
 
-| Config | Time |
-|--------|------|
-| indexdata + zlib | **3.36s** |
+| Dataset | Size | buffered+none | buffered+zlib | uring+none | uring+zlib |
+|---------|------|---------------|---------------|------------|------------|
+| Malta | 9 MB | 14 ms | 42 ms | — | — |
+| Greater London | 124 MB | 140 ms | 333 ms | — | — |
+| Denmark | 487 MB | 218 ms | 331 ms | — | — |
+| Switzerland | 529 MB | 561 ms | 1.22s | — | — |
+| Norway | 1.4 GB | 549 ms | 747 ms | — | — |
+| Japan | 2.4 GB | 1.87s | 2.88s | — | — |
+| Germany | 4.7 GB | 3.42s | 5.34s | 4.4s | 9.6s |
+| North America | 18.8 GB | 14.9s | 17.3s | **11.9s** | 15.2s |
 
-### Germany (4.5 GB, 146K-change daily diff, commit `a6ebbfe`)
-
-Rewrite fraction: 18.4%.
-
-| Config | Time |
-|--------|------|
-| buffered + zlib | **5.3s** |
-| buffered + none | **3.4s** |
-
-### North America (18.8 GB, 645K-change daily diff, commit `a6ebbfe`)
-
-303K passthrough / 19.6K rewritten blobs. All variants under 600 MB RSS.
-
-| Config | Time | vs buffered | vs pre-optimization |
-|--------|------|-------------|---------------------|
-| buffered + zlib | 17.3s | baseline | -60% |
-| buffered + none | 14.9s | baseline | -59% |
-| uring + zlib | 15.2s | **-12%** | -54% |
-| uring + none | **11.9s** | **-20%** | -54% |
+Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
+North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
+rewritten blobs. All variants under 600 MB RSS.
 
 io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
-12-20% improvement.
+12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
 ## Add-locations-to-ways
 
@@ -162,16 +146,53 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
 ### Denmark (487 MB indexed, 59M elements)
 
-Commits `23862d1` (general), `46f7388` (add-locations), `fc76dfb` (inspect).
+Commit `23862d1` (full suite), plantasjen.
+
+| Command | Time |
+|---------|------|
+| sort (sorted, indexdata) | 144 ms |
+| cat --type relation | 217 ms |
+| tags-filter highway=primary | 240 ms |
+| inspect-tags --type way | 344 ms |
+| getid | 528 ms |
+| tags-filter amenity=* | 583 ms |
+| cat --type way | 1.11s |
+| inspect-nodes | 1.74s |
+| inspect-tags | 1.80s |
+| tags-filter two-pass | 2.53s |
+| getid --invert | 2.72s |
+| extract --simple | 2.79s |
+| extract --complete | 2.86s |
+| extract --smart | 3.02s |
+| fileinfo (inspect) | 3.58s |
+| add-locations-to-ways | 5.47s |
+| check --refs | 7.19s |
+
+### Japan (2.4 GB indexed, 344M elements)
+
+| Command | Time |
+|---------|------|
+| cat --type relation | 365 ms |
+| cat --type way | 3.44s |
+| extract --smart | 12.2s |
+| tags-filter two-pass | 11.9s |
+| add-locations-to-ways | 43.1s |
+
+### Germany (4.7 GB indexed)
+
+| Command | Time |
+|---------|------|
+| add-locations-to-ways | 64.5s |
+
+### vs osmium (Denmark, commit `23862d1`)
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexdata) | **0.036s** | — | 109x vs full decode |
-| sort (sorted, indexdata) | **0.14s** | 11.6s | 83x |
-| apply-changes (indexdata + zlib) | **2.7s** | 7.2s | 2.7x |
-| tags-filter w/highway=primary -R | **0.24s** | 0.56s | 2.3x |
-| cat --type way (indexdata) | **1.1s** | 2.22s | 2.0x |
-| add-locations-to-ways | **8.3s** | 12.6s | 1.5x |
+| sort (sorted, indexdata) | **0.14s** | 11.6s | **83x** |
+| apply-changes (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
+| tags-filter w/highway=primary -R | **0.24s** | 0.56s | **2.3x** |
+| cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
+| add-locations-to-ways | **8.3s** | 12.6s | **1.5x** |
 | check --refs | **4.8s** | 4.5s | 0.94x |
 
 ## Pipeline end-to-end

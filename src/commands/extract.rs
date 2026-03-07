@@ -1037,8 +1037,8 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 
     // --- Pass 1: Collect matches ---
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let (bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids) =
-        collect_pass1(input, region, &bbox_int, direct_io)?;
+    let mut handler = CompleteRelationHandler;
+    let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
 
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -1054,10 +1054,10 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     })?;
 
     let ids = ExtractPass2IdSets {
-        bbox_node_ids: &bbox_node_ids,
-        all_way_node_ids: &all_way_node_ids,
-        matched_way_ids: &matched_way_ids,
-        matched_relation_ids: &matched_relation_ids,
+        bbox_node_ids: &result.bbox_node_ids,
+        all_way_node_ids: &result.all_way_node_ids,
+        matched_way_ids: &result.matched_way_ids,
+        matched_relation_ids: &result.matched_relation_ids,
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
@@ -1180,237 +1180,122 @@ fn merge_relation_batch_smart_parallel(
     }
 }
 
-/// Collect pass 1 ID sets for the complete-ways strategy.
+// ---------------------------------------------------------------------------
+// Pass 1: Generic ID collection with pluggable relation handling
+// ---------------------------------------------------------------------------
+
+/// Output of pass 1 ID collection, shared between complete-ways and smart strategies.
+struct Pass1Result {
+    bbox_node_ids: IdSetDense,
+    matched_way_ids: IdSetDense,
+    all_way_node_ids: IdSetDense,
+    matched_relation_ids: IdSetDense,
+}
+
+/// Strategy-specific relation handling for pass 1.
+///
+/// Implementations control what happens after a relation is matched:
+/// - `CompleteRelationHandler`: no-op (just collects relation IDs)
+/// - `SmartRelationHandler`: additionally collects way/node member IDs from
+///   multipolygon/boundary relations
+trait RelationHandler {
+    /// Process a single matched relation in the unsorted/mixed fallback path.
+    /// Called after the relation ID has already been added to `matched_relation_ids`.
+    fn handle_relation(&mut self, r: &crate::Relation);
+
+    /// Merge a batch of relation blocks in parallel (sorted path).
+    fn merge_relation_batch(
+        &mut self,
+        batch: &[PrimitiveBlock],
+        bbox_node_ids: &IdSetDense,
+        matched_way_ids: &IdSetDense,
+        matched_relation_ids: &mut IdSetDense,
+    );
+}
+
+struct CompleteRelationHandler;
+
+impl RelationHandler for CompleteRelationHandler {
+    fn handle_relation(&mut self, _r: &crate::Relation) {}
+
+    fn merge_relation_batch(
+        &mut self,
+        batch: &[PrimitiveBlock],
+        bbox_node_ids: &IdSetDense,
+        matched_way_ids: &IdSetDense,
+        matched_relation_ids: &mut IdSetDense,
+    ) {
+        merge_relation_batch_parallel(batch, bbox_node_ids, matched_way_ids, matched_relation_ids);
+    }
+}
+
+struct SmartRelationHandler {
+    extra_way_ids: IdSetDense,
+    extra_node_ids: IdSetDense,
+}
+
+impl SmartRelationHandler {
+    fn new() -> Self {
+        Self {
+            extra_way_ids: IdSetDense::new(),
+            extra_node_ids: IdSetDense::new(),
+        }
+    }
+}
+
+impl RelationHandler for SmartRelationHandler {
+    fn handle_relation(&mut self, r: &crate::Relation) {
+        if is_smart_relation(r) {
+            for m in r.members() {
+                match m.id {
+                    MemberId::Way(id) => self.extra_way_ids.set(id),
+                    MemberId::Node(id) => self.extra_node_ids.set(id),
+                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                }
+            }
+        }
+    }
+
+    fn merge_relation_batch(
+        &mut self,
+        batch: &[PrimitiveBlock],
+        bbox_node_ids: &IdSetDense,
+        matched_way_ids: &IdSetDense,
+        matched_relation_ids: &mut IdSetDense,
+    ) {
+        merge_relation_batch_smart_parallel(
+            batch,
+            bbox_node_ids,
+            matched_way_ids,
+            matched_relation_ids,
+            &mut self.extra_way_ids,
+            &mut self.extra_node_ids,
+        );
+    }
+}
+
+/// Collect pass 1 ID sets with strategy-specific relation handling.
 ///
 /// Reads all elements via pipelined decode, collecting:
 /// - `bbox_node_ids`: nodes within the bounding box
 /// - `matched_way_ids`: ways referencing at least one bbox node
 /// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
 /// - `matched_relation_ids`: relations with matched node/way members
-#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-fn collect_pass1(
-    input: &Path,
-    region: &Region,
-    bbox_int: &BboxInt,
-    direct_io: bool,
-) -> Result<(IdSetDense, IdSetDense, IdSetDense, IdSetDense)> {
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut all_way_node_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
-
-    let reader = ElementReader::open(input, direct_io)?;
-    let is_sorted = reader.header().is_sorted();
-    let filter = spatial_blob_filter(bbox_int);
-    if !is_sorted {
-        for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
-            let block = block_result?;
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn)
-                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                    {
-                        bbox_node_ids.set(dn.id());
-                    }
-                    Element::Node(n)
-                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                    {
-                        bbox_node_ids.set(n.id());
-                    }
-                    Element::Way(w)
-                        if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                    {
-                        matched_way_ids.set(w.id());
-                        for r in w.refs() {
-                            all_way_node_ids.set(r);
-                        }
-                    }
-                    Element::Relation(r)
-                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                    {
-                        matched_relation_ids.set(r.id());
-                    }
-                    _ => {}
-                }
-            }
-        }
-        return Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids));
-    }
-
-    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block_result in reader
-        .with_blob_filter(filter)
-        .decode_threads(1)
-        .into_blocks_pipelined()
-    {
-        let block = block_result?;
-        match block.block_type() {
-            BlockType::DenseNodes | BlockType::Nodes => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-                if !relation_batch.is_empty() {
-                    merge_relation_batch_parallel(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(dn.id());
-                        }
-                        Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(n.id());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            BlockType::Ways => {
-                if !relation_batch.is_empty() {
-                    merge_relation_batch_parallel(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                way_batch.push(block);
-                if way_batch.len() >= BATCH_SIZE {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-            }
-            BlockType::Relations => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-                relation_batch.push(block);
-                if relation_batch.len() >= BATCH_SIZE {
-                    merge_relation_batch_parallel(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-            }
-            BlockType::Mixed | BlockType::Empty => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-                if !relation_batch.is_empty() {
-                    merge_relation_batch_parallel(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(dn.id());
-                        }
-                        Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(n.id());
-                        }
-                        Element::Way(w)
-                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                        {
-                            matched_way_ids.set(w.id());
-                            for r in w.refs() {
-                                all_way_node_ids.set(r);
-                            }
-                        }
-                        Element::Relation(r)
-                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                        {
-                            matched_relation_ids.set(r.id());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-    }
-
-    if !way_batch.is_empty() {
-        merge_way_batch_parallel(
-            &way_batch,
-            &bbox_node_ids,
-            &mut matched_way_ids,
-            &mut all_way_node_ids,
-        );
-    }
-    if !relation_batch.is_empty() {
-        merge_relation_batch_parallel(
-            &relation_batch,
-            &bbox_node_ids,
-            &matched_way_ids,
-            &mut matched_relation_ids,
-        );
-    }
-
-    Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids))
-}
-
-/// Collect pass 1 ID sets for the smart strategy.
 ///
-/// Same as [`collect_pass1`] but additionally collects extra way and node IDs
-/// from multipolygon/boundary relations for complete geometry inclusion.
+/// The `handler` controls additional per-relation processing (e.g. smart
+/// strategy collects extra way/node IDs from multipolygon/boundary relations).
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
-fn collect_pass1_smart(
+fn collect_pass1_generic<H: RelationHandler>(
     input: &Path,
     region: &Region,
     bbox_int: &BboxInt,
     direct_io: bool,
-) -> Result<(IdSetDense, IdSetDense, IdSetDense, IdSetDense, IdSetDense, IdSetDense)> {
+    handler: &mut H,
+) -> Result<Pass1Result> {
     let mut bbox_node_ids = IdSetDense::new();
     let mut matched_way_ids = IdSetDense::new();
     let mut all_way_node_ids = IdSetDense::new();
     let mut matched_relation_ids = IdSetDense::new();
-    let mut extra_way_ids = IdSetDense::new();
-    let mut extra_node_ids = IdSetDense::new();
 
     let reader = ElementReader::open(input, direct_io)?;
     let is_sorted = reader.header().is_sorted();
@@ -1442,28 +1327,15 @@ fn collect_pass1_smart(
                         if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
                     {
                         matched_relation_ids.set(r.id());
-                        if is_smart_relation(r) {
-                            for m in r.members() {
-                                match m.id {
-                                    MemberId::Way(id) => extra_way_ids.set(id),
-                                    MemberId::Node(id) => extra_node_ids.set(id),
-                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                                }
-                            }
-                        }
+                        handler.handle_relation(r);
                     }
                     _ => {}
                 }
             }
         }
-        return Ok((
-            bbox_node_ids,
-            matched_way_ids,
-            all_way_node_ids,
-            matched_relation_ids,
-            extra_way_ids,
-            extra_node_ids,
-        ));
+        return Ok(Pass1Result {
+            bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+        });
     }
 
     let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
@@ -1486,13 +1358,11 @@ fn collect_pass1_smart(
                     way_batch.clear();
                 }
                 if !relation_batch.is_empty() {
-                    merge_relation_batch_smart_parallel(
+                    handler.merge_relation_batch(
                         &relation_batch,
                         &bbox_node_ids,
                         &matched_way_ids,
                         &mut matched_relation_ids,
-                        &mut extra_way_ids,
-                        &mut extra_node_ids,
                     );
                     relation_batch.clear();
                 }
@@ -1514,13 +1384,11 @@ fn collect_pass1_smart(
             }
             BlockType::Ways => {
                 if !relation_batch.is_empty() {
-                    merge_relation_batch_smart_parallel(
+                    handler.merge_relation_batch(
                         &relation_batch,
                         &bbox_node_ids,
                         &matched_way_ids,
                         &mut matched_relation_ids,
-                        &mut extra_way_ids,
-                        &mut extra_node_ids,
                     );
                     relation_batch.clear();
                 }
@@ -1547,13 +1415,11 @@ fn collect_pass1_smart(
                 }
                 relation_batch.push(block);
                 if relation_batch.len() >= BATCH_SIZE {
-                    merge_relation_batch_smart_parallel(
+                    handler.merge_relation_batch(
                         &relation_batch,
                         &bbox_node_ids,
                         &matched_way_ids,
                         &mut matched_relation_ids,
-                        &mut extra_way_ids,
-                        &mut extra_node_ids,
                     );
                     relation_batch.clear();
                 }
@@ -1569,13 +1435,11 @@ fn collect_pass1_smart(
                     way_batch.clear();
                 }
                 if !relation_batch.is_empty() {
-                    merge_relation_batch_smart_parallel(
+                    handler.merge_relation_batch(
                         &relation_batch,
                         &bbox_node_ids,
                         &matched_way_ids,
                         &mut matched_relation_ids,
-                        &mut extra_way_ids,
-                        &mut extra_node_ids,
                     );
                     relation_batch.clear();
                 }
@@ -1603,15 +1467,7 @@ fn collect_pass1_smart(
                             if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
                         {
                             matched_relation_ids.set(r.id());
-                            if is_smart_relation(r) {
-                                for m in r.members() {
-                                    match m.id {
-                                        MemberId::Way(id) => extra_way_ids.set(id),
-                                        MemberId::Node(id) => extra_node_ids.set(id),
-                                        MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                                    }
-                                }
-                            }
+                            handler.handle_relation(r);
                         }
                         _ => {}
                     }
@@ -1629,17 +1485,17 @@ fn collect_pass1_smart(
         );
     }
     if !relation_batch.is_empty() {
-        merge_relation_batch_smart_parallel(
+        handler.merge_relation_batch(
             &relation_batch,
             &bbox_node_ids,
             &matched_way_ids,
             &mut matched_relation_ids,
-            &mut extra_way_ids,
-            &mut extra_node_ids,
         );
     }
 
-    Ok((bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids, extra_way_ids, extra_node_ids))
+    Ok(Pass1Result {
+        bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1795,9 +1651,9 @@ fn extract_smart(
 
     // --- Pass 1: Collect matches + smart relation deps ---
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let (bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
-         extra_way_ids, mut extra_node_ids) =
-        collect_pass1_smart(input, region, &bbox_int, direct_io)?;
+    let mut handler = SmartRelationHandler::new();
+    let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    let mut extra_node_ids = handler.extra_node_ids;
 
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
@@ -1809,7 +1665,7 @@ fn extract_smart(
         for group in block.groups() {
             for w in group.ways() {
                 let wid = w.id();
-                if extra_way_ids.get(wid) && !matched_way_ids.get(wid) {
+                if handler.extra_way_ids.get(wid) && !result.matched_way_ids.get(wid) {
                     for r in w.refs() {
                         extra_node_ids.set(r);
                     }
@@ -1832,12 +1688,12 @@ fn extract_smart(
     })?;
 
     let ids = ExtractPass3IdSets {
-        bbox_node_ids: &bbox_node_ids,
-        all_way_node_ids: &all_way_node_ids,
+        bbox_node_ids: &result.bbox_node_ids,
+        all_way_node_ids: &result.all_way_node_ids,
         extra_node_ids: &extra_node_ids,
-        matched_way_ids: &matched_way_ids,
-        extra_way_ids: &extra_way_ids,
-        matched_relation_ids: &matched_relation_ids,
+        matched_way_ids: &result.matched_way_ids,
+        extra_way_ids: &handler.extra_way_ids,
+        matched_relation_ids: &result.matched_relation_ids,
     };
 
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {

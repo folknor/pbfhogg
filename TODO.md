@@ -28,12 +28,10 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
      2259ms (-14% from 2625ms baseline), Japan simple 11,643ms (-8% from
      12,619ms). Sorted pass1 optimization validated — single-pass eliminates
      second file read. Full results in `notes/performance.md`.
-  2. **~300 lines of duplication** between `collect_pass1` and `collect_pass1_smart`.
-     The sorted path, unsorted fallback, and batch-flush logic are near-identical.
-     Refactor into a generic pass1 driver parameterized by a relation handler
-     closure — the only real difference is that smart adds `extra_way_ids` /
-     `extra_node_ids` collection and calls `merge_relation_batch_smart_parallel`
-     instead of `merge_relation_batch_parallel`. Should eliminate ~200 lines.
+  2. ~~**~300 lines of duplication** between `collect_pass1` and `collect_pass1_smart`.~~
+     Refactored into `collect_pass1_generic<H: RelationHandler>` with
+     `CompleteRelationHandler` (no-op) and `SmartRelationHandler` (collects
+     extra way/node IDs). Net -144 lines. Verified via `brokkr verify extract`.
   3. **`Mixed | Empty` handler is a full sequential fallback** that defeats the
      optimization. A single Mixed block flushes both batches and processes all
      element types sequentially. Correct but fragile — rare in practice.

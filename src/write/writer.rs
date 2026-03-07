@@ -772,6 +772,22 @@ pub(crate) fn frame_blob(
     frame_blob_into(blob_type, uncompressed, compression, indexdata, None, &mut scratch)
 }
 
+/// Compress and frame a blob using per-thread scratch buffers.
+///
+/// Intended for rayon `par_iter` workers that produce fully framed blobs
+/// in the parallel phase, so the sequential write phase can use
+/// `write_raw_owned` with bounded backpressure (no second rayon dispatch).
+pub(crate) fn frame_blob_pipelined(
+    uncompressed: &[u8],
+    compression: &Compression,
+    indexdata: Option<&[u8]>,
+    tagdata: Option<&[u8]>,
+) -> io::Result<Vec<u8>> {
+    PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
+        frame_blob_into("OSMData", uncompressed, compression, indexdata, tagdata, scratch)
+    })
+}
+
 /// Compress and frame a blob using reusable scratch buffers.
 ///
 /// Returns an owned `Vec<u8>` suitable for sending through a pipeline channel.

@@ -17,7 +17,8 @@ use crate::file_reader::FileReader;
 use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
 
-use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
+use crate::writer::frame_blob_pipelined;
+use super::{flush_local, read_raw_frame, Result, BATCH_SIZE};
 
 /// Which metadata attributes to strip via `--clean`.
 #[derive(Clone, Copy, Default)]
@@ -305,6 +306,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
             let (batch_blobs, batch_elements) = process_batch(
                 batch,
                 &mut writer,
+                compression,
                 tf.nodes,
                 tf.ways,
                 tf.relations,
@@ -329,23 +331,24 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
 
 /// Process a batch of `PrimitiveBlock`s in parallel via rayon.
 ///
-/// Each rayon worker thread owns a `BlockBuilder` (via `map_init`) and
-/// processes one block at a time, flushing serialized output to a local
-/// `Vec<OwnedBlock>`. After parallel processing, the serialized
-/// blocks are written sequentially to the `PbfWriter` in batch order.
+/// Each rayon worker thread decodes, serializes, compresses, and frames blobs
+/// in a single parallel pass. The sequential phase writes fully framed blobs
+/// via `write_raw_owned`, which has bounded backpressure through the writer
+/// thread's `sync_channel`. This avoids the unbounded rayon task queue that
+/// caused OOM on planet-scale files.
 ///
 /// Returns `(blobs_decoded, elements_written)`.
 fn process_batch(
     batch: &[crate::PrimitiveBlock],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    compression: Compression,
     filter_node: bool,
     filter_way: bool,
     filter_relation: bool,
     clean: &CleanAttrs,
 ) -> Result<(u64, u64)> {
-    // Parallel phase: each rayon thread processes one block, returning
-    // serialized block bytes (with BlobIndex + tagdata) + element count.
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, u64), String>;
+    // Parallel phase: decode → serialize → compress → frame, all in one pass.
+    type BatchResult = std::result::Result<(Vec<Vec<u8>>, u64), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
@@ -356,23 +359,38 @@ fn process_batch(
                     block, bb, &mut output,
                     filter_node, filter_way, filter_relation, clean,
                 )?;
-                // Flush any remaining partial block from this thread's builder.
-                // The builder is reused across blocks within this batch, so we
-                // must drain it after each block to avoid mixing elements from
-                // different source blocks.
                 flush_local(bb, &mut output)?;
-                Ok((output, count))
+
+                // Compress and frame each serialized block on this rayon thread.
+                let mut framed: Vec<Vec<u8>> = Vec::with_capacity(output.len());
+                for (block_bytes, index, tagdata) in output {
+                    let indexdata = index.serialize();
+                    let blob = frame_blob_pipelined(
+                        &block_bytes,
+                        &compression,
+                        Some(indexdata.as_slice()),
+                        tagdata.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    framed.push(blob);
+                }
+                Ok((framed, count))
             },
         )
         .collect();
 
-    // Sequential phase: write serialized blocks in order, propagate errors.
+    // Sequential phase: write pre-framed blobs with bounded backpressure.
     let mut total_blobs: u64 = 0;
     let mut total_elements: u64 = 0;
-    drain_batch_results(results, writer, |count| {
-        total_blobs += 1;
+    for result in results {
+        let (framed_blobs, count) =
+            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
         total_elements += count;
-    })?;
+        for blob in framed_blobs {
+            writer.write_raw_owned(blob)?;
+            total_blobs += 1;
+        }
+    }
 
     Ok((total_blobs, total_elements))
 }

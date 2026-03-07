@@ -157,7 +157,15 @@ See `notes/test-plan.md` for the full pre-release test matrix (feature permutati
 I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
 
 - [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
-- [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — OOM-killed both with and without `--direct-io` (~19-22 GB written, 27.8 GB RSS at kill). The pipelined writer's rayon pool and reorder buffer accumulate too many in-flight blocks. Unlike merge, `cat` lacks adaptive byte budgeting. Works on europe (32.4 GB). Fix: add backpressure or memory-bounded batching to the cat filtered path.
+- [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:
+  1. Batch-side (commit `abe2782`): `DECODE_BATCH_BYTE_BUDGET = 32 MiB` caps
+     decompressed bytes per batch via `for_each_primitive_block_batch_budgeted`.
+  2. Writer-side: compression moved into the `par_iter` parallel phase, then
+     `write_raw_owned` feeds the writer thread's bounded `sync_channel(32)`.
+     Eliminates the unbounded `rayon::spawn` queue that was the main OOM cause.
+  Europe (33.6 GB) completes in 121s, 224/8200 batches byte-limited.
+  **Planet validation still pending.** Strip `eprintln!` instrumentation
+  in `cat_filtered` after planet run.
 
 ### Other
 

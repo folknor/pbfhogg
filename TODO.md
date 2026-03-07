@@ -24,13 +24,16 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 - [ ] **Extract sorted pass1 (`37b7c19`): benchmark and clean up.** Parallelizes
   way/relation ID collection for sorted PBFs by batching blocks and using
   `par_iter` with thread-local Vecs. Algorithm is correct but has open issues:
-  1. **No benchmark data.** Never measured — no results in brokkr at this commit.
-     Two prior attempts regressed 14x and 33-43x respectively. Must run
-     `brokkr bench extract` (Denmark + Japan, indexed) before and after to
-     validate the optimization actually helps.
+  1. ~~**No benchmark data.**~~ Benchmarked (commit `1b10bfd`): Denmark simple
+     2259ms (-14% from 2625ms baseline), Japan simple 11,643ms (-8% from
+     12,619ms). Sorted pass1 optimization validated — single-pass eliminates
+     second file read. Full results in `notes/performance.md`.
   2. **~300 lines of duplication** between `collect_pass1` and `collect_pass1_smart`.
      The sorted path, unsorted fallback, and batch-flush logic are near-identical.
-     Extract shared helpers or a generic pass1 driver.
+     Refactor into a generic pass1 driver parameterized by a relation handler
+     closure — the only real difference is that smart adds `extra_way_ids` /
+     `extra_node_ids` collection and calls `merge_relation_batch_smart_parallel`
+     instead of `merge_relation_batch_parallel`. Should eliminate ~200 lines.
   3. **`Mixed | Empty` handler is a full sequential fallback** that defeats the
      optimization. A single Mixed block flushes both batches and processes all
      element types sequentially. Correct but fragile — rare in practice.
@@ -51,10 +54,12 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   `build_from_diff` already correctly excludes deleted ways (they're removed
   from `way_index` by the OSC parser).
 
-- [ ] **Run Germany full profiling suite** (4.5 GB, ~500M elements). Currently only
-  merge timing exists — missing read baselines (`tags-count`, `check-refs`),
-  decode+write (`cat --type`), and allocations. Run:
-  `brokkr profile --dataset germany`
+- [x] **Run Germany full profiling suite** (4.7 GB, ~496M elements, commit `1b10bfd`).
+  Timing: inspect-tags 23.9s, check-refs 74.1s, merge zlib 6.2s, merge none 4.4s.
+  Allocations: merge 293 MB net (17+ GB cumulative churn through rewrite pipeline).
+  check-refs is single-threaded consumer bound (74s wall, 73s on one core).
+  cat --type (zlib): 61.8s, 10.9 GB RSS, 240 GB cumulative alloc (175 MB net).
+  Full results in `notes/performance.md`.
 
 ## ALTW memory optimization
 
@@ -124,12 +129,13 @@ overhead for ALTW because sequential readahead from page cache is faster.
 
 ## Consolidation
 
-- [ ] **Investigate shared reader thread for raw-frame streaming** — `merge.rs` spawns a
-  dedicated reader thread (bounded mpsc channel, `read_raw_frame` loop, skips OsmHeader).
-  `sort.rs` does sequential seeks and `add_locations_to_ways.rs` has its own scan loop.
-  Investigate whether extracting `spawn_reader_thread(path, direct_io) -> (JoinHandle,
-  Receiver<RawBlobFrame>)` into `mod.rs` would benefit sort and ALTW, or whether their
-  access patterns are too different (random seek vs sequential scan).
+- [x] **Investigate shared reader thread for raw-frame streaming** — Investigated.
+  The three commands have fundamentally incompatible access patterns:
+  merge uses sequential raw-frame streaming via dedicated thread + bounded channel;
+  sort uses random seek access (`File::seek` to sorted blob offsets);
+  ALTW uses `ElementReader::into_blocks_pipelined()` which already has its own
+  I/O thread internally, plus a selective header-scan passthrough path.
+  No shared abstraction would serve all three. Not worth extracting.
 
 ## Release prep
 

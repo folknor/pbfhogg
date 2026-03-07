@@ -208,7 +208,27 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | cat --dedupe | 102.2s |
 | renumber | 152.4s |
 
-### Germany (4.7 GB indexed)
+### Germany (4.7 GB indexed, ~496M elements)
+
+Hotpath profiling, commit `1b10bfd`, plantasjen.
+
+| Test | Time | RSS | Notes |
+|------|------|-----|-------|
+| inspect-tags | 23.9s | 1.6 GB | decompress_blob 28.7s cumulative (parallel), pipeline 12.1s |
+| check-refs | 74.1s | 4.6 GB | 99.97% in pipeline, single-threaded consumer bound |
+| cat --type (zlib) | 61.8s | 10.9 GB | frame_blob 193s cumulative (parallel zlib), add_node 22.6s (429M), add_way 22.8s (70M) |
+| apply-changes zlib | 6.2s | 395 MB | classify 2.9s, rewrite+output 2.1s |
+| apply-changes none | 4.4s | 252 MB | classify 1.2s, rewrite+output 1.9s |
+
+Allocation profiling (same commit):
+
+| Test | Net Alloc | Cumulative | Key finding |
+|------|-----------|------------|-------------|
+| inspect-tags | 3.0 GB | 25.7 GB | decompress_blob 5.1 GB, wire::parse 3.1 GB |
+| check-refs | 2.4 GB | 4.0 GB | wire::parse 3.0 GB (126%), nearly all in block::new |
+| cat --type (zlib) | 175 MB | 240 GB | take_owned 41 GB, add_way 14.8 GB, decompress 6.9 GB |
+| merge zlib | 293 MB | 29.6 GB | rewrite_block_parallel 17.3 GB, read_raw_frame 4.4 GB |
+| merge none | 293 MB | 31.7 GB | same pattern, RSS under 300 MB |
 
 Previous commit data (commit `46f7388`):
 
@@ -226,6 +246,21 @@ Previous commit data (commit `46f7388`):
 | cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
 | add-locations-to-ways | **8.3s** | 12.6s | **1.5x** |
 | check --refs | **4.8s** | 4.5s | 0.94x |
+
+## Extract
+
+Commit `1b10bfd`, plantasjen. Best of 3 runs, indexed PBFs.
+
+| Dataset | Size | simple | complete | smart |
+|---------|------|--------|----------|-------|
+| Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms |
+| Japan | 2.4 GB | 11,643 ms | 12,213 ms | 13,893 ms |
+
+Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`.
+
+Sorted pass1 optimization (commit `37b7c19`) impact on simple strategy:
+Denmark -14% (2625→2259ms), Japan -8% (12,619→11,643ms). Single-pass
+classification on sorted input eliminates the second file read.
 
 ## Pipeline end-to-end
 

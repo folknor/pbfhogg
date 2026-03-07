@@ -1932,7 +1932,7 @@ fn run_inspect(
             || key.starts_with("elements.")
             || key.starts_with("blocks.")
             || key == "indexed";
-        let has_other_flags = extended || id_ranges || locations || anomalies || nodes || blocks.is_some();
+        let has_other_flags = extended || id_ranges || locations || anomalies || nodes || indexed || blocks.is_some();
         if !needs_full_scan && !has_other_flags {
             let mut reader = pbfhogg::BlobReader::open(path, direct_io)?;
             let header = match reader.next() {

@@ -129,14 +129,16 @@ impl DirectReader {
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
         let buffered = self.buf.remaining() as u64;
         if n <= buffered {
+            #[allow(clippy::cast_possible_truncation)] // n <= buffered <= buf capacity (usize)
             self.buf.consume(n as usize);
             return Ok(());
         }
         // Consume remaining buffer, then lseek past the rest.
         let past_buf = n - buffered;
+        #[allow(clippy::cast_possible_truncation)] // buffered <= buf capacity (usize)
         self.buf.consume(buffered as usize);
         use std::io::{Seek, SeekFrom};
-        self.file.seek(SeekFrom::Current(past_buf as i64))?;
+        self.file.seek(SeekFrom::Current(past_buf.cast_signed()))?;
         Ok(())
     }
 

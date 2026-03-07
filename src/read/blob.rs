@@ -931,6 +931,7 @@ impl BlobReader<BufReader<File>> {
 /// The indexdata, when present, contains blob-level metadata (element type,
 /// ID range, count, and optionally spatial bbox) that allows merge to classify
 /// blobs without decompression. The tagdata contains per-blob tag key metadata.
+#[allow(clippy::type_complexity)]
 pub(crate) fn parse_blob_header_with_index(
     header_bytes: &[u8],
 ) -> Result<(BlobKind, usize, Option<[u8; crate::blob_index::INDEX_SIZE]>, Option<Box<[u8]>>)> {

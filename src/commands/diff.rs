@@ -199,6 +199,7 @@ pub fn diff(
         drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
     }
 
+    #[allow(clippy::drop_non_drop)] // explicit drop to release borrow on writer
     drop(ctx);
     Ok(stats)
 }

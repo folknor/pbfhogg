@@ -41,6 +41,7 @@ const fn ud_buf_idx(ud: u64) -> u16 {
 }
 
 /// Extract the expected length from user_data (bits 16+).
+#[allow(clippy::cast_possible_truncation)] // upper 48 bits, max 256KB << 16 fits u32
 const fn ud_expected_len(ud: u64) -> u32 {
     (ud >> 16) as u32
 }
@@ -466,7 +467,7 @@ impl UringState {
                     self.pool.release(buf_idx);
                     return Err(io::Error::from_raw_os_error(-result));
                 }
-                if (result as u32) != expected_len {
+                if result.cast_unsigned() != expected_len {
                     self.pool.release(buf_idx);
                     return Err(io::Error::other(format!(
                         "io_uring short read: expected {expected_len}, got {result}"
@@ -474,7 +475,7 @@ impl UringState {
                 }
             } else {
                 // Write CQE — either standalone WriteFixed or from a linked chain.
-                if result == -(libc::ECANCELED as i32) {
+                if result == -libc::ECANCELED {
                     // Write was canceled because the linked read failed.
                     // Buffer was already released in the read CQE error path.
                     continue;
@@ -482,7 +483,7 @@ impl UringState {
                 if result < 0 {
                     return Err(io::Error::from_raw_os_error(-result));
                 }
-                if (result as u32) != expected_len {
+                if result.cast_unsigned() != expected_len {
                     return Err(io::Error::other(format!(
                         "io_uring short write: expected {expected_len} bytes, got {result}"
                     )));

@@ -859,10 +859,21 @@ fn classify_block_simple(
 #[allow(clippy::too_many_arguments)]
 fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
     // Check if input is sorted — if so, classify + write in a single file pass.
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
-    let is_sorted = reader.header().is_sorted();
-    drop(reader);
+    // We need a quick header check without keeping the reader open. Use BlobReader
+    // to read just the first blob (header) instead of a full ElementReader.
+    let is_sorted = {
+        let mut br = crate::BlobReader::open(input, direct_io)?;
+        match br.next() {
+            Some(Ok(blob)) => match blob.decode()? {
+                crate::blob::BlobDecode::OsmHeader(h) => {
+                    super::warn_locations_on_ways_loss(&h);
+                    h.is_sorted()
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    };
 
     if is_sorted {
         return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io, overrides);

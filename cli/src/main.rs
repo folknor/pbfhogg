@@ -1924,6 +1924,48 @@ fn run_inspect(
     if get.is_some() && json {
         return Err("--get and --json cannot be used together".into());
     }
+
+    // --get header.* or file.* only: read just the header blob, skip full scan
+    if let Some(key) = get {
+        let needs_full_scan = key.starts_with("data.")
+            || key.starts_with("metadata.")
+            || key.starts_with("elements.")
+            || key.starts_with("blocks.")
+            || key == "indexed";
+        let has_other_flags = extended || id_ranges || locations || anomalies || nodes || blocks.is_some();
+        if !needs_full_scan && !has_other_flags {
+            let mut reader = pbfhogg::BlobReader::open(path, direct_io)?;
+            let header = match reader.next() {
+                Some(Ok(blob)) => match blob.decode()? {
+                    pbfhogg::blob::BlobDecode::OsmHeader(h) => *h,
+                    _ => return Err("first blob is not an OsmHeader".into()),
+                },
+                Some(Err(e)) => return Err(e.into()),
+                None => return Err("empty PBF file".into()),
+            };
+            let val = match key {
+                "file.name" => Some(
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string()),
+                ),
+                "file.size" => Some(std::fs::metadata(path)?.len().to_string()),
+                "file.format" => Some("PBF".to_string()),
+                "header.bbox" => header.bbox().map(|bb| format!("{} {} {} {}", bb.left, bb.bottom, bb.right, bb.top)),
+                "header.writing_program" => header.writing_program().map(String::from),
+                "header.replication.url" => header.osmosis_replication_base_url().map(String::from),
+                "header.replication.sequence" => header.osmosis_replication_sequence_number().map(|s| s.to_string()),
+                "header.replication.timestamp" => header.osmosis_replication_timestamp().map(|t| t.to_string()),
+                _ => return Err(format!("unknown key: {key}").into()),
+            };
+            match val {
+                Some(v) => println!("{v}"),
+                None => return Err(format!("key {key} has no value in this file").into()),
+            }
+            return Ok(());
+        }
+    }
+
     // --get with data.* keys requires --extended
     let extended = extended
         || get

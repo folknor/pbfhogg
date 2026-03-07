@@ -53,12 +53,8 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
-    {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
-
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
     let mut stats = GetparentsStats {
         nodes_written: 0,

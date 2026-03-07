@@ -212,11 +212,6 @@ pub fn getid(
          based on requested ID types is a no-op — all blobs are decompressed \
          (significantly slower).")?;
 
-    {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
-
     if opts.add_referenced {
         getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)
     } else {
@@ -227,10 +222,6 @@ pub fn getid(
 /// Remove elements matching the given IDs (output everything else).
 #[hotpath::measure]
 pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
-    {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
     filter_by_id(input, output, ids, false, None, compression, direct_io, overrides)
 }
 
@@ -250,6 +241,7 @@ fn filter_by_id(
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     // Skip blob types with no matching IDs (getid only — removeid needs all types).
     let reader = if include {
         reader.with_blob_filter(BlobFilter::new(
@@ -323,6 +315,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
 
     // Pass 2: Write matching elements + dependent nodes (parallel batches).
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
     let reader = reader.with_blob_filter(BlobFilter::new(

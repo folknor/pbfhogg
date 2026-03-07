@@ -5,7 +5,7 @@ Rust library for reading, writing, and merging OpenStreetMap PBF files. The full
 **Production pipeline** (runs every planet refresh cycle):
 ```
 Bootstrap (once):  pbfhogg cat → pbfhogg add-locations-to-ways → enriched PBF
-Steady state:      pbfhogg merge --locations-on-ways (daily diffs)
+Steady state:      pbfhogg apply-changes --locations-on-ways (daily diffs)
                                       │
                                       ├── elivagar → PMTiles → nidhogg (tile serving)
                                       └── nidhogg (PBF ingest → query API)
@@ -84,7 +84,7 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 ## Pipeline 2: Merge (nidhogg only)
 
-**Entry**: `src/commands/merge.rs:1032` — `merge(base, osc, output, compression, direct_io, io_uring, sqpoll)`
+**Entry**: `src/commands/merge.rs` — `merge(base, osc, output, &MergeOptions, &HeaderOverrides)`
 
 **OSC diff parsing**: `src/osc.rs` — `CompactDiffOverlay` with arena-packed binary layouts (`Vec<u8>` per type), `FxHashMap<i64, u32>` index (byte offsets into arenas), `StringInterner` for tag keys/roles, `HashSet<i64>` for deletes. 40-60% less memory than per-element HashMap. Typical Denmark diff: ~300KB compressed, ~50K entries.
 
@@ -123,22 +123,25 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 ## Pipeline 3: Cat (pbfhogg CLI, used to generate indexed PBFs)
 
-**No type filter** (passthrough) — `src/commands/cat.rs`: reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. **No decompress/compress.**
+**Entry**: `src/commands/cat.rs` — `cat(files, output, type_filter, &CleanAttrs, compression, direct_io, force, &HeaderOverrides)`
 
-**With type filter** — `src/commands/cat.rs`: full decode → `BlockBuilder` → re-encode → compress. Same allocation pattern as merge rewrite path.
+**No type filter** (passthrough) — reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. **No decompress/compress.**
+
+**With type filter** — full decode → `BlockBuilder` → re-encode → compress. Same allocation pattern as merge rewrite path. `CleanAttrs` optionally strips metadata attributes (version, timestamp, changeset, uid, user).
+
+**Dedupe mode** (`--dedupe`) — K-way sorted merge of multiple PBFs with blob-level passthrough and exact-duplicate deduplication. All inputs must be sorted.
 
 ## Pipeline 4: Add-locations-to-ways (enrichment step)
 
-**Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, index_type)`
+**Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides)`
 
-Two-pass algorithm that embeds node coordinates directly into way elements.
+Two-pass algorithm that embeds node coordinates directly into way elements. Uses a file-backed `DenseMmapIndex` (8 bytes/slot, direct addressing by node ID) that works from country to planet scale without OOM.
 
 **Pass 1 — Parallel node index building:**
 - Pipelined read with `BlobFilter::only_nodes()` — skips way/relation blobs entirely
 - Batch-and-dispatch: collects `INDEX_BATCH_SIZE=64` blocks, then `par_iter` on rayon global pool
 - Uses `elements_skip_metadata()` — skips metadata parsing (only needs id/lat/lon)
-- **Hash variant**: `par_iter().fold().reduce()` builds per-thread partial `FxHashMap<i64, (i32, i32)>`, merged pairwise, extended into master map
-- **Dense variant**: `SharedDenseWriter` holds raw `*mut u8` into anonymous mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free. Planet-scale: 128 GB virtual, ~68 GB physical (requires `vm.overcommit_memory=1`)
+- `DenseMmapIndex`: file-backed anonymous mmap in scratch dir (next to output). `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free. Default capacity 16B slots (128 GB virtual). Temp file cleaned up on drop.
 
 **Pass 2 — Output with locations on ways:**
 - **Indexed PBF (fast path)**: reads raw blob frames, classifies by `BlobIndex.kind` from BlobHeader indexdata

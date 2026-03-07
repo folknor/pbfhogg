@@ -167,11 +167,6 @@ pub fn tags_filter(
              filters are no-ops — all blobs are decompressed (significantly slower).")?;
     }
 
-    {
-        let reader = crate::ElementReader::open(input, opts.direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
-
     let expressions = parse_expressions(opts.expression_strs)?;
     if opts.omit_referenced {
         tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io, overrides)
@@ -284,6 +279,7 @@ fn tags_filter_single_pass(
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     // Blob-level filtering can't help in invert mode — we want non-matching blobs.
     let reader = if invert {
         reader
@@ -545,6 +541,7 @@ fn tags_filter_two_pass(
     // Pass 1: skip blob types that no expression targets.
     // In invert mode, we need all blob types since non-matching elements are kept.
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     let reader = if invert {
         reader
     } else {

@@ -79,13 +79,6 @@ pub fn cat(
         }
     }
 
-    // Check first file — if it has LocationsOnWays, coordinates are lost
-    // through re-encoding (cat doesn't preserve way lat/lon fields).
-    {
-        let reader = crate::ElementReader::open(files[0], direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
-
     match (type_filter, clean.any()) {
         (None, false) => cat_passthrough(files, output, compression, direct_io, overrides),
         (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io, overrides),
@@ -107,6 +100,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             if frame.blob_type == BlobKind::OsmHeader {
                 let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                super::warn_locations_on_ways_loss(&header);
                 hdr_bytes = Some(build_output_header(&header, single_file, overrides, |hb| hb)?);
                 break;
             }
@@ -251,6 +245,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     // Read header from first file
     // -----------------------------------------------------------------------
     let first_reader = ElementReader::open(files[0], direct_io)?;
+    super::warn_locations_on_ways_loss(first_reader.header());
     let header = first_reader.header().clone();
     let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb)?;
     let mut blobs_decoded: u64 = 0;

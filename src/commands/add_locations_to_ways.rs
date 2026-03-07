@@ -366,18 +366,6 @@ pub fn add_locations_to_ways(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    // Check if input already has LocationsOnWays — the coordinates will be
-    // rebuilt from scratch, so warn about redundant work.
-    {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        if reader.header().has_locations_on_ways() {
-            eprintln!(
-                "Warning: input PBF already declares LocationsOnWays. \
-                 Existing way-node coordinates will be overwritten."
-            );
-        }
-    }
-
     let indexdata_present = require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).")?;
@@ -426,8 +414,14 @@ fn build_node_index_dense(
         capacity: index.capacity,
     };
 
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_nodes());
+    let reader = ElementReader::open(input, direct_io)?;
+    if reader.header().has_locations_on_ways() {
+        eprintln!(
+            "Warning: input PBF already declares LocationsOnWays. \
+             Existing way-node coordinates will be overwritten."
+        );
+    }
+    let reader = reader.with_blob_filter(BlobFilter::only_nodes());
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(INDEX_BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {

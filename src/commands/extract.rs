@@ -734,10 +734,6 @@ pub fn extract(
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op — all blobs are decompressed (significantly slower).")?;
     }
-    {
-        let reader = crate::ElementReader::open(input, direct_io)?;
-        super::warn_locations_on_ways_loss(reader.header());
-    }
     match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io, overrides),
         ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io, overrides),
@@ -864,6 +860,7 @@ fn classify_block_simple(
 fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
     // Check if input is sorted — if so, classify + write in a single file pass.
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     let is_sorted = reader.header().is_sorted();
     drop(reader);
 
@@ -1034,6 +1031,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
@@ -1811,6 +1809,7 @@ fn extract_smart(
 
     // --- Pass 3: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
+    super::warn_locations_on_ways_loss(reader.header());
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {

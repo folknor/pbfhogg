@@ -10,9 +10,10 @@ use super::{
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::blob::{decode_blob_to_headerblock, BlobKind};
+use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
+use crate::blob_index::{scan_block_ids, scan_block_tags};
 use crate::file_reader::FileReader;
-use crate::writer::{Compression, PbfWriter};
+use crate::writer::{reframe_raw_with_index, Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader};
 
 use super::{drain_batch_results, flush_local, read_raw_frame, Result, BATCH_SIZE};
@@ -110,6 +111,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 
     let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
     let mut blobs: u64 = 0;
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
     for file in files {
         let mut reader = FileReader::open(file, direct_io)?;
@@ -122,14 +124,40 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
-                    #[cfg(feature = "linux-direct-io")]
-                    writer.write_raw_copy(
-                        input_fd,
-                        frame.file_offset,
-                        frame.frame_bytes.len() as u64,
-                    )?;
-                    #[cfg(not(feature = "linux-direct-io"))]
-                    writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                    if frame.index.is_some() {
+                        // Already has indexdata — pass through as-is.
+                        #[cfg(feature = "linux-direct-io")]
+                        writer.write_raw_copy(
+                            input_fd,
+                            frame.file_offset,
+                            frame.frame_bytes.len() as u64,
+                        )?;
+                        #[cfg(not(feature = "linux-direct-io"))]
+                        writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                    } else {
+                        // No indexdata — decompress to scan IDs/tags, reframe with index.
+                        let blob_bytes = frame.blob_bytes();
+                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
+                        let index = match scan_block_ids(&decompress_buf) {
+                            Some(idx) => idx,
+                            None => {
+                                // Unrecognized block — pass through without indexdata.
+                                writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                                decompress_buf.clear();
+                                blobs += 1;
+                                continue;
+                            }
+                        };
+                        let tagdata = scan_block_tags(&decompress_buf);
+                        let tagdata_bytes = tagdata.as_ref().map(crate::blob_index::TagIndex::serialize);
+                        let reframed = reframe_raw_with_index(
+                            blob_bytes,
+                            &index.serialize(),
+                            tagdata_bytes.as_deref(),
+                        )?;
+                        decompress_buf.clear();
+                        writer.write_raw_owned(reframed)?;
+                    }
                     blobs += 1;
                 }
                 _ => {}

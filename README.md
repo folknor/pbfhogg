@@ -126,7 +126,16 @@ Getid supports `--add-referenced` to include way node refs (two-pass), `--id-fil
 
 **Input assumption:** pbfhogg assumes canonical OSM snapshot data (Geofabrik extracts or planet files) with unique element IDs. Custom or malformed PBFs with duplicate IDs are not validated and may produce incorrect output. In particular, `add-locations-to-ways` indexes nodes by ID — duplicate node IDs will silently overwrite earlier coordinates with later ones.
 
-Commands that benefit from blob-level indexdata (`apply-changes`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf`.
+Commands that benefit from blob-level indexdata (`apply-changes`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` — the passthrough path adds indexdata automatically without re-compressing blobs, using minimal memory. The `--type` filtered path also embeds indexdata but does full decode and re-encode.
+
+Indexdata generation via passthrough cat (commit `69a127f`):
+
+| Dataset | Size | Buffered | `--direct-io` | Overhead |
+|---------|------|----------|---------------|----------|
+| Planet | 87 GB | **497s** (8m17s) | 520s (+5%) | +0.5% file size |
+| Denmark | 461 MB | **2.8s** | — | — |
+
+Buffered I/O wins here — sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
 
 All write commands accept `--compression` to control blob compression: `none`, `zlib` (default), `zstd`, or with explicit level (`zlib:9`, `zstd:19`).
 

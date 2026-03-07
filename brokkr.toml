@@ -10,6 +10,7 @@ project = "pbfhogg"
 data = "data"
 scratch = "data/bench-tmp"
 target = "target"
+features = ["linux-direct-io", "linux-io-uring"]
 
 [plantasjen.drives]
 source = "nvme"
@@ -161,6 +162,16 @@ xxhash = "1f1c5da73006766adf72428155ed9978"
 origin = "Geofabrik"
 download_date = "2026-03-07"
 
+[plantasjen.datasets.europe.pbf.indexed]
+file = "europe-20260301-seq4714-with-indexdata.osm.pbf"
+xxhash = "4a804b9db630c3530f2600c9717187e2"
+seq = 4714
+
+[plantasjen.datasets.europe.pbf.altw]
+file = "europe-20260301-seq4714-altw.osm.pbf"
+xxhash = "28fb583aea9731c01390b64e5ab3a182"
+seq = 4714
+
 [plantasjen.datasets.europe.pbf.raw]
 file = "europe-20260301-seq4714.osm.pbf"
 xxhash = "4bffe84a25c009f8d720745c6fce45c6"
@@ -169,6 +180,14 @@ seq = 4714
 [plantasjen.datasets.planet]
 origin = "planet.openstreetmap.org"
 download_date = "2026-03-07"
+
+[plantasjen.datasets.planet.pbf.indexed]
+file = "planet-20260223-with-indexdata.osm.pbf"
+xxhash = "3ce64c662db10ed2c551ad2737144df1"
+
+[plantasjen.datasets.planet.pbf.altw]
+file = "planet-20260223-altw.osm.pbf"
+xxhash = "e83b43b8b1883efcc252e47b5c275535"
 
 [plantasjen.datasets.planet.pbf.raw]
 file = "planet-20260223.osm.pbf"

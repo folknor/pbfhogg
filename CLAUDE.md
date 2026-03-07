@@ -37,6 +37,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr profile [--dataset name] [--variant V] [--osc-seq SEQ]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite. Default variant: indexed.
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
+- `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history (stored in `$XDG_DATA_HOME/brokkr/history.db`). Every brokkr invocation is recorded with timing, exit status, project, and git context. Works from any directory.
 - `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps.
 
 ### brokkr.toml
@@ -81,9 +82,9 @@ No shell scripts remain. All development tooling is in `brokkr`.
 
 To generate a PBF with blob-level indexdata, use `cat`:
 ```
-brokkr run cat input.osm.pbf --type node,way,relation -o output-with-indexdata.osm.pbf
+brokkr run -- cat input.osm.pbf -o output-with-indexdata.osm.pbf
 ```
-There is no `--add-indexdata` flag — `cat` embeds indexdata automatically when writing.
+The passthrough path (no `--type`) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files. Planet (87 GB): 497s buffered, 520s `--direct-io` (+5% slower); Denmark (461 MB): 2.8s buffered (commit `69a127f`, plantasjen). Buffered wins for sequential single-file passthrough — `--direct-io` only helps with concurrent read/write (merge). The `--type` filtered path also embeds indexdata but does full decode+re-encode (OOMs on planet at 30 GB host).
 
 `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, and `inspect --nodes` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 

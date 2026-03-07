@@ -9,6 +9,8 @@
 //! [`super::direct_writer::DirectWriter`]). When a buffer fills, a `WriteFixed`
 //! SQE is submitted. CQEs are reaped to recycle buffer indices via a free-list.
 
+use std::collections::VecDeque;
+
 use crate::write::writer::{PipelineItem, PipelinePayload, WRITE_AHEAD};
 use io_uring::opcode;
 use io_uring::types::Fixed;
@@ -708,6 +710,7 @@ fn uring_main_loop(
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
                     handle_copy_range_uring(state, in_fd, offset, len)?;
                 }
+            }
         }
 
         // Opportunistically reap CQEs without blocking to recycle buffers.

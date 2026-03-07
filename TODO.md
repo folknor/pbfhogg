@@ -56,6 +56,72 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   decode+write (`cat --type`), and allocations. Run:
   `brokkr profile --dataset germany`
 
+## ALTW memory optimization
+
+### Current implementation
+
+`DenseMmapIndex` is a direct-mapped array: `index[node_id] = (lat, lon)`.
+Node ID is the array index, so lookup is O(1) — but the array must span the
+full node ID range, not just the number of nodes. OSM node IDs go up to ~13B,
+so the index is 16B slots × 8 bytes = 128 GB virtual address space. Only
+touched pages consume physical memory (~80 GB for planet's 10.4B nodes).
+Gaps between IDs waste address space but not much physical memory.
+
+This is the standard approach — osmium uses the same strategy (`dense_mmap_array`).
+It's the fastest possible access pattern when it fits in RAM.
+
+### The problem
+
+Planet ALTW takes 96m on plantasjen (30 GB RAM, 8 GB swap) — CPU mostly idle,
+bottlenecked on page faults in the dense mmap index. The kernel constantly
+evicts and re-faults pages across the 80 GB working set. `vmstat` would show
+heavy `si`/`so` (swap in/out) activity. Production host (64 GB) should be
+fine but still tight — the working set barely fits.
+
+Planet stats: 10.4B nodes read, 285M written (97% dropped as untagged), 1.17B
+ways processed, 14.1M relations, 452 passthrough blobs, 50K decoded, 0 missing
+locations. Output 88.4 GB (+0.7% from embedded way-node coordinates).
+
+### Alternative approaches (in priority order)
+
+1. **Two-pass with referenced-nodes-only index** — Pass 1: scan all ways to
+   collect the set of referenced node IDs (~2B unique IDs for planet). Pass 2:
+   stream through nodes, only indexing those in the referenced set. Memory
+   drops from ~80 GB touched to ~16 GB (2B × 8 bytes). The extra pass is
+   sequential I/O. Could use a sorted Vec or compact hash map for the
+   referenced ID set (~16 GB for 2B i64s).
+
+2. **On-disk sorted store** — Sort all nodes by ID into a temporary file on
+   nvme, then merge-join with way node references (also sorted by referenced
+   node ID). Memory = just I/O buffers. Slowest approach but constant memory
+   regardless of planet size.
+
+3. **Partitioned/chunked index** — Split the node ID range into chunks (e.g.
+   1M IDs each). Process the file in rounds, one chunk at a time — each round
+   only needs the chunk's memory. Trades many passes for arbitrarily low
+   memory. Similar to osmium's `flex_mem` strategy.
+
+All three approaches shift the bottleneck from random mmap faults to sequential
+I/O, which is where `--direct-io`, io_uring, and erofs provide real benefit.
+The current random 8-byte reads across 128 GB of mmap is the worst possible
+access pattern for all three of those tools — `--direct-io` actually adds 2%
+overhead for ALTW because sequential readahead from page cache is faster.
+
+### Quick wins to test first
+
+- [ ] **Larger nvme swap** (64-128 GB) on europe dataset — measure how much
+  swap sizing alone improves the 30 GB host story before writing new code.
+  Current 8 GB swap + 30 GB RAM = 38 GB addressable, well below the ~30 GB
+  touched by europe's 3.7B nodes.
+
+### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
+
+| Dataset | Size | Elements | Time | Notes |
+|---------|------|----------|------|-------|
+| Europe | 33.6 GB | 4.2B (3.7B nodes, 454M ways, 8.2M rels) | 2565s (43m) | buffered |
+| Europe | 33.6 GB | 4.2B | 2611s (43m) | `--direct-io` (+2%, no benefit) |
+| Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound |
+
 ## Consolidation
 
 - [ ] **Investigate shared reader thread for raw-frame streaming** — `merge.rs` spawns a

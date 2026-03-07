@@ -56,6 +56,15 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   decode+write (`cat --type`), and allocations. Run:
   `brokkr profile --dataset germany`
 
+## Consolidation
+
+- [ ] **Investigate shared reader thread for raw-frame streaming** — `merge.rs` spawns a
+  dedicated reader thread (bounded mpsc channel, `read_raw_frame` loop, skips OsmHeader).
+  `sort.rs` does sequential seeks and `add_locations_to_ways.rs` has its own scan loop.
+  Investigate whether extracting `spawn_reader_thread(path, direct_io) -> (JoinHandle,
+  Receiver<RawBlobFrame>)` into `mod.rs` would benefit sort and ALTW, or whether their
+  access patterns are too different (random seek vs sequential scan).
+
 ## Release prep
 
 ### crates.io blockers
@@ -71,6 +80,10 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 - [x] **Audit wildcard re-exports** — replaced all 6 wildcard `pub use` with explicit named re-exports (42 types). Downgraded 6 internal blob.rs free functions from `pub` to `pub(crate)`.
 - [x] **`commands` module visibility** — keeping `#[doc(hidden)] pub`. CLI crate depends on these as a separate package so `pub(crate)` won't work. Feature-gating adds complexity for no compile-time benefit (heavy deps already gated). Standard Rust convention (serde, tokio do the same).
 - [ ] **Clarify license** — README mentions MIT but only Apache-2.0 is declared. Pick one story.
+
+### Testing
+
+- [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
 
 ### Other
 

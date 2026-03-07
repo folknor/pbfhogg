@@ -1,6 +1,6 @@
-# pbfhogg deviations from osmium-tool
+# pbfhogg deviations from osmium
 
-Intentional behavioral differences from osmium-tool. These are deliberate design
+Intentional behavioral differences from osmium. These are deliberate design
 choices, not bugs.
 
 ## add-locations-to-ways: relation-member nodes always preserved

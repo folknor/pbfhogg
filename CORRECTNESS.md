@@ -1,7 +1,7 @@
 # pbfhogg correctness notes
 
 Parser/encoder edge cases and data representation limits that are accepted by
-design. For intentional behavioral differences from osmium-tool, see
+design. For intentional behavioral differences from osmium, see
 DEVIATIONS.md.
 
 ## Non-packed repeated fields (protobuf spec violation)

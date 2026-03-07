@@ -144,41 +144,73 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
 ## CLI commands
 
-### Denmark (487 MB indexed, 59M elements)
+Commit `aacbe80`, plantasjen. Best of 3 runs.
 
-Commit `23862d1` (full suite), plantasjen.
+### Denmark (487 MB indexed, 59M elements)
 
 | Command | Time |
 |---------|------|
-| sort (sorted, indexdata) | 144 ms |
-| cat --type relation | 217 ms |
-| tags-filter highway=primary | 240 ms |
-| inspect-tags --type way | 344 ms |
-| getid | 528 ms |
-| tags-filter amenity=* | 583 ms |
-| cat --type way | 1.11s |
-| inspect-nodes | 1.74s |
-| inspect-tags | 1.80s |
-| tags-filter two-pass | 2.53s |
-| getid --invert | 2.72s |
-| extract --simple | 2.79s |
-| extract --complete | 2.86s |
-| extract --smart | 3.02s |
-| fileinfo (inspect) | 3.58s |
-| add-locations-to-ways | 5.47s |
-| check --refs | 7.19s |
+| tags-filter-osc | 14 ms |
+| inspect (indexdata) | 19 ms |
+| cat --type relation | 85 ms |
+| tags-filter highway=primary | 152 ms |
+| inspect-tags --type way | 251 ms |
+| sort (sorted, indexdata) | 366 ms |
+| getid | 379 ms |
+| getparents | 400 ms |
+| tags-filter amenity=* | 438 ms |
+| apply-changes | 517 ms |
+| cat --type way | 614 ms |
+| merge-changes | 107 ms |
+| inspect-tags | 1.61s |
+| inspect-nodes | 1.73s |
+| check --ids | 1.87s |
+| getid --invert | 1.87s |
+| extract --simple | 2.48s |
+| extract --complete | 2.40s |
+| tags-filter two-pass | 2.62s |
+| extract --smart | 2.65s |
+| add-locations-to-ways | 5.59s |
+| check --refs | 6.83s |
+| time-filter | 9.39s |
+| cat --dedupe | 22.4s |
+| renumber | 22.3s |
 
 ### Japan (2.4 GB indexed, 344M elements)
 
 | Command | Time |
 |---------|------|
-| cat --type relation | 365 ms |
-| cat --type way | 3.44s |
-| extract --smart | 12.2s |
-| tags-filter two-pass | 11.9s |
-| add-locations-to-ways | 43.1s |
+| inspect (indexdata) | 92 ms |
+| tags-filter-osc | 169 ms |
+| cat --type relation | 306 ms |
+| tags-filter highway=primary | 840 ms |
+| sort (sorted, indexdata) | 1.33s |
+| merge-changes | 1.62s |
+| getid | 1.94s |
+| getparents | 2.06s |
+| tags-filter amenity=* | 2.20s |
+| inspect-tags --type way | 2.43s |
+| apply-changes | 2.53s |
+| cat --type way | 3.45s |
+| inspect-tags | 4.82s |
+| getid --invert | 8.55s |
+| inspect-nodes | 9.14s |
+| extract --simple | 9.36s |
+| check --ids | 10.4s |
+| extract --complete | 11.6s |
+| extract --smart | 12.9s |
+| tags-filter two-pass | 13.7s |
+| check --refs | 38.7s |
+| time-filter | 43.8s |
+| add-locations-to-ways | 64.1s |
+| diff | 72.2s |
+| diff --format osc | 73.1s |
+| cat --dedupe | 102.2s |
+| renumber | 152.4s |
 
 ### Germany (4.7 GB indexed)
+
+Previous commit data (commit `46f7388`):
 
 | Command | Time |
 |---------|------|

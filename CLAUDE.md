@@ -15,7 +15,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install --path ~/Programs/brokkr`. Invoked as `brokkr` from the project root (reads `./brokkr.toml` for project detection).
 
 - `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`). Supports `--features` and `--no-default-features`.
-- `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
+- `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status. Shows computed XXH128 hashes for each dataset file (copy into the `xxhash` field in `brokkr.toml`).
 - `brokkr run [options] [-- args]` — build release CLI and run passthrough command args. Supports machine-readable timing:
   - `--time` prints key=value timing output
   - `--json` prints structured JSON timing output
@@ -38,6 +38,38 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps.
+
+### brokkr.toml
+
+```toml
+project = "pbfhogg"
+
+[plantasjen]
+data = "data"
+scratch = "data/scratch"
+
+[plantasjen.datasets.denmark]
+origin = "Geofabrik"
+download_date = "2026-02-20"
+bbox = "8.0,54.5,13.0,58.0"
+
+[plantasjen.datasets.denmark.pbf.indexed]
+file = "denmark-with-indexdata.osm.pbf"
+xxhash = "3f1977fd..."
+seq = 4704
+
+[plantasjen.datasets.denmark.pbf.raw]
+file = "denmark-raw.osm.pbf"
+seq = 4704
+
+[plantasjen.datasets.denmark.osc.4705]
+file = "denmark-4705.osc.gz"
+xxhash = "fa581f7b..."
+```
+
+- `pbf.<variant>` — PBF files keyed by variant name. `--variant` selects (default: `indexed`).
+- `osc.<seq>` — OSC diff files keyed by sequence number. `--osc-seq` selects.
+- `xxhash` — XXH128 file hash. Run `brokkr env` to see computed values.
 
 Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored).
 

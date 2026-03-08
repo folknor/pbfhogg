@@ -125,7 +125,10 @@ impl DirectReader {
     /// Skip `n` bytes without materializing data.
     ///
     /// Discards any buffered bytes that overlap the skip range, then seeks
-    /// the fd past the remainder.
+    /// the fd. The seek target is aligned down to a page boundary, and the
+    /// buffer is refilled so the read position lands at the correct logical
+    /// offset. This is necessary because O_DIRECT requires page-aligned
+    /// file offsets for `read()`.
     pub(crate) fn skip(&mut self, n: u64) -> io::Result<()> {
         let buffered = self.buf.remaining() as u64;
         if n <= buffered {
@@ -133,12 +136,36 @@ impl DirectReader {
             self.buf.consume(n as usize);
             return Ok(());
         }
-        // Consume remaining buffer, then lseek past the rest.
+        // Consume remaining buffer, then seek past the rest.
         let past_buf = n - buffered;
         #[allow(clippy::cast_possible_truncation)] // buffered <= buf capacity (usize)
         self.buf.consume(buffered as usize);
+
         use std::io::{Seek, SeekFrom};
-        self.file.seek(SeekFrom::Current(past_buf.cast_signed()))?;
+        let current_pos = self.file.stream_position()?;
+        let target = current_pos + past_buf;
+        let aligned = target & !(PAGE_SIZE as u64 - 1);
+        self.file.seek(SeekFrom::Start(aligned))?;
+
+        if aligned < target {
+            // Refill buffer from the aligned position, then skip the gap.
+            // gap < PAGE_SIZE, so it always fits in usize.
+            #[allow(clippy::cast_possible_truncation)]
+            let gap = (target - aligned) as usize;
+            let filled = self.buf.fill_from(self.file.as_raw_fd())?;
+            if filled < gap {
+                self.eof = true;
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "skip past end of file",
+                ));
+            }
+            self.buf.consume(gap);
+        } else {
+            // Already aligned — just clear the buffer so next read refills.
+            self.buf.pos = 0;
+            self.buf.len = 0;
+        }
         Ok(())
     }
 

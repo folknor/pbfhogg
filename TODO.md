@@ -156,6 +156,23 @@ overhead for ALTW because sequential readahead from page cache is faster.
 See `notes/test-plan.md` for the full pre-release test matrix (feature permutations,
 I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
 
+### Cross-validation known diffs
+
+Three `brokkr verify` commands show known differences vs osmium. These are semantic
+disagreements, not bugs — but should be investigated and either fixed or documented
+before release.
+
+- [ ] **`check-refs` relation counting** — pbfhogg counts missing reference occurrences,
+  osmium counts unique missing IDs. Ways-only output is identical. Decide which
+  semantics are correct and align, or document the difference.
+- [ ] **`diff` version comparison** — 14-element discrepancy out of 59.1M elements.
+  pbfhogg uses content equality (coordinates, tags, refs, members), osmium uses
+  version/timestamp ordering. Document the semantic difference or add a
+  `--version-compare` mode.
+- [ ] **`derive-changes` delete loss** — pbfhogg roundtrip is perfect. osmium loses
+  1243 deletes when generating OSC from two PBFs. This is an osmium limitation,
+  not a pbfhogg bug. Document it.
+
 - [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
 - [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:
   1. Batch-side (commit `abe2782`): `DECODE_BATCH_BYTE_BUDGET = 32 MiB` caps
@@ -171,6 +188,19 @@ I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Add a CHANGELOG.md before first tagged release
+- [x] **`sort --direct-io` EINVAL** — `DirectReader::skip()` seeked to an unaligned
+  file offset, causing the next `libc::read` to fail with EINVAL. Fixed by
+  aligning the seek target down to a page boundary, refilling the buffer, and
+  consuming the alignment gap.
+- [x] **osmium "invalid BlobHeader size" with indexdata PBFs** — osmium rejects
+  BlobHeaders larger than its hardcoded max when indexdata fields are present.
+  Filed [libosmium#405](https://github.com/osmcode/libosmium/issues/405), fixed
+  upstream but not yet released. Not a pbfhogg bug. Affects `verify derive-changes`
+  and `verify diff` (both buffered and `--direct-io`) when the input PBF has indexdata.
+- [x] **`copy_file_range` cross-device fallback** — `copy_file_range` returns `EXDEV`
+  when input and output are on different filesystems. Sort and any command using
+  `write_raw_copy` would fail with "writer thread terminated" in cross-device
+  setups. Fixed with `pread`+`write` fallback in `copy_range_fallback()`.
 - [x] **All 4 feature permutations pass clippy + tests** (commit `a52ac80`): default,
   `linux-direct-io`+`linux-io-uring`, `--no-default-features`, and
   `--no-default-features`+linux features. Fixed 6 latent clippy errors in

@@ -741,7 +741,12 @@ fn copy_range(
             )
         };
         if n < 0 {
-            return Err(io::Error::last_os_error());
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EXDEV) {
+                // Cross-device: fall back to pread+write.
+                return copy_range_fallback(in_fd, out_fd, offset, len);
+            }
+            return Err(err);
         }
         if n == 0 {
             return Err(io::Error::new(
@@ -752,6 +757,44 @@ fn copy_range(
         let n = n.cast_unsigned() as u64;
         offset += n;
         len -= n;
+    }
+    Ok(())
+}
+
+/// Fallback for cross-device copies: pread from `in_fd` at `offset`, write to `out_fd`.
+#[cfg(feature = "linux-direct-io")]
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn copy_range_fallback(
+    in_fd: std::os::unix::io::RawFd,
+    out_fd: std::os::unix::io::RawFd,
+    mut offset: u64,
+    mut len: u64,
+) -> io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+
+    let mut buf = vec![0u8; 256 * 1024];
+    // Wrap in ManuallyDrop so we don't close the fd when done — caller owns it.
+    let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
+    // Read from in_fd using pread (doesn't change file position).
+    while len > 0 {
+        let chunk = buf.len().min(len as usize);
+        let n = unsafe {
+            libc::pread(in_fd, buf.as_mut_ptr().cast(), chunk, offset as i64)
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "pread returned 0 during cross-device copy",
+            ));
+        }
+        let n = n.cast_unsigned();
+        out.write_all(&buf[..n])?;
+        offset += n as u64;
+        len -= n as u64;
     }
     Ok(())
 }

@@ -79,21 +79,18 @@ Priority 3 (CLI integration): **DONE**
 Each verify command should run with both buffered and direct-io to exercise both
 write paths against reference tools. All default to `--dataset denmark --variant indexed`.
 
-**Prerequisite:** brokkr verify commands need `--direct-io` support added (see
-"Brokkr changes needed" at end of document).
-
 | Command | Buffered | `--direct-io` | Notes |
 |---------|----------|---------------|-------|
-| `verify sort` | [ ] | [ ] | vs osmium sort |
-| `verify cat` | [ ] | [ ] | type filters vs osmium cat |
-| `verify extract` | [ ] | [ ] | simple/complete/smart vs osmium |
-| `verify tags-filter` | [ ] | [ ] | 3 expressions vs osmium |
-| `verify getid-removeid` | [ ] | [ ] | getid + invert vs osmium |
-| `verify add-locations-to-ways` | [ ] | [ ] | vs osmium |
-| `verify check-refs` | [ ] | [ ] | vs osmium check-refs |
-| `verify merge` | [ ] | [ ] | vs osmium/osmosis/osmconvert |
-| `verify derive-changes` | [ ] | [ ] | diff --format osc roundtrip |
-| `verify diff` | [ ] | [ ] | diff summary vs osmium diff |
+| `verify sort` | [x] | [x] | vs osmium sort |
+| `verify cat` | [x] | [x] | type filters vs osmium cat |
+| `verify extract` | [x] | [x] | simple/complete/smart vs osmium |
+| `verify tags-filter` | [x] | [x] | 3 expressions vs osmium |
+| `verify getid-removeid` | [x] | [x] | getid + invert vs osmium |
+| `verify add-locations-to-ways` | [x] | [x] | vs osmium |
+| `verify check-refs` | **known diff** | **known diff** | ways-only identical; relation counts differ (occurrences vs unique IDs) |
+| `verify merge` | [x] | [x] | vs osmium/osmosis/osmconvert |
+| `verify derive-changes` | **known diff** | **osmium bug** | [libosmium#405](https://github.com/osmcode/libosmium/issues/405): osmium rejects large BlobHeaders (indexdata). Fixed upstream, not released. |
+| `verify diff` | **known diff** | **osmium bug** | same libosmium#405 — not a pbfhogg issue |
 
 Note: verify commands must run **one at a time**, never in parallel.
 
@@ -148,29 +145,7 @@ strategy:
 
 Each matrix entry runs: `cargo clippy` + `cargo test` with the given features.
 
-## Brokkr changes needed
+## Brokkr changes done
 
-The following changes are needed in brokkr before section 3 is executable:
-
-**Add `--direct-io` flag to all verify subcommands that produce output PBFs.**
-
-Currently none of the 10 `brokkr verify` subcommands accept `--direct-io`. The flag
-should be forwarded to the underlying pbfhogg command so the write path uses O_DIRECT.
-
-Commands that write PBFs and need the flag:
-- `verify sort` — passes to `pbfhogg sort`
-- `verify cat` — passes to `pbfhogg cat`
-- `verify extract` — passes to `pbfhogg extract`
-- `verify tags-filter` — passes to `pbfhogg tags-filter`
-- `verify getid-removeid` — passes to `pbfhogg getid`
-- `verify add-locations-to-ways` — passes to `pbfhogg add-locations-to-ways`
-- `verify merge` — passes to `pbfhogg apply-changes`
-- `verify derive-changes` — passes to `pbfhogg diff --format osc`
-
-Commands that don't write PBFs (no flag needed):
-- `verify check-refs` — read-only comparison
-- `verify diff` — summary output only
-
-The flag should require building pbfhogg with `--features linux-direct-io`. The verify
-command should pass `--direct-io` through to the pbfhogg CLI invocation. The comparison
-logic (diff against osmium output) stays the same — only the write path changes.
+- [x] `--direct-io` flag added to all verify subcommands that produce output PBFs
+- [x] `--package` / `-p` flag added to `brokkr check`

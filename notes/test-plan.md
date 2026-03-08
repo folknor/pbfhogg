@@ -61,18 +61,18 @@ on the release toolchain, document it as a known issue.
 | `linux-io-uring` | 2 tests | `sort_overlapping_blobs_uring`, `merge_basic_create_modify_delete_uring` |
 | `--direct-io` in commands | 4 tests | sort, merge, cat, add-locations-to-ways |
 | `--uring` in commands | 2 tests | sort, merge |
-| Feature-missing error paths | **untested** | `"--direct-io requires the linux-direct-io feature"` |
-| CLI binary invocation | **none** | All tests call library API directly |
+| Feature-missing error paths | 2 tests | `sort_direct_io_feature_missing_error`, `sort_io_uring_feature_missing_error` |
+| CLI binary invocation | 7 tests | `cli/tests/cli.rs`: version, help, cat, sort, inspect, check, feature-gated flags |
 
 ### Remaining test gaps
 
-Priority 2 (error paths):
-- [ ] Build without `linux-direct-io`, pass `direct_io: true` — expect error
-- [ ] Build without `linux-io-uring`, pass `io_uring: true` — expect error
+Priority 2 (error paths): **DONE**
+- [x] Build without `linux-direct-io`, pass `direct_io: true` — expect error
+- [x] Build without `linux-io-uring`, pass `io_uring: true` — expect error
 
-Priority 3 (CLI integration):
-- [ ] Invoke `pbfhogg` binary via `std::process::Command` for key commands
-- [ ] Verify `--direct-io` flag accepted/rejected based on compiled features
+Priority 3 (CLI integration): **DONE**
+- [x] Invoke `pbfhogg` binary via `std::process::Command` for key commands
+- [x] Verify `--direct-io` flag accepted/rejected based on compiled features
 
 ## 3. Cross-validation (brokkr verify)
 

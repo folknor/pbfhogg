@@ -579,7 +579,7 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
     match file.read_exact(&mut buf) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            return Err(std::io::Error::new(std::io::ErrorKind::Other, "too small"));
+            return Err(std::io::Error::other("too small"));
         }
         Err(e) => return Err(e),
     }
@@ -596,7 +596,7 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
     if size > 0 && size < 1000 {
         return Ok(InputKind::Pbf);
     }
-    Err(std::io::Error::new(std::io::ErrorKind::Other, "ambiguous"))
+    Err(std::io::Error::other("ambiguous"))
 }
 
 /// Combine CLI positional expressions with expressions read from a file.
@@ -613,6 +613,7 @@ fn combine_expressions(
     Ok(all)
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
         .percentiles(&[50, 95, 99])
@@ -1078,6 +1079,7 @@ fn main() {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_check(
     path: &std::path::Path,
     ids: bool,
@@ -1229,6 +1231,7 @@ fn run_check(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tags_count(
     path: &std::path::Path,
     min_count: u64,
@@ -1284,6 +1287,7 @@ fn parse_clean_attrs(attrs: &[String]) -> Result<pbfhogg::cat::CleanAttrs, Box<d
     Ok(clean)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_cat(
     files: &[PathBuf],
     output: &std::path::Path,
@@ -1363,6 +1367,7 @@ fn run_renumber(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_tags_filter(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1498,6 +1503,7 @@ fn print_missing_ids(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_diff(
     old: &std::path::Path,
     new: &std::path::Path,
@@ -1563,6 +1569,7 @@ fn run_derive_changes(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_getid(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1609,6 +1616,7 @@ fn run_getid(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_getparents(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1629,6 +1637,7 @@ fn run_getparents(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_removeid(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1657,6 +1666,7 @@ fn extract_strategy(simple: bool, smart: bool) -> pbfhogg::extract::ExtractStrat
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_extract(
     file: &std::path::Path,
     output: &std::path::Path,
@@ -1873,6 +1883,7 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn run_inspect(
     path: &std::path::Path,
     indexed: bool,
@@ -2021,6 +2032,7 @@ fn run_inspect(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_apply_changes(
     base: &std::path::Path,
     changes: &std::path::Path,
@@ -2140,7 +2152,7 @@ fn run_bench_read(path: &std::path::Path, mode: &str) -> Result<(), Box<dyn std:
                     for el in block.elements() {
                         match el {
                             pbfhogg::Element::Node(_) | pbfhogg::Element::DenseNode(_) => {
-                                nodes += 1
+                                nodes += 1;
                             }
                             pbfhogg::Element::Way(_) => ways += 1,
                             pbfhogg::Element::Relation(_) => rels += 1,
@@ -2330,7 +2342,7 @@ fn run_bench_merge(
         }
     };
 
-    let _ = std::fs::remove_file(output);
+    drop(std::fs::remove_file(output));
 
     let start = Instant::now();
     let opts = pbfhogg::merge::MergeOptions {

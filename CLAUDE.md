@@ -14,7 +14,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
 Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install --path ~/Programs/brokkr`. Invoked as `brokkr` from the project root (reads `./brokkr.toml` for project detection).
 
-- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`). Supports `--features` and `--no-default-features`.
+- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`). Supports `--features`, `--no-default-features`, and `--package` / `-p` (forwarded to both clippy and test).
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status. Shows computed XXH128 hashes for each dataset file (copy into the `xxhash` field in `brokkr.toml`).
 - `brokkr run [options] [-- args]` — build release CLI and run passthrough command args. Supports machine-readable timing:
   - `--time` prints key=value timing output
@@ -38,7 +38,6 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history (stored in `$XDG_DATA_HOME/brokkr/history.db`). Every brokkr invocation is recorded with timing, exit status, project, and git context. Works from any directory.
-- `brokkr preview [--from step] [--dataset name] [--variant V] [--no-open] [--pmtiles path]` — end-to-end visual pipeline inspection. Builds pbfhogg for the enrich step (`add-locations-to-ways`), then elivagar (tilegen), nidhogg (ingest/serve), and opens a map viewer. Use `--from tilegen|ingest|serve` to skip upstream steps. `--pmtiles` reuses an existing PMTiles file (implies `--from serve`). Elivagar pipeline flags (`--fanout-cap-default`, `--fanout-cap`, `--polygon-simplify-factor`, etc.) are passed through to tilegen.
 
 ### brokkr.toml
 
@@ -117,9 +116,13 @@ Subagents must NOT run any shell commands. They write code only. Integration, bu
 
 The repo is a Cargo workspace with two packages:
 - **`pbfhogg`** (root) — library crate. Read/write API, commands.
-- **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary.
+- **`pbfhogg-cli`** (`cli/`) — binary crate. CLI dispatch via clap. Produces the `pbfhogg` binary. Has its own integration tests in `cli/tests/cli.rs`.
 
 Library users who only need read/write can depend on `pbfhogg` with `default-features = false` to skip the `commands` feature (avoids `serde_json` and `roaring` deps used by `extract` and `check_refs`).
+
+### Clippy caching pitfall
+
+`cargo clippy --all-targets` (workspace-wide, used by `brokkr check`) can use cached results and miss lint violations in the CLI crate. If you change `cli/src/main.rs`, always verify with `brokkr check --package pbfhogg-cli` to force a fresh clippy run on that package.
 
 ## Architecture
 

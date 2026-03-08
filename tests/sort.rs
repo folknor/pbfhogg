@@ -559,3 +559,77 @@ fn sort_overlapping_blobs_uring() {
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Feature-missing error paths
+// ---------------------------------------------------------------------------
+
+/// When built without `linux-direct-io`, passing `direct_io: true` must fail
+/// with a clear error message rather than silently falling back.
+#[cfg(not(feature = "linux-direct-io"))]
+#[test]
+fn sort_direct_io_feature_missing_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let result = pbfhogg::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: true,
+            io_uring: false,
+            force: false,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(_) => panic!("should fail without linux-direct-io feature"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("direct-io") && msg.contains("feature"),
+                "error should mention the missing feature, got: {msg}"
+            );
+        }
+    }
+}
+
+/// When built without `linux-io-uring`, passing `io_uring: true` must fail
+/// with a clear error message.
+#[cfg(not(feature = "linux-io-uring"))]
+#[test]
+fn sort_io_uring_feature_missing_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+
+    let result = pbfhogg::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: true,
+            force: false,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(_) => panic!("should fail without linux-io-uring feature"),
+        Err(e) => {
+            let msg = e.to_string();
+            assert!(
+                msg.contains("io-uring") && msg.contains("feature"),
+                "error should mention the missing feature, got: {msg}"
+            );
+        }
+    }
+}

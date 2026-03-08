@@ -411,3 +411,151 @@ fn sort_preserves_historical_information_feature() {
         "output header must declare HistoricalInformation",
     );
 }
+
+// ---------------------------------------------------------------------------
+// O_DIRECT / io_uring helpers
+// ---------------------------------------------------------------------------
+
+/// Check if an error is EINVAL (O_DIRECT not supported on this filesystem).
+#[cfg(feature = "linux-direct-io")]
+fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return io_err.raw_os_error() == Some(libc::EINVAL);
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
+            return io_err.raw_os_error() == Some(libc::EINVAL);
+        }
+    }
+    false
+}
+
+/// Check if an error is due to io_uring unavailability.
+#[cfg(feature = "linux-io-uring")]
+fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return true;
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        return matches!(pbf_err.kind(), pbfhogg::ErrorKind::Io(_));
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// O_DIRECT variant
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn sort_overlapping_blobs_direct_io() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("overlapping.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+    let result = pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: true,
+            io_uring: false,
+            force: true,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(_) => {
+            let contents = read_all_elements_with_coords(&output);
+
+            // All 10 nodes preserved
+            assert_eq!(contents.nodes.len(), 10);
+            // 2 ways, 1 relation preserved
+            assert_eq!(contents.ways.len(), 2);
+            assert_eq!(contents.relations.len(), 1);
+
+            // Correctly sorted
+            assert_sorted(&contents);
+
+            // Header declares Sort.Type_then_ID
+            assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+
+            // Node IDs are 1..=10
+            let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+            assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+            // Node coordinates preserved
+            #[allow(clippy::cast_possible_truncation)]
+            for (id, lat, lon, _) in &contents.nodes {
+                assert_eq!(*lat, *id as i32 * 1_000_000);
+                assert_eq!(*lon, *id as i32 * 2_000_000);
+            }
+        }
+        Err(e) if is_einval(&*e) => {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring variant
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-io-uring")]
+#[test]
+fn sort_overlapping_blobs_uring() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("overlapping.osm.pbf");
+    let output = dir.path().join("sorted.osm.pbf");
+
+    write_unsorted_overlapping_pbf(&input);
+    let result = pbfhogg::commands::sort::sort(
+        &input,
+        &output,
+        &SortOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: true,
+            force: true,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(_) => {
+            let contents = read_all_elements_with_coords(&output);
+
+            // All 10 nodes preserved
+            assert_eq!(contents.nodes.len(), 10);
+            // 2 ways, 1 relation preserved
+            assert_eq!(contents.ways.len(), 2);
+            assert_eq!(contents.relations.len(), 1);
+
+            // Correctly sorted
+            assert_sorted(&contents);
+
+            // Header declares Sort.Type_then_ID
+            assert!(read_header(&output).is_sorted(), "output missing Sort.Type_then_ID");
+
+            // Node IDs are 1..=10
+            let node_ids: Vec<i64> = contents.nodes.iter().map(|(id, _, _, _)| *id).collect();
+            assert_eq!(node_ids, (1..=10).collect::<Vec<_>>());
+
+            // Node coordinates preserved
+            #[allow(clippy::cast_possible_truncation)]
+            for (id, lat, lon, _) in &contents.nodes {
+                assert_eq!(*lat, *id as i32 * 1_000_000);
+                assert_eq!(*lon, *id as i32 * 2_000_000);
+            }
+        }
+        Err(e) if is_uring_unavailable(&*e) => {
+            eprintln!("io_uring not available, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}

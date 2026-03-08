@@ -1284,3 +1284,251 @@ fn merge_cross_validate_osmium() {
     drop(std::fs::remove_file(&pbfhogg_out));
     drop(std::fs::remove_file(&osmium_out));
 }
+
+// ---------------------------------------------------------------------------
+// O_DIRECT / io_uring helpers
+// ---------------------------------------------------------------------------
+
+/// Check if an error is EINVAL (O_DIRECT not supported on this filesystem).
+#[cfg(feature = "linux-direct-io")]
+fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return io_err.raw_os_error() == Some(libc::EINVAL);
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
+            return io_err.raw_os_error() == Some(libc::EINVAL);
+        }
+    }
+    false
+}
+
+/// Check if an error is due to io_uring unavailability.
+#[cfg(feature = "linux-io-uring")]
+fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return true;
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        return matches!(pbf_err.kind(), pbfhogg::ErrorKind::Io(_));
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// O_DIRECT variant
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn merge_basic_create_modify_delete_direct_io() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")] },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="4" lat="55.0" lon="12.0" version="1">
+      <tag k="name" v="four"/>
+    </node>
+  </create>
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="2">
+      <tag k="name" v="two-modified"/>
+    </node>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#);
+
+    let result = merge(
+        &base,
+        &osc,
+        &output,
+        &MergeOptions {
+            compression: Compression::default(),
+            direct_io: true,
+            io_uring: false,
+            force: true,
+            locations_on_ways: false,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(stats) => {
+            let c = read_all_elements(&output);
+
+            // Nodes: 1 (unchanged), 2 (modified), 4 (created). Node 3 deleted.
+            assert_eq!(node_ids(&c), vec![1, 2, 4]);
+
+            // Node 1 unchanged
+            assert_eq!(c.nodes[0].1, 100_000_000);
+            assert_eq!(c.nodes[0].2, 200_000_000);
+            assert_eq!(c.nodes[0].3, vec![("name".to_string(), "one".to_string())]);
+
+            // Node 2 modified coords and tags
+            assert_eq!(c.nodes[1].1, 350_000_000);
+            assert_eq!(c.nodes[1].2, 450_000_000);
+            assert_eq!(c.nodes[1].3, vec![("name".to_string(), "two-modified".to_string())]);
+
+            // Node 4 created
+            assert_eq!(c.nodes[2].1, 550_000_000);
+            assert_eq!(c.nodes[2].2, 120_000_000);
+            assert_eq!(c.nodes[2].3, vec![("name".to_string(), "four".to_string())]);
+
+            // Way 10 modified
+            assert_eq!(way_ids(&c), vec![10]);
+            assert_eq!(c.ways[0].1, vec![1, 2]);
+            assert_eq!(c.ways[0].2, vec![("highway".to_string(), "primary".to_string())]);
+
+            // Relation 100 unchanged
+            assert_eq!(relation_ids(&c), vec![100]);
+            assert_eq!(c.relations[0].2, vec![("type".to_string(), "multipolygon".to_string())]);
+
+            // Stats
+            assert_eq!(stats.deleted, 1);
+        }
+        Err(e) if is_einval(&*e) => {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// io_uring variant
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-io-uring")]
+#[test]
+fn merge_basic_create_modify_delete_uring() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "one")] },
+            TestNode { id: 2, lat: 300_000_000, lon: 400_000_000, tags: vec![("name", "two")] },
+            TestNode { id: 3, lat: 500_000_000, lon: 600_000_000, tags: vec![("name", "three")] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2, 3], tags: vec![("highway", "road")] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Way(10), role: "outer" }],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="4" lat="55.0" lon="12.0" version="1">
+      <tag k="name" v="four"/>
+    </node>
+  </create>
+  <modify>
+    <node id="2" lat="35.0" lon="45.0" version="2">
+      <tag k="name" v="two-modified"/>
+    </node>
+    <way id="10" version="2">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+  <delete>
+    <node id="3" version="2"/>
+  </delete>
+</osmChange>"#);
+
+    let result = merge(
+        &base,
+        &osc,
+        &output,
+        &MergeOptions {
+            compression: Compression::default(),
+            direct_io: false,
+            io_uring: true,
+            force: true,
+            locations_on_ways: false,
+        },
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(stats) => {
+            let c = read_all_elements(&output);
+
+            // Nodes: 1 (unchanged), 2 (modified), 4 (created). Node 3 deleted.
+            assert_eq!(node_ids(&c), vec![1, 2, 4]);
+
+            // Node 1 unchanged
+            assert_eq!(c.nodes[0].1, 100_000_000);
+            assert_eq!(c.nodes[0].2, 200_000_000);
+            assert_eq!(c.nodes[0].3, vec![("name".to_string(), "one".to_string())]);
+
+            // Node 2 modified coords and tags
+            assert_eq!(c.nodes[1].1, 350_000_000);
+            assert_eq!(c.nodes[1].2, 450_000_000);
+            assert_eq!(c.nodes[1].3, vec![("name".to_string(), "two-modified".to_string())]);
+
+            // Node 4 created
+            assert_eq!(c.nodes[2].1, 550_000_000);
+            assert_eq!(c.nodes[2].2, 120_000_000);
+            assert_eq!(c.nodes[2].3, vec![("name".to_string(), "four".to_string())]);
+
+            // Way 10 modified
+            assert_eq!(way_ids(&c), vec![10]);
+            assert_eq!(c.ways[0].1, vec![1, 2]);
+            assert_eq!(c.ways[0].2, vec![("highway".to_string(), "primary".to_string())]);
+
+            // Relation 100 unchanged
+            assert_eq!(relation_ids(&c), vec![100]);
+            assert_eq!(c.relations[0].2, vec![("type".to_string(), "multipolygon".to_string())]);
+
+            // Stats
+            assert_eq!(stats.deleted, 1);
+        }
+        Err(e) if is_uring_unavailable(&*e) => {
+            eprintln!("io_uring not available, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}

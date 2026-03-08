@@ -119,22 +119,12 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
 
-        #[cfg(feature = "linux-direct-io")]
-        let input_fd = reader.raw_fd();
-
         while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
             match &frame.blob_type {
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
                     if frame.index.is_some() {
                         // Already has indexdata — pass through as-is.
-                        #[cfg(feature = "linux-direct-io")]
-                        writer.write_raw_copy(
-                            input_fd,
-                            frame.file_offset,
-                            frame.frame_bytes.len() as u64,
-                        )?;
-                        #[cfg(not(feature = "linux-direct-io"))]
                         writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                     } else {
                         // No indexdata — decompress to scan IDs/tags, reframe with index.

@@ -604,3 +604,85 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
     assert!(node_ids.contains(&1));
     assert!(node_ids.contains(&2), "untagged relation-member node was dropped");
 }
+
+// ---------------------------------------------------------------------------
+// O_DIRECT helper
+// ---------------------------------------------------------------------------
+
+/// Check if an error is EINVAL (O_DIRECT not supported on this filesystem).
+#[cfg(feature = "linux-direct-io")]
+fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return io_err.raw_os_error() == Some(libc::EINVAL);
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
+            return io_err.raw_os_error() == Some(libc::EINVAL);
+        }
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// O_DIRECT variant
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "linux-direct-io")]
+#[test]
+fn basic_locations_added_direct_io() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let result = add_locations_to_ways(
+        &input,
+        &output,
+        true,
+        Compression::default(),
+        true,
+        true,
+        &pbfhogg::HeaderOverrides::default(),
+    );
+
+    match result {
+        Ok(stats) => {
+            assert_eq!(stats.ways_written, 1);
+            assert_eq!(stats.missing_locations, 0);
+
+            // Read output and verify way has locations
+            let reader = BlobReader::from_path(&output).expect("open output");
+            let mut found_way = false;
+            for blob in reader {
+                let blob = blob.expect("read blob");
+                if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+                    for element in block.elements() {
+                        if let Element::Way(w) = element {
+                            assert_eq!(w.id(), 10);
+                            let locs: Vec<(i32, i32)> = w
+                                .node_locations()
+                                .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                                .collect();
+                            assert_eq!(
+                                locs,
+                                vec![
+                                    (550_000_000, 120_000_000),
+                                    (551_000_000, 121_000_000),
+                                    (552_000_000, 122_000_000),
+                                ]
+                            );
+                            found_way = true;
+                        }
+                    }
+                }
+            }
+            assert!(found_way, "way not found in output");
+        }
+        Err(e) if is_einval(&*e) => {
+            eprintln!("O_DIRECT not supported on this filesystem, skipping test");
+            return;
+        }
+        Err(e) => panic!("unexpected error: {e}"),
+    }
+}

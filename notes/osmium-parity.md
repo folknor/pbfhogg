@@ -18,7 +18,7 @@ command count.
 | `renumber` | `renumber` | Same |
 | `add-locations-to-ways` | `add-locations-to-ways` | Same |
 | `time-filter` | `time-filter` | Same |
-| `diff` | `diff` | Same |
+| `diff` | `diff` | Content equality instead of version ordering (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)) |
 | `apply-changes` | `apply-changes` | Same |
 | `merge-changes` | `merge-changes` | Same |
 | `fileinfo` | `inspect` | Different name, more capabilities |
@@ -52,6 +52,12 @@ pbfhogg check input.pbf --ids                    # ID uniqueness/ordering only
 pbfhogg check input.pbf --json                   # machine-readable output
 ```
 
+**Counting difference:** For missing relation-to-relation members, osmium reports
+the number of broken references (occurrences), while pbfhogg reports unique
+missing IDs with the occurrence count in parentheses when they differ:
+`Missing relation members: 706 (777 references)`. Both tools find the same
+set of missing IDs.
+
 ### removeid is now `getid --invert`
 
 ```
@@ -81,6 +87,11 @@ pbfhogg diff --format osc old.pbf new.pbf -o changes.osc --update-timestamp
 Text diff (the default `--format text`) and OSC diff have separate flag sets.
 Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are rejected with `--format osc`,
 and vice versa for `--increment-version` / `--update-timestamp`.
+
+**Lossless deletes:** pbfhogg's `diff --format osc` produces a perfect roundtrip
+— applying the derived OSC to the old PBF reproduces the new PBF exactly.
+osmium's `derive-changes` can lose deletes when the deleted element is absent
+from both input files (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
 ### merge is now `cat --dedupe`
 

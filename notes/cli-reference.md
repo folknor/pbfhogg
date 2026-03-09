@@ -79,6 +79,8 @@ pbfhogg check [OPTIONS] <FILE>
 | `--max-errors <N>` | Stop after N violations (0 = unlimited) [default: 100] |
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
+
+For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
 | `--json` | Machine-readable JSON output |
 | `-q, --quiet` | Exit-code only, no output |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -200,7 +202,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 
 ### diff
 
-Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering.
+Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering — deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
 
@@ -219,6 +221,8 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
+
+With `--format osc`, produces a lossless roundtrip — applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 | `--ignore-changeset` | Compatibility flag (already ignored by content-equality mode) |
 | `--ignore-uid` | Compatibility flag (already ignored by content-equality mode) |
 | `--ignore-user` | Compatibility flag (already ignored by content-equality mode) |

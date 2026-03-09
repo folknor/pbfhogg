@@ -644,6 +644,7 @@ fn basic_locations_added_direct_io() {
         true,
         true,
         &pbfhogg::HeaderOverrides::default(),
+        pbfhogg::add_locations_to_ways::IndexType::default(),
     );
 
     match result {
@@ -685,4 +686,133 @@ fn basic_locations_added_direct_io() {
         }
         Err(e) => panic!("unexpected error: {e}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse index variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn basic_locations_added_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::add_locations_to_ways::IndexType::Sparse).expect("add locations");
+    assert_eq!(stats.ways_written, 1);
+    assert_eq!(stats.missing_locations, 0);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut found_way = false;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    assert_eq!(w.id(), 10);
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(
+                        locs,
+                        vec![
+                            (550_000_000, 120_000_000),
+                            (551_000_000, 121_000_000),
+                            (552_000_000, 122_000_000),
+                        ]
+                    );
+                    found_way = true;
+                }
+            }
+        }
+    }
+    assert!(found_way, "way not found in output");
+}
+
+#[test]
+fn passthrough_basic_with_indexdata_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_indexed(&input, &test_nodes(), &test_ways(), &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::add_locations_to_ways::IndexType::Sparse).expect("add locations");
+    assert_eq!(stats.ways_written, 1);
+    assert_eq!(stats.missing_locations, 0);
+    assert!(stats.blobs_passthrough > 0, "expected passthrough blobs");
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut found_way = false;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    assert_eq!(w.id(), 10);
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(
+                        locs,
+                        vec![
+                            (550_000_000, 120_000_000),
+                            (551_000_000, 121_000_000),
+                            (552_000_000, 122_000_000),
+                        ]
+                    );
+                    found_way = true;
+                }
+            }
+        }
+    }
+    assert!(found_way, "way not found in output");
+}
+
+#[test]
+fn missing_node_refs_get_zero_coordinates_sparse() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Way references node 999 which doesn't exist
+    let ways = vec![TestWay {
+        id: 10,
+        refs: vec![1, 999, 3],
+        tags: vec![("highway", "primary")],
+    }];
+    write_test_pbf(&input, &test_nodes(), &ways, &[]);
+
+    let stats = add_locations_to_ways(&input, &output, true, Compression::default(), false, true, &pbfhogg::HeaderOverrides::default(), pbfhogg::add_locations_to_ways::IndexType::Sparse).expect("add locations");
+    assert_eq!(stats.missing_locations, 1);
+
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut found_way = false;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                if let Element::Way(w) = element {
+                    let locs: Vec<(i32, i32)> = w
+                        .node_locations()
+                        .map(|loc| (loc.decimicro_lat(), loc.decimicro_lon()))
+                        .collect();
+                    assert_eq!(
+                        locs,
+                        vec![
+                            (550_000_000, 120_000_000),
+                            (0, 0),
+                            (552_000_000, 122_000_000),
+                        ]
+                    );
+                    found_way = true;
+                }
+            }
+        }
+    }
+    assert!(found_way, "way not found in output");
 }

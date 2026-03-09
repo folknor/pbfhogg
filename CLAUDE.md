@@ -71,7 +71,7 @@ xxhash = "fa581f7b..."
 - `osc.<seq>` — OSC diff files keyed by sequence number. `--osc-seq` selects.
 - `xxhash` — XXH128 file hash. Run `brokkr env` to see computed values.
 
-Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored).
+Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored). **`--force` is a top-level flag before the subcommand**, e.g. `brokkr bench --force commands add-locations-to-ways`, NOT `brokkr bench commands add-locations-to-ways --force`.
 
 ## Scripts
 

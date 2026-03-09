@@ -85,26 +85,37 @@ Planet stats: 10.4B nodes read, 285M written (97% dropped as untagged), 1.17B
 ways processed, 14.1M relations, 452 passthrough blobs, 50K decoded, 0 missing
 locations. Output 88.4 GB (+0.7% from embedded way-node coordinates).
 
-### Alternative approaches (in priority order)
+### Pass 0: referenced-nodes-only index (implemented)
 
-1. **Two-pass with referenced-nodes-only index** — Pass 1: scan all ways to
-   collect the set of referenced node IDs (~2B unique IDs for planet). Pass 2:
-   stream through nodes, only indexing those in the referenced set. Memory
-   drops from ~80 GB touched to ~16 GB (2B × 8 bytes). The extra pass is
-   sequential I/O. Could use a sorted Vec or compact hash map for the
-   referenced ID set (~16 GB for 2B i64s).
+**Implemented** (uncommitted, post `3677069`): `collect_way_referenced_node_ids`
+scans way blobs to build an `IdSetDense` bitset (~1.6 GB for planet's ~2B
+unique way node refs). `build_node_index_dense` then only inserts nodes
+present in the bitset. Reduces touched mmap pages from ~80 GB to ~16 GB at
+planet scale.
 
-2. **On-disk sorted store** — Sort all nodes by ID into a temporary file on
+**Result on plantasjen (30 GB RAM + 8 GB swap):** No improvement at Europe
+scale — 2631s vs 2565s baseline (+2.6%, noise). The reduced 16 GB mmap
+working set + 33 GB input file page cache still exceeds 30 GB physical
+memory, so swap thrashing dominates regardless. The optimization should help
+on 64 GB hosts where 16 GB fits in RAM, and is strictly better than before
+(fewer pages touched = less swap pressure when memory is merely tight rather
+than catastrophically insufficient).
+
+**Denmark (465 MB):** 6.4s, fits entirely in RAM, no measurable difference.
+
+### Remaining approaches (if 64 GB host isn't sufficient)
+
+1. **On-disk sorted store** — Sort all nodes by ID into a temporary file on
    nvme, then merge-join with way node references (also sorted by referenced
    node ID). Memory = just I/O buffers. Slowest approach but constant memory
    regardless of planet size.
 
-3. **Partitioned/chunked index** — Split the node ID range into chunks (e.g.
+2. **Partitioned/chunked index** — Split the node ID range into chunks (e.g.
    1M IDs each). Process the file in rounds, one chunk at a time — each round
    only needs the chunk's memory. Trades many passes for arbitrarily low
    memory. Similar to osmium's `flex_mem` strategy.
 
-All three approaches shift the bottleneck from random mmap faults to sequential
+Both approaches shift the bottleneck from random mmap faults to sequential
 I/O, which is where `--direct-io`, io_uring, and erofs provide real benefit.
 The current random 8-byte reads across 128 GB of mmap is the worst possible
 access pattern for all three of those tools — `--direct-io` actually adds 2%
@@ -114,16 +125,19 @@ overhead for ALTW because sequential readahead from page cache is faster.
 
 - [ ] **Larger nvme swap** (64-128 GB) on europe dataset — measure how much
   swap sizing alone improves the 30 GB host story before writing new code.
-  Current 8 GB swap + 30 GB RAM = 38 GB addressable, well below the ~30 GB
-  touched by europe's 3.7B nodes.
+  Current 8 GB swap + 30 GB RAM = 38 GB addressable, well below the ~16 GB
+  mmap touched by europe's ~2B way-referenced nodes (post pass-0 optimization).
+- [ ] **Test on 64 GB host** — the pass-0 optimization should eliminate swap
+  pressure entirely when 16 GB mmap + input page cache fits in physical memory.
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 
 | Dataset | Size | Elements | Time | Notes |
 |---------|------|----------|------|-------|
-| Europe | 33.6 GB | 4.2B (3.7B nodes, 454M ways, 8.2M rels) | 2565s (43m) | buffered |
-| Europe | 33.6 GB | 4.2B | 2611s (43m) | `--direct-io` (+2%, no benefit) |
-| Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound |
+| Europe | 33.6 GB | 4.2B (3.7B nodes, 454M ways, 8.2M rels) | 2565s (43m) | buffered, commit `69a127f` (no pass 0) |
+| Europe | 33.6 GB | 4.2B | 2611s (43m) | `--direct-io` (+2%, no benefit), commit `69a127f` |
+| Europe | 33.6 GB | 4.2B | 2631s (44m) | buffered, post `3677069` (with pass 0), +2.6% noise |
+| Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound, commit `69a127f` |
 
 ## Release prep
 

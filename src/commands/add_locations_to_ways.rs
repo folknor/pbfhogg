@@ -370,7 +370,15 @@ pub fn add_locations_to_ways(
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).")?;
     let scratch_dir = output.parent().unwrap_or(Path::new("."));
-    let index = build_node_index(input, direct_io, scratch_dir)?;
+
+    // Pass 0: collect the set of node IDs referenced by ways. Only these
+    // nodes need coordinate lookups, so only these get indexed. At planet
+    // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
+    let referenced = collect_way_referenced_node_ids(input, direct_io)?;
+
+    let index = build_node_index(input, direct_io, scratch_dir, &referenced)?;
+    drop(referenced);
+
     let relation_member_node_ids = if keep_untagged_nodes {
         None
     } else {
@@ -397,16 +405,26 @@ pub fn add_locations_to_ways(
 /// for parallel node index population.
 const INDEX_BATCH_SIZE: usize = 64;
 
-fn build_node_index(input: &Path, direct_io: bool, scratch_dir: &Path) -> Result<DenseMmapIndex> {
-    build_node_index_dense(input, direct_io, scratch_dir)
+fn build_node_index(
+    input: &Path,
+    direct_io: bool,
+    scratch_dir: &Path,
+    referenced: &IdSetDense,
+) -> Result<DenseMmapIndex> {
+    build_node_index_dense(input, direct_io, scratch_dir, referenced)
 }
 
 /// Build the dense mmap index in parallel. Each rayon task writes directly
 /// to disjoint mmap slots via `SharedDenseWriter`.
+///
+/// Only nodes present in `referenced` are inserted — at planet scale this
+/// reduces touched pages from ~80 GB (all 10.4B nodes) to ~16 GB (~2B
+/// way-referenced nodes).
 fn build_node_index_dense(
     input: &Path,
     direct_io: bool,
     scratch_dir: &Path,
+    referenced: &IdSetDense,
 ) -> Result<DenseMmapIndex> {
     let mut index = DenseMmapIndex::new(DENSE_INDEX_DEFAULT_CAPACITY, scratch_dir)?;
     let writer = SharedDenseWriter {
@@ -427,15 +445,39 @@ fn build_node_index_dense(
     for block in reader.into_blocks_pipelined() {
         batch.push(block?);
         if batch.len() >= INDEX_BATCH_SIZE {
-            index_batch_dense(&batch, &writer);
+            index_batch_dense(&batch, &writer, referenced);
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        index_batch_dense(&batch, &writer);
+        index_batch_dense(&batch, &writer, referenced);
     }
 
     Ok(index)
+}
+
+/// Collect all node IDs referenced by ways (pass 0).
+///
+/// Scans only way blobs (via `BlobFilter`) and builds a bitset of every node
+/// ID that appears in any way's refs list. At planet scale (~2B unique node
+/// refs), this costs ~1.6 GB — far less than indexing all 10.4B nodes.
+fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_ways());
+    let mut referenced = IdSetDense::new();
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements_skip_metadata() {
+            if let Element::Way(w) = element {
+                for node_id in w.refs() {
+                    if node_id >= 0 {
+                        referenced.set(node_id);
+                    }
+                }
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 /// Collect all node IDs referenced by relation members.
@@ -461,17 +503,22 @@ fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdS
 }
 
 /// Parallel insert for one batch of blocks into the dense mmap index.
-fn index_batch_dense(batch: &[PrimitiveBlock], writer: &SharedDenseWriter) {
+/// Only inserts nodes present in `referenced` (way-referenced node IDs).
+fn index_batch_dense(
+    batch: &[PrimitiveBlock],
+    writer: &SharedDenseWriter,
+    referenced: &IdSetDense,
+) {
     batch.par_iter().for_each(|block| {
         for element in block.elements_skip_metadata() {
             match &element {
-                Element::DenseNode(dn) => {
+                Element::DenseNode(dn) if referenced.get(dn.id()) => {
                     writer.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
                 }
-                Element::Node(n) => {
+                Element::Node(n) if referenced.get(n.id()) => {
                     writer.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
                 }
-                Element::Way(_) | Element::Relation(_) => {}
+                _ => {}
             }
         }
     });

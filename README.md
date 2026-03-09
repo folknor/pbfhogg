@@ -120,7 +120,7 @@ Tags-filter uses OR semantics across expressions. In default mode (without `-R`)
 
 Apply-changes with `--locations-on-ways` preserves and updates inline way-node coordinates through OSC diffs, eliminating the need to re-run `add-locations-to-ways` after each merge. Requires a sorted base PBF with `LocationsOnWays` (bootstrap with `add-locations-to-ways` once). Surviving base ways forward existing coordinates as raw bytes; OSC ways look up node coordinates from a sparse index built from the diff and base PBF.
 
-Add-locations-to-ways uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID). The index is backed by a temporary file that the kernel pages in/out under memory pressure, so it works from country-scale to planet-scale without OOM.
+Add-locations-to-ways supports two index strategies via `--index-type`: `dense` (default) uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID) — fastest when the working set fits in RAM. `sparse` uses a Planetiler-inspired chunk-indexed array with batched sorted lookups — ~540 MB RAM + compact on-disk values file, memory-bounded for planet on low-RAM hosts (~1.85x slower than dense when data fits in RAM).
 
 Getid supports `--add-referenced` to include way node refs (two-pass), `--id-file` / `--id-osm-file` to read IDs from files, and `--default-type` for bare numeric IDs. `--invert` reverses the selection (remove listed IDs, keep everything else).
 

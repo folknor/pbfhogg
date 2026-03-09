@@ -359,6 +359,9 @@ enum Command {
         /// Keep all untagged nodes in output (default: drop untagged nodes unless referenced by a relation)
         #[arg(long)]
         keep_untagged_nodes: bool,
+        /// Node coordinate index type: 'dense' (fast, high memory) or 'sparse' (bounded memory)
+        #[arg(long, default_value = "dense")]
+        index_type: String,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -923,6 +926,7 @@ fn main() {
             file,
             output,
             keep_untagged_nodes,
+            index_type,
             compression,
             force,
             io,
@@ -931,6 +935,7 @@ fn main() {
             &file,
             &output.output,
             keep_untagged_nodes,
+            &index_type,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -1768,16 +1773,19 @@ fn run_extract_config(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_add_locations_to_ways(
     file: &std::path::Path,
     output: &std::path::Path,
     keep_untagged_nodes: bool,
+    index_type: &str,
     compression: &str,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let compression: Compression = compression.parse()?;
+    let index_type: pbfhogg::add_locations_to_ways::IndexType = index_type.parse()?;
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
         file,
         output,
@@ -1786,6 +1794,7 @@ fn run_add_locations_to_ways(
         direct_io,
         force,
         overrides,
+        index_type,
     )?;
     stats.print_summary();
     Ok(())

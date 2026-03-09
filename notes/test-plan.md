@@ -107,7 +107,8 @@ Commands that accept I/O flags, with the modes that need testing:
 | apply-changes | [x] | [x] | [x] | [x] |
 | extract --simple | [x] | [x] | n/a | [x] |
 | extract --smart | [x] | [x] | n/a | [x] |
-| add-locations-to-ways | [x] | [x] | n/a | [x] |
+| add-locations-to-ways (dense) | [x] | [x] | n/a | [x] |
+| add-locations-to-ways (sparse) | [x] | [ ] | n/a | [ ] |
 | tags-filter | [x] | [x] | n/a | [x] |
 | getid | [x] | [x] | n/a | [x] |
 | getparents | [x] | [x] | n/a | n/a |
@@ -117,7 +118,8 @@ Commands that accept I/O flags, with the modes that need testing:
 | inspect | [x] | [x] | n/a | [x] |
 | check | [x] | [x] | n/a | n/a |
 
-All 54 cells tested on Denmark dataset (commit `4f69912`). All pass.
+54 cells tested on Denmark dataset (commit `4f69912`). All pass for dense index.
+Sparse index: Denmark buffered tested (identical output, 15.5s vs dense 8.4s).
 
 `--uring` is only available on: cat --dedupe, sort, apply-changes.
 
@@ -131,6 +133,8 @@ All 54 cells tested on Denmark dataset (commit `4f69912`). All pass.
 | Planet | 87 GB | cat passthrough | [x] Pass (50816 blobs) |
 | Planet | 87 GB | cat --type | **OOM** (SIGKILL on 30 GB host, known issue) |
 | Planet | 87 GB | merge | Skipped (no planet OSC diff available) |
+| Planet | 87 GB | add-locations-to-ways --index-type sparse | [ ] Pending — key validation for memory-bounded path |
+| Europe | 33.6 GB | add-locations-to-ways --index-type sparse | [ ] Pending — intermediate scale validation |
 
 ### Ignored tests
 

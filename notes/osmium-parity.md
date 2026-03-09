@@ -188,7 +188,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| `-i, --index-type` | `add-locations-to-ways` uses DenseMmapIndex only |
+| ~~`-i, --index-type`~~ | ~~`add-locations-to-ways` uses DenseMmapIndex only~~ — **Now supported:** `--index-type dense\|sparse` |
 
 ### Flags only pbfhogg has
 

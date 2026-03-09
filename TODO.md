@@ -103,7 +103,23 @@ than catastrophically insufficient).
 
 **Denmark (465 MB):** 6.4s, fits entirely in RAM, no measurable difference.
 
-### Remaining approaches (if 64 GB host isn't sufficient)
+### Sparse index: Planetiler-inspired chunk-indexed array (implemented)
+
+**Implemented** (uncommitted, post pass 0): `--index-type sparse` uses a
+`SparseArrayIndex` — chunk-indexed (chunk size 256) sparse array. RAM:
+`offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk:
+compact packed (lat, lon) values file via read-only mmap (~16 GB for planet).
+Way lookups are batched and sorted by file offset, converting random I/O
+into sequential scans via `FxHashMap` pre-resolution.
+
+**Denmark (465 MB):** dense 8.4s vs sparse 15.5s (+85%). Overhead is pure CPU
+(sorting, hashing) — no I/O pressure at this scale.
+
+**Planet-scale validation pending.** The sparse index should eliminate the page
+fault thrashing that makes dense take 96 minutes on plantasjen (30 GB RAM),
+since it uses ~540 MB RAM + sequential I/O instead of 16 GB random mmap access.
+
+### Remaining approaches (if sparse index isn't sufficient at planet scale)
 
 1. **On-disk sorted store** — Sort all nodes by ID into a temporary file on
    nvme, then merge-join with way node references (also sorted by referenced
@@ -115,19 +131,12 @@ than catastrophically insufficient).
    only needs the chunk's memory. Trades many passes for arbitrarily low
    memory. Similar to osmium's `flex_mem` strategy.
 
-Both approaches shift the bottleneck from random mmap faults to sequential
-I/O, which is where `--direct-io`, io_uring, and erofs provide real benefit.
-The current random 8-byte reads across 128 GB of mmap is the worst possible
-access pattern for all three of those tools — `--direct-io` actually adds 2%
-overhead for ALTW because sequential readahead from page cache is faster.
-
 ### Quick wins to test first
 
-- [ ] **Larger nvme swap** (64-128 GB) on europe dataset — measure how much
-  swap sizing alone improves the 30 GB host story before writing new code.
-  Current 8 GB swap + 30 GB RAM = 38 GB addressable, well below the ~16 GB
-  mmap touched by europe's ~2B way-referenced nodes (post pass-0 optimization).
-- [ ] **Test on 64 GB host** — the pass-0 optimization should eliminate swap
+- [ ] **Planet-scale sparse index validation** — run `add-locations-to-ways
+  --index-type sparse` on planet (87 GB) on plantasjen (30 GB RAM + 8 GB swap).
+  Expected: eliminates page fault thrashing, completes in reasonable time.
+- [ ] **Test dense on 64 GB host** — the pass-0 optimization should eliminate swap
   pressure entirely when 16 GB mmap + input page cache fits in physical memory.
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)

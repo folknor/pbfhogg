@@ -1,7 +1,8 @@
 //! Embed node coordinates in ways. Equivalent to `osmium add-locations-to-ways`.
 
-use std::io::Read;
+use std::io::{Read, BufWriter, Write as _};
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use rayon::prelude::*;
@@ -24,6 +25,60 @@ use super::{
 use super::id_set_dense::IdSetDense;
 
 use super::{Result, BATCH_SIZE, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
+
+// ---------------------------------------------------------------------------
+// Index type selection
+// ---------------------------------------------------------------------------
+
+/// Strategy for storing node coordinates during add-locations-to-ways.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum IndexType {
+    /// Direct-mapped array: `index[node_id] = (lat, lon)`. Fastest when the
+    /// working set fits in RAM. At planet scale (~16 GB touched after pass 0
+    /// filtering), this requires ~30+ GB of free memory to avoid page thrashing.
+    #[default]
+    Dense,
+    /// Chunk-indexed sparse array with batched sorted lookups. Uses ~540 MB
+    /// RAM for the chunk index plus a compact on-disk values file (~16 GB for
+    /// planet). Way lookups are batched and sorted by file offset, converting
+    /// random I/O into sequential scans. Works on memory-constrained hosts.
+    Sparse,
+}
+
+/// Parse error for [`IndexType`].
+#[derive(Debug, Clone)]
+pub struct ParseIndexTypeError(String);
+
+impl std::fmt::Display for ParseIndexTypeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for ParseIndexTypeError {}
+
+impl FromStr for IndexType {
+    type Err = ParseIndexTypeError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "dense" => Ok(Self::Dense),
+            "sparse" => Ok(Self::Sparse),
+            _ => Err(ParseIndexTypeError(format!(
+                "unknown index type '{s}': expected 'dense' or 'sparse'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for IndexType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Dense => f.write_str("dense"),
+            Self::Sparse => f.write_str("sparse"),
+        }
+    }
+}
 
 /// Default dense index capacity: 16 billion entries (128 GB virtual).
 /// Covers current OSM max node ID (~12.5B) with headroom for growth.
@@ -171,6 +226,263 @@ impl SharedDenseWriter {
         unsafe {
             let ptr = self.base.add(offset).cast::<AtomicU64>();
             (*ptr).store(packed, Ordering::Relaxed);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sparse array index (Planetiler-inspired)
+// ---------------------------------------------------------------------------
+
+/// Bits to shift a node ID right to get the chunk index.
+const CHUNK_SHIFT: u32 = 8;
+/// Number of entries per chunk (256).
+const CHUNK_MASK: u64 = (1u64 << CHUNK_SHIFT) - 1;
+/// Marker for chunks with no entries.
+const CHUNK_NOT_PRESENT: u64 = u64::MAX;
+
+/// Chunk-indexed sparse node coordinate store.
+///
+/// Partitions the node ID space into chunks of 256 IDs. Each chunk stores
+/// a contiguous run of `(lat: i32, lon: i32)` entries in a file-backed mmap,
+/// with leading empty slots trimmed via `start_pad` and gaps filled with
+/// sentinel `(0, 0)` values. Trailing slots after the last entry in each
+/// chunk are also filled with sentinels when the next chunk begins.
+///
+/// RAM cost: `offsets` (8 bytes/chunk) + `start_pad` (1 byte/chunk).
+/// At planet scale (~49M chunks): ~440 MB RAM + ~16 GB on disk.
+///
+/// Requires sequential writes in ascending node ID order (satisfied by
+/// sorted PBF files).
+struct SparseArrayIndex {
+    /// Byte offset into the values mmap where each chunk starts.
+    offsets: Vec<u64>,
+    /// Leading empty slots skipped per chunk.
+    start_pad: Vec<u8>,
+    /// Packed (lat: i32, lon: i32) values, file-backed read-only mmap.
+    mmap: memmap2::Mmap,
+    _file: std::fs::File,
+}
+
+impl SparseArrayIndex {
+    /// Look up a node's coordinates. Returns `None` for negative IDs,
+    /// chunks not present, or sentinel entries.
+    /// Look up coordinates from the mmap at a computed byte offset.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    fn read_at(&self, base: u64, slot: u64) -> Option<(i32, i32)> {
+        let byte_offset = (base + slot * ENTRY_SIZE as u64) as usize;
+        let end = byte_offset + ENTRY_SIZE;
+        if end > self.mmap.len() {
+            return None;
+        }
+        let bytes = &self.mmap[byte_offset..end];
+        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if lat == 0 && lon == 0 {
+            return None; // sentinel
+        }
+        Some((lat, lon))
+    }
+
+    /// Resolve a chunk base and slot for a node ID. Returns `None` if the
+    /// node cannot be in this index.
+    #[allow(clippy::cast_sign_loss)]
+    fn resolve(&self, node_id: i64) -> Option<(u64, u64)> {
+        if node_id < 0 {
+            return None;
+        }
+        let id = node_id as u64;
+        let chunk_id = (id >> CHUNK_SHIFT) as usize;
+        if chunk_id >= self.offsets.len() {
+            return None;
+        }
+        let base = self.offsets[chunk_id];
+        if base == CHUNK_NOT_PRESENT {
+            return None;
+        }
+        let offset_in_chunk = (id & CHUNK_MASK) as u8;
+        let pad = self.start_pad[chunk_id];
+        if offset_in_chunk < pad {
+            return None;
+        }
+        let slot = (offset_in_chunk - pad) as u64;
+        Some((base, slot))
+    }
+
+    #[allow(clippy::cast_sign_loss)]
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        let (base, slot) = self.resolve(node_id)?;
+        self.read_at(base, slot)
+    }
+
+    /// Compute the byte offset into the values mmap for a node ID.
+    /// Used by batched sorted lookups to sort by file position.
+    #[allow(clippy::cast_sign_loss)]
+    fn byte_offset(&self, node_id: i64) -> Option<u64> {
+        let (base, slot) = self.resolve(node_id)?;
+        Some(base + slot * ENTRY_SIZE as u64)
+    }
+
+    /// Read a `(lat, lon)` pair at a known valid byte offset.
+    /// The offset must have been produced by `byte_offset()`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn get_at_offset(&self, byte_offset: u64) -> Option<(i32, i32)> {
+        let start = byte_offset as usize;
+        let end = start + ENTRY_SIZE;
+        if end > self.mmap.len() {
+            return None;
+        }
+        let bytes = &self.mmap[start..end];
+        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if lat == 0 && lon == 0 {
+            return None;
+        }
+        Some((lat, lon))
+    }
+}
+
+/// Build a sparse array index from node blobs.
+///
+/// Writes values sequentially to a temp file, tracking chunk boundaries.
+/// Nodes must arrive in ascending ID order (guaranteed by sorted PBFs).
+/// Only nodes present in `referenced` are stored.
+#[allow(clippy::cast_sign_loss)]
+fn build_node_index_sparse(
+    input: &Path,
+    direct_io: bool,
+    scratch_dir: &Path,
+    referenced: &IdSetDense,
+) -> Result<SparseArrayIndex> {
+    // Pre-size for planet-scale: max node ID ~12.5B → ~49M chunks.
+    let initial_chunks = 50_000_000;
+    let mut offsets: Vec<u64> = Vec::new();
+    let mut start_pad: Vec<u8> = Vec::new();
+
+    let temp_path = scratch_dir.join(format!(
+        ".pbfhogg-sparse-index-{}",
+        std::process::id()
+    ));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .map_err(|e| format!("failed to create sparse index temp file: {e}"))?;
+    drop(std::fs::remove_file(&temp_path));
+
+    let sentinel = [0u8; ENTRY_SIZE];
+    let mut writer = BufWriter::with_capacity(256 * 1024, &file);
+    let mut current_chunk: usize = usize::MAX; // no chunk yet
+    let mut last_offset_in_chunk: u8 = 0;
+    let mut byte_pos: u64 = 0;
+
+    // Reserve space for chunk arrays.
+    offsets.reserve(initial_chunks);
+    start_pad.reserve(initial_chunks);
+
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_nodes());
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements_skip_metadata() {
+            let (id, lat, lon) = match &element {
+                Element::DenseNode(dn) if referenced.get(dn.id()) => {
+                    (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
+                }
+                Element::Node(n) if referenced.get(n.id()) => {
+                    (n.id(), n.decimicro_lat(), n.decimicro_lon())
+                }
+                _ => continue,
+            };
+
+            if id < 0 {
+                continue;
+            }
+            let uid = id as u64;
+            let chunk_id = (uid >> CHUNK_SHIFT) as usize;
+            let offset_in_chunk = (uid & CHUNK_MASK) as u8;
+
+            if chunk_id != current_chunk {
+                // Close previous chunk: pad trailing slots with sentinels.
+                if current_chunk != usize::MAX {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let trailing = (CHUNK_MASK as u8).wrapping_sub(last_offset_in_chunk);
+                    for _ in 0..trailing {
+                        writer.write_all(&sentinel)?;
+                        byte_pos += ENTRY_SIZE as u64;
+                    }
+                }
+                // Ensure offsets/start_pad are large enough for this chunk.
+                if chunk_id >= offsets.len() {
+                    offsets.resize(chunk_id + 1, CHUNK_NOT_PRESENT);
+                    start_pad.resize(chunk_id + 1, 0);
+                }
+                offsets[chunk_id] = byte_pos;
+                start_pad[chunk_id] = offset_in_chunk;
+                current_chunk = chunk_id;
+                last_offset_in_chunk = offset_in_chunk;
+            } else {
+                // Fill gaps within the chunk with sentinels.
+                let gap = offset_in_chunk.wrapping_sub(last_offset_in_chunk).wrapping_sub(1);
+                for _ in 0..gap {
+                    writer.write_all(&sentinel)?;
+                    byte_pos += ENTRY_SIZE as u64;
+                }
+                last_offset_in_chunk = offset_in_chunk;
+            }
+
+            // Write the actual entry.
+            let mut buf = [0u8; ENTRY_SIZE];
+            buf[..4].copy_from_slice(&lat.to_le_bytes());
+            buf[4..].copy_from_slice(&lon.to_le_bytes());
+            writer.write_all(&buf)?;
+            byte_pos += ENTRY_SIZE as u64;
+        }
+    }
+
+    // Close final chunk: pad trailing slots.
+    if current_chunk != usize::MAX {
+        #[allow(clippy::cast_possible_truncation)]
+        let trailing = (CHUNK_MASK as u8).wrapping_sub(last_offset_in_chunk);
+        for _ in 0..trailing {
+            writer.write_all(&sentinel)?;
+        }
+    }
+
+    writer.flush()?;
+    drop(writer);
+
+    // Re-map as read-only for the lookup phase.
+    let mmap = unsafe {
+        memmap2::Mmap::map(&file)
+            .map_err(|e| format!("failed to mmap sparse index values: {e}"))?
+    };
+
+    Ok(SparseArrayIndex {
+        offsets,
+        start_pad,
+        mmap,
+        _file: file,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Unified node index
+// ---------------------------------------------------------------------------
+
+/// Unified node coordinate index dispatching to either dense or sparse.
+enum NodeIndex {
+    Dense(DenseMmapIndex),
+    Sparse(SparseArrayIndex),
+}
+
+impl NodeIndex {
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        match self {
+            Self::Dense(idx) => idx.get(node_id),
+            Self::Sparse(idx) => idx.get(node_id),
         }
     }
 }
@@ -357,6 +669,7 @@ impl Stats {
 /// If `keep_untagged_nodes` is false, nodes with zero tags are omitted from
 /// the output (their coordinates are still used for ways).
 #[hotpath::measure]
+#[allow(clippy::too_many_arguments)]
 pub fn add_locations_to_ways(
     input: &Path,
     output: &Path,
@@ -365,6 +678,7 @@ pub fn add_locations_to_ways(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    index_type: IndexType,
 ) -> Result<Stats> {
     let indexdata_present = require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
@@ -376,7 +690,7 @@ pub fn add_locations_to_ways(
     // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
     let referenced = collect_way_referenced_node_ids(input, direct_io)?;
 
-    let index = build_node_index(input, direct_io, scratch_dir, &referenced)?;
+    let index = build_node_index(input, direct_io, scratch_dir, &referenced, index_type)?;
     drop(referenced);
 
     let relation_member_node_ids = if keep_untagged_nodes {
@@ -410,8 +724,18 @@ fn build_node_index(
     direct_io: bool,
     scratch_dir: &Path,
     referenced: &IdSetDense,
-) -> Result<DenseMmapIndex> {
-    build_node_index_dense(input, direct_io, scratch_dir, referenced)
+    index_type: IndexType,
+) -> Result<NodeIndex> {
+    match index_type {
+        IndexType::Dense => {
+            build_node_index_dense(input, direct_io, scratch_dir, referenced)
+                .map(NodeIndex::Dense)
+        }
+        IndexType::Sparse => {
+            build_node_index_sparse(input, direct_io, scratch_dir, referenced)
+                .map(NodeIndex::Sparse)
+        }
+    }
 }
 
 /// Build the dense mmap index in parallel. Each rayon task writes directly
@@ -533,7 +857,7 @@ fn index_batch_dense(
 fn write_output_checked(
     input: &Path,
     output: &Path,
-    index: &DenseMmapIndex,
+    index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
@@ -574,7 +898,7 @@ fn write_output_checked(
 fn write_output_decode_all(
     input: &Path,
     output: &Path,
-    index: &DenseMmapIndex,
+    index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
@@ -652,6 +976,84 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
     dst.blobs_decoded += src.blobs_decoded;
 }
 
+// ---------------------------------------------------------------------------
+// Batched sorted lookups for sparse index
+// ---------------------------------------------------------------------------
+
+use rustc_hash::FxHashMap;
+
+/// How to resolve node coordinates during way processing.
+enum LocationLookup<'a> {
+    /// Direct random access (dense index or sparse with small dataset).
+    Index(&'a NodeIndex),
+    /// Pre-resolved map from batched sorted lookup (sparse, large dataset).
+    Resolved(&'a FxHashMap<i64, (i32, i32)>),
+}
+
+impl LocationLookup<'_> {
+    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+        match self {
+            Self::Index(idx) => idx.get(node_id),
+            Self::Resolved(map) => map.get(&node_id).copied(),
+        }
+    }
+}
+
+/// Entry for sorting lookups by file offset.
+struct LookupEntry {
+    /// Byte offset into the sparse index values mmap.
+    mmap_offset: u64,
+    /// The node ID (used as key in the result map).
+    node_id: i64,
+}
+
+/// Collect all unique way node refs from a batch of blocks, resolve their
+/// coordinates via sorted sequential access through the sparse index mmap,
+/// and return a map of node_id → (lat, lon).
+///
+/// This converts random I/O (one page fault per lookup) into sequential I/O
+/// (one pass through the mmap in file order). At planet scale, a batch of
+/// ~128 way blobs contains ~100K unique node refs. Sorting these by mmap
+/// offset and scanning sequentially touches each page at most once.
+fn resolve_batch_locations(
+    blocks: &[PrimitiveBlock],
+    sparse: &SparseArrayIndex,
+) -> FxHashMap<i64, (i32, i32)> {
+    // Collect all unique node refs with their mmap offsets.
+    let mut entries: Vec<LookupEntry> = Vec::new();
+    let mut seen = FxHashMap::<i64, ()>::default();
+
+    for block in blocks {
+        for element in block.elements_skip_metadata() {
+            if let Element::Way(w) = element {
+                for node_id in w.refs() {
+                    if seen.contains_key(&node_id) {
+                        continue;
+                    }
+                    seen.insert(node_id, ());
+                    if let Some(offset) = sparse.byte_offset(node_id) {
+                        entries.push(LookupEntry { mmap_offset: offset, node_id });
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by mmap offset → sequential access pattern.
+    entries.sort_unstable_by_key(|e| e.mmap_offset);
+
+    // Resolve coordinates via sequential scan.
+    let mut result = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
+    for entry in &entries {
+        if let Some(coords) = sparse.get_at_offset(entry.mmap_offset) {
+            result.insert(entry.node_id, coords);
+        }
+    }
+
+    result
+}
+
+
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
 #[allow(clippy::too_many_arguments)]
@@ -659,7 +1061,7 @@ fn process_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    index: &DenseMmapIndex,
+    lookup: &LocationLookup<'_>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     refs_buf: &mut Vec<i64>,
@@ -723,7 +1125,7 @@ fn process_block(
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
                 for node_id in refs_buf.iter() {
-                    match index.get(*node_id) {
+                    match lookup.get(*node_id) {
                         Some(loc) => locations_buf.push(loc),
                         None => {
                             stats.missing_locations += 1;
@@ -755,13 +1157,26 @@ fn process_block(
 }
 
 /// Process a batch of `PrimitiveBlock`s in parallel via rayon.
+///
+/// For sparse indexes: pre-resolves all way node coordinates via sorted
+/// sequential scan before parallel processing (avoids random mmap I/O).
 fn process_batch(
     batch: &[PrimitiveBlock],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    index: &DenseMmapIndex,
+    index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
 ) -> Result<Stats> {
+    // For sparse index: resolve all way node coordinates upfront.
+    let resolved_map;
+    let lookup = match index {
+        NodeIndex::Dense(_) => LocationLookup::Index(index),
+        NodeIndex::Sparse(sparse) => {
+            resolved_map = resolve_batch_locations(batch, sparse);
+            LocationLookup::Resolved(&resolved_map)
+        }
+    };
+
     type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
     let results: Vec<BatchResult> = batch
         .par_iter()
@@ -773,7 +1188,7 @@ fn process_batch(
                     block,
                     bb,
                     &mut output,
-                    index,
+                    &lookup,
                     keep_untagged_nodes,
                     relation_member_node_ids,
                     refs_buf, locations_buf,
@@ -881,7 +1296,7 @@ fn read_header_raw<R: Read>(
 fn write_output_passthrough(
     input: &Path,
     output: &Path,
-    node_index: &DenseMmapIndex,
+    node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
@@ -1042,19 +1457,94 @@ fn write_output_passthrough(
     Ok(stats)
 }
 
+/// Decompress and parse a batch of slots in parallel.
+fn decompress_slot_batch(
+    batch: &[BatchSlot],
+) -> std::result::Result<Vec<PrimitiveBlock>, String> {
+    batch
+        .par_iter()
+        .map_init(
+            DecompressPool::new,
+            |pool, slot| {
+                let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
+                    .map_err(|e| e.to_string())?;
+                let bytes = decompress_blob(&wire_blob, Some(pool))
+                    .map_err(|e| e.to_string())?;
+                parse_primitive_block_from_bytes_owned(&bytes)
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .collect()
+}
+
 /// Process a batch of slots in parallel: decompress, transform, write.
 ///
-/// Each rayon worker decompresses and parses its blob, then routes to the
-/// appropriate element handler. Results are collected and written sequentially
-/// to preserve input order.
+/// For sparse indexes: decompresses all blobs first, pre-resolves way node
+/// coordinates via sorted sequential scan, then processes in parallel.
+/// For dense indexes: decompresses and processes in one parallel pass.
 fn process_slot_batch(
     batch: &[BatchSlot],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    node_index: &DenseMmapIndex,
+    node_index: &NodeIndex,
+    keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
+) -> Result<Stats> {
+    // For sparse: decompress first, resolve locations, then process.
+    // For dense: decompress + process in one pass (original path).
+    let resolved_map;
+    let decoded_blocks;
+    let (blocks_ref, lookup): (&[PrimitiveBlock], LocationLookup<'_>) = match node_index {
+        NodeIndex::Dense(_) => {
+            // Dense path: decompress + process in single parallel pass.
+            return process_slot_batch_dense(
+                batch, writer, node_index, keep_untagged_nodes, relation_member_node_ids,
+            );
+        }
+        NodeIndex::Sparse(sparse) => {
+            decoded_blocks = decompress_slot_batch(batch)
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            resolved_map = resolve_batch_locations(&decoded_blocks, sparse);
+            (&decoded_blocks, LocationLookup::Resolved(&resolved_map))
+        }
+    };
+
+    type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+    let results: Vec<SlotResult> = blocks_ref
+        .par_iter()
+        .map_init(
+            || (BlockBuilder::new(), Vec::<i64>::new(), Vec::<(i32, i32)>::new()),
+            |(bb, refs_buf, locations_buf), block| {
+                let mut output: Vec<OwnedBlock> = Vec::new();
+                let block_stats = process_block(
+                    block, bb, &mut output, &lookup,
+                    keep_untagged_nodes, relation_member_node_ids,
+                    refs_buf, locations_buf,
+                )?;
+                flush_local(bb, &mut output)?;
+                Ok((std::mem::take(&mut output), block_stats))
+            },
+        )
+        .collect();
+
+    let mut total = Stats {
+        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
+        ways_written: 0, relations_written: 0, missing_locations: 0,
+        blobs_passthrough: 0, blobs_decoded: 0,
+    };
+    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
+    Ok(total)
+}
+
+/// Dense-index path for slot batch: decompress + process in one parallel pass.
+fn process_slot_batch_dense(
+    batch: &[BatchSlot],
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
 ) -> Result<Stats> {
     type SlotResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
+    let lookup = LocationLookup::Index(node_index);
 
     let results: Vec<SlotResult> = batch
         .par_iter()
@@ -1071,9 +1561,6 @@ fn process_slot_batch(
             |(bb, output, refs_buf, locations_buf, pool), slot| {
                 output.clear();
 
-                // Decompress and parse the blob in this worker thread.
-                // Per-worker DecompressPool reuses the decompression buffer across blobs
-                // via PooledBuffer + Bytes::from_owner (returned to pool on drop).
                 let wire_blob = WireBlob::parse_slice(slot.frame().blob_bytes())
                     .map_err(|e| e.to_string())?;
                 let bytes = decompress_blob(&wire_blob, Some(pool))
@@ -1082,12 +1569,8 @@ fn process_slot_batch(
                     .map_err(|e| e.to_string())?;
 
                 let block_stats = process_block(
-                    &block,
-                    bb,
-                    output,
-                    node_index,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
+                    &block, bb, output, &lookup,
+                    keep_untagged_nodes, relation_member_node_ids,
                     refs_buf, locations_buf,
                 )?;
 
@@ -1098,17 +1581,10 @@ fn process_slot_batch(
         .collect();
 
     let mut total = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
+        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
+        ways_written: 0, relations_written: 0, missing_locations: 0,
+        blobs_passthrough: 0, blobs_decoded: 0,
     };
-
     drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
-
     Ok(total)
 }

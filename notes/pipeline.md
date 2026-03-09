@@ -133,15 +133,23 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 ## Pipeline 4: Add-locations-to-ways (enrichment step)
 
-**Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides)`
+**Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides, index_type)`
 
-Two-pass algorithm that embeds node coordinates directly into way elements. Uses a file-backed `DenseMmapIndex` (8 bytes/slot, direct addressing by node ID) that works from country to planet scale without OOM.
+Two-pass algorithm that embeds node coordinates directly into way elements. `NodeIndex` enum dispatches between two index strategies:
+
+- **`Dense`** (`DenseMmapIndex`): file-backed anonymous mmap, 8 bytes/slot, direct addressing by node ID. 128 GB virtual address space, ~16 GB touched at planet (after pass 0 filtering). Fastest when working set fits in RAM.
+- **`Sparse`** (`SparseArrayIndex`): Planetiler-inspired chunk-indexed sparse array (chunk size 256). RAM: `offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk: compact packed (lat, lon) values file via read-only mmap (~16 GB for planet). Way lookups use batched sorted access — collect all node refs from a batch, sort by file offset, sequential scan into `FxHashMap`, then process blocks with pre-resolved coordinates. Memory-bounded for planet on low-RAM hosts.
+
+**Pass 0 — Way-referenced node IDs (both index types):**
+- Scans way blobs to build `IdSetDense` bitset (~1.6 GB for planet's ~2B unique way-node refs)
+- Dense: filters which mmap slots to populate. Sparse: determines which nodes to store.
 
 **Pass 1 — Parallel node index building:**
 - Pipelined read with `BlobFilter::only_nodes()` — skips way/relation blobs entirely
 - Batch-and-dispatch: collects `INDEX_BATCH_SIZE=64` blocks, then `par_iter` on rayon global pool
 - Uses `elements_skip_metadata()` — skips metadata parsing (only needs id/lat/lon)
-- `DenseMmapIndex`: file-backed anonymous mmap in scratch dir (next to output). `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free. Default capacity 16B slots (128 GB virtual). Temp file cleaned up on drop.
+- **Dense path**: `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free.
+- **Sparse path**: `build_node_index_sparse` writes chunk-indexed entries sequentially to a temp file via `BufWriter`. Each chunk stores only present nodes (dense within the chunk). Trailing sentinel padding per chunk. File mmapped read-only after build.
 
 **Pass 2 — Output with locations on ways:**
 - **Indexed PBF (fast path)**: reads raw blob frames, classifies by `BlobIndex.kind` from BlobHeader indexdata
@@ -149,6 +157,8 @@ Two-pass algorithm that embeds node coordinates directly into way elements. Uses
   - Node blobs + `keep_untagged=false` → decompress → filter untagged → re-encode
   - Relation blobs → `write_raw_owned` (always passthrough)
   - Way blobs → decompress → coordinate lookup → `add_way_with_locations` → re-encode
+  - **Dense**: direct `NodeIndex::get(id)` per way node ref
+  - **Sparse**: `resolve_batch_locations` collects all way node refs from the batch, sorts by mmap offset, sequential scan builds `FxHashMap<i64, (i32, i32)>`, then `LocationLookup::Resolved` provides O(1) HashMap lookups during block processing
   - Batch processing via `par_iter().map_init(BlockBuilder::new, ...)` for way and node batches
 - **Non-indexed PBF (fallback)**: full decode-all path, same as above but every blob is decoded
 

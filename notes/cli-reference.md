@@ -276,7 +276,7 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 ### add-locations-to-ways
 
-Embed node coordinates in ways. Uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID) that works from country to planet scale without OOM.
+Embed node coordinates in ways. Two index strategies: `dense` (default, direct-mapped mmap, fastest when working set fits in RAM) and `sparse` (Planetiler-inspired chunk-indexed array with batched sorted lookups, memory-bounded for planet on low-RAM hosts).
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -287,6 +287,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
+| `--index-type <TYPE>` | Node index type: `dense` (default, fast when data fits in RAM) or `sparse` (Planetiler-inspired, memory-bounded for planet on low-RAM hosts) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

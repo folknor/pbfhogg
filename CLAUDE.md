@@ -87,6 +87,13 @@ The passthrough path (no `--type`) adds indexdata via decompress+scan without re
 
 `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, and `inspect --nodes` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 
+### add-locations-to-ways index types
+
+`add-locations-to-ways` supports `--index-type dense|sparse` (default: `dense`):
+
+- **`dense`** — Direct-mapped mmap array (`index[node_id] = (lat, lon)`). Fastest when the working set fits in RAM. At planet scale (~16 GB touched after pass 0 filtering), requires ~30+ GB free memory to avoid page cache thrashing.
+- **`sparse`** — Planetiler-inspired chunk-indexed sparse array. ~540 MB RAM for chunk index + compact on-disk values file (~16 GB for planet). Way lookups are batched and sorted by file offset, converting random I/O into sequential scans. Works on memory-constrained hosts (tested on 30 GB host with planet). ~1.85x slower than dense on Denmark (all fits in RAM, overhead is pure CPU).
+
 ## Verify subcommands
 
 Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconvert). All default to `--dataset denmark`.

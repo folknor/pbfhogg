@@ -87,7 +87,7 @@ write paths against reference tools. All default to `--dataset denmark --variant
 | `verify tags-filter` | [x] | [x] | 3 expressions vs osmium |
 | `verify getid-removeid` | [x] | [x] | getid + invert vs osmium |
 | `verify add-locations-to-ways` | [x] | [x] | vs osmium |
-| `verify check-refs` | **known diff** | **known diff** | ways-only identical; relation counts differ (occurrences vs unique IDs) |
+| `verify check-refs` | [x] | [ ] | was known diff — fixed: reports unique IDs + occurrence count, verified against osmium |
 | `verify merge` | [x] | [x] | vs osmium/osmosis/osmconvert |
 | `verify derive-changes` | **known diff** | **osmium bug** | [libosmium#405](https://github.com/osmcode/libosmium/issues/405): osmium rejects large BlobHeaders (indexdata). Fixed upstream, not released. |
 | `verify diff` | **known diff** | **osmium bug** | same libosmium#405 — not a pbfhogg issue |

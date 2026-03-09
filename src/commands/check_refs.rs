@@ -27,6 +27,10 @@ pub struct RefCheckResult {
     pub missing_way_refs: u64,
     pub missing_node_members: u64,
     pub missing_relation_members: u64,
+    /// Number of relation-to-relation references that point to missing IDs.
+    /// May exceed `missing_relation_members` when multiple relations reference
+    /// the same missing relation.
+    pub missing_relation_member_occurrences: u64,
     /// Every missing reference occurrence (populated when `show_ids` is true).
     /// Not deduplicated — each occurrence is a separate entry.
     pub missing_refs: Vec<MissingRef>,
@@ -58,9 +62,9 @@ impl RefCheckResult {
 ///
 /// Relies on PBF sort order: nodes before ways before relations. Reports
 /// unique missing IDs for nodes and ways (since they precede relations and
-/// are fully indexed before relation processing). Reports missing reference
-/// occurrences for relation-to-relation members (deferred to post-pass to
-/// handle forward references). Matches osmium check-refs semantics.
+/// are fully indexed before relation processing). Reports unique missing
+/// relation IDs for relation-to-relation members (deferred to post-pass to
+/// handle forward references, then deduplicated).
 ///
 /// # Why this is NOT an ID-only consumer
 ///
@@ -136,6 +140,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         missing_way_refs: 0,
         missing_node_members: 0,
         missing_relation_members: 0,
+        missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
     };
 
@@ -222,11 +227,15 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     result.missing_way_refs = missing_way_refs_set.len();
 
     // Resolve deferred relation refs against the complete relation_ids set.
-    // Count occurrences (not unique IDs) to match osmium semantics.
+    // Deduplicate missing IDs via RoaringTreemap to count unique missing
+    // relation IDs, consistent with node/way counting above.
     if check_relations {
+        let mut missing_relation_members_set = RoaringTreemap::new();
+        let mut occurrences: u64 = 0;
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
             if !relation_ids.contains(id) {
-                result.missing_relation_members += 1;
+                missing_relation_members_set.insert(id);
+                occurrences += 1;
                 if show_ids {
                     missing_refs.push(MissingRef {
                         missing_type: 'r',
@@ -237,6 +246,8 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 }
             }
         }
+        result.missing_relation_members = missing_relation_members_set.len();
+        result.missing_relation_member_occurrences = occurrences;
     }
 
     result.missing_refs = missing_refs;

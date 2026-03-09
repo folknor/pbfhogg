@@ -1079,7 +1079,7 @@ fn main() {
     }
 }
 
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
 fn run_check(
     path: &std::path::Path,
     ids: bool,
@@ -1164,6 +1164,7 @@ fn run_check(
                 "missing_way_refs": result.missing_way_refs,
                 "missing_node_members": result.missing_node_members,
                 "missing_relation_members": result.missing_relation_members,
+                "missing_relation_member_occurrences": result.missing_relation_member_occurrences,
                 "passed": result.is_valid(),
             });
             if show_ids {
@@ -1214,7 +1215,15 @@ fn run_check(
                     println!("Missing node members in relations: {}", result.missing_node_members);
                 }
                 if result.missing_relation_members > 0 {
-                    println!("Missing relation members: {}", result.missing_relation_members);
+                    if result.missing_relation_member_occurrences > result.missing_relation_members {
+                        println!(
+                            "Missing relation members: {} ({} references)",
+                            result.missing_relation_members,
+                            result.missing_relation_member_occurrences,
+                        );
+                    } else {
+                        println!("Missing relation members: {}", result.missing_relation_members);
+                    }
                 }
             }
             if result.is_valid() {

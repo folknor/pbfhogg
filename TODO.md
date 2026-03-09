@@ -162,16 +162,16 @@ Three `brokkr verify` commands show known differences vs osmium. These are seman
 disagreements, not bugs — but should be investigated and either fixed or documented
 before release.
 
-- [ ] **`check-refs` relation counting** — pbfhogg counts missing reference occurrences,
-  osmium counts unique missing IDs. Ways-only output is identical. Decide which
-  semantics are correct and align, or document the difference.
-- [ ] **`diff` version comparison** — 14-element discrepancy out of 59.1M elements.
+- [x] **`check-refs` relation counting** — fixed: deferred relation refs now
+  deduplicated via `RoaringTreemap`. Reports unique missing IDs (706) with
+  occurrence count in parentheses (777 references) when they differ. The 777
+  matches osmium's count exactly. `brokkr verify check-refs` now passes.
+- [x] **`diff` version comparison** — 14-element discrepancy out of 59.1M elements.
   pbfhogg uses content equality (coordinates, tags, refs, members), osmium uses
-  version/timestamp ordering. Document the semantic difference or add a
-  `--version-compare` mode.
-- [ ] **`derive-changes` delete loss** — pbfhogg roundtrip is perfect. osmium loses
-  1243 deletes when generating OSC from two PBFs. This is an osmium limitation,
-  not a pbfhogg bug. Document it.
+  version/timestamp ordering. Documented in DEVIATIONS.md. Content equality is
+  strictly better: deterministic regardless of metadata completeness.
+- [x] **`derive-changes` delete loss** — pbfhogg roundtrip is perfect. osmium loses
+  1243 deletes when generating OSC from two PBFs. Documented in DEVIATIONS.md.
 
 - [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
 - [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:

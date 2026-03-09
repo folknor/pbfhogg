@@ -25,7 +25,7 @@ linux-io-uring = ["pbfhogg/linux-io-uring"]
 pbfhogg = { path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4", features = ["derive"] }
 serde_json = "1"
-hotpath = "0.13"
+hotpath = "0.14"
 tikv-jemallocator = { version = "0.6", optional = true }
 mimalloc-crate = { package = "mimalloc", version = "0.1", optional = true }
 

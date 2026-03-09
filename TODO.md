@@ -125,30 +125,12 @@ overhead for ALTW because sequential readahead from page cache is faster.
 | Europe | 33.6 GB | 4.2B | 2611s (43m) | `--direct-io` (+2%, no benefit) |
 | Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound |
 
-## Consolidation
-
-- [x] **Investigate shared reader thread for raw-frame streaming** — Investigated.
-  The three commands have fundamentally incompatible access patterns:
-  merge uses sequential raw-frame streaming via dedicated thread + bounded channel;
-  sort uses random seek access (`File::seek` to sorted blob offsets);
-  ALTW uses `ElementReader::into_blocks_pipelined()` which already has its own
-  I/O thread internally, plus a selective header-scan passthrough path.
-  No shared abstraction would serve all three. Not worth extracting.
-
 ## Release prep
 
 ### crates.io blockers
 
 - [ ] **Publish `protohoggr` first** — currently `path = "../protohoggr"` only. Add `version = "0.2"` alongside the path dep so crates.io resolves it. Publish protohoggr before pbfhogg.
 - [ ] **Add `version` to CLI path dep** — `cli/Cargo.toml` needs `version = "0.2"` on the `pbfhogg` dep if we publish pbfhogg-cli too (or skip publishing the CLI crate).
-- [x] **Add `readme` field** — added to root `Cargo.toml` (CLI has no README, skipped).
-- [x] **Add `rust-version`** — set to `1.85` (edition 2024 minimum) in both Cargo.toml files.
-- [x] **`hotpath` dep** — must stay unconditional; `#[hotpath::measure]` attributes are used throughout library code and need the crate present to compile. When the `hotpath` feature is off (default), proc macros expand to nothing — zero runtime cost.
-
-### Public API cleanup
-
-- [x] **Audit wildcard re-exports** — replaced all 6 wildcard `pub use` with explicit named re-exports (42 types). Downgraded 6 internal blob.rs free functions from `pub` to `pub(crate)`.
-- [x] **`commands` module visibility** — keeping `#[doc(hidden)] pub`. CLI crate depends on these as a separate package so `pub(crate)` won't work. Feature-gating adds complexity for no compile-time benefit (heavy deps already gated). Standard Rust convention (serde, tokio do the same).
 - [ ] **Clarify license** — README mentions MIT but only Apache-2.0 is declared. Pick one story.
 
 ### Testing
@@ -161,17 +143,6 @@ I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
 Three `brokkr verify` commands show known differences vs osmium. These are semantic
 disagreements, not bugs — but should be investigated and either fixed or documented
 before release.
-
-- [x] **`check-refs` relation counting** — fixed: deferred relation refs now
-  deduplicated via `RoaringTreemap`. Reports unique missing IDs (706) with
-  occurrence count in parentheses (777 references) when they differ. The 777
-  matches osmium's count exactly. `brokkr verify check-refs` now passes.
-- [x] **`diff` version comparison** — 14-element discrepancy out of 59.1M elements.
-  pbfhogg uses content equality (coordinates, tags, refs, members), osmium uses
-  version/timestamp ordering. Documented in DEVIATIONS.md. Content equality is
-  strictly better: deterministic regardless of metadata completeness.
-- [x] **`derive-changes` delete loss** — pbfhogg roundtrip is perfect. osmium loses
-  1243 deletes when generating OSC from two PBFs. Documented in DEVIATIONS.md.
 
 - [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
 - [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:
@@ -188,26 +159,6 @@ before release.
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
 - [ ] Add a CHANGELOG.md before first tagged release
-- [x] **`sort --direct-io` EINVAL** — `DirectReader::skip()` seeked to an unaligned
-  file offset, causing the next `libc::read` to fail with EINVAL. Fixed by
-  aligning the seek target down to a page boundary, refilling the buffer, and
-  consuming the alignment gap.
-- [x] **osmium "invalid BlobHeader size" with indexdata PBFs** — osmium rejects
-  BlobHeaders larger than its hardcoded max when indexdata fields are present.
-  Filed [libosmium#405](https://github.com/osmcode/libosmium/issues/405), fixed
-  upstream but not yet released. Not a pbfhogg bug. Affects `verify derive-changes`
-  and `verify diff` (both buffered and `--direct-io`) when the input PBF has indexdata.
-- [x] **`copy_file_range` cross-device fallback** — `copy_file_range` returns `EXDEV`
-  when input and output are on different filesystems. Sort and any command using
-  `write_raw_copy` would fail with "writer thread terminated" in cross-device
-  setups. Fixed with `pread`+`write` fallback in `copy_range_fallback()`.
-- [x] **All 4 feature permutations pass clippy + tests** (commit `a52ac80`): default,
-  `linux-direct-io`+`linux-io-uring`, `--no-default-features`, and
-  `--no-default-features`+linux features. Fixed 6 latent clippy errors in
-  `direct_reader.rs`, `uring_writer.rs`, `diff.rs`, `blob.rs` plus 2 compile
-  errors in `uring_writer.rs` (missing `VecDeque` import, unclosed delimiter).
-- [x] **io_uring runtime validated** (commit `eb60cb5`): merge bench with `--uring`
-  works correctly after compile fixes. Requires `RLIMIT_MEMLOCK >= 16 MB`.
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)

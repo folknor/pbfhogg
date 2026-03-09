@@ -138,7 +138,6 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     let input_fd = 0i32;
     // io_uring uses linked ReadFixed+WriteFixed for CopyRange.
     // Buffered output supports copy_file_range. O_DIRECT cannot.
-    #[allow(unused_variables)]
     let use_copy_range = io_uring || (!direct_io && cfg!(feature = "linux-direct-io"));
 
     let mut stats = SortStats {

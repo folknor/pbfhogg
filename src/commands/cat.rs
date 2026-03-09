@@ -174,16 +174,14 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 /// into `output`. Returns the number of elements written.
 ///
 /// Called from rayon worker threads via `map_init`.
-#[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &crate::PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    filter_node: bool,
-    filter_way: bool,
-    filter_relation: bool,
+    tf: &TypeFilter,
     clean: &CleanAttrs,
 ) -> std::result::Result<u64, String> {
+    let (filter_node, filter_way, filter_relation) = (tf.nodes, tf.ways, tf.relations);
     let mut count: u64 = 0;
 
     // Reusable buffers — same hoisting strategy as the old sequential path.
@@ -297,9 +295,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
                 batch,
                 &mut writer,
                 compression,
-                tf.nodes,
-                tf.ways,
-                tf.relations,
+                &tf,
                 clean,
             )?;
             blobs_decoded += batch_blobs;
@@ -332,9 +328,7 @@ fn process_batch(
     batch: &[crate::PrimitiveBlock],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     compression: Compression,
-    filter_node: bool,
-    filter_way: bool,
-    filter_relation: bool,
+    tf: &TypeFilter,
     clean: &CleanAttrs,
 ) -> Result<(u64, u64)> {
     // Parallel phase: decode → serialize → compress → frame, all in one pass.
@@ -346,8 +340,7 @@ fn process_batch(
             |bb, block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let count = process_block(
-                    block, bb, &mut output,
-                    filter_node, filter_way, filter_relation, clean,
+                    block, bb, &mut output, tf, clean,
                 )?;
                 flush_local(bb, &mut output)?;
 

@@ -799,7 +799,6 @@ impl InspectReport {
     ///
     /// `block_limit`: `None` = no block detail, `Some(0)` = distribution stats
     /// + full listing, `Some(N)` = distribution stats + first/last N blocks.
-    #[allow(clippy::cast_precision_loss)]
     pub fn print_report(&mut self, block_limit: Option<usize>) {
         self.print_report_filtered(block_limit, false);
     }
@@ -964,7 +963,6 @@ impl InspectReport {
 
     /// Print per-type distribution stats (min/max/median/p99) for block
     /// element counts and compressed sizes.
-    #[allow(clippy::cast_precision_loss)]
     fn print_block_distribution(infos: &[BlockInfo]) {
         println!("Block distribution:");
         for kind in [BlockKind::Nodes, BlockKind::Ways, BlockKind::Relations, BlockKind::Mixed] {
@@ -1123,7 +1121,6 @@ impl InspectReport {
     /// Retrieve a single value by dot-path key, for `--get` scripting.
     ///
     /// Returns `None` for unknown keys.
-    #[allow(clippy::cast_precision_loss)]
     pub fn get_value(&self, key: &str) -> Option<String> {
         self.get_value_inner(key)
     }

@@ -98,35 +98,47 @@ Note: verify commands must run **one at a time**, never in parallel.
 
 Commands that accept I/O flags, with the modes that need testing:
 
-| Command | buffered | `--direct-io` | `--uring` | `--force` (raw PBF) |
+| Command | buffered | `--direct-io` | `--io-uring` | `--force` (raw PBF) |
 |---------|----------|---------------|-----------|---------------------|
-| cat (passthrough) | [x] | [ ] | n/a | [ ] |
-| cat --type | [ ] | [ ] | n/a | [ ] |
-| cat --dedupe | [ ] | [ ] | [ ] | [ ] |
-| sort | [ ] | [ ] | [ ] | [ ] |
-| apply-changes | [ ] | [ ] | [ ] | [ ] |
-| extract --simple | [ ] | [ ] | n/a | [ ] |
-| extract --smart | [ ] | [ ] | n/a | [ ] |
-| add-locations-to-ways | [ ] | [ ] | n/a | [ ] |
-| tags-filter | [ ] | [ ] | n/a | [ ] |
-| getid | [ ] | [ ] | n/a | [ ] |
-| getparents | [ ] | [ ] | n/a | n/a |
-| renumber | [ ] | [ ] | n/a | n/a |
-| time-filter | [ ] | [ ] | n/a | n/a |
-| diff | [ ] | [ ] | n/a | n/a |
-| inspect | [ ] | [ ] | n/a | [ ] |
-| check | [ ] | [ ] | n/a | n/a |
+| cat (passthrough) | [x] | [x] | n/a | [x] |
+| cat --type | [x] | [x] | n/a | [x] |
+| cat --dedupe | [x] | [x] | [x] | [x] |
+| sort | [x] | [x] | [x] | [x] |
+| apply-changes | [x] | [x] | [x] | [x] |
+| extract --simple | [x] | [x] | n/a | [x] |
+| extract --smart | [x] | [x] | n/a | [x] |
+| add-locations-to-ways | [x] | [x] | n/a | [x] |
+| tags-filter | [x] | [x] | n/a | [x] |
+| getid | [x] | [x] | n/a | [x] |
+| getparents | [x] | [x] | n/a | n/a |
+| renumber | [x] | [x] | n/a | n/a |
+| time-filter | [x] | [x] | n/a | n/a |
+| diff | [x] | [x] | n/a | n/a |
+| inspect | [x] | [x] | n/a | [x] |
+| check | [x] | [x] | n/a | n/a |
+
+All 54 cells tested on Denmark dataset (commit `4f69912`). All pass.
 
 `--uring` is only available on: cat --dedupe, sort, apply-changes.
 
 ## 5. Scale testing
 
-| Dataset | Size | Commands to test |
-|---------|------|-----------------|
-| Denmark | 461 MB | All commands (fast iteration) |
-| Germany | 4.5 GB | merge (direct-io crossover point) |
-| North America | 18.8 GB | merge buffered vs uring (uring wins 12-20%) |
-| Planet | 87 GB | cat passthrough, merge (extrapolated ~47s uring+none) |
+| Dataset | Size | Commands to test | Status |
+|---------|------|-----------------|--------|
+| Denmark | 461 MB | All commands (fast iteration) | [x] All pass (section 4) |
+| Germany | 4.5 GB | merge buffered + direct-io | [x] Both pass |
+| North America | 18.8 GB | merge buffered + io-uring | [x] Both pass, identical element counts |
+| Planet | 87 GB | cat passthrough | [x] Pass (50816 blobs) |
+| Planet | 87 GB | cat --type | **OOM** (SIGKILL on 30 GB host, known issue) |
+| Planet | 87 GB | merge | Skipped (no planet OSC diff available) |
+
+### Ignored tests
+
+| Test | Status |
+|------|--------|
+| `roundtrip_denmark` | [x] Pass |
+| `merge_cross_validate_osmium` | [x] Pass (88.9s) |
+| `sorted_flag_but_unsorted_nodes_panics` | **FAIL** (known: nightly 1.95 debug_assertions regression) |
 
 ## 6. CI matrix (future GitHub Actions)
 

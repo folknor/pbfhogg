@@ -46,6 +46,33 @@ git merge template/master --allow-unrelated-histories
 
 4. **Content** — replace the placeholder docs in `docs/guide/` and `docs/api/` with your actual documentation. Update the sidebar entries in `config.ts` to match.
 
+### Pre-publish checklist
+
+Before deploying, make sure you've updated everything that ships with template placeholder content:
+
+**`docs/.vitepress/config.ts`:**
+- [ ] `projectName` — template placeholder
+- [ ] `projectDescription` — template placeholder
+- [ ] `githubUrl` — powers the GitHub icon in the header
+- [ ] `base` — set to `'/repo-name/'` for GitHub Pages project sites
+- [ ] `logo` — update path to your logo SVG
+- [ ] `footer.message` — update to your actual license
+- [ ] Sidebar sections — placeholder Guide/API structure, update to match your actual pages
+
+**`docs/index.md`:**
+- [ ] `hero.name`, `hero.text`, `hero.tagline` — template placeholders
+- [ ] `hero.image.src` — update path to your logo SVG
+- [ ] Hero GitHub button `link` — update to your repo URL
+- [ ] Feature cards — template placeholders (icons, titles, descriptions)
+- [ ] Body content below the fold — template placeholder
+
+**`docs/guide/index.md`:**
+- [ ] Placeholder content — replace with your own getting started guide
+
+**`docs/public/`:**
+- [ ] Replace logo SVGs with your own
+- [ ] Add a `favicon.svg` (referenced in config but not present in the template)
+
 5. **README** — `raw/` contains ready-made README drafts for each project (`nidhogg-README.md`, `elivagar-README.md`, `pbfhogg-README.md`) with logos, badges, and light/dark mode already wired up. To use one as a starting point, copy it to your project root as `README.md` and adjust paths.
 
    Each README header uses a `<picture>` tag so GitHub shows the right logo for light/dark mode:

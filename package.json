@@ -10,5 +10,5 @@
   "devDependencies": {
     "vitepress": "2.0.0-alpha.16"
   },
-  "packageManager": "pnpm@10.30.1"
+  "packageManager": "pnpm@10.32.0"
 }

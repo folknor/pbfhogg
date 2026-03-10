@@ -106,6 +106,7 @@ body {
 
 .VPHome .vp-doc.container {
   max-width: calc(var(--vp-layout-max-width) - 64px) !important;
+  padding-top: 4rem;
 }
 
 /* ── Rem-ify VitePress px values ───────────────────────────────────────── *
@@ -951,6 +952,10 @@ body {
   top: calc(1.5rem + 0.025em);
 }
 
+.VPHome .vp-doc h2 .header-anchor {
+  top: 0.025em;
+}
+
 /* ── Nav logo hover ─────────────────────────────────────────────────────── */
 
 .VPNavBarTitle .title {
@@ -1096,10 +1101,15 @@ body {
 
 .VPNavBar {
   border-bottom: none !important;
+  box-shadow: none !important;
 }
 
 .VPNavBar .divider-line {
   background-color: transparent !important;
+}
+
+.VPNavBar .divider {
+  display: none !important;
 }
 
 .VPNavBarTitle.has-sidebar .title {
@@ -1118,29 +1128,28 @@ body {
   border-top: none !important;
 }
 
-/* ── Screenshot / demo container ────────────────────────────────────────── */
-/* Use in markdown:
- *   <div class="demo-frame">
- *     <img src="./screenshot.png" alt="Screenshot" />
- *   </div>
- */
+/* ── Doc images ────────────────────────────────────────────────────────── */
 
-.demo-frame {
-  margin: 2rem auto;
-  max-width: 720px;
-  border-radius: 8px;
-  overflow: hidden;
-  border: 1px solid var(--vp-c-divider);
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+.vp-doc p:has(> img) {
+  margin: 2rem 8rem;
 }
 
-.dark .demo-frame {
-  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
-}
-
-.demo-frame img {
+.vp-doc p > img {
   display: block;
   width: 100%;
+  border-radius: 12px;
+  border: 4px solid var(--vp-c-divider);
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.08);
+  transition: border-color 0.3s ease, box-shadow 0.3s ease;
+}
+
+.vp-doc p > img:hover {
+  border-color: var(--vp-c-brand-1);
+  box-shadow: 0 12px 24px var(--vp-c-brand-soft);
+}
+
+.dark .vp-doc p > img {
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
 }
 
 /* ── Asciinema embed container ──────────────────────────────────────────── */
@@ -1361,29 +1370,46 @@ div[class*="language-"] .copy:hover {
 .custom-block {
   border-radius: 8px;
   border-width: 1px;
-  margin: 1.5rem 0;
+  margin: 2rem 0 1.5rem !important;
+  padding: 1.25rem 1.5rem !important;
 }
 
 .custom-block.tip {
-  border-color: var(--vp-c-brand-2);
-  background-color: var(--vp-c-brand-soft);
+  border-color: #40a02b;
+  background-color: rgba(64, 160, 43, 0.1);
 }
 
 .custom-block.warning {
-  border-color: #e68200;
-  background-color: rgba(255, 145, 0, 0.1);
+  border-color: #df8e1d;
+  background-color: rgba(223, 142, 29, 0.1);
 }
 
 .custom-block.danger {
-  border-color: #f44336;
-  background-color: rgba(255, 82, 82, 0.1);
+  border-color: #d20f39;
+  background-color: rgba(210, 15, 57, 0.1);
 }
 
-.custom-block-title {
+.dark .custom-block.tip {
+  border-color: #a6e3a1;
+  background-color: rgba(166, 227, 161, 0.08);
+}
+
+.dark .custom-block.warning {
+  border-color: #f9e2af;
+  background-color: rgba(249, 226, 175, 0.08);
+}
+
+.dark .custom-block.danger {
+  border-color: #f38ba8;
+  background-color: rgba(243, 139, 168, 0.08);
+}
+
+.custom-block p.custom-block-title {
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.025em;
   font-size: 0.85rem;
+  padding-bottom: 0.5rem !important;
 }
 
 /* ── Badge utility classes ────────────────────────────────────────────── */
@@ -1448,15 +1474,18 @@ div[class*="language-"] .copy:hover {
   position: relative;
   box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
   margin: 1.5rem 0;
-  padding-top: 2rem;
+  padding-top: 2.5rem;
+  line-height: 1.6;
 }
 
 .terminal::before {
-  content: "● ● ●";
+  content: "";
   position: absolute;
-  top: 0.5rem;
+  top: 0.75rem;
   left: 1rem;
-  color: #ff5252;
-  font-size: 0.75rem;
-  letter-spacing: 0.25rem;
+  width: 0.6rem;
+  height: 0.6rem;
+  border-radius: 50%;
+  background: #ff5f56;
+  box-shadow: 1rem 0 0 #ffbd2e, 2rem 0 0 #27c93f;
 }

@@ -23,6 +23,10 @@ nidhogg monaco-latest.osm.pbf monaco.pmtiles
 
 That's it. The output is a single `.pmtiles` file you can open in [PMTiles Viewer](https://protomaps.github.io/PMTiles/) or serve from any static file host.
 
+![Main window after first launch](https://placecats.com/720/400)
+
+*The main window after generating your first tileset.*
+
 ## Adding Ocean Fill
 
 Without an ocean shapefile, water areas will be transparent. For proper coastlines and ocean rendering:
@@ -36,6 +40,10 @@ unzip water-polygons-split-4326.zip
 nidhogg --ocean water-polygons-split-4326/water_polygons.shp \
         monaco-latest.osm.pbf monaco.pmtiles
 ```
+
+![Ocean fill comparison](https://placecats.com/neo/1000/556)
+
+*Before and after enabling ocean fill — coastlines render correctly with the shapefile.*
 
 ## Serving Tiles
 
@@ -61,6 +69,10 @@ If you prefer MBTiles, generate that format instead and serve with [Martin](http
 nidhogg --format mbtiles monaco-latest.osm.pbf monaco.mbtiles
 martin monaco.mbtiles
 ```
+
+![Tile server dashboard](https://placecats.com/g/720/400)
+
+*The Martin tile server dashboard showing live connections and tile request stats.*
 
 ## Next Steps
 

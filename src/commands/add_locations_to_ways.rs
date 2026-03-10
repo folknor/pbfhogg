@@ -43,6 +43,10 @@ pub enum IndexType {
     /// planet). Way lookups are batched and sorted by file offset, converting
     /// random I/O into sequential scans. Works on memory-constrained hosts.
     Sparse,
+    /// External join via double radix permutation. Bounded memory (<1 GB),
+    /// all sequential I/O. Uses ~224 GB temp disk at planet scale. Best for
+    /// memory-constrained hosts where dense thrashes and sparse is too slow.
+    External,
 }
 
 /// Parse error for [`IndexType`].
@@ -64,8 +68,9 @@ impl FromStr for IndexType {
         match s {
             "dense" => Ok(Self::Dense),
             "sparse" => Ok(Self::Sparse),
+            "external" => Ok(Self::External),
             _ => Err(ParseIndexTypeError(format!(
-                "unknown index type '{s}': expected 'dense' or 'sparse'"
+                "unknown index type '{s}': expected 'dense', 'sparse', or 'external'"
             ))),
         }
     }
@@ -76,6 +81,7 @@ impl std::fmt::Display for IndexType {
         match self {
             Self::Dense => f.write_str("dense"),
             Self::Sparse => f.write_str("sparse"),
+            Self::External => f.write_str("external"),
         }
     }
 }
@@ -690,6 +696,19 @@ pub fn add_locations_to_ways(
     overrides: &HeaderOverrides,
     index_type: IndexType,
 ) -> Result<Stats> {
+    // External join has its own pipeline — dispatch early.
+    if index_type == IndexType::External {
+        return super::external_join::external_join(
+            input,
+            output,
+            keep_untagged_nodes,
+            compression,
+            direct_io,
+            force,
+            overrides,
+        );
+    }
+
     let indexdata_present = require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).")?;
@@ -745,6 +764,7 @@ fn build_node_index(
             build_node_index_sparse(input, direct_io, scratch_dir, referenced)
                 .map(NodeIndex::Sparse)
         }
+        IndexType::External => unreachable!("external dispatched before build_node_index"),
     }
 }
 
@@ -815,7 +835,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
 }
 
 /// Collect all node IDs referenced by relation members.
-fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
+pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_relations());
     let mut member_node_ids = IdSetDense::new();

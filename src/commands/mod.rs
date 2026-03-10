@@ -1,5 +1,6 @@
 pub mod add_locations_to_ways;
 pub mod cat;
+pub(crate) mod external_join;
 #[cfg(feature = "commands")]
 pub mod check_refs;
 pub mod derive_changes;

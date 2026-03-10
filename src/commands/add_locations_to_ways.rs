@@ -254,36 +254,56 @@ const CHUNK_NOT_PRESENT: u64 = u64::MAX;
 ///
 /// Requires sequential writes in ascending node ID order (satisfied by
 /// sorted PBF files).
+/// Abstraction over the sparse values storage: mmap or pread.
+enum SparseValueReader {
+    #[cfg(not(unix))]
+    Mmap(memmap2::Mmap),
+    #[cfg(unix)]
+    Pread {
+        file: std::fs::File,
+        file_len: u64,
+    },
+}
+
+impl SparseValueReader {
+    /// Read `len` bytes at `offset` into `buf`. Returns false on failure.
+    #[allow(clippy::cast_possible_truncation)]
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> bool {
+        match self {
+            #[cfg(not(unix))]
+            Self::Mmap(mmap) => {
+                let start = offset as usize;
+                let end = start + buf.len();
+                if end > mmap.len() {
+                    return false;
+                }
+                buf.copy_from_slice(&mmap[start..end]);
+                true
+            }
+            #[cfg(unix)]
+            Self::Pread { file, file_len } => {
+                if offset + buf.len() as u64 > *file_len {
+                    return false;
+                }
+                use std::os::unix::fs::FileExt;
+                file.read_exact_at(buf, offset).is_ok()
+            }
+        }
+    }
+}
+
 struct SparseArrayIndex {
-    /// Byte offset into the values mmap where each chunk starts.
+    /// Byte offset into the values file where each chunk starts.
     offsets: Vec<u64>,
     /// Leading empty slots skipped per chunk.
     start_pad: Vec<u8>,
-    /// Packed (lat: i32, lon: i32) values, file-backed read-only mmap.
-    mmap: memmap2::Mmap,
+    /// Storage backend for value reads.
+    reader: SparseValueReader,
+    /// Backing file (kept open for lifetime).
     _file: std::fs::File,
 }
 
 impl SparseArrayIndex {
-    /// Look up a node's coordinates. Returns `None` for negative IDs,
-    /// chunks not present, or sentinel entries.
-    /// Look up coordinates from the mmap at a computed byte offset.
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn read_at(&self, base: u64, slot: u64) -> Option<(i32, i32)> {
-        let byte_offset = (base + slot * ENTRY_SIZE as u64) as usize;
-        let end = byte_offset + ENTRY_SIZE;
-        if end > self.mmap.len() {
-            return None;
-        }
-        let bytes = &self.mmap[byte_offset..end];
-        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if lat == 0 && lon == 0 {
-            return None; // sentinel
-        }
-        Some((lat, lon))
-    }
-
     /// Resolve a chunk base and slot for a node ID. Returns `None` if the
     /// node cannot be in this index.
     #[allow(clippy::cast_sign_loss)]
@@ -312,34 +332,32 @@ impl SparseArrayIndex {
     #[allow(clippy::cast_sign_loss)]
     fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         let (base, slot) = self.resolve(node_id)?;
-        self.read_at(base, slot)
+        let byte_offset = base + slot * ENTRY_SIZE as u64;
+        let mut buf = [0u8; ENTRY_SIZE];
+        if !self.reader.read_at(&mut buf, byte_offset) {
+            return None;
+        }
+        decode_entry(&buf)
     }
 
-    /// Compute the byte offset into the values mmap for a node ID.
+    /// Compute the byte offset into the values file for a node ID.
     /// Used by batched sorted lookups to sort by file position.
     #[allow(clippy::cast_sign_loss)]
     fn byte_offset(&self, node_id: i64) -> Option<u64> {
         let (base, slot) = self.resolve(node_id)?;
         Some(base + slot * ENTRY_SIZE as u64)
     }
+}
 
-    /// Read a `(lat, lon)` pair at a known valid byte offset.
-    /// The offset must have been produced by `byte_offset()`.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get_at_offset(&self, byte_offset: u64) -> Option<(i32, i32)> {
-        let start = byte_offset as usize;
-        let end = start + ENTRY_SIZE;
-        if end > self.mmap.len() {
-            return None;
-        }
-        let bytes = &self.mmap[start..end];
-        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if lat == 0 && lon == 0 {
-            return None;
-        }
-        Some((lat, lon))
+/// Decode a single `(lat, lon)` entry from an 8-byte buffer.
+/// Returns `None` for sentinel `(0, 0)` values.
+fn decode_entry(bytes: &[u8]) -> Option<(i32, i32)> {
+    let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+    if lat == 0 && lon == 0 {
+        return None;
     }
+    Some((lat, lon))
 }
 
 /// Build a sparse array index from node blobs.
@@ -464,16 +482,32 @@ fn build_node_index_sparse(
     writer.flush()?;
     drop(writer);
 
-    // Re-map as read-only for the lookup phase.
-    let mmap = unsafe {
-        memmap2::Mmap::map(&file)
-            .map_err(|e| format!("failed to mmap sparse index values: {e}"))?
+    let file_len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat sparse index file: {e}"))?
+        .len();
+
+    // Use pread on unix, mmap as fallback.
+    #[cfg(unix)]
+    let reader = SparseValueReader::Pread {
+        file: file
+            .try_clone()
+            .map_err(|e| format!("failed to clone sparse index file: {e}"))?,
+        file_len,
+    };
+    #[cfg(not(unix))]
+    let reader = {
+        let mmap = unsafe {
+            memmap2::Mmap::map(&file)
+                .map_err(|e| format!("failed to mmap sparse index values: {e}"))?
+        };
+        SparseValueReader::Mmap(mmap)
     };
 
     Ok(SparseArrayIndex {
         offsets,
         start_pad,
-        mmap,
+        reader,
         _file: file,
     })
 }
@@ -937,6 +971,7 @@ fn write_output_decode_all(
     )?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut resolve_scratch: Vec<u8> = Vec::new();
 
     for block in reader.into_blocks_pipelined() {
         batch.push(block?);
@@ -948,6 +983,7 @@ fn write_output_decode_all(
                 index,
                 keep_untagged_nodes,
                 relation_member_node_ids,
+                &mut resolve_scratch,
             )?;
             merge_stats(&mut stats, &batch_stats);
             batch.clear();
@@ -961,6 +997,7 @@ fn write_output_decode_all(
             index,
             keep_untagged_nodes,
             relation_member_node_ids,
+            &mut resolve_scratch,
         )?;
         merge_stats(&mut stats, &batch_stats);
     }
@@ -1011,25 +1048,33 @@ impl LocationLookup<'_> {
 
 /// Entry for sorting lookups by file offset.
 struct LookupEntry {
-    /// Byte offset into the sparse index values mmap.
-    mmap_offset: u64,
+    /// Byte offset into the sparse index values file.
+    file_offset: u64,
     /// The node ID (used as key in the result map).
     node_id: i64,
 }
 
+/// Maximum span (in bytes) to coalesce into a single pread call.
+/// 128 KB is ~16K entries. Entries within this window of the run start
+/// are merged into one read, even if there are gaps between them.
+const PREAD_RUN_MAX: u64 = 128 * 1024;
+
 /// Collect all unique way node refs from a batch of blocks, resolve their
-/// coordinates via sorted sequential access through the sparse index mmap,
-/// and return a map of node_id → (lat, lon).
+/// coordinates via coalesced reads through the sparse index, and return a
+/// map of node_id → (lat, lon).
 ///
-/// This converts random I/O (one page fault per lookup) into sequential I/O
-/// (one pass through the mmap in file order). At planet scale, a batch of
-/// ~128 way blobs contains ~100K unique node refs. Sorting these by mmap
-/// offset and scanning sequentially touches each page at most once.
+/// Entries are sorted by file offset, then offsets within `PREAD_RUN_MAX`
+/// of each other are coalesced into a single read. The entire span is
+/// read into a scratch buffer, then individual entries are decoded by
+/// offset within the buffer. This converts many small random reads into
+/// fewer larger sequential reads.
+#[allow(clippy::cast_possible_truncation)]
 fn resolve_batch_locations(
     blocks: &[PrimitiveBlock],
     sparse: &SparseArrayIndex,
+    scratch: &mut Vec<u8>,
 ) -> FxHashMap<i64, (i32, i32)> {
-    // Collect all unique node refs with their mmap offsets.
+    // Collect all unique node refs with their file offsets.
     let mut entries: Vec<LookupEntry> = Vec::new();
     let mut seen = FxHashMap::<i64, ()>::default();
 
@@ -1042,22 +1087,52 @@ fn resolve_batch_locations(
                     }
                     seen.insert(node_id, ());
                     if let Some(offset) = sparse.byte_offset(node_id) {
-                        entries.push(LookupEntry { mmap_offset: offset, node_id });
+                        entries.push(LookupEntry { file_offset: offset, node_id });
                     }
                 }
             }
         }
     }
 
-    // Sort by mmap offset → sequential access pattern.
-    entries.sort_unstable_by_key(|e| e.mmap_offset);
+    // Sort by file offset → coalesced sequential reads.
+    entries.sort_unstable_by_key(|e| e.file_offset);
 
-    // Resolve coordinates via sequential scan.
+    // Resolve coordinates via coalesced reads.
     let mut result = FxHashMap::with_capacity_and_hasher(entries.len(), Default::default());
-    for entry in &entries {
-        if let Some(coords) = sparse.get_at_offset(entry.mmap_offset) {
-            result.insert(entry.node_id, coords);
+
+    let mut i = 0;
+    while i < entries.len() {
+        // Start a new run from entries[i].
+        let run_start = entries[i].file_offset;
+        let mut run_end = run_start + ENTRY_SIZE as u64;
+        let mut j = i + 1;
+
+        // Extend run: merge entries whose end falls within PREAD_RUN_MAX
+        // of the run start. This coalesces across gaps (sparse entries
+        // on different pages that are still close enough to read together).
+        while j < entries.len() {
+            let entry_end = entries[j].file_offset + ENTRY_SIZE as u64;
+            if entry_end - run_start > PREAD_RUN_MAX {
+                break;
+            }
+            run_end = entry_end;
+            j += 1;
         }
+
+        // Read the entire span in one call.
+        let run_len = (run_end - run_start) as usize;
+        scratch.resize(run_len, 0);
+        if sparse.reader.read_at(&mut scratch[..run_len], run_start) {
+            // Decode only the entries we need from the buffer.
+            for entry in &entries[i..j] {
+                let buf_offset = (entry.file_offset - run_start) as usize;
+                if let Some(coords) = decode_entry(&scratch[buf_offset..buf_offset + ENTRY_SIZE]) {
+                    result.insert(entry.node_id, coords);
+                }
+            }
+        }
+
+        i = j;
     }
 
     result
@@ -1176,13 +1251,14 @@ fn process_batch(
     index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
+    resolve_scratch: &mut Vec<u8>,
 ) -> Result<Stats> {
     // For sparse index: resolve all way node coordinates upfront.
     let resolved_map;
     let lookup = match index {
         NodeIndex::Dense(_) => LocationLookup::Index(index),
         NodeIndex::Sparse(sparse) => {
-            resolved_map = resolve_batch_locations(batch, sparse);
+            resolved_map = resolve_batch_locations(batch, sparse, resolve_scratch);
             LocationLookup::Resolved(&resolved_map)
         }
     };
@@ -1346,6 +1422,7 @@ fn write_output_passthrough(
     // Coalescing buffer for non-copy-range passthrough (without linux-direct-io,
     // or when copy_file_range is incompatible with O_DIRECT output).
     let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
+    let mut resolve_scratch: Vec<u8> = Vec::new();
 
     while let Some(header) = read_blob_header(&mut reader, &mut file_offset)? {
         if header.blob_type != BlobKind::OsmData {
@@ -1372,6 +1449,7 @@ fn write_output_passthrough(
                     node_index,
                     keep_untagged_nodes,
                     relation_member_node_ids,
+                    &mut resolve_scratch,
                 )?;
                 merge_stats(&mut stats, &batch_stats);
                 batch.clear();
@@ -1441,6 +1519,7 @@ fn write_output_passthrough(
                 node_index,
                 keep_untagged_nodes,
                 relation_member_node_ids,
+                &mut resolve_scratch,
             )?;
             merge_stats(&mut stats, &batch_stats);
             batch.clear();
@@ -1456,6 +1535,7 @@ fn write_output_passthrough(
             node_index,
             keep_untagged_nodes,
             relation_member_node_ids,
+            &mut resolve_scratch,
         )?;
         merge_stats(&mut stats, &batch_stats);
     }
@@ -1498,6 +1578,7 @@ fn process_slot_batch(
     node_index: &NodeIndex,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
+    resolve_scratch: &mut Vec<u8>,
 ) -> Result<Stats> {
     // For sparse: decompress first, resolve locations, then process.
     // For dense: decompress + process in one pass (original path).
@@ -1513,7 +1594,7 @@ fn process_slot_batch(
         NodeIndex::Sparse(sparse) => {
             decoded_blocks = decompress_slot_batch(batch)
                 .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-            resolved_map = resolve_batch_locations(&decoded_blocks, sparse);
+            resolved_map = resolve_batch_locations(&decoded_blocks, sparse, resolve_scratch);
             (&decoded_blocks, LocationLookup::Resolved(&resolved_map))
         }
     };

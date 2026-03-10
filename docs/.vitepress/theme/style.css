@@ -82,6 +82,7 @@ html {
 
 body {
   font-size: inherit;
+  overflow-x: hidden;
 }
 
 /* ── Wide-screen layout ────────────────────────────────────────────────── */

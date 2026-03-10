@@ -347,7 +347,7 @@ impl SparseArrayIndex {
 /// Writes values sequentially to a temp file, tracking chunk boundaries.
 /// Nodes must arrive in ascending ID order (guaranteed by sorted PBFs).
 /// Only nodes present in `referenced` are stored.
-#[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
 fn build_node_index_sparse(
     input: &Path,
     direct_io: bool,
@@ -376,6 +376,7 @@ fn build_node_index_sparse(
     let mut current_chunk: usize = usize::MAX; // no chunk yet
     let mut last_offset_in_chunk: u8 = 0;
     let mut byte_pos: u64 = 0;
+    let mut prev_id: i64 = -1;
 
     // Reserve space for chunk arrays.
     offsets.reserve(initial_chunks);
@@ -400,6 +401,15 @@ fn build_node_index_sparse(
             if id < 0 {
                 continue;
             }
+            if id <= prev_id {
+                return Err(format!(
+                    "sparse index requires strictly increasing node IDs, \
+                     but node {id} follows node {prev_id} (use --index-type dense \
+                     for unsorted input)"
+                )
+                .into());
+            }
+            prev_id = id;
             let uid = id as u64;
             let chunk_id = (uid >> CHUNK_SHIFT) as usize;
             let offset_in_chunk = (uid & CHUNK_MASK) as u8;

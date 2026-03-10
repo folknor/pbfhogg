@@ -61,83 +61,17 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## ALTW memory optimization
 
-### Current implementation
+See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 
-`DenseMmapIndex` is a direct-mapped array: `index[node_id] = (lat, lon)`.
-Node ID is the array index, so lookup is O(1) — but the array must span the
-full node ID range, not just the number of nodes. OSM node IDs go up to ~13B,
-so the index is 16B slots × 8 bytes = 128 GB virtual address space. Only
-touched pages consume physical memory (~80 GB for planet's 10.4B nodes).
-Gaps between IDs waste address space but not much physical memory.
+**Status**: Sparse index (Planetiler-inspired) implemented (`--index-type sparse`)
+but **2.5x slower than dense at Europe scale** — the sorted batch access pattern
+doesn't help when the mmap working set exceeds RAM. Dense remains the faster
+option at all tested scales.
 
-This is the standard approach — osmium uses the same strategy (`dense_mmap_array`).
-It's the fastest possible access pattern when it fits in RAM.
-
-### The problem
-
-Planet ALTW takes 96m on plantasjen (30 GB RAM, 8 GB swap) — CPU mostly idle,
-bottlenecked on page faults in the dense mmap index. The kernel constantly
-evicts and re-faults pages across the 80 GB working set. `vmstat` would show
-heavy `si`/`so` (swap in/out) activity. Production host (64 GB) should be
-fine but still tight — the working set barely fits.
-
-Planet stats: 10.4B nodes read, 285M written (97% dropped as untagged), 1.17B
-ways processed, 14.1M relations, 452 passthrough blobs, 50K decoded, 0 missing
-locations. Output 88.4 GB (+0.7% from embedded way-node coordinates).
-
-### Pass 0: referenced-nodes-only index (implemented)
-
-**Implemented** (uncommitted, post `3677069`): `collect_way_referenced_node_ids`
-scans way blobs to build an `IdSetDense` bitset (~1.6 GB for planet's ~2B
-unique way node refs). `build_node_index_dense` then only inserts nodes
-present in the bitset. Reduces touched mmap pages from ~80 GB to ~16 GB at
-planet scale.
-
-**Result on plantasjen (30 GB RAM + 8 GB swap):** No improvement at Europe
-scale — 2631s vs 2565s baseline (+2.6%, noise). The reduced 16 GB mmap
-working set + 33 GB input file page cache still exceeds 30 GB physical
-memory, so swap thrashing dominates regardless. The optimization should help
-on 64 GB hosts where 16 GB fits in RAM, and is strictly better than before
-(fewer pages touched = less swap pressure when memory is merely tight rather
-than catastrophically insufficient).
-
-**Denmark (465 MB):** 6.4s, fits entirely in RAM, no measurable difference.
-
-### Sparse index: Planetiler-inspired chunk-indexed array (implemented)
-
-**Implemented** (uncommitted, post pass 0): `--index-type sparse` uses a
-`SparseArrayIndex` — chunk-indexed (chunk size 256) sparse array. RAM:
-`offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk:
-compact packed (lat, lon) values file via read-only mmap (~16 GB for planet).
-Way lookups are batched and sorted by file offset, converting random I/O
-into sequential scans via `FxHashMap` pre-resolution.
-
-**Denmark (465 MB):** dense 8.4s vs sparse 15.5s (+85%). Overhead is pure CPU
-(sorting, hashing) — no I/O pressure at this scale.
-
-**Planet-scale validation pending.** The sparse index should eliminate the page
-fault thrashing that makes dense take 96 minutes on plantasjen (30 GB RAM),
-since it uses ~540 MB RAM + sequential I/O instead of 16 GB random mmap access.
-
-### Remaining approaches (if sparse index isn't sufficient at planet scale)
-
-1. **On-disk sorted store** — Sort all nodes by ID into a temporary file on
-   nvme, then merge-join with way node references (also sorted by referenced
-   node ID). Memory = just I/O buffers. Slowest approach but constant memory
-   regardless of planet size.
-
-2. **Partitioned/chunked index** — Split the node ID range into chunks (e.g.
-   1M IDs each). Process the file in rounds, one chunk at a time — each round
-   only needs the chunk's memory. Trades many passes for arbitrarily low
-   memory. Similar to osmium's `flex_mem` strategy.
-
-### Quick wins to test first
-
-- [ ] **Planet-scale sparse index validation** — run `add-locations-to-ways
-  --index-type sparse` on planet (87 GB) on plantasjen (30 GB RAM + 8 GB swap).
-  Expected: eliminates page fault thrashing, completes in reasonable time.
-- [ ] **Test dense on 64 GB host** — the pass-0 optimization should eliminate swap
-  pressure entirely when 16 GB mmap + input page cache fits in physical memory.
+**Next steps**:
+- [ ] Test pread + fadvise (replace sparse mmap with explicit I/O + readahead hints)
+- [ ] Test dense on 64 GB host (may solve the problem without code changes)
+- [ ] If neither works, implement partitioned multi-pass
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 

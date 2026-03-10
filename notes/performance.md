@@ -142,16 +142,19 @@ well under an hour.
 `--direct-io` provides no benefit for ALTW — workload is compute/memory-bound,
 not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
-### Dense vs Sparse index (Denmark, 465 MB indexed, commit `b3a98b0`)
+### Dense vs Sparse index (commit `52d6273`, plantasjen)
 
-| Index type | Time | Notes |
-|------------|------|-------|
-| `dense` | **8.4s** | Direct mmap, all fits in RAM |
-| `sparse` | 15.5s (+85%) | Chunk-indexed + batched sorted lookups, CPU overhead |
+| Dataset | Dense | Sparse | Ratio |
+|---------|-------|--------|-------|
+| Denmark (465 MB) | **6.8s** | 14.1s | 2.1x |
+| Europe (33.6 GB) | **2,565s** (43m) | 6,453s (107m) | **2.5x** |
 
-Sparse overhead is pure CPU (sorting, hashing) — no I/O pressure at Denmark scale.
-At planet scale on memory-constrained hosts (30 GB RAM + 8 GB swap), sparse should
-eliminate the page fault thrashing that makes dense take 96 minutes.
+Sparse is slower than dense at all tested scales. At Denmark scale the overhead
+is pure CPU (sorting, hashing). At Europe scale the overhead ratio *increases*
+(2.5x vs 2.1x) — the 16 GB on-disk values mmap thrashes just like the dense
+mmap, but with additional sort+hash CPU cost on top.
+
+See [altw-memory.md](altw-memory.md) for full analysis and next steps.
 
 ## CLI commands
 

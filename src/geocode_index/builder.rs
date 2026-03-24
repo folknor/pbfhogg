@@ -713,7 +713,7 @@ fn cover_segment(
     // At level 14 (~620m), step ~250m. Use half the cell edge as step size.
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
-    let seg_len_deg = ((dlat as f64 * 1e-7).powi(2) + (dlon as f64 * 1e-7).powi(2)).sqrt();
+    let seg_len_deg = ((dlat * 1e-7).powi(2) + (dlon * 1e-7).powi(2)).sqrt();
 
     // Approximate cell edge in degrees: ~180 / 2^(level/2) is a rough heuristic
     // More precise: level 17 ≈ 0.0007°, level 14 ≈ 0.006°, level 10 ≈ 0.01°
@@ -869,6 +869,7 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
 }
 
 /// Parse polygon vertices (with sentinel separators) into exterior + hole rings as f64.
+#[allow(clippy::type_complexity)]
 fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
     let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
     let mut current: Vec<(f64, f64)> = Vec::new();

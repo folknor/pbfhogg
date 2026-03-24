@@ -528,6 +528,34 @@ enum Command {
         #[arg(long, default_value = "buffered")]
         io_mode: String,
     },
+    /// Build a reverse geocoding index from a PBF file
+    BuildGeocodeIndex {
+        /// Input PBF file
+        file: PathBuf,
+        /// Output directory for index files
+        #[arg(long)]
+        output_dir: PathBuf,
+        /// S2 cell level for streets/addresses
+        #[arg(long, default_value = "17")]
+        street_level: u8,
+        /// Fallback cell level for rural areas
+        #[arg(long, default_value = "14")]
+        coarse_level: u8,
+        /// S2 cell level for admin boundaries
+        #[arg(long, default_value = "10")]
+        admin_level: u8,
+        /// Douglas-Peucker vertex cap per admin polygon
+        #[arg(long, default_value = "500")]
+        max_admin_vertices: u16,
+        /// Fine-level max search distance in meters
+        #[arg(long, default_value = "75")]
+        search_radius: f32,
+        /// Coarse-level max search distance in meters
+        #[arg(long, default_value = "1000")]
+        coarse_search_radius: f32,
+        #[command(flatten)]
+        force: ForceArg,
+    },
 }
 
 
@@ -1063,6 +1091,27 @@ fn main() {
             quiet,
             io.direct_io,
         ),
+        Command::BuildGeocodeIndex {
+            file,
+            output_dir,
+            street_level,
+            coarse_level,
+            admin_level,
+            max_admin_vertices,
+            search_radius,
+            coarse_search_radius,
+            force,
+        } => run_build_geocode_index(
+            &file,
+            &output_dir,
+            street_level,
+            coarse_level,
+            admin_level,
+            max_admin_vertices,
+            search_radius,
+            coarse_search_radius,
+            force.force,
+        ),
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
         Command::BenchWrite {
             file,
@@ -1082,6 +1131,38 @@ fn main() {
         eprintln!("Error: {e}");
         process::exit(1);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_build_geocode_index(
+    file: &std::path::Path,
+    output_dir: &std::path::Path,
+    street_level: u8,
+    coarse_level: u8,
+    admin_level: u8,
+    max_admin_vertices: u16,
+    search_radius: f32,
+    coarse_search_radius: f32,
+    force: bool,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let config = pbfhogg::geocode_index::builder::BuildConfig {
+        input_path: file.to_path_buf(),
+        output_dir: output_dir.to_path_buf(),
+        force,
+        street_level,
+        coarse_level,
+        admin_level,
+        max_admin_vertices,
+        fine_search_radius_m: search_radius,
+        coarse_search_radius_m: coarse_search_radius,
+    };
+    let stats = pbfhogg::geocode_index::builder::build_geocode_index(&config)?;
+    eprintln!(
+        "Index built: {} addr, {} streets, {} interp, {} admin, {} fine cells, {} coarse cells, {} admin cells",
+        stats.addr_points, stats.street_ways, stats.interp_ways, stats.admin_polygons,
+        stats.fine_cells, stats.coarse_cells, stats.admin_cells,
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]

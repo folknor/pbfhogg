@@ -170,6 +170,18 @@ struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 #[allow(clippy::too_many_lines)]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
+
+    // Guard against silently overwriting an existing index
+    let header_path = config.output_dir.join(FILE_HEADER);
+    if header_path.exists() && !config.force {
+        return Err(format!(
+            "output directory {} already contains a geocode index. \
+             Use --force to overwrite.",
+            config.output_dir.display()
+        )
+        .into());
+    }
+
     std::fs::create_dir_all(&config.output_dir)?;
 
     // Validate input

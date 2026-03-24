@@ -316,10 +316,10 @@ impl AdminCell {
 }
 
 // ---------------------------------------------------------------------------
-// admin_polygons.bin (20 bytes per record)
+// admin_polygons.bin (22 bytes per record)
 // ---------------------------------------------------------------------------
 
-pub const ADMIN_POLYGON_SIZE: usize = 20;
+pub const ADMIN_POLYGON_SIZE: usize = 22;
 
 #[derive(Debug, Clone, Copy)]
 pub struct AdminPolygon {
@@ -329,8 +329,10 @@ pub struct AdminPolygon {
     pub vertex_offset: u32,
     pub vertex_count: u32,
     pub name_offset: u32,
-    /// ISO 3166-1 alpha2, packed: `(c0 << 8) | c1`. 0 if not admin_level=2.
-    pub country_code: u16,
+    /// String offset for ISO 3166-1 alpha2 country code (0 = none).
+    /// Only populated for admin_level=2 boundaries. The builder interns
+    /// the 2-char code (e.g., "DK") into the string pool.
+    pub country_code_offset: u32,
     /// Admin level 2–11.
     pub admin_level: u8,
 }
@@ -342,9 +344,9 @@ impl AdminPolygon {
         buf[4..8].copy_from_slice(&self.vertex_offset.to_le_bytes());
         buf[8..12].copy_from_slice(&self.vertex_count.to_le_bytes());
         buf[12..16].copy_from_slice(&self.name_offset.to_le_bytes());
-        buf[16..18].copy_from_slice(&self.country_code.to_le_bytes());
-        buf[18] = self.admin_level;
-        // buf[19] reserved
+        buf[16..20].copy_from_slice(&self.country_code_offset.to_le_bytes());
+        buf[20] = self.admin_level;
+        // buf[21] reserved
         buf
     }
 
@@ -354,8 +356,8 @@ impl AdminPolygon {
             vertex_offset: u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]),
             vertex_count: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
             name_offset: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
-            country_code: u16::from_le_bytes([buf[16], buf[17]]),
-            admin_level: buf[18],
+            country_code_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            admin_level: buf[20],
         }
     }
 }
@@ -595,16 +597,17 @@ mod tests {
             vertex_offset: 8000,
             vertex_count: 500,
             name_offset: 400,
-            country_code: (b'D' as u16) << 8 | b'K' as u16,
+            country_code_offset: 42, // string pool offset for "DK"
             admin_level: 2,
         };
         let bytes = poly.to_bytes();
+        assert_eq!(bytes.len(), ADMIN_POLYGON_SIZE);
         let parsed = AdminPolygon::from_bytes(&bytes);
         assert!((parsed.area - 123.456).abs() < 0.001);
         assert_eq!(parsed.vertex_offset, 8000);
         assert_eq!(parsed.vertex_count, 500);
         assert_eq!(parsed.name_offset, 400);
-        assert_eq!(parsed.country_code, (b'D' as u16) << 8 | b'K' as u16);
+        assert_eq!(parsed.country_code_offset, 42);
         assert_eq!(parsed.admin_level, 2);
     }
 

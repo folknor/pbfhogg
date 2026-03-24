@@ -27,10 +27,10 @@ pub struct ReverseResult<'a> {
     pub address: Option<AddressMatch<'a>>,
     pub street: Option<StreetMatch<'a>>,
     pub interpolation: Option<InterpolationMatch<'a>>,
+    /// One entry per admin level (2–11), smallest-area polygon at each level.
     pub admin: Vec<AdminMatch<'a>>,
 }
 
-/// A matched address point.
 #[derive(Debug)]
 pub struct AddressMatch<'a> {
     pub lat_e7: i32,
@@ -41,7 +41,6 @@ pub struct AddressMatch<'a> {
     pub distance_m: f64,
 }
 
-/// A matched street segment.
 #[derive(Debug)]
 pub struct StreetMatch<'a> {
     pub name: &'a str,
@@ -50,7 +49,6 @@ pub struct StreetMatch<'a> {
     pub distance_m: f64,
 }
 
-/// A fully resolved interpolation match.
 #[derive(Debug)]
 pub struct InterpolationMatch<'a> {
     pub street: &'a str,
@@ -58,11 +56,11 @@ pub struct InterpolationMatch<'a> {
     pub distance_m: f64,
 }
 
-/// An admin boundary match.
 #[derive(Debug)]
 pub struct AdminMatch<'a> {
     pub admin_level: u8,
     pub name: &'a str,
+    /// ISO 3166-1 alpha2, only populated for admin_level=2.
     pub country_code: Option<&'a str>,
 }
 
@@ -72,6 +70,7 @@ pub struct Candidates<'a> {
     pub addresses: Vec<AddressMatch<'a>>,
     pub streets: Vec<StreetMatch<'a>>,
     pub interpolations: Vec<InterpolationCandidate<'a>>,
+    /// All admin polygons containing the query point (not collapsed per level).
     pub admin: Vec<AdminMatch<'a>>,
 }
 
@@ -86,20 +85,69 @@ pub struct InterpolationCandidate<'a> {
     pub distance_m: f64,
 }
 
+impl<'a> Candidates<'a> {
+    /// Apply default ranking: nearest of each type, smallest admin per level,
+    /// postcode fallback from nearest address if no postal boundary.
+    pub fn into_result(self, reader: &'a Reader) -> ReverseResult<'a> {
+        let address = self
+            .addresses
+            .into_iter()
+            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+
+        let street = self
+            .streets
+            .into_iter()
+            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal));
+
+        let interpolation = self
+            .interpolations
+            .iter()
+            .min_by(|a, b| a.distance_m.partial_cmp(&b.distance_m).unwrap_or(std::cmp::Ordering::Equal))
+            .and_then(|c| {
+                let hn = reader.interpolate(c)?;
+                Some(InterpolationMatch {
+                    street: c.street,
+                    house_number: hn,
+                    distance_m: c.distance_m,
+                })
+            });
+
+        // Collapse admin to smallest-area per level
+        let mut best_by_level: [Option<AdminMatch<'a>>; 12] = Default::default();
+        for m in self.admin {
+            let level = m.admin_level as usize;
+            if level < 12 {
+                // Keep (no area comparison possible at this level — admin matches
+                // already passed PIP, just keep first per level)
+                if best_by_level[level].is_none() {
+                    best_by_level[level] = Some(m);
+                }
+            }
+        }
+        let admin: Vec<_> = best_by_level.into_iter().flatten().collect();
+
+        ReverseResult {
+            address,
+            street,
+            interpolation,
+            admin,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reader
 // ---------------------------------------------------------------------------
 
 /// A memory-mapped reverse geocoding index reader.
 ///
-/// `Send + Sync` — all state is in read-only mmap'd files. Multiple threads
-/// can call `query()` or `candidates()` concurrently.
+/// `Send + Sync` — all fields are `Mmap` (which is `Send + Sync`) or plain
+/// values.
 pub struct Reader {
     header: Header,
     fine_max_dist_sq: f64,
     coarse_max_dist_sq: f64,
 
-    // Mmap'd files
     geo_cells: Mmap,
     street_entries: Mmap,
     addr_entries: Mmap,
@@ -119,10 +167,6 @@ pub struct Reader {
     admin_vertices: Mmap,
     strings: Mmap,
 }
-
-// Safety: all fields are read-only mmap'd data or plain values.
-unsafe impl Send for Reader {}
-unsafe impl Sync for Reader {}
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -179,15 +223,14 @@ impl Reader {
 
     // -- Public query API ----------------------------------------------------
 
-    /// High-level query: returns ranked result (nearest of each type).
-    /// Allocation-free internally — tracks only the nearest candidate during
-    /// iteration.
+    /// High-level query: nearest of each type, allocation-free on the hot path.
+    /// Internally iterates mmap'd entry lists without materializing Vecs.
     pub fn query(&self, lat: f64, lon: f64) -> ReverseResult<'_> {
         let ctx = QueryContext::new(lat, lon);
+        let mut best = BestTracker::new();
 
         // Fine-level search
-        let mut best = BestTracker::new();
-        self.search_street_level(
+        self.search_street_level_best(
             &ctx,
             &self.geo_cells,
             &self.street_entries,
@@ -198,9 +241,9 @@ impl Reader {
             &mut best,
         );
 
-        // Coarse fallback if no street or address found
+        // Coarse fallback
         if best.street.is_none() && best.addr.is_none() {
-            self.search_street_level(
+            self.search_street_level_best(
                 &ctx,
                 &self.coarse_geo_cells,
                 &self.coarse_street_entries,
@@ -212,24 +255,19 @@ impl Reader {
             );
         }
 
-        // Admin lookup
-        let admin = self.search_admin(&ctx);
+        // Admin lookup (collapsed to one per level)
+        let admin = self.search_admin_ranked(&ctx);
 
-        // Assemble result
+        // Assemble
         let address = best.addr.map(|(idx, dist_sq)| {
             let pt = self.read_addr_point(idx);
-            let dist_m = radians_sq_to_meters(dist_sq);
             AddressMatch {
                 lat_e7: pt.lat_e7,
                 lon_e7: pt.lon_e7,
                 house_number: self.read_string(pt.housenumber_offset),
                 street: self.read_string(pt.street_offset),
-                postcode: if pt.postcode_offset == 0 {
-                    None
-                } else {
-                    Some(self.read_string(pt.postcode_offset))
-                },
-                distance_m: dist_m,
+                postcode: nonzero_string(self, pt.postcode_offset),
+                distance_m: radians_sq_to_meters(dist_sq),
             }
         });
 
@@ -257,12 +295,11 @@ impl Reader {
         }
     }
 
-    /// Low-level query: returns all candidates within radius, unranked.
+    /// Low-level query: all candidates within radius, unranked.
     pub fn candidates(&self, lat: f64, lon: f64) -> Candidates<'_> {
         let ctx = QueryContext::new(lat, lon);
-
-        // Fine-level
         let mut cands = CandidateCollector::new();
+
         self.collect_candidates(
             &ctx,
             &self.geo_cells,
@@ -274,7 +311,6 @@ impl Reader {
             &mut cands,
         );
 
-        // Coarse fallback if no street or address
         if cands.streets.is_empty() && cands.addresses.is_empty() {
             self.collect_candidates(
                 &ctx,
@@ -288,7 +324,8 @@ impl Reader {
             );
         }
 
-        let admin = self.search_admin(&ctx);
+        // Admin: return ALL containing polygons, not collapsed
+        let admin = self.search_admin_all(&ctx);
 
         Candidates {
             addresses: cands.addresses,
@@ -304,24 +341,22 @@ impl Reader {
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }
-        let total_len = self.way_total_length(&self.interp_nodes, &iw.node_offset, iw.node_count);
+        let total_len = self.way_length(&self.interp_nodes, iw.node_offset, iw.node_count);
         if total_len < 1e-15 {
             return None;
         }
         let acc_len = self.accumulated_length(
             &self.interp_nodes,
-            &iw.node_offset,
+            iw.node_offset,
             candidate.segment_index,
             candidate.snap_lat_e7,
             candidate.snap_lon_e7,
         );
         let t = acc_len / total_len;
-        let start = iw.start_number;
-        let end = iw.end_number;
-        let diff = end as f64 - start as f64;
+        let diff = iw.end_number as f64 - iw.start_number as f64;
         let number = match iw.interpolation_type {
-            0 => start as f64 + (t * diff).round(), // all
-            _ => start as f64 + 2.0 * ((t * diff) / 2.0).round(), // even or odd
+            0 => iw.start_number as f64 + (t * diff).round(),
+            _ => iw.start_number as f64 + 2.0 * ((t * diff) / 2.0).round(),
         };
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         Some(number.max(0.0) as u32)
@@ -351,10 +386,9 @@ impl Reader {
 }
 
 // ---------------------------------------------------------------------------
-// Internal query helpers
+// Internal types
 // ---------------------------------------------------------------------------
 
-/// Precomputed values for a query point.
 struct QueryContext {
     lat: f64,
     lon: f64,
@@ -366,35 +400,29 @@ struct QueryContext {
 impl QueryContext {
     fn new(lat: f64, lon: f64) -> Self {
         let lat_rad = lat.to_radians();
-        let lon_rad = lon.to_radians();
         Self {
             lat,
             lon,
             lat_rad,
-            lon_rad,
+            lon_rad: lon.to_radians(),
             cos_lat: lat_rad.cos(),
         }
     }
 }
 
-/// Tracks the nearest candidate of each type for `query()`.
+/// Tracks nearest candidate of each type for `query()` (allocation-free).
 struct BestTracker {
-    addr: Option<(u32, f64)>,             // (index, dist_sq)
-    street: Option<(u32, i32, i32, f64)>, // (way_idx, snap_lat, snap_lon, dist_sq)
-    interp: Option<(u32, u16, i32, i32, f64)>, // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
+    addr: Option<(u32, f64)>,                   // (index, dist_sq)
+    street: Option<(u32, i32, i32, f64)>,       // (way_idx, snap_lat, snap_lon, dist_sq)
+    interp: Option<(u32, u16, i32, i32, f64)>,  // (way_idx, seg_idx, snap_lat, snap_lon, dist_sq)
 }
 
 impl BestTracker {
     fn new() -> Self {
-        Self {
-            addr: None,
-            street: None,
-            interp: None,
-        }
+        Self { addr: None, street: None, interp: None }
     }
 }
 
-/// Collects all candidates for `candidates()`.
 struct CandidateCollector<'a> {
     addresses: Vec<AddressMatch<'a>>,
     streets: Vec<StreetMatch<'a>>,
@@ -411,10 +439,166 @@ impl<'a> CandidateCollector<'a> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Zero-allocation entry iterators over mmap'd bytes
+// ---------------------------------------------------------------------------
+
+/// Iterator over u32 entries (addr_entries, interp_entries with u32 offset).
+struct U32EntryIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: u16,
+}
+
+impl<'a> U32EntryIter<'a> {
+    fn new(mmap: &'a [u8], offset: u32) -> Self {
+        let off = offset as usize;
+        if off + 2 > mmap.len() {
+            return Self { data: mmap, pos: 0, remaining: 0 };
+        }
+        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
+        Self { data: mmap, pos: off + 2, remaining: count }
+    }
+}
+
+impl Iterator for U32EntryIter<'_> {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<u32> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let end = self.pos + 4;
+        if end > self.data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let val = u32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos = end;
+        self.remaining -= 1;
+        Some(val)
+    }
+}
+
+/// Iterator over segment ref entries (6 bytes each).
+struct SegmentEntryIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: u16,
+}
+
+impl<'a> SegmentEntryIter<'a> {
+    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
+    fn new(mmap: &'a [u8], offset: u64) -> Self {
+        let off = offset as usize;
+        if off + 2 > mmap.len() {
+            return Self { data: mmap, pos: 0, remaining: 0 };
+        }
+        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
+        Self { data: mmap, pos: off + 2, remaining: count }
+    }
+
+    fn from_u32(mmap: &'a [u8], offset: u32) -> Self {
+        Self::new(mmap, offset as u64)
+    }
+}
+
+impl Iterator for SegmentEntryIter<'_> {
+    type Item = SegmentRef;
+
+    fn next(&mut self) -> Option<SegmentRef> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let end = self.pos + SEGMENT_REF_SIZE;
+        if end > self.data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let rec: &[u8; SEGMENT_REF_SIZE] = self.data[self.pos..end].try_into().ok()?;
+        self.pos = end;
+        self.remaining -= 1;
+        Some(SegmentRef::from_bytes(rec))
+    }
+}
+
+/// Iterator over admin entries (u32 values with interior flag).
+struct AdminEntryIter<'a> {
+    data: &'a [u8],
+    pos: usize,
+    remaining: u16,
+}
+
+impl<'a> AdminEntryIter<'a> {
+    fn new(mmap: &'a [u8], offset: u32) -> Self {
+        let off = offset as usize;
+        if off + 2 > mmap.len() {
+            return Self { data: mmap, pos: 0, remaining: 0 };
+        }
+        let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]);
+        Self { data: mmap, pos: off + 2, remaining: count }
+    }
+}
+
+impl Iterator for AdminEntryIter<'_> {
+    type Item = (u32, bool); // (polygon_index, is_interior_hint)
+
+    fn next(&mut self) -> Option<(u32, bool)> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let end = self.pos + 4;
+        if end > self.data.len() {
+            self.remaining = 0;
+            return None;
+        }
+        let raw = u32::from_le_bytes([
+            self.data[self.pos],
+            self.data[self.pos + 1],
+            self.data[self.pos + 2],
+            self.data[self.pos + 3],
+        ]);
+        self.pos = end;
+        self.remaining -= 1;
+        Some((raw & INDEX_MASK, raw & INTERIOR_FLAG != 0))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S2 cell helpers (fixed-size array, no allocation)
+// ---------------------------------------------------------------------------
+
+/// Maximum cells in a neighborhood: 1 center + up to 8 neighbors.
+const MAX_NEIGHBORHOOD: usize = 9;
+
+/// Returns the cell + all neighbors at the given level as a fixed-size array.
+fn cell_neighborhood(lat: f64, lon: f64, level: u8) -> ([u64; MAX_NEIGHBORHOOD], usize) {
+    let ll = LatLng::from_degrees(lat, lon);
+    let cell = CellID::from(ll).parent(level as u64);
+    let neighbors = cell.all_neighbors(level as u64);
+    let mut cells = [0u64; MAX_NEIGHBORHOOD];
+    cells[0] = cell.0;
+    let count = 1 + neighbors.len().min(MAX_NEIGHBORHOOD - 1);
+    for (i, n) in neighbors.iter().enumerate().take(MAX_NEIGHBORHOOD - 1) {
+        cells[i + 1] = n.0;
+    }
+    (cells, count)
+}
+
+// ---------------------------------------------------------------------------
+// Search implementations
+// ---------------------------------------------------------------------------
+
 impl Reader {
-    /// Search a street-level cell index (fine or coarse) for the best matches.
+    /// Allocation-free search: iterates entry lists via mmap iterators,
+    /// tracks only the nearest candidate.
     #[allow(clippy::too_many_arguments)]
-    fn search_street_level(
+    fn search_street_level_best(
         &self,
         ctx: &QueryContext,
         geo_cells_mmap: &Mmap,
@@ -425,44 +609,63 @@ impl Reader {
         max_dist_sq: f64,
         best: &mut BestTracker,
     ) {
-        let cells = cell_neighborhood(ctx.lat, ctx.lon, level);
+        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, level);
         let cell_count = geo_cells_mmap.len() / GEO_CELL_SIZE;
 
-        for cell_id in &cells {
-            let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, *cell_id) else {
+        for &cell_id in &cells[..count] {
+            let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, cell_id) else {
                 continue;
             };
 
             // Address points
             if gc.addr_offset != format::NO_DATA_U32 {
-                self.score_addr_points(ctx, addr_entries_mmap, gc.addr_offset, max_dist_sq, best);
+                for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
+                    let pt = self.read_addr_point(idx);
+                    let dist_sq = geo::approx_distance_sq(
+                        ctx.lat_rad, ctx.lon_rad,
+                        geo::e7_to_rad(pt.lat_e7), geo::e7_to_rad(pt.lon_e7),
+                        ctx.cos_lat,
+                    );
+                    if dist_sq < max_dist_sq
+                        && (best.addr.is_none() || dist_sq < best.addr.map_or(f64::MAX, |b| b.1))
+                    {
+                        best.addr = Some((idx, dist_sq));
+                    }
+                }
             }
 
             // Street segments
             if gc.street_offset != format::NO_DATA_U64 {
-                self.score_street_segments(
-                    ctx,
-                    street_entries_mmap,
-                    gc.street_offset,
-                    max_dist_sq,
-                    best,
-                );
+                for seg_ref in SegmentEntryIter::new(street_entries_mmap, gc.street_offset) {
+                    let (snap_lat, snap_lon, dist_sq) =
+                        self.street_segment_distance(ctx, &seg_ref);
+                    if dist_sq < max_dist_sq
+                        && (best.street.is_none() || dist_sq < best.street.map_or(f64::MAX, |b| b.3))
+                    {
+                        best.street = Some((seg_ref.way_index, snap_lat, snap_lon, dist_sq));
+                    }
+                }
             }
 
             // Interpolation segments
             if gc.interp_offset != format::NO_DATA_U32 {
-                self.score_interp_segments(
-                    ctx,
-                    interp_entries_mmap,
-                    gc.interp_offset,
-                    max_dist_sq,
-                    best,
-                );
+                for seg_ref in SegmentEntryIter::from_u32(interp_entries_mmap, gc.interp_offset) {
+                    let (snap_lat, snap_lon, dist_sq) =
+                        self.interp_segment_distance(ctx, &seg_ref);
+                    if dist_sq < max_dist_sq
+                        && (best.interp.is_none() || dist_sq < best.interp.map_or(f64::MAX, |b| b.4))
+                    {
+                        best.interp = Some((
+                            seg_ref.way_index, seg_ref.segment_index,
+                            snap_lat, snap_lon, dist_sq,
+                        ));
+                    }
+                }
             }
         }
     }
 
-    /// Collect all candidates from a street-level cell index.
+    /// Collecting search: materializes all candidates within radius.
     #[allow(clippy::too_many_arguments)]
     fn collect_candidates<'a>(
         &'a self,
@@ -475,354 +678,202 @@ impl Reader {
         max_dist_sq: f64,
         cands: &mut CandidateCollector<'a>,
     ) {
-        let cells = cell_neighborhood(ctx.lat, ctx.lon, level);
+        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, level);
         let cell_count = geo_cells_mmap.len() / GEO_CELL_SIZE;
 
-        for cell_id in &cells {
-            let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, *cell_id) else {
+        for &cell_id in &cells[..count] {
+            let Some(gc) = binary_search_cells(geo_cells_mmap, cell_count, cell_id) else {
                 continue;
             };
 
             if gc.addr_offset != format::NO_DATA_U32 {
-                self.collect_addr_points(ctx, addr_entries_mmap, gc.addr_offset, max_dist_sq, cands);
-            }
-            if gc.street_offset != format::NO_DATA_U64 {
-                self.collect_street_segments(
-                    ctx,
-                    street_entries_mmap,
-                    gc.street_offset,
-                    max_dist_sq,
-                    cands,
-                );
-            }
-            if gc.interp_offset != format::NO_DATA_U32 {
-                self.collect_interp_segments(
-                    ctx,
-                    interp_entries_mmap,
-                    gc.interp_offset,
-                    max_dist_sq,
-                    cands,
-                );
-            }
-        }
-    }
-
-    // -- Address scoring -----------------------------------------------------
-
-    fn score_addr_points(
-        &self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u32,
-        max_dist_sq: f64,
-        best: &mut BestTracker,
-    ) {
-        for idx in read_u32_entries(entries_mmap, offset) {
-            let pt = self.read_addr_point(idx);
-            let dist_sq = geo::approx_distance_sq(
-                ctx.lat_rad,
-                ctx.lon_rad,
-                geo::e7_to_rad(pt.lat_e7),
-                geo::e7_to_rad(pt.lon_e7),
-                ctx.cos_lat,
-            );
-            if dist_sq < max_dist_sq
-                && (best.addr.is_none() || dist_sq < best.addr.map_or(f64::MAX, |b| b.1))
-            {
-                best.addr = Some((idx, dist_sq));
-            }
-        }
-    }
-
-    fn collect_addr_points<'a>(
-        &'a self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u32,
-        max_dist_sq: f64,
-        cands: &mut CandidateCollector<'a>,
-    ) {
-        for idx in read_u32_entries(entries_mmap, offset) {
-            let pt = self.read_addr_point(idx);
-            let dist_sq = geo::approx_distance_sq(
-                ctx.lat_rad,
-                ctx.lon_rad,
-                geo::e7_to_rad(pt.lat_e7),
-                geo::e7_to_rad(pt.lon_e7),
-                ctx.cos_lat,
-            );
-            if dist_sq < max_dist_sq {
-                cands.addresses.push(AddressMatch {
-                    lat_e7: pt.lat_e7,
-                    lon_e7: pt.lon_e7,
-                    house_number: self.read_string(pt.housenumber_offset),
-                    street: self.read_string(pt.street_offset),
-                    postcode: if pt.postcode_offset == 0 {
-                        None
-                    } else {
-                        Some(self.read_string(pt.postcode_offset))
-                    },
-                    distance_m: radians_sq_to_meters(dist_sq),
-                });
-            }
-        }
-    }
-
-    // -- Street segment scoring ----------------------------------------------
-
-    fn score_street_segments(
-        &self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u64,
-        max_dist_sq: f64,
-        best: &mut BestTracker,
-    ) {
-        for seg_ref in read_segment_entries(entries_mmap, offset) {
-            let (snap_lat, snap_lon, dist_sq) =
-                self.segment_distance(ctx, &self.street_nodes, &self.street_ways, &seg_ref);
-            if dist_sq < max_dist_sq
-                && (best.street.is_none() || dist_sq < best.street.map_or(f64::MAX, |b| b.3))
-            {
-                best.street = Some((seg_ref.way_index, snap_lat, snap_lon, dist_sq));
-            }
-        }
-    }
-
-    fn collect_street_segments<'a>(
-        &'a self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u64,
-        max_dist_sq: f64,
-        cands: &mut CandidateCollector<'a>,
-    ) {
-        for seg_ref in read_segment_entries(entries_mmap, offset) {
-            let (snap_lat, snap_lon, dist_sq) =
-                self.segment_distance(ctx, &self.street_nodes, &self.street_ways, &seg_ref);
-            if dist_sq < max_dist_sq {
-                let way = self.read_street_way(seg_ref.way_index);
-                cands.streets.push(StreetMatch {
-                    name: self.read_string(way.name_offset),
-                    snap_lat_e7: snap_lat,
-                    snap_lon_e7: snap_lon,
-                    distance_m: radians_sq_to_meters(dist_sq),
-                });
-            }
-        }
-    }
-
-    // -- Interpolation segment scoring ---------------------------------------
-
-    fn score_interp_segments(
-        &self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u32,
-        max_dist_sq: f64,
-        best: &mut BestTracker,
-    ) {
-        for seg_ref in read_segment_entries_u32(entries_mmap, offset) {
-            let (snap_lat, snap_lon, dist_sq) =
-                self.interp_segment_distance(ctx, &seg_ref);
-            if dist_sq < max_dist_sq
-                && (best.interp.is_none() || dist_sq < best.interp.map_or(f64::MAX, |b| b.4))
-            {
-                best.interp = Some((
-                    seg_ref.way_index,
-                    seg_ref.segment_index,
-                    snap_lat,
-                    snap_lon,
-                    dist_sq,
-                ));
-            }
-        }
-    }
-
-    fn collect_interp_segments<'a>(
-        &'a self,
-        ctx: &QueryContext,
-        entries_mmap: &Mmap,
-        offset: u32,
-        max_dist_sq: f64,
-        cands: &mut CandidateCollector<'a>,
-    ) {
-        for seg_ref in read_segment_entries_u32(entries_mmap, offset) {
-            let (snap_lat, snap_lon, dist_sq) =
-                self.interp_segment_distance(ctx, &seg_ref);
-            if dist_sq < max_dist_sq {
-                let iw = self.read_interp_way(seg_ref.way_index);
-                cands.interpolations.push(InterpolationCandidate {
-                    street: self.read_string(iw.street_offset),
-                    way_index: seg_ref.way_index,
-                    segment_index: seg_ref.segment_index,
-                    snap_lat_e7: snap_lat,
-                    snap_lon_e7: snap_lon,
-                    distance_m: radians_sq_to_meters(dist_sq),
-                });
-            }
-        }
-    }
-
-    // -- Segment distance helpers --------------------------------------------
-
-    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
-    fn segment_distance(
-        &self,
-        ctx: &QueryContext,
-        nodes_mmap: &Mmap,
-        ways_mmap: &Mmap,
-        seg_ref: &SegmentRef,
-    ) -> (i32, i32, f64) {
-        let way_offset = seg_ref.way_index as usize * STREET_WAY_SIZE;
-        let way = read_record::<STREET_WAY_SIZE>(ways_mmap, way_offset)
-            .map(StreetWay::from_bytes);
-        let Some(way) = way else {
-            return (0, 0, f64::MAX);
-        };
-        let node_byte_offset =
-            way.node_offset as usize + seg_ref.segment_index as usize * NODE_COORD_SIZE;
-        self.two_node_distance(ctx, nodes_mmap, node_byte_offset)
-    }
-
-    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
-    fn interp_segment_distance(
-        &self,
-        ctx: &QueryContext,
-        seg_ref: &SegmentRef,
-    ) -> (i32, i32, f64) {
-        let way_offset = seg_ref.way_index as usize * INTERP_WAY_SIZE;
-        let way = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, way_offset)
-            .map(InterpWay::from_bytes);
-        let Some(way) = way else {
-            return (0, 0, f64::MAX);
-        };
-        let node_byte_offset =
-            way.node_offset as usize + seg_ref.segment_index as usize * NODE_COORD_SIZE;
-        self.two_node_distance(ctx, &self.interp_nodes, node_byte_offset)
-    }
-
-    fn two_node_distance(
-        &self,
-        ctx: &QueryContext,
-        nodes_mmap: &Mmap,
-        byte_offset: usize,
-    ) -> (i32, i32, f64) {
-        let a = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset).map(NodeCoord::from_bytes);
-        let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset + NODE_COORD_SIZE)
-            .map(NodeCoord::from_bytes);
-        let (Some(a), Some(b)) = (a, b) else {
-            return (0, 0, f64::MAX);
-        };
-
-        let (t, dist_sq) = geo::point_to_segment_distance_sq(
-            ctx.lon_rad,
-            ctx.lat_rad,
-            geo::e7_to_rad(a.lon_e7),
-            geo::e7_to_rad(a.lat_e7),
-            geo::e7_to_rad(b.lon_e7),
-            geo::e7_to_rad(b.lat_e7),
-            ctx.cos_lat,
-        );
-
-        // Compute snap point in e7
-        #[allow(clippy::cast_possible_truncation)]
-        let snap_lat = (a.lat_e7 as f64 + t * (b.lat_e7 - a.lat_e7) as f64) as i32;
-        #[allow(clippy::cast_possible_truncation)]
-        let snap_lon = (a.lon_e7 as f64 + t * (b.lon_e7 - a.lon_e7) as f64) as i32;
-
-        (snap_lat, snap_lon, dist_sq)
-    }
-
-    // -- Admin lookup --------------------------------------------------------
-
-    fn search_admin<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
-        let cells = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
-        let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
-
-        // Track best (smallest area) polygon per admin level
-        let mut best_by_level: [Option<(u32, f32)>; 12] = [None; 12]; // (poly_idx, area)
-
-        for cell_id in &cells {
-            let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, *cell_id)
-            else {
-                continue;
-            };
-
-            for (poly_idx, is_interior) in read_admin_entries(&self.admin_entries, ac.entries_offset)
-            {
-                let poly = self.read_admin_polygon(poly_idx);
-                let level = poly.admin_level as usize;
-                if level >= 12 {
-                    continue;
-                }
-
-                // Skip if we already have a smaller polygon at this level
-                if let Some((_, best_area)) = best_by_level[level] {
-                    if poly.area >= best_area {
-                        continue;
+                for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
+                    let pt = self.read_addr_point(idx);
+                    let dist_sq = geo::approx_distance_sq(
+                        ctx.lat_rad, ctx.lon_rad,
+                        geo::e7_to_rad(pt.lat_e7), geo::e7_to_rad(pt.lon_e7),
+                        ctx.cos_lat,
+                    );
+                    if dist_sq < max_dist_sq {
+                        cands.addresses.push(AddressMatch {
+                            lat_e7: pt.lat_e7,
+                            lon_e7: pt.lon_e7,
+                            house_number: self.read_string(pt.housenumber_offset),
+                            street: self.read_string(pt.street_offset),
+                            postcode: nonzero_string(self, pt.postcode_offset),
+                            distance_m: radians_sq_to_meters(dist_sq),
+                        });
                     }
                 }
+            }
 
-                // Interior hint: test first (likely match), but still verify with PIP
-                let _ = is_interior; // Priority ordering only — always do PIP
+            if gc.street_offset != format::NO_DATA_U64 {
+                for seg_ref in SegmentEntryIter::new(street_entries_mmap, gc.street_offset) {
+                    let (snap_lat, snap_lon, dist_sq) =
+                        self.street_segment_distance(ctx, &seg_ref);
+                    if dist_sq < max_dist_sq {
+                        let way = self.read_street_way(seg_ref.way_index);
+                        cands.streets.push(StreetMatch {
+                            name: self.read_string(way.name_offset),
+                            snap_lat_e7: snap_lat,
+                            snap_lon_e7: snap_lon,
+                            distance_m: radians_sq_to_meters(dist_sq),
+                        });
+                    }
+                }
+            }
 
-                if self.admin_polygon_contains(ctx, &poly) {
-                    best_by_level[level] = Some((poly_idx, poly.area));
+            if gc.interp_offset != format::NO_DATA_U32 {
+                for seg_ref in SegmentEntryIter::from_u32(interp_entries_mmap, gc.interp_offset) {
+                    let (snap_lat, snap_lon, dist_sq) =
+                        self.interp_segment_distance(ctx, &seg_ref);
+                    if dist_sq < max_dist_sq {
+                        let iw = self.read_interp_way(seg_ref.way_index);
+                        cands.interpolations.push(InterpolationCandidate {
+                            street: self.read_string(iw.street_offset),
+                            way_index: seg_ref.way_index,
+                            segment_index: seg_ref.segment_index,
+                            snap_lat_e7: snap_lat,
+                            snap_lon_e7: snap_lon,
+                            distance_m: radians_sq_to_meters(dist_sq),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // -- Admin search --------------------------------------------------------
+
+    /// Ranked admin: one per level, smallest area, with interior cell optimization.
+    fn search_admin_ranked<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
+        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
+        let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
+        let mut best_by_level: [(Option<u32>, f32); 12] = [(None, f32::MAX); 12];
+
+        for &cell_id in &cells[..count] {
+            let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
+                continue;
+            };
+            for (poly_idx, is_interior) in AdminEntryIter::new(&self.admin_entries, ac.entries_offset) {
+                let poly = self.read_admin_polygon(poly_idx);
+                let level = poly.admin_level as usize;
+                if level >= 12 || poly.area >= best_by_level[level].1 {
+                    continue;
+                }
+                // Interior hint: skip PIP test (accepted approximation per spec)
+                if is_interior || self.admin_polygon_contains(ctx, &poly) {
+                    best_by_level[level] = (Some(poly_idx), poly.area);
                 }
             }
         }
 
         let mut result = Vec::new();
-        for &(poly_idx, _) in best_by_level.iter().flatten() {
-            let poly = self.read_admin_polygon(poly_idx);
-            // Country codes are packed as u16 in the polygon record.
-            // The builder interns them into the string pool; for level-2
-            // boundaries the name_offset points to the country name and
-            // we store the 2-char code separately. For now, return None
-            // — the builder will intern country codes as strings.
-            result.push(AdminMatch {
-                admin_level: poly.admin_level,
-                name: self.read_string(poly.name_offset),
-                country_code: None, // TODO: resolve from string pool once builder interns codes
-            });
+        for &(maybe_idx, _) in &best_by_level {
+            if let Some(poly_idx) = maybe_idx {
+                let poly = self.read_admin_polygon(poly_idx);
+                result.push(AdminMatch {
+                    admin_level: poly.admin_level,
+                    name: self.read_string(poly.name_offset),
+                    country_code: nonzero_string(self, poly.country_code_offset),
+                });
+            }
+        }
+        result
+    }
+
+    /// All admin polygons containing the point (for candidates API).
+    fn search_admin_all<'a>(&'a self, ctx: &QueryContext) -> Vec<AdminMatch<'a>> {
+        let (cells, count) = cell_neighborhood(ctx.lat, ctx.lon, self.header.admin_cell_level);
+        let cell_count = self.admin_cells.len() / ADMIN_CELL_SIZE;
+        let mut result = Vec::new();
+        let mut seen: Vec<u32> = Vec::new(); // dedup polygon IDs across cells
+
+        for &cell_id in &cells[..count] {
+            let Some(ac) = binary_search_admin_cells(&self.admin_cells, cell_count, cell_id) else {
+                continue;
+            };
+            for (poly_idx, is_interior) in AdminEntryIter::new(&self.admin_entries, ac.entries_offset) {
+                if seen.contains(&poly_idx) {
+                    continue;
+                }
+                let poly = self.read_admin_polygon(poly_idx);
+                if is_interior || self.admin_polygon_contains(ctx, &poly) {
+                    seen.push(poly_idx);
+                    result.push(AdminMatch {
+                        admin_level: poly.admin_level,
+                        name: self.read_string(poly.name_offset),
+                        country_code: nonzero_string(self, poly.country_code_offset),
+                    });
+                }
+            }
         }
         result
     }
 
     fn admin_polygon_contains(&self, ctx: &QueryContext, poly: &AdminPolygon) -> bool {
-        let vertices = self.read_admin_vertices(poly);
-        if vertices.is_empty() {
+        let start = poly.vertex_offset as usize;
+        let count = poly.vertex_count as usize;
+        if count < 3 {
             return false;
         }
 
-        // Split into exterior + holes at sentinel markers
+        // Parse vertices into rings separated by sentinel
         let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
-        let mut current_ring: Vec<(f64, f64)> = Vec::new();
+        let mut current: Vec<(f64, f64)> = Vec::new();
 
-        for nc in &vertices {
-            if *nc == format::RING_SENTINEL {
-                if current_ring.len() >= 3 {
-                    rings.push(std::mem::take(&mut current_ring));
+        for i in 0..count {
+            let offset = start + i * NODE_COORD_SIZE;
+            let Some(rec) = read_record::<NODE_COORD_SIZE>(&self.admin_vertices, offset) else {
+                break;
+            };
+            let nc = NodeCoord::from_bytes(rec);
+            if nc == format::RING_SENTINEL {
+                if current.len() >= 3 {
+                    rings.push(std::mem::take(&mut current));
                 } else {
-                    current_ring.clear();
+                    current.clear();
                 }
             } else {
-                current_ring.push((nc.lon_e7 as f64 * 1e-7, nc.lat_e7 as f64 * 1e-7));
+                current.push((nc.lon_e7 as f64 * 1e-7, nc.lat_e7 as f64 * 1e-7));
             }
         }
-        if current_ring.len() >= 3 {
-            rings.push(current_ring);
+        if current.len() >= 3 {
+            rings.push(current);
         }
-
         if rings.is_empty() {
             return false;
         }
 
-        // First ring is exterior, rest are holes
         let exterior = &rings[0];
         let holes: Vec<&[(f64, f64)]> = rings[1..].iter().map(Vec::as_slice).collect();
         geo::point_in_polygon(ctx.lon, ctx.lat, exterior, &holes)
+    }
+
+    // -- Segment distance ----------------------------------------------------
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn street_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
+        let way_offset = seg_ref.way_index as usize * STREET_WAY_SIZE;
+        let Some(rec) = read_record::<STREET_WAY_SIZE>(&self.street_ways, way_offset) else {
+            return (0, 0, f64::MAX);
+        };
+        let way = StreetWay::from_bytes(rec);
+        let node_byte_offset =
+            way.node_offset as usize + seg_ref.segment_index as usize * NODE_COORD_SIZE;
+        two_node_distance(ctx, &self.street_nodes, node_byte_offset)
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    fn interp_segment_distance(&self, ctx: &QueryContext, seg_ref: &SegmentRef) -> (i32, i32, f64) {
+        let way_offset = seg_ref.way_index as usize * INTERP_WAY_SIZE;
+        let Some(rec) = read_record::<INTERP_WAY_SIZE>(&self.interp_ways, way_offset) else {
+            return (0, 0, f64::MAX);
+        };
+        let way = InterpWay::from_bytes(rec);
+        let node_byte_offset =
+            way.node_offset as usize + seg_ref.segment_index as usize * NODE_COORD_SIZE;
+        two_node_distance(ctx, &self.interp_nodes, node_byte_offset)
     }
 
     // -- Record readers ------------------------------------------------------
@@ -832,11 +883,8 @@ impl Reader {
         read_record::<ADDR_POINT_SIZE>(&self.addr_points, offset)
             .map(AddrPoint::from_bytes)
             .unwrap_or(AddrPoint {
-                lat_e7: 0,
-                lon_e7: 0,
-                housenumber_offset: 0,
-                street_offset: 0,
-                postcode_offset: 0,
+                lat_e7: 0, lon_e7: 0,
+                housenumber_offset: 0, street_offset: 0, postcode_offset: 0,
             })
     }
 
@@ -844,11 +892,7 @@ impl Reader {
         let offset = index as usize * STREET_WAY_SIZE;
         read_record::<STREET_WAY_SIZE>(&self.street_ways, offset)
             .map(StreetWay::from_bytes)
-            .unwrap_or(StreetWay {
-                node_offset: 0,
-                name_offset: 0,
-                node_count: 0,
-            })
+            .unwrap_or(StreetWay { node_offset: 0, name_offset: 0, node_count: 0 })
     }
 
     fn read_interp_way(&self, index: u32) -> InterpWay {
@@ -856,12 +900,8 @@ impl Reader {
         read_record::<INTERP_WAY_SIZE>(&self.interp_ways, offset)
             .map(InterpWay::from_bytes)
             .unwrap_or(InterpWay {
-                node_offset: 0,
-                street_offset: 0,
-                start_number: 0,
-                end_number: 0,
-                node_count: 0,
-                interpolation_type: 0,
+                node_offset: 0, street_offset: 0,
+                start_number: 0, end_number: 0, node_count: 0, interpolation_type: 0,
             })
     }
 
@@ -870,26 +910,9 @@ impl Reader {
         read_record::<ADMIN_POLYGON_SIZE>(&self.admin_polygons, offset)
             .map(AdminPolygon::from_bytes)
             .unwrap_or(AdminPolygon {
-                area: 0.0,
-                vertex_offset: 0,
-                vertex_count: 0,
-                name_offset: 0,
-                country_code: 0,
-                admin_level: 0,
+                area: 0.0, vertex_offset: 0, vertex_count: 0,
+                name_offset: 0, country_code_offset: 0, admin_level: 0,
             })
-    }
-
-    fn read_admin_vertices(&self, poly: &AdminPolygon) -> Vec<NodeCoord> {
-        let start = poly.vertex_offset as usize;
-        let count = poly.vertex_count as usize;
-        let mut vertices = Vec::with_capacity(count);
-        for i in 0..count {
-            let offset = start + i * NODE_COORD_SIZE;
-            if let Some(rec) = read_record::<NODE_COORD_SIZE>(&self.admin_vertices, offset) {
-                vertices.push(NodeCoord::from_bytes(rec));
-            }
-        }
-        vertices
     }
 
     fn read_string(&self, offset: u32) -> &str {
@@ -919,24 +942,18 @@ impl Reader {
         if iw.start_number == 0 || iw.end_number == 0 {
             return None;
         }
-        let total_len = self.way_total_length(&self.interp_nodes, &iw.node_offset, iw.node_count);
+        let total_len = self.way_length(&self.interp_nodes, iw.node_offset, iw.node_count);
         if total_len < 1e-15 {
             return None;
         }
         let acc_len = self.accumulated_length(
-            &self.interp_nodes,
-            &iw.node_offset,
-            seg_idx,
-            snap_lat,
-            snap_lon,
+            &self.interp_nodes, iw.node_offset, seg_idx, snap_lat, snap_lon,
         );
         let t = acc_len / total_len;
-        let start = iw.start_number;
-        let end = iw.end_number;
-        let diff = end as f64 - start as f64;
+        let diff = iw.end_number as f64 - iw.start_number as f64;
         let number = match iw.interpolation_type {
-            0 => start as f64 + (t * diff).round(),
-            _ => start as f64 + 2.0 * ((t * diff) / 2.0).round(),
+            0 => iw.start_number as f64 + (t * diff).round(),
+            _ => iw.start_number as f64 + 2.0 * ((t * diff) / 2.0).round(),
         };
         #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
         let house_number = number.max(0.0) as u32;
@@ -947,97 +964,88 @@ impl Reader {
         })
     }
 
-    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
-    fn way_total_length(&self, nodes_mmap: &Mmap, node_offset: &u64, node_count: u16) -> f64 {
+    #[allow(clippy::cast_possible_truncation)]
+    fn way_length(&self, nodes_mmap: &Mmap, node_offset: u64, node_count: u16) -> f64 {
         let mut total = 0.0;
-        let base = *node_offset as usize;
+        let base = node_offset as usize;
         for i in 0..(node_count as usize).saturating_sub(1) {
             let a = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + i * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + (i + 1) * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             if let (Some(a), Some(b)) = (a, b) {
-                let d = geo::approx_distance_sq(
-                    geo::e7_to_rad(a.lat_e7),
-                    geo::e7_to_rad(a.lon_e7),
-                    geo::e7_to_rad(b.lat_e7),
-                    geo::e7_to_rad(b.lon_e7),
-                    geo::e7_to_rad(a.lat_e7).cos(),
-                );
-                total += d.sqrt();
+                total += segment_length(&a, &b);
             }
         }
         total
     }
 
-    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
+    #[allow(clippy::cast_possible_truncation)]
     fn accumulated_length(
         &self,
         nodes_mmap: &Mmap,
-        node_offset: &u64,
+        node_offset: u64,
         seg_idx: u16,
         snap_lat: i32,
         snap_lon: i32,
     ) -> f64 {
         let mut acc = 0.0;
-        let base = *node_offset as usize;
-        // Sum lengths of segments 0..seg_idx
+        let base = node_offset as usize;
         for i in 0..seg_idx as usize {
             let a = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + i * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, base + (i + 1) * NODE_COORD_SIZE)
                 .map(NodeCoord::from_bytes);
             if let (Some(a), Some(b)) = (a, b) {
-                let d = geo::approx_distance_sq(
-                    geo::e7_to_rad(a.lat_e7),
-                    geo::e7_to_rad(a.lon_e7),
-                    geo::e7_to_rad(b.lat_e7),
-                    geo::e7_to_rad(b.lon_e7),
-                    geo::e7_to_rad(a.lat_e7).cos(),
-                );
-                acc += d.sqrt();
+                acc += segment_length(&a, &b);
             }
         }
-        // Add partial segment to snap point
-        let seg_start =
-            read_record::<NODE_COORD_SIZE>(nodes_mmap, base + seg_idx as usize * NODE_COORD_SIZE)
-                .map(NodeCoord::from_bytes);
-        if let Some(seg_start) = seg_start {
-            let d = geo::approx_distance_sq(
-                geo::e7_to_rad(seg_start.lat_e7),
-                geo::e7_to_rad(seg_start.lon_e7),
-                geo::e7_to_rad(snap_lat),
-                geo::e7_to_rad(snap_lon),
-                geo::e7_to_rad(seg_start.lat_e7).cos(),
-            );
-            acc += d.sqrt();
+        // Partial segment to snap point
+        if let Some(rec) = read_record::<NODE_COORD_SIZE>(
+            nodes_mmap, base + seg_idx as usize * NODE_COORD_SIZE,
+        ) {
+            let seg_start = NodeCoord::from_bytes(rec);
+            let snap = NodeCoord { lat_e7: snap_lat, lon_e7: snap_lon };
+            acc += segment_length(&seg_start, &snap);
         }
         acc
     }
 }
 
 // ---------------------------------------------------------------------------
-// S2 cell helpers
+// Free functions
 // ---------------------------------------------------------------------------
 
-fn cell_neighborhood(lat: f64, lon: f64, level: u8) -> Vec<u64> {
-    let ll = LatLng::from_degrees(lat, lon);
-    let cell = CellID::from(ll).parent(level as u64);
-    let mut cells = vec![cell.0];
-    for neighbor in cell.all_neighbors(level as u64) {
-        cells.push(neighbor.0);
-    }
-    cells
+fn two_node_distance(ctx: &QueryContext, nodes_mmap: &Mmap, byte_offset: usize) -> (i32, i32, f64) {
+    let a = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset).map(NodeCoord::from_bytes);
+    let b = read_record::<NODE_COORD_SIZE>(nodes_mmap, byte_offset + NODE_COORD_SIZE)
+        .map(NodeCoord::from_bytes);
+    let (Some(a), Some(b)) = (a, b) else {
+        return (0, 0, f64::MAX);
+    };
+    let (t, dist_sq) = geo::point_to_segment_distance_sq(
+        ctx.lon_rad, ctx.lat_rad,
+        geo::e7_to_rad(a.lon_e7), geo::e7_to_rad(a.lat_e7),
+        geo::e7_to_rad(b.lon_e7), geo::e7_to_rad(b.lat_e7),
+        ctx.cos_lat,
+    );
+    #[allow(clippy::cast_possible_truncation)]
+    let snap_lat = (a.lat_e7 as f64 + t * (b.lat_e7 - a.lat_e7) as f64) as i32;
+    #[allow(clippy::cast_possible_truncation)]
+    let snap_lon = (a.lon_e7 as f64 + t * (b.lon_e7 - a.lon_e7) as f64) as i32;
+    (snap_lat, snap_lon, dist_sq)
 }
 
-// ---------------------------------------------------------------------------
-// Binary search helpers
-// ---------------------------------------------------------------------------
+fn segment_length(a: &NodeCoord, b: &NodeCoord) -> f64 {
+    geo::approx_distance_sq(
+        geo::e7_to_rad(a.lat_e7), geo::e7_to_rad(a.lon_e7),
+        geo::e7_to_rad(b.lat_e7), geo::e7_to_rad(b.lon_e7),
+        geo::e7_to_rad(a.lat_e7).cos(),
+    )
+    .sqrt()
+}
 
 fn binary_search_cells(mmap: &[u8], count: usize, target: u64) -> Option<GeoCell> {
-    if count == 0 {
-        return None;
-    }
     let mut lo = 0usize;
     let mut hi = count;
     while lo < hi {
@@ -1054,9 +1062,6 @@ fn binary_search_cells(mmap: &[u8], count: usize, target: u64) -> Option<GeoCell
 }
 
 fn binary_search_admin_cells(mmap: &[u8], count: usize, target: u64) -> Option<AdminCell> {
-    if count == 0 {
-        return None;
-    }
     let mut lo = 0usize;
     let mut hi = count;
     while lo < hi {
@@ -1072,94 +1077,14 @@ fn binary_search_admin_cells(mmap: &[u8], count: usize, target: u64) -> Option<A
     None
 }
 
-// ---------------------------------------------------------------------------
-// Entry list readers
-// ---------------------------------------------------------------------------
-
-/// Read u32 entries (for addr_entries, interp_entries with u32 offset).
-fn read_u32_entries(mmap: &[u8], offset: u32) -> Vec<u32> {
-    let off = offset as usize;
-    if off + 2 > mmap.len() {
-        return Vec::new();
-    }
-    let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]) as usize;
-    let data_start = off + 2;
-    let data_end = data_start + count * 4;
-    if data_end > mmap.len() {
-        return Vec::new();
-    }
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = data_start + i * 4;
-        entries.push(u32::from_le_bytes([
-            mmap[base],
-            mmap[base + 1],
-            mmap[base + 2],
-            mmap[base + 3],
-        ]));
-    }
-    entries
-}
-
-/// Read segment ref entries from street_entries (u64 offset).
-#[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
-fn read_segment_entries(mmap: &[u8], offset: u64) -> Vec<SegmentRef> {
-    let off = offset as usize;
-    if off + 2 > mmap.len() {
-        return Vec::new();
-    }
-    let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]) as usize;
-    let data_start = off + 2;
-    let data_end = data_start + count * SEGMENT_REF_SIZE;
-    if data_end > mmap.len() {
-        return Vec::new();
-    }
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = data_start + i * SEGMENT_REF_SIZE;
-        if let Some(rec) = read_record::<SEGMENT_REF_SIZE>(mmap, base) {
-            entries.push(SegmentRef::from_bytes(rec));
-        }
-    }
-    entries
-}
-
-/// Read segment ref entries from interp_entries (u32 offset).
-fn read_segment_entries_u32(mmap: &[u8], offset: u32) -> Vec<SegmentRef> {
-    read_segment_entries(mmap, offset as u64)
-}
-
-/// Read admin entries: returns (polygon_index, is_interior_hint).
-fn read_admin_entries(mmap: &[u8], offset: u32) -> Vec<(u32, bool)> {
-    let off = offset as usize;
-    if off + 2 > mmap.len() {
-        return Vec::new();
-    }
-    let count = u16::from_le_bytes([mmap[off], mmap[off + 1]]) as usize;
-    let data_start = off + 2;
-    let data_end = data_start + count * 4;
-    if data_end > mmap.len() {
-        return Vec::new();
-    }
-    let mut entries = Vec::with_capacity(count);
-    for i in 0..count {
-        let base = data_start + i * 4;
-        let raw = u32::from_le_bytes([mmap[base], mmap[base + 1], mmap[base + 2], mmap[base + 3]]);
-        let is_interior = raw & INTERIOR_FLAG != 0;
-        let idx = raw & INDEX_MASK;
-        entries.push((idx, is_interior));
-    }
-    entries
-}
-
-// ---------------------------------------------------------------------------
-// Utility
-// ---------------------------------------------------------------------------
-
 fn read_record<const N: usize>(mmap: &[u8], offset: usize) -> Option<&[u8; N]> {
     mmap.get(offset..offset + N)?.try_into().ok()
 }
 
 fn radians_sq_to_meters(rad_sq: f64) -> f64 {
     rad_sq.sqrt() * geo::EARTH_RADIUS_M
+}
+
+fn nonzero_string<'a>(reader: &'a Reader, offset: u32) -> Option<&'a str> {
+    if offset == 0 { None } else { Some(reader.read_string(offset)) }
 }

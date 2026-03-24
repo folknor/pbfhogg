@@ -109,7 +109,12 @@ Stream relations. For each relation with `boundary=administrative` (admin_level
 2–10) or `boundary=postal_code` (treated as level 11):
 - Record the relation ID, admin_level, name, and country_code (ISO 3166-1:alpha2
   from `ISO3166-1:alpha2` tag, for admin_level=2 only).
-- Collect all way member IDs with role `outer` or empty role into an `IdSetDense`.
+- Collect all way member IDs into an `IdSetDense`, recording the role (`outer`,
+  `inner`, or empty) per member per relation. Both outer and inner members are
+  needed — inner rings define holes (enclaves, exclusion zones) that must be
+  subtracted during point-in-polygon testing. Without inner rings, queries inside
+  enclaves (e.g., Vatican City within Rome) would incorrectly match the enclosing
+  boundary.
 
 **Scan 3b — Resolve way geometries:**
 Re-scan way blobs (blob filter: `BlobFilter::only_ways()`). For each way whose
@@ -118,12 +123,14 @@ store the way geometry.
 
 **Ring assembly:**
 After scan 3b, assemble ways into closed rings per relation using endpoint
-matching. This reuses the ring assembly algorithm from nidhogg's `geocode.rs`
-(`assemble_rings`), adapted to work with pbfhogg's coordinate types:
-- Build an endpoint map: `HashMap<(i32, i32), Vec<usize>>` mapping quantized
-  endpoints to segment indices.
+matching, grouped by role. This reuses the ring assembly algorithm from nidhogg's
+`geocode.rs` (`assemble_rings`), adapted to work with pbfhogg's coordinate types:
+- Group way geometries by role: outer (including empty role) and inner separately.
+- For each group, build an endpoint map: `HashMap<(i32, i32), Vec<usize>>`
+  mapping quantized endpoints to segment indices.
 - Trace rings by following endpoint chains.
-- Classify rings as exterior (CCW) or holes (CW) by signed area.
+- Classify outer rings as exterior and inner rings as holes by role assignment
+  (not signed area alone — the role tag is authoritative per OSM conventions).
 
 **Polygon simplification:**
 Apply Douglas-Peucker to each assembled ring with a vertex cap
@@ -154,10 +161,25 @@ per cell.
 Same as streets — cover each segment at `street_level`.
 
 **For each admin polygon:**
-Compute two coverings at `admin_level`:
-- `GetCovering()` — all cells touched by the polygon boundary (edge cells).
-- `GetInteriorCovering()` — cells fully contained (interior cells, marked with
-  high-bit flag).
+Compute edge and interior cell sets at `admin_level`:
+
+**Edge cells:** For each segment of each ring (outer and inner), compute the S2
+cells at `admin_level` that the segment crosses. This uses the same segment-level
+covering as streets: compute the cell ID for each endpoint and, if they differ,
+walk the cell boundary crossings between them. All cells touched by any ring
+segment are edge cells.
+
+**Interior cells:** Flood-fill from a seed point known to be inside the polygon
+(e.g., the centroid, verified by point-in-polygon test). Starting from the seed
+cell, BFS-expand to all neighbors at `admin_level` that pass the point-in-polygon
+test (testing the cell center). Stop expanding when the cell center falls outside
+the polygon. This is correct because at level 10 (~1.2 km cells), any cell whose
+center is inside the polygon is fully interior — the cell is far smaller than the
+polygon features. Edge cells (already identified) are excluded from the interior
+set.
+
+Interior cells are marked with the high-bit flag (0x8000_0000) in the entry list,
+allowing the reader to skip ray-casting for queries landing in them.
 
 **Sort and merge:**
 - Sort street/address/interpolation cell entries by cell ID.
@@ -175,23 +197,28 @@ and interpolation ways are smaller. Admin cells are negligible.
 
 The S2 `RegionCoverer` is used for line segment covering. The `s2` Rust crate
 (v0.0.13, `s2 = "0.0.13"` on crates.io) provides `CellID`, `LatLng`,
-`RegionCoverer`, and `CellID::all_neighbors`. Polygon/polyline covering in the
-Rust crate is incomplete — for line segments, we iterate segment endpoints and
-compute fixed-level cell coverings. For admin polygon covering, we rasterize: test
-a grid of points within the polygon's bbox to find interior cells, and use the
-polygon's ring segments to find edge cells.
+`RegionCoverer`, and `CellID::all_neighbors`. For admin polygon covering, see
+the edge-walk + flood-fill approach described above.
 
 ### 3.5. Finalization: interpolation endpoint resolution
 
-For each interpolation way, find the nearest address point to each endpoint
-(within the search radius). If both endpoints resolve to address points with
-numeric house numbers, store the start/end numbers. Otherwise, the interpolation
-way is written with start=0, end=0 (unusable for interpolation but still provides
-a street name match).
+For each interpolation way, resolve the house numbers at each endpoint:
 
-This is a spatial join: for each interpolation endpoint, query the address point
-cell index to find candidates. The index is already built at this point, so this
-is a read-only lookup.
+1. Look up nearby address points using the cell index (already built at this point).
+2. **Filter by street name:** Only consider address points whose `addr:street`
+   matches the interpolation way's `addr:street`. This prevents assigning numbers
+   from a different street that happens to be nearby.
+3. **Prefer topological matches:** If an address point's coordinates exactly match
+   the interpolation endpoint (same node), prefer it over merely-nearby points.
+   In OSM, interpolation way endpoints are typically placed on the address nodes
+   they interpolate between.
+4. **Fall back to nearest:** Among same-street candidates within the search radius,
+   pick the nearest.
+
+If both endpoints resolve to address points with parseable numeric house numbers,
+store the start/end numbers. Otherwise, the interpolation way is written with
+start=0, end=0 (unusable for interpolation but still provides a street name match
+for nearest-street queries).
 
 ### 3.6. Cleanup
 
@@ -203,6 +230,18 @@ summary statistics.
 All files use **little-endian** byte order. All coordinates are **i32
 decimicrodegrees** (10^-7 degrees), matching nidhogg's disk format convention.
 String references are **u32 byte offsets** into `strings.bin`.
+
+**Serialization approach:** Records are read and written via manual byte-level
+helpers (`read_u32_le`, `write_i32_le`, etc.), not `#[repr(C)]` transmutation.
+This avoids alignment padding issues (several records mix u32/u16/u8 fields that
+would get padding under `repr(C)`) and is safe on all architectures. The format
+structs in Rust use `#[repr(Rust)]` with explicit `from_bytes` / `to_bytes`
+methods.
+
+**Offset widths:** Files estimated to exceed 4 GB at planet scale use **u64 byte
+offsets**. Files that stay under 4 GB use **u32**. The specific choice per file is
+noted in each section. The u32/u64 boundary is based on planet-scale estimates with
+a 2x safety margin.
 
 ### 4.0. `geocode_header.bin` — Index header
 
@@ -217,14 +256,14 @@ Fixed-size, 64 bytes:
 | 10 | `u16` | Max admin vertices (default 500) |
 | 12 | `f32` | Search radius in meters (default 75.0) |
 | 16 | `u32` | Replication sequence number (0 if unknown) |
-| 20 | `u32` | Replication timestamp (unix seconds, 0 if unknown) |
-| 24 | `u32` | Address point count |
-| 28 | `u32` | Street way count |
-| 32 | `u32` | Interpolation way count |
-| 36 | `u32` | Admin polygon count |
-| 40 | `u32` | Geo cell count (street-level) |
-| 44 | `u32` | Admin cell count |
-| 48 | `[u8; 16]` | Reserved (zero) |
+| 20 | `u64` | Replication timestamp (unix seconds, 0 if unknown) |
+| 28 | `u32` | Address point count |
+| 32 | `u32` | Street way count |
+| 36 | `u32` | Interpolation way count |
+| 40 | `u32` | Admin polygon count |
+| 44 | `u32` | Geo cell count (street-level) |
+| 48 | `u32` | Admin cell count |
+| 52 | `[u8; 12]` | Reserved (zero) |
 
 The reader checks magic + version on load and rejects mismatches. The cell levels
 and search radius are stored so the reader doesn't need to assume defaults.
@@ -236,11 +275,13 @@ Sorted by cell_id. One entry per unique cell. Binary-searchable.
 | Offset | Type | Field |
 |--------|------|-------|
 | 0 | `u64` | S2 cell ID at street level |
-| 8 | `u32` | Byte offset into `street_entries.bin` (0xFFFF_FFFF = no streets) |
-| 12 | `u32` | Byte offset into `addr_entries.bin` (0xFFFF_FFFF = no addresses) |
-| 16 | `u32` | Byte offset into `interp_entries.bin` (0xFFFF_FFFF = no interpolation) |
+| 8 | `u64` | Byte offset into `street_entries.bin` (u64::MAX = no streets) |
+| 16 | `u64` | Byte offset into `addr_entries.bin` (u64::MAX = no addresses) |
+| 24 | `u64` | Byte offset into `interp_entries.bin` (u64::MAX = no interpolation) |
 
-Record size: **20 bytes**.
+Record size: **32 bytes**.
+
+All three entry files can exceed 4 GB at planet scale, so offsets are u64.
 
 ### 4.2. `street_entries.bin` — Street way IDs per cell
 
@@ -270,20 +311,29 @@ Same layout:
 | `u16` | Entry count (N) |
 | `[u32; N]` | Interpolation way indices (into `interp_ways.bin`) |
 
+**Entry count overflow (sections 4.2–4.4):** The u16 entry count limits each cell
+to 65535 entries. At level 17 (~77m cells), this is safe for addresses and
+interpolation. Dense urban street networks could theoretically exceed this. The
+builder emits a debug assertion if any cell exceeds 65535 entries and, if triggered
+in release, truncates to 65535 with a warning. This loses some candidates in the
+affected cell but the same ways appear in neighboring cells, so the query still
+finds them via the 9-cell neighborhood expansion.
+
 ### 4.5. `street_ways.bin` — Street way geometry
 
 Fixed-size header per way, followed by variable node data in `street_nodes.bin`:
 
 | Offset | Type | Field |
 |--------|------|-------|
-| 0 | `u32` | Node offset (byte index into `street_nodes.bin`) |
-| 4 | `u16` | Node count |
-| 6 | `u32` | Name string offset (into `strings.bin`) |
+| 0 | `u64` | Node offset (byte index into `street_nodes.bin`) |
+| 8 | `u32` | Name string offset (into `strings.bin`) |
+| 12 | `u16` | Node count |
 
-Record size: **10 bytes**.
+Record size: **14 bytes**.
 
-Note: u16 for node count (max 65535) instead of traccar-geocoder's u8 (max 255).
-Some OSM ways have >255 nodes.
+Node offset is u64 because `street_nodes.bin` reaches ~24 GB at planet scale.
+u16 for node count (max 65535) instead of traccar-geocoder's u8 (max 255) —
+some OSM ways have >255 nodes.
 
 ### 4.6. `street_nodes.bin` — Street way node coordinates
 
@@ -313,14 +363,17 @@ Record size: **16 bytes**.
 
 | Offset | Type | Field |
 |--------|------|-------|
-| 0 | `u32` | Node offset (byte index into `interp_nodes.bin`) |
-| 4 | `u16` | Node count |
-| 6 | `u32` | Street name string offset |
-| 10 | `u32` | Start house number (0 = unresolved) |
-| 14 | `u32` | End house number (0 = unresolved) |
-| 18 | `u8` | Interpolation type: 0=all, 1=even, 2=odd |
+| 0 | `u64` | Node offset (byte index into `interp_nodes.bin`) |
+| 8 | `u32` | Street name string offset |
+| 12 | `u32` | Start house number (0 = unresolved) |
+| 16 | `u32` | End house number (0 = unresolved) |
+| 20 | `u16` | Node count |
+| 22 | `u8` | Interpolation type: 0=all, 1=even, 2=odd |
 
-Record size: **19 bytes**.
+Record size: **23 bytes**.
+
+Node offset is u64 for consistency with street_ways (interp_nodes.bin is small,
+but using u32 here would be a format inconsistency that invites bugs).
 
 ### 4.9. `interp_nodes.bin` — Interpolation way node coordinates
 
@@ -354,18 +407,19 @@ high bit) require a point-in-polygon test.
 
 | Offset | Type | Field |
 |--------|------|-------|
-| 0 | `u32` | Vertex offset (byte index into `admin_vertices.bin`) |
-| 4 | `u32` | Vertex count |
-| 8 | `u32` | Name string offset |
-| 12 | `u8` | Admin level (2–11) |
-| 13 | `u16` | Country code (ISO 3166-1 alpha2, packed: `(c0 << 8) | c1`) |
-| 15 | `f32` | Approximate area (square degrees, for smallest-polygon selection) |
+| 0 | `f32` | Approximate area (square degrees, for smallest-polygon selection) |
+| 4 | `u32` | Vertex offset (byte index into `admin_vertices.bin`) |
+| 8 | `u32` | Vertex count |
+| 12 | `u32` | Name string offset |
+| 16 | `u16` | Country code (ISO 3166-1 alpha2, packed: `(c0 << 8) | c1`) |
+| 18 | `u8` | Admin level (2–11) |
 | 19 | `u8` | Reserved (zero) |
 
 Record size: **20 bytes**.
 
-Vertex count uses u32 (not u16) because some admin boundaries exceed 65535 vertices
-even after simplification.
+Fields are ordered largest-first to avoid alignment padding. Vertex count is u32
+to allow bypassing simplification (`--max-admin-vertices 0`); with the default cap
+of 500, u16 would suffice, but u32 keeps the format general.
 
 ### 4.13. `admin_vertices.bin` — Admin polygon vertices
 
@@ -392,7 +446,7 @@ mapping string content to its byte offset.
 
 | | Denmark (465 MB) | Planet (~87 GB) |
 |---|---|---|
-| geo_cells.bin | ~30 MB | ~6 GB |
+| geo_cells.bin | ~50 MB | ~10 GB |
 | street_entries.bin | ~15 MB | ~3 GB |
 | addr_entries.bin | ~10 MB | ~2 GB |
 | interp_entries.bin | ~2 MB | ~400 MB |
@@ -406,13 +460,12 @@ mapping string content to its byte offset.
 | admin_polygons.bin | ~100 KB | ~6 MB |
 | admin_vertices.bin | ~5 MB | ~500 MB |
 | strings.bin | ~20 MB | ~2 GB |
-| **Total** | **~275 MB** | **~50 GB** |
+| **Total** | **~295 MB** | **~55 GB** |
 
-These are rough estimates. The planet estimate is 2.5–3x larger than
-traccar-geocoder's 18 GB because we use i32 coordinates (same size as f32 per
-field but we have more fields per record in some cases) and more conservative
-deduplication of cell entries. Actual sizes will be validated on Denmark during
-implementation.
+These are rough estimates. The planet estimate is ~3x larger than
+traccar-geocoder's 18 GB because we use u64 offsets where they use u32,
+wider record formats (u16 node counts vs u8), and more conservative deduplication
+of cell entries. Actual sizes will be validated on Denmark during implementation.
 
 ## 5. Reader API
 
@@ -435,7 +488,9 @@ pub mod geocode_index {
         /// Interpolated address, if any.
         pub interpolation: Option<InterpolationMatch>,
         /// Administrative hierarchy (one entry per admin level found).
-        pub admin: Vec<AdminMatch>,
+        /// Admin levels are 2–11, so max 10 entries. ArrayVec avoids heap
+        /// allocation on the query hot path.
+        pub admin: ArrayVec<AdminMatch, 10>,
     }
 
     pub struct AddressMatch {
@@ -515,18 +570,30 @@ Track the nearest point. `cos_lat` is computed once per query.
 
 Streets: for each way, iterate node pairs (segments). Compute
 point-to-segment distance (project query point onto segment, clamp parameter
-to [0, 1]). Track nearest segment + snap point. Use a stack-allocated
-`[u32; 64]` array to skip duplicate way IDs across neighboring cells.
+to [0, 1]). Track nearest segment + snap point.
+
+**Deduplication:** A stack-allocated `[u32; 128]` hash table (512 bytes) tracks
+seen way IDs across neighboring cells. Hash: `way_id % 128`. On collision
+(different ID in the slot), the new ID **evicts** the old one — duplicates may
+be processed twice, but the result is still correct (just redundant distance
+calculations). This is a performance optimization, not a correctness requirement:
+the worst case is O(2x) work for ways that span many cells, not incorrect results.
+At level 17 (~77m cells), a typical 9-cell neighborhood contains <100 unique ways,
+so collisions are rare.
 
 Interpolation: same as streets for distance. If the nearest segment is found
 and the way has resolved start/end house numbers, interpolate:
 ```
 t = accumulated_distance_to_snap_point / total_way_length
+// For type == all:
 number = start + round(t * (end - start))
-// Adjust for even/odd:
-if type == even: number = start + 2 * round(t * (end - start) / 2)
-if type == odd:  number = start + 2 * round(t * (end - start) / 2) + 1
+// For type == even or odd:
+number = start + 2 * round(t * (end - start) / 2)
 ```
+The even/odd formula preserves the parity of `start` naturally — OSM even
+interpolation ways have even start/end values, and odd ways have odd values.
+The step size of 2 with rounding to the nearest multiple keeps the output on
+the correct parity without an additional +1 offset.
 
 **Step 4 — Admin lookup:**
 ```
@@ -636,10 +703,21 @@ The `s2` crate provides:
 - `CellID::all_neighbors(level)` — 8 neighbors for query expansion
 - `RegionCoverer` — line segment covering (for street/interpolation cell assignment)
 
+The `s2` crate at v0.0.13 is the only maintained Rust S2 implementation. Its core
+APIs (CellID, LatLng, neighbors) are stable and used in production by
+traccar-geocoder. If `RegionCoverer` proves insufficient for segment covering, the
+fallback is to compute cell IDs for both segment endpoints and, if they differ, walk
+intermediate points along the segment to find all crossed cells — this is ~50 lines
+of code and only needed during the build, not at query time.
+
+If the crate becomes unmaintained, vendoring the ~200 lines for cell ID computation
++ parent + neighbors is straightforward. The reader only needs `CellID::from` and
+`all_neighbors`; `RegionCoverer` is builder-only.
+
 For admin polygon covering, the `s2` crate's polygon/polyline support is
-incomplete. We rasterize instead: sample the polygon bbox at the admin cell level
-grid, test each sample point with `point_in_polygon`, and union with edge cells
-found by covering each ring segment.
+incomplete. We use a two-phase approach instead: (1) walk ring segments to find
+edge cells, (2) flood-fill from a verified interior seed point to find interior
+cells. See section 3.4 for details.
 
 ## 8. Failure modes and resumability
 
@@ -711,9 +789,9 @@ interpolation and edge-case polygon containment).
 
 1. **`src/geo.rs`** — Extract geometry primitives from extract.rs. Add
    `simplify_ring`, `assemble_rings`, distance functions. Unit tests.
-2. **`src/geocode_index/format.rs`** — Define the on-disk format structs
-   (`#[repr(C)]` for mmap interpretation), header, magic, version. Serialization
-   and deserialization helpers.
+2. **`src/geocode_index/format.rs`** — Define the on-disk format structs, header,
+   magic, version. Manual byte-level `from_bytes` / `to_bytes` methods (not
+   `#[repr(C)]` transmutation — see section 4 serialization approach).
 3. **`src/geocode_index/reader.rs`** — `Reader::open`, `Reader::query`. Unit tests
    with synthetic index.
 4. **`src/geocode_index/builder.rs`** — The four-pass build pipeline. String pool.

@@ -184,9 +184,23 @@ pub fn simplify_ring(ring: &[(f64, f64)], max_vertices: usize) -> Vec<(f64, f64)
         return ring.to_vec();
     }
 
+    // Compute the bounding box diagonal as the upper bound for epsilon.
+    // This ensures hi is always large enough to reduce to 2 vertices.
+    let mut min_x = f64::MAX;
+    let mut max_x = f64::MIN;
+    let mut min_y = f64::MAX;
+    let mut max_y = f64::MIN;
+    for &(x, y) in ring {
+        if x < min_x { min_x = x; }
+        if x > max_x { max_x = x; }
+        if y < min_y { min_y = y; }
+        if y > max_y { max_y = y; }
+    }
+    let diag = ((max_x - min_x).powi(2) + (max_y - min_y).powi(2)).sqrt();
+
     // Binary search for epsilon
     let mut lo = 0.0_f64;
-    let mut hi = 1.0_f64;
+    let mut hi = diag;
 
     for _ in 0..20 {
         let epsilon = (lo + hi) / 2.0;
@@ -274,6 +288,13 @@ fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mu
 /// Each segment is a slice of `(lat_e7, lon_e7)` coordinate pairs (i32
 /// decimicrodegrees). Segments are joined by matching endpoints. Returns
 /// closed rings as vectors of coordinate pairs. Unclosed chains are dropped.
+///
+/// **Limitation:** This is a greedy assembler — it follows the first available
+/// continuation at each endpoint without backtracking. On ambiguous endpoint
+/// graphs (where multiple unused segments share an endpoint), an unlucky
+/// branch can consume segments into a dead-end chain and prevent a valid
+/// closed ring from being assembled later. This is acceptable for OSM admin
+/// boundary relations, which produce well-formed endpoint graphs in practice.
 pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
     if segments.is_empty() {
         return Vec::new();

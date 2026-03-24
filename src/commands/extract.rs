@@ -198,9 +198,15 @@ fn polygon_contains(polygons: &[PolygonRings], px: f64, py: f64) -> bool {
 }
 
 /// Check if a single polygon (exterior + holes) contains the point.
+/// Calls geo primitives directly to avoid per-point allocation.
 fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
-    let holes: Vec<&[(f64, f64)]> = poly.holes.iter().map(Vec::as_slice).collect();
-    crate::geo::point_in_polygon(px, py, &poly.exterior, &holes)
+    if !crate::geo::point_in_ring_with_antimeridian(px, py, &poly.exterior) {
+        return false;
+    }
+    !poly
+        .holes
+        .iter()
+        .any(|hole| crate::geo::point_in_ring_with_antimeridian(px, py, hole))
 }
 
 // Delegate to geo module — used by tests and polygon_bbox_f64

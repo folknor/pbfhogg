@@ -8,7 +8,8 @@
 /// Magic bytes for the index header: `GIDX`.
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 
-/// Current format version.
+/// Current format version. No prior versions exist — this is the initial format.
+/// AdminPolygon is 22 bytes with country_code_offset (u32 string pool reference).
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Sentinel value for "no data" in u32 offset fields.

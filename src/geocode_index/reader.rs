@@ -62,6 +62,9 @@ pub struct AdminMatch<'a> {
     pub name: &'a str,
     /// ISO 3166-1 alpha2, only populated for admin_level=2.
     pub country_code: Option<&'a str>,
+    /// Approximate area in square degrees (from the polygon record).
+    /// Used by `into_result()` to pick the smallest polygon per level.
+    pub area: f32,
 }
 
 /// Raw unranked candidates from [`Reader::candidates`].
@@ -112,14 +115,15 @@ impl<'a> Candidates<'a> {
                 })
             });
 
-        // Collapse admin to smallest-area per level
+        // Collapse admin to smallest-area per level (matches query() semantics)
         let mut best_by_level: [Option<AdminMatch<'a>>; 12] = Default::default();
         for m in self.admin {
             let level = m.admin_level as usize;
             if level < 12 {
-                // Keep (no area comparison possible at this level — admin matches
-                // already passed PIP, just keep first per level)
-                if best_by_level[level].is_none() {
+                let dominated = best_by_level[level]
+                    .as_ref()
+                    .is_none_or(|existing| m.area < existing.area);
+                if dominated {
                     best_by_level[level] = Some(m);
                 }
             }
@@ -776,6 +780,7 @@ impl Reader {
                     admin_level: poly.admin_level,
                     name: self.read_string(poly.name_offset),
                     country_code: nonzero_string(self, poly.country_code_offset),
+                    area: poly.area,
                 });
             }
         }
@@ -804,6 +809,7 @@ impl Reader {
                         admin_level: poly.admin_level,
                         name: self.read_string(poly.name_offset),
                         country_code: nonzero_string(self, poly.country_code_offset),
+                        area: poly.area,
                     });
                 }
             }

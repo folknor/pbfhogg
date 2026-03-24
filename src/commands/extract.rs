@@ -199,81 +199,12 @@ fn polygon_contains(polygons: &[PolygonRings], px: f64, py: f64) -> bool {
 
 /// Check if a single polygon (exterior + holes) contains the point.
 fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
-    if !point_in_ring_with_antimeridian(px, py, &poly.exterior) {
-        return false;
-    }
-    !poly
-        .holes
-        .iter()
-        .any(|hole| point_in_ring_with_antimeridian(px, py, hole))
+    let holes: Vec<&[(f64, f64)]> = poly.holes.iter().map(Vec::as_slice).collect();
+    crate::geo::point_in_polygon(px, py, &poly.exterior, &holes)
 }
 
-/// Point-in-ring that handles rings crossing the antimeridian.
-fn point_in_ring_with_antimeridian(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
-    if !ring_crosses_antimeridian(ring) {
-        return point_in_ring(px, py, ring);
-    }
-
-    let unwrapped = unwrap_ring_longitudes(ring);
-    point_in_ring(px, py, &unwrapped)
-        || point_in_ring(px + 360.0, py, &unwrapped)
-        || point_in_ring(px - 360.0, py, &unwrapped)
-}
-
-/// Detect whether any ring segment crosses the antimeridian.
-fn ring_crosses_antimeridian(ring: &[(f64, f64)]) -> bool {
-    if ring.len() < 2 {
-        return false;
-    }
-    ring.windows(2)
-        .any(|segment| (segment[1].0 - segment[0].0).abs() > 180.0)
-}
-
-/// Unwrap longitudes into a continuous sequence to avoid +/-180 discontinuity.
-fn unwrap_ring_longitudes(ring: &[(f64, f64)]) -> Vec<(f64, f64)> {
-    let mut out = Vec::with_capacity(ring.len());
-    if ring.is_empty() {
-        return out;
-    }
-
-    let (first_lon, first_lat) = ring[0];
-    out.push((first_lon, first_lat));
-    let mut prev_unwrapped_lon = first_lon;
-
-    for &(lon, lat) in &ring[1..] {
-        let mut adjusted = lon;
-        while adjusted - prev_unwrapped_lon > 180.0 {
-            adjusted -= 360.0;
-        }
-        while adjusted - prev_unwrapped_lon < -180.0 {
-            adjusted += 360.0;
-        }
-        out.push((adjusted, lat));
-        prev_unwrapped_lon = adjusted;
-    }
-
-    out
-}
-
-/// Ray-casting point-in-polygon test.
-/// Point and ring vertices are (lon, lat) == (x, y).
-fn point_in_ring(px: f64, py: f64, ring: &[(f64, f64)]) -> bool {
-    let mut inside = false;
-    let n = ring.len();
-    if n < 3 {
-        return false;
-    }
-    let mut j = n - 1;
-    for i in 0..n {
-        let (xi, yi) = ring[i];
-        let (xj, yj) = ring[j];
-        if ((yi > py) != (yj > py)) && (px < (xj - xi) * (py - yi) / (yj - yi) + xi) {
-            inside = !inside;
-        }
-        j = i;
-    }
-    inside
-}
+// Delegate to geo module — used by tests and polygon_bbox_f64
+use crate::geo::ring_crosses_antimeridian;
 
 // ---------------------------------------------------------------------------
 // GeoJSON parsing
@@ -1890,6 +1821,7 @@ use super::{clean_metadata, dense_node_metadata, element_metadata};
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
+    use crate::geo::{point_in_ring, point_in_ring_with_antimeridian};
     use std::io::Write as _;
     use tempfile::TempDir;
 

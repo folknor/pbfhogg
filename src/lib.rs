@@ -116,6 +116,8 @@ pub mod read;
 pub mod write;
 #[doc(hidden)]
 pub mod commands;
+pub mod geo;
+pub mod geocode_index;
 pub mod osc;
 pub(crate) mod blob_index;
 mod error;

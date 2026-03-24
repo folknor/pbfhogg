@@ -157,6 +157,16 @@ struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 // ---------------------------------------------------------------------------
 
 /// Build the reverse geocoding index from an OSM PBF file.
+///
+/// # Known limitations
+///
+/// - **Planet scale:** All intermediate data is held in RAM. Planet-scale builds
+///   (>>64 GB) require streaming to temp files and external merge sort. This
+///   implementation works for regional extracts (Denmark, Germany, etc.).
+/// - **Interpolation:** Endpoint resolution (start/end house numbers) is not yet
+///   implemented — all interpolation ways are written with start=0, end=0, making
+///   them unusable for house number interpolation at query time. They still provide
+///   nearest-street matches.
 #[allow(clippy::too_many_lines)]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
@@ -418,8 +428,10 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let cl = config.coarse_level;
 
     let (fine_addr, coarse_addr) = assign_addr_cells(&addr_points, sl, cl);
-    let (fine_street, coarse_street) = assign_seg_cells(&street_ways, sl, cl);
-    let (fine_interp, coarse_interp) = assign_seg_cells_interp(&interp_ways, sl, cl);
+    let street_node_lists: Vec<&[(i32, i32)]> = street_ways.iter().map(|w| w.nodes.as_slice()).collect();
+    let (fine_street, coarse_street) = assign_seg_cells_generic(&street_node_lists, sl, cl);
+    let interp_node_lists: Vec<&[(i32, i32)]> = interp_ways.iter().map(|w| w.nodes.as_slice()).collect();
+    let (fine_interp, coarse_interp) = assign_seg_cells_generic(&interp_node_lists, sl, cl);
     let admin_cell_entries = assign_admin_cells(&admin_polygons, config.admin_level);
 
     eprintln!("  {} fine street, {} fine addr, {} admin cell entries",
@@ -641,11 +653,74 @@ fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
             vert_out.write_all(&v.to_bytes())?;
         }
         #[allow(clippy::cast_possible_truncation)]
-        { offset += p.vertices.len() as u32; }
+        { offset += (p.vertices.len() * NODE_COORD_SIZE) as u32; }
     }
     poly_out.flush()?;
     vert_out.flush()?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// S2 cell covering for line segments
+// ---------------------------------------------------------------------------
+
+/// Cover a line segment by sampling intermediate points to find all S2 cells
+/// the segment passes through at the given level.
+///
+/// Walks the segment in steps smaller than the cell edge length, collecting
+/// all unique cell IDs. This catches cells that the segment crosses diagonally
+/// without having either endpoint inside them.
+fn cover_segment(
+    lat1_e7: i32, lon1_e7: i32,
+    lat2_e7: i32, lon2_e7: i32,
+    level: u8,
+) -> Vec<u64> {
+    let lat1 = lat1_e7 as f64 * 1e-7;
+    let lon1 = lon1_e7 as f64 * 1e-7;
+    let lat2 = lat2_e7 as f64 * 1e-7;
+    let lon2 = lon2_e7 as f64 * 1e-7;
+
+    let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
+    let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
+
+    if c1.0 == c2.0 {
+        return vec![c1.0];
+    }
+
+    // Walk intermediate points. At level 17 (~77m), step ~30m to catch all crossings.
+    // At level 14 (~620m), step ~250m. Use half the cell edge as step size.
+    let dlat = lat2 - lat1;
+    let dlon = lon2 - lon1;
+    let seg_len_deg = ((dlat as f64 * 1e-7).powi(2) + (dlon as f64 * 1e-7).powi(2)).sqrt();
+
+    // Approximate cell edge in degrees: ~180 / 2^(level/2) is a rough heuristic
+    // More precise: level 17 ≈ 0.0007°, level 14 ≈ 0.006°, level 10 ≈ 0.01°
+    let step_deg = match level {
+        17 => 0.0003,
+        14 => 0.003,
+        10 => 0.005,
+        _ => 0.001,
+    };
+
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    let steps = ((seg_len_deg / step_deg).ceil() as usize).max(2);
+
+    let mut cells = Vec::with_capacity(steps + 1);
+    cells.push(c1.0);
+
+    for i in 1..steps {
+        let t = i as f64 / steps as f64;
+        let lat = lat1 + t * (lat2 - lat1);
+        let lon = lon1 + t * (lon2 - lon1);
+        let c = CellID::from(LatLng::from_degrees(lat, lon)).parent(level as u64).0;
+        if !cells.contains(&c) {
+            cells.push(c);
+        }
+    }
+    if !cells.contains(&c2.0) {
+        cells.push(c2.0);
+    }
+    cells
 }
 
 // ---------------------------------------------------------------------------
@@ -667,56 +742,33 @@ fn assign_addr_cells(
     (fine, coarse)
 }
 
+/// Assign segment cells for a generic set of ways (used for both streets and interp).
 #[allow(clippy::cast_possible_truncation)]
-fn assign_seg_cells(
-    ways: &[RawStreetWay], fine_level: u8, coarse_level: u8,
+fn assign_seg_cells_generic(
+    node_lists: &[&[(i32, i32)]],
+    fine_level: u8,
+    coarse_level: u8,
 ) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
     let mut fine = Vec::new();
     let mut coarse = Vec::new();
-    for (way_idx, w) in ways.iter().enumerate() {
-        for (seg_idx, pair) in w.nodes.windows(2).enumerate() {
-            let ll1 = LatLng::from_degrees(pair[0].0 as f64 * 1e-7, pair[0].1 as f64 * 1e-7);
-            let ll2 = LatLng::from_degrees(pair[1].0 as f64 * 1e-7, pair[1].1 as f64 * 1e-7);
-            let c1f = CellID::from(ll1).parent(fine_level as u64).0;
-            let c2f = CellID::from(ll2).parent(fine_level as u64).0;
-            let c1c = CellID::from(ll1).parent(coarse_level as u64).0;
-            let c2c = CellID::from(ll2).parent(coarse_level as u64).0;
+    for (way_idx, nodes) in node_lists.iter().enumerate() {
+        for (seg_idx, pair) in nodes.windows(2).enumerate() {
+            let (lat1, lon1) = pair[0];
+            let (lat2, lon2) = pair[1];
 
-            fine.push(SegCellEntry { cell_id: c1f, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            if c2f != c1f {
-                fine.push(SegCellEntry { cell_id: c2f, way_index: way_idx as u32, segment_index: seg_idx as u16 });
+            for cid in cover_segment(lat1, lon1, lat2, lon2, fine_level) {
+                fine.push(SegCellEntry {
+                    cell_id: cid,
+                    way_index: way_idx as u32,
+                    segment_index: seg_idx as u16,
+                });
             }
-            coarse.push(SegCellEntry { cell_id: c1c, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            if c2c != c1c {
-                coarse.push(SegCellEntry { cell_id: c2c, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            }
-        }
-    }
-    (fine, coarse)
-}
-
-#[allow(clippy::cast_possible_truncation)]
-fn assign_seg_cells_interp(
-    ways: &[RawInterpWay], fine_level: u8, coarse_level: u8,
-) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
-    let mut fine = Vec::new();
-    let mut coarse = Vec::new();
-    for (way_idx, iw) in ways.iter().enumerate() {
-        for (seg_idx, pair) in iw.nodes.windows(2).enumerate() {
-            let ll1 = LatLng::from_degrees(pair[0].0 as f64 * 1e-7, pair[0].1 as f64 * 1e-7);
-            let ll2 = LatLng::from_degrees(pair[1].0 as f64 * 1e-7, pair[1].1 as f64 * 1e-7);
-            let c1f = CellID::from(ll1).parent(fine_level as u64).0;
-            let c2f = CellID::from(ll2).parent(fine_level as u64).0;
-            let c1c = CellID::from(ll1).parent(coarse_level as u64).0;
-            let c2c = CellID::from(ll2).parent(coarse_level as u64).0;
-
-            fine.push(SegCellEntry { cell_id: c1f, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            if c2f != c1f {
-                fine.push(SegCellEntry { cell_id: c2f, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            }
-            coarse.push(SegCellEntry { cell_id: c1c, way_index: way_idx as u32, segment_index: seg_idx as u16 });
-            if c2c != c1c {
-                coarse.push(SegCellEntry { cell_id: c2c, way_index: way_idx as u32, segment_index: seg_idx as u16 });
+            for cid in cover_segment(lat1, lon1, lat2, lon2, coarse_level) {
+                coarse.push(SegCellEntry {
+                    cell_id: cid,
+                    way_index: way_idx as u32,
+                    segment_index: seg_idx as u16,
+                });
             }
         }
     }
@@ -728,22 +780,26 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
     let mut entries = Vec::new();
 
     for (poly_idx, poly) in polygons.iter().enumerate() {
-        let mut edge_cells = std::collections::HashSet::new();
+        // Parse vertices into rings (exterior + holes) separated by RING_SENTINEL
+        let (ext_f64, hole_rings) = parse_polygon_rings(&poly.vertices);
+        if ext_f64.len() < 3 { continue; }
 
-        // Edge cells from ring segments
+        let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
+
+        // Edge cells: cover each ring segment using cover_segment
+        let mut edge_cells = std::collections::HashSet::new();
         for v in poly.vertices.windows(2) {
             if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
-            let ll1 = LatLng::from_degrees(v[0].lat_e7 as f64 * 1e-7, v[0].lon_e7 as f64 * 1e-7);
-            let ll2 = LatLng::from_degrees(v[1].lat_e7 as f64 * 1e-7, v[1].lon_e7 as f64 * 1e-7);
-            edge_cells.insert(CellID::from(ll1).parent(admin_level as u64).0);
-            edge_cells.insert(CellID::from(ll2).parent(admin_level as u64).0);
+            for cid in cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level) {
+                edge_cells.insert(cid);
+            }
         }
 
         for &cid in &edge_cells {
             entries.push(AdminCellEntry { cell_id: cid, poly_index: poly_idx as u32, is_interior: false });
         }
 
-        // Interior cells: flood-fill from centroid
+        // Interior cells: flood-fill from centroid using point_in_polygon (with holes)
         let exterior_end = poly.vertices.iter()
             .position(|v| *v == RING_SENTINEL)
             .unwrap_or(poly.vertices.len());
@@ -758,11 +814,8 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
         let clat = sum_lat as f64 / count as f64 * 1e-7;
         let clon = sum_lon as f64 / count as f64 * 1e-7;
 
-        let ext_f64: Vec<(f64, f64)> = exterior.iter()
-            .map(|v| (v.lon_e7 as f64 * 1e-7, v.lat_e7 as f64 * 1e-7))
-            .collect();
-
-        if !crate::geo::point_in_ring(clon, clat, &ext_f64) { continue; }
+        // Centroid must be inside the polygon (exterior AND not in any hole)
+        if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) { continue; }
 
         let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
         let mut visited = std::collections::HashSet::new();
@@ -774,7 +827,10 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
             if edge_cells.contains(&cell.0) { continue; }
 
             let center_ll = s2::latlng::LatLng::from(cell);
-            if crate::geo::point_in_ring(center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64) {
+            // Test with holes — cells inside enclaves are NOT interior
+            if crate::geo::point_in_polygon(
+                center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64, &hole_slices,
+            ) {
                 entries.push(AdminCellEntry {
                     cell_id: cell.0, poly_index: poly_idx as u32, is_interior: true,
                 });
@@ -788,6 +844,29 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
         }
     }
     entries
+}
+
+/// Parse polygon vertices (with sentinel separators) into exterior + hole rings as f64.
+fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+    let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut current: Vec<(f64, f64)> = Vec::new();
+    for v in vertices {
+        if *v == RING_SENTINEL {
+            if current.len() >= 3 {
+                rings.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        } else {
+            current.push((v.lon_e7 as f64 * 1e-7, v.lat_e7 as f64 * 1e-7));
+        }
+    }
+    if current.len() >= 3 {
+        rings.push(current);
+    }
+    let exterior = rings.first().cloned().unwrap_or_default();
+    let holes = if rings.len() > 1 { rings[1..].to_vec() } else { Vec::new() };
+    (exterior, holes)
 }
 
 // ---------------------------------------------------------------------------

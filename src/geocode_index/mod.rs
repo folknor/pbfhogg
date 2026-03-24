@@ -12,3 +12,6 @@ pub mod format;
 
 #[cfg(feature = "geocode-reader")]
 pub mod reader;
+
+#[cfg(feature = "commands")]
+pub mod builder;

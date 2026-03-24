@@ -1091,6 +1091,6 @@ fn radians_sq_to_meters(rad_sq: f64) -> f64 {
     rad_sq.sqrt() * geo::EARTH_RADIUS_M
 }
 
-fn nonzero_string<'a>(reader: &'a Reader, offset: u32) -> Option<&'a str> {
+fn nonzero_string(reader: &Reader, offset: u32) -> Option<&str> {
     if offset == 0 { None } else { Some(reader.read_string(offset)) }
 }

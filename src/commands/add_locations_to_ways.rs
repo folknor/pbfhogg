@@ -122,7 +122,7 @@ const _: () = assert!(std::mem::size_of::<usize>() >= 8);
 impl DenseMmapIndex {
     /// Look up a node's coordinates by ID. Returns `None` for unset entries.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    fn get(&self, node_id: i64) -> Option<(i32, i32)> {
+    pub(crate) fn get(&self, node_id: i64) -> Option<(i32, i32)> {
         if node_id < 0 {
             return None;
         }
@@ -146,7 +146,7 @@ impl DenseMmapIndex {
         Some((lat, lon))
     }
 
-    fn new(capacity: usize, scratch_dir: &Path) -> Result<Self> {
+    pub(crate) fn new(capacity: usize, scratch_dir: &Path) -> Result<Self> {
         let byte_len = capacity
             .checked_mul(ENTRY_SIZE)
             .ok_or("dense index capacity overflow")?;
@@ -184,6 +184,21 @@ impl DenseMmapIndex {
             })?
         };
         Ok(Self { mmap, _file: file, capacity })
+    }
+
+    /// Insert a node's coordinates (sequential use only).
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub(crate) fn set(&mut self, node_id: i64, lat: i32, lon: i32) {
+        if node_id < 0 {
+            return;
+        }
+        let idx = node_id as usize;
+        if idx >= self.capacity {
+            return;
+        }
+        let offset = idx * ENTRY_SIZE;
+        let packed = (lat as u32 as u64) | ((lon as u32 as u64) << 32);
+        self.mmap[offset..offset + ENTRY_SIZE].copy_from_slice(&packed.to_le_bytes());
     }
 }
 

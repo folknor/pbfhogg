@@ -10,6 +10,5 @@
 
 pub mod format;
 
-// Reader requires S2 for cell ID computation at query time.
-// #[cfg(feature = "geocode-reader")]
-// pub mod reader;
+#[cfg(feature = "geocode-reader")]
+pub mod reader;

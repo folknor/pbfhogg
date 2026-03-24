@@ -117,7 +117,7 @@ pub mod write;
 #[doc(hidden)]
 pub mod commands;
 pub mod geo;
-pub mod geocode_index;
+pub mod geocode_index;  // format is always available; reader requires geocode-reader feature
 pub mod osc;
 pub(crate) mod blob_index;
 mod error;

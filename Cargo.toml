@@ -56,7 +56,8 @@ categories = ["parser-implementations", "encoding", "science::geo"]
 
 [features]
 default = ["commands"]
-commands = ["dep:serde_json", "dep:roaring"]
+geocode-reader = ["dep:s2"]
+commands = ["dep:serde_json", "dep:roaring", "geocode-reader"]
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
 linux-direct-io = ["dep:libc"]
@@ -74,6 +75,7 @@ hotpath = "0.14"
 quick-xml = "0.39"
 serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
+s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7", optional = true }
 libc = { version = "0.2", optional = true }
 

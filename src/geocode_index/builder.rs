@@ -438,17 +438,25 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         fine_street.len(), fine_addr.len(), admin_cell_entries.len());
 
     // Sort and write cell indices
+    let mut fine_street = fine_street;
+    let mut fine_addr = fine_addr;
+    let mut fine_interp = fine_interp;
+    let mut coarse_street = coarse_street;
+    let mut coarse_addr = coarse_addr;
+    let mut coarse_interp = coarse_interp;
+    let mut admin_cell_entries = admin_cell_entries;
+
     let fine_count = write_merged_geo_index(
         &config.output_dir, FILE_GEO_CELLS, FILE_STREET_ENTRIES,
         FILE_ADDR_ENTRIES, FILE_INTERP_ENTRIES,
-        &mut { fine_street }, &mut { fine_addr }, &mut { fine_interp },
+        &mut fine_street, &mut fine_addr, &mut fine_interp,
     )?;
     let coarse_count = write_merged_geo_index(
         &config.output_dir, FILE_COARSE_GEO_CELLS, FILE_COARSE_STREET_ENTRIES,
         FILE_COARSE_ADDR_ENTRIES, FILE_COARSE_INTERP_ENTRIES,
-        &mut { coarse_street }, &mut { coarse_addr }, &mut { coarse_interp },
+        &mut coarse_street, &mut coarse_addr, &mut coarse_interp,
     )?;
-    let admin_count = write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
+    let admin_count = write_admin_index(&config.output_dir, &mut admin_cell_entries)?;
 
     // Write header
     #[allow(clippy::cast_possible_truncation)]
@@ -471,6 +479,20 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         admin_cell_count: admin_count,
     };
     std::fs::write(config.output_dir.join(FILE_HEADER), header.to_bytes())?;
+
+    // Build-time smoke test: re-open with Reader and verify a query works
+    #[cfg(feature = "geocode-reader")]
+    {
+        eprintln!("  Running smoke test...");
+        let test_reader = super::reader::Reader::open(&config.output_dir)?;
+        if !addr_points.is_empty() {
+            let pt = &addr_points[0];
+            let result = test_reader.query(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+            if result.address.is_none() && result.street.is_none() {
+                eprintln!("  WARNING: smoke test query returned no address or street match");
+            }
+        }
+    }
 
     let elapsed = start_time.elapsed();
     eprintln!("Done in {:.1}s", elapsed.as_secs_f64());

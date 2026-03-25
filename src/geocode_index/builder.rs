@@ -290,6 +290,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     #[cfg(feature = "hotpath")]
     let pass1_ms = pass1_start.elapsed().as_millis();
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass1_kb={rss}"); }
 
     // -----------------------------------------------------------------------
     // Pass 2: Nodes + Ways (fused single scan, pipelined)
@@ -446,13 +448,19 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     }
     eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
         addr_points.len(), street_ways.len(), interp_ways.len(), way_geom.len());
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass2_scan_kb={rss}"); }
     drop(needed_admin_ways);
     drop(node_index);
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass2_drop_kb={rss}"); }
 
     // Ring assembly + simplification
     let admin_polygons = assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_assembly_kb={rss}"); }
 
     #[cfg(feature = "hotpath")]
     let pass2_ms = pass2_start.elapsed().as_millis();
@@ -464,6 +472,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         &mut interp_ways, &addr_points, &strings, config.street_level,
     );
     eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_interp_kb={rss}"); }
 
     // -----------------------------------------------------------------------
     // Pass 3: S2 cell assignment + write index files
@@ -490,6 +500,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     eprintln!("  {} fine street, {} fine addr, {} admin cell entries",
         fine_street.len(), fine_addr.len(), admin_cell_entries.len());
+    #[cfg(feature = "hotpath")]
+    if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_cell_assign_kb={rss}"); }
 
     // Sort and write cell indices
     let mut fine_street = fine_street;

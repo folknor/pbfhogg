@@ -213,11 +213,87 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut interp_ways: Vec<RawInterpWay> = Vec::new();
 
     // -----------------------------------------------------------------------
-    // Pass 1: Nodes — address points + dense coordinate index
+    // Pass 1: Relations — collect admin boundary metadata + way member IDs
+    // (Runs first so we know which way IDs to collect in pass 3.)
     // -----------------------------------------------------------------------
-    eprintln!("Pass 1: Nodes...");
+    eprintln!("Pass 1: Relations...");
     #[cfg(feature = "hotpath")]
     let pass1_start = std::time::Instant::now();
+
+    let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
+    {
+        let reader = ElementReader::from_path(&config.input_path)?;
+        reader.with_blob_filter(BlobFilter::only_relations()).for_each(|element| {
+            if let Element::Relation(rel) = element {
+                let mut boundary: Option<&str> = None;
+                let mut level_str: Option<&str> = None;
+                let mut rel_name: Option<&str> = None;
+                let mut cc: Option<&str> = None;
+                let mut postal: Option<&str> = None;
+
+                for (k, v) in rel.tags() {
+                    match k {
+                        "boundary" => boundary = Some(v),
+                        "admin_level" => level_str = Some(v),
+                        "name" => rel_name = Some(v),
+                        "ISO3166-1:alpha2" => cc = Some(v),
+                        "postal_code" => postal = Some(v),
+                        _ => {}
+                    }
+                }
+
+                let Some(b) = boundary else { return };
+                let (is_admin, is_postal) = (b == "administrative", b == "postal_code");
+                if !is_admin && !is_postal { return; }
+
+                let admin_level = if is_admin {
+                    let Some(ls) = level_str else { return };
+                    let Ok(l) = ls.parse::<u8>() else { return };
+                    if !(2..=10).contains(&l) { return; }
+                    l
+                } else { 11 };
+
+                let name_str = if is_postal { postal.or(rel_name) } else { rel_name };
+                let Some(ns) = name_str else { return };
+
+                let name_offset = strings.intern(ns);
+                let cc_offset = if admin_level == 2 { cc.map_or(0, |c| strings.intern(c)) } else { 0 };
+
+                let mut outer = Vec::new();
+                let mut inner = Vec::new();
+                for m in rel.members() {
+                    if let MemberId::Way(wid) = m.id {
+                        let role = m.role().unwrap_or("");
+                        if role == "inner" { inner.push(wid); }
+                        else { outer.push(wid); }
+                    }
+                }
+
+                admin_relations.push(RawAdminRelation {
+                    admin_level, name_offset, country_code_offset: cc_offset,
+                    outer_way_ids: outer, inner_way_ids: inner,
+                });
+            }
+        })?;
+    }
+    eprintln!("  {} admin relations", admin_relations.len());
+
+    // Build set of way IDs needed for admin boundary geometry
+    let mut needed_admin_ways = crate::commands::id_set_dense::IdSetDense::new();
+    for r in &admin_relations {
+        for &wid in &r.outer_way_ids { needed_admin_ways.set(wid); }
+        for &wid in &r.inner_way_ids { needed_admin_ways.set(wid); }
+    }
+
+    #[cfg(feature = "hotpath")]
+    let pass1_ms = pass1_start.elapsed().as_millis();
+
+    // -----------------------------------------------------------------------
+    // Pass 2: Nodes — address points + dense coordinate index
+    // -----------------------------------------------------------------------
+    eprintln!("Pass 2: Nodes...");
+    #[cfg(feature = "hotpath")]
+    let pass2_start = std::time::Instant::now();
     let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
 
     {
@@ -253,23 +329,34 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     eprintln!("  {} address points from nodes", addr_points.len());
 
     #[cfg(feature = "hotpath")]
-    let pass1_ms = pass1_start.elapsed().as_millis();
+    let pass2_ms = pass2_start.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
-    // Pass 2: Ways — streets, building addresses, interpolation
+    // Pass 3: Ways — streets, buildings, interpolation, AND admin geometry
+    // (Single way scan does all way processing, including admin boundary
+    // way geometry resolution that was previously a separate scan.)
     // -----------------------------------------------------------------------
-    eprintln!("Pass 2: Ways...");
+    eprintln!("Pass 3: Ways...");
     #[cfg(feature = "hotpath")]
-    let pass2_start = std::time::Instant::now();
+    let pass3_start = std::time::Instant::now();
 
+    let mut way_geom: HashMap<i64, Vec<(i32, i32)>> = HashMap::new();
     {
         let reader = ElementReader::from_path(&config.input_path)?;
         reader.with_blob_filter(BlobFilter::only_ways()).for_each(|element| {
             if let Element::Way(way) = element {
+                let way_id = way.id();
+                let is_admin_way = needed_admin_ways.get(way_id);
+
                 let coords: Vec<(i32, i32)> = way.refs()
                     .filter_map(|nid| node_index.get(nid))
                     .collect();
                 if coords.is_empty() { return; }
+
+                // Collect admin way geometry if needed
+                if is_admin_way {
+                    way_geom.insert(way_id, coords.clone());
+                }
 
                 let mut highway: Option<&str> = None;
                 let mut name: Option<&str> = None;
@@ -343,100 +430,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             }
         })?;
     }
-    eprintln!("  {} streets, {} interp, {} total addr", street_ways.len(), interp_ways.len(), addr_points.len());
-
-    #[cfg(feature = "hotpath")]
-    let pass2_ms = pass2_start.elapsed().as_millis();
-
-    // -----------------------------------------------------------------------
-    // Pass 3: Relations — admin boundaries
-    // -----------------------------------------------------------------------
-    eprintln!("Pass 3: Admin boundaries...");
-    #[cfg(feature = "hotpath")]
-    let pass3_start = std::time::Instant::now();
-
-    let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
-    {
-        let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_relations()).for_each(|element| {
-            if let Element::Relation(rel) = element {
-                let mut boundary: Option<&str> = None;
-                let mut level_str: Option<&str> = None;
-                let mut rel_name: Option<&str> = None;
-                let mut cc: Option<&str> = None;
-                let mut postal: Option<&str> = None;
-
-                for (k, v) in rel.tags() {
-                    match k {
-                        "boundary" => boundary = Some(v),
-                        "admin_level" => level_str = Some(v),
-                        "name" => rel_name = Some(v),
-                        "ISO3166-1:alpha2" => cc = Some(v),
-                        "postal_code" => postal = Some(v),
-                        _ => {}
-                    }
-                }
-
-                let Some(b) = boundary else { return };
-                let (is_admin, is_postal) = (b == "administrative", b == "postal_code");
-                if !is_admin && !is_postal { return; }
-
-                let admin_level = if is_admin {
-                    let Some(ls) = level_str else { return };
-                    let Ok(l) = ls.parse::<u8>() else { return };
-                    if !(2..=10).contains(&l) { return; }
-                    l
-                } else { 11 };
-
-                let name_str = if is_postal { postal.or(rel_name) } else { rel_name };
-                let Some(ns) = name_str else { return };
-
-                let name_offset = strings.intern(ns);
-                let cc_offset = if admin_level == 2 { cc.map_or(0, |c| strings.intern(c)) } else { 0 };
-
-                let mut outer = Vec::new();
-                let mut inner = Vec::new();
-                for m in rel.members() {
-                    if let MemberId::Way(wid) = m.id {
-                        let role = m.role().unwrap_or("");
-                        if role == "inner" { inner.push(wid); }
-                        else { outer.push(wid); }
-                    }
-                }
-
-                admin_relations.push(RawAdminRelation {
-                    admin_level, name_offset, country_code_offset: cc_offset,
-                    outer_way_ids: outer, inner_way_ids: inner,
-                });
-            }
-        })?;
-    }
-    eprintln!("  {} admin relations", admin_relations.len());
-
-    // Scan 3b: resolve way geometries
-    let mut needed = crate::commands::id_set_dense::IdSetDense::new();
-    for r in &admin_relations {
-        for &wid in &r.outer_way_ids { needed.set(wid); }
-        for &wid in &r.inner_way_ids { needed.set(wid); }
-    }
-
-    let mut way_geom: HashMap<i64, Vec<(i32, i32)>> = HashMap::new();
-    {
-        let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_ways()).for_each(|element| {
-            if let Element::Way(way) = element {
-                if !needed.get(way.id()) { return; }
-                let coords: Vec<(i32, i32)> = way.refs()
-                    .filter_map(|nid| node_index.get(nid))
-                    .collect();
-                if !coords.is_empty() {
-                    way_geom.insert(way.id(), coords);
-                }
-            }
-        })?;
-    }
-    eprintln!("  {} way geometries resolved", way_geom.len());
-    drop(needed);
+    eprintln!("  {} streets, {} interp, {} total addr, {} admin way geoms",
+        street_ways.len(), interp_ways.len(), addr_points.len(), way_geom.len());
+    drop(needed_admin_ways);
     drop(node_index);
 
     // Ring assembly + simplification

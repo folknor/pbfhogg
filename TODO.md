@@ -117,6 +117,64 @@ before release.
   **Planet validation still pending.** Strip `eprintln!` instrumentation
   in `cat_filtered` after planet run.
 
+### Cross-pipeline optimization audit (commit `398b1a4`)
+
+Findings from code audit + outside review of transferring geocode builder
+optimizations (block-pipelined + skip_metadata, tag-first classification,
+FxHash, pass fusion, clone/alloc cleanup) to other commands.
+
+**getid** (moderate impact, low risk):
+- [ ] Replace `dep_node_ids: BTreeSet<i64>` with `IdSetDense` in `getid_with_refs`
+  (`src/commands/getid.rs:289`). Currently O(log n) per node lookup in pass 2;
+  `IdSetDense` gives O(1). Matters for `--add-referenced` with large way ID sets.
+  Also consider `strip_tags_ids: Option<&BTreeSet<i64>>`.
+- [ ] Use `elements_skip_metadata()` in `getid_with_refs` pass 1 (line 297) and
+  `parse_ids_from_pbf` (line 141). Both only need IDs/refs, not metadata.
+
+**merge** (low impact, low risk):
+- [ ] Use `elements_skip_metadata()` in `block_overlaps_diff` (`src/commands/merge.rs:547`).
+  Only accesses element IDs. Rare code path (blobs that pass coarse range check).
+
+**extract --smart** (low-medium impact, medium risk):
+- [ ] Audit for any remaining std HashMap/HashSet in smart-mode dependency walks.
+- [ ] Verify all classification passes use `elements_skip_metadata()` (believed done).
+- [ ] Check for opportunities to reduce repeated full-file traversals in relation
+  closure expansion.
+
+**tags_filter** (low impact, low risk):
+- [ ] Verify no refs/dependencies resolved before cheap tag rejection in default mode.
+- [ ] Audit for std hash containers in hot paths (believed cold-path only).
+
+**add-locations-to-ways** (low impact, low risk):
+- [ ] Audit for tag-first rejection opportunities in rewrite/decode phases where
+  unconditional per-way location resolution may still occur.
+- [ ] Check for remaining std hash containers in batch processing helpers.
+
+**inspect** (negligible impact):
+- [ ] Use `elements_skip_metadata()` in full-decode path when `--extended` is not set
+  and `--locations` is. Minor — index-only fast path already skips decompression.
+
+**check_refs** (no action):
+- Already consumer-bound (RoaringTreemap insertions, decode workers idle at 1% CPU).
+  Switching to block-pipelined + skip_metadata would not reduce wall time.
+
+**sort, cat** (no action):
+- Already optimal — blob-level passthrough, single-pass, or need full metadata for output.
+
+### Geocode index builder: planet-scale architecture
+
+The builder currently holds all intermediate data in RAM. Denmark (309 MB RSS)
+and Germany (~4 GB RSS) work. Planet would OOM on a 30 GB host.
+
+- [ ] Stream street_ways/interp_ways/addr_points to temp files during pass 2
+  instead of retaining in memory
+- [ ] Compute S2 cell entries during pass 2 (while coordinates are hot) and
+  append unsorted to temp files
+- [ ] External merge sort for cell entries instead of in-memory sort
+- [ ] Referenced-node-only dense index (prefilter node IDs from ways, as ALTW
+  does) instead of indexing every node
+- [ ] Chunk-sort cell entries on disk (write sorted chunks, k-way merge)
+
 ### Other
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)

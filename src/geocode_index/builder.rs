@@ -129,6 +129,8 @@ struct RawInterpWay {
     street_offset: u32,
     interpolation_type: u8,
     nodes: Vec<(i32, i32)>,
+    start_number: u32,
+    end_number: u32,
 }
 
 struct RawAdminRelation {
@@ -163,10 +165,6 @@ struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 /// - **Planet scale:** All intermediate data is held in RAM. Planet-scale builds
 ///   (>>64 GB) require streaming to temp files and external merge sort. This
 ///   implementation works for regional extracts (Denmark, Germany, etc.).
-/// - **Interpolation:** Endpoint resolution (start/end house numbers) is not yet
-///   implemented — all interpolation ways are written with start=0, end=0, making
-///   them unusable for house number interpolation at query time. They still provide
-///   nearest-street matches.
 #[allow(clippy::too_many_lines)]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
@@ -288,6 +286,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                             street_offset: strings.intern(st),
                             interpolation_type: itype,
                             nodes: coords,
+                            start_number: 0,
+                            end_number: 0,
                         });
                     }
                     return;
@@ -422,6 +422,14 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_polygons = assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
+
+    // -----------------------------------------------------------------------
+    // Interpolation endpoint resolution
+    // -----------------------------------------------------------------------
+    let resolved = resolve_interpolation_endpoints(
+        &mut interp_ways, &addr_points, &strings, config.street_level,
+    );
+    eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
 
     // -----------------------------------------------------------------------
     // Pass 4: S2 cell assignment + write index files
@@ -605,6 +613,148 @@ fn assemble_admin_polygons(
 }
 
 // ---------------------------------------------------------------------------
+// Interpolation endpoint resolution
+// ---------------------------------------------------------------------------
+
+/// Parse leading digits from a house number string (e.g., "42" from "42A").
+fn parse_house_number(s: &str) -> u32 {
+    let mut n = 0u32;
+    for b in s.bytes() {
+        if b.is_ascii_digit() {
+            n = n.saturating_mul(10).saturating_add(u32::from(b - b'0'));
+        } else {
+            break;
+        }
+    }
+    n
+}
+
+/// Resolve start/end house numbers for interpolation ways by matching
+/// their endpoints against nearby address points with the same street name.
+/// Returns the count of successfully resolved ways.
+#[allow(clippy::cast_possible_truncation)]
+fn resolve_interpolation_endpoints(
+    interp_ways: &mut [RawInterpWay],
+    addr_points: &[RawAddrPoint],
+    strings: &StringPool,
+    street_level: u8,
+) -> u32 {
+    if interp_ways.is_empty() || addr_points.is_empty() {
+        return 0;
+    }
+
+    // Build spatial index: S2 cell at street_level -> list of addr point indices
+    let mut cell_to_addrs: HashMap<u64, Vec<u32>> = HashMap::new();
+    for (idx, pt) in addr_points.iter().enumerate() {
+        let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+        let cell = CellID::from(ll).parent(street_level as u64).0;
+        cell_to_addrs.entry(cell).or_default().push(idx as u32);
+    }
+
+    let mut resolved = 0u32;
+
+    for iw in interp_ways.iter_mut() {
+        if iw.nodes.len() < 2 {
+            continue;
+        }
+
+        let start_coord = iw.nodes[0];
+        let end_coord = iw.nodes[iw.nodes.len() - 1];
+
+        let start_hn = find_endpoint_house_number(
+            start_coord, iw.street_offset, addr_points, strings, &cell_to_addrs, street_level,
+        );
+        let end_hn = find_endpoint_house_number(
+            end_coord, iw.street_offset, addr_points, strings, &cell_to_addrs, street_level,
+        );
+
+        if let (Some(s), Some(e)) = (start_hn, end_hn) {
+            iw.start_number = s;
+            iw.end_number = e;
+            resolved += 1;
+        }
+    }
+
+    resolved
+}
+
+/// Find the house number of an address point near an interpolation endpoint.
+/// Prefers coordinate-coincident points, falls back to nearest same-street point.
+#[allow(clippy::cast_possible_truncation)]
+fn find_endpoint_house_number(
+    endpoint: (i32, i32),
+    street_offset: u32,
+    addr_points: &[RawAddrPoint],
+    strings: &StringPool,
+    cell_to_addrs: &HashMap<u64, Vec<u32>>,
+    street_level: u8,
+) -> Option<u32> {
+    let (lat_e7, lon_e7) = endpoint;
+    let ll = LatLng::from_degrees(lat_e7 as f64 * 1e-7, lon_e7 as f64 * 1e-7);
+    let center = CellID::from(ll).parent(street_level as u64);
+
+    // Search center cell + neighbors
+    let mut best_idx: Option<u32> = None;
+    let mut best_dist_sq = i64::MAX;
+    let mut found_exact = false;
+
+    let mut check_cell = |cell_id: u64| {
+        let Some(indices) = cell_to_addrs.get(&cell_id) else { return };
+        for &idx in indices {
+            let pt = &addr_points[idx as usize];
+            // Must be same street
+            if pt.street_offset != street_offset {
+                continue;
+            }
+            let dlat = (pt.lat_e7 - lat_e7) as i64;
+            let dlon = (pt.lon_e7 - lon_e7) as i64;
+            let dist_sq = dlat * dlat + dlon * dlon;
+
+            // Coordinate-coincident (within 1 decimicrodegree ≈ 0.01m)
+            let is_exact = dlat.abs() <= 1 && dlon.abs() <= 1;
+
+            if is_exact && !found_exact {
+                // First exact match beats any previous non-exact
+                found_exact = true;
+                best_idx = Some(idx);
+                best_dist_sq = dist_sq;
+            } else if is_exact || !found_exact {
+                // Among same category (exact or non-exact), pick nearest
+                if dist_sq < best_dist_sq {
+                    best_idx = Some(idx);
+                    best_dist_sq = dist_sq;
+                }
+            }
+        }
+    };
+
+    check_cell(center.0);
+    for n in center.all_neighbors(street_level as u64) {
+        check_cell(n.0);
+    }
+
+    let idx = best_idx?;
+    let pt = &addr_points[idx as usize];
+    let hn_str = read_string_from_pool(strings, pt.housenumber_offset);
+    let hn = parse_house_number(hn_str);
+    if hn > 0 { Some(hn) } else { None }
+}
+
+/// Read a null-terminated string from the pool by offset.
+fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
+    if offset == 0 {
+        return "";
+    }
+    let start = offset as usize;
+    if start >= pool.data.len() {
+        return "";
+    }
+    let remaining = &pool.data[start..];
+    let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
+    std::str::from_utf8(&remaining[..end]).unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
 // Data file writers
 // ---------------------------------------------------------------------------
 
@@ -653,7 +803,7 @@ fn write_interp_data(dir: &Path, ways: &[RawInterpWay]) -> Result<()> {
         let rec = InterpWay {
             node_offset: offset,
             street_offset: iw.street_offset,
-            start_number: 0, end_number: 0, // TODO: endpoint resolution
+            start_number: iw.start_number, end_number: iw.end_number,
             node_count: iw.nodes.len().min(u16::MAX as usize) as u16,
             interpolation_type: iw.interpolation_type,
         };

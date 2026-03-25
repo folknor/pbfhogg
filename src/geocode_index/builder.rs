@@ -18,6 +18,14 @@ use super::format::*;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
+/// Read current RSS in kilobytes from `/proc/self/statm`.
+#[cfg(feature = "hotpath")]
+fn read_rss_kb() -> Option<u64> {
+    let statm = std::fs::read_to_string("/proc/self/statm").ok()?;
+    let pages: u64 = statm.split_whitespace().nth(1)?.parse().ok()?;
+    Some(pages * 4) // pages × 4096 / 1024
+}
+
 // ---------------------------------------------------------------------------
 // Highway exclusion list
 // ---------------------------------------------------------------------------
@@ -166,6 +174,7 @@ struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 ///   (>>64 GB) require streaming to temp files and external merge sort. This
 ///   implementation works for regional extracts (Denmark, Germany, etc.).
 #[allow(clippy::too_many_lines)]
+#[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
 
@@ -207,6 +216,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Pass 1: Nodes — address points + dense coordinate index
     // -----------------------------------------------------------------------
     eprintln!("Pass 1: Nodes...");
+    #[cfg(feature = "hotpath")]
+    let pass1_start = std::time::Instant::now();
     let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
 
     {
@@ -241,10 +252,15 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     }
     eprintln!("  {} address points from nodes", addr_points.len());
 
+    #[cfg(feature = "hotpath")]
+    let pass1_ms = pass1_start.elapsed().as_millis();
+
     // -----------------------------------------------------------------------
     // Pass 2: Ways — streets, building addresses, interpolation
     // -----------------------------------------------------------------------
     eprintln!("Pass 2: Ways...");
+    #[cfg(feature = "hotpath")]
+    let pass2_start = std::time::Instant::now();
 
     {
         let reader = ElementReader::from_path(&config.input_path)?;
@@ -329,10 +345,15 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     }
     eprintln!("  {} streets, {} interp, {} total addr", street_ways.len(), interp_ways.len(), addr_points.len());
 
+    #[cfg(feature = "hotpath")]
+    let pass2_ms = pass2_start.elapsed().as_millis();
+
     // -----------------------------------------------------------------------
     // Pass 3: Relations — admin boundaries
     // -----------------------------------------------------------------------
     eprintln!("Pass 3: Admin boundaries...");
+    #[cfg(feature = "hotpath")]
+    let pass3_start = std::time::Instant::now();
 
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
@@ -423,6 +444,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
 
+    #[cfg(feature = "hotpath")]
+    let pass3_ms = pass3_start.elapsed().as_millis();
+
     // -----------------------------------------------------------------------
     // Interpolation endpoint resolution
     // -----------------------------------------------------------------------
@@ -435,6 +459,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Pass 4: S2 cell assignment + write index files
     // -----------------------------------------------------------------------
     eprintln!("Pass 4: S2 cells + write...");
+    #[cfg(feature = "hotpath")]
+    let pass4_start = std::time::Instant::now();
 
     // Write data files
     write_street_data(&config.output_dir, &street_ways)?;
@@ -514,8 +540,28 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         }
     }
 
+    #[cfg(feature = "hotpath")]
+    let pass4_ms = pass4_start.elapsed().as_millis();
+
     let elapsed = start_time.elapsed();
     eprintln!("Done in {:.1}s", elapsed.as_secs_f64());
+
+    #[cfg(feature = "hotpath")]
+    {
+        eprintln!("pass1_nodes_ms={pass1_ms}");
+        eprintln!("pass2_ways_ms={pass2_ms}");
+        eprintln!("pass3_admin_ms={pass3_ms}");
+        eprintln!("pass4_cells_ms={pass4_ms}");
+        eprintln!("addr_points={}", addr_points.len());
+        eprintln!("street_ways={}", street_ways.len());
+        eprintln!("interp_ways={}", interp_ways.len());
+        eprintln!("admin_polygons={}", admin_polygons.len());
+        eprintln!("strings_bytes={}", strings.data.len());
+        eprintln!("strings_unique={}", strings.index.len());
+        if let Some(rss_kb) = read_rss_kb() {
+            eprintln!("peak_rss_kb={rss_kb}");
+        }
+    }
 
     #[allow(clippy::cast_possible_truncation)]
     Ok(BuildStats {
@@ -533,6 +579,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 // Admin polygon assembly
 // ---------------------------------------------------------------------------
 
+#[hotpath::measure]
 fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
     way_geom: &HashMap<i64, Vec<(i32, i32)>>,
@@ -633,6 +680,7 @@ fn parse_house_number(s: &str) -> u32 {
 /// their endpoints against nearby address points with the same street name.
 /// Returns the count of successfully resolved ways.
 #[allow(clippy::cast_possible_truncation)]
+#[hotpath::measure]
 fn resolve_interpolation_endpoints(
     interp_ways: &mut [RawInterpWay],
     addr_points: &[RawAddrPoint],
@@ -928,6 +976,7 @@ fn assign_addr_cells(
 
 /// Assign segment cells for a generic set of ways (used for both streets and interp).
 #[allow(clippy::cast_possible_truncation)]
+#[hotpath::measure]
 fn assign_seg_cells_generic(
     node_lists: &[&[(i32, i32)]],
     fine_level: u8,
@@ -960,6 +1009,7 @@ fn assign_seg_cells_generic(
 }
 
 #[allow(clippy::cast_possible_truncation)]
+#[hotpath::measure]
 fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<AdminCellEntry> {
     let mut entries = Vec::new();
 
@@ -1058,6 +1108,7 @@ fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64
 // Cell index writers
 // ---------------------------------------------------------------------------
 
+#[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 fn write_merged_geo_index(
     dir: &Path, cells_file: &str, street_file: &str, addr_file: &str, interp_file: &str,

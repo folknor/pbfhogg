@@ -3,7 +3,6 @@
 //! Reads an OSM PBF file in multiple passes and writes the set of binary index
 //! files described in `notes/reverse-geocoding-spec.md` section 4.
 
-use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
@@ -223,57 +222,61 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
         let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_relations()).for_each_pipelined(|element| {
-            if let Element::Relation(rel) = element {
-                let mut boundary: Option<&str> = None;
-                let mut level_str: Option<&str> = None;
-                let mut rel_name: Option<&str> = None;
-                let mut cc: Option<&str> = None;
-                let mut postal: Option<&str> = None;
+        reader.with_blob_filter(BlobFilter::only_relations())
+            .for_each_block_pipelined(|block| {
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(rel) = element {
+                    let mut boundary: Option<&str> = None;
+                    let mut level_str: Option<&str> = None;
+                    let mut rel_name: Option<&str> = None;
+                    let mut cc: Option<&str> = None;
+                    let mut postal: Option<&str> = None;
 
-                for (k, v) in rel.tags() {
-                    match k {
-                        "boundary" => boundary = Some(v),
-                        "admin_level" => level_str = Some(v),
-                        "name" => rel_name = Some(v),
-                        "ISO3166-1:alpha2" => cc = Some(v),
-                        "postal_code" => postal = Some(v),
-                        _ => {}
+                    for (k, v) in rel.tags() {
+                        match k {
+                            "boundary" => boundary = Some(v),
+                            "admin_level" => level_str = Some(v),
+                            "name" => rel_name = Some(v),
+                            "ISO3166-1:alpha2" => cc = Some(v),
+                            "postal_code" => postal = Some(v),
+                            _ => {}
+                        }
                     }
-                }
 
-                let Some(b) = boundary else { return };
-                let (is_admin, is_postal) = (b == "administrative", b == "postal_code");
-                if !is_admin && !is_postal { return; }
+                    let Some(b) = boundary else { continue };
+                    let (is_admin, is_postal) = (b == "administrative", b == "postal_code");
+                    if !is_admin && !is_postal { continue; }
 
-                let admin_level = if is_admin {
-                    let Some(ls) = level_str else { return };
-                    let Ok(l) = ls.parse::<u8>() else { return };
-                    if !(2..=10).contains(&l) { return; }
-                    l
-                } else { 11 };
+                    let admin_level = if is_admin {
+                        let Some(ls) = level_str else { continue };
+                        let Ok(l) = ls.parse::<u8>() else { continue };
+                        if !(2..=10).contains(&l) { continue; }
+                        l
+                    } else { 11 };
 
-                let name_str = if is_postal { postal.or(rel_name) } else { rel_name };
-                let Some(ns) = name_str else { return };
+                    let name_str = if is_postal { postal.or(rel_name) } else { rel_name };
+                    let Some(ns) = name_str else { continue };
 
-                let name_offset = strings.intern(ns);
-                let cc_offset = if admin_level == 2 { cc.map_or(0, |c| strings.intern(c)) } else { 0 };
+                    let name_offset = strings.intern(ns);
+                    let cc_offset = if admin_level == 2 { cc.map_or(0, |c| strings.intern(c)) } else { 0 };
 
-                let mut outer = Vec::new();
-                let mut inner = Vec::new();
-                for m in rel.members() {
-                    if let MemberId::Way(wid) = m.id {
-                        let role = m.role().unwrap_or("");
-                        if role == "inner" { inner.push(wid); }
-                        else { outer.push(wid); }
+                    let mut outer = Vec::new();
+                    let mut inner = Vec::new();
+                    for m in rel.members() {
+                        if let MemberId::Way(wid) = m.id {
+                            let role = m.role().unwrap_or("");
+                            if role == "inner" { inner.push(wid); }
+                            else { outer.push(wid); }
+                        }
                     }
-                }
 
-                admin_relations.push(RawAdminRelation {
-                    admin_level, name_offset, country_code_offset: cc_offset,
-                    outer_way_ids: outer, inner_way_ids: inner,
-                });
+                    admin_relations.push(RawAdminRelation {
+                        admin_level, name_offset, country_code_offset: cc_offset,
+                        outer_way_ids: outer, inner_way_ids: inner,
+                    });
+                }
             }
+            Ok(())
         })?;
     }
     eprintln!("  {} admin relations", admin_relations.len());
@@ -303,94 +306,112 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let pass2_start = std::time::Instant::now();
 
     let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
-    let mut way_geom: HashMap<i64, Vec<(i32, i32)>> = HashMap::new();
+    let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> = rustc_hash::FxHashMap::default();
 
     {
-        // Filter: nodes + ways, skip relations (already scanned in pass 1)
+        // Filter: nodes + ways, skip relations (already scanned in pass 1).
+        // Block-level pipelining with elements_skip_metadata() — we don't
+        // need version/timestamp/changeset/uid/user for any element.
         let reader = ElementReader::from_path(&config.input_path)?;
         reader.with_blob_filter(BlobFilter::new(true, true, false))
-            .for_each_pipelined(|element| {
-            match element {
-                Element::DenseNode(node) => {
-                    let lat_e7 = node.decimicro_lat();
-                    let lon_e7 = node.decimicro_lon();
-                    node_index.set(node.id(), lat_e7, lon_e7);
+            .for_each_block_pipelined(|block| {
+            for element in block.elements_skip_metadata() {
+                match element {
+                    Element::DenseNode(node) => {
+                        let lat_e7 = node.decimicro_lat();
+                        let lon_e7 = node.decimicro_lon();
+                        node_index.set(node.id(), lat_e7, lon_e7);
 
-                    let mut hn: Option<&str> = None;
-                    let mut st: Option<&str> = None;
-                    let mut pc: Option<&str> = None;
-                    for (k, v) in node.tags() {
-                        match k {
-                            "addr:housenumber" => hn = Some(v),
-                            "addr:street" => st = Some(v),
-                            "addr:postcode" => pc = Some(v),
-                            _ => {}
+                        let mut hn: Option<&str> = None;
+                        let mut st: Option<&str> = None;
+                        let mut pc: Option<&str> = None;
+                        for (k, v) in node.tags() {
+                            match k {
+                                "addr:housenumber" => hn = Some(v),
+                                "addr:street" => st = Some(v),
+                                "addr:postcode" => pc = Some(v),
+                                _ => {}
+                            }
                         }
-                    }
-                    if let (Some(h), Some(s)) = (hn, st) {
-                        addr_points.push(RawAddrPoint {
-                            lat_e7, lon_e7,
-                            housenumber_offset: strings.intern(h),
-                            street_offset: strings.intern(s),
-                            postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                        });
-                    }
-                }
-                Element::Way(way) => {
-                    let way_id = way.id();
-                    let is_admin_way = needed_admin_ways.get(way_id);
-
-                    let coords: Vec<(i32, i32)> = way.refs()
-                        .filter_map(|nid| node_index.get(nid))
-                        .collect();
-                    if coords.is_empty() { return; }
-
-                    // Collect admin way geometry if needed
-                    if is_admin_way {
-                        way_geom.insert(way_id, coords.clone());
-                    }
-
-                    let mut highway: Option<&str> = None;
-                    let mut name: Option<&str> = None;
-                    let mut hn: Option<&str> = None;
-                    let mut addr_st: Option<&str> = None;
-                    let mut pc: Option<&str> = None;
-                    let mut building = false;
-                    let mut interp: Option<&str> = None;
-
-                    for (k, v) in way.tags() {
-                        match k {
-                            "highway" => highway = Some(v),
-                            "name" => name = Some(v),
-                            "addr:housenumber" => hn = Some(v),
-                            "addr:street" => addr_st = Some(v),
-                            "addr:postcode" => pc = Some(v),
-                            "building" => building = true,
-                            "addr:interpolation" => interp = Some(v),
-                            _ => {}
-                        }
-                    }
-
-                    // Interpolation ways
-                    if let (Some(itype_str), Some(st)) = (interp, addr_st) {
-                        if coords.len() >= 2 {
-                            let itype = match itype_str {
-                                "even" => 1u8, "odd" => 2, _ => 0,
-                            };
-                            interp_ways.push(RawInterpWay {
-                                street_offset: strings.intern(st),
-                                interpolation_type: itype,
-                                nodes: coords,
-                                start_number: 0,
-                                end_number: 0,
+                        if let (Some(h), Some(s)) = (hn, st) {
+                            addr_points.push(RawAddrPoint {
+                                lat_e7, lon_e7,
+                                housenumber_offset: strings.intern(h),
+                                street_offset: strings.intern(s),
+                                postcode_offset: pc.map_or(0, |p| strings.intern(p)),
                             });
                         }
-                        return;
                     }
+                    Element::Way(way) => {
+                        let way_id = way.id();
+                        let is_admin_way = needed_admin_ways.get(way_id);
 
-                    // Building addresses (centroid)
-                    if building {
-                        if let (Some(h), Some(s)) = (hn, addr_st) {
+                        // Tag-first classification: check tags before resolving
+                        // coordinates. Skips node-index lookups for irrelevant ways.
+                        let mut highway: Option<&str> = None;
+                        let mut name: Option<&str> = None;
+                        let mut hn: Option<&str> = None;
+                        let mut addr_st: Option<&str> = None;
+                        let mut pc: Option<&str> = None;
+                        let mut building = false;
+                        let mut interp: Option<&str> = None;
+
+                        for (k, v) in way.tags() {
+                            match k {
+                                "highway" => highway = Some(v),
+                                "name" => name = Some(v),
+                                "addr:housenumber" => hn = Some(v),
+                                "addr:street" => addr_st = Some(v),
+                                "addr:postcode" => pc = Some(v),
+                                "building" => building = true,
+                                "addr:interpolation" => interp = Some(v),
+                                _ => {}
+                            }
+                        }
+
+                        // Skip coordinate resolution for irrelevant ways
+                        let is_street = highway.is_some() && name.is_some()
+                            && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
+                        let is_building_addr = building && hn.is_some() && addr_st.is_some();
+                        let is_interp = interp.is_some() && addr_st.is_some();
+
+                        if !is_admin_way && !is_street && !is_building_addr && !is_interp {
+                            continue; // Skip coordinate resolution entirely
+                        }
+
+                        let coords: Vec<(i32, i32)> = way.refs()
+                            .filter_map(|nid| node_index.get(nid))
+                            .collect();
+                        if coords.is_empty() { continue; }
+
+                        // Admin way geometry — move coords if no other consumer needs them
+                        if is_admin_way && !is_street && !is_building_addr && !is_interp {
+                            way_geom.insert(way_id, coords);
+                            continue;
+                        }
+                        if is_admin_way {
+                            way_geom.insert(way_id, coords.clone());
+                        }
+
+                        // Interpolation ways
+                        if is_interp {
+                            if coords.len() >= 2 {
+                                let itype = match interp.unwrap_or("") {
+                                    "even" => 1u8, "odd" => 2, _ => 0,
+                                };
+                                interp_ways.push(RawInterpWay {
+                                    street_offset: strings.intern(addr_st.unwrap_or("")),
+                                    interpolation_type: itype,
+                                    nodes: coords,
+                                    start_number: 0,
+                                    end_number: 0,
+                                });
+                            }
+                            continue;
+                        }
+
+                        // Building addresses (centroid)
+                        if is_building_addr {
                             let (sum_lat, sum_lon) = coords.iter()
                                 .fold((0i64, 0i64), |acc, &(lat, lon)| {
                                     (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
@@ -403,25 +424,24 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                             let clon = (sum_lon / count) as i32;
                             addr_points.push(RawAddrPoint {
                                 lat_e7: clat, lon_e7: clon,
-                                housenumber_offset: strings.intern(h),
-                                street_offset: strings.intern(s),
+                                housenumber_offset: strings.intern(hn.unwrap_or("")),
+                                street_offset: strings.intern(addr_st.unwrap_or("")),
                                 postcode_offset: pc.map_or(0, |p| strings.intern(p)),
                             });
                         }
-                    }
 
-                    // Streets
-                    if let (Some(hw), Some(n)) = (highway, name) {
-                        if coords.len() >= 2 && !EXCLUDED_HIGHWAYS.contains(&hw) {
+                        // Streets
+                        if is_street && coords.len() >= 2 {
                             street_ways.push(RawStreetWay {
-                                name_offset: strings.intern(n),
+                                name_offset: strings.intern(name.unwrap_or("")),
                                 nodes: coords,
                             });
                         }
                     }
+                    _ => {} // Node (non-dense) — rare, ignore
                 }
-                _ => {} // Node (non-dense) — rare, ignore
             }
+            Ok(())
         })?;
     }
     eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
@@ -464,10 +484,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let cl = config.coarse_level;
 
     let (fine_addr, coarse_addr) = assign_addr_cells(&addr_points, sl, cl);
-    let street_node_lists: Vec<&[(i32, i32)]> = street_ways.iter().map(|w| w.nodes.as_slice()).collect();
-    let (fine_street, coarse_street) = assign_seg_cells_generic(&street_node_lists, sl, cl);
-    let interp_node_lists: Vec<&[(i32, i32)]> = interp_ways.iter().map(|w| w.nodes.as_slice()).collect();
-    let (fine_interp, coarse_interp) = assign_seg_cells_generic(&interp_node_lists, sl, cl);
+    let (fine_street, coarse_street) = assign_seg_cells_generic(&street_ways, sl, cl);
+    let (fine_interp, coarse_interp) = assign_seg_cells_generic(&interp_ways, sl, cl);
     let admin_cell_entries = assign_admin_cells(&admin_polygons, config.admin_level);
 
     eprintln!("  {} fine street, {} fine addr, {} admin cell entries",
@@ -571,7 +589,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 #[hotpath::measure]
 fn assemble_admin_polygons(
     relations: &[RawAdminRelation],
-    way_geom: &HashMap<i64, Vec<(i32, i32)>>,
+    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     config: &BuildConfig,
 ) -> Vec<AssembledPolygon> {
     let mut result = Vec::new();
@@ -681,7 +699,7 @@ fn resolve_interpolation_endpoints(
     }
 
     // Build spatial index: S2 cell at street_level -> list of addr point indices
-    let mut cell_to_addrs: HashMap<u64, Vec<u32>> = HashMap::new();
+    let mut cell_to_addrs: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
     for (idx, pt) in addr_points.iter().enumerate() {
         let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
         let cell = CellID::from(ll).parent(street_level as u64).0;
@@ -723,7 +741,7 @@ fn find_endpoint_house_number(
     street_offset: u32,
     addr_points: &[RawAddrPoint],
     strings: &StringPool,
-    cell_to_addrs: &HashMap<u64, Vec<u32>>,
+    cell_to_addrs: &FxHashMap<u64, Vec<u32>>,
     street_level: u8,
 ) -> Option<u32> {
     let (lat_e7, lon_e7) = endpoint;
@@ -968,21 +986,35 @@ fn assign_addr_cells(
     (fine, coarse)
 }
 
+/// Trait for types that have a node list (RawStreetWay, RawInterpWay).
+trait HasNodes {
+    fn nodes(&self) -> &[(i32, i32)];
+}
+
+impl HasNodes for RawStreetWay {
+    fn nodes(&self) -> &[(i32, i32)] { &self.nodes }
+}
+
+impl HasNodes for RawInterpWay {
+    fn nodes(&self) -> &[(i32, i32)] { &self.nodes }
+}
+
 /// Assign segment cells for a generic set of ways (used for both streets and interp).
 /// Uses par_iter for parallel S2 cell computation — each way is independent.
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
-fn assign_seg_cells_generic(
-    node_lists: &[&[(i32, i32)]],
+fn assign_seg_cells_generic<T: HasNodes + Sync>(
+    ways: &[T],
     fine_level: u8,
     coarse_level: u8,
 ) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
     use rayon::prelude::*;
 
-    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = node_lists
+    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = ways
         .par_iter()
         .enumerate()
-        .map(|(way_idx, nodes)| {
+        .map(|(way_idx, way)| {
+            let nodes = way.nodes();
             let mut fine = Vec::new();
             let mut coarse = Vec::new();
             for (seg_idx, pair) in nodes.windows(2).enumerate() {
@@ -1026,7 +1058,7 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
         let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
 
         // Edge cells: cover each ring segment using cover_segment
-        let mut edge_cells = std::collections::HashSet::new();
+        let mut edge_cells = rustc_hash::FxHashSet::default();
         for v in poly.vertices.windows(2) {
             if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
             cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level, |cid| {
@@ -1057,7 +1089,7 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
         if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) { continue; }
 
         let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = rustc_hash::FxHashSet::default();
         let mut queue = std::collections::VecDeque::new();
         visited.insert(seed.0);
         queue.push_back(seed);

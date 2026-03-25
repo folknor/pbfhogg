@@ -124,47 +124,53 @@ optimizations (block-pipelined + skip_metadata, tag-first classification,
 FxHash, pass fusion, clone/alloc cleanup) to other commands.
 
 **getid** (moderate impact, low risk):
-- [ ] Replace `dep_node_ids: BTreeSet<i64>` with `IdSetDense` in `getid_with_refs`
-  (`src/commands/getid.rs:289`). Currently O(log n) per node lookup in pass 2;
-  `IdSetDense` gives O(1). Matters for `--add-referenced` with large way ID sets.
-  Also consider `strip_tags_ids: Option<&BTreeSet<i64>>`.
-- [ ] Use `elements_skip_metadata()` in `getid_with_refs` pass 1 (line 297) and
-  `parse_ids_from_pbf` (line 141). Both only need IDs/refs, not metadata.
-- [ ] Audit pass fusion for `--add-referenced` / `--invert` flows — check if
-  multiple similar scans can be combined.
+- [x] Replace `dep_node_ids: BTreeSet<i64>` with `IdSetDense` in `getid_with_refs`.
+  O(log n) → O(1) per node lookup. Also removed dead `strip_tags_ids` parameter.
+  Commit `a704f5c`.
+- [x] Use `elements_skip_metadata()` in `getid_with_refs` pass 1 and
+  `parse_ids_from_pbf`. Commits `a704f5c`, `58e38d8`.
+- [ ] Audit pass fusion for `--add-referenced` / `--invert` flows — checked:
+  cannot fuse (pass 2 needs complete dep_node_ids before deciding which nodes
+  to emit). Two-pass structure is inherent to the data dependency.
 
 **merge** (low impact, low risk):
-- [ ] Use `elements_skip_metadata()` in `block_overlaps_diff` (`src/commands/merge.rs:547`).
-  Only accesses element IDs. Rare code path (blobs that pass coarse range check).
+- [x] Use `elements_skip_metadata()` in `block_overlaps_diff`. Commit `b90e8ef`.
 
-**extract --smart** (low-medium impact, medium risk):
-- [ ] Audit for any remaining std HashMap/HashSet in smart-mode dependency walks.
-- [ ] Verify all classification passes use `elements_skip_metadata()` (believed done).
+**extract --smart** (verified — already optimized):
+- [x] Audit: no std HashMap/HashSet in hot paths. Uses IdSetDense throughout.
+- [x] Verify: all classification passes use `elements_skip_metadata()` (confirmed:
+  lines 1242, 1305, 1382, 723, 742, 752, 763, 1022, 1054, 1086).
 - [ ] Check for opportunities to reduce repeated full-file traversals in relation
-  closure expansion.
+  closure expansion. (Inherent to transitive closure — may not be reducible.)
 
-**tags_filter** (low impact, low risk):
-- [ ] Verify no refs/dependencies resolved before cheap tag rejection in default mode.
-- [ ] Audit for std hash containers in hot paths (believed cold-path only).
+**tags_filter** (verified — already optimized):
+- [x] Verified: tag-first classification in place. Way refs collected only after tag
+  match (line 580). `elements_skip_metadata()` in all collection passes.
+- [x] Audit: std HashSet only in cold-path expression parsing (line 28-29, once at
+  startup). Not worth changing.
 
-**add-locations-to-ways** (low impact, low risk):
-- [ ] Audit for tag-first rejection opportunities in rewrite/decode phases where
-  unconditional per-way location resolution may still occur.
-- [ ] Check for remaining std hash containers in batch processing helpers.
-- [ ] Audit clone/allocation in batch processing and passthrough coalescing paths.
+**add-locations-to-ways** (verified — already optimized):
+- [x] Audit: `elements_skip_metadata()` used in all scan passes (lines 411, 839,
+  859, 882, 1072). Only the write path (line 1129) uses `elements()` (correct —
+  needs full metadata for output).
+- [x] Audit: FxHashMap already used in all hot paths (lines 1028, 1035, 1066).
+  IdSetDense for ID sets.
+- [ ] Tag-first rejection in rewrite phase: ALTW processes all ways unconditionally
+  (no tag-based filtering). Not applicable — every way gets location enrichment.
+- [ ] Clone/allocation in batch processing: passthrough coalescing uses raw bytes,
+  no cloning. Batch slot dispatch is enum-based. Already well optimized.
 
-**inspect** (negligible impact):
-- [ ] Use `elements_skip_metadata()` in full-decode path when `--extended` is not set
-  and `--locations` is. Minor — index-only fast path already skips decompression.
-- [ ] Audit hash containers in counting/stat maps for hot subcommands (e.g.,
-  `inspect tags` frequency counting).
+**inspect** (verified — already optimized):
+- [ ] `elements_skip_metadata()` in `--locations` without `--extended`: minor, deferred.
+  Index-only fast path already skips decompression for the common case.
+- [x] Audit: `inspect tags` uses FxHashMap for counting (tags_count.rs). No std hash
+  in hot paths.
 
-**check_refs** (no action currently):
-- Already consumer-bound (RoaringTreemap insertions, decode workers idle at 1% CPU).
-  Switching to block-pipelined + skip_metadata would not reduce wall time.
-- [ ] Re-evaluate if consumer bottleneck shifts (e.g., after RoaringTreemap
-  improvements or if used with `--check-relations` which may change the profile).
-- [ ] Audit for std hash containers in hot reference-check paths.
+**check_refs** (verified — no action):
+- Consumer-bound (RoaringTreemap insertions, decode workers idle at 1% CPU).
+  Block-pipelined + skip_metadata would not reduce wall time.
+- [x] Audit: uses RoaringTreemap for all ID sets (optimal). No std hash in hot paths.
+- [ ] Re-evaluate if consumer bottleneck shifts after RoaringTreemap improvements.
 
 **sort, cat** (no action):
 - Already optimal — blob-level passthrough, single-pass, or need full metadata for output.

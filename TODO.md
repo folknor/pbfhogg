@@ -130,6 +130,8 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
   Also consider `strip_tags_ids: Option<&BTreeSet<i64>>`.
 - [ ] Use `elements_skip_metadata()` in `getid_with_refs` pass 1 (line 297) and
   `parse_ids_from_pbf` (line 141). Both only need IDs/refs, not metadata.
+- [ ] Audit pass fusion for `--add-referenced` / `--invert` flows — check if
+  multiple similar scans can be combined.
 
 **merge** (low impact, low risk):
 - [ ] Use `elements_skip_metadata()` in `block_overlaps_diff` (`src/commands/merge.rs:547`).
@@ -149,14 +151,20 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
 - [ ] Audit for tag-first rejection opportunities in rewrite/decode phases where
   unconditional per-way location resolution may still occur.
 - [ ] Check for remaining std hash containers in batch processing helpers.
+- [ ] Audit clone/allocation in batch processing and passthrough coalescing paths.
 
 **inspect** (negligible impact):
 - [ ] Use `elements_skip_metadata()` in full-decode path when `--extended` is not set
   and `--locations` is. Minor — index-only fast path already skips decompression.
+- [ ] Audit hash containers in counting/stat maps for hot subcommands (e.g.,
+  `inspect tags` frequency counting).
 
-**check_refs** (no action):
+**check_refs** (no action currently):
 - Already consumer-bound (RoaringTreemap insertions, decode workers idle at 1% CPU).
   Switching to block-pipelined + skip_metadata would not reduce wall time.
+- [ ] Re-evaluate if consumer bottleneck shifts (e.g., after RoaringTreemap
+  improvements or if used with `--check-relations` which may change the profile).
+- [ ] Audit for std hash containers in hot reference-check paths.
 
 **sort, cat** (no action):
 - Already optimal — blob-level passthrough, single-pass, or need full metadata for output.

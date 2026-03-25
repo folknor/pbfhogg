@@ -138,7 +138,7 @@ pub fn parse_ids_from_pbf(path: &Path, direct_io: bool) -> Result<IdSet> {
     };
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        for element in block.elements() {
+        for element in block.elements_skip_metadata() {
             match &element {
                 Element::DenseNode(dn) => { set.node_ids.insert(dn.id()); }
                 Element::Node(n) => { set.node_ids.insert(n.id()); }

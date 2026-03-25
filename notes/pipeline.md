@@ -5,10 +5,12 @@ Rust library for reading, writing, and merging OpenStreetMap PBF files. The full
 **Production pipeline** (runs every planet refresh cycle):
 ```
 Bootstrap (once):  pbfhogg cat → pbfhogg add-locations-to-ways → enriched PBF
+                   pbfhogg build-geocode-index → reverse geocoding index
 Steady state:      pbfhogg apply-changes --locations-on-ways (daily diffs)
+                   pbfhogg build-geocode-index (rebuild after merge)
                                       │
                                       ├── elivagar → PMTiles → nidhogg (tile serving)
-                                      └── nidhogg (PBF ingest → query API)
+                                      └── nidhogg (PBF ingest + reverse geocoding)
 ```
 
 `merge --locations-on-ways` preserves and updates inline way-node coordinates
@@ -50,7 +52,8 @@ The two downstream consumers are:
 ## Cargo Features in Play
 
 Both consumers use default features. In practice:
-- `commands` feature: **enabled** (brings in `roaring`, `serde_json` — needed for merge)
+- `commands` feature: **enabled** (brings in `roaring`, `serde_json`, `s2` — needed for merge + geocode builder)
+- `geocode-reader` feature: **implied by `commands`**. nidhogg can alternatively depend on just `geocode-reader` for the reverse geocoding reader without pulling in `roaring`/`serde_json`.
 - `linux-direct-io`: **disabled** (nidhogg passes `false`)
 - `linux-io-uring`: **disabled** (nidhogg passes `false`)
 - Zlib backend: **zlib-rs** (hardcoded, pure Rust, via flate2)

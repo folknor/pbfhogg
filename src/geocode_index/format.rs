@@ -3,7 +3,7 @@
 //! All records use little-endian byte order and manual serialization (no
 //! `#[repr(C)]` transmutation) to avoid alignment padding issues.
 //!
-//! See `REVERSE_GEOCODING_SPEC.md` section 4 for the full format specification.
+//! See `notes/reverse-geocoding-spec.md` section 4 for the full format specification.
 
 /// Magic bytes for the index header: `GIDX`.
 pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";

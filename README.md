@@ -110,6 +110,7 @@ pbfhogg getid <file> -o <out> <ids>       Extract elements by ID (e.g. n123 w456
 pbfhogg getid <file> -o <out> --invert    Remove elements by ID
 pbfhogg getparents <file> -o <out> <ids>  Find ways/relations referencing given IDs (reverse lookup)
 pbfhogg time-filter <file> -o <out> <ts>  Filter history PBF to a snapshot at a timestamp
+pbfhogg build-geocode-index <f> --output-dir <d>  Build reverse geocoding index (S2 cells, mmap-ready)
 ```
 
 Inspect reports block breakdown by type (DenseNodes/Ways/Relations/Mixed) with compressed sizes, element counts with tagged node count, and **ordering analysis** — whether the file follows the standard nodes → ways → relations layout or has non-standard interleaving (with block ranges). On indexed PBFs, inspect uses an **index-only fast path** that reads only blob headers and skips all decompression — completing in ~36ms on a 473 MB file vs ~4s for full decode (109x speedup). Falls back to full decode on non-indexed PBFs or when `--locations` is requested. Optional flags: `--blocks` shows per-type distribution stats (min/max/median/p99 for elements-per-block and compressed size) plus a full per-block table; `--blocks=N` limits the table to the first and last N blocks; `--id-ranges` shows min/max element IDs per type with monotonicity checks; `--locations` reports locations-on-ways diagnostics (coverage percentage, coords-per-way percentiles); `--extended` runs a full scan for timestamp ranges, data bbox, metadata coverage, and ordering.
@@ -126,7 +127,7 @@ Getid supports `--add-referenced` to include way node refs (two-pass), `--id-fil
 
 **Input assumption:** pbfhogg assumes canonical OSM snapshot data (Geofabrik extracts or planet files) with unique element IDs. Custom or malformed PBFs with duplicate IDs are not validated and may produce incorrect output. In particular, `add-locations-to-ways` indexes nodes by ID — duplicate node IDs will silently overwrite earlier coordinates with later ones.
 
-Commands that benefit from blob-level indexdata (`apply-changes`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` — the passthrough path adds indexdata automatically without re-compressing blobs, using minimal memory. The `--type` filtered path also embeds indexdata but does full decode and re-encode.
+Commands that benefit from blob-level indexdata (`apply-changes`, `sort`, `add-locations-to-ways`, `extract` complete/smart, `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, `build-geocode-index`) will error if the input PBF lacks indexdata. Pass `--force` to proceed anyway (slower). Generate an indexed PBF with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf` — the passthrough path adds indexdata automatically without re-compressing blobs, using minimal memory. The `--type` filtered path also embeds indexdata but does full decode and re-encode.
 
 Indexdata generation via passthrough cat (commit `69a127f`):
 

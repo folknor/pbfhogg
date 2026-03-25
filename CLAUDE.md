@@ -30,6 +30,7 @@ Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install
 - `brokkr bench allocator [--dataset name] [--variant V] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check --refs. Default variant: indexed.
 - `brokkr bench blob-filter [--dataset name] [--indexed-variant V] [--raw-variant V] [--runs N]` — indexdata vs non-indexdata performance comparison. Default variants: indexed + raw.
 - `brokkr bench planetiler [--dataset name] [--variant V] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR. Default variant: indexed.
+- `brokkr bench build-geocode-index [--dataset name] [--variant V] [--runs N]` — geocode index build benchmark. Output to `<scratch>/geocode-<dataset>/`. Default variant: indexed.
 - `brokkr bench all [--dataset name] [--variant V] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines. Default variant: indexed.
 - `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report)
 - `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [-n N] [--top N]` — query/compare benchmark results from SQLite. Use `--top 0` to show all hotpath functions. Use `--compare-last --command hotpath` to diff two most recent hotpath runs. Results stored by bench harness (clean tree only).
@@ -71,7 +72,7 @@ xxhash = "fa581f7b..."
 - `osc.<seq>` — OSC diff files keyed by sequence number. `--osc-seq` selects.
 - `xxhash` — XXH128 file hash. Run `brokkr env` to see computed values.
 
-Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored). **`--force` is a top-level flag before the subcommand**, e.g. `brokkr bench --force commands add-locations-to-ways`, NOT `brokkr bench commands add-locations-to-ways --force`.
+Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git — stage it with your next commit when modified). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored). **`--force` is a top-level flag before the subcommand**, e.g. `brokkr bench --force commands add-locations-to-ways`, NOT `brokkr bench commands add-locations-to-ways --force`.
 
 ## Scripts
 
@@ -85,7 +86,7 @@ brokkr run -- cat input.osm.pbf -o output-with-indexdata.osm.pbf
 ```
 The passthrough path (no `--type`) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files. Planet (87 GB): 497s buffered, 520s `--direct-io` (+5% slower); Denmark (461 MB): 2.8s buffered (commit `69a127f`, plantasjen). Buffered wins for sequential single-file passthrough — `--direct-io` only helps with concurrent read/write (merge). The `--type` filtered path also embeds indexdata but does full decode+re-encode (OOMs on planet at 30 GB host).
 
-`apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, and `inspect --nodes` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
+`apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, and `build-geocode-index` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 
 ### add-locations-to-ways index types
 
@@ -144,6 +145,13 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - `PbfWriter`: blob framing, compression (zlib/zstd/none), raw passthrough for merges. `to_path` uses parallel compression via rayon + reorder buffer. `to_path_direct` bypasses page cache via O_DIRECT. `to_path_uring` uses registered buffers + WriteFixed for I/O-bound workloads. `new(writer)` provides sync mode for in-memory / generic-Write usage.
 - `uring_writer.rs`: io_uring writer thread — `AlignedBufferPool` (64×256KB registered buffers), `UringState` (buffered accumulation + WriteFixed submission + CQE reaping)
 
+**Geocode index:** `geocode_index/` module
+- `format.rs`: on-disk binary format (19 files, header/cells/entries/data/strings). Manual byte-level serialization, no `#[repr(C)]`.
+- `reader.rs`: mmap reader with two-layer API. `query()` (allocation-free, nearest-of-each-type) and `candidates()` (Vec-backed, all matches). S2 cell neighborhood lookup, binary search on sorted cell arrays, segment-level distance scoring.
+- `builder.rs`: 4-pass build pipeline. Pass 1: nodes (address points + dense mmap index). Pass 2: ways (streets, building centroids, interpolation). Pass 3: relations (admin boundary assembly + simplification). Pass 4: S2 cell assignment at fine+coarse levels, sorted index writing. Interpolation endpoint resolution via spatial join against address points.
+
+**Geometry:** `geo.rs` — shared primitives (point-in-ring, antimeridian handling, point-in-polygon with holes, Douglas-Peucker simplification, ring assembly, cos-projection distance).
+
 ## Conventions
 
 - All performance numbers (timings, allocations, throughput) in markdown files must include the git commit hash and hostname where the measurement was taken. Benchmark results are stored automatically in `.brokkr/results.db` (SQLite).
@@ -154,7 +162,8 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 
 ## Features (library crate)
 
-- `commands` (default): enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`)
+- `commands` (default): enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`)
+- `geocode-reader`: enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`). Included by `commands`. Downstream consumers (e.g., nidhogg) can enable this without the full `commands` feature.
 - `linux-direct-io`: O_DIRECT read/write paths (bypasses page cache, requires `libc`)
 - `linux-io-uring`: io_uring writer thread (requires `io-uring` + `libc`, Linux 5.1+, sufficient `RLIMIT_MEMLOCK`)
 

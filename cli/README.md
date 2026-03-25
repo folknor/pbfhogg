@@ -28,6 +28,7 @@ Requires Rust 1.85+. The binary is called `pbfhogg`.
 | `renumber` | Renumber all element IDs sequentially |
 | `time-filter` | Filter history PBF to a point-in-time snapshot |
 | `merge-changes` | Merge multiple OSC files into one |
+| `build-geocode-index` | Build a reverse geocoding index (S2 cells, mmap-ready) |
 
 ## Common flags
 

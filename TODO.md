@@ -9,6 +9,11 @@ or BlockBuilder/PbfWriter APIs):
 
     brokkr check -- --ignored
 
+`tests/geocode_index.rs` has 6 `#[ignore]` tests — they build a geocode index from the
+Denmark PBF and query it. ~154s in release mode. Run with:
+
+    cargo test --release --test geocode_index -- --ignored
+
 `sorted_flag_but_unsorted_nodes_panics` in `tests/read_paths.rs` is `#[ignore]` — it
 verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Type_then_ID`
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95

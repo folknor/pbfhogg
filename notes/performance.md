@@ -297,6 +297,49 @@ Steady state: `apply-changes --locations-on-ways` (daily diffs).
 | add-locations-to-ways | 2565s (43m) | — |
 | **Total bootstrap** | **~45m** | — |
 
+## build-geocode-index
+
+Reverse geocoding index build. 4-pass pipeline: nodes (address points + dense
+node index), ways (streets, buildings, interpolation), relations (admin boundary
+assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14).
+
+Commit `ed34092`, plantasjen.
+
+| Dataset | PBF size | Time | Index size | Addr points | Streets | Admin |
+|---------|----------|------|------------|-------------|---------|-------|
+| Denmark | 465 MB | **20.8s** | 172 MB | 2.6M | 314K | 2K |
+| Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K |
+
+Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
+interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
+
+### Comparison with traccar-geocoder
+
+No directly comparable data — different hardware, different format, different
+build architecture (traccar uses C++ with libosmium, single-threaded, all data
+in RAM). Numbers from the HN thread (2026-03-21):
+
+| Dataset | traccar-geocoder | pbfhogg | Notes |
+|---------|-----------------|---------|-------|
+| Australia/Oceania (~1.1 GB) | ~15 min (KomoD) | — | Not tested |
+| Germany (4.5 GB) | — | **30 min** | Comparable scale to Aus/Oceania |
+| Planet (~87 GB) | 8-10 hours (192 GB RAM) | — | Would OOM on 30 GB host |
+
+Extrapolated planet: ~19 × 30 min = ~9.5 hours build time, ~34 GB index (vs
+traccar's 18 GB). Our index is larger due to segment-level indexing (6 bytes
+vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
+builder currently holds all intermediate data in RAM — planet requires
+streaming to temp files (not yet implemented).
+
+traccar's index is more compact (18 GB planet) because it uses f32 coords,
+u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),
+and no coarse fallback. Our format trades size for query precision (segment-
+level reads, i32 coords, wider offsets) and rural coverage (coarse index).
+
+Query latency not yet benchmarked. Both architectures use the same algorithm
+(S2 cell neighborhood + binary search + distance scoring on mmap'd data), so
+sub-millisecond latency is expected.
+
 ## `--direct-io` impact summary
 
 | Workload | Bottleneck | `--direct-io` effect |

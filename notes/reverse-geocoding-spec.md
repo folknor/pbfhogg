@@ -1,6 +1,6 @@
 # Reverse Geocoding Index: Implementation Specification
 
-Parent document: [REVERSE_GEOCODING.md](REVERSE_GEOCODING.md) (problem statement and
+Parent document: [reverse-geocoding.md](reverse-geocoding.md) (problem statement and
 design direction).
 
 ## 1. Scope

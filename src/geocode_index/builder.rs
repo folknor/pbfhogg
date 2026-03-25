@@ -1,7 +1,7 @@
 //! Builder for the reverse geocoding index.
 //!
 //! Reads an OSM PBF file in multiple passes and writes the set of binary index
-//! files described in `REVERSE_GEOCODING_SPEC.md` section 4.
+//! files described in `notes/reverse-geocoding-spec.md` section 4.
 
 use std::collections::HashMap;
 use std::io::{BufWriter, Write};

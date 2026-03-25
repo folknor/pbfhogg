@@ -12,7 +12,7 @@ vector tiles. Its forward geocoding (Tantivy full-text search over place nodes a
 eventually addresses) covers the `/search` direction: text query to coordinates.
 
 The biggest missing piece, identified as **high priority** in
-[nidhogg's API gap analysis](../nidhogg/research/API_GAP_ANALYSIS.md), is **reverse
+[nidhogg's API gap analysis](../../nidhogg/research/API_GAP_ANALYSIS.md), is **reverse
 geocoding**: coordinates to structured address. This is the Nominatim `/reverse`
 endpoint — given a lat/lon, return the nearest street, house number, city, postcode,
 and country.

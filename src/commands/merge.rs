@@ -544,7 +544,7 @@ fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> usize {
 /// otherwise unaffected block just to interleave pure creates would be wasted
 /// work. OSM consumers handle non-strictly-sorted IDs across block boundaries.
 fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> bool {
-    for element in block.elements() {
+    for element in block.elements_skip_metadata() {
         let dominated = match &element {
             Element::DenseNode(dn) => {
                 let id = dn.id();

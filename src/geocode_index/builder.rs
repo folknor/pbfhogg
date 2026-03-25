@@ -223,7 +223,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
         let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_relations()).for_each(|element| {
+        reader.with_blob_filter(BlobFilter::only_relations()).for_each_pipelined(|element| {
             if let Element::Relation(rel) = element {
                 let mut boundary: Option<&str> = None;
                 let mut level_str: Option<&str> = None;
@@ -289,149 +289,143 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let pass1_ms = pass1_start.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
-    // Pass 2: Nodes — address points + dense coordinate index
+    // Pass 2: Nodes + Ways (fused single scan, pipelined)
+    //
+    // Sorted PBFs (Sort.Type_then_ID) guarantee all node blobs come before
+    // way blobs. A single pipelined scan processes nodes first (populating
+    // the dense coordinate index + address points), then ways (streets,
+    // buildings, interpolation, admin geometry). The pipelined closure runs
+    // sequentially on the caller thread — no concurrent data structure changes
+    // needed. Decompression is overlapped with I/O in the pipeline's rayon pool.
     // -----------------------------------------------------------------------
-    eprintln!("Pass 2: Nodes...");
+    eprintln!("Pass 2: Nodes + Ways (pipelined)...");
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
+
     let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
-
-    {
-        let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_nodes()).for_each(|element| {
-            if let Element::DenseNode(node) = element {
-                let lat_e7 = node.decimicro_lat();
-                let lon_e7 = node.decimicro_lon();
-                node_index.set(node.id(), lat_e7, lon_e7);
-
-                let mut hn: Option<&str> = None;
-                let mut st: Option<&str> = None;
-                let mut pc: Option<&str> = None;
-                for (k, v) in node.tags() {
-                    match k {
-                        "addr:housenumber" => hn = Some(v),
-                        "addr:street" => st = Some(v),
-                        "addr:postcode" => pc = Some(v),
-                        _ => {}
-                    }
-                }
-                if let (Some(h), Some(s)) = (hn, st) {
-                    addr_points.push(RawAddrPoint {
-                        lat_e7, lon_e7,
-                        housenumber_offset: strings.intern(h),
-                        street_offset: strings.intern(s),
-                        postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                    });
-                }
-            }
-        })?;
-    }
-    eprintln!("  {} address points from nodes", addr_points.len());
-
-    #[cfg(feature = "hotpath")]
-    let pass2_ms = pass2_start.elapsed().as_millis();
-
-    // -----------------------------------------------------------------------
-    // Pass 3: Ways — streets, buildings, interpolation, AND admin geometry
-    // (Single way scan does all way processing, including admin boundary
-    // way geometry resolution that was previously a separate scan.)
-    // -----------------------------------------------------------------------
-    eprintln!("Pass 3: Ways...");
-    #[cfg(feature = "hotpath")]
-    let pass3_start = std::time::Instant::now();
-
     let mut way_geom: HashMap<i64, Vec<(i32, i32)>> = HashMap::new();
+
     {
+        // Filter: nodes + ways, skip relations (already scanned in pass 1)
         let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::only_ways()).for_each(|element| {
-            if let Element::Way(way) = element {
-                let way_id = way.id();
-                let is_admin_way = needed_admin_ways.get(way_id);
+        reader.with_blob_filter(BlobFilter::new(true, true, false))
+            .for_each_pipelined(|element| {
+            match element {
+                Element::DenseNode(node) => {
+                    let lat_e7 = node.decimicro_lat();
+                    let lon_e7 = node.decimicro_lon();
+                    node_index.set(node.id(), lat_e7, lon_e7);
 
-                let coords: Vec<(i32, i32)> = way.refs()
-                    .filter_map(|nid| node_index.get(nid))
-                    .collect();
-                if coords.is_empty() { return; }
-
-                // Collect admin way geometry if needed
-                if is_admin_way {
-                    way_geom.insert(way_id, coords.clone());
-                }
-
-                let mut highway: Option<&str> = None;
-                let mut name: Option<&str> = None;
-                let mut hn: Option<&str> = None;
-                let mut addr_st: Option<&str> = None;
-                let mut pc: Option<&str> = None;
-                let mut building = false;
-                let mut interp: Option<&str> = None;
-
-                for (k, v) in way.tags() {
-                    match k {
-                        "highway" => highway = Some(v),
-                        "name" => name = Some(v),
-                        "addr:housenumber" => hn = Some(v),
-                        "addr:street" => addr_st = Some(v),
-                        "addr:postcode" => pc = Some(v),
-                        "building" => building = true,
-                        "addr:interpolation" => interp = Some(v),
-                        _ => {}
+                    let mut hn: Option<&str> = None;
+                    let mut st: Option<&str> = None;
+                    let mut pc: Option<&str> = None;
+                    for (k, v) in node.tags() {
+                        match k {
+                            "addr:housenumber" => hn = Some(v),
+                            "addr:street" => st = Some(v),
+                            "addr:postcode" => pc = Some(v),
+                            _ => {}
+                        }
                     }
-                }
-
-                // Interpolation ways
-                if let (Some(itype_str), Some(st)) = (interp, addr_st) {
-                    if coords.len() >= 2 {
-                        let itype = match itype_str {
-                            "even" => 1u8, "odd" => 2, _ => 0,
-                        };
-                        interp_ways.push(RawInterpWay {
-                            street_offset: strings.intern(st),
-                            interpolation_type: itype,
-                            nodes: coords,
-                            start_number: 0,
-                            end_number: 0,
-                        });
-                    }
-                    return;
-                }
-
-                // Building addresses (centroid)
-                if building {
-                    if let (Some(h), Some(s)) = (hn, addr_st) {
-                        let (sum_lat, sum_lon) = coords.iter()
-                            .fold((0i64, 0i64), |acc, &(lat, lon)| {
-                                (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
-                            });
-                        #[allow(clippy::cast_possible_wrap)]
-                        let count = coords.len().max(1) as i64;
-                        #[allow(clippy::cast_possible_truncation)]
-                        let clat = (sum_lat / count) as i32;
-                        #[allow(clippy::cast_possible_truncation)]
-                        let clon = (sum_lon / count) as i32;
+                    if let (Some(h), Some(s)) = (hn, st) {
                         addr_points.push(RawAddrPoint {
-                            lat_e7: clat, lon_e7: clon,
+                            lat_e7, lon_e7,
                             housenumber_offset: strings.intern(h),
                             street_offset: strings.intern(s),
                             postcode_offset: pc.map_or(0, |p| strings.intern(p)),
                         });
                     }
                 }
+                Element::Way(way) => {
+                    let way_id = way.id();
+                    let is_admin_way = needed_admin_ways.get(way_id);
 
-                // Streets
-                if let (Some(hw), Some(n)) = (highway, name) {
-                    if coords.len() >= 2 && !EXCLUDED_HIGHWAYS.contains(&hw) {
-                        street_ways.push(RawStreetWay {
-                            name_offset: strings.intern(n),
-                            nodes: coords,
-                        });
+                    let coords: Vec<(i32, i32)> = way.refs()
+                        .filter_map(|nid| node_index.get(nid))
+                        .collect();
+                    if coords.is_empty() { return; }
+
+                    // Collect admin way geometry if needed
+                    if is_admin_way {
+                        way_geom.insert(way_id, coords.clone());
+                    }
+
+                    let mut highway: Option<&str> = None;
+                    let mut name: Option<&str> = None;
+                    let mut hn: Option<&str> = None;
+                    let mut addr_st: Option<&str> = None;
+                    let mut pc: Option<&str> = None;
+                    let mut building = false;
+                    let mut interp: Option<&str> = None;
+
+                    for (k, v) in way.tags() {
+                        match k {
+                            "highway" => highway = Some(v),
+                            "name" => name = Some(v),
+                            "addr:housenumber" => hn = Some(v),
+                            "addr:street" => addr_st = Some(v),
+                            "addr:postcode" => pc = Some(v),
+                            "building" => building = true,
+                            "addr:interpolation" => interp = Some(v),
+                            _ => {}
+                        }
+                    }
+
+                    // Interpolation ways
+                    if let (Some(itype_str), Some(st)) = (interp, addr_st) {
+                        if coords.len() >= 2 {
+                            let itype = match itype_str {
+                                "even" => 1u8, "odd" => 2, _ => 0,
+                            };
+                            interp_ways.push(RawInterpWay {
+                                street_offset: strings.intern(st),
+                                interpolation_type: itype,
+                                nodes: coords,
+                                start_number: 0,
+                                end_number: 0,
+                            });
+                        }
+                        return;
+                    }
+
+                    // Building addresses (centroid)
+                    if building {
+                        if let (Some(h), Some(s)) = (hn, addr_st) {
+                            let (sum_lat, sum_lon) = coords.iter()
+                                .fold((0i64, 0i64), |acc, &(lat, lon)| {
+                                    (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
+                                });
+                            #[allow(clippy::cast_possible_wrap)]
+                            let count = coords.len().max(1) as i64;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let clat = (sum_lat / count) as i32;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let clon = (sum_lon / count) as i32;
+                            addr_points.push(RawAddrPoint {
+                                lat_e7: clat, lon_e7: clon,
+                                housenumber_offset: strings.intern(h),
+                                street_offset: strings.intern(s),
+                                postcode_offset: pc.map_or(0, |p| strings.intern(p)),
+                            });
+                        }
+                    }
+
+                    // Streets
+                    if let (Some(hw), Some(n)) = (highway, name) {
+                        if coords.len() >= 2 && !EXCLUDED_HIGHWAYS.contains(&hw) {
+                            street_ways.push(RawStreetWay {
+                                name_offset: strings.intern(n),
+                                nodes: coords,
+                            });
+                        }
                     }
                 }
+                _ => {} // Node (non-dense) — rare, ignore
             }
         })?;
     }
-    eprintln!("  {} streets, {} interp, {} total addr, {} admin way geoms",
-        street_ways.len(), interp_ways.len(), addr_points.len(), way_geom.len());
+    eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
+        addr_points.len(), street_ways.len(), interp_ways.len(), way_geom.len());
     drop(needed_admin_ways);
     drop(node_index);
 
@@ -441,7 +435,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
 
     #[cfg(feature = "hotpath")]
-    let pass3_ms = pass3_start.elapsed().as_millis();
+    let pass2_ms = pass2_start.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
     // Interpolation endpoint resolution
@@ -452,9 +446,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
 
     // -----------------------------------------------------------------------
-    // Pass 4: S2 cell assignment + write index files
+    // Pass 3: S2 cell assignment + write index files
     // -----------------------------------------------------------------------
-    eprintln!("Pass 4: S2 cells + write...");
+    eprintln!("Pass 3: S2 cells + write...");
     #[cfg(feature = "hotpath")]
     let pass4_start = std::time::Instant::now();
 
@@ -544,10 +538,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     #[cfg(feature = "hotpath")]
     {
-        eprintln!("pass1_nodes_ms={pass1_ms}");
-        eprintln!("pass2_ways_ms={pass2_ms}");
-        eprintln!("pass3_admin_ms={pass3_ms}");
-        eprintln!("pass4_cells_ms={pass4_ms}");
+        eprintln!("pass1_relations_ms={pass1_ms}");
+        eprintln!("pass2_nodes_ways_ms={pass2_ms}");
+        eprintln!("pass3_cells_ms={pass4_ms}");
         eprintln!("addr_points={}", addr_points.len());
         eprintln!("street_ways={}", street_ways.len());
         eprintln!("interp_ways={}", interp_ways.len());

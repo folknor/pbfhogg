@@ -313,6 +313,41 @@ Commit `ed34092`, plantasjen.
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
 interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
 
+### Optimization arc (Denmark, plantasjen)
+
+| Commit | Change | Time | Cumulative |
+|--------|--------|------|------------|
+| `d27f17e` | Baseline (4 scans, sequential for_each) | 21.4s | — |
+| `e7a12e6` | 3 scans (reorder: relations first) | 18.5s | -14% |
+| `da4d939` | 2 scans (fused node+way, pipelined) | 10.9s | -49% |
+| `60df011` | Zero-alloc cover_segment + parallel S2 cells | 10.4s | -51% |
+| `398b1a4` | Block-pipelined, skip_metadata, tag-first way classification | 9.7s | -55% |
+
+### Germany RSS profile (commit `3449db2`, plantasjen, hotpath)
+
+588s total, 3.6 GB peak RSS. Per-phase memory:
+
+| Phase | RSS | Wall time | Notes |
+|---|---|---|---|
+| After pass 1 (relations) | 223 MB | 1.8s | admin_relations + IdSetDense |
+| After pass 2 scan (nodes+ways) | **17.6 GB** | 572s | Dense node index mmap dominates |
+| After pass 2 drop (node index freed) | 168 MB | — | Pages evicted, data Vecs are modest |
+| After ring assembly | 428 MB | +12.7s | + admin polygons (43K) |
+| After interpolation resolution | 955 MB | +4.4s | + transient spatial index |
+| After cell assignment | **3.7 GB** | +10s | All cell entry Vecs materialized |
+
+Pipeline (`run_pipeline`) takes 556s / 94% — Germany is I/O + decompress bound
+at this scale. Main thread CPU averages 32% (waiting on pipeline).
+
+Key observations for planet-scale planning:
+- Dense node index is the RSS peak (17.6 GB). Planet would push to ~30+ GB.
+  Referenced-node-only index (pass 1.5 in planet spec) would cut this to ~10 GB.
+- Cell entry Vecs are the second peak (3.7 GB). Planet estimate: ~19 GB.
+  Bucketed cell assignment (planet spec) eliminates this.
+- Data Vecs (streets, addr, interp, strings) are only ~168 MB after node index
+  drops. Streaming to output files would reduce this further but is not the
+  bottleneck at Germany scale.
+
 ### Comparison with traccar-geocoder
 
 No directly comparable data — different hardware, different format, different
@@ -322,10 +357,10 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Dataset | traccar-geocoder | pbfhogg | Notes |
 |---------|-----------------|---------|-------|
 | Australia/Oceania (~1.1 GB) | ~15 min (KomoD) | — | Not tested |
-| Germany (4.5 GB) | — | **30 min** | Comparable scale to Aus/Oceania |
+| Germany (4.5 GB) | — | **9.8 min** | After optimization (was 30 min) |
 | Planet (~87 GB) | 8-10 hours (192 GB RAM) | — | Would OOM on 30 GB host |
 
-Extrapolated planet: ~19 × 30 min = ~9.5 hours build time, ~34 GB index (vs
+Extrapolated planet: ~19 × 10 min = ~3.2 hours build time, ~34 GB index (vs
 traccar's 18 GB). Our index is larger due to segment-level indexing (6 bytes
 vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
 builder currently holds all intermediate data in RAM — planet requires

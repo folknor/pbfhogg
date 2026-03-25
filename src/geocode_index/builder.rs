@@ -888,14 +888,15 @@ fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
 /// Cover a line segment by sampling intermediate points to find all S2 cells
 /// the segment passes through at the given level.
 ///
-/// Walks the segment in steps smaller than the cell edge length, collecting
-/// all unique cell IDs. This catches cells that the segment crosses diagonally
-/// without having either endpoint inside them.
+/// Calls `emit(cell_id)` for each unique cell the segment crosses. No heap
+/// allocation — uses a small stack buffer for deduplication (most segments
+/// cross 1–4 cells).
 fn cover_segment(
     lat1_e7: i32, lon1_e7: i32,
     lat2_e7: i32, lon2_e7: i32,
     level: u8,
-) -> Vec<u64> {
+    mut emit: impl FnMut(u64),
+) {
     let lat1 = lat1_e7 as f64 * 1e-7;
     let lon1 = lon1_e7 as f64 * 1e-7;
     let lat2 = lat2_e7 as f64 * 1e-7;
@@ -904,18 +905,16 @@ fn cover_segment(
     let c1 = CellID::from(LatLng::from_degrees(lat1, lon1)).parent(level as u64);
     let c2 = CellID::from(LatLng::from_degrees(lat2, lon2)).parent(level as u64);
 
+    emit(c1.0);
     if c1.0 == c2.0 {
-        return vec![c1.0];
+        return;
     }
 
-    // Walk intermediate points. At level 17 (~77m), step ~30m to catch all crossings.
-    // At level 14 (~620m), step ~250m. Use half the cell edge as step size.
+    // Walk intermediate points. Step size < half cell edge to catch crossings.
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
     let seg_len_deg = ((dlat * 1e-7).powi(2) + (dlon * 1e-7).powi(2)).sqrt();
 
-    // Approximate cell edge in degrees: ~180 / 2^(level/2) is a rough heuristic
-    // More precise: level 17 ≈ 0.0007°, level 14 ≈ 0.006°, level 10 ≈ 0.01°
     let step_deg = match level {
         17 => 0.0003,
         14 => 0.003,
@@ -926,22 +925,28 @@ fn cover_segment(
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let steps = ((seg_len_deg / step_deg).ceil() as usize).max(2);
 
-    let mut cells = Vec::with_capacity(steps + 1);
-    cells.push(c1.0);
+    // Stack-based dedup for the common case (1–8 cells per segment)
+    let mut seen = [0u64; 8];
+    seen[0] = c1.0;
+    let mut seen_count = 1usize;
 
     for i in 1..steps {
         let t = i as f64 / steps as f64;
         let lat = lat1 + t * (lat2 - lat1);
         let lon = lon1 + t * (lon2 - lon1);
         let c = CellID::from(LatLng::from_degrees(lat, lon)).parent(level as u64).0;
-        if !cells.contains(&c) {
-            cells.push(c);
+        let already = seen[..seen_count].contains(&c);
+        if !already {
+            emit(c);
+            if seen_count < seen.len() {
+                seen[seen_count] = c;
+                seen_count += 1;
+            }
         }
     }
-    if !cells.contains(&c2.0) {
-        cells.push(c2.0);
+    if !seen[..seen_count].contains(&c2.0) {
+        emit(c2.0);
     }
-    cells
 }
 
 // ---------------------------------------------------------------------------
@@ -964,6 +969,7 @@ fn assign_addr_cells(
 }
 
 /// Assign segment cells for a generic set of ways (used for both streets and interp).
+/// Uses par_iter for parallel S2 cell computation — each way is independent.
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 fn assign_seg_cells_generic(
@@ -971,28 +977,38 @@ fn assign_seg_cells_generic(
     fine_level: u8,
     coarse_level: u8,
 ) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
-    let mut fine = Vec::new();
-    let mut coarse = Vec::new();
-    for (way_idx, nodes) in node_lists.iter().enumerate() {
-        for (seg_idx, pair) in nodes.windows(2).enumerate() {
-            let (lat1, lon1) = pair[0];
-            let (lat2, lon2) = pair[1];
+    use rayon::prelude::*;
 
-            for cid in cover_segment(lat1, lon1, lat2, lon2, fine_level) {
-                fine.push(SegCellEntry {
-                    cell_id: cid,
-                    way_index: way_idx as u32,
-                    segment_index: seg_idx as u16,
+    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = node_lists
+        .par_iter()
+        .enumerate()
+        .map(|(way_idx, nodes)| {
+            let mut fine = Vec::new();
+            let mut coarse = Vec::new();
+            for (seg_idx, pair) in nodes.windows(2).enumerate() {
+                let (lat1, lon1) = pair[0];
+                let (lat2, lon2) = pair[1];
+                let wi = way_idx as u32;
+                let si = seg_idx as u16;
+
+                cover_segment(lat1, lon1, lat2, lon2, fine_level, |cid| {
+                    fine.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
+                });
+                cover_segment(lat1, lon1, lat2, lon2, coarse_level, |cid| {
+                    coarse.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
                 });
             }
-            for cid in cover_segment(lat1, lon1, lat2, lon2, coarse_level) {
-                coarse.push(SegCellEntry {
-                    cell_id: cid,
-                    way_index: way_idx as u32,
-                    segment_index: seg_idx as u16,
-                });
-            }
-        }
+            (fine, coarse)
+        })
+        .collect();
+
+    let total_fine: usize = per_way.iter().map(|(f, _)| f.len()).sum();
+    let total_coarse: usize = per_way.iter().map(|(_, c)| c.len()).sum();
+    let mut fine = Vec::with_capacity(total_fine);
+    let mut coarse = Vec::with_capacity(total_coarse);
+    for (f, c) in per_way {
+        fine.extend(f);
+        coarse.extend(c);
     }
     (fine, coarse)
 }
@@ -1013,9 +1029,9 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
         let mut edge_cells = std::collections::HashSet::new();
         for v in poly.vertices.windows(2) {
             if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
-            for cid in cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level) {
+            cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level, |cid| {
                 edge_cells.insert(cid);
-            }
+            });
         }
 
         for &cid in &edge_cells {

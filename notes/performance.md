@@ -108,6 +108,19 @@ io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
 12-20% improvement. sqpoll adds no measurable benefit (<1%).
 
+### Cross-pipeline optimization: skip_metadata in block_overlaps_diff
+
+Commit `b90e8ef`: use `elements_skip_metadata()` in `block_overlaps_diff`
+(only accesses element IDs, not metadata). Single-line change.
+
+Germany hotpath (commit `1b10f18`, plantasjen):
+- apply-changes-zlib: **6942ms → 5928ms (-15%)**
+
+Larger improvement than expected — Germany's 18.4% rewrite fraction means
+more blobs reach the precise `block_overlaps_diff` check (which decodes all
+elements to test IDs against the diff). Skipping metadata decode saves ~1s
+across ~11K precise-check invocations.
+
 ## Add-locations-to-ways
 
 Dense mmap index: 16B slots × 8 bytes = 128 GB virtual address space.

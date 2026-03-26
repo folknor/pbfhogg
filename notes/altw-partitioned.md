@@ -183,18 +183,18 @@ cheap, and the alternative (buffering the entire file) is worse.
 
 ### Comparison with previous approaches
 
-| Approach | Memory | Temp disk | I/O pattern | Denmark | Planet (est.) |
-|----------|--------|-----------|-------------|---------|---------------|
-| Dense mmap | 16 GB touched | 128 GB mmap file | Random | 8.2s | 96m (measured) |
-| Sparse mmap | 540 MB + 16 GB | 16 GB mmap file | Sorted random | 14.1s | ~150m (extrapolated) |
-| **External join (current)** | **<1 GB** | **~4.3 GB** | **Sequential** | **302s** | **~60m (stage 2 bottleneck)** |
-| **External join (optimized)** | **<1 GB** | **~224 GB peak** | **Sequential** | **~30-40s (est.)** | **~7-15m** |
-| 64 GB host + dense | 16 GB touched | 128 GB mmap file | Random (fits) | 8.2s | ~20m (estimated) |
+| Approach | Memory | Temp disk | I/O pattern | Denmark | Japan | Planet (est.) |
+|----------|--------|-----------|-------------|---------|-------|---------------|
+| Dense mmap | 16 GB touched | 128 GB mmap file | Random | 8.2s | 72s | 96m (measured) |
+| Sparse mmap | 540 MB + 16 GB | 16 GB mmap file | Sorted random | 14.1s | 72s | ~150m (extrapolated) |
+| External (old, 256× re-read) | <1 GB | ~4.3 GB | Sequential | 302s | — | unusable |
+| **External (single-pass merge)** | **<1 GB** | **~4.3 GB** | **Sequential** | **25s** | **143s** | **~45-60m (est.)** |
+| 64 GB host + dense | 16 GB touched | 128 GB mmap file | Random (fits) | 8.2s | 72s | ~20m (estimated) |
 
-The external join trades temp disk space for bounded memory and sequential I/O.
-The temp disk cost (~224 GB peak) is acceptable on NVMe. The current
-implementation is bottlenecked on stage 2 (256× PBF re-reads); the optimized
-version with a node-coord sidecar eliminates this.
+The external join trades wall time for bounded memory (<1 GB) and sequential I/O.
+At planet scale on a 30 GB host, external should be faster than dense (which
+thrashes at 96 min). The single-pass node merge (commit `a334c72`) eliminated
+the 256× PBF re-read bottleneck without needing a sidecar file.
 
 ## Partition selectivity measurement (disproven hypothesis)
 
@@ -228,52 +228,40 @@ metadata approach but motivated the external join design above.
 Implemented in `src/commands/external_join.rs` (~580 lines). Available as
 `--index-type external` in `add-locations-to-ways`.
 
-### Denmark results (465 MB, 60.8M refs, commit `034422c`, plantasjen)
+### Denmark results (465 MB, 60.8M refs, plantasjen)
 
-| Index | Time | Ratio |
-|-------|------|-------|
-| dense | 8,168 ms | baseline |
-| **external** | **302,069 ms (5m2s)** | **37x** |
+| Index | Time | Ratio | Commit |
+|-------|------|-------|--------|
+| dense | 8,168 ms | baseline | `034422c` |
+| external (old, 256× re-read) | 302,069 ms (5m2s) | 37x | `034422c` |
+| **external (single-pass merge)** | **24,799 ms (25s)** | **3.5x** | `a334c72` |
 
-**Correctness**: identical to dense — 10,175,884 elements, 0 differences.
-Cross-validated against osmium via `brokkr verify add-locations-to-ways`.
+### Japan results (2.4 GB, 344M elements, plantasjen)
+
+| Index | Time | Ratio | Commit |
+|-------|------|-------|--------|
+| dense | 72,284 ms | baseline | `48a351a` |
+| **external (single-pass merge)** | **143,275 ms (2.4m)** | **2.0x** | `a334c72` |
+
+**Correctness**: identical to dense — verified via `brokkr verify add-locations-to-ways`.
 
 **Temp disk**: ~1.9 GB node buckets + ~1.9 GB slot buckets + ~487 MB
-coord_slots = ~4.3 GB peak. Cleaned up automatically on completion.
+coord_slots = ~4.3 GB peak (Denmark). Cleaned up automatically on completion.
 
-### Bottleneck analysis
+### Bottleneck history
 
-**Stage 2 dominates.** The current implementation re-reads ALL node blobs
-256 times (once per bucket) to merge-join with each bucket's COO pairs.
-At Denmark scale: 256 × ~370 MB PBF node data = ~92 GB of redundant
-decoding. This is O(N_buckets × PBF_node_size), the worst-scaling stage.
+**Original stage 2 (commit `034422c`)**: re-read ALL node blobs 256 times
+(once per bucket). Denmark: 256 × ~370 MB PBF node data = ~92 GB of
+redundant decoding. 280s of the 302s total.
 
-The original design assumed stage 2 would read "node blobs whose IDs fall
-in bucket b's range" — but the implementation reads ALL node blobs and
-filters by ID range, because PBF blobs don't align with node-ID ranges
-(same misalignment that killed partition skipping).
+**Fix (commit `a334c72`)**: single-pass node merge. Since PBF nodes are
+sorted by ID and buckets partition the ID space into ascending ranges,
+a single pass through the node stream processes all 256 buckets. Each
+node is read exactly once. No sidecar file needed.
 
-**Fix**: write a compact node-coord sidecar file during stage 1
-(`node_id: i64, lat: i32, lon: i32` = 16 bytes/node, sorted by node_id).
-Stage 2 then binary-searches the sidecar for each bucket's ID range and
-reads only the matching byte range. This converts stage 2 from
-`O(256 × all_nodes)` to `O(all_nodes)` total — each node read exactly once.
-
-At Denmark scale: sidecar = 52.5M nodes × 16 bytes = ~840 MB (fits in RAM,
-but not required — range reads via pread are fine). At planet scale:
-10.4B nodes × 16 bytes = ~166 GB, sequential write then 256 range reads.
-
-### Time budget (Denmark, measured)
-
-| Stage | Description | Est. time |
-|-------|-------------|-----------|
-| Stage 1 | Way pass: emit COO pairs | ~2s |
-| Stage 2 | Node join: 256 × full PBF reads | **~280s** (bottleneck) |
-| Stage 3 | Slot reorder | ~5s |
-| Stage 4 | Assembly | ~15s |
-
-With node-coord sidecar, stage 2 should drop to ~10-20s (single sequential
-read of sidecar + per-bucket sort + merge-join). Total: ~30-40s.
+The originally planned fix was a node-coord sidecar file (16 bytes/node,
+sorted, with range reads). The single-pass merge is simpler and avoids
+the extra temp disk (~32 GB for referenced-only sidecar at planet).
 
 ## Next steps
 
@@ -282,9 +270,9 @@ read of sidecar + per-bucket sort + merge-join). Total: ~30-40s.
 - [x] Implement full pipeline (`src/commands/external_join.rs`)
 - [x] Verify correctness on Denmark — identical to dense
 - [x] Benchmark on Denmark — 302s (37x slower, stage 2 bottleneck identified)
-- [ ] **Optimize stage 2**: node-coord sidecar to eliminate 256× PBF re-reads
-- [ ] Benchmark optimized external on Denmark (target: ~30-40s)
-- [ ] Benchmark on Japan (medium scale, 2.4 GB)
+- [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
+- [x] Benchmark optimized external on Denmark — 25s (3.5x dense)
+- [x] Benchmark on Japan — 143s (2.0x dense)
 - [ ] Benchmark on Europe (the key test — currently 43m with dense)
 - [ ] Add O_DIRECT support to bucket file I/O (planet-scale page cache bypass)
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

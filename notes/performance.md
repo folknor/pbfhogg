@@ -155,17 +155,30 @@ well under an hour.
 `--direct-io` provides no benefit for ALTW — workload is compute/memory-bound,
 not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
-### Dense vs Sparse index (commit `52d6273`, plantasjen)
+### Dense vs Sparse vs External index (plantasjen)
 
-| Dataset | Dense | Sparse | Ratio |
-|---------|-------|--------|-------|
-| Denmark (465 MB) | **6.8s** | 14.1s | 2.1x |
-| Europe (33.6 GB) | **2,565s** (43m) | 6,453s (107m) | **2.5x** |
+| Dataset | Dense | Sparse | External | Commit |
+|---------|-------|--------|----------|--------|
+| Denmark (465 MB) | **6.8s** | 14.1s | 25s | `a334c72` |
+| Japan (2.4 GB) | **72s** | 72s | 143s | `a334c72` |
+| Europe (33.6 GB) | **2,565s** (43m) | 6,453s (107m) | — | `52d6273` |
+| Planet (87.7 GB) | 5,773s (96m)* | — | — | `69a127f` |
 
-Sparse is slower than dense at all tested scales. At Denmark scale the overhead
-is pure CPU (sorting, hashing). At Europe scale the overhead ratio *increases*
-(2.5x vs 2.1x) — the 16 GB on-disk values mmap thrashes just like the dense
-mmap, but with additional sort+hash CPU cost on top.
+*Planet with dense thrashes on 30 GB host (memory-latency-bound).
+
+Dense is fastest when the working set fits in RAM. External uses <1 GB RAM
+at any scale via bucketed sequential I/O (4-stage radix join pipeline).
+At planet scale on a 30 GB host, external (~45-60 min estimated) should
+outperform dense (96 min thrashing). See `notes/altw-partitioned.md`.
+
+Sparse is slower than dense at all scales. At Europe scale the overhead
+ratio *increases* (2.5x vs 2.1x) — the 16 GB on-disk values mmap thrashes
+just like the dense mmap, with additional sort+hash CPU cost on top.
+
+The external join was dramatically improved by a single-pass node merge
+(commit `a334c72`): Denmark 302s → 25s (12x). The previous implementation
+re-read ALL PBF node blobs 256 times (once per bucket); the new version
+reads them exactly once.
 
 See [altw-memory.md](altw-memory.md) for full analysis and next steps.
 

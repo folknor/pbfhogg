@@ -145,39 +145,51 @@ Any new parallel classification path should avoid introducing a second competing
 Performance improvements may vary by extract selectivity.
 Single-pass removes I/O regardless, but CPU behavior may still vary significantly by region density.
 
-## Theoretical / uncertain opportunities
+## Theoretical / uncertain opportunities — ALL CLOSED
 
-## A) Deferred relation matching with lightweight member bloom/filter
+Reviewed by perf + arch teams. None address the remaining osmium gap,
+which is structural: double element iteration (classify then re-encode),
+re-encoding overhead (full decode+rebuild vs osmium's raw passthrough),
+and zlib-rs vs C zlib (15-19% sync compression gap).
 
-For unsorted inputs, buffer unresolved relations cheaply (ID + compact member refs) until prerequisite sets are known.
+## ~~A) Deferred relation matching~~ — CLOSED
 
-- could reduce need for full second pass in partially unsorted data
-- complexity and memory-risk uncertain
+0% impact on osmium gap. Only helps unsorted input, which doesn't exist
+in production (all Geofabrik/planet PBFs are Sort.Type_then_ID). The
+sorted single-pass path (item 1) already handles all production inputs.
 
-## B) Block-level relation prefilter from tag/index metadata
+## ~~B) Block-level relation prefilter~~ — CLOSED
 
-Extend blob metadata with relation member-type summaries to skip relation block decoding in simple mode when impossible to match.
+<1% impact. Relation blobs are already cheap (Denmark: ~35 blobs, Japan:
+~100 blobs). Index format evolution cost is high. Member-type summaries
+have low selectivity (relations span wide ID ranges).
 
-- potentially useful but requires index format evolution and writer overhead
-- uncertain ROI
+## ~~C) Unified extract engine~~ — CLOSED (full refactor)
 
-## C) Unified extract engine with strategy-specific policies
+0% perf impact — maintainability only. Current code already has the right
+unification (collect_pass1_generic + RelationHandler for pass 1, shared
+process_extract_pass2_batch for write path). Remaining duplication is
+~150 lines of structurally similar but semantically distinct code.
 
-Build a common pass planner (simple/complete/smart) that chooses single/multi-pass automatically based on sortedness + index richness.
+A full unified pass planner would add abstraction complexity and coupling
+risk without removing code. The fused single-pass path (simple sorted)
+is fundamentally different from multi-pass (complete/smart).
 
-- good long-term maintainability
-- higher up-front refactor cost
+**One low-cost improvement identified:** merge extract_block_pass2 and
+extract_block_pass3 into a single function with a unified filter struct
+(ExtractPass2IdSets + ExtractPass3IdSets → one struct with optional
+extra_way_ids/extra_node_ids). Eliminates ~100 lines, low risk.
 
-## D) Adaptive batch sizing by match density
+## ~~D) Adaptive batch sizing~~ — CLOSED
 
-Dynamically shrink/grow parallel batch size based on recent output density to balance latency vs throughput.
-
-- possible micro-gain
-- uncertain net benefit vs complexity
+<0.5% impact. Write path is not the bottleneck. Item 6 (skip empty
+blocks) already handles sparse extracts. For dense extracts, batches
+stay full at 64 and adaptive sizing has no effect.
 
 ## Implementation status
 
-All practical items (1-6) done, #7 skipped. Verified via `brokkr verify extract`
+All practical items (1-6) done, #7 skipped. Theoretical items A-D all
+closed per reviewer consensus. Verified via `brokkr verify extract`
 (all 3 strategies pass) and `brokkr check` (clippy + tests clean).
 
 Initial single-pass results (items 1-3): Denmark -14% (2625→2277ms),

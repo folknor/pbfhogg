@@ -1104,8 +1104,12 @@ fn bucketed_cell_assignment(
 ) -> Result<u32> {
     use rayon::prelude::*;
 
-    // Create temp directory for bucket files
+    // Create temp directory for bucket files (remove first to avoid stale files
+    // from a failed prior run contaminating this build).
     let bucket_dir = output_dir.join(format!(".buckets-level{level}"));
+    if bucket_dir.exists() {
+        std::fs::remove_dir_all(&bucket_dir)?;
+    }
     std::fs::create_dir_all(&bucket_dir)?;
 
     // Open 256 bucket writers (lazy — most will be used)
@@ -1173,10 +1177,11 @@ fn bucketed_cell_assignment(
         chunk_start = chunk_end;
     }
 
-    // Interpolation (small enough to do in one pass)
+    // Interpolation — collect per-way entries, then distribute with proper error propagation
     for (way_idx, iw) in interp_ways.iter().enumerate() {
         let nc = iw.node_count as usize;
         if nc < 2 { continue; }
+        let mut way_entries: Vec<(u64, u32, u16)> = Vec::new();
         for seg_idx in 0..nc - 1 {
             let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
             let off2 = off1 + NODE_COORD_SIZE;
@@ -1185,15 +1190,14 @@ fn bucketed_cell_assignment(
                 read_node_at(interp_nodes_mmap, off2 as u64),
             ) {
                 cover_segment(n1.0, n1.1, n2.0, n2.1, level, |cid| {
-                    let b = bucket_for_cell(cid);
-                    ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)
-                        .expect("bucket writer");
-                    write_bucket_record(
-                        bucket_writers[b].as_mut().expect("ensured"),
-                        cid, ENTRY_TYPE_INTERP, way_idx as u32, seg_idx as u16,
-                    ).expect("bucket write");
+                    way_entries.push((cid, way_idx as u32, seg_idx as u16));
                 });
             }
+        }
+        for &(cid, wi, si) in &way_entries {
+            let b = bucket_for_cell(cid);
+            ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
+            write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_INTERP, wi, si)?;
         }
     }
 
@@ -1214,6 +1218,7 @@ fn bucketed_cell_assignment(
     let mut addr_byte_offset: u32 = 0;
     let mut interp_byte_offset: u64 = 0;
     let mut total_cells: u32 = 0;
+    let mut prev_cell_id: u64 = 0;
 
     for bucket_idx in 0..NUM_BUCKETS {
         let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
@@ -1299,6 +1304,11 @@ fn bucketed_cell_assignment(
                 } else { NO_DATA_U32 },
             };
             cells_out.write_all(&gc.to_bytes())?;
+            debug_assert!(
+                cell_id > prev_cell_id || total_cells == 0,
+                "bucket ordering violated: cell {cell_id} <= prev {prev_cell_id}"
+            );
+            prev_cell_id = cell_id;
             total_cells += 1;
 
             // Advance byte offsets

@@ -191,6 +191,21 @@ impl Reader {
             let path = dir.join(name);
             let file = std::fs::File::open(&path)
                 .map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+            let len = file.metadata()
+                .map_err(|e| format!("failed to stat {}: {e}", path.display()))?
+                .len();
+            if len == 0 {
+                // memmap2::Mmap::map() fails on zero-length files.
+                // Return an empty read-only anonymous mmap instead.
+                // All consumers check record bounds before reading,
+                // so an empty mmap (len=0) is handled correctly.
+                return Ok(unsafe {
+                    memmap2::MmapOptions::new().map_anon()
+                        .map_err(|e| format!("failed to create empty mmap for {}: {e}", path.display()))?
+                        .make_read_only()
+                        .map_err(|e| format!("failed to make anon mmap read-only for {}: {e}", path.display()))?
+                });
+            }
             // SAFETY: the file is read-only for the lifetime of the Reader.
             let m = unsafe { Mmap::map(&file) }
                 .map_err(|e| format!("failed to mmap {}: {e}", path.display()))?;

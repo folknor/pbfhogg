@@ -512,21 +512,15 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass2_drop_kb={rss}"); }
 
     // Mmap output files for coordinate access in cell assignment + interpolation
-    // Mmap helper that handles empty files by returning an empty slice-equivalent.
-    // memmap2::Mmap::map() fails on zero-length files; we use MmapOptions with
-    // a minimum length of 1 byte for empty files (the extra byte is never read
-    // since all consumers check bounds).
+    // Mmap helper: handles empty files via anonymous read-only mmap (same as Reader).
     let mmap_file = |name: &str| -> Result<memmap2::Mmap> {
         let path = config.output_dir.join(name);
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         if len == 0 {
-            // Write a single zero byte so mmap succeeds, then map read-only.
-            // The consumers all check record bounds, so the extra byte is harmless.
-            drop(file);
-            std::fs::write(&path, &[0u8])?;
-            let file = std::fs::File::open(&path)?;
-            return Ok(unsafe { memmap2::Mmap::map(&file)? });
+            return Ok(unsafe {
+                memmap2::MmapOptions::new().map_anon()?.make_read_only()?
+            });
         }
         Ok(unsafe { memmap2::Mmap::map(&file)? })
     };

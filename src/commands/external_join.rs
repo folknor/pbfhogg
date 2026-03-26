@@ -114,17 +114,11 @@ impl Drop for ScratchDir {
 // Bucket writers
 // ---------------------------------------------------------------------------
 
-/// Bytes written between fadvise(DONTNEED) cycles on bucket files.
-/// 256 MB keeps write-side page cache bounded without excessive syscalls.
-const BUCKET_ADVISE_INTERVAL: u64 = 256 * 1024 * 1024;
-
 /// Set of buffered writers for radix bucket files.
 struct BucketWriters {
     writers: Vec<Option<BufWriter<std::fs::File>>>,
     paths: Vec<PathBuf>,
     entry_counts: Vec<u64>,
-    /// Cumulative bytes written since last fadvise cycle.
-    bytes_since_advise: u64,
 }
 
 impl BucketWriters {
@@ -142,33 +136,22 @@ impl BucketWriters {
             paths.push(path);
         }
 
-        Ok(Self { writers, paths, entry_counts, bytes_since_advise: 0 })
+        Ok(Self { writers, paths, entry_counts })
     }
 
-    /// Track bytes written and periodically flush + fadvise(DONTNEED) to
-    /// prevent bucket writes from filling page cache (56 GB at Europe scale).
-    /// No-op without `linux-direct-io` — the flush+fadvise cycle is pointless
-    /// when fadvise isn't available.
-    fn track_write(&mut self, _bytes: u64) -> Result<()> {
-        #[cfg(feature = "linux-direct-io")]
-        {
-            self.bytes_since_advise += _bytes;
-            if self.bytes_since_advise >= BUCKET_ADVISE_INTERVAL {
-                self.flush_and_advise()?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Flush all writers and advise kernel to drop their pages.
-    #[cfg_attr(not(feature = "linux-direct-io"), allow(unused))]
-    fn flush_and_advise(&mut self) -> Result<()> {
+    /// Flush, sync, fadvise(DONTNEED), and close all writers.
+    /// sync_data() ensures pages are clean so fadvise can evict them.
+    /// Only runs once per stage — acceptable cost at stage boundaries.
+    fn finish(&mut self) -> Result<Vec<u64>> {
         for writer in &mut self.writers {
             if let Some(w) = writer.as_mut() {
                 w.flush()?;
                 #[cfg(feature = "linux-direct-io")]
                 {
                     use std::os::unix::io::AsRawFd;
+                    // sync_data makes pages clean; fadvise evicts clean pages.
+                    // Without sync, dirty pages survive DONTNEED.
+                    let _ = w.get_ref().sync_data();
                     unsafe {
                         libc::posix_fadvise(
                             w.get_ref().as_raw_fd(),
@@ -179,15 +162,6 @@ impl BucketWriters {
                     };
                 }
             }
-        }
-        self.bytes_since_advise = 0;
-        Ok(())
-    }
-
-    /// Flush, fadvise, and close all writers. Returns per-bucket entry counts.
-    fn finish(&mut self) -> Result<Vec<u64>> {
-        self.flush_and_advise()?;
-        for writer in &mut self.writers {
             *writer = None;
         }
         Ok(self.entry_counts.clone())
@@ -310,7 +284,6 @@ fn stage1_way_pass(
                         writer.write_all(&pair_buf)?;
                     }
                     node_buckets.entry_counts[bucket] += 1;
-                    node_buckets.track_write(COO_PAIR_SIZE as u64)?;
                     slot_pos += 1;
                 }
             }
@@ -455,7 +428,6 @@ fn stage2_node_join(
                     writer.write_all(&entry_buf)?;
                 }
                 slot_buckets.entry_counts[bucket] += 1;
-                slot_buckets.track_write(RESOLVED_ENTRY_SIZE as u64)?;
                 resolved_count += 1;
                 pair_cursor += 1;
             }
@@ -955,7 +927,6 @@ pub fn external_join(
     let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets)?;
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
-    advise_dontneed_buckets(&node_buckets);
     let stage1_ms = t1.elapsed().as_millis();
     eprintln!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
     eprintln!("stage1_ms={stage1_ms}");
@@ -968,7 +939,6 @@ pub fn external_join(
     let resolved_count =
         stage2_node_join(input, direct_io, &node_buckets, &mut slot_buckets, total_slots)?;
     slot_buckets.finish()?;
-    advise_dontneed_buckets(&slot_buckets);
     node_buckets.cleanup();
     let stage2_ms = t2.elapsed().as_millis();
     eprintln!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");

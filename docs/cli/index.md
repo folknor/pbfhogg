@@ -3,8 +3,11 @@
 pbfhogg includes a command-line toolkit for common OSM PBF operations. Install it with:
 
 ```sh
-cargo install pbfhogg-cli
+# Build from source
+cargo install --path cli
 ```
+
+> **Note:** pbfhogg-cli is not yet published on crates.io. Build from source for now.
 
 The binary is called `pbfhogg`. Requires Rust 1.87+.
 

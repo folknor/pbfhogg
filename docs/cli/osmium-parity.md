@@ -188,7 +188,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| ~~`-i, --index-type`~~ | ~~`add-locations-to-ways` uses DenseMmapIndex only~~ — **Now supported:** `--index-type dense\|sparse` |
+| ~~`-i, --index-type`~~ | ~~`add-locations-to-ways` uses DenseMmapIndex only~~ — **Now supported:** `--index-type dense\|sparse\|external` |
 
 ### Flags only pbfhogg has
 
@@ -220,8 +220,10 @@ has no osmium equivalent.
 To create an indexed PBF:
 
 ```
-pbfhogg cat input.pbf --type node,way,relation -o indexed.pbf
+pbfhogg cat input.pbf -o indexed.pbf
 ```
+
+The passthrough path (no `--type` filter) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files.
 
 Commands that benefit from indexdata will error if it's missing. Use `--force`
 to run anyway (slower). Check if a file is indexed:

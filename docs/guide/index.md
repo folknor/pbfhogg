@@ -10,8 +10,10 @@ pbfhogg is a Rust library and CLI toolkit for reading, writing, and transforming
 
 ```toml
 [dependencies]
-pbfhogg = "0.2"
+pbfhogg = { path = "../pbfhogg" }
 ```
+
+> **Note:** pbfhogg is not yet published on crates.io. Use a path or git dependency for now.
 
 ```rust
 use pbfhogg::{ElementReader, Element};
@@ -27,8 +29,8 @@ reader.for_each(|element| {
 ### As a CLI
 
 ```sh
-# Install
-cargo install pbfhogg-cli
+# Build from source
+cargo install --path cli
 
 # Inspect a PBF file
 pbfhogg inspect denmark.osm.pbf

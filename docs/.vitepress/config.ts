@@ -1,7 +1,7 @@
 import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
-const projectName = 'Pbfhogg'
+const projectName = 'pbfhogg'
 const projectDescription = 'Fast OpenStreetMap PBF reader and writer for Rust'
 const githubUrl = 'https://github.com/folknor/pbfhogg'
 const base = '/pbfhogg/'
@@ -36,7 +36,7 @@ export default defineConfig({
     ],
 
     footer: {
-      message: `Released under the Apache License 2.0.`,
+      message: `Released under the Apache License 2.0. | Copyright folk@folk.wtf`,
     },
 
     sidebar: {

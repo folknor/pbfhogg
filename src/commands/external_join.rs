@@ -57,13 +57,6 @@ fn read_rss_kb() -> u64 {
 // Constants
 // ---------------------------------------------------------------------------
 
-/// External join forces O_DIRECT for all PBF reads when the feature is available.
-/// Users choose `--index-type external` precisely because they're memory-constrained;
-/// letting the kernel cache 32+ GB of PBF pages defeats the purpose and causes OOM.
-fn force_direct_io(user_flag: bool) -> bool {
-    if cfg!(feature = "linux-direct-io") { true } else { user_flag }
-}
-
 /// Number of buckets for radix partitioning. 256 = partition by high byte.
 const NUM_BUCKETS: usize = 256;
 
@@ -154,10 +147,15 @@ impl BucketWriters {
 
     /// Track bytes written and periodically flush + fadvise(DONTNEED) to
     /// prevent bucket writes from filling page cache (56 GB at Europe scale).
-    fn track_write(&mut self, bytes: u64) -> Result<()> {
-        self.bytes_since_advise += bytes;
-        if self.bytes_since_advise >= BUCKET_ADVISE_INTERVAL {
-            self.flush_and_advise()?;
+    /// No-op without `linux-direct-io` — the flush+fadvise cycle is pointless
+    /// when fadvise isn't available.
+    fn track_write(&mut self, _bytes: u64) -> Result<()> {
+        #[cfg(feature = "linux-direct-io")]
+        {
+            self.bytes_since_advise += _bytes;
+            if self.bytes_since_advise >= BUCKET_ADVISE_INTERVAL {
+                self.flush_and_advise()?;
+            }
         }
         Ok(())
     }
@@ -186,12 +184,10 @@ impl BucketWriters {
         Ok(())
     }
 
-    /// Flush and close all writers. Returns per-bucket entry counts.
+    /// Flush, fadvise, and close all writers. Returns per-bucket entry counts.
     fn finish(&mut self) -> Result<Vec<u64>> {
+        self.flush_and_advise()?;
         for writer in &mut self.writers {
-            if let Some(w) = writer.as_mut() {
-                w.flush()?;
-            }
             *writer = None;
         }
         Ok(self.entry_counts.clone())
@@ -295,7 +291,7 @@ fn stage1_way_pass(
     direct_io: bool,
     node_buckets: &mut BucketWriters,
 ) -> Result<u64> {
-    let reader = ElementReader::open(input, force_direct_io(direct_io))?
+    let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_ways());
 
     let mut slot_pos: u64 = 0;
@@ -399,7 +395,7 @@ fn stage2_node_join(
     }
 
     // Single pass through all node blobs.
-    let reader = ElementReader::open(input, force_direct_io(direct_io))?
+    let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_nodes());
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
@@ -685,7 +681,7 @@ fn stage4_assembly(
         blobs_decoded: 0,
     };
 
-    let reader = ElementReader::open(input, force_direct_io(direct_io))?;
+    let reader = ElementReader::open(input, direct_io)?;
     let mut writer = writer_from_header(
         output,
         compression,
@@ -996,7 +992,7 @@ pub fn external_join(
         None
     } else {
         Some(super::add_locations_to_ways::collect_relation_member_node_ids(
-            input, force_direct_io(direct_io),
+            input, direct_io,
         )?)
     };
     eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);

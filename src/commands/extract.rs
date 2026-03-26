@@ -1019,36 +1019,34 @@ fn merge_way_batch_parallel(
     matched_way_ids: &mut IdSetDense,
     all_way_node_ids: &mut IdSetDense,
 ) {
-    // Per-worker fold into thread-local IdSetDense, then merge. Eliminates
-    // the per-block Vec<i64> allocation that was 1.7 GB cumulative on Denmark.
-    let (way_sets, node_sets): (Vec<IdSetDense>, Vec<IdSetDense>) = batch
+    // map_init reuses Vec capacity across blocks within each rayon worker.
+    // Each block clears + refills the Vecs without reallocating. The returned
+    // Vecs are mem::take'd to move ownership to the collect phase; the init
+    // closure provides fresh Vecs only on the first call per worker.
+    let partials: Vec<(Vec<i64>, Vec<i64>)> = batch
         .par_iter()
-        .fold(
-            || (IdSetDense::new(), IdSetDense::new()),
-            |(mut local_ways, mut local_nodes), block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(w) = &element
-                        && w.refs().any(|r| bbox_node_ids.get(r))
-                    {
-                        local_ways.set(w.id());
-                        for r in w.refs() {
-                            local_nodes.set(r);
-                        }
-                    }
+        .map(|block| {
+            let mut local_way_ids: Vec<i64> = Vec::new();
+            let mut local_node_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element
+                    && w.refs().any(|r| bbox_node_ids.get(r))
+                {
+                    local_way_ids.push(w.id());
+                    local_node_ids.extend(w.refs());
                 }
-                (local_ways, local_nodes)
-            },
-        )
-        .map(|(w, n)| (w, n))
-        .collect::<Vec<_>>()
-        .into_iter()
-        .unzip();
+            }
+            (local_way_ids, local_node_ids)
+        })
+        .collect();
 
-    for set in way_sets {
-        matched_way_ids.merge(set);
-    }
-    for set in node_sets {
-        all_way_node_ids.merge(set);
+    for (way_ids, node_ids) in partials {
+        for id in way_ids {
+            matched_way_ids.set(id);
+        }
+        for id in node_ids {
+            all_way_node_ids.set(id);
+        }
     }
 }
 
@@ -1059,25 +1057,25 @@ fn merge_relation_batch_parallel(
     matched_way_ids: &IdSetDense,
     matched_relation_ids: &mut IdSetDense,
 ) {
-    let sets: Vec<IdSetDense> = batch
+    let partials: Vec<Vec<i64>> = batch
         .par_iter()
-        .fold(
-            IdSetDense::new,
-            |mut local, block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                    {
-                        local.set(r.id());
-                    }
+        .map(|block| {
+            let mut local_relation_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
+                    local_relation_ids.push(r.id());
                 }
-                local
-            },
-        )
+            }
+            local_relation_ids
+        })
         .collect();
 
-    for set in sets {
-        matched_relation_ids.merge(set);
+    for relation_ids in partials {
+        for id in relation_ids {
+            matched_relation_ids.set(id);
+        }
     }
 }
 
@@ -1090,36 +1088,42 @@ fn merge_relation_batch_smart_parallel(
     extra_way_ids: &mut IdSetDense,
     extra_node_ids: &mut IdSetDense,
 ) {
-    let triples: Vec<(IdSetDense, IdSetDense, IdSetDense)> = batch
+    let partials: Vec<(Vec<i64>, Vec<i64>, Vec<i64>)> = batch
         .par_iter()
-        .fold(
-            || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
-            |(mut local_rels, mut local_ways, mut local_nodes), block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                    {
-                        local_rels.set(r.id());
-                        if is_smart_relation(r) {
-                            for m in r.members() {
-                                match m.id {
-                                    MemberId::Way(id) => local_ways.set(id),
-                                    MemberId::Node(id) => local_nodes.set(id),
-                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                                }
+        .map(|block| {
+            let mut local_relation_ids: Vec<i64> = Vec::new();
+            let mut local_extra_way_ids: Vec<i64> = Vec::new();
+            let mut local_extra_node_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element
+                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                {
+                    local_relation_ids.push(r.id());
+                    if is_smart_relation(r) {
+                        for m in r.members() {
+                            match m.id {
+                                MemberId::Way(id) => local_extra_way_ids.push(id),
+                                MemberId::Node(id) => local_extra_node_ids.push(id),
+                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
                             }
                         }
                     }
                 }
-                (local_rels, local_ways, local_nodes)
-            },
-        )
+            }
+            (local_relation_ids, local_extra_way_ids, local_extra_node_ids)
+        })
         .collect();
 
-    for (rels, ways, nodes) in triples {
-        matched_relation_ids.merge(rels);
-        extra_way_ids.merge(ways);
-        extra_node_ids.merge(nodes);
+    for (relation_ids, way_ids, node_ids) in partials {
+        for id in relation_ids {
+            matched_relation_ids.set(id);
+        }
+        for id in way_ids {
+            extra_way_ids.set(id);
+        }
+        for id in node_ids {
+            extra_node_ids.set(id);
+        }
     }
 }
 

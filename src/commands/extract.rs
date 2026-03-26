@@ -709,6 +709,7 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 ///
 /// Uses `block_type()` (1 byte per group) to branch by type phase,
 /// eliminating dead match arms in the hot inner loop for sorted PBFs.
+#[hotpath::measure]
 fn classify_block_simple(
     block: &PrimitiveBlock,
     region: &Region,
@@ -1011,6 +1012,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 // Pass 1 ID collection helpers
 // ---------------------------------------------------------------------------
 
+#[hotpath::measure]
 fn merge_way_batch_parallel(
     batch: &[PrimitiveBlock],
     bbox_node_ids: &IdSetDense,
@@ -1044,6 +1046,7 @@ fn merge_way_batch_parallel(
     }
 }
 
+#[hotpath::measure]
 fn merge_relation_batch_parallel(
     batch: &[PrimitiveBlock],
     bbox_node_ids: &IdSetDense,
@@ -1072,6 +1075,7 @@ fn merge_relation_batch_parallel(
     }
 }
 
+#[hotpath::measure]
 fn merge_relation_batch_smart_parallel(
     batch: &[PrimitiveBlock],
     bbox_node_ids: &IdSetDense,
@@ -1224,6 +1228,7 @@ impl RelationHandler for SmartRelationHandler {
 /// The `handler` controls additional per-relation processing (e.g. smart
 /// strategy collects extra way/node IDs from multipolygon/boundary relations).
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+#[hotpath::measure]
 fn collect_pass1_generic<H: RelationHandler>(
     input: &Path,
     region: &Region,
@@ -1454,6 +1459,7 @@ struct ExtractPass2IdSets<'a> {
 
 /// Process a single block for Pass 2 of complete-ways: write elements whose IDs
 /// were collected in Pass 1. Uses thread-local BlockBuilder and output buffer.
+#[hotpath::measure]
 fn extract_block_pass2(
     block: &PrimitiveBlock,
     ids: &ExtractPass2IdSets<'_>,
@@ -1662,6 +1668,7 @@ struct ExtractPass3IdSets<'a> {
 
 /// Process a single block for Pass 3 of smart extraction: write elements whose IDs
 /// were collected in Passes 1+2. Uses thread-local BlockBuilder and output buffer.
+#[hotpath::measure]
 fn extract_block_pass3(
     block: &PrimitiveBlock,
     ids: &ExtractPass3IdSets<'_>,

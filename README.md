@@ -1,4 +1,18 @@
-# pbfhogg
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/public/pbfhogg-logo-text-dark.svg">
+    <img src="docs/public/pbfhogg-logo-text.svg" width="300" alt="pbfhogg">
+  </picture>
+  <br>
+  <em>Fast OpenStreetMap PBF reader and writer for Rust</em>
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/rust-stable-orange?logo=rust" alt="Rust">
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="License"></a>
+</p>
+
+---
 
 Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. Designed for planet-scale operations on normal hardware.
 

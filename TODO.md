@@ -196,6 +196,13 @@ and Germany (~4 GB RSS) work. Planet would OOM on a 30 GB host.
   does) instead of indexing every node
 - [ ] Chunk-sort cell entries on disk (write sorted chunks, k-way merge)
 
+### README badges (after publishing)
+
+- [ ] crates.io version badge — `https://img.shields.io/crates/v/pbfhogg`
+- [ ] docs.rs badge — `https://img.shields.io/docsrs/pbfhogg`
+- [ ] CI status badge — `https://img.shields.io/github/actions/workflow/status/folknor/pbfhogg/ci.yml`
+  (requires GitHub Actions CI workflow)
+
 ### Other
 
 - [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)

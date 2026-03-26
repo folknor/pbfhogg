@@ -1,6 +1,7 @@
 [workspace]
 members = ["cli"]
 exclude = ["bench/osmpbf-baseline"]
+dependencies = {}
 
 [workspace.package]
 version = "0.2.0"
@@ -77,11 +78,11 @@ serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
 s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7", optional = true }
-libc = { version = "0.2", optional = true }
+libc = { version = "0.2.183", optional = true }
 
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "3.27.0"
 
 [profile.release]
 opt-level = 3

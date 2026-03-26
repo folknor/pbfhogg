@@ -1019,25 +1019,26 @@ fn merge_way_batch_parallel(
     matched_way_ids: &mut IdSetDense,
     all_way_node_ids: &mut IdSetDense,
 ) {
-    // map_init reuses Vec capacity across blocks within each rayon worker.
-    // Each block clears + refills the Vecs without reallocating. The returned
-    // Vecs are mem::take'd to move ownership to the collect phase; the init
-    // closure provides fresh Vecs only on the first call per worker.
+    // Per-worker aggregate Vecs via fold: one (Vec, Vec) per rayon worker
+    // accumulates across all blocks in the batch. ~6 Vecs instead of ~64
+    // (one per block), cutting allocation churn ~10x while keeping
+    // O(matched_elements) work (no IdSetDense::merge).
     let partials: Vec<(Vec<i64>, Vec<i64>)> = batch
         .par_iter()
-        .map(|block| {
-            let mut local_way_ids: Vec<i64> = Vec::new();
-            let mut local_node_ids: Vec<i64> = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element
-                    && w.refs().any(|r| bbox_node_ids.get(r))
-                {
-                    local_way_ids.push(w.id());
-                    local_node_ids.extend(w.refs());
+        .fold(
+            || (Vec::new(), Vec::new()),
+            |(mut local_way_ids, mut local_node_ids), block| {
+                for element in block.elements_skip_metadata() {
+                    if let Element::Way(w) = &element
+                        && w.refs().any(|r| bbox_node_ids.get(r))
+                    {
+                        local_way_ids.push(w.id());
+                        local_node_ids.extend(w.refs());
+                    }
                 }
-            }
-            (local_way_ids, local_node_ids)
-        })
+                (local_way_ids, local_node_ids)
+            },
+        )
         .collect();
 
     for (way_ids, node_ids) in partials {
@@ -1059,17 +1060,19 @@ fn merge_relation_batch_parallel(
 ) {
     let partials: Vec<Vec<i64>> = batch
         .par_iter()
-        .map(|block| {
-            let mut local_relation_ids: Vec<i64> = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element
-                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                {
-                    local_relation_ids.push(r.id());
+        .fold(
+            Vec::new,
+            |mut local, block| {
+                for element in block.elements_skip_metadata() {
+                    if let Element::Relation(r) = &element
+                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                    {
+                        local.push(r.id());
+                    }
                 }
-            }
-            local_relation_ids
-        })
+                local
+            },
+        )
         .collect();
 
     for relation_ids in partials {
@@ -1090,28 +1093,28 @@ fn merge_relation_batch_smart_parallel(
 ) {
     let partials: Vec<(Vec<i64>, Vec<i64>, Vec<i64>)> = batch
         .par_iter()
-        .map(|block| {
-            let mut local_relation_ids: Vec<i64> = Vec::new();
-            let mut local_extra_way_ids: Vec<i64> = Vec::new();
-            let mut local_extra_node_ids: Vec<i64> = Vec::new();
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element
-                    && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                {
-                    local_relation_ids.push(r.id());
-                    if is_smart_relation(r) {
-                        for m in r.members() {
-                            match m.id {
-                                MemberId::Way(id) => local_extra_way_ids.push(id),
-                                MemberId::Node(id) => local_extra_node_ids.push(id),
-                                MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+        .fold(
+            || (Vec::new(), Vec::new(), Vec::new()),
+            |(mut local_rels, mut local_ways, mut local_nodes), block| {
+                for element in block.elements_skip_metadata() {
+                    if let Element::Relation(r) = &element
+                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
+                    {
+                        local_rels.push(r.id());
+                        if is_smart_relation(r) {
+                            for m in r.members() {
+                                match m.id {
+                                    MemberId::Way(id) => local_ways.push(id),
+                                    MemberId::Node(id) => local_nodes.push(id),
+                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                }
                             }
                         }
                     }
                 }
-            }
-            (local_relation_ids, local_extra_way_ids, local_extra_node_ids)
-        })
+                (local_rels, local_ways, local_nodes)
+            },
+        )
         .collect();
 
     for (relation_ids, way_ids, node_ids) in partials {

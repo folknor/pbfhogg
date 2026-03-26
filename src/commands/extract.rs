@@ -758,8 +758,11 @@ fn classify_block_simple(
                 }
             }
         }
-        BlockType::Mixed | BlockType::Empty => {
-            // Fallback for unsorted/mixed blocks — check all element types.
+        BlockType::Empty => {
+            // Empty blocks have no elements — skip.
+        }
+        BlockType::Mixed => {
+            // Fallback for mixed blocks — check all element types.
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
@@ -1360,7 +1363,10 @@ fn collect_pass1_generic<H: RelationHandler>(
                     relation_batch.clear();
                 }
             }
-            BlockType::Mixed | BlockType::Empty => {
+            BlockType::Empty => {
+                // Empty blocks have no elements — skip without flushing batches.
+            }
+            BlockType::Mixed => {
                 if !way_batch.is_empty() {
                     merge_way_batch_parallel(
                         &way_batch,

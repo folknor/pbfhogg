@@ -37,12 +37,14 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
      Refactored into `collect_pass1_generic<H: RelationHandler>` with
      `CompleteRelationHandler` (no-op) and `SmartRelationHandler` (collects
      extra way/node IDs). Net -144 lines. Verified via `brokkr verify extract`.
-  3. **`Mixed | Empty` handler is a full sequential fallback** that defeats the
-     optimization. A single Mixed block flushes both batches and processes all
-     element types sequentially. Correct but fragile — rare in practice.
-  4. **Vec-per-block allocation in batch helpers.** Each `par_iter` task creates
-     new Vecs for local IDs. For 64 way blocks with ~8000 ways each, the
-     `local_node_ids` Vec could hold millions of entries per batch.
+  3. ~~**`Mixed | Empty` handler is a full sequential fallback.**~~
+     Split Empty from Mixed (commit `ff29c1f`). Empty blocks now skip without
+     flushing batches. Mixed blocks retain sequential fallback — rare in
+     production PBFs, not worth parallelizing (perf reviewer consensus).
+  4. **Vec-per-block allocation in batch helpers.** Low priority per perf
+     reviewer consensus — allocator handles the short-lived pattern well.
+     Only pursue if alloc profiling shows it as a hotspot. Proper fix would
+     be per-worker fold/reduce, not just map_init.
   5. **`decode_threads(1)` may under-utilize.** Reduces pipeline decode to one
      thread since the consumer does its own parallelism. Sensible tradeoff but
      may leave the I/O thread idle waiting for the single decoder.
@@ -74,7 +76,9 @@ doesn't help when the mmap working set exceeds RAM. Dense remains the faster
 option at all tested scales.
 
 **Next steps**:
-- [ ] Test pread + fadvise (replace sparse mmap with explicit I/O + readahead hints)
+- [ ] ~~Test pread + fadvise~~ — perf reviewer consensus: won't help. The 2.5x
+  gap is a working-set-exceeds-RAM problem (capacity miss), not a prefetch
+  miss. The batched sorted access is already the right algorithm.
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
 - [ ] If neither works, implement partitioned multi-pass
 

@@ -303,11 +303,14 @@ fn stage2_node_join(
                 *sorted_pairs = load_coo_bucket(&node_buckets.paths[*bucket_idx])?;
                 sorted_pairs.sort_unstable_by_key(|p| p.node_id);
                 *pair_cursor = 0;
-                #[allow(clippy::cast_possible_truncation)]
-                {
-                    *bucket_max_id = (((*bucket_idx as u64 + 1) * range_size).min(MAX_NODE_ID))
-                        .cast_signed();
-                }
+                // Last bucket covers everything above its lower bound —
+                // prevents silent data loss if node IDs exceed MAX_NODE_ID.
+                *bucket_max_id = if *bucket_idx == NUM_BUCKETS - 1 {
+                    i64::MAX
+                } else {
+                    #[allow(clippy::cast_possible_truncation)]
+                    { ((*bucket_idx as u64 + 1) * range_size).cast_signed() }
+                };
                 return Ok(true);
             }
             *bucket_idx += 1;
@@ -816,6 +819,17 @@ pub fn external_join(
         force,
         "external join requires indexdata for efficient blob filtering",
     )?;
+
+    // The single-pass node merge in stage 2 requires sorted PBF input
+    // (nodes in ascending ID order). Verify the header declares Sort.Type_then_ID.
+    {
+        let reader = ElementReader::from_path(input)?;
+        if !reader.header().is_sorted() {
+            return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
+                        The single-pass node merge depends on ascending node ID order."
+                .into());
+        }
+    }
 
     let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")))?;
 

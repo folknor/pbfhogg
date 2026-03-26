@@ -274,93 +274,122 @@ fn stage2_node_join(
     let mut resolved_count: u64 = 0;
     let range_size = MAX_NODE_ID.div_ceil(NUM_BUCKETS as u64);
 
-    for bucket_idx in 0..NUM_BUCKETS {
-        if node_buckets.entry_counts[bucket_idx] == 0 {
-            continue;
-        }
+    // Single-pass node merge: read PBF nodes exactly once, advancing through
+    // buckets as node IDs increase. Since PBF nodes are sorted by ID and
+    // buckets partition the ID space into ascending ranges, each node falls
+    // into exactly one bucket. We load one bucket at a time (~500 MB peak).
+    //
+    // Previous implementation: 256 separate PBF reads (one per bucket),
+    // each decompressing ALL node blobs. That was 256× the I/O cost.
 
-        // Load bucket into memory and sort by node_id.
-        let pairs = load_coo_bucket(&node_buckets.paths[bucket_idx])?;
-        if pairs.is_empty() {
-            continue;
-        }
+    // Pre-load all non-empty buckets sorted by node_id.
+    // We advance through them as the node stream progresses.
+    let mut bucket_idx: usize = 0;
+    let mut sorted_pairs: Vec<CooPair> = Vec::new();
+    let mut pair_cursor: usize = 0;
+    let mut bucket_max_id: i64 = 0;
 
-        // Build a sorted lookup: node_id → Vec<slot_pos>.
-        // Using a Vec of pairs sorted by node_id for merge-join with the
-        // node stream (also sorted by node_id).
-        let mut sorted_pairs = pairs;
-        sorted_pairs.sort_unstable_by_key(|p| p.node_id);
-
-        // Determine the node ID range for this bucket.
-        let bucket_min_id = (bucket_idx as u64 * range_size).cast_signed();
-        #[allow(clippy::cast_possible_truncation)]
-        let bucket_max_id = (((bucket_idx as u64 + 1) * range_size).min(MAX_NODE_ID)).cast_signed();
-
-        // Stream nodes in this ID range, merge-join with sorted pairs.
-        let reader = ElementReader::open(input, direct_io)?
-            .with_blob_filter(BlobFilter::only_nodes());
-
-        let mut pair_cursor = 0usize;
-        let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
-
-        for block in reader.into_blocks_pipelined() {
-            let block = block?;
-            for element in block.elements_skip_metadata() {
-                let (id, lat, lon) = match &element {
-                    Element::DenseNode(dn) => {
-                        (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
-                    }
-                    Element::Node(n) => {
-                        (n.id(), n.decimicro_lat(), n.decimicro_lon())
-                    }
-                    _ => continue,
-                };
-
-                // Skip nodes outside this bucket's range.
-                if id < bucket_min_id {
-                    continue;
-                }
-                if id >= bucket_max_id {
-                    continue;
-                }
-
-                // Advance cursor past any pairs with smaller node_id.
-                while pair_cursor < sorted_pairs.len()
-                    && sorted_pairs[pair_cursor].node_id < id
+    // Advance to first non-empty bucket.
+    fn load_next_bucket(
+        bucket_idx: &mut usize,
+        sorted_pairs: &mut Vec<CooPair>,
+        pair_cursor: &mut usize,
+        bucket_max_id: &mut i64,
+        node_buckets: &BucketWriters,
+        range_size: u64,
+    ) -> Result<bool> {
+        while *bucket_idx < NUM_BUCKETS {
+            if node_buckets.entry_counts[*bucket_idx] > 0 {
+                *sorted_pairs = load_coo_bucket(&node_buckets.paths[*bucket_idx])?;
+                sorted_pairs.sort_unstable_by_key(|p| p.node_id);
+                *pair_cursor = 0;
+                #[allow(clippy::cast_possible_truncation)]
                 {
-                    pair_cursor += 1;
+                    *bucket_max_id = (((*bucket_idx as u64 + 1) * range_size).min(MAX_NODE_ID))
+                        .cast_signed();
                 }
+                return Ok(true);
+            }
+            *bucket_idx += 1;
+        }
+        Ok(false)
+    }
 
-                // Emit resolved entries for all pairs matching this node_id.
-                while pair_cursor < sorted_pairs.len()
-                    && sorted_pairs[pair_cursor].node_id == id
-                {
-                    let entry = ResolvedEntry {
-                        slot_pos: sorted_pairs[pair_cursor].slot_pos,
-                        lat,
-                        lon,
-                    };
-                    let bucket = entry.slot_bucket(total_slots);
-                    entry.write_to(&mut entry_buf);
-                    if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
-                        writer.write_all(&entry_buf)?;
-                    }
-                    slot_buckets.entry_counts[bucket] += 1;
-                    resolved_count += 1;
-                    pair_cursor += 1;
+    let has_bucket = load_next_bucket(
+        &mut bucket_idx, &mut sorted_pairs, &mut pair_cursor,
+        &mut bucket_max_id, node_buckets, range_size,
+    )?;
+
+    if !has_bucket {
+        return Ok(0); // No COO pairs at all
+    }
+
+    // Single pass through all node blobs.
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(BlobFilter::only_nodes());
+
+    let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
+
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        for element in block.elements_skip_metadata() {
+            let (id, lat, lon) = match &element {
+                Element::DenseNode(dn) => {
+                    (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
+                }
+                Element::Node(n) => {
+                    (n.id(), n.decimicro_lat(), n.decimicro_lon())
+                }
+                _ => continue,
+            };
+
+            // Advance to the bucket that covers this node ID.
+            while id >= bucket_max_id {
+                if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
+                    eprintln!(
+                        "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved so far)"
+                    );
+                }
+                bucket_idx += 1;
+                let has = load_next_bucket(
+                    &mut bucket_idx, &mut sorted_pairs, &mut pair_cursor,
+                    &mut bucket_max_id, node_buckets, range_size,
+                )?;
+                if !has {
+                    // No more buckets — remaining nodes have no COO pairs.
+                    return Ok(resolved_count);
                 }
             }
-        }
 
-        if bucket_idx % 16 == 0 {
-            eprintln!(
-                "  node join: bucket {}/{} ({} resolved so far)",
-                bucket_idx + 1,
-                NUM_BUCKETS,
-                resolved_count
-            );
+            // Advance cursor past any pairs with smaller node_id.
+            while pair_cursor < sorted_pairs.len()
+                && sorted_pairs[pair_cursor].node_id < id
+            {
+                pair_cursor += 1;
+            }
+
+            // Emit resolved entries for all pairs matching this node_id.
+            while pair_cursor < sorted_pairs.len()
+                && sorted_pairs[pair_cursor].node_id == id
+            {
+                let entry = ResolvedEntry {
+                    slot_pos: sorted_pairs[pair_cursor].slot_pos,
+                    lat,
+                    lon,
+                };
+                let bucket = entry.slot_bucket(total_slots);
+                entry.write_to(&mut entry_buf);
+                if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
+                    writer.write_all(&entry_buf)?;
+                }
+                slot_buckets.entry_counts[bucket] += 1;
+                resolved_count += 1;
+                pair_cursor += 1;
+            }
         }
     }
+
+    eprintln!("  node join: complete ({resolved_count} resolved)");
 
     Ok(resolved_count)
 }

@@ -36,8 +36,33 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
+// RSS tracking
+// ---------------------------------------------------------------------------
+
+/// Read current RSS in kilobytes from `/proc/self/statm`.
+fn read_rss_kb() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(resident_str) = statm.split_whitespace().nth(1) else {
+        return 0;
+    };
+    let Ok(pages) = resident_str.parse::<u64>() else {
+        return 0;
+    };
+    pages * 4 // page size = 4 KB on x86_64
+}
+
+// ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+/// External join forces O_DIRECT for all PBF reads when the feature is available.
+/// Users choose `--index-type external` precisely because they're memory-constrained;
+/// letting the kernel cache 32+ GB of PBF pages defeats the purpose and causes OOM.
+fn force_direct_io(user_flag: bool) -> bool {
+    if cfg!(feature = "linux-direct-io") { true } else { user_flag }
+}
 
 /// Number of buckets for radix partitioning. 256 = partition by high byte.
 const NUM_BUCKETS: usize = 256;
@@ -96,11 +121,17 @@ impl Drop for ScratchDir {
 // Bucket writers
 // ---------------------------------------------------------------------------
 
+/// Bytes written between fadvise(DONTNEED) cycles on bucket files.
+/// 256 MB keeps write-side page cache bounded without excessive syscalls.
+const BUCKET_ADVISE_INTERVAL: u64 = 256 * 1024 * 1024;
+
 /// Set of buffered writers for radix bucket files.
 struct BucketWriters {
     writers: Vec<Option<BufWriter<std::fs::File>>>,
     paths: Vec<PathBuf>,
     entry_counts: Vec<u64>,
+    /// Cumulative bytes written since last fadvise cycle.
+    bytes_since_advise: u64,
 }
 
 impl BucketWriters {
@@ -118,7 +149,41 @@ impl BucketWriters {
             paths.push(path);
         }
 
-        Ok(Self { writers, paths, entry_counts })
+        Ok(Self { writers, paths, entry_counts, bytes_since_advise: 0 })
+    }
+
+    /// Track bytes written and periodically flush + fadvise(DONTNEED) to
+    /// prevent bucket writes from filling page cache (56 GB at Europe scale).
+    fn track_write(&mut self, bytes: u64) -> Result<()> {
+        self.bytes_since_advise += bytes;
+        if self.bytes_since_advise >= BUCKET_ADVISE_INTERVAL {
+            self.flush_and_advise()?;
+        }
+        Ok(())
+    }
+
+    /// Flush all writers and advise kernel to drop their pages.
+    #[cfg_attr(not(feature = "linux-direct-io"), allow(unused))]
+    fn flush_and_advise(&mut self) -> Result<()> {
+        for writer in &mut self.writers {
+            if let Some(w) = writer.as_mut() {
+                w.flush()?;
+                #[cfg(feature = "linux-direct-io")]
+                {
+                    use std::os::unix::io::AsRawFd;
+                    unsafe {
+                        libc::posix_fadvise(
+                            w.get_ref().as_raw_fd(),
+                            0,
+                            0,
+                            libc::POSIX_FADV_DONTNEED,
+                        )
+                    };
+                }
+            }
+        }
+        self.bytes_since_advise = 0;
+        Ok(())
     }
 
     /// Flush and close all writers. Returns per-bucket entry counts.
@@ -230,11 +295,12 @@ fn stage1_way_pass(
     direct_io: bool,
     node_buckets: &mut BucketWriters,
 ) -> Result<u64> {
-    let reader = ElementReader::open(input, direct_io)?
+    let reader = ElementReader::open(input, force_direct_io(direct_io))?
         .with_blob_filter(BlobFilter::only_ways());
 
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
+    let mut block_count: u64 = 0;
 
     for block in reader.into_blocks_pipelined() {
         let block = block?;
@@ -248,9 +314,14 @@ fn stage1_way_pass(
                         writer.write_all(&pair_buf)?;
                     }
                     node_buckets.entry_counts[bucket] += 1;
+                    node_buckets.track_write(COO_PAIR_SIZE as u64)?;
                     slot_pos += 1;
                 }
             }
+        }
+        block_count += 1;
+        if block_count % 1000 == 0 {
+            eprintln!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB", read_rss_kb() / 1024);
         }
     }
 
@@ -328,7 +399,7 @@ fn stage2_node_join(
     }
 
     // Single pass through all node blobs.
-    let reader = ElementReader::open(input, direct_io)?
+    let reader = ElementReader::open(input, force_direct_io(direct_io))?
         .with_blob_filter(BlobFilter::only_nodes());
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
@@ -350,7 +421,9 @@ fn stage2_node_join(
             while id >= bucket_max_id {
                 if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
                     eprintln!(
-                        "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved so far)"
+                        "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, rss={}MB)",
+                        sorted_pairs.len(),
+                        read_rss_kb() / 1024,
                     );
                 }
                 bucket_idx += 1;
@@ -386,6 +459,7 @@ fn stage2_node_join(
                     writer.write_all(&entry_buf)?;
                 }
                 slot_buckets.entry_counts[bucket] += 1;
+                slot_buckets.track_write(RESOLVED_ENTRY_SIZE as u64)?;
                 resolved_count += 1;
                 pair_cursor += 1;
             }
@@ -611,7 +685,7 @@ fn stage4_assembly(
         blobs_decoded: 0,
     };
 
-    let reader = ElementReader::open(input, direct_io)?;
+    let reader = ElementReader::open(input, force_direct_io(direct_io))?;
     let mut writer = writer_from_header(
         output,
         compression,
@@ -878,15 +952,6 @@ pub fn external_join(
 
     let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")))?;
 
-    // Collect relation member node IDs (for node filtering).
-    let relation_member_node_ids = if keep_untagged_nodes {
-        None
-    } else {
-        Some(super::add_locations_to_ways::collect_relation_member_node_ids(
-            input, direct_io,
-        )?)
-    };
-
     // --- Stage 1: Way pass ---
     let t1 = std::time::Instant::now();
     eprintln!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
@@ -898,6 +963,7 @@ pub fn external_join(
     let stage1_ms = t1.elapsed().as_millis();
     eprintln!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
     eprintln!("stage1_ms={stage1_ms}");
+    eprintln!("  rss_after_stage1_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 2: Node join ---
     let t2 = std::time::Instant::now();
@@ -911,6 +977,7 @@ pub fn external_join(
     let stage2_ms = t2.elapsed().as_millis();
     eprintln!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
     eprintln!("stage2_ms={stage2_ms}");
+    eprintln!("  rss_after_stage2_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 3: Slot reorder ---
     let t3 = std::time::Instant::now();
@@ -921,6 +988,18 @@ pub fn external_join(
     let stage3_ms = t3.elapsed().as_millis();
     eprintln!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
     eprintln!("stage3_ms={stage3_ms}");
+    eprintln!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
+
+    // Collect relation member node IDs (for node filtering in stage 4).
+    // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
+    let relation_member_node_ids = if keep_untagged_nodes {
+        None
+    } else {
+        Some(super::add_locations_to_ways::collect_relation_member_node_ids(
+            input, force_direct_io(direct_io),
+        )?)
+    };
+    eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 4: Assembly ---
     let t4 = std::time::Instant::now();
@@ -941,6 +1020,7 @@ pub fn external_join(
     eprintln!("stage4_ms={stage4_ms}");
     eprintln!("total_slots={total_slots}");
     eprintln!("resolved_count={resolved_count}");
+    eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
 
     // scratch_dir dropped here → cleanup all temp files.
     Ok(stats)

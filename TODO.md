@@ -69,6 +69,24 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   cat --type (zlib): 61.8s, 10.9 GB RSS, 240 GB cumulative alloc (175 MB net).
   Full results in `notes/performance.md`.
 
+## Pipelined reader: fadvise(DONTNEED) after each blob read
+
+The IO thread in `pipeline.rs` reads blobs sequentially and sends owned copies
+through the channel. Once a blob is sent, the page cache copy is never accessed
+again. Adding `fadvise(FADV_DONTNEED)` on the consumed byte range after each
+blob read would evict pages behind the read head, preventing the kernel from
+caching the entire file.
+
+This is a general improvement — any consumer doing a single forward pass over a
+large PBF (merge, ALTW, geocode builder, elivagar ingest) would benefit.
+Distinct from the sparse-index "pread + fadvise" item below, which was about
+random access patterns. Sequential forward reads are exactly where DONTNEED
+shines.
+
+Identified during Europe-scale external join OOM investigation (stage 2 read
+32.4 GB of node blobs, kernel cached all pages as RSS → 21 GB → OOM killed).
+Gate behind `#[cfg(feature = "linux-direct-io")]` since it needs `libc`.
+
 ## ALTW memory optimization
 
 See [notes/altw-memory.md](notes/altw-memory.md) for full research log.

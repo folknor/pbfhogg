@@ -119,7 +119,7 @@ All `--variant` flags default to `indexed`. `--osc-seq` auto-selects if exactly 
 
 ## Review tool
 
-`review` fans out code review queries to persistent AI sessions. Configured in `.review.md`.
+`review` fans out code review queries to persistent AI sessions. Configured in `.review.toml`.
 
 Five archetypes, two groups:
 - `bugs` — logic errors, edge cases, error handling, crashes
@@ -131,12 +131,12 @@ Five archetypes, two groups:
 Groups: `sweep` = [bugs, perf, arch, correctness], `everything` = all five.
 
 Usage:
-- `echo "question" | review sweep --raw` — ask 4 archetypes (ongoing use)
-- `echo "question" | review planet --raw` — ask planet sessions
-- `echo "question" | review sweep --staged` — with scope flag (re-anchors with archetype prompt)
-- `echo "question" | review perf --general --dry-run` — preview prompt without sending
+- `echo "question" | review sweep` — ask 4 archetypes (stdin goes direct)
+- `echo "question" | review planet` — ask planet sessions
+- `echo "question" | review everything` — ask all 5 archetypes
+- `echo "question" | review perf --anchor` — re-anchor with grounding prefix (for stale sessions)
 
-Prefer `--raw` for ongoing use — sessions are already primed with project context, so the archetype prefix is redundant. Omit `--raw` for the first review in a session or occasionally to re-anchor a stale session. `--raw` cannot be combined with scope flags (`--staged`, `--commit`, etc.) — with `--raw` you provide all context yourself in stdin, including what files or commits to look at.
+Stdin goes directly to the sessions by default. Use `--anchor` to prepend the grounding prefix when a session has gone stale or for first use. When using `--anchor`, include a short identity reminder in stdin, e.g., "Remember: you're our planet-scale systems reviewer." or "Remember: you're our spatial correctness expert."
 
 **Use this tool before implementing major changes.** Write up the problem, send to reviewers, wait for answers. The write-up + review cycle is faster than implement + discover it's wrong.
 

@@ -1,0 +1,68 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - run: pnpm install
+
+      # ── Optional: build cargo doc ──────────────────────────────────────
+      # Uncomment the following block for Rust projects to include API docs.
+      #
+      # - uses: dtolnay/rust-toolchain@stable
+      #
+      # - name: Build API docs
+      #   run: cargo doc --no-deps
+      #
+      # - name: Copy API docs into VitePress output
+      #   run: |
+      #     mkdir -p docs/.vitepress/dist/api
+      #     cp -r target/doc/* docs/.vitepress/dist/api/
+      # ──────────────────────────────────────────────────────────────────
+
+      - run: pnpm build
+
+      # If cargo doc was built, copy it into the dist after vitepress build
+      # (uncomment alongside the cargo doc block above)
+      #
+      # - name: Copy API docs into dist
+      #   run: |
+      #     mkdir -p docs/.vitepress/dist/api
+      #     cp -r target/doc/* docs/.vitepress/dist/api/
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/.vitepress/dist
+
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,0 +1,14 @@
+{
+  "name": "gh-template",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vitepress dev docs",
+    "build": "vitepress build docs",
+    "preview": "vitepress preview docs"
+  },
+  "devDependencies": {
+    "vitepress": "2.0.0-alpha.17"
+  },
+  "packageManager": "pnpm@10.33.0"
+}

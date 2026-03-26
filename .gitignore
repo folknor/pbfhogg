@@ -10,3 +10,6 @@ bench/osmpbf-baseline/target/
 .brokkr/*
 !.brokkr/results.db
 research
+node_modules
+docs/.vitepress/dist
+docs/.vitepress/cache

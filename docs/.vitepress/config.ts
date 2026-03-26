@@ -4,7 +4,7 @@ import { defineConfig } from 'vitepress'
 const projectName = 'Pbfhogg'
 const projectDescription = 'Fast OpenStreetMap PBF reader and writer for Rust'
 const githubUrl = 'https://github.com/folknor/pbfhogg'
-const base = '/' // set to '/repo-name/' for GitHub Pages project sites
+const base = '/pbfhogg/'
 // ────────────────────────────────────────────────────────────────────────────
 
 export default defineConfig({
@@ -23,7 +23,8 @@ export default defineConfig({
 
     nav: [
       { text: 'Guide', link: '/guide/' },
-      { text: 'API Docs', link: '/api/' },
+      { text: 'CLI', link: '/cli/' },
+      { text: 'API Docs', link: 'https://docs.rs/pbfhogg' },
     ],
 
     search: {
@@ -35,7 +36,7 @@ export default defineConfig({
     ],
 
     footer: {
-      message: `Released under the MIT License.`,
+      message: `Released under the Apache License 2.0.`,
     },
 
     sidebar: {
@@ -44,18 +45,32 @@ export default defineConfig({
           text: 'Guide',
           items: [
             { text: 'Getting Started', link: '/guide/' },
-            { text: 'Installation', link: '/guide/install' },
-            { text: 'Configuration', link: '/guide/configuration' },
-            { text: 'Usage', link: '/guide/usage' },
-            { text: 'Advanced', link: '/guide/advanced' },
+            { text: 'Reading PBF Files', link: '/guide/reading' },
+            { text: 'Writing PBF Files', link: '/guide/writing' },
+            { text: 'Indexdata', link: '/guide/indexdata' },
+            { text: 'Performance', link: '/guide/performance' },
+          ],
+        },
+        {
+          text: 'Reference',
+          items: [
+            { text: 'Correctness', link: '/guide/correctness' },
           ],
         },
       ],
-      '/api/': [
+      '/cli/': [
         {
-          text: 'API Reference',
+          text: 'CLI Reference',
           items: [
-            { text: 'Overview', link: '/api/' },
+            { text: 'Overview', link: '/cli/' },
+            { text: 'Commands', link: '/cli/commands' },
+          ],
+        },
+        {
+          text: 'Compatibility',
+          items: [
+            { text: 'Osmium Parity', link: '/cli/osmium-parity' },
+            { text: 'Deviations', link: '/cli/deviations' },
           ],
         },
       ],

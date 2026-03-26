@@ -1,83 +1,57 @@
 # Getting Started
 
-## What is Nidhogg?
+## What is pbfhogg?
 
-Nidhogg is a vector tile generator that reads OpenStreetMap data in PBF format and produces [Shortbread](https://shortbread-tiles.org/)-schema vector tiles packaged as PMTiles, MBTiles, or a directory of individual `.mvt` files.
-
-It's designed for the common case: you have an OSM extract, you want production-ready vector tiles, and you don't want to set up a database or learn a new configuration language. One binary, one command.
+pbfhogg is a Rust library and CLI toolkit for reading, writing, and transforming OpenStreetMap PBF files. It's designed for planet-scale operations (80+ GB files) on normal hardware (30 GB RAM).
 
 ## Quick Start
 
-Install Nidhogg and generate your first tileset in under a minute:
+### As a library
+
+```toml
+[dependencies]
+pbfhogg = "0.2"
+```
+
+```rust
+use pbfhogg::{ElementReader, Element};
+
+let reader = ElementReader::from_path("input.osm.pbf")?;
+reader.for_each(|element| {
+    if let Element::Way(way) = element {
+        println!("Way {} has {} refs", way.id(), way.refs().count());
+    }
+})?;
+```
+
+### As a CLI
 
 ```sh
 # Install
-cargo install nidhogg
+cargo install pbfhogg-cli
 
-# Download an extract (e.g., Monaco — tiny, great for testing)
-wget https://download.geofabrik.de/europe/monaco-latest.osm.pbf
+# Inspect a PBF file
+pbfhogg inspect denmark.osm.pbf
 
-# Generate tiles
-nidhogg monaco-latest.osm.pbf monaco.pmtiles
+# Extract a region
+pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8
+
+# Apply a daily diff
+pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf
 ```
 
-That's it. The output is a single `.pmtiles` file you can open in [PMTiles Viewer](https://protomaps.github.io/PMTiles/) or serve from any static file host.
+## Features
 
-![Main window after first launch](https://placecats.com/720/400)
-
-*The main window after generating your first tileset.*
-
-## Adding Ocean Fill
-
-Without an ocean shapefile, water areas will be transparent. For proper coastlines and ocean rendering:
-
-```sh
-# Download the ocean shapefile (~800 MB)
-wget https://osmdata.openstreetmap.de/download/water-polygons-split-4326.zip
-unzip water-polygons-split-4326.zip
-
-# Generate tiles with ocean fill
-nidhogg --ocean water-polygons-split-4326/water_polygons.shp \
-        monaco-latest.osm.pbf monaco.pmtiles
-```
-
-![Ocean fill comparison](https://placecats.com/neo/1000/556)
-
-*Before and after enabling ocean fill — coastlines render correctly with the shapefile.*
-
-## Serving Tiles
-
-### From Cloud Storage
-
-PMTiles can be served directly from S3, GCS, R2, or any HTTP server that supports range requests:
-
-```sh
-# Upload to S3
-aws s3 cp monaco.pmtiles s3://my-bucket/tiles/monaco.pmtiles
-
-# Or serve locally with any HTTP server
-python -m http.server 8080
-```
-
-Then point your map renderer at `http://localhost:8080/monaco.pmtiles` using a PMTiles-aware client like [MapLibre GL JS](https://maplibre.org/) with the [pmtiles protocol](https://docs.protomaps.com/pmtiles/maplibre).
-
-### With a Tile Server
-
-If you prefer MBTiles, generate that format instead and serve with [Martin](https://martin.maplibre.org/) or TileServer GL:
-
-```sh
-nidhogg --format mbtiles monaco-latest.osm.pbf monaco.mbtiles
-martin monaco.mbtiles
-```
-
-![Tile server dashboard](https://placecats.com/g/720/400)
-
-*The Martin tile server dashboard showing live connections and tile request stats.*
+- **Read** PBF files sequentially, in parallel, or with a 3-stage pipelined decoder
+- **Write** valid PBF files with dense node packing, delta encoding, and configurable compression
+- **Blob passthrough** — unmodified blobs are copied as raw bytes, no decompression needed
+- **Blob indexdata** — element type, ID range, and spatial bbox embedded per blob for fast filtering
+- **25+ CLI commands** — inspect, sort, extract, merge, diff, tags-filter, getid, and more
+- **Cross-validated** against osmium on all commands
 
 ## Next Steps
 
-- [Installation](./install) — building from source, pre-built binaries, Docker
-- [Configuration](./configuration) — config file reference, environment variables
-- [Usage](./usage) — CLI reference, common workflows, examples
-- [Advanced](./advanced) — performance tuning, custom layers, plugins
-- [API Reference](/api/) — Rust library API documentation
+- [Reading PBF Files](./reading) — ElementReader API, read modes, blob filtering
+- [Writing PBF Files](./writing) — BlockBuilder, PbfWriter, compression options
+- [Indexdata](./indexdata) — what it is, how to generate it, which commands use it
+- [Performance](./performance) — benchmarks, optimization tips, planet-scale considerations

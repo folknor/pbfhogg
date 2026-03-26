@@ -398,9 +398,15 @@ fn stage2_node_join(
 }
 
 /// Load a COO bucket file into memory as a Vec of pairs.
+/// Advises DONTNEED after reading to evict from page cache.
 fn load_coo_bucket(path: &Path) -> Result<Vec<CooPair>> {
-    let data = std::fs::read(path)
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut data)
         .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
+    #[cfg(feature = "linux-direct-io")]
+    advise_dontneed_file(&file);
     let count = data.len() / COO_PAIR_SIZE;
     let mut pairs = Vec::with_capacity(count);
     let mut buf = [0u8; COO_PAIR_SIZE];
@@ -489,9 +495,15 @@ fn stage3_slot_reorder(
 }
 
 /// Load a resolved-entry bucket file into memory.
+/// Advises DONTNEED after reading to evict from page cache.
 fn load_resolved_bucket(path: &Path) -> Result<Vec<ResolvedEntry>> {
-    let data = std::fs::read(path)
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
+    let mut data = Vec::new();
+    std::io::Read::read_to_end(&mut &file, &mut data)
         .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
+    #[cfg(feature = "linux-direct-io")]
+    advise_dontneed_file(&file);
     let count = data.len() / RESOLVED_ENTRY_SIZE;
     let mut entries = Vec::with_capacity(count);
     let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
@@ -506,10 +518,33 @@ fn load_resolved_bucket(path: &Path) -> Result<Vec<ResolvedEntry>> {
 // Stage 4: Assembly — emit enriched PBF
 // ---------------------------------------------------------------------------
 
-/// Read the coord_slots file and provide sequential coordinate lookup.
+/// Advise the kernel to evict bucket file pages from the page cache.
+/// Prevents ~320 GB of temp data from polluting the cache at planet scale.
+fn advise_dontneed_buckets(#[cfg_attr(not(feature = "linux-direct-io"), allow(unused))] buckets: &BucketWriters) {
+    #[cfg(feature = "linux-direct-io")]
+    {
+        use std::os::unix::io::AsRawFd;
+        for path in &buckets.paths {
+            if let Ok(file) = std::fs::File::open(path) {
+                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+            }
+        }
+    }
+}
+
+/// Advise the kernel to evict a single file's pages from page cache.
+#[cfg(feature = "linux-direct-io")]
+fn advise_dontneed_file(file: &std::fs::File) {
+    use std::os::unix::io::AsRawFd;
+    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
+}
+
+/// Memory-mapped coord_slots file for zero-syscall coordinate lookup.
+/// Access is sequential (slot_pos advances monotonically during assembly),
+/// so MADV_SEQUENTIAL enables kernel readahead. Replaces the previous
+/// per-ref pread approach (8B syscalls at planet scale).
 struct CoordSlots {
-    #[cfg(unix)]
-    file: std::fs::File,
+    mmap: memmap2::Mmap,
     total_slots: u64,
 }
 
@@ -517,25 +552,35 @@ impl CoordSlots {
     fn open(path: &Path, total_slots: u64) -> Result<Self> {
         let file = std::fs::File::open(path)
             .map_err(|e| format!("failed to open coord_slots: {e}"))?;
-        Ok(Self {
-            #[cfg(unix)]
-            file,
-            total_slots,
-        })
+        let len = file.metadata()
+            .map_err(|e| format!("failed to stat coord_slots: {e}"))?
+            .len();
+        if len == 0 {
+            return Ok(Self {
+                mmap: memmap2::MmapOptions::new().map_anon()?.make_read_only()?,
+                total_slots: 0,
+            });
+        }
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("failed to mmap coord_slots: {e}"))?;
+        #[cfg(unix)]
+        {
+            mmap.advise(memmap2::Advice::Sequential).ok();
+        }
+        Ok(Self { mmap, total_slots })
     }
 
-    /// Read a coordinate at the given slot position.
-    #[cfg(unix)]
+    /// Read a coordinate at the given slot position. Zero syscalls — direct
+    /// mmap byte access.
+    #[allow(clippy::cast_possible_truncation)]
     fn get(&self, slot_pos: u64) -> Option<(i32, i32)> {
-        use std::os::unix::fs::FileExt;
         if slot_pos >= self.total_slots {
             return None;
         }
-        let offset = slot_pos * COORD_SLOT_SIZE as u64;
-        let mut buf = [0u8; COORD_SLOT_SIZE];
-        self.file.read_at(&mut buf, offset).ok()?;
-        let lat = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
-        let lon = i32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+        let offset = slot_pos as usize * COORD_SLOT_SIZE;
+        let bytes = self.mmap.get(offset..offset + COORD_SLOT_SIZE)?;
+        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
         if lat == 0 && lon == 0 {
             return None; // sentinel
         }
@@ -843,34 +888,42 @@ pub fn external_join(
     };
 
     // --- Stage 1: Way pass ---
+    let t1 = std::time::Instant::now();
     eprintln!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
     let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
     let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets)?;
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
-    eprintln!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets");
+    advise_dontneed_buckets(&node_buckets);
+    let stage1_ms = t1.elapsed().as_millis();
+    eprintln!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
+    eprintln!("stage1_ms={stage1_ms}");
 
     // --- Stage 2: Node join ---
+    let t2 = std::time::Instant::now();
     eprintln!("external join: stage 2 — node join (merge-join per bucket)...");
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
     let resolved_count =
         stage2_node_join(input, direct_io, &node_buckets, &mut slot_buckets, total_slots)?;
     slot_buckets.finish()?;
+    advise_dontneed_buckets(&slot_buckets);
     node_buckets.cleanup();
-    eprintln!("  {resolved_count} coordinates resolved");
+    let stage2_ms = t2.elapsed().as_millis();
+    eprintln!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
+    eprintln!("stage2_ms={stage2_ms}");
 
     // --- Stage 3: Slot reorder ---
+    let t3 = std::time::Instant::now();
     eprintln!("external join: stage 3 — slot reorder, building coord_slots file...");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
     stage3_slot_reorder(&slot_buckets, &coord_slots_path, total_slots)?;
     slot_buckets.cleanup();
-    eprintln!(
-        "  coord_slots: {} slots, {} bytes",
-        total_slots,
-        total_slots * COORD_SLOT_SIZE as u64
-    );
+    let stage3_ms = t3.elapsed().as_millis();
+    eprintln!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
+    eprintln!("stage3_ms={stage3_ms}");
 
     // --- Stage 4: Assembly ---
+    let t4 = std::time::Instant::now();
     eprintln!("external join: stage 4 — assembling enriched PBF...");
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
     let stats = stage4_assembly(
@@ -883,6 +936,11 @@ pub fn external_join(
         direct_io,
         overrides,
     )?;
+    let stage4_ms = t4.elapsed().as_millis();
+    eprintln!("  assembly complete ({stage4_ms}ms)");
+    eprintln!("stage4_ms={stage4_ms}");
+    eprintln!("total_slots={total_slots}");
+    eprintln!("resolved_count={resolved_count}");
 
     // scratch_dir dropped here → cleanup all temp files.
     Ok(stats)

@@ -199,12 +199,12 @@ impl Reader {
                 // Return an empty read-only anonymous mmap instead.
                 // All consumers check record bounds before reading,
                 // so an empty mmap (len=0) is handled correctly.
-                return Ok(unsafe {
+                return Ok(
                     memmap2::MmapOptions::new().map_anon()
                         .map_err(|e| format!("failed to create empty mmap for {}: {e}", path.display()))?
                         .make_read_only()
                         .map_err(|e| format!("failed to make anon mmap read-only for {}: {e}", path.display()))?
-                });
+                );
             }
             // SAFETY: the file is read-only for the lifetime of the Reader.
             let m = unsafe { Mmap::map(&file) }

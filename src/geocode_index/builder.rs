@@ -147,9 +147,7 @@ struct AssembledPolygon {
     vertices: Vec<NodeCoord>,
 }
 
-// Cell entry types for sorting
-struct AddrCellEntry { cell_id: u64, addr_index: u32 }
-struct SegCellEntry { cell_id: u64, way_index: u32, segment_index: u16 }
+// Cell entry types
 struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 
 // ---------------------------------------------------------------------------
@@ -518,9 +516,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         if len == 0 {
-            return Ok(unsafe {
+            return Ok(
                 memmap2::MmapOptions::new().map_anon()?.make_read_only()?
-            });
+            );
         }
         Ok(unsafe { memmap2::Mmap::map(&file)? })
     };
@@ -573,51 +571,46 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
 
     // -----------------------------------------------------------------------
-    // Pass 3: S2 cell assignment + write cell index files
+    // Pass 3: Bucketed S2 cell assignment + write cell index files
+    //
+    // Instead of accumulating all cell entries in RAM (~19 GB at planet),
+    // partition into 256 buckets by top 8 bits of cell_id. Write tagged
+    // entries to temp bucket files, then process one bucket at a time.
     // -----------------------------------------------------------------------
-    eprintln!("Pass 3: S2 cells + write...");
+    eprintln!("Pass 3: S2 cells + write (bucketed)...");
     #[cfg(feature = "hotpath")]
     let pass4_start = std::time::Instant::now();
 
     let sl = config.street_level;
     let cl = config.coarse_level;
-
-    // Cell assignment reads from mmap'd files
-    let (fine_addr, coarse_addr) = assign_addr_cells_mmap(&addr_points_mmap, sl, cl);
-    let (fine_street, coarse_street) = assign_seg_cells_mmap(
-        &street_ways_mmap, &street_nodes_mmap, street_way_count, sl, cl,
-    );
     let interp_way_count = interp_ways.len();
-    let (fine_interp, coarse_interp) = assign_seg_cells_interp_slim(
-        &interp_ways, &interp_nodes_mmap, sl, cl,
-    );
+
+    // Admin cells are small enough to stay in memory
     let admin_cell_entries = assign_admin_cells(&admin_polygons, config.admin_level);
 
-    eprintln!("  {} fine street, {} fine addr, {} admin cell entries",
-        fine_street.len(), fine_addr.len(), admin_cell_entries.len());
+    // Process fine and coarse levels via bucketed distribution
+    let fine_count = bucketed_cell_assignment(
+        &config.output_dir,
+        FILE_GEO_CELLS, FILE_STREET_ENTRIES, FILE_ADDR_ENTRIES, FILE_INTERP_ENTRIES,
+        &street_ways_mmap, &street_nodes_mmap, street_way_count,
+        &addr_points_mmap, addr_point_count,
+        &interp_ways, &interp_nodes_mmap,
+        sl,
+    )?;
+    let coarse_count = bucketed_cell_assignment(
+        &config.output_dir,
+        FILE_COARSE_GEO_CELLS, FILE_COARSE_STREET_ENTRIES,
+        FILE_COARSE_ADDR_ENTRIES, FILE_COARSE_INTERP_ENTRIES,
+        &street_ways_mmap, &street_nodes_mmap, street_way_count,
+        &addr_points_mmap, addr_point_count,
+        &interp_ways, &interp_nodes_mmap,
+        cl,
+    )?;
+    let admin_count = write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
+
+    eprintln!("  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells");
     #[cfg(feature = "hotpath")]
     if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_cell_assign_kb={rss}"); }
-
-    // Sort and write cell indices
-    let mut fine_street = fine_street;
-    let mut fine_addr = fine_addr;
-    let mut fine_interp = fine_interp;
-    let mut coarse_street = coarse_street;
-    let mut coarse_addr = coarse_addr;
-    let mut coarse_interp = coarse_interp;
-    let mut admin_cell_entries = admin_cell_entries;
-
-    let fine_count = write_merged_geo_index(
-        &config.output_dir, FILE_GEO_CELLS, FILE_STREET_ENTRIES,
-        FILE_ADDR_ENTRIES, FILE_INTERP_ENTRIES,
-        &mut fine_street, &mut fine_addr, &mut fine_interp,
-    )?;
-    let coarse_count = write_merged_geo_index(
-        &config.output_dir, FILE_COARSE_GEO_CELLS, FILE_COARSE_STREET_ENTRIES,
-        FILE_COARSE_ADDR_ENTRIES, FILE_COARSE_INTERP_ENTRIES,
-        &mut coarse_street, &mut coarse_addr, &mut coarse_interp,
-    )?;
-    let admin_count = write_admin_index(&config.output_dir, &mut admin_cell_entries)?;
 
     // Write header
     #[allow(clippy::cast_possible_truncation)]
@@ -1025,134 +1018,314 @@ fn cover_segment(
 // S2 cell assignment
 // ---------------------------------------------------------------------------
 
-/// Assign address point cells from mmap'd addr_points.bin.
-#[allow(clippy::cast_possible_truncation)]
-fn assign_addr_cells_mmap(
-    addr_mmap: &[u8], fine_level: u8, coarse_level: u8,
-) -> (Vec<AddrCellEntry>, Vec<AddrCellEntry>) {
-    let count = addr_mmap.len() / ADDR_POINT_SIZE;
-    let mut fine = Vec::with_capacity(count);
-    let mut coarse = Vec::with_capacity(count);
-    for idx in 0..count {
-        if let Some(pt) = read_addr_point_mmap(addr_mmap, idx as u32) {
-            let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
-            let cell = CellID::from(ll);
-            fine.push(AddrCellEntry { cell_id: cell.parent(fine_level as u64).0, addr_index: idx as u32 });
-            coarse.push(AddrCellEntry { cell_id: cell.parent(coarse_level as u64).0, addr_index: idx as u32 });
+// ---------------------------------------------------------------------------
+// Bucketed cell assignment
+// ---------------------------------------------------------------------------
+
+const NUM_BUCKETS: usize = 256;
+const STREET_CHUNK: usize = 100_000;
+const ADDR_CHUNK: usize = 500_000;
+
+/// Tagged bucket record: 15 bytes on disk.
+/// cell_id (8) + entry_type (1) + way_or_addr_index (4) + segment_index (2)
+const BUCKET_RECORD_SIZE: usize = 15;
+const ENTRY_TYPE_STREET: u8 = 0;
+const ENTRY_TYPE_ADDR: u8 = 1;
+const ENTRY_TYPE_INTERP: u8 = 2;
+
+fn bucket_for_cell(cell_id: u64) -> usize {
+    (cell_id >> 56) as usize
+}
+
+/// Ensure bucket writer exists, creating the file lazily.
+fn ensure_bucket_writer(
+    writers: &mut [Option<BufWriter<std::fs::File>>],
+    bucket: usize,
+    bucket_dir: &Path,
+) -> Result<()> {
+    if writers[bucket].is_none() {
+        let path = bucket_dir.join(format!("{bucket:03}"));
+        writers[bucket] = Some(BufWriter::new(std::fs::File::create(path)?));
+    }
+    Ok(())
+}
+
+fn write_bucket_record(w: &mut BufWriter<std::fs::File>, cell_id: u64, etype: u8, index: u32, segment: u16) -> std::io::Result<()> {
+    let mut buf = [0u8; BUCKET_RECORD_SIZE];
+    buf[0..8].copy_from_slice(&cell_id.to_le_bytes());
+    buf[8] = etype;
+    buf[9..13].copy_from_slice(&index.to_le_bytes());
+    buf[13..15].copy_from_slice(&segment.to_le_bytes());
+    w.write_all(&buf)
+}
+
+struct ParsedBucketEntry {
+    cell_id: u64,
+    etype: u8,
+    index: u32,
+    segment: u16,
+}
+
+fn parse_bucket_file(data: &[u8]) -> Vec<ParsedBucketEntry> {
+    let count = data.len() / BUCKET_RECORD_SIZE;
+    let mut entries = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = i * BUCKET_RECORD_SIZE;
+        let cell_id = u64::from_le_bytes([
+            data[off], data[off+1], data[off+2], data[off+3],
+            data[off+4], data[off+5], data[off+6], data[off+7],
+        ]);
+        let etype = data[off+8];
+        let index = u32::from_le_bytes([data[off+9], data[off+10], data[off+11], data[off+12]]);
+        let segment = u16::from_le_bytes([data[off+13], data[off+14]]);
+        entries.push(ParsedBucketEntry { cell_id, etype, index, segment });
+    }
+    entries
+}
+
+/// Run bucketed cell assignment for one level (fine or coarse).
+/// Returns the number of unique cells written.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[hotpath::measure]
+fn bucketed_cell_assignment(
+    output_dir: &Path,
+    cells_file: &str,
+    street_entries_file: &str,
+    addr_entries_file: &str,
+    interp_entries_file: &str,
+    street_ways_mmap: &[u8],
+    street_nodes_mmap: &[u8],
+    street_way_count: u32,
+    addr_points_mmap: &[u8],
+    addr_point_count: u32,
+    interp_ways: &[SlimInterpWay],
+    interp_nodes_mmap: &[u8],
+    level: u8,
+) -> Result<u32> {
+    use rayon::prelude::*;
+
+    // Create temp directory for bucket files
+    let bucket_dir = output_dir.join(format!(".buckets-level{level}"));
+    std::fs::create_dir_all(&bucket_dir)?;
+
+    // Open 256 bucket writers (lazy — most will be used)
+    let mut bucket_writers: Vec<Option<BufWriter<std::fs::File>>> = (0..NUM_BUCKETS)
+        .map(|_| None)
+        .collect();
+
+    // Stage A: Chunked parallel compute + single-threaded distribute
+
+    // Streets
+    let mut chunk_start = 0u32;
+    while chunk_start < street_way_count {
+        let chunk_end = (chunk_start + STREET_CHUNK as u32).min(street_way_count);
+        let entries: Vec<(u64, u32, u16)> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .flat_map_iter(|way_idx| {
+                let offset = way_idx as usize * STREET_WAY_SIZE;
+                let rec = street_ways_mmap.get(offset..offset + STREET_WAY_SIZE)
+                    .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
+                    .map(StreetWay::from_bytes);
+                let mut out = Vec::new();
+                if let Some(rec) = rec {
+                    let nc = rec.node_count as usize;
+                    if nc >= 2 {
+                        for seg_idx in 0..nc - 1 {
+                            let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
+                            let off2 = off1 + NODE_COORD_SIZE;
+                            if let (Some(n1), Some(n2)) = (
+                                read_node_at(street_nodes_mmap, off1 as u64),
+                                read_node_at(street_nodes_mmap, off2 as u64),
+                            ) {
+                                cover_segment(n1.0, n1.1, n2.0, n2.1, level, |cid| {
+                                    out.push((cid, way_idx, seg_idx as u16));
+                                });
+                            }
+                        }
+                    }
+                }
+                out.into_iter()
+            })
+            .collect();
+
+        for &(cid, wi, si) in &entries {
+            let b = bucket_for_cell(cid);
+            ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
+            write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_STREET, wi, si)?;
+        }
+        chunk_start = chunk_end;
+    }
+
+    // Address points
+    let addr_count = addr_point_count as usize;
+    let mut chunk_start = 0usize;
+    while chunk_start < addr_count {
+        let chunk_end = (chunk_start + ADDR_CHUNK).min(addr_count);
+        for idx in chunk_start..chunk_end {
+            if let Some(pt) = read_addr_point_mmap(addr_points_mmap, idx as u32) {
+                let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+                let cid = CellID::from(ll).parent(level as u64).0;
+                let b = bucket_for_cell(cid);
+                ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
+                write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_ADDR, idx as u32, 0)?;
+            }
+        }
+        chunk_start = chunk_end;
+    }
+
+    // Interpolation (small enough to do in one pass)
+    for (way_idx, iw) in interp_ways.iter().enumerate() {
+        let nc = iw.node_count as usize;
+        if nc < 2 { continue; }
+        for seg_idx in 0..nc - 1 {
+            let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+            let off2 = off1 + NODE_COORD_SIZE;
+            if let (Some(n1), Some(n2)) = (
+                read_node_at(interp_nodes_mmap, off1 as u64),
+                read_node_at(interp_nodes_mmap, off2 as u64),
+            ) {
+                cover_segment(n1.0, n1.1, n2.0, n2.1, level, |cid| {
+                    let b = bucket_for_cell(cid);
+                    ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)
+                        .expect("bucket writer");
+                    write_bucket_record(
+                        bucket_writers[b].as_mut().expect("ensured"),
+                        cid, ENTRY_TYPE_INTERP, way_idx as u32, seg_idx as u16,
+                    ).expect("bucket write");
+                });
+            }
         }
     }
-    (fine, coarse)
-}
 
-/// Assign street segment cells from mmap'd street_ways.bin + street_nodes.bin.
-#[allow(clippy::cast_possible_truncation)]
-#[hotpath::measure]
-fn assign_seg_cells_mmap(
-    ways_mmap: &[u8],
-    nodes_mmap: &[u8],
-    way_count: u32,
-    fine_level: u8,
-    coarse_level: u8,
-) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
-    use rayon::prelude::*;
+    // Flush and drop all bucket writers
+    for writer in bucket_writers.iter_mut().flatten() {
+        writer.flush()?;
+    }
+    drop(bucket_writers);
 
-    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = (0..way_count)
-        .into_par_iter()
-        .map(|way_idx| {
-            let offset = way_idx as usize * STREET_WAY_SIZE;
-            let Some(rec) = ways_mmap.get(offset..offset + STREET_WAY_SIZE)
-                .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
-                .map(StreetWay::from_bytes) else {
-                return (Vec::new(), Vec::new());
+    // Stage B: Process buckets in order, write merged output
+
+    let mut cells_out = BufWriter::new(std::fs::File::create(output_dir.join(cells_file))?);
+    let mut street_out = BufWriter::new(std::fs::File::create(output_dir.join(street_entries_file))?);
+    let mut addr_out = BufWriter::new(std::fs::File::create(output_dir.join(addr_entries_file))?);
+    let mut interp_out = BufWriter::new(std::fs::File::create(output_dir.join(interp_entries_file))?);
+
+    let mut street_byte_offset: u64 = 0;
+    let mut addr_byte_offset: u32 = 0;
+    let mut interp_byte_offset: u64 = 0;
+    let mut total_cells: u32 = 0;
+
+    for bucket_idx in 0..NUM_BUCKETS {
+        let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
+        if !bucket_path.exists() { continue; }
+
+        let data = std::fs::read(&bucket_path)?;
+        std::fs::remove_file(&bucket_path)?;
+        if data.is_empty() { continue; }
+
+        let mut entries = parse_bucket_file(&data);
+        drop(data); // free the raw bytes
+
+        // Sort by cell_id
+        entries.sort_unstable_by_key(|e| e.cell_id);
+
+        // Group by cell_id and write merged output
+        let mut i = 0;
+        while i < entries.len() {
+            let cell_id = entries[i].cell_id;
+            let group_start = i;
+            while i < entries.len() && entries[i].cell_id == cell_id {
+                i += 1;
+            }
+            let group = &entries[group_start..i];
+
+            // Partition into typed sub-groups
+            let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
+            let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
+            let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
+            for e in group {
+                match e.etype {
+                    ENTRY_TYPE_STREET => streets.push(e),
+                    ENTRY_TYPE_ADDR => addrs.push(e),
+                    ENTRY_TYPE_INTERP => interps.push(e),
+                    _ => {}
+                }
+            }
+
+            // Write street entries
+            let has_streets = !streets.is_empty();
+            if has_streets {
+                let count = streets.len().min(u16::MAX as usize) as u16;
+                street_out.write_all(&count.to_le_bytes())?;
+                for e in &streets[..count as usize] {
+                    street_out.write_all(&SegmentRef {
+                        way_index: e.index,
+                        segment_index: e.segment,
+                    }.to_bytes())?;
+                }
+            }
+
+            // Write addr entries
+            let has_addrs = !addrs.is_empty();
+            if has_addrs {
+                let count = addrs.len().min(u16::MAX as usize) as u16;
+                addr_out.write_all(&count.to_le_bytes())?;
+                for e in &addrs[..count as usize] {
+                    addr_out.write_all(&e.index.to_le_bytes())?;
+                }
+            }
+
+            // Write interp entries
+            let has_interps = !interps.is_empty();
+            if has_interps {
+                let count = interps.len().min(u16::MAX as usize) as u16;
+                interp_out.write_all(&count.to_le_bytes())?;
+                for e in &interps[..count as usize] {
+                    interp_out.write_all(&SegmentRef {
+                        way_index: e.index,
+                        segment_index: e.segment,
+                    }.to_bytes())?;
+                }
+            }
+
+            // Write geo cell record
+            let gc = GeoCell {
+                cell_id,
+                street_offset: if has_streets { street_byte_offset } else { NO_DATA_U64 },
+                addr_offset: if has_addrs { addr_byte_offset } else { NO_DATA_U32 },
+                interp_offset: if has_interps {
+                    #[allow(clippy::cast_possible_truncation)]
+                    { interp_byte_offset as u32 }
+                } else { NO_DATA_U32 },
             };
+            cells_out.write_all(&gc.to_bytes())?;
+            total_cells += 1;
 
-            let mut fine = Vec::new();
-            let mut coarse = Vec::new();
-            let nc = rec.node_count as usize;
-            if nc < 2 { return (fine, coarse); }
-
-            for seg_idx in 0..nc - 1 {
-                let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
-                let off2 = off1 + NODE_COORD_SIZE;
-                let (Some(n1), Some(n2)) = (
-                    read_node_at(nodes_mmap, off1 as u64),
-                    read_node_at(nodes_mmap, off2 as u64),
-                ) else { continue };
-
-                let wi = way_idx;
-                let si = seg_idx as u16;
-                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |cid| {
-                    fine.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
-                });
-                cover_segment(n1.0, n1.1, n2.0, n2.1, coarse_level, |cid| {
-                    coarse.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
-                });
+            // Advance byte offsets
+            if has_streets {
+                let count = streets.len().min(u16::MAX as usize);
+                street_byte_offset += 2 + (count * SEGMENT_REF_SIZE) as u64;
             }
-            (fine, coarse)
-        })
-        .collect();
-
-    let total_fine: usize = per_way.iter().map(|(f, _)| f.len()).sum();
-    let total_coarse: usize = per_way.iter().map(|(_, c)| c.len()).sum();
-    let mut fine = Vec::with_capacity(total_fine);
-    let mut coarse = Vec::with_capacity(total_coarse);
-    for (f, c) in per_way {
-        fine.extend(f);
-        coarse.extend(c);
-    }
-    (fine, coarse)
-}
-
-/// Assign interpolation segment cells from slim metadata + mmap'd interp_nodes.
-#[allow(clippy::cast_possible_truncation)]
-#[hotpath::measure]
-fn assign_seg_cells_interp_slim(
-    interp_ways: &[SlimInterpWay],
-    nodes_mmap: &[u8],
-    fine_level: u8,
-    coarse_level: u8,
-) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
-    use rayon::prelude::*;
-
-    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = interp_ways
-        .par_iter()
-        .enumerate()
-        .map(|(way_idx, iw)| {
-            let mut fine = Vec::new();
-            let mut coarse = Vec::new();
-            let nc = iw.node_count as usize;
-            if nc < 2 { return (fine, coarse); }
-
-            for seg_idx in 0..nc - 1 {
-                let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
-                let off2 = off1 + NODE_COORD_SIZE;
-                let (Some(n1), Some(n2)) = (
-                    read_node_at(nodes_mmap, off1 as u64),
-                    read_node_at(nodes_mmap, off2 as u64),
-                ) else { continue };
-
-                let wi = way_idx as u32;
-                let si = seg_idx as u16;
-                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |cid| {
-                    fine.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
-                });
-                cover_segment(n1.0, n1.1, n2.0, n2.1, coarse_level, |cid| {
-                    coarse.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
-                });
+            if has_addrs {
+                let count = addrs.len().min(u16::MAX as usize);
+                addr_byte_offset += 2 + (count * 4) as u32;
             }
-            (fine, coarse)
-        })
-        .collect();
-
-    let total_fine: usize = per_way.iter().map(|(f, _)| f.len()).sum();
-    let total_coarse: usize = per_way.iter().map(|(_, c)| c.len()).sum();
-    let mut fine = Vec::with_capacity(total_fine);
-    let mut coarse = Vec::with_capacity(total_coarse);
-    for (f, c) in per_way {
-        fine.extend(f);
-        coarse.extend(c);
+            if has_interps {
+                let count = interps.len().min(u16::MAX as usize);
+                interp_byte_offset += 2 + (count * SEGMENT_REF_SIZE) as u64;
+            }
+        }
     }
-    (fine, coarse)
+
+    cells_out.flush()?;
+    street_out.flush()?;
+    addr_out.flush()?;
+    interp_out.flush()?;
+
+    // Clean up bucket directory
+    std::fs::remove_dir_all(&bucket_dir).ok();
+
+    Ok(total_cells)
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1254,92 +1427,6 @@ fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64
 // ---------------------------------------------------------------------------
 // Cell index writers
 // ---------------------------------------------------------------------------
-
-#[hotpath::measure]
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-fn write_merged_geo_index(
-    dir: &Path, cells_file: &str, street_file: &str, addr_file: &str, interp_file: &str,
-    street: &mut [SegCellEntry], addr: &mut [AddrCellEntry], interp: &mut [SegCellEntry],
-) -> Result<u32> {
-    street.sort_unstable_by_key(|e| e.cell_id);
-    addr.sort_unstable_by_key(|e| e.cell_id);
-    interp.sort_unstable_by_key(|e| e.cell_id);
-
-    let mut all_ids: Vec<u64> = Vec::new();
-    for e in street.iter() { all_ids.push(e.cell_id); }
-    for e in addr.iter() { all_ids.push(e.cell_id); }
-    for e in interp.iter() { all_ids.push(e.cell_id); }
-    all_ids.sort_unstable();
-    all_ids.dedup();
-
-    let street_off = write_seg_entries(&dir.join(street_file), &all_ids, street)?;
-    let addr_off = write_u32_entries(&dir.join(addr_file), &all_ids, addr)?;
-    let interp_off = write_seg_entries(&dir.join(interp_file), &all_ids, interp)?;
-
-    let mut out = BufWriter::new(std::fs::File::create(dir.join(cells_file))?);
-    for &cid in &all_ids {
-        let gc = GeoCell {
-            cell_id: cid,
-            street_offset: street_off.get(&cid).copied().unwrap_or(NO_DATA_U64),
-            addr_offset: addr_off.get(&cid).copied().unwrap_or(NO_DATA_U32),
-            #[allow(clippy::cast_possible_truncation)]
-            interp_offset: interp_off.get(&cid).copied().map_or(NO_DATA_U32, |v| v as u32),
-        };
-        out.write_all(&gc.to_bytes())?;
-    }
-    out.flush()?;
-    Ok(all_ids.len() as u32)
-}
-
-fn write_seg_entries(
-    path: &Path, cell_ids: &[u64], entries: &[SegCellEntry],
-) -> Result<FxHashMap<u64, u64>> {
-    let mut offsets = FxHashMap::default();
-    let mut out = BufWriter::new(std::fs::File::create(path)?);
-    let mut byte_off: u64 = 0;
-    let mut i = 0;
-    for &cid in cell_ids {
-        let start = i;
-        while i < entries.len() && entries[i].cell_id == cid { i += 1; }
-        if start == i { continue; }
-        offsets.insert(cid, byte_off);
-        #[allow(clippy::cast_possible_truncation)]
-        let count = (i - start).min(u16::MAX as usize) as u16;
-        out.write_all(&count.to_le_bytes())?;
-        byte_off += 2;
-        for e in &entries[start..start + count as usize] {
-            out.write_all(&SegmentRef { way_index: e.way_index, segment_index: e.segment_index }.to_bytes())?;
-            byte_off += SEGMENT_REF_SIZE as u64;
-        }
-    }
-    out.flush()?;
-    Ok(offsets)
-}
-
-fn write_u32_entries(
-    path: &Path, cell_ids: &[u64], entries: &[AddrCellEntry],
-) -> Result<FxHashMap<u64, u32>> {
-    let mut offsets = FxHashMap::default();
-    let mut out = BufWriter::new(std::fs::File::create(path)?);
-    let mut byte_off: u32 = 0;
-    let mut i = 0;
-    for &cid in cell_ids {
-        let start = i;
-        while i < entries.len() && entries[i].cell_id == cid { i += 1; }
-        if start == i { continue; }
-        offsets.insert(cid, byte_off);
-        #[allow(clippy::cast_possible_truncation)]
-        let count = (i - start).min(u16::MAX as usize) as u16;
-        out.write_all(&count.to_le_bytes())?;
-        byte_off += 2;
-        for e in &entries[start..start + count as usize] {
-            out.write_all(&e.addr_index.to_le_bytes())?;
-            byte_off += 4;
-        }
-    }
-    out.flush()?;
-    Ok(offsets)
-}
 
 #[allow(clippy::cast_possible_truncation)]
 fn write_admin_index(dir: &Path, entries: &mut [AdminCellEntry]) -> Result<u32> {

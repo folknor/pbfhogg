@@ -258,24 +258,25 @@ merge-join with nodes, re-bucket by slot_pos, assemble sequentially.
 elements, 0 differences (commit `034422c`, plantasjen). Cross-validated
 against osmium via `brokkr verify add-locations-to-ways`.
 
-**Denmark result** (465 MB, 60.8M way-node refs, plantasjen):
+**Results** (plantasjen):
 
-| Index | Time | Ratio | Commit |
-|-------|------|-------|--------|
-| dense | 8,168 ms | baseline | `034422c` |
-| **external** | **302,069 ms (5m)** | **37x slower** | `034422c` |
+| Index | Denmark | Japan | Europe | Commit |
+|-------|---------|-------|--------|--------|
+| dense | 8,168 ms | 72s | 2,565s (43m) | `034422c` |
+| external (old, 256× re-read) | 302s (5m) | — | — | `034422c` |
+| **external (single-pass merge)** | **25s** | **143s** | **2,060s (34m)** | `a334c72` |
 
-The 37x slowdown at Denmark scale is expected — everything fits in RAM,
-so dense is optimal. External pays full I/O cost: 256 full PBF reads of
-all node blobs in stage 2 (one per bucket), plus temp disk I/O for bucket
-files (~1.9 GB node buckets, ~1.9 GB slot buckets, ~487 MB coord_slots).
+The original external join was 37x slower than dense on Denmark due to
+stage 2 re-reading ALL node blobs 256 times. The single-pass node merge
+(commit `a334c72`) reads PBF nodes exactly once — a **12x speedup on
+Denmark** (302s → 25s).
 
-**Stage 2 is the bottleneck.** Currently re-reads ALL node blobs 256 times
-(once per bucket). At Denmark scale this is ~256 × 370 MB = ~92 GB of
-redundant PBF decoding. The fix is writing node coords to a compact sorted
-sidecar during stage 1, then reading byte ranges in stage 2.
+**Europe: external is 20% faster than dense.** At the scale where the dense
+mmap working set (~16 GB) exceeds available RAM, external's sequential I/O
+wins. The crossover is between Japan (2.4 GB, dense 2x faster) and Europe
+(33.6 GB, external 20% faster).
 
-See [altw-partitioned.md](altw-partitioned.md) for full design.
+See [altw-partitioned.md](altw-partitioned.md) for full design and benchmarks.
 
 ### 4. Larger swap / 64 GB host (infrastructure)
 
@@ -292,8 +293,9 @@ See [altw-partitioned.md](altw-partitioned.md) for full design.
 - [x] ~~Design and implement partitioned multi-pass~~ — disproven by measurement
 - [x] Implement external join pipeline (`src/commands/external_join.rs`)
 - [x] Verify external join correctness on Denmark — identical to dense
-- [ ] **Optimize stage 2**: node-coord sidecar to eliminate 256× PBF re-reads
-- [ ] Benchmark external join on Japan (medium scale, fits in RAM)
-- [ ] Benchmark external join on Europe (the key test — currently 43m with dense)
+- [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
+- [x] Benchmark external join on Japan — 143s (2.0x dense)
+- [x] Benchmark external join on Europe — **2,060s (34m), 20% faster than dense**
+- [ ] Benchmark external join on planet (87.7 GB) — estimated ~90 min
 - [ ] Add O_DIRECT support to bucket file I/O
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

@@ -183,18 +183,23 @@ cheap, and the alternative (buffering the entire file) is worse.
 
 ### Comparison with previous approaches
 
-| Approach | Memory | Temp disk | I/O pattern | Denmark | Japan | Planet (est.) |
-|----------|--------|-----------|-------------|---------|-------|---------------|
-| Dense mmap | 16 GB touched | 128 GB mmap file | Random | 8.2s | 72s | 96m (measured) |
-| Sparse mmap | 540 MB + 16 GB | 16 GB mmap file | Sorted random | 14.1s | 72s | ~150m (extrapolated) |
-| External (old, 256× re-read) | <1 GB | ~4.3 GB | Sequential | 302s | — | unusable |
-| **External (single-pass merge)** | **<1 GB** | **~4.3 GB** | **Sequential** | **25s** | **143s** | **~45-60m (est.)** |
-| 64 GB host + dense | 16 GB touched | 128 GB mmap file | Random (fits) | 8.2s | 72s | ~20m (estimated) |
+| Approach | Memory | Temp disk | I/O pattern | Denmark | Japan | Europe | Planet (est.) |
+|----------|--------|-----------|-------------|---------|-------|--------|---------------|
+| Dense mmap | 16 GB touched | 128 GB mmap file | Random | **8.2s** | **72s** | 2,565s (43m) | 96m (measured) |
+| Sparse mmap | 540 MB + 16 GB | 16 GB mmap file | Sorted random | 14.1s | 72s | 6,453s (107m) | ~150m (est.) |
+| External (old, 256× re-read) | <1 GB | ~4.3 GB | Sequential | 302s | — | — | unusable |
+| **External (single-pass)** | **<1 GB** | **~4.3 GB** | **Sequential** | **25s** | **143s** | **2,060s (34m)** | **~90m (est.)** |
+| 64 GB host + dense | 16 GB touched | 128 GB mmap file | Random (fits) | **8.2s** | **72s** | ~20m (est.) | ~20m (est.) |
 
 The external join trades wall time for bounded memory (<1 GB) and sequential I/O.
-At planet scale on a 30 GB host, external should be faster than dense (which
-thrashes at 96 min). The single-pass node merge (commit `a334c72`) eliminated
-the 256× PBF re-read bottleneck without needing a sidecar file.
+
+**Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
+(33.6 GB, external 20% faster). Dense thrashes when the mmap working set
+(~16 GB) plus input file page cache exceeds available RAM. External's
+sequential I/O stays bounded regardless of input size.
+
+The single-pass node merge (commit `a334c72`) eliminated the 256× PBF
+re-read bottleneck without needing a sidecar file.
 
 ## Partition selectivity measurement (disproven hypothesis)
 
@@ -273,6 +278,7 @@ the extra temp disk (~32 GB for referenced-only sidecar at planet).
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark optimized external on Denmark — 25s (3.5x dense)
 - [x] Benchmark on Japan — 143s (2.0x dense)
-- [ ] Benchmark on Europe (the key test — currently 43m with dense)
+- [x] Benchmark on Europe — **2060s (34m), 20% faster than dense (43m)**
+- [ ] Benchmark on planet (87.7 GB) — estimated ~90 min
 - [ ] Add O_DIRECT support to bucket file I/O (planet-scale page cache bypass)
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

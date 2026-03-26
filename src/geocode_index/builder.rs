@@ -119,23 +119,14 @@ impl StringPool {
 // Intermediate data
 // ---------------------------------------------------------------------------
 
-struct RawAddrPoint {
-    lat_e7: i32,
-    lon_e7: i32,
-    housenumber_offset: u32,
-    street_offset: u32,
-    postcode_offset: u32,
-}
-
-struct RawStreetWay {
-    name_offset: u32,
-    nodes: Vec<(i32, i32)>,
-}
-
-struct RawInterpWay {
+/// Slim interpolation metadata kept in memory during the build.
+/// Node coordinates are written directly to interp_nodes.bin;
+/// this struct stores only the file offset and count.
+struct SlimInterpWay {
     street_offset: u32,
     interpolation_type: u8,
-    nodes: Vec<(i32, i32)>,
+    node_file_offset: u64,
+    node_count: u16,
     start_number: u32,
     end_number: u32,
 }
@@ -207,9 +198,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     drop(reader);
 
     let mut strings = StringPool::new();
-    let mut addr_points: Vec<RawAddrPoint> = Vec::new();
-    let mut street_ways: Vec<RawStreetWay> = Vec::new();
-    let mut interp_ways: Vec<RawInterpWay> = Vec::new();
+    let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
 
     // -----------------------------------------------------------------------
     // Pass 1: Relations — collect admin boundary metadata + way member IDs
@@ -310,6 +299,29 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
     let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> = rustc_hash::FxHashMap::default();
 
+    // Streaming output: write data files directly during the scan instead
+    // of accumulating Vecs. Running counters track offsets and record counts.
+    let mut street_ways_out = BufWriter::new(
+        std::fs::File::create(config.output_dir.join(FILE_STREET_WAYS))?,
+    );
+    let mut street_nodes_out = BufWriter::new(
+        std::fs::File::create(config.output_dir.join(FILE_STREET_NODES))?,
+    );
+    let mut addr_points_out = BufWriter::new(
+        std::fs::File::create(config.output_dir.join(FILE_ADDR_POINTS))?,
+    );
+    let mut interp_nodes_out = BufWriter::new(
+        std::fs::File::create(config.output_dir.join(FILE_INTERP_NODES))?,
+    );
+
+    let mut street_node_offset: u64 = 0;
+    let mut interp_node_offset: u64 = 0;
+    let mut addr_point_count: u32 = 0;
+    let mut street_way_count: u32 = 0;
+    // First address point lat/lon for the smoke test (since we won't have the Vec)
+    let mut first_addr_lat_e7: i32 = 0;
+    let mut first_addr_lon_e7: i32 = 0;
+
     {
         // Filter: nodes + ways, skip relations (already scanned in pass 1).
         // Block-level pipelining with elements_skip_metadata() — we don't
@@ -336,12 +348,19 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                             }
                         }
                         if let (Some(h), Some(s)) = (hn, st) {
-                            addr_points.push(RawAddrPoint {
+                            // Stream directly to addr_points.bin
+                            let ap = AddrPoint {
                                 lat_e7, lon_e7,
                                 housenumber_offset: strings.intern(h),
                                 street_offset: strings.intern(s),
                                 postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                            });
+                            };
+                            addr_points_out.write_all(&ap.to_bytes())?;
+                            if addr_point_count == 0 {
+                                first_addr_lat_e7 = lat_e7;
+                                first_addr_lon_e7 = lon_e7;
+                            }
+                            addr_point_count += 1;
                         }
                     }
                     Element::Way(way) => {
@@ -378,7 +397,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                         let is_interp = interp.is_some() && addr_st.is_some();
 
                         if !is_admin_way && !is_street && !is_building_addr && !is_interp {
-                            continue; // Skip coordinate resolution entirely
+                            continue;
                         }
 
                         let coords: Vec<(i32, i32)> = way.refs()
@@ -395,24 +414,33 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                             way_geom.insert(way_id, coords.clone());
                         }
 
-                        // Interpolation ways
+                        // Interpolation ways — write nodes to file, keep slim metadata
                         if is_interp {
                             if coords.len() >= 2 {
                                 let itype = match interp.unwrap_or("") {
                                     "even" => 1u8, "odd" => 2, _ => 0,
                                 };
-                                interp_ways.push(RawInterpWay {
+                                #[allow(clippy::cast_possible_truncation)]
+                                let nc = coords.len().min(u16::MAX as usize) as u16;
+                                interp_ways.push(SlimInterpWay {
                                     street_offset: strings.intern(addr_st.unwrap_or("")),
                                     interpolation_type: itype,
-                                    nodes: coords,
+                                    node_file_offset: interp_node_offset,
+                                    node_count: nc,
                                     start_number: 0,
                                     end_number: 0,
                                 });
+                                for &(lat, lon) in &coords {
+                                    interp_nodes_out.write_all(
+                                        &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                                    )?;
+                                }
+                                interp_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
                             }
                             continue;
                         }
 
-                        // Building addresses (centroid)
+                        // Building addresses (centroid) — stream to addr_points.bin
                         if is_building_addr {
                             let (sum_lat, sum_lon) = coords.iter()
                                 .fold((0i64, 0i64), |acc, &(lat, lon)| {
@@ -424,20 +452,37 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                             let clat = (sum_lat / count) as i32;
                             #[allow(clippy::cast_possible_truncation)]
                             let clon = (sum_lon / count) as i32;
-                            addr_points.push(RawAddrPoint {
+                            let ap = AddrPoint {
                                 lat_e7: clat, lon_e7: clon,
                                 housenumber_offset: strings.intern(hn.unwrap_or("")),
                                 street_offset: strings.intern(addr_st.unwrap_or("")),
                                 postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                            });
+                            };
+                            addr_points_out.write_all(&ap.to_bytes())?;
+                            if addr_point_count == 0 {
+                                first_addr_lat_e7 = clat;
+                                first_addr_lon_e7 = clon;
+                            }
+                            addr_point_count += 1;
                         }
 
-                        // Streets
+                        // Streets — stream to street_ways.bin + street_nodes.bin
                         if is_street && coords.len() >= 2 {
-                            street_ways.push(RawStreetWay {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let nc = coords.len().min(u16::MAX as usize) as u16;
+                            let sw = StreetWay {
+                                node_offset: street_node_offset,
                                 name_offset: strings.intern(name.unwrap_or("")),
-                                nodes: coords,
-                            });
+                                node_count: nc,
+                            };
+                            street_ways_out.write_all(&sw.to_bytes())?;
+                            for &(lat, lon) in &coords {
+                                street_nodes_out.write_all(
+                                    &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                                )?;
+                            }
+                            street_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
+                            street_way_count += 1;
                         }
                     }
                     _ => {} // Node (non-dense) — rare, ignore
@@ -446,14 +491,49 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             Ok(())
         })?;
     }
+
+    // Flush and drop writers before mmap
+    street_ways_out.flush()?;
+    street_nodes_out.flush()?;
+    addr_points_out.flush()?;
+    interp_nodes_out.flush()?;
+    drop(street_ways_out);
+    drop(street_nodes_out);
+    drop(addr_points_out);
+    drop(interp_nodes_out);
+
     eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
-        addr_points.len(), street_ways.len(), interp_ways.len(), way_geom.len());
+        addr_point_count, street_way_count, interp_ways.len(), way_geom.len());
     #[cfg(feature = "hotpath")]
     if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass2_scan_kb={rss}"); }
     drop(needed_admin_ways);
     drop(node_index);
     #[cfg(feature = "hotpath")]
     if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_pass2_drop_kb={rss}"); }
+
+    // Mmap output files for coordinate access in cell assignment + interpolation
+    // Mmap helper that handles empty files by returning an empty slice-equivalent.
+    // memmap2::Mmap::map() fails on zero-length files; we use MmapOptions with
+    // a minimum length of 1 byte for empty files (the extra byte is never read
+    // since all consumers check bounds).
+    let mmap_file = |name: &str| -> Result<memmap2::Mmap> {
+        let path = config.output_dir.join(name);
+        let file = std::fs::File::open(&path)?;
+        let len = file.metadata()?.len();
+        if len == 0 {
+            // Write a single zero byte so mmap succeeds, then map read-only.
+            // The consumers all check record bounds, so the extra byte is harmless.
+            drop(file);
+            std::fs::write(&path, &[0u8])?;
+            let file = std::fs::File::open(&path)?;
+            return Ok(unsafe { memmap2::Mmap::map(&file)? });
+        }
+        Ok(unsafe { memmap2::Mmap::map(&file)? })
+    };
+    let street_ways_mmap = mmap_file(FILE_STREET_WAYS)?;
+    let street_nodes_mmap = mmap_file(FILE_STREET_NODES)?;
+    let addr_points_mmap = mmap_file(FILE_ADDR_POINTS)?;
+    let interp_nodes_mmap = mmap_file(FILE_INTERP_NODES)?;
 
     // Ring assembly + simplification
     let admin_polygons = assemble_admin_polygons(&admin_relations, &way_geom, config);
@@ -466,36 +546,57 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let pass2_ms = pass2_start.elapsed().as_millis();
 
     // -----------------------------------------------------------------------
-    // Interpolation endpoint resolution
+    // Interpolation endpoint resolution (reads from mmap'd addr_points.bin)
     // -----------------------------------------------------------------------
-    let resolved = resolve_interpolation_endpoints(
-        &mut interp_ways, &addr_points, &strings, config.street_level,
+    let resolved = resolve_interpolation_endpoints_mmap(
+        &mut interp_ways, &addr_points_mmap, &interp_nodes_mmap, &strings, config.street_level,
     );
     eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
     #[cfg(feature = "hotpath")]
     if let Some(rss) = read_rss_kb() { eprintln!("  rss_after_interp_kb={rss}"); }
 
+    // Write interp_ways.bin now (after resolution has set start/end numbers)
+    {
+        let mut iw_out = BufWriter::new(
+            std::fs::File::create(config.output_dir.join(FILE_INTERP_WAYS))?,
+        );
+        for iw in &interp_ways {
+            let rec = InterpWay {
+                node_offset: iw.node_file_offset,
+                street_offset: iw.street_offset,
+                start_number: iw.start_number,
+                end_number: iw.end_number,
+                node_count: iw.node_count,
+                interpolation_type: iw.interpolation_type,
+            };
+            iw_out.write_all(&rec.to_bytes())?;
+        }
+        iw_out.flush()?;
+    }
+
+    // Write admin + strings data files
+    write_admin_data(&config.output_dir, &admin_polygons)?;
+    std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
+
     // -----------------------------------------------------------------------
-    // Pass 3: S2 cell assignment + write index files
+    // Pass 3: S2 cell assignment + write cell index files
     // -----------------------------------------------------------------------
     eprintln!("Pass 3: S2 cells + write...");
     #[cfg(feature = "hotpath")]
     let pass4_start = std::time::Instant::now();
 
-    // Write data files
-    write_street_data(&config.output_dir, &street_ways)?;
-    write_addr_data(&config.output_dir, &addr_points)?;
-    write_interp_data(&config.output_dir, &interp_ways)?;
-    write_admin_data(&config.output_dir, &admin_polygons)?;
-    std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
-
-    // Compute S2 cell assignments
     let sl = config.street_level;
     let cl = config.coarse_level;
 
-    let (fine_addr, coarse_addr) = assign_addr_cells(&addr_points, sl, cl);
-    let (fine_street, coarse_street) = assign_seg_cells_generic(&street_ways, sl, cl);
-    let (fine_interp, coarse_interp) = assign_seg_cells_generic(&interp_ways, sl, cl);
+    // Cell assignment reads from mmap'd files
+    let (fine_addr, coarse_addr) = assign_addr_cells_mmap(&addr_points_mmap, sl, cl);
+    let (fine_street, coarse_street) = assign_seg_cells_mmap(
+        &street_ways_mmap, &street_nodes_mmap, street_way_count, sl, cl,
+    );
+    let interp_way_count = interp_ways.len();
+    let (fine_interp, coarse_interp) = assign_seg_cells_interp_slim(
+        &interp_ways, &interp_nodes_mmap, sl, cl,
+    );
     let admin_cell_entries = assign_admin_cells(&admin_polygons, config.admin_level);
 
     eprintln!("  {} fine street, {} fine addr, {} admin cell entries",
@@ -536,9 +637,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         coarse_search_radius_m: config.coarse_search_radius_m,
         replication_sequence: repl_seq,
         replication_timestamp: repl_ts,
-        addr_point_count: addr_points.len() as u32,
-        street_way_count: street_ways.len() as u32,
-        interp_way_count: interp_ways.len() as u32,
+        addr_point_count,
+        street_way_count,
+        interp_way_count: interp_way_count as u32,
         admin_polygon_count: admin_polygons.len() as u32,
         geo_cell_count: fine_count,
         coarse_cell_count: coarse_count,
@@ -546,14 +647,16 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     };
     std::fs::write(config.output_dir.join(FILE_HEADER), header.to_bytes())?;
 
-    // Build-time smoke test: re-open with Reader and verify a query works
+    // Build-time smoke test
     #[cfg(feature = "geocode-reader")]
     {
         eprintln!("  Running smoke test...");
         let test_reader = super::reader::Reader::open(&config.output_dir)?;
-        if !addr_points.is_empty() {
-            let pt = &addr_points[0];
-            let result = test_reader.query(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+        if addr_point_count > 0 {
+            let result = test_reader.query(
+                first_addr_lat_e7 as f64 * 1e-7,
+                first_addr_lon_e7 as f64 * 1e-7,
+            );
             if result.address.is_none() && result.street.is_none() {
                 eprintln!("  WARNING: smoke test query returned no address or street match");
             }
@@ -571,9 +674,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         eprintln!("pass1_relations_ms={pass1_ms}");
         eprintln!("pass2_nodes_ways_ms={pass2_ms}");
         eprintln!("pass3_cells_ms={pass4_ms}");
-        eprintln!("addr_points={}", addr_points.len());
-        eprintln!("street_ways={}", street_ways.len());
-        eprintln!("interp_ways={}", interp_ways.len());
+        eprintln!("addr_points={addr_point_count}");
+        eprintln!("street_ways={street_way_count}");
+        eprintln!("interp_ways={interp_way_count}");
         eprintln!("admin_polygons={}", admin_polygons.len());
         eprintln!("strings_bytes={}", strings.data.len());
         eprintln!("strings_unique={}", strings.index.len());
@@ -582,15 +685,14 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         }
     }
 
-    #[allow(clippy::cast_possible_truncation)]
     Ok(BuildStats {
-        addr_points: addr_points.len() as u64,
-        street_ways: street_ways.len() as u64,
-        interp_ways: interp_ways.len() as u64,
+        addr_points: u64::from(addr_point_count),
+        street_ways: u64::from(street_way_count),
+        interp_ways: interp_way_count as u64,
         admin_polygons: admin_polygons.len() as u64,
-        fine_cells: fine_count as u64,
-        coarse_cells: coarse_count as u64,
-        admin_cells: admin_count as u64,
+        fine_cells: u64::from(fine_count),
+        coarse_cells: u64::from(coarse_count),
+        admin_cells: u64::from(admin_count),
     })
 }
 
@@ -679,7 +781,7 @@ fn assemble_admin_polygons(
 }
 
 // ---------------------------------------------------------------------------
-// Interpolation endpoint resolution
+// Interpolation endpoint resolution (mmap-based)
 // ---------------------------------------------------------------------------
 
 /// Parse leading digits from a house number string (e.g., "42" from "42A").
@@ -695,44 +797,69 @@ fn parse_house_number(s: &str) -> u32 {
     n
 }
 
+/// Read an AddrPoint from the mmap'd addr_points.bin by index.
+fn read_addr_point_mmap(mmap: &[u8], index: u32) -> Option<AddrPoint> {
+    let offset = index as usize * ADDR_POINT_SIZE;
+    let end = offset + ADDR_POINT_SIZE;
+    if end > mmap.len() { return None; }
+    Some(AddrPoint::from_bytes(mmap[offset..end].try_into().ok()?))
+}
+
+/// Read a NodeCoord from a node mmap by byte offset.
+#[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
+fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> {
+    let off = byte_offset as usize;
+    let end = off + NODE_COORD_SIZE;
+    if end > mmap.len() { return None; }
+    let nc = NodeCoord::from_bytes(mmap[off..end].try_into().ok()?);
+    Some((nc.lat_e7, nc.lon_e7))
+}
+
 /// Resolve start/end house numbers for interpolation ways by matching
 /// their endpoints against nearby address points with the same street name.
-/// Returns the count of successfully resolved ways.
+/// Reads address points from mmap'd addr_points.bin.
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
-fn resolve_interpolation_endpoints(
-    interp_ways: &mut [RawInterpWay],
-    addr_points: &[RawAddrPoint],
+fn resolve_interpolation_endpoints_mmap(
+    interp_ways: &mut [SlimInterpWay],
+    addr_mmap: &[u8],
+    interp_nodes_mmap: &[u8],
     strings: &StringPool,
     street_level: u8,
 ) -> u32 {
-    if interp_ways.is_empty() || addr_points.is_empty() {
+    let addr_count = addr_mmap.len() / ADDR_POINT_SIZE;
+    if interp_ways.is_empty() || addr_count == 0 {
         return 0;
     }
 
-    // Build spatial index: S2 cell at street_level -> list of addr point indices
+    // Build spatial index: S2 cell -> list of addr point indices
     let mut cell_to_addrs: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
-    for (idx, pt) in addr_points.iter().enumerate() {
-        let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
-        let cell = CellID::from(ll).parent(street_level as u64).0;
-        cell_to_addrs.entry(cell).or_default().push(idx as u32);
+    for idx in 0..addr_count {
+        if let Some(pt) = read_addr_point_mmap(addr_mmap, idx as u32) {
+            let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+            let cell = CellID::from(ll).parent(street_level as u64).0;
+            cell_to_addrs.entry(cell).or_default().push(idx as u32);
+        }
     }
 
     let mut resolved = 0u32;
 
     for iw in interp_ways.iter_mut() {
-        if iw.nodes.len() < 2 {
+        if iw.node_count < 2 { continue; }
+
+        let Some(start_coord) = read_node_at(interp_nodes_mmap, iw.node_file_offset) else {
             continue;
-        }
+        };
+        let last_offset = iw.node_file_offset + (iw.node_count as u64 - 1) * NODE_COORD_SIZE as u64;
+        let Some(end_coord) = read_node_at(interp_nodes_mmap, last_offset) else {
+            continue;
+        };
 
-        let start_coord = iw.nodes[0];
-        let end_coord = iw.nodes[iw.nodes.len() - 1];
-
-        let start_hn = find_endpoint_house_number(
-            start_coord, iw.street_offset, addr_points, strings, &cell_to_addrs, street_level,
+        let start_hn = find_endpoint_house_number_mmap(
+            start_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
         );
-        let end_hn = find_endpoint_house_number(
-            end_coord, iw.street_offset, addr_points, strings, &cell_to_addrs, street_level,
+        let end_hn = find_endpoint_house_number_mmap(
+            end_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
         );
 
         if let (Some(s), Some(e)) = (start_hn, end_hn) {
@@ -746,12 +873,11 @@ fn resolve_interpolation_endpoints(
 }
 
 /// Find the house number of an address point near an interpolation endpoint.
-/// Prefers coordinate-coincident points, falls back to nearest same-street point.
 #[allow(clippy::cast_possible_truncation)]
-fn find_endpoint_house_number(
+fn find_endpoint_house_number_mmap(
     endpoint: (i32, i32),
     street_offset: u32,
-    addr_points: &[RawAddrPoint],
+    addr_mmap: &[u8],
     strings: &StringPool,
     cell_to_addrs: &FxHashMap<u64, Vec<u32>>,
     street_level: u8,
@@ -760,7 +886,6 @@ fn find_endpoint_house_number(
     let ll = LatLng::from_degrees(lat_e7 as f64 * 1e-7, lon_e7 as f64 * 1e-7);
     let center = CellID::from(ll).parent(street_level as u64);
 
-    // Search center cell + neighbors
     let mut best_idx: Option<u32> = None;
     let mut best_dist_sq = i64::MAX;
     let mut found_exact = false;
@@ -768,29 +893,20 @@ fn find_endpoint_house_number(
     let mut check_cell = |cell_id: u64| {
         let Some(indices) = cell_to_addrs.get(&cell_id) else { return };
         for &idx in indices {
-            let pt = &addr_points[idx as usize];
-            // Must be same street
-            if pt.street_offset != street_offset {
-                continue;
-            }
+            let Some(pt) = read_addr_point_mmap(addr_mmap, idx) else { continue };
+            if pt.street_offset != street_offset { continue; }
             let dlat = (pt.lat_e7 - lat_e7) as i64;
             let dlon = (pt.lon_e7 - lon_e7) as i64;
             let dist_sq = dlat * dlat + dlon * dlon;
-
-            // Coordinate-coincident (within 1 decimicrodegree ≈ 0.01m)
             let is_exact = dlat.abs() <= 1 && dlon.abs() <= 1;
 
             if is_exact && !found_exact {
-                // First exact match beats any previous non-exact
                 found_exact = true;
                 best_idx = Some(idx);
                 best_dist_sq = dist_sq;
-            } else if is_exact || !found_exact {
-                // Among same category (exact or non-exact), pick nearest
-                if dist_sq < best_dist_sq {
-                    best_idx = Some(idx);
-                    best_dist_sq = dist_sq;
-                }
+            } else if (is_exact || !found_exact) && dist_sq < best_dist_sq {
+                best_idx = Some(idx);
+                best_dist_sq = dist_sq;
             }
         }
     };
@@ -801,7 +917,7 @@ fn find_endpoint_house_number(
     }
 
     let idx = best_idx?;
-    let pt = &addr_points[idx as usize];
+    let pt = read_addr_point_mmap(addr_mmap, idx)?;
     let hn_str = read_string_from_pool(strings, pt.housenumber_offset);
     let hn = parse_house_number(hn_str);
     if hn > 0 { Some(hn) } else { None }
@@ -809,80 +925,12 @@ fn find_endpoint_house_number(
 
 /// Read a null-terminated string from the pool by offset.
 fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
-    if offset == 0 {
-        return "";
-    }
+    if offset == 0 { return ""; }
     let start = offset as usize;
-    if start >= pool.data.len() {
-        return "";
-    }
+    if start >= pool.data.len() { return ""; }
     let remaining = &pool.data[start..];
     let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
     std::str::from_utf8(&remaining[..end]).unwrap_or("")
-}
-
-// ---------------------------------------------------------------------------
-// Data file writers
-// ---------------------------------------------------------------------------
-
-fn write_street_data(dir: &Path, ways: &[RawStreetWay]) -> Result<()> {
-    let mut ways_out = BufWriter::new(std::fs::File::create(dir.join(FILE_STREET_WAYS))?);
-    let mut nodes_out = BufWriter::new(std::fs::File::create(dir.join(FILE_STREET_NODES))?);
-    let mut offset: u64 = 0;
-    for w in ways {
-        #[allow(clippy::cast_possible_truncation)]
-        let rec = StreetWay {
-            node_offset: offset,
-            name_offset: w.name_offset,
-            node_count: w.nodes.len().min(u16::MAX as usize) as u16,
-        };
-        ways_out.write_all(&rec.to_bytes())?;
-        for &(lat, lon) in &w.nodes {
-            nodes_out.write_all(&NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes())?;
-        }
-        offset += (w.nodes.len() * NODE_COORD_SIZE) as u64;
-    }
-    ways_out.flush()?;
-    nodes_out.flush()?;
-    Ok(())
-}
-
-fn write_addr_data(dir: &Path, points: &[RawAddrPoint]) -> Result<()> {
-    let mut out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADDR_POINTS))?);
-    for pt in points {
-        out.write_all(&AddrPoint {
-            lat_e7: pt.lat_e7, lon_e7: pt.lon_e7,
-            housenumber_offset: pt.housenumber_offset,
-            street_offset: pt.street_offset,
-            postcode_offset: pt.postcode_offset,
-        }.to_bytes())?;
-    }
-    out.flush()?;
-    Ok(())
-}
-
-fn write_interp_data(dir: &Path, ways: &[RawInterpWay]) -> Result<()> {
-    let mut ways_out = BufWriter::new(std::fs::File::create(dir.join(FILE_INTERP_WAYS))?);
-    let mut nodes_out = BufWriter::new(std::fs::File::create(dir.join(FILE_INTERP_NODES))?);
-    let mut offset: u64 = 0;
-    for iw in ways {
-        #[allow(clippy::cast_possible_truncation)]
-        let rec = InterpWay {
-            node_offset: offset,
-            street_offset: iw.street_offset,
-            start_number: iw.start_number, end_number: iw.end_number,
-            node_count: iw.nodes.len().min(u16::MAX as usize) as u16,
-            interpolation_type: iw.interpolation_type,
-        };
-        ways_out.write_all(&rec.to_bytes())?;
-        for &(lat, lon) in &iw.nodes {
-            nodes_out.write_all(&NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes())?;
-        }
-        offset += (iw.nodes.len() * NODE_COORD_SIZE) as u64;
-    }
-    ways_out.flush()?;
-    nodes_out.flush()?;
-    Ok(())
 }
 
 fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
@@ -983,62 +1031,118 @@ fn cover_segment(
 // S2 cell assignment
 // ---------------------------------------------------------------------------
 
+/// Assign address point cells from mmap'd addr_points.bin.
 #[allow(clippy::cast_possible_truncation)]
-fn assign_addr_cells(
-    points: &[RawAddrPoint], fine_level: u8, coarse_level: u8,
+fn assign_addr_cells_mmap(
+    addr_mmap: &[u8], fine_level: u8, coarse_level: u8,
 ) -> (Vec<AddrCellEntry>, Vec<AddrCellEntry>) {
-    let mut fine = Vec::with_capacity(points.len());
-    let mut coarse = Vec::with_capacity(points.len());
-    for (idx, pt) in points.iter().enumerate() {
-        let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
-        let cell = CellID::from(ll);
-        fine.push(AddrCellEntry { cell_id: cell.parent(fine_level as u64).0, addr_index: idx as u32 });
-        coarse.push(AddrCellEntry { cell_id: cell.parent(coarse_level as u64).0, addr_index: idx as u32 });
+    let count = addr_mmap.len() / ADDR_POINT_SIZE;
+    let mut fine = Vec::with_capacity(count);
+    let mut coarse = Vec::with_capacity(count);
+    for idx in 0..count {
+        if let Some(pt) = read_addr_point_mmap(addr_mmap, idx as u32) {
+            let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
+            let cell = CellID::from(ll);
+            fine.push(AddrCellEntry { cell_id: cell.parent(fine_level as u64).0, addr_index: idx as u32 });
+            coarse.push(AddrCellEntry { cell_id: cell.parent(coarse_level as u64).0, addr_index: idx as u32 });
+        }
     }
     (fine, coarse)
 }
 
-/// Trait for types that have a node list (RawStreetWay, RawInterpWay).
-trait HasNodes {
-    fn nodes(&self) -> &[(i32, i32)];
-}
-
-impl HasNodes for RawStreetWay {
-    fn nodes(&self) -> &[(i32, i32)] { &self.nodes }
-}
-
-impl HasNodes for RawInterpWay {
-    fn nodes(&self) -> &[(i32, i32)] { &self.nodes }
-}
-
-/// Assign segment cells for a generic set of ways (used for both streets and interp).
-/// Uses par_iter for parallel S2 cell computation — each way is independent.
+/// Assign street segment cells from mmap'd street_ways.bin + street_nodes.bin.
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
-fn assign_seg_cells_generic<T: HasNodes + Sync>(
-    ways: &[T],
+fn assign_seg_cells_mmap(
+    ways_mmap: &[u8],
+    nodes_mmap: &[u8],
+    way_count: u32,
     fine_level: u8,
     coarse_level: u8,
 ) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
     use rayon::prelude::*;
 
-    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = ways
-        .par_iter()
-        .enumerate()
-        .map(|(way_idx, way)| {
-            let nodes = way.nodes();
+    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = (0..way_count)
+        .into_par_iter()
+        .map(|way_idx| {
+            let offset = way_idx as usize * STREET_WAY_SIZE;
+            let Some(rec) = ways_mmap.get(offset..offset + STREET_WAY_SIZE)
+                .and_then(|b| <&[u8; STREET_WAY_SIZE]>::try_from(b).ok())
+                .map(StreetWay::from_bytes) else {
+                return (Vec::new(), Vec::new());
+            };
+
             let mut fine = Vec::new();
             let mut coarse = Vec::new();
-            for (seg_idx, pair) in nodes.windows(2).enumerate() {
-                let (lat1, lon1) = pair[0];
-                let (lat2, lon2) = pair[1];
-                let wi = way_idx as u32;
-                let si = seg_idx as u16;
+            let nc = rec.node_count as usize;
+            if nc < 2 { return (fine, coarse); }
 
-                cover_segment(lat1, lon1, lat2, lon2, fine_level, |cid| {
+            for seg_idx in 0..nc - 1 {
+                let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
+                let off2 = off1 + NODE_COORD_SIZE;
+                let (Some(n1), Some(n2)) = (
+                    read_node_at(nodes_mmap, off1 as u64),
+                    read_node_at(nodes_mmap, off2 as u64),
+                ) else { continue };
+
+                let wi = way_idx;
+                let si = seg_idx as u16;
+                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |cid| {
                     fine.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
                 });
-                cover_segment(lat1, lon1, lat2, lon2, coarse_level, |cid| {
+                cover_segment(n1.0, n1.1, n2.0, n2.1, coarse_level, |cid| {
+                    coarse.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
+                });
+            }
+            (fine, coarse)
+        })
+        .collect();
+
+    let total_fine: usize = per_way.iter().map(|(f, _)| f.len()).sum();
+    let total_coarse: usize = per_way.iter().map(|(_, c)| c.len()).sum();
+    let mut fine = Vec::with_capacity(total_fine);
+    let mut coarse = Vec::with_capacity(total_coarse);
+    for (f, c) in per_way {
+        fine.extend(f);
+        coarse.extend(c);
+    }
+    (fine, coarse)
+}
+
+/// Assign interpolation segment cells from slim metadata + mmap'd interp_nodes.
+#[allow(clippy::cast_possible_truncation)]
+#[hotpath::measure]
+fn assign_seg_cells_interp_slim(
+    interp_ways: &[SlimInterpWay],
+    nodes_mmap: &[u8],
+    fine_level: u8,
+    coarse_level: u8,
+) -> (Vec<SegCellEntry>, Vec<SegCellEntry>) {
+    use rayon::prelude::*;
+
+    let per_way: Vec<(Vec<SegCellEntry>, Vec<SegCellEntry>)> = interp_ways
+        .par_iter()
+        .enumerate()
+        .map(|(way_idx, iw)| {
+            let mut fine = Vec::new();
+            let mut coarse = Vec::new();
+            let nc = iw.node_count as usize;
+            if nc < 2 { return (fine, coarse); }
+
+            for seg_idx in 0..nc - 1 {
+                let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+                let off2 = off1 + NODE_COORD_SIZE;
+                let (Some(n1), Some(n2)) = (
+                    read_node_at(nodes_mmap, off1 as u64),
+                    read_node_at(nodes_mmap, off2 as u64),
+                ) else { continue };
+
+                let wi = way_idx as u32;
+                let si = seg_idx as u16;
+                cover_segment(n1.0, n1.1, n2.0, n2.1, fine_level, |cid| {
+                    fine.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
+                });
+                cover_segment(n1.0, n1.1, n2.0, n2.1, coarse_level, |cid| {
                     coarse.push(SegCellEntry { cell_id: cid, way_index: wi, segment_index: si });
                 });
             }

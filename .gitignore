@@ -9,3 +9,4 @@ bench/osmpbf-baseline/target/
 .bench_stderr.*
 .brokkr/*
 !.brokkr/results.db
+research

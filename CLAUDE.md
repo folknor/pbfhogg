@@ -117,6 +117,29 @@ All `--variant` flags default to `indexed`. `--osc-seq` auto-selects if exactly 
 - **NEVER run benchmark, profiling, or verify commands in parallel.** Not two, not three — ONE AT A TIME. Benchmarks require exclusive access to CPU, memory, and I/O. Running multiple simultaneously makes every result wrong. Always wait for each to fully complete before starting the next. This applies to bench, verify, hotpath, and profile subcommands.
 - When an optimization workflow requires multiple benchmark runs (baseline, mid-work, post-work), run each one **sequentially** and report results between runs. Do NOT launch them as parallel background tasks.
 
+## Review tool
+
+`review` fans out code review queries to persistent AI sessions. Configured in `.review.md`.
+
+Five archetypes, two groups:
+- `bugs` — logic errors, edge cases, error handling, crashes
+- `perf` — allocations, complexity, hot paths, scan structure
+- `arch` — coupling, abstractions, API design, feature gates
+- `correctness` — spatial algorithms, binary format fidelity, OSM data model
+- `planet` — O_DIRECT, io_uring, mmap, allocators, streaming pipelines, memory-constrained processing
+
+Groups: `sweep` = [bugs, perf, arch, correctness], `everything` = all five.
+
+Usage:
+- `echo "question" | review sweep --raw` — ask 4 archetypes (ongoing use)
+- `echo "question" | review planet --raw` — ask planet sessions
+- `echo "question" | review sweep --staged` — with scope flag (re-anchors with archetype prompt)
+- `echo "question" | review perf --general --dry-run` — preview prompt without sending
+
+Prefer `--raw` for ongoing use — sessions are already primed with project context, so the archetype prefix is redundant. Omit `--raw` for the first review in a session or occasionally to re-anchor a stale session. `--raw` cannot be combined with scope flags (`--staged`, `--commit`, etc.) — with `--raw` you provide all context yourself in stdin, including what files or commits to look at.
+
+**Use this tool before implementing major changes.** Write up the problem, send to reviewers, wait for answers. The write-up + review cycle is faster than implement + discover it's wrong.
+
 ## Subagents
 Subagents must NOT run any shell commands. They write code only. Integration, building, and testing is done in the main conversation.
 

@@ -1,9 +1,9 @@
 import { defineConfig } from 'vitepress'
 
 // ── Replace these per-project ──────────────────────────────────────────────
-const projectName = 'Kvakk'
-const projectDescription = 'Quick Share for Linux and Windows'
-const githubUrl = 'https://github.com/user/kvakk'
+const projectName = 'Pbfhogg'
+const projectDescription = 'Fast OpenStreetMap PBF reader and writer for Rust'
+const githubUrl = 'https://github.com/folknor/pbfhogg'
 const base = '/' // set to '/repo-name/' for GitHub Pages project sites
 // ────────────────────────────────────────────────────────────────────────────
 
@@ -19,7 +19,7 @@ export default defineConfig({
   ],
 
   themeConfig: {
-    logo: '/kvakk-logo.svg',
+    logo: '/pbfhogg-logo.svg',
 
     nav: [
       { text: 'Guide', link: '/guide/' },

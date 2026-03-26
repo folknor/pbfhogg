@@ -2,19 +2,19 @@
 layout: home
 
 hero:
-  name: "Kvakk"
-  text: "Quick Share for Linux and Windows"
-  tagline: "Send and receive files with Android devices on your local network using Google's Quick Share protocol. No phone app, no cloud, no fuss."
+  name: "Pbfhogg"
+  text: "Fast OpenStreetMap PBF reader and writer for Rust"
+  tagline: "Pipelined parallel decoding, memory-mapped reading, blob passthrough, and PBF writing — all in one crate."
   image:
-    src: /kvakk-logo.svg
-    alt: Kvakk logo
+    src: /pbfhogg-logo.svg
+    alt: Pbfhogg logo
   actions:
     - theme: brand
       text: Get Started
       link: /guide/
     - theme: alt
       text: GitHub
-      link: https://github.com/user/kvakk
+      link: https://github.com/folknor/pbfhogg
 
 features:
   - icon:

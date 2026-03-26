@@ -159,10 +159,10 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
 | Dataset | Dense | Sparse | External | Commit |
 |---------|-------|--------|----------|--------|
-| Denmark (465 MB) | **6.8s** | 14.1s | 25s | `a334c72` |
+| Denmark (465 MB) | **6.8s** | 14.1s | 22s | `165cbb2` |
 | Japan (2.4 GB) | **72s** | 72s | 143s | `a334c72` |
-| Europe (33.6 GB) | 2,565s (43m) | 6,453s (107m) | **2,060s (34m)** | `0b5507f` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | ~90m (est.) | — |
+| Europe (33.6 GB) | 2,565s (43m) | 6,453s (107m) | **1,824s (30m)** | `165cbb2` |
+| Planet (87.7 GB) | 5,773s (96m)* | — | ~80m (est.) | — |
 
 *Planet with dense thrashes on 30 GB host (memory-latency-bound).
 
@@ -170,13 +170,18 @@ Dense is fastest when the working set fits in RAM. External uses <1 GB RAM
 at any scale via bucketed sequential I/O (4-stage radix join pipeline).
 
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
-(33.6 GB, external 20% faster). At Europe scale, dense's mmap working set
+(33.6 GB, external 29% faster). At Europe scale, dense's mmap working set
 (~16 GB) exceeds available RAM after page cache pressure from the 33.6 GB
 input file, causing thrashing. External's sequential I/O stays bounded.
 
-Planet extrapolation: external ~90 min (2.6× Europe) vs dense 96 min
-(measured, thrashing). External should be comparable or faster at planet
-scale while using <1 GB RSS vs dense's 16 GB mmap. See `notes/altw-partitioned.md`.
+Planet extrapolation: external ~80 min (2.6× Europe) vs dense 96 min
+(measured, thrashing). External should be ~17% faster at planet scale
+while using <1 GB RSS vs dense's 16 GB mmap. See `notes/altw-partitioned.md`.
+
+fadvise(DONTNEED) on bucket files + mmap coord_slots with MADV_SEQUENTIAL
+(commit `165cbb2`): Denmark 25→22s, Europe 2060→1824s (-11%). fadvise
+prevents bucket writes from evicting PBF pages; mmap eliminates per-ref
+pread syscalls in the assembly stage.
 
 Sparse is slower than dense at all scales. At Europe scale the overhead
 ratio *increases* (2.5x vs 2.1x) — the 16 GB on-disk values mmap thrashes

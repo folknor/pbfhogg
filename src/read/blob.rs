@@ -531,6 +531,12 @@ pub struct BlobReader<R: Read + Send> {
     /// Default `true` for compatibility. Disabled in hot paths that never
     /// call `Blob::index()` (par_map_reduce, unfiltered pipeline).
     parse_indexdata: bool,
+    /// File descriptor for fadvise(DONTNEED) after each blob read. When set,
+    /// the reader evicts page cache pages behind the read head, preventing
+    /// sequential reads from accumulating the entire file in RSS.
+    /// Only set for buffered FileReader — O_DIRECT has no pages to evict.
+    #[cfg(feature = "linux-direct-io")]
+    evict_fd: Option<std::os::unix::io::RawFd>,
 }
 
 impl<R: Read + Send> BlobReader<R> {
@@ -558,6 +564,8 @@ impl<R: Read + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            #[cfg(feature = "linux-direct-io")]
+            evict_fd: None,
         }
     }
 
@@ -670,6 +678,8 @@ impl BlobReader<FileReader> {
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = FileReader::buffered(path.as_ref())?;
+        #[cfg(feature = "linux-direct-io")]
+        let evict_fd = Some(reader.raw_fd());
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -677,6 +687,8 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            #[cfg(feature = "linux-direct-io")]
+            evict_fd,
         })
     }
 
@@ -694,12 +706,15 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            evict_fd: None, // O_DIRECT: no pages to evict
         })
     }
 
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
+        #[cfg(feature = "linux-direct-io")]
+        let evict_fd = if direct { None } else { Some(reader.raw_fd()) };
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -707,6 +722,8 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            #[cfg(feature = "linux-direct-io")]
+            evict_fd,
         })
     }
 }
@@ -745,6 +762,25 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
             .offset
             .map(|x| ByteOffset(x.0 + header.datasize as u64));
 
+        // Evict page cache pages behind the read head. After the blob data is
+        // copied into owned buffers (blob_data Vec above), the kernel's cached
+        // pages for the consumed byte range are never accessed again. Advising
+        // DONTNEED prevents sequential reads from accumulating the entire file
+        // in RSS — critical for 30+ GB PBFs on memory-constrained hosts.
+        #[cfg(feature = "linux-direct-io")]
+        if let Some(fd) = self.evict_fd
+            && let Some(offset) = self.offset
+        {
+            unsafe {
+                libc::posix_fadvise(
+                    fd,
+                    0,
+                    offset.0.try_into().unwrap_or(i64::MAX),
+                    libc::POSIX_FADV_DONTNEED,
+                )
+            };
+        }
+
         Some(Ok(Blob::new(header, blob, prev_offset)))
     }
 }
@@ -779,6 +815,8 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
+            #[cfg(feature = "linux-direct-io")]
+            evict_fd: None,
         })
     }
 

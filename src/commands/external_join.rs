@@ -396,14 +396,17 @@ fn stage2_node_join(
 
     eprintln!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
 
-    // Pipelined node-only scan: parallel decompression without PrimitiveBlock.
-    // IO thread reads blobs, rayon threads decompress, consumer parses dense
-    // nodes inline from raw bytes. Zero per-block heap allocations beyond the
-    // pooled decompression buffers.
+    // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
+    // per-block heap allocations (WireStringTable entries, group_ranges) that
+    // cause 25+ GB of allocator retention at Europe scale.
+    //
+    // Reads blobs sequentially, decompresses into a reusable buffer, and walks
+    // the wire format directly for dense node id/lat/lon. Zero per-block heap
+    // allocations beyond the reusable decompression buffer.
     use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
-    use crate::blob::{BlobReader, BlobType, DecompressPool, decompress_blob};
 
-    let mut blob_reader = BlobReader::open(input, direct_io)?;
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(false);
     // Skip the header blob.
     let _ = blob_reader.next();
 
@@ -412,67 +415,14 @@ fn stage2_node_join(
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
 
-    // Pipeline: IO thread → rayon decompress → consumer (this thread).
-    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<crate::blob::Blob>)>(16);
-    let (dec_tx, dec_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<bytes::Bytes>)>(32);
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
 
-    std::thread::scope(|scope| -> Result<()> {
-        // IO thread: read blobs sequentially.
-        scope.spawn(move || {
-            for (seq, blob_result) in blob_reader.enumerate() {
-                if raw_tx.send((seq, blob_result)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Dispatch thread: decompress on rayon pool, skip non-data blobs.
-        let dispatch_tx = dec_tx.clone();
-        scope.spawn(move || {
-            let decode_threads = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                .unwrap_or(4);
-            let Ok(decode_pool) = rayon::ThreadPoolBuilder::new()
-                .num_threads(decode_threads)
-                .build()
-            else {
-                return;
-            };
-            let buffer_pool = DecompressPool::new();
-            for (seq, blob_result) in raw_rx {
-                let tx = dispatch_tx.clone();
-                let bp = std::sync::Arc::clone(&buffer_pool);
-                match blob_result {
-                    Ok(blob) => {
-                        decode_pool.spawn(move || {
-                            let item = if matches!(blob.get_type(), BlobType::OsmData) {
-                                Some(blob.decompress_pooled(&bp))
-                            } else {
-                                None
-                            };
-                            drop(tx.send((seq, item.unwrap_or(Ok(bytes::Bytes::new())))));
-                        });
-                    }
-                    Err(e) => {
-                        drop(tx.send((seq, Err(e))));
-                    }
-                }
-            }
-        });
-        drop(dec_tx);
-
-        // Consumer: reorder + parse dense nodes inline.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<bytes::Bytes>> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
-
-        for (seq, item) in dec_rx {
-            reorder.push(seq, item);
-
-            while let Some(result) = reorder.pop_ready() {
-                let decompressed = result?;
-                if decompressed.is_empty() {
-                    continue;
-                }
+        // Decompress without constructing PrimitiveBlock (no string table alloc).
+        let decompressed = blob.decompress_raw()?;
 
         block_count += 1;
         if block_count.is_multiple_of(1000) {
@@ -566,7 +516,7 @@ fn stage2_node_join(
                         // No more buckets — done. Break all the way out.
                         // Remaining nodes have no COO pairs.
                         eprintln!("  node join: complete ({resolved_count} resolved)");
-                        return Ok(());
+                        return Ok(resolved_count);
                     }
                 }
 
@@ -595,12 +545,9 @@ fn stage2_node_join(
                 }
             }
         }
-            } // while let pop_ready
-        } // for dec_rx
+    }
 
-        eprintln!("  node join: complete ({resolved_count} resolved)");
-        Ok(())
-    })?; // thread::scope
+    eprintln!("  node join: complete ({resolved_count} resolved)");
 
     Ok(resolved_count)
 }
@@ -610,11 +557,16 @@ fn stage2_node_join(
 /// bucket loads, preventing heap accumulation from the allocator holding
 /// freed blocks.
 #[hotpath::measure]
+#[allow(clippy::cast_possible_truncation)]
 fn load_coo_bucket_into(path: &Path, data_buf: &mut Vec<u8>, pairs: &mut Vec<CooPair>) -> Result<()> {
-    data_buf.clear();
     let file = std::fs::File::open(path)
         .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
-    std::io::Read::read_to_end(&mut &file, data_buf)
+    let len = file.metadata()
+        .map_err(|e| format!("failed to stat bucket {}: {e}", path.display()))?
+        .len() as usize;
+    data_buf.clear();
+    data_buf.resize(len, 0);
+    std::io::Read::read_exact(&mut &file, data_buf)
         .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
     #[cfg(feature = "linux-direct-io")]
     advise_dontneed_file(&file);
@@ -817,6 +769,7 @@ fn stage4_assembly(
     // freed on the consumer thread. Sequential decode keeps all alloc/free on
     // one thread. Batch parallel assembly still uses rayon for BlockBuilder work.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(false);
     let header_blob = blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
@@ -833,13 +786,16 @@ fn stage4_assembly(
     let mut slot_pos: u64 = 0;
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut block_count: u64 = 0;
+    // Single-thread pool for decompression buffer reuse — no cross-thread issue
+    // since the sequential reader keeps all alloc/free on this thread.
+    let decompress_pool = crate::blob::DecompressPool::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        let decompressed = blob.decompress_raw()?;
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
         let block = PrimitiveBlock::new(decompressed)?;
         batch.push(block);
 

@@ -41,7 +41,7 @@ pub(crate) fn rss_line() -> String {
 /// Emit a named phase marker to the sidecar profiler (if active).
 ///
 /// The marker is timestamped with CLOCK_MONOTONIC microseconds since process
-/// start and written to the FIFO at `PBFHOGG_MARKER_FIFO`. If no sidecar is
+/// start and written to the FIFO at `BROKKR_MARKER_FIFO`. If no sidecar is
 /// running (env var absent), this is a no-op. If the FIFO buffer is full,
 /// the marker is silently dropped (O_NONBLOCK).
 pub(crate) fn emit_marker(name: &str) {
@@ -51,7 +51,7 @@ pub(crate) fn emit_marker(name: &str) {
     static STATE: OnceLock<Option<(std::fs::File, std::time::Instant)>> = OnceLock::new();
 
     let state = STATE.get_or_init(|| {
-        let path = std::env::var("PBFHOGG_MARKER_FIFO").ok()?;
+        let path = std::env::var("BROKKR_MARKER_FIFO").ok()?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;

@@ -14,31 +14,32 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
 Standalone development tool at `~/Programs/brokkr`. Installed via `cargo install --path ~/Programs/brokkr`. Invoked as `brokkr` from the project root (reads `./brokkr.toml` for project detection).
 
-- `brokkr check [-- args]` — run clippy + tests. Extra args forwarded to `cargo test` (e.g., `brokkr check -- --ignored`). Supports `--features`, `--no-default-features`, and `--package` / `-p` (forwarded to both clippy and test).
-- `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status. Shows computed XXH128 hashes for each dataset file (copy into the `xxhash` field in `brokkr.toml`).
-- `brokkr run [options] [-- args]` — build release CLI and run passthrough command args. Supports machine-readable timing:
-  - `--time` prints key=value timing output
-  - `--json` prints structured JSON timing output
-  - `--runs N` repeats execution N times (summary stats include min/median/p95)
-  - `--no-build` skips build and runs an already-built binary (fails clearly if missing)
-  - examples: `brokkr run --time -- --help`, `brokkr run --json --runs 5 --no-build -- --version`
-- `brokkr bench read [--dataset name] [--variant V] [--runs N] [--modes list]` — read benchmark (4 modes: sequential, parallel, pipelined, blobreader). Results stored in SQLite. Default variant: indexed.
-- `brokkr bench write [--dataset name] [--variant V] [--runs N] [--compression list]` — write benchmark (sync + pipelined × compression). Default compressions: none,zlib:6,zstd:3. Results stored in SQLite. Default variant: indexed.
-- `brokkr bench merge [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N] [--uring] [--compression list]` — merge benchmark (I/O modes × compression). Default compressions: zlib,none. `--uring` adds io_uring variants with preflight checks. Results stored in SQLite. Default variant: indexed.
-- `brokkr bench commands [command] [--dataset name] [--variant V] [--osc-seq SEQ] [--runs N]` — CLI command benchmark (27 commands, external timing). Use `all` for full suite. `diff` and `diff-osc` auto-generate a merged PBF (cached in scratch). Results stored in SQLite. Default variant: indexed.
-- `brokkr bench extract [--dataset name] [--variant V] [--runs N] [--bbox bbox] [--strategies list]` — extract strategy benchmark (simple/complete/smart). Default dataset: japan. Default variant: indexed.
-- `brokkr bench allocator [--dataset name] [--variant V] [--runs N]` — allocator comparison (default/jemalloc/mimalloc) via check --refs. Default variant: indexed.
-- `brokkr bench blob-filter [--dataset name] [--indexed-variant V] [--raw-variant V] [--runs N]` — indexdata vs non-indexdata performance comparison. Default variants: indexed + raw.
-- `brokkr bench planetiler [--dataset name] [--variant V] [--runs N]` — Planetiler Java PBF read benchmark. Auto-downloads JDK + Planetiler JAR. Default variant: indexed.
-- `brokkr bench build-geocode-index [--dataset name] [--variant V] [--runs N]` — geocode index build benchmark. Output to `<scratch>/geocode-<dataset>/`. Default variant: indexed.
-- `brokkr bench all [--dataset name] [--variant V] [--runs N]` — full suite: read + write + merge + commands + osmpbf/osmium/planetiler baselines. Default variant: indexed.
-- `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report)
-- `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [-n N] [--top N]` — query/compare benchmark results from SQLite. Use `--top 0` to show all hotpath functions. Use `--compare-last --command hotpath` to diff two most recent hotpath runs. Results stored by bench harness (clean tree only).
-- `brokkr hotpath [--dataset name] [--variant V] [--osc-seq SEQ] [--alloc] [--runs N] [--test NAME]` — hotpath profiling (function-level timing/allocation metrics). Default dataset: denmark, runs: 1. `--alloc` uses `hotpath-alloc` feature for allocation tracking. Wall-clock stored in SQLite. Default variant: indexed. `--test` runs a single test: inspect-tags, check-refs, cat, apply-changes-zlib, apply-changes-none.
-- `brokkr profile [--dataset name] [--variant V] [--osc-seq SEQ]` — two-pass profiling: timing pass (6 tests with `hotpath` feature) then allocation pass (2 tests with `hotpath-alloc` feature). Console output only, no SQLite. Default variant: indexed.
-- `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik. Regions: malta, greater-london, switzerland, norway, japan, denmark, germany, north-america. Auto-generates indexed PBF via `cat`. Idempotent (skips existing files).
+Every measurable command is a top-level subcommand. Mode flags control behavior:
+
+```
+brokkr <command> [--dataset D] [--variant V]   # run once, print timing
+brokkr <command> [--dataset D] --bench          # 3 runs, store in DB
+brokkr <command> [--dataset D] --hotpath        # function-level timing
+brokkr <command> [--dataset D] --alloc          # allocation tracking
+brokkr <command> [--dataset D] --bench --sidecar  # bench + sidecar profiler (100ms /proc sampling + markers)
+```
+
+pbfhogg commands (every CLI command is a brokkr subcommand):
+- `brokkr inspect-tags --dataset denmark`
+- `brokkr add-locations-to-ways --dataset europe --index-type external --bench`
+- `brokkr build-geocode-index --dataset denmark --hotpath`
+- `brokkr read --bench` — multi-variant read benchmark
+- `brokkr suite pbfhogg --bench` — full suite
+
+Utility commands (unchanged):
+- `brokkr check [-- args]` — run clippy + tests. Supports `--features`, `--no-default-features`, `--package` / `-p`.
+- `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
+- `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report).
+- `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [-n N] [--top N]` — query/compare benchmark results from SQLite.
+- `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik.
 - `brokkr clean` — remove scratch temp files and verify output directories.
-- `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history (stored in `$XDG_DATA_HOME/brokkr/history.db`). Every brokkr invocation is recorded with timing, exit status, project, and git context. Works from any directory.
+- `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history.
+- `brokkr verify <command> [--dataset name]` — cross-validate against reference tools.
 
 ### brokkr.toml
 
@@ -82,7 +83,7 @@ No shell scripts remain. All development tooling is in `brokkr`.
 
 To generate a PBF with blob-level indexdata, use `cat`:
 ```
-brokkr run -- cat input.osm.pbf -o output-with-indexdata.osm.pbf
+brokkr cat input.osm.pbf -o output-with-indexdata.osm.pbf
 ```
 The passthrough path (no `--type`) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files. Planet (87 GB): 497s buffered, 520s `--direct-io` (+5% slower); Denmark (461 MB): 2.8s buffered (commit `69a127f`, plantasjen). Buffered wins for sequential single-file passthrough — `--direct-io` only helps with concurrent read/write (merge). The `--type` filtered path also embeds indexdata but does full decode+re-encode (OOMs on planet at 30 GB host).
 

@@ -25,7 +25,7 @@ brokkr bench commands <cmd> --profile
 1. brokkr creates FIFO: `mkfifo <scratch>/.sidecar-{pid}.fifo`
 2. Sidecar thread opens FIFO read end (blocking open is fine — instant since
    no writer yet). This guarantees a reader exists.
-3. brokkr spawns pbfhogg with `PBFHOGG_MARKER_FIFO` env var
+3. brokkr spawns pbfhogg with `BROKKR_MARKER_FIFO` env var
 4. pbfhogg's first `emit_marker` opens the write end with `O_NONBLOCK` — succeeds
    because the sidecar already has the read end open.
 
@@ -137,7 +137,7 @@ mkfifo <scratch>/.sidecar-{pid}.fifo
 The sidecar thread opens the read end BEFORE pbfhogg is spawned.
 pbfhogg receives the path via environment variable:
 ```
-PBFHOGG_MARKER_FIFO=<scratch>/.sidecar-{pid}.fifo
+BROKKR_MARKER_FIFO=<scratch>/.sidecar-{pid}.fifo
 ```
 
 ### FIFO fd caching in pbfhogg
@@ -156,7 +156,7 @@ static MARKER_FILE: OnceLock<Option<(File, Instant)>> = OnceLock::new();
 
 fn marker_state() -> Option<&'static (File, Instant)> {
     MARKER_FILE.get_or_init(|| {
-        let path = std::env::var("PBFHOGG_MARKER_FIFO").ok()?;
+        let path = std::env::var("BROKKR_MARKER_FIFO").ok()?;
         let f = std::fs::OpenOptions::new()
             .write(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -296,7 +296,7 @@ the child handle is always available and authoritative.
 
 1. brokkr creates the FIFO in scratch dir
 2. Sidecar thread opens FIFO read end (guarantees reader exists)
-3. Sets `PBFHOGG_MARKER_FIFO` in the pbfhogg child environment
+3. Sets `BROKKR_MARKER_FIFO` in the pbfhogg child environment
 4. Spawns pbfhogg (child handle retained)
 5. Sidecar loop: sample /proc, drain FIFO markers, buffer in memory
 6. Child exits (detected via child handle, not PID)

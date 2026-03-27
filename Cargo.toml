@@ -56,7 +56,7 @@ keywords = ["osm", "openstreetmap", "pbf", "protobuf", "gis"]
 categories = ["parser-implementations", "encoding", "science::geo"]
 
 [features]
-default = ["commands"]
+default = ["commands", "debug-logging"]
 geocode-reader = ["dep:s2"]
 commands = ["dep:serde_json", "dep:roaring", "geocode-reader"]
 debug-logging = []

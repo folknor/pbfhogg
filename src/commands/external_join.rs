@@ -844,15 +844,20 @@ fn stage4_assembly(
         blobs_decoded: 0,
     };
 
-    // Pipelined reader with decode_threads(1) — overlaps IO with single-thread
-    // decode. One decode thread limits cross-thread alloc/free churn from
-    // PrimitiveBlock construction (WireStringTable + group_ranges Boxes).
-    let reader = ElementReader::open(input, direct_io)?
-        .decode_threads(1);
+    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free churn.
+    // Pipelined reader with decode_threads(1) is 17% faster (383s vs 461s) but
+    // causes 27 GB peak anon RSS from cross-thread PrimitiveBlock allocation
+    // retention. Not safe on memory-constrained hosts.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(false);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+
     let mut writer = writer_from_header(
         output,
         compression,
-        reader.header(),
+        &header,
         true,
         overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
@@ -861,9 +866,16 @@ fn stage4_assembly(
     let mut slot_pos: u64 = 0;
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut block_count: u64 = 0;
+    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
+        batch.push(block);
 
         if batch.len() >= BATCH_SIZE {
             let batch_stats = assemble_batch(

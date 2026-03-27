@@ -361,147 +361,158 @@ fn stage2_node_join(
 
     debug_log!("  stage2: after bucket load, {}", crate::debug::rss_line());
 
-    // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
-    // per-block heap allocations (WireStringTable entries, group_ranges) that
-    // cause 25+ GB of allocator retention at Europe scale.
-    use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+    // P2b: Parallel node-only scan. IO thread reads blobs, dispatch thread fans
+    // out to rayon workers for parallel decompression + tuple extraction. Consumer
+    // merge-joins tuples in file order. Decompression buffers stay thread-local.
+    // See notes/p2b-parallel-tuples-spec.md.
+    use super::node_scanner::{NodeTuple, extract_node_tuples};
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(false);
+    blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    blob_reader.set_parse_indexdata(true); // re-enable for blob filter
 
     debug_log!("  stage2: reader open, {}", crate::debug::rss_line());
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
-    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                continue;
-            }
-        }
+    type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
+    type DecodedItem = (usize, crate::error::Result<Vec<NodeTuple>>);
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawItem>(16);
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
-        block_count += 1;
-        if block_count.is_multiple_of(1000) {
-            debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, {}", crate::debug::rss_line());
-        }
-
-        // Parse PrimitiveBlock wire format inline — extract only granularity,
-        // lat_offset, lon_offset, and PrimitiveGroup data. Skip string table.
-        let buffer: &[u8] = &decompressed;
-        let mut cursor = Cursor::new(buffer);
-        let mut granularity: i64 = 100;
-        let mut lat_offset: i64 = 0;
-        let mut lon_offset: i64 = 0;
-        // No fixed-size limit on groups — use Vec (typically 1 group per block).
-        let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            match (field, wire_type) {
-                (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; }
-                (2, WIRE_LEN) => {
-                    let data = cursor.read_len_delimited()?;
-                    let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                    group_starts.push((offset, data.len()));
-                }
-                #[allow(clippy::cast_possible_wrap)]
-                (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
-                (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
-                (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
-                _ => { cursor.skip_field(wire_type)?; }
-            }
-        }
-
-        for &(off, len) in &group_starts {
-            let group_data = &buffer[off..off + len];
-            let mut gcursor = Cursor::new(group_data);
-            let mut dense_data: Option<&[u8]> = None;
-            while let Some((field, wire_type)) = gcursor.read_tag()? {
-                if field == 2 && wire_type == WIRE_LEN {
-                    dense_data = Some(gcursor.read_len_delimited()?);
-                    break;
-                }
-                gcursor.skip_field(wire_type)?;
-            }
-
-            let Some(dd) = dense_data else { continue };
-            let dense = WireDenseNodes::parse(dd)?;
-
-            let mut ids = PackedSint64Iter::new(dense.id_data);
-            let mut lats = PackedSint64Iter::new(dense.lat_data);
-            let mut lons = PackedSint64Iter::new(dense.lon_data);
-            let mut cum_id: i64 = 0;
-            let mut cum_lat: i64 = 0;
-            let mut cum_lon: i64 = 0;
-
-            while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
-                cum_id += did;
-                cum_lat += dlat;
-                cum_lon += dlon;
-                let id = cum_id;
-                #[allow(clippy::cast_possible_truncation)]
-                let lat = ((lat_offset + granularity * cum_lat) / 100) as i32;
-                #[allow(clippy::cast_possible_truncation)]
-                let lon = ((lon_offset + granularity * cum_lon) / 100) as i32;
-
-                // Advance to the bucket that covers this node ID.
-                while id >= bucket_max_id {
-                    if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
-                        debug_log!(
-                            "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, {})",
-                            sorted_pairs.len(),
-                            crate::debug::rss_line(),
-                        );
+    std::thread::scope(|scope| -> Result<()> {
+        // IO thread: read blobs, filter to node blobs, assign contiguous seq numbers.
+        scope.spawn(move || {
+            let mut seq: usize = 0;
+            for blob_result in &mut blob_reader {
+                match blob_result {
+                    Ok(blob) => {
+                        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                            continue;
+                        }
+                        if let Some(idx) = blob.index() {
+                            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                                continue;
+                            }
+                        }
+                        if raw_tx.send((seq, Ok(blob))).is_err() {
+                            break;
+                        }
+                        seq += 1;
                     }
-                    bucket_idx += 1;
-                    let has = load_next_bucket(
-                        &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
-                        &mut bucket_max_id, node_buckets, range_size,
-                    )?;
-                    if !has {
-                        debug_log!("  node join: complete ({resolved_count} resolved)");
-                        return Ok(resolved_count);
+                    Err(e) => {
+                        drop(raw_tx.send((seq, Err(e))));
+                        break;
                     }
                 }
+            }
+        });
 
-                while pair_cursor < sorted_pairs.len()
-                    && sorted_pairs[pair_cursor].node_id < id
-                {
-                    pair_cursor += 1;
+        // Dispatch thread: receive raw blobs, spawn rayon decode tasks.
+        let dispatch_tx = decoded_tx.clone();
+        scope.spawn(move || {
+            let decode_threads = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(4);
+            let Ok(decode_pool) = rayon::ThreadPoolBuilder::new()
+                .num_threads(decode_threads)
+                .build()
+            else {
+                return;
+            };
+            for (seq, blob_result) in raw_rx {
+                let tx = dispatch_tx.clone();
+                decode_pool.spawn(move || {
+                    let result = blob_result.and_then(|blob| {
+                        // Thread-local decompress buffer: reused across blobs on this thread.
+                        thread_local! {
+                            static DBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+                        }
+                        DBUF.with_borrow_mut(|dbuf| {
+                            blob.decompress_into(dbuf)?;
+                            let mut tuples = Vec::new();
+                            extract_node_tuples(dbuf, &mut tuples)
+                                .map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
+                                ))?;
+                            Ok(tuples)
+                        })
+                    });
+                    drop(tx.send((seq, result)));
+                });
+            }
+        });
+        drop(decoded_tx);
+
+        // Consumer: reorder + merge-join.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<Vec<NodeTuple>>> =
+            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (seq, item) in decoded_rx {
+            reorder.push(seq, item);
+
+            while let Some(result) = reorder.pop_ready() {
+                let tuples = result?;
+
+                block_count += 1;
+                if block_count.is_multiple_of(1000) {
+                    debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, {}", crate::debug::rss_line());
                 }
 
-                while pair_cursor < sorted_pairs.len()
-                    && sorted_pairs[pair_cursor].node_id == id
-                {
-                    let entry = ResolvedEntry {
-                        slot_pos: sorted_pairs[pair_cursor].slot_pos,
-                        lat,
-                        lon,
-                    };
-                    let bucket = entry.slot_bucket(total_slots);
-                    entry.write_to(&mut entry_buf);
-                    if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
-                        writer.write_all(&entry_buf)?;
+                for &NodeTuple { id, lat, lon } in &tuples {
+                    // Advance to the bucket that covers this node ID.
+                    while id >= bucket_max_id {
+                        if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
+                            debug_log!(
+                                "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, {})",
+                                sorted_pairs.len(),
+                                crate::debug::rss_line(),
+                            );
+                        }
+                        bucket_idx += 1;
+                        let has = load_next_bucket(
+                            &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
+                            &mut bucket_max_id, node_buckets, range_size,
+                        )?;
+                        if !has {
+                            debug_log!("  node join: complete ({resolved_count} resolved)");
+                            return Ok(());
+                        }
                     }
-                    slot_buckets.entry_counts[bucket] += 1;
-                    resolved_count += 1;
-                    pair_cursor += 1;
+
+                    while pair_cursor < sorted_pairs.len()
+                        && sorted_pairs[pair_cursor].node_id < id
+                    {
+                        pair_cursor += 1;
+                    }
+
+                    while pair_cursor < sorted_pairs.len()
+                        && sorted_pairs[pair_cursor].node_id == id
+                    {
+                        let entry = ResolvedEntry {
+                            slot_pos: sorted_pairs[pair_cursor].slot_pos,
+                            lat,
+                            lon,
+                        };
+                        let bucket = entry.slot_bucket(total_slots);
+                        entry.write_to(&mut entry_buf);
+                        if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
+                            writer.write_all(&entry_buf)?;
+                        }
+                        slot_buckets.entry_counts[bucket] += 1;
+                        resolved_count += 1;
+                        pair_cursor += 1;
+                    }
                 }
             }
         }
-    }
 
-    debug_log!("  node join: complete ({resolved_count} resolved)");
+        debug_log!("  node join: complete ({resolved_count} resolved)");
+        Ok(())
+    })?;
 
     Ok(resolved_count)
 }

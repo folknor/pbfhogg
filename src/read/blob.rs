@@ -475,6 +475,12 @@ impl Blob {
         decompress_blob(&self.blob, None)
     }
 
+    /// Decompress into a caller-owned buffer (clear + refill).
+    /// Enables thread-local buffer reuse in parallel pipelines.
+    pub(crate) fn decompress_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+        decompress_parsed_blob_into(&self.blob, buf)
+    }
+
     /// Decompress with buffer pool reuse, without constructing a `PrimitiveBlock`.
     pub(crate) fn decompress_pooled(&self, pool: &Arc<DecompressPool>) -> Result<Bytes> {
         decompress_blob(&self.blob, Some(pool))

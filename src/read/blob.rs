@@ -566,7 +566,7 @@ pub struct BlobReader<R: Read + Send> {
     /// the reader evicts page cache pages behind the read head, preventing
     /// sequential reads from accumulating the entire file in RSS.
     /// Only set for buffered FileReader — O_DIRECT has no pages to evict.
-    #[cfg(feature = "linux-direct-io")]
+    #[cfg(target_os = "linux")]
     evict_fd: Option<std::os::unix::io::RawFd>,
 }
 
@@ -595,7 +595,7 @@ impl<R: Read + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
-            #[cfg(feature = "linux-direct-io")]
+            #[cfg(target_os = "linux")]
             evict_fd: None,
         }
     }
@@ -709,8 +709,15 @@ impl BlobReader<FileReader> {
     /// ```
     pub fn from_path<P: AsRef<Path>>(path: P) -> Result<Self> {
         let reader = FileReader::buffered(path.as_ref())?;
-        #[cfg(feature = "linux-direct-io")]
-        let evict_fd = Some(reader.raw_fd());
+        #[cfg(target_os = "linux")]
+        let evict_fd = Some({
+            use std::os::unix::io::AsRawFd;
+            match &reader {
+                FileReader::Buffered(r) => r.get_ref().as_raw_fd(),
+                #[cfg(feature = "linux-direct-io")]
+                FileReader::Direct(r) => r.raw_fd(),
+            }
+        });
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -718,7 +725,7 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
-            #[cfg(feature = "linux-direct-io")]
+            #[cfg(target_os = "linux")]
             evict_fd,
         })
     }
@@ -744,8 +751,17 @@ impl BlobReader<FileReader> {
     /// Open a file, selecting buffered or O_DIRECT based on the `direct` flag.
     pub fn open<P: AsRef<Path>>(path: P, direct: bool) -> Result<Self> {
         let reader = FileReader::open(path.as_ref(), direct)?;
-        #[cfg(feature = "linux-direct-io")]
-        let evict_fd = if direct { None } else { Some(reader.raw_fd()) };
+        #[cfg(target_os = "linux")]
+        let evict_fd = if direct { None } else {
+            Some({
+                use std::os::unix::io::AsRawFd;
+                match &reader {
+                    FileReader::Buffered(r) => r.get_ref().as_raw_fd(),
+                    #[cfg(feature = "linux-direct-io")]
+                    FileReader::Direct(r) => r.raw_fd(),
+                }
+            })
+        };
         Ok(BlobReader {
             reader,
             offset: Some(ByteOffset(0)),
@@ -753,7 +769,7 @@ impl BlobReader<FileReader> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
-            #[cfg(feature = "linux-direct-io")]
+            #[cfg(target_os = "linux")]
             evict_fd,
         })
     }
@@ -798,10 +814,12 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // pages for the consumed byte range are never accessed again. Advising
         // DONTNEED prevents sequential reads from accumulating the entire file
         // in RSS — critical for 30+ GB PBFs on memory-constrained hosts.
-        #[cfg(feature = "linux-direct-io")]
+        #[cfg(target_os = "linux")]
         if let Some(fd) = self.evict_fd
             && let Some(offset) = self.offset
         {
+            // posix_fadvise(fd, 0, offset, POSIX_FADV_DONTNEED)
+            // SAFETY: fd is valid (owned by FileReader in same struct), offset is in range.
             unsafe {
                 libc::posix_fadvise(
                     fd,
@@ -846,7 +864,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             header_buf: Vec::new(),
             parse_tagdata: false,
             parse_indexdata: true,
-            #[cfg(feature = "linux-direct-io")]
+            #[cfg(target_os = "linux")]
             evict_fd: None,
         })
     }

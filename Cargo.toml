@@ -62,8 +62,8 @@ commands = ["dep:serde_json", "dep:roaring", "geocode-reader"]
 debug-logging = []
 hotpath = ["hotpath/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc"]
-linux-direct-io = ["dep:libc"]
-linux-io-uring = ["dep:io-uring", "dep:libc"]
+linux-direct-io = []
+linux-io-uring = ["dep:io-uring"]
 
 [dependencies]
 protohoggr = { path = "../protohoggr" }
@@ -79,7 +79,7 @@ serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
 s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7", optional = true }
-libc = { version = "0.2.183", optional = true }
+libc = "0.2.183"
 
 
 [dev-dependencies]

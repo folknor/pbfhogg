@@ -75,7 +75,7 @@ impl IdSetDense {
                 let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
                 let range_start = if min_id > chunk_base { min_id - chunk_base } else { 0 };
                 let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
-                let range_end = if max_id < chunk_end { max_id - chunk_base } else { (CHUNK_SIZE as u64) << 3 - 1 };
+                let range_end = if max_id < chunk_end { max_id - chunk_base } else { ((CHUNK_SIZE as u64) << 3) - 1 };
 
                 // Check byte range for any set bits.
                 let start_byte = (range_start >> 3) as usize;

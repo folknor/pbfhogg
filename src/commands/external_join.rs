@@ -197,6 +197,8 @@ impl BucketWriters {
 /// Compact node coordinate tuple for cross-thread transfer.
 /// Used by the parallel node scanner to send only essential data through
 /// the channel — decompression buffers stay on the worker thread.
+/// Kept for P2b (parallel tuples, next cycle). See investigation doc.
+#[allow(dead_code)]
 #[derive(Clone, Copy)]
 struct NodeTuple {
     id: i64,
@@ -209,6 +211,7 @@ struct NodeTuple {
 /// This is the core of the node-only scanner, factored out so it can run on
 /// either the main thread (sequential) or rayon workers (parallel).
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[allow(dead_code)]
 fn extract_node_tuples(
     decompressed: &[u8],
     out: &mut Vec<NodeTuple>,
@@ -220,8 +223,7 @@ fn extract_node_tuples(
     let mut granularity: i64 = 100;
     let mut lat_offset: i64 = 0;
     let mut lon_offset: i64 = 0;
-    let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
-    let mut group_count: usize = 0;
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
@@ -229,10 +231,7 @@ fn extract_node_tuples(
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited()?;
                 let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                if group_count < 8 {
-                    group_starts[group_count] = (offset, data.len());
-                    group_count += 1;
-                }
+                group_starts.push((offset, data.len()));
             }
             (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
             (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
@@ -241,7 +240,7 @@ fn extract_node_tuples(
         }
     }
 
-    for &(off, len) in &group_starts[..group_count] {
+    for &(off, len) in &group_starts {
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
         let mut dense_data: Option<&[u8]> = None;
@@ -525,8 +524,8 @@ fn stage2_node_join(
         let mut granularity: i64 = 100;
         let mut lat_offset: i64 = 0;
         let mut lon_offset: i64 = 0;
-        let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
-        let mut group_count: usize = 0;
+        // No fixed-size limit on groups — use Vec (typically 1 group per block).
+        let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
@@ -534,10 +533,7 @@ fn stage2_node_join(
                 (2, WIRE_LEN) => {
                     let data = cursor.read_len_delimited()?;
                     let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                    if group_count < 8 {
-                        group_starts[group_count] = (offset, data.len());
-                        group_count += 1;
-                    }
+                    group_starts.push((offset, data.len()));
                 }
                 #[allow(clippy::cast_possible_wrap)]
                 (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
@@ -547,7 +543,7 @@ fn stage2_node_join(
             }
         }
 
-        for &(off, len) in &group_starts[..group_count] {
+        for &(off, len) in &group_starts {
             let group_data = &buffer[off..off + len];
             let mut gcursor = Cursor::new(group_data);
             let mut dense_data: Option<&[u8]> = None;

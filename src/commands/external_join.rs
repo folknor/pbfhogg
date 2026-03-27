@@ -368,7 +368,8 @@ fn stage2_node_join(
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(false);
-    let _ = blob_reader.next(); // skip header blob
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     blob_reader.set_parse_indexdata(true); // re-enable for blob filter
 
     debug_log!("  stage2: reader open, {}", crate::debug::rss_line());

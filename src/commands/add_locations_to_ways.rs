@@ -414,7 +414,8 @@ fn build_node_index_sparse(
     // See notes/cross-pipeline-optimization-plan.md.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
-    let _ = blob_reader.next(); // skip header blob
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
@@ -863,7 +864,8 @@ fn build_node_index_dense(
     // See notes/cross-pipeline-optimization-plan.md.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
-    let _ = blob_reader.next(); // skip header blob
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();

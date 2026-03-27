@@ -329,7 +329,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         // See notes/cross-pipeline-optimization-plan.md.
         let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, false)?;
         blob_reader.set_parse_indexdata(true);
-        let _ = blob_reader.next(); // skip header blob
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let decompress_pool = crate::blob::DecompressPool::new();
 
         for blob_result in &mut blob_reader {

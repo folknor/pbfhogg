@@ -6,8 +6,22 @@
 //! scale when using the pipelined reader.
 //!
 //! Used by:
-//! - External join stage 2 (merge-join with sorted bucket pairs)
+//! - External join stage 2 (inline variant for interleaved merge-join)
 //! - ALTW dense pass 1 (node index build)
+//! - ALTW sparse pass 1 (node index build)
+//!
+//! # Known limitations
+//!
+//! - **DenseNodes only.** Only parses PrimitiveGroup field 2 (DenseNodes). Non-dense
+//!   Node messages (field 1) are silently skipped. All modern PBF writers (osmium,
+//!   pbfhogg, Planetiler, osm2pgsql) use dense encoding exclusively. Pre-2012 PBFs
+//!   or hand-crafted test files may use non-dense nodes — those would produce missing
+//!   coordinates without error.
+//!
+//! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElemKind::Node` check)
+//!   relies on each blob containing exactly one element type, which is guaranteed by
+//!   `Sort.Type_then_ID`. Mixed-type blobs in unsorted PBFs could be mislabeled by
+//!   indexdata, causing nodes in a mislabeled blob to be skipped.
 //!
 //! See `notes/cross-pipeline-optimization-plan.md` for the full list of retrofit targets.
 

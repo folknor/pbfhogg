@@ -153,7 +153,7 @@ struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 /// - **Planet scale:** All intermediate data is held in RAM. Planet-scale builds
 ///   (>>64 GB) require streaming to temp files and external merge sort. This
 ///   implementation works for regional extracts (Denmark, Germany, etc.).
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let start_time = std::time::Instant::now();
@@ -321,12 +321,30 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut first_addr_lon_e7: i32 = 0;
 
     {
-        // Filter: nodes + ways, skip relations (already scanned in pass 1).
-        // Block-level pipelining with elements_skip_metadata() — we don't
-        // need version/timestamp/changeset/uid/user for any element.
-        let reader = ElementReader::from_path(&config.input_path)?;
-        reader.with_blob_filter(BlobFilter::new(true, true, false))
-            .for_each_block_pipelined(|block| {
+        // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
+        // retention (25+ GB at Europe/planet scale). The fused node+way scan
+        // needs full PrimitiveBlock (for tag access), so we can't use the
+        // node-only scanner here. But sequential decode keeps all alloc/free
+        // on one thread, bounding heap to ~1.6 GB.
+        // See notes/cross-pipeline-optimization-plan.md.
+        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, false)?;
+        blob_reader.set_parse_indexdata(true);
+        let _ = blob_reader.next(); // skip header blob
+        let decompress_pool = crate::blob::DecompressPool::new();
+
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
+            // Skip relation blobs (already scanned in pass 1).
+            if let Some(idx) = blob.index() {
+                if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                    continue;
+                }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = crate::block::PrimitiveBlock::new(decompressed)?;
             for element in block.elements_skip_metadata() {
                 match element {
                     Element::DenseNode(node) => {
@@ -486,8 +504,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                     _ => {} // Node (non-dense) — rare, ignore
                 }
             }
-            Ok(())
-        })?;
+        } // for blob_result
     }
 
     // Flush and drop writers before mmap

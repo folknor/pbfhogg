@@ -802,7 +802,6 @@ pub fn add_locations_to_ways(
 
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
 /// for parallel node index population.
-const INDEX_BATCH_SIZE: usize = 64;
 
 fn build_node_index(
     input: &Path,
@@ -990,28 +989,6 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
         crate::debug::rss_line(),
     );
     Ok(member_node_ids)
-}
-
-/// Parallel insert for one batch of blocks into the dense mmap index.
-/// Only inserts nodes present in `referenced` (way-referenced node IDs).
-fn index_batch_dense(
-    batch: &[PrimitiveBlock],
-    writer: &SharedDenseWriter,
-    referenced: &IdSetDense,
-) {
-    batch.par_iter().for_each(|block| {
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) if referenced.get(dn.id()) => {
-                    writer.insert(dn.id(), dn.decimicro_lat(), dn.decimicro_lon());
-                }
-                Element::Node(n) if referenced.get(n.id()) => {
-                    writer.insert(n.id(), n.decimicro_lat(), n.decimicro_lon());
-                }
-                _ => {}
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------

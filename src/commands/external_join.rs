@@ -756,11 +756,11 @@ fn stage4_assembly(
                 if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
                     // Check tagdata: empty keys = no tagged nodes in this blob.
                     let has_tags = blob.tag_index()
-                        .map_or(true, |ti| !ti.keys_empty());
+                        .is_none_or(|ti| !ti.keys_empty());
                     if !has_tags {
                         // Check if any node in this blob is a relation member.
                         let has_members = relation_member_node_ids
-                            .map_or(false, |ids| ids.any_in_range(idx.min_id, idx.max_id));
+                            .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
                         if !has_members {
                             skipped_node_blobs += 1;
                             // Node blobs don't contain ways, so slot_pos unchanged.

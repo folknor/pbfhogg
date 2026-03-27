@@ -73,7 +73,7 @@ impl IdSetDense {
             if let Some(chunk) = &self.chunks[cid] {
                 // Determine the bit range within this chunk.
                 let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
-                let range_start = if min_id > chunk_base { min_id - chunk_base } else { 0 };
+                let range_start = min_id.saturating_sub(chunk_base);
                 let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
                 let range_end = if max_id < chunk_end { max_id - chunk_base } else { ((CHUNK_SIZE as u64) << 3) - 1 };
 

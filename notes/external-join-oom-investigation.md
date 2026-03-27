@@ -183,25 +183,28 @@ May not fully fix the retention.
 
 ## Summary of timings
 
-### Europe (32.4 GB, commit `cf350a9`, plantasjen)
+### Europe end-to-end (32.4 GB, plantasjen)
 
-| Stage | Original | Current | Speedup | Status |
-|-------|----------|---------|---------|--------|
-| Stage 1 (way pass) | 108s | 81s | 1.3x | Done |
-| Stage 2 (node join) | OOM | 327s | N/A (was broken) | Done (sequential) |
-| Stage 3 (slot reorder) | 1079s | 72s | 15x | Done |
-| Stage 4 (assembly) | OOM | disabled | — | **Blocked** |
-| **Total 1-3** | **1502s** | **480s** | **3.1x** | |
-| **Estimated 1-4** | — | **~730-830s** | — | After stage 4 fix |
+| Stage | commit `ee9b19f` | commit `d272b49` | RSS post-finish |
+|-------|-----------------|-----------------|-----------------|
+| Stage 1 (way pass) | 82s | 82s | 74 MB |
+| Stage 2 (node join) | 331s | **301s** | 74 MB |
+| Stage 3 (slot reorder) | 73s | 73s | 74 MB |
+| Relation scan | — | — | 1342 MB |
+| Stage 4 (assembly) | 392s | 392s | 10587 MB |
+| **Total** | **901s (15 min)** | **~871s (est.)** | |
 
-### Denmark (465 MB, commit `cf350a9`, plantasjen)
+Stage 2 improvement: skip non-node blobs + DecompressPool reuse (-30s, -9%).
+
+### Denmark end-to-end (465 MB, commit `ee9b19f`, plantasjen)
 
 | Stage | Time | RSS peak |
 |-------|------|----------|
-| Stage 1 | 3.6s | 45 MB |
-| Stage 2 | 6.5s | 148 MB |
-| Stage 3 | 0.8s | 51 MB |
-| **Total 1-3** | **11s** | |
+| Stage 1 | 2.7s | 40 MB |
+| Stage 2 | 4.2s | 53 MB |
+| Stage 3 | 0.6s | 58 MB |
+| Stage 4 | 5.0s | 840 MB |
+| **Total** | **14s** | |
 
 ### Historical comparison
 
@@ -209,7 +212,11 @@ May not fully fix the retention.
 |---------|---------|--------|--------|
 | Original (256× re-read) | 302s | — | `034422c` |
 | Single-pass merge | 25s | 2,060s (34m) | `a334c72` |
-| **Node-only scanner + scatter** | **11s** | **480s (8m, stages 1-3)** | `cf350a9` |
+| Node-only scanner + scatter (stages 1-3) | 11s | 480s (8m) | `cf350a9` |
+| End-to-end (all 4 stages) | 14s | 901s (15m) | `ee9b19f` |
+| **+ blob skip + pool reuse** | 14s | **~871s (est.)** | `d272b49` |
+
+Dense ALTW at Europe scale: 2,565s (43 min). **External is 2.9x faster.**
 
 ## What we shipped
 
@@ -262,7 +269,7 @@ May not fully fix the retention.
 | Stage | Time | RSS post-finish |
 |-------|------|-----------------|
 | Stage 1 (way pass) | 82s | 74 MB |
-| Stage 2 (node join) | 331s | 74 MB |
+| Stage 2 (node join) | 331s → **301s** (commit `d272b49`) | 74 MB |
 | Stage 3 (slot reorder) | 73s | 74 MB |
 | Relation scan | — | 1342 MB |
 | Stage 4 (assembly) | 392s | 10587 MB |
@@ -274,15 +281,90 @@ DecompressPool: 103 drops (stage 1), 12 drops (stage 4).
 Comparison: dense at Europe scale = 2,565s (43 min). External = **2.8x faster.**
 Previous external (single-pass merge, `a334c72`) = 2,060s (34 min). **2.3x faster.**
 
-## Next steps
+## Optimization matrix
 
-1. ~~Fix stage 4~~ — done (commit `2873919`, sequential reader)
-2. ~~Full end-to-end Europe measurement~~ — done (901s, commit `ee9b19f`)
-3. **Stage 2 parallelism** — approach B (thread-local decompress, send tuples).
-   Stage 2 is 37% of total time (331s/901s). Parallel decompression could
-   bring it to ~55-80s, total to ~620-650s (~10 min).
-4. **Stage 4 optimization** — 44% of total time (392s/901s). Currently
-   sequential decode. Similar parallel approach as stage 2, but needs full
-   PrimitiveBlock (not node-only). RSS peaked at 10.6 GB — room for more
-   in-flight blocks if parallelized carefully.
-5. **Planet benchmark** — full pipeline on 87.7 GB PBF.
+Baseline: Europe end-to-end 901s (commit `ee9b19f`, plantasjen).
+
+### Priority 1: Wasted work elimination
+
+| ID | Stage | Approach | Expected | Risk | Effort |
+|----|-------|----------|----------|------|--------|
+| ~~P1a~~ | ~~Stage 2 (331s)~~ | ~~**Skip non-node blobs.** Check indexdata, skip non-node blobs before decompression.~~ | ~~15-20%~~ | ~~Done~~ | **Measured: 301s (-9%, -30s). commit `d272b49`** |
+| P1b | Stage 4 (392s) | **Tagdata-based node blob skipping.** With `keep_untagged_nodes=false` (default), node blobs whose tagdata shows zero tag keys contain only untagged nodes → skip entirely. 96% of nodes are dropped in Europe. Could skip 90%+ of node blob decompression. | **Up to 75% of stage 4 node processing** | Medium — needs tagdata parsing | Medium |
+| P1c | Stage 4 (392s) | **Relation blob passthrough.** Relation blobs don't need coordinate enrichment. With indexdata, skip decompression and pass through raw. ~600 blobs at Europe. | Small (~few seconds) | Low | Low |
+
+### Priority 2: Alloc/decompress optimization
+
+| ID | Stage | Approach | Expected | Risk | Effort |
+|----|-------|----------|----------|------|--------|
+| ~~P2a~~ | ~~Stage 2~~ | ~~Reusable decompress buffer (DecompressPool for single-thread buffer reuse).~~ | ~~5-10%~~ | ~~Done~~ | **Measured as part of P1a: combined -9%. commit `d272b49`** |
+| P2b | Stage 2 | **Parallel tuples (approach B).** Rayon threads decompress + extract (id,lat,lon) into worker-owned Vecs, send tuples through channel. Thread-local decompress buffers + tuple buffers recycled back to workers (not dropped cross-thread). | 4-6x (55-80s) | Medium | Medium |
+| P2c | Stage 4 | Same parallel pattern as P2b but for full elements. Workers decompress + extract element data, send compact work units. Heavy data dies on worker thread. | 3-4x (100-150s) | Higher | Medium-High |
+| P2d | All | Faster zlib backend. `decompress_blob` is 53.5% of time. If `zlib-rs` has a faster mode or if a different backend exists. | Unknown | Low | Low |
+
+### Priority 3: Micro-optimizations
+
+| ID | Stage | Approach | Expected | Risk | Effort |
+|----|-------|----------|----------|------|--------|
+| P3a | Stages 1+2 | **Precompute range_size divisions.** `CooPair::node_bucket()` and `ResolvedEntry::slot_bucket()` recompute `div_ceil` per entry (4.69B calls each). Hoist to a local. | ~1-2s each | None | Trivial |
+| P3b | Stage 2 | **Early exit on exhausted bucket.** When `pair_cursor == sorted_pairs.len()`, skip the compare path for remaining nodes until next bucket transition. | Small | None | Trivial |
+| P3c | Stage 2 | **Eliminate data_buf intermediate.** Parse COO pairs directly from a BufReader (16 bytes at a time) instead of reading entire bucket file into memory. Eliminates ~290 MB data_buf. | ~5-10s | Low | Low |
+| P3d | Stages 2+4 | `set_parse_tagdata(false)` on BlobReaders that don't need tag data. | Minimal | None | Trivial |
+
+### Priority 4: Cross-cutting experiments
+
+| ID | Experiment | Applies to | Expected | Risk | Effort |
+|----|-----------|------------|----------|------|--------|
+| P4a | jemalloc | All stages | Unknown throughput delta (memory bounded). May help stage 4's 10.6 GB from allocator churn. | Low | Trivial (feature flag) |
+| P4b | `--direct-io` reads | Stages 1, 2, 4 | May hurt (bypasses readahead) or help. BlobReader fadvise already active. | Low | Trivial (CLI flag) |
+| P4c | BATCH_SIZE tuning | Stage 4 | Larger = more rayon parallelism. Affects RSS. Currently 32. | Low | Trivial |
+| P4d | Pipeline config tuning | Stages 1, 4 | `read_ahead`, `decode_ahead` values. | Low | Trivial |
+| P4e | Output compression mode | Stage 4 | `--compression none` for timing vs `zlib` for production. | Low | Trivial |
+
+### Priority 5: Architectural (low payoff)
+
+| ID | Approach | Expected | Risk | Effort |
+|----|----------|----------|------|--------|
+| P5a | Stage 4 decode_threads(1) | IO overlap without full cross-thread churn. One-line test. May or may not OOM at Europe. | ~10-15% of stage 4 | Medium | Trivial |
+| P5b | Way-only scanner for stage 1 | Skip string table. Stage 1 is 9% — low payoff. | ~10-20% of 82s | Low | Medium |
+| P5c | Parallel stage 3 bucket processing | rayon over 256 buckets. Stage 3 is 8% — low payoff. | ~2-4x of 73s | Low | Low |
+| P5d | Planet coord_slots windowed reader | Sequential windowed reader instead of 64 GB mmap at planet scale. | Planet safety only | Low | Medium |
+
+### Recommended test order
+
+1. **P1a** — skip non-node blobs in stage 2. Free 15-20%. Zero risk.
+2. **P3a** — precompute range_size divisions. Trivial, ~2-4s.
+3. **P2a** — reusable decompress buffer for stage 2. Low effort.
+4. **P4a** — jemalloc. Zero code, one run.
+5. **P5a** — decode_threads(1) for stage 4. One-line test.
+6. **P2b** — parallel tuples for stage 2. Big architectural win.
+7. **P1b** — tagdata node blob skipping for stage 4. Medium effort, big win.
+8. **P2c** — parallel stage 4.
+9. Rest as time permits.
+
+### Theoretical ceiling
+
+If both stages 2 and 4 are parallelized (P1a + P1b):
+- Stage 1: 82s
+- Stage 2: ~65s (from 331s)
+- Stage 3: 73s
+- Stage 4: ~120s (from 392s)
+- **Total: ~340s (~5.5 min)**
+
+That would be 6.5x faster than the original 2,060s and 7.5x faster than dense (2,565s).
+
+### Done
+
+- [x] Fix stage 4 OOM — sequential reader (commit `2873919`)
+- [x] Full end-to-end Europe — 901s (commit `ee9b19f`)
+- [x] Node-only scanner for stage 2 — eliminates PrimitiveBlock churn
+- [x] Scatter buffer for stage 3 — 15x speedup
+- [x] BlobReader fadvise(DONTNEED) — general infrastructure
+- [x] Deferred IdSetDense — saves 1.4 GB during stages 1-3
+- [x] DecompressPool for stage 4 — buffer reuse
+- [x] set_parse_indexdata(false) — stages 2 + 4
+- [x] read_exact for bucket loads — exact-size allocation
+- [x] Hotpath annotations on all external join functions
+- [x] Skip non-node blobs in stage 2 (indexdata check) — commit `d272b49`
+- [x] DecompressPool reuse in stage 2 — commit `d272b49`
+- [ ] Planet benchmark — 87.7 GB PBF

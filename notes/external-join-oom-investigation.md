@@ -299,7 +299,7 @@ Baseline: Europe end-to-end 901s (commit `ee9b19f`, plantasjen).
 | ID | Stage | Approach | Expected | Risk | Effort |
 |----|-------|----------|----------|------|--------|
 | ~~P1a~~ | ~~Stage 2 (331s)~~ | ~~**Skip non-node blobs.** Check indexdata, skip non-node blobs before decompression.~~ | ~~15-20%~~ | ~~Done~~ | **Measured: 301s (-9%, -30s). commit `d272b49`** |
-| P1b | Stage 4 (461s) | **Tagdata-based node blob skipping.** Skip node blobs with empty tagdata + no relation member nodes. 96% of nodes dropped. | **Up to 75% of stage 4 node decode** | **BLOCKED** | **Requires tagdata in PBF. Current Europe PBF (passthrough `cat`) has indexdata but no tagdata. Needs regeneration via `cat --type` (~5-8 min Europe, OOMs at planet on 30 GB host). Code implemented, ready to test on tagdata-enabled PBF.** |
+| ~~P1b~~ | ~~Stage 4 (461s)~~ | ~~Tagdata node blob skipping.~~ | ~~75%~~ | ~~Done~~ | **Zero blobs skipped. The 96% drop rate is per-node, not per-blob. 149M tagged nodes are spread across 464K blobs (~320 tagged/blob). Nearly every node blob has some tags → tagdata non-empty → can't skip. Wrong granularity.** |
 | P1c | Stage 4 (392s) | **Relation blob passthrough.** Relation blobs don't need coordinate enrichment. With indexdata, skip decompression and pass through raw. ~600 blobs at Europe. | Small (~few seconds) | Low | Low |
 
 ### Priority 2: Alloc/decompress optimization

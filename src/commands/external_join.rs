@@ -414,15 +414,27 @@ fn stage2_node_join(
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
+    // Single-thread pool for decompression buffer reuse.
+    let decompress_pool = crate::blob::DecompressPool::new();
+
+    // Re-enable indexdata parsing so we can skip non-node blobs.
+    blob_reader.set_parse_indexdata(true);
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
+        // Skip non-node blobs using indexdata. Stage 2 only needs nodes —
+        // decompressing way/relation blobs (~50% of file) is pure waste.
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                continue;
+            }
+        }
 
-        // Decompress without constructing PrimitiveBlock (no string table alloc).
-        let decompressed = blob.decompress_raw()?;
+        // Decompress with buffer reuse (no PrimitiveBlock construction).
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
 
         block_count += 1;
         if block_count.is_multiple_of(1000) {

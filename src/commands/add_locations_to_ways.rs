@@ -409,25 +409,39 @@ fn build_node_index_sparse(
     offsets.reserve(initial_chunks);
     start_pad.reserve(initial_chunks);
 
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_nodes());
+    // Node-only sequential scanner: bypasses PrimitiveBlock construction to avoid
+    // cross-thread alloc/free retention (25+ GB at Europe/planet scale).
+    // See notes/cross-pipeline-optimization-plan.md.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let _ = blob_reader.next(); // skip header blob
+
+    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
 
     let mut block_count: u64 = 0;
     #[cfg(feature = "debug-logging")]
     let mut stored_nodes: u64 = 0;
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                continue;
+            }
+        }
+
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        tuples.clear();
+        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples)?;
+
         block_count += 1;
-        for element in block.elements_skip_metadata() {
-            let (id, lat, lon) = match &element {
-                Element::DenseNode(dn) if referenced.get(dn.id()) => {
-                    (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
-                }
-                Element::Node(n) if referenced.get(n.id()) => {
-                    (n.id(), n.decimicro_lat(), n.decimicro_lon())
-                }
-                _ => continue,
-            };
+        for &super::node_scanner::NodeTuple { id, lat, lon } in &tuples {
+            if !referenced.get(id) {
+                continue;
+            }
 
             if id < 0 {
                 continue;

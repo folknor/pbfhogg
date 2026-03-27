@@ -276,7 +276,11 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 ### add-locations-to-ways
 
-Embed node coordinates in ways. Two index strategies: `dense` (default, direct-mapped mmap, fastest when working set fits in RAM) and `sparse` (Planetiler-inspired chunk-indexed array with batched sorted lookups, memory-bounded for planet on low-RAM hosts).
+Embed node coordinates in ways. Three index strategies:
+
+- **dense** (default) — Direct-mapped mmap array. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires ~30+ GB free memory to avoid page cache thrashing.
+- **sparse** — Planetiler-inspired chunk-indexed sparse array. Bounded memory (~540 MB). Slower than dense at all scales. No temp disk needed. Works on any PBF.
+- **external** — Double radix permutation via 4-stage pipeline. Bounded memory (~1.6 GB). 2.8x faster than dense at Europe scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~224 GB at planet.
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -287,7 +291,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `--index-type <TYPE>` | Node index type: `dense` (default, fast when data fits in RAM) or `sparse` (Planetiler-inspired, memory-bounded for planet on low-RAM hosts) |
+| `--index-type <TYPE>` | Node index type: `dense` (default), `sparse`, or `external` |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |

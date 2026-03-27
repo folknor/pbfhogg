@@ -61,6 +61,31 @@ impl Default for PipelineConfig {
 ///
 /// The closure runs on the calling thread and may hold mutable state.
 /// PBF ordering (nodes → ways → relations) is preserved.
+///
+/// # Memory warning: cross-thread PrimitiveBlock retention
+///
+/// Each `PrimitiveBlock` allocates `WireStringTable::entries` (~10 KB) and
+/// `group_ranges` (~8 bytes) on a rayon decode thread. The consumer drops
+/// them on the calling thread. Neither glibc nor jemalloc returns these
+/// freed pages to the OS promptly — they accumulate as anonymous RSS.
+///
+/// At 400K+ blocks (Europe/planet scale), this causes **25+ GB of heap
+/// retention** that the allocator holds as "free but mapped" memory.
+/// This was measured and verified across glibc, jemalloc, and multiple
+/// `MALLOC_ARENA_MAX` configurations.
+///
+/// **Mitigation patterns:**
+/// - **Sequential reader**: use `BlobReader` directly instead of this
+///   pipeline. All alloc/free on one thread. Used by external join stages 2+4.
+/// - **Node-only scanner**: use `commands::node_scanner::extract_node_tuples`
+///   to bypass PrimitiveBlock entirely. Zero per-block heap allocations.
+///   Used by external join stage 2 and ALTW dense/sparse pass 1.
+/// - **Batch-based consumers** (e.g., `for_each_primitive_block_batch` with
+///   `par_iter`) are partially mitigated because the batch processes blocks
+///   on the consumer's rayon pool, reducing the cross-thread window.
+///
+/// See `notes/external-join-oom-investigation.md` and
+/// `notes/cross-pipeline-optimization-plan.md` for the full analysis.
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]

@@ -214,9 +214,11 @@ Stage 2 improvement: skip non-node blobs + DecompressPool reuse (-30s, -9%).
 | Single-pass merge | 25s | 2,060s (34m) | `a334c72` |
 | Node-only scanner + scatter (stages 1-3) | 11s | 480s (8m) | `cf350a9` |
 | End-to-end (all 4 stages) | 14s | 901s (15m) | `ee9b19f` |
-| **+ blob skip + pool reuse** | 14s | **~871s (est.)** | `d272b49` |
+| + blob skip + pool reuse | 14s | ~871s (est.) | `d272b49` |
+| Full baseline (measured) | 14s | 930s | post-`d272b49` |
+| **+ decode_threads(1) stage 4** | 14s | **~834s (est.)** | pending commit |
 
-Dense ALTW at Europe scale: 2,565s (43 min). **External is 2.9x faster.**
+Dense ALTW at Europe scale: 2,565s (43 min). **External is ~3.1x faster.**
 
 ## What we shipped
 
@@ -272,8 +274,8 @@ Dense ALTW at Europe scale: 2,565s (43 min). **External is 2.9x faster.**
 | Stage 2 (node join) | 331s → **301s** (commit `d272b49`) | 74 MB |
 | Stage 3 (slot reorder) | 73s | 74 MB |
 | Relation scan | — | 1342 MB |
-| Stage 4 (assembly) | 392s | 10587 MB |
-| **Total** | **901s (15 min)** | |
+| Stage 4 (assembly) | 392s → **383s** (decode_threads(1)) | 10587 MB → **1804 MB** |
+| **Total** | **~834s (est.)** | |
 
 Output: 3.7B nodes read, 149M written, 454M ways, 8.2M relations, 0 missing.
 DecompressPool: 103 drops (stage 1), 12 drops (stage 4).
@@ -325,7 +327,7 @@ Baseline: Europe end-to-end 901s (commit `ee9b19f`, plantasjen).
 
 | ID | Approach | Expected | Risk | Effort |
 |----|----------|----------|------|--------|
-| P5a | Stage 4 decode_threads(1) | IO overlap without full cross-thread churn. One-line test. May or may not OOM at Europe. | ~10-15% of stage 4 | Medium | Trivial |
+| ~~P5a~~ | ~~Stage 4 decode_threads(1)~~ | ~~IO overlap without full cross-thread churn.~~ | ~~10-15%~~ | ~~Done~~ | **Measured: 383s (-17%, -78s). RSS 1.8 GB (was 11.8 GB).** |
 | P5b | Way-only scanner for stage 1 | Skip string table. Stage 1 is 9% — low payoff. | ~10-20% of 82s | Low | Medium |
 | P5c | Parallel stage 3 bucket processing | rayon over 256 buckets. Stage 3 is 8% — low payoff. | ~2-4x of 73s | Low | Low |
 | P5d | Planet coord_slots windowed reader | Sequential windowed reader instead of 64 GB mmap at planet scale. | Planet safety only | Low | Medium |
@@ -367,4 +369,10 @@ That would be 6.5x faster than the original 2,060s and 7.5x faster than dense (2
 - [x] Hotpath annotations on all external join functions
 - [x] Skip non-node blobs in stage 2 (indexdata check) — commit `d272b49`
 - [x] DecompressPool reuse in stage 2 — commit `d272b49`
+- [x] Precomputed slot_range_size — **regression** (+24s), reverted
+- [x] Tuple intermediary (extract_node_tuples) — **regression** (+11s), reverted for sequential path. Function kept for parallel version.
+- [x] jemalloc — no throughput difference on sequential path
+- [x] decode_threads(1) for stage 4 — 461s → 383s (-17%), anon RSS 1.6 GB flat (was 11.8 GB)
+- [x] decode_threads(2) tested — 320s but 27 GB peak anon. Unsafe for planet. Rejected.
+- [x] Periodic RSS logging confirmed decode_threads(1) anon=1574 MB flat for 520K blocks
 - [ ] Planet benchmark — 87.7 GB PBF

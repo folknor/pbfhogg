@@ -1,328 +1,267 @@
-# External join OOM investigation — Europe scale
+# External join optimization — Europe scale
 
 ## Setup
 - Europe PBF: 32.4 GB, 4.69B way-node refs, 256 buckets
-- Host: 32 GB RAM, ~25 GB free
+- Host: 32 GB RAM, ~25 GB free (plantasjen)
 - External join: 4 stages (way pass, node join, slot reorder, assembly)
-- Stage 2 (node join) OOM killed every time at bucket 16/256
 
-## Investigation timeline
+## The four stages
+
+### Stage 1: Way pass
+Scan all way blobs via pipelined reader. For each way, emit (node_id, slot_pos)
+COO pairs into 256 node buckets partitioned by high bits of node_id. Output:
+56 GB of bucket files on disk. BufWriter per bucket (256 KB buffers).
+
+### Stage 2: Node join
+Read all PBF node blobs. For each node, merge-join with the matching bucket's
+sorted COO pairs. Emit resolved (slot_pos, lat, lon) entries into 256 slot
+buckets partitioned by high bits of slot_pos.
+
+### Stage 3: Slot reorder
+Read slot buckets in order. For each bucket, scatter entries by position into
+a dense buffer, then write the buffer sequentially to the coord_slots file.
+
+### Stage 4: Assembly
+Read the full PBF. For each element, look up way-node coordinates from
+coord_slots. Write enriched PBF with node locations embedded in ways.
+
+## OOM investigation timeline
 
 ### Phase 1: Assumed page cache problem
 
-Initial RSS logging showed stage 2 hitting 21+ GB RSS. We assumed this was
-page cache from PBF reads + bucket write dirty pages.
+Initial RSS logging showed stage 2 hitting 21+ GB RSS. Assumed page cache.
 
-**Attempted fixes (all failed to prevent OOM):**
+**Attempted fixes (all failed to prevent stage 2 OOM):**
 
-1. **Periodic flush+fadvise(DONTNEED) on bucket writes** — fadvise only evicts
-   clean pages; dirty pages from recent writes survive. No effect on RSS.
-
-2. **sync_data() before fadvise** — works (stage 1 post-finish: 73 MB) but
-   256 fdatasync calls × 220 cycles = **4.4x throughput penalty** (108s → 474s).
-   Unacceptable.
-
-3. **BlobReader fadvise(DONTNEED) after each blob read** — general infrastructure
-   improvement (commit `4ab6976`). Evicts PBF read pages behind read head.
-   Stage 1 post-finish dropped to 46 MB. But stage 2 RSS grew identically —
-   freeing read pages just let kernel fill that space with more dirty write pages.
-
-4. **sync_file_range(SYNC_FILE_RANGE_WRITE) for async writeback** — non-blocking
-   writeback hint. Zero effect on stage 2 RSS growth.
-
-5. **O_DIRECT for bucket writes (DirectWriter)** — bypasses page cache entirely.
-   **Zero effect.** Same linear RSS growth.
+| Fix | Effect | Why it failed |
+|-----|--------|---------------|
+| Periodic flush+fadvise(DONTNEED) on bucket writes | No RSS change | fadvise only evicts clean pages; dirty pages survive |
+| sync_data() before fadvise | Works (73 MB post-finish) | 4.4x throughput penalty (108s → 474s) |
+| BlobReader fadvise after each blob read | Stage 1 post-finish: 46 MB | Stage 2 still OOM — freed read pages filled by write dirty pages |
+| sync_file_range(SYNC_FILE_RANGE_WRITE) async writeback | Zero effect | Async writeback not completing before next cycle |
+| O_DIRECT for bucket writes (DirectWriter) | Zero effect | Same linear RSS growth |
 
 ### Phase 2: RssAnon/RssFile breakdown
 
-Added `/proc/self/status` parsing to distinguish anonymous heap from file-backed
-pages. Result:
+Added `/proc/self/status` parsing. **file=4MB throughout.** ALL 24+ GB was
+anonymous heap. Every page cache fix was targeting the wrong problem.
 
-```
-stage2: 28000 blocks, rss=23966MB anon=23962MB file=4MB
-```
-
-**file=4MB throughout.** ALL 24+ GB is anonymous heap, not page cache.
-Every page cache fix was targeting the wrong problem.
-
-### Phase 3: Allocator theory
-
-Sent findings to reviewers. Consensus: glibc malloc arena retention from
-cross-thread alloc/free (IO thread allocates → rayon threads free).
-
-**Tests:**
+### Phase 3: Allocator theory (disproved)
 
 | Test | Stage 2 RSS growth | Result |
 |------|-------------------|--------|
 | `MALLOC_ARENA_MAX=2` | Same linear growth | No help |
-| `MALLOC_ARENA_MAX=1` | Same growth (delayed start, reuses stage 1 arena) | No help |
+| `MALLOC_ARENA_MAX=1` | Same (delayed start, reuses stage 1 arena) | No help |
 | jemalloc (`--features jemalloc`) | Same linear growth | No help |
 
-**Conclusion: NOT allocator arena retention.** Three different allocator configs
-produce identical growth. This is a real memory issue in application code.
+NOT allocator arena retention. Three different allocator configs produce
+identical growth.
 
 ### Phase 4: Binary search for the leak
 
-**Test 1: Skip all node processing (`continue` in block loop)**
-```rust
-for block in reader.into_blocks_pipelined() {
-    let block = block?;
-    continue; // skip everything
-}
-```
-Result: **RSS flat at 383 MB** through 68K blocks. Pipeline is NOT leaking.
+| Test | RSS | Conclusion |
+|------|-----|------------|
+| `continue` before element loop (skip everything) | 383 MB flat | Pipeline NOT leaking |
+| Iterate elements + extract id/lat/lon, skip merge-join | 478 MB → 25168 MB, plateaued | Leak in element iteration |
+| Full merge-join, disable writes | Same growth | Writes not the problem |
+| Buffer reuse in load_coo_bucket | Same growth | Bucket loading not the problem |
+| DecompressPool full-drops counter | 52 drops / 464K blocks | Pool NOT the problem |
 
-**Test 2: Full merge-join but skip slot bucket writes**
-```rust
-// commented out: writer.write_all(&entry_buf) and entry_counts increment
-```
-Result: **Same linear growth.** 22+ GB at bucket 16. Writes are not the problem.
+### Root cause
 
-**Conclusion:** The leak is NOT in bucket loading (buffer reuse had zero effect).
+PrimitiveBlock construction allocates per-block on rayon decode threads:
+- `WireStringTable::entries: Box<[(u32, u32)]>` (~100-1000 entries)
+- `WireBlock::group_ranges: Box<[(u32, u32)]>` (~1-4 entries)
+- `into_boxed_slice()` reallocs (Vec→Box, freeing Vec overallocation)
 
-### Phase 5: Further bisection (element iteration)
-
-**Test: skip everything (`continue` before element loop)**
-Result: 383 MB flat through 464K blocks. Pipeline + DecompressPool NOT leaking.
-
-**Test: iterate elements + extract id/lat/lon, skip ALL merge-join logic**
-Result: 478 MB → 25168 MB over 464K blocks, then PLATEAUED. Completed.
-
-**Test: full merge-join, disable slot bucket writes only**
-Result: same growth. Writes not the problem.
-
-**Test: buffer reuse in load_coo_bucket (clear+refill instead of new Vecs)**
-Result: same growth. Bucket loading not the problem.
-
-**Conclusion:** The leak is triggered by element iteration itself. Calling
-`block.elements_skip_metadata()` and iterating DenseNode elements causes
-~54 KB/block of anonymous heap retention. The plateau proves it's not a
-logical leak — the allocator eventually reuses freed memory.
-
-### Phase 6: Allocator and pool diagnostics
-
-**DecompressPool full-drops counter:** 52 drops across 464K blocks (stage 1).
-Only 104 MB of pool churn. Pool is NOT the problem.
-
-**MALLOC_ARENA_MAX=1:** Same growth, but stage 1 memory didn't drop at finish()
-(single arena can't reclaim as effectively). Stage 2 flat for first 9K blocks
-(reusing stage 1's arena space), then grew.
-
-**jemalloc (--features jemalloc):** Same growth. jemalloc's dirty_decay not
-returning pages fast enough. Or MADV_FREE pages still count as RssAnon.
-
-## Root cause analysis
-
-Every PrimitiveBlock construction (in rayon decode threads) allocates:
-1. `WireStringTable::entries: Box<[(u32, u32)]>` — ~100-1000 entries × 8 bytes
-2. `WireBlock::group_ranges: Box<[(u32, u32)]>` — ~1-4 entries × 8 bytes
-3. `into_boxed_slice()` reallocs (Vec→Box, freeing Vec overallocation)
-
-These are allocated on rayon decode threads, freed on the consumer thread
-when PrimitiveBlock is dropped. Cross-thread alloc/free with varying sizes
-causes allocator fragmentation that neither glibc nor jemalloc resolves:
-- glibc: holds freed pages in per-thread arenas
-- jemalloc: marks MADV_FREE (still counts as RssAnon without pressure)
-
+Allocated on rayon threads, freed on consumer thread (cross-thread).
+Neither glibc nor jemalloc returns the physical pages to the OS fast enough.
 464K blocks × ~54 KB retained/block = ~25 GB peak before plateau.
 
-The full merge-join OOMs at 27 GB because it adds ~2 GB of live data
-(sorted_pairs, writes) on top of the ~25 GB retained free pages.
+The plateau proves it's not a logical leak — the allocator eventually reuses
+freed memory. But the full merge-join OOMs at 27 GB because it adds ~2 GB
+of live data on top.
 
-## Growth pattern
+## Current implementation (commit `cf350a9`)
 
-~0.8 GB per 1000 blocks in stage 2. All anonymous heap (RssFile=4MB).
-Plateaus at ~25 GB after ~400K blocks (allocator free lists saturate).
-16 buckets processed before OOM at 25-27 GB in full merge-join.
+### Stage 1: Way pass — pipelined reader + BufWriter buckets
+- **Time:** 81s (Europe)
+- **RSS:** ~11 GB peak (write cache), 114 MB post-finish
+- **Implementation:** Standard pipelined `ElementReader` with `BlobFilter::only_ways()`.
+  BufWriter per bucket. `sync_data+fadvise` in `finish()` for stage boundary cleanup.
 
-## Proposed fixes (to be tested)
+**Tested permutations:**
 
-**Approach A — Reuse WireBlock allocations:** Thread-local reusable Vecs
-for string table entries and group_ranges in the decode path. Eliminates
-per-block alloc/free churn.
+| Variant | Time | RSS peak | Notes |
+|---------|------|----------|-------|
+| BufWriter (current) | 81s | ~11 GB | Dirty write pages in kernel cache |
+| DirectWriter (O_DIRECT) | 108s | ~11 GB | Same RSS (was heap, not page cache) |
 
-**Approach B — Node-only scanner:** Bypass PrimitiveBlock entirely for
-stage 2. Decompress blob, walk wire format directly for dense node
-id/lat/lon. Skips string table parsing, group range collection, UTF-8
-validation. Zero per-block heap allocations beyond the decompression buffer.
+DirectWriter was slower and didn't help RSS. Reverted to BufWriter.
 
-Key code paths for both approaches:
-- `decompress_blob()` in blob.rs (already decoupled from PrimitiveBlock)
-- `WireBlock::parse()` in wire.rs (the allocation site)
-- `WireDenseNodes::parse()` in wire.rs (zero-alloc, borrows from buffer)
-- `DenseNodeIter` in dense.rs (zero-alloc, maintains delta accumulators)
-- `PackedSint64Iter` in protohoggr (varint decoder, stack-based)
+**Untested permutations:**
+- `--direct-io` for PBF reads (may help RSS if combined with BlobReader fadvise)
+- jemalloc (throughput comparison, not memory — memory is bounded by finish())
 
-## What we kept
+### Stage 2: Node join — sequential node-only scanner
+- **Time:** 327s (Europe), 6s (Denmark)
+- **RSS:** 1405 MB stable through 522K blocks, 114 MB post-finish
+- **Implementation:** Sequential `BlobReader` + `decompress_raw()` + inline wire
+  format parsing. No `PrimitiveBlock`, no string table, no `WireBlock`, no
+  `Box<[...]>` allocations. Delta-decodes id/lat/lon from `PackedSint64Iter`.
 
-- **BlobReader fadvise(DONTNEED)** — commit `4ab6976`. General infrastructure
-  improvement. Stage 2 RSS 383 MB with pipeline-only drain proves it works.
-- **Deferred IdSetDense** — saves 1.4 GB during stages 1-3.
-- **sync_data+fadvise in finish()** — effective at stage boundaries.
-- **RSS logging with anon/file breakdown** — essential for diagnosis.
-- **O_DIRECT bucket writes** — reverted to BufWriter (not the problem).
-- **Buffer reuse in load_coo_bucket/load_resolved_bucket** — implemented
-  but not the fix. Keep anyway (good practice, helps stage 3).
+**Tested permutations:**
 
-## Approach B results: Node-only scanner
+| Variant | Time | RSS | Notes |
+|---------|------|-----|-------|
+| Pipelined PrimitiveBlock (original) | — | OOM at 27 GB | Cross-thread alloc/free |
+| Sequential node-only scanner (current) | 327s | 1405 MB | Single-threaded zlib decompression |
+| Pipelined node-only scanner | — | OOM at 23 GB | DecompressPool cross-thread pattern |
+| Element iteration only (no merge-join) | — | 25 GB plateau | Proves it's PrimitiveBlock, not merge-join |
 
-Replaced `into_blocks_pipelined` + `PrimitiveBlock` in stage 2 with sequential
-`BlobReader` + `decompress_raw()` + inline wire format parsing. No string table,
-no `WireBlock`, no `Box<[...]>` allocations.
+**Correctness:** Denmark output verified identical to dense index (0 diffs).
 
-**Denmark results:**
-- Stage 2: 142 MB peak RSS, 39 MB post-finish. 6033ms.
-- Element counts match dense exactly (3513255 nodes, 6616526 ways, 46103 relations)
-- Diff: 0 differences (byte-identical output)
+**Bottleneck analysis:** 327s is single-threaded zlib decompression of ~25 GB
+of compressed node data at ~80 MB/s. At the CPU ceiling — no algorithmic
+improvement possible, only parallelism.
 
-**Europe results (in progress):**
-- Stage 2: 1376 MB stable through 522K blocks (4.69B nodes resolved). 353s.
-- Post-stage2: 84 MB.
-- Stage 3+ in progress.
+**Proposed improvements (from reviewer consensus):**
 
-The node-only scanner eliminates the 25 GB heap retention completely. RSS stays
-flat because there are no per-block heap allocations — only the reusable
-decompression buffer and the bucket load Vecs.
+| Approach | Description | Expected | Risk |
+|----------|-------------|----------|------|
+| A: IO overlap | IO thread reads, consumer decompresses+parses | ~5-15% gain | Low |
+| B: Parallel tuples | Rayon threads decompress + extract (id,lat,lon) tuples, send tuples through channel | 4-6x (55-80s) | Medium — new channel/ordering boundary |
+| C: Consumer-side pool | Rayon sends compressed blobs, consumer decompresses | Same as sequential | N/A |
+| D: Accept 327s | Move to stage 4 | — | — |
 
-**Europe full run (stages 1-4):** Stage 4 OOM killed. Same PrimitiveBlock
-churn as stage 2 but now with 1380 MB IdSetDense on top. Stage 4 uses the
-standard pipelined assembly path (shared with dense/sparse ALTW). Fix
-independently via sequential iteration or decode_threads(1).
+**Reviewer consensus:** Fix stage 4 first. The pattern that fixes stage 4
+(sequential read + batch parallel encode) likely transfers to stage 2.
 
-## Test matrix — stages 1-3 permutations
+### Stage 3: Slot reorder — scatter buffer
+- **Time:** 72s (Europe), 810ms (Denmark)
+- **RSS:** 114 MB stable
+- **Implementation:** For each bucket, allocate zeroed buffer covering the
+  bucket's slot range (~146 MB at Europe scale). Scatter entries by position
+  (no sort). Write entire buffer via `write_all`. Buffer reused across buckets.
 
-Stage 4 disabled (early exit after stage 3) while testing optimization
-strategies for stages 1-3.
+**Previous implementation:** 4.69B individual `pwrite64` calls (8 bytes each).
+~938s of pure syscall overhead. **15x speedup** from scatter buffer.
 
-Baseline from the full Europe run above:
-- Stage 1: 108s (way pass, BufWriter buckets)
-- Stage 2: 315s (node-only scanner, sequential BlobReader)
-- Stage 3: 1079s (slot reorder, pwrite per entry)
-- Total stages 1-3: ~1502s (~25 min)
+**Tested permutations:**
 
-### Stage 1 permutations (way pass → bucket writes)
+| Variant | Time | Notes |
+|---------|------|-------|
+| pwrite per entry (original) | 1079s | 4.69B syscalls |
+| Scatter buffer (current) | 72s | 256 write_all calls, no sort |
 
-| # | Read path | Write path | Expected effect |
-|---|-----------|------------|-----------------|
-| A1 | pipelined (current) | BufWriter (current) | baseline |
-| A2 | pipelined | DirectWriter (O_DIRECT) | eliminates write cache (was 11 GB) |
+**Untested permutations:**
+- Sequential BufWriter with sentinel fill (approach 1 from reviewers)
+- mmap coord_slots + memcpy
+- Parallel bucket processing (rayon)
 
-### Stage 2 permutations (node join)
+### Stage 4: Assembly — DISABLED (OOM)
+- **Status:** Temporarily disabled. OOM killed at Europe scale.
+- **Root cause:** Same PrimitiveBlock cross-thread alloc/free as stage 2.
+  Standard pipelined reader (`into_blocks_pipelined`) + full element iteration
+  for assembly causes 25+ GB heap retention. With IdSetDense (1.4 GB) on top,
+  exceeds 32 GB host.
 
-| # | Decode path | Notes |
-|---|-------------|-------|
-| B1 | node-only scanner (current) | sequential, no PrimitiveBlock |
-| B2 | pipelined + PrimitiveBlock | original path, for comparison (will OOM without fix) |
+**Proposed fix (from reviewer consensus):**
 
-### Stage 3 permutations (slot reorder)
+Sequential read + batch parallel encode:
+1. Read blocks sequentially (no cross-thread buffer ownership during read)
+2. Accumulate a batch of N blocks
+3. `par_iter` over the batch for BlockBuilder encoding
+4. Write OwnedBlocks to PbfWriter
 
-Stage 3 is the new bottleneck at 1079s. It does 256 sequential bucket loads,
-sorts each, then pwrite per entry to coord_slots.
+This is the same `assemble_batch` pattern already in the code, but fed by a
+sequential reader instead of the pipelined one. Estimated: ~250-350s.
 
-| # | Strategy | Expected effect |
-|---|----------|-----------------|
-| C1 | current (pwrite per entry) | baseline 1079s |
-| C2 | buffered writer (BufWriter wrapping pwrite) | reduce syscall count |
-| C3 | mmap coord_slots + memcpy | eliminate pwrite entirely |
-| C4 | parallel bucket processing (rayon) | utilize multiple cores |
+**Alternative:** `decode_threads(1)` on the pipelined reader — limits to
+one decode thread, reducing cross-thread churn. Still uses PrimitiveBlock.
+May not fully fix the retention.
 
-### Cross-cutting permutations
+## Summary of timings
 
-| # | Feature | Applies to |
-|---|---------|------------|
-| D1 | BlobReader fadvise (current) | stages 1, 2 reads |
-| D2 | --direct-io on PBF reads | stages 1, 2 reads |
-| D3 | jemalloc | all stages |
-| D4 | sync_data+fadvise in finish() (current) | stage 1, 2 boundary |
+### Europe (32.4 GB, commit `cf350a9`, plantasjen)
 
-### Stage 3 deep dive — why 1079s
+| Stage | Original | Current | Speedup | Status |
+|-------|----------|---------|---------|--------|
+| Stage 1 (way pass) | 108s | 81s | 1.3x | Done |
+| Stage 2 (node join) | OOM | 327s | N/A (was broken) | Done (sequential) |
+| Stage 3 (slot reorder) | 1079s | 72s | 15x | Done |
+| Stage 4 (assembly) | OOM | disabled | — | **Blocked** |
+| **Total 1-3** | **1502s** | **480s** | **3.1x** | |
+| **Estimated 1-4** | — | **~730-830s** | — | After stage 4 fix |
 
-4.69B entries × 8-byte `write_at` each = 4.69B `pwrite64` syscalls.
-At ~200ns/syscall on NVMe = ~938s of pure syscall overhead. Remaining ~141s
-is bucket I/O + sort. The pwrite storm is the bottleneck.
+### Denmark (465 MB, commit `cf350a9`, plantasjen)
 
-Key insight (from perf reviewers): the slot buckets already partition the
-slot_pos space in ascending order. Processing buckets 0→255 produces
-globally sequential output. The current code treats this as random I/O
-when it's actually sequential.
+| Stage | Time | RSS peak |
+|-------|------|----------|
+| Stage 1 | 3.6s | 45 MB |
+| Stage 2 | 6.5s | 148 MB |
+| Stage 3 | 0.8s | 51 MB |
+| **Total 1-3** | **11s** | |
 
-#### Stage 3 approach 1: Sequential BufWriter with sentinel fill
+### Historical comparison
 
-Process buckets 0→255. For each bucket, sort entries by slot_pos (already done).
-Write entries sequentially to a BufWriter, filling gaps with zero sentinels:
+| Version | Denmark | Europe | Commit |
+|---------|---------|--------|--------|
+| Original (256× re-read) | 302s | — | `034422c` |
+| Single-pass merge | 25s | 2,060s (34m) | `a334c72` |
+| **Node-only scanner + scatter** | **11s** | **480s (8m, stages 1-3)** | `cf350a9` |
 
-```
-for bucket 0..256:
-    load + sort entries
-    for each entry:
-        write zero sentinels for gap between last_slot and entry.slot_pos
-        write (lat, lon) as 8 bytes
-write trailing sentinels to total_slots
-```
+## What we shipped
 
-Replaces 4.69B pwrite64 with ~144K write calls (37 GB / 256 KB BufWriter).
-Sequential write at ~3 GB/s ≈ 12s. Plus bucket I/O + sort ≈ 141s.
-**Expected: ~150-160s** (7x speedup).
+- **BlobReader fadvise(DONTNEED)** — commit `4ab6976`. General infrastructure.
+  Evicts page cache pages behind read head after each blob. Benefits all
+  single-pass forward scans. Stage 2 RSS 383 MB with pipeline-only drain.
+- **Deferred IdSetDense** — moved from before stage 1 to before stage 4.
+  Saves 1.4 GB during stages 1-3.
+- **Node-only wire-format scanner** — bypasses PrimitiveBlock for stage 2.
+  Zero per-block heap allocations. 1.4 GB stable RSS at Europe scale.
+- **Scatter buffer for stage 3** — eliminates sort and 4.69B pwrite calls.
+  15x speedup.
+- **Buffer reuse in load_coo_bucket_into** — clear+refill instead of new Vecs.
+  Doesn't fix the OOM (root cause was PrimitiveBlock, not buckets) but good
+  practice.
+- **sync_data+fadvise in BucketWriters::finish()** — clean stage boundary.
+- **Blob::decompress_raw() and decompress_pooled()** — decompression without
+  PrimitiveBlock construction.
+- **DecompressPool::pool_full_drops counter** — diagnostic.
+- **RSS logging with RssAnon/RssFile breakdown** — essential for diagnosis.
+- **Hotpath annotations** on all external join functions.
 
-Pro: simple, no memory risk, sequential I/O.
-Con: writes 37 GB including gaps (sentinels), even for sparse distributions.
+## Transferable insights
 
-#### Stage 3 approach 2: Dense scatter buffer per bucket
-
-For each bucket, compute its slot range from the partitioning. Allocate a
-zeroed buffer covering that range (bucket_slot_count × 8 bytes). Scatter
-entries directly by position — no sort needed:
-
-```
-for bucket 0..256:
-    let range_slots = total_slots / 256  (approx)
-    let mut buf = vec![0u8; range_slots * 8]
-    load bucket entries
-    for each entry:
-        buf[(entry.slot_pos - bucket_start) * 8 ..] = (lat, lon)
-    write_all(buf)
-```
-
-Eliminates: 4.69B pwrite syscalls, bucket sort entirely, random writes.
-One write_all per bucket = 256 write calls total.
-**Expected: comparable to approach 1, possibly faster (no sort).**
-
-Pro: eliminates sort, simplest write pattern (one write_all per bucket).
-Con: allocates a buffer sized to the bucket's full slot range (~146 MB
-at Europe scale: 37.5 GB / 256). Reusable across buckets (high-water).
-
-#### Stage 3 approach 3: mmap coord_slots + memcpy
-
-mmap the pre-allocated coord_slots file as MmapMut. Write entries via
-memory copy instead of pwrite. Zero syscalls during write loop.
-
-Pro: zero syscalls, no gap fill, works with any access pattern.
-Con: 37 GB mmap on 32 GB host may cause memory pressure. Dirty pages
-from mmap writes have the same kernel writeback issues we saw in stage 1.
-
-Lower priority — approaches 1-2 avoid mmap complexity.
-
-### Priority order
-
-1. **C (stage 3)** — 72% of total time. Test approaches 1 and 2.
-2. **A2** — measure O_DIRECT bucket write throughput impact on stage 1
-3. **B (stage 2)** — profile node-only scanner for further optimization
-4. **D2** — --direct-io vs buffered read comparison with fadvise
-5. **D3** — jemalloc vs glibc throughput comparison
-
-### Transferable insights
-
-These patterns apply beyond external join:
-
-- **Sequential BufWriter with gap fill** — any command writing a sparse
-  positional file (geocode index cells, renumber output).
-- **Dense scatter buffer** — any radix-bucketed workflow where the bucket
-  partitioning defines the output order. Eliminates sort when position
-  is computable from the entry.
-- **Node-only scanner** — any command that only needs id/lat/lon from node
-  blobs. Bypassing PrimitiveBlock avoids string table + group range
-  allocations that cause heap retention at scale.
-- **BlobReader fadvise(DONTNEED)** — general infrastructure, benefits all
-  single-pass forward scans.
 - **RssAnon/RssFile breakdown** — essential for diagnosing memory issues.
   Without this, we chased page cache for hours when the problem was heap.
+- **PrimitiveBlock cross-thread alloc/free** — the pipelined reader's
+  PrimitiveBlock construction causes ~54 KB/block of heap retention from
+  cross-thread alloc/free of WireStringTable entries and group_ranges.
+  This affects ANY consumer that uses `into_blocks_pipelined` with element
+  iteration at scale (464K+ blocks). The node-only scanner pattern
+  (decompress + inline wire parse) avoids this entirely.
+- **fadvise(DONTNEED) only evicts clean pages** — dirty pages from write()
+  survive DONTNEED. sync_data() makes them clean but is expensive.
+  sync_file_range(SYNC_FILE_RANGE_WRITE) is async but didn't help in practice.
+- **O_DIRECT on reads paradox** — freeing read pages via O_DIRECT or fadvise
+  lets the kernel fill that space with dirty write pages, potentially making
+  RSS worse. Must control both read and write page cache together.
+- **Dense scatter buffer** — any radix-bucketed workflow where bucket
+  partitioning defines output order. Eliminates sort when position is
+  computable from the entry. 15x speedup at Europe scale.
+- **Node-only scanner** — any command that only needs id/lat/lon from node
+  blobs. Bypasses PrimitiveBlock entirely. Applicable to geocode builder,
+  extract pass 1, and any future node-only command.
+- **BlobReader fadvise(DONTNEED)** — general infrastructure improvement for
+  all single-pass forward scans.
+
+## Next steps
+
+1. **Fix stage 4** — sequential read + batch parallel encode. Same
+   `assemble_batch` pattern, fed by sequential reader.
+2. **Full end-to-end Europe measurement** (stages 1-4).
+3. **Stage 2 parallelism** — approach B (thread-local decompress, send tuples)
+   if the stage 4 fix suggests the right pattern.
+4. **Planet benchmark** — full pipeline on 87.7 GB PBF.

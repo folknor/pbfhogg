@@ -396,16 +396,14 @@ fn stage2_node_join(
 
     eprintln!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
 
-    // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
-    // per-block heap allocations (WireStringTable entries, group_ranges) that
-    // cause 25+ GB of allocator retention at Europe scale.
-    //
-    // Reads blobs sequentially, decompresses into a reusable buffer, and walks
-    // the wire format directly for dense node id/lat/lon. Zero per-block heap
-    // allocations beyond the reusable decompression buffer.
+    // Pipelined node-only scan: parallel decompression without PrimitiveBlock.
+    // IO thread reads blobs, rayon threads decompress, consumer parses dense
+    // nodes inline from raw bytes. Zero per-block heap allocations beyond the
+    // pooled decompression buffers.
     use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+    use crate::blob::{BlobReader, BlobType, DecompressPool, decompress_blob};
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let mut blob_reader = BlobReader::open(input, direct_io)?;
     // Skip the header blob.
     let _ = blob_reader.next();
 
@@ -413,16 +411,68 @@ fn stage2_node_join(
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
-    let mut decompress_buf: Vec<u8> = Vec::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
+    // Pipeline: IO thread → rayon decompress → consumer (this thread).
+    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<crate::blob::Blob>)>(16);
+    let (dec_tx, dec_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<bytes::Bytes>)>(32);
 
-        // Decompress without constructing PrimitiveBlock (no string table alloc).
-        let decompressed = blob.decompress_raw()?;
+    std::thread::scope(|scope| -> Result<()> {
+        // IO thread: read blobs sequentially.
+        scope.spawn(move || {
+            for (seq, blob_result) in blob_reader.enumerate() {
+                if raw_tx.send((seq, blob_result)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Dispatch thread: decompress on rayon pool, skip non-data blobs.
+        let dispatch_tx = dec_tx.clone();
+        scope.spawn(move || {
+            let decode_threads = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(4);
+            let Ok(decode_pool) = rayon::ThreadPoolBuilder::new()
+                .num_threads(decode_threads)
+                .build()
+            else {
+                return;
+            };
+            let buffer_pool = DecompressPool::new();
+            for (seq, blob_result) in raw_rx {
+                let tx = dispatch_tx.clone();
+                let bp = std::sync::Arc::clone(&buffer_pool);
+                match blob_result {
+                    Ok(blob) => {
+                        decode_pool.spawn(move || {
+                            let item = if matches!(blob.get_type(), BlobType::OsmData) {
+                                Some(blob.decompress_pooled(&bp))
+                            } else {
+                                None
+                            };
+                            drop(tx.send((seq, item.unwrap_or(Ok(bytes::Bytes::new())))));
+                        });
+                    }
+                    Err(e) => {
+                        drop(tx.send((seq, Err(e))));
+                    }
+                }
+            }
+        });
+        drop(dec_tx);
+
+        // Consumer: reorder + parse dense nodes inline.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<bytes::Bytes>> =
+            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (seq, item) in dec_rx {
+            reorder.push(seq, item);
+
+            while let Some(result) = reorder.pop_ready() {
+                let decompressed = result?;
+                if decompressed.is_empty() {
+                    continue;
+                }
 
         block_count += 1;
         if block_count.is_multiple_of(1000) {
@@ -436,7 +486,6 @@ fn stage2_node_join(
         let mut granularity: i64 = 100;
         let mut lat_offset: i64 = 0;
         let mut lon_offset: i64 = 0;
-        decompress_buf.clear();
         // Collect group byte ranges on the stack (typical: 1 group per block).
         let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
         let mut group_count: usize = 0;
@@ -514,7 +563,10 @@ fn stage2_node_join(
                         &mut bucket_max_id, node_buckets, range_size,
                     )?;
                     if !has {
-                        return Ok(resolved_count);
+                        // No more buckets — done. Break all the way out.
+                        // Remaining nodes have no COO pairs.
+                        eprintln!("  node join: complete ({resolved_count} resolved)");
+                        return Ok(());
                     }
                 }
 
@@ -543,9 +595,12 @@ fn stage2_node_join(
                 }
             }
         }
-    }
+            } // while let pop_ready
+        } // for dec_rx
 
-    eprintln!("  node join: complete ({resolved_count} resolved)");
+        eprintln!("  node join: complete ({resolved_count} resolved)");
+        Ok(())
+    })?; // thread::scope
 
     Ok(resolved_count)
 }

@@ -77,21 +77,33 @@ But fadvise doesn't need O_DIRECT — it's a separate concern. Should be gated o
 `target_os = "linux"` with `libc` as a direct dependency for the fadvise path,
 so buffered-only Linux builds also get page cache eviction.
 
+## ALTW external join: stage 4 assembly OOM
+
+External join stages 1-3 work at Europe scale (480s, 1.4 GB RSS). Stage 4
+(assembly) OOMs due to PrimitiveBlock cross-thread alloc/free churn —
+same root cause as stage 2's original OOM.
+
+**Fix:** Sequential read + batch parallel encode. Read blocks sequentially
+(no cross-thread buffer ownership), accumulate batch, `par_iter` for
+BlockBuilder encoding. Same `assemble_batch` pattern, fed by sequential
+reader instead of pipelined. Estimated: ~250-350s.
+
+See [notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md).
+
 ## ALTW memory optimization
 
 See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 
-**Status**: Sparse index (Planetiler-inspired) implemented (`--index-type sparse`)
-but **2.5x slower than dense at Europe scale** — the sorted batch access pattern
-doesn't help when the mmap working set exceeds RAM. Dense remains the faster
-option at all tested scales.
+**Status**: External join (`--index-type external`) is the primary solution
+for memory-constrained hosts. Europe stages 1-3: 480s, 1.4 GB RSS (commit
+`cf350a9`). Sparse index remains available but 2.5x slower than dense.
 
 **Next steps**:
-- [ ] ~~Test pread + fadvise~~ — perf reviewer consensus: won't help. The 2.5x
-  gap is a working-set-exceeds-RAM problem (capacity miss), not a prefetch
-  miss. The batched sorted access is already the right algorithm.
+- [x] ~~Test pread + fadvise~~ — perf reviewer consensus: won't help
+- [ ] Fix stage 4 assembly OOM (see above)
+- [ ] Full end-to-end Europe measurement
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
-- [ ] If neither works, implement partitioned multi-pass
+- [ ] Planet benchmark (87.7 GB)
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 

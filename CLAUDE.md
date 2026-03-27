@@ -94,7 +94,7 @@ The passthrough path (no `--type`) adds indexdata via decompress+scan without re
 
 - **`dense`** — Direct-mapped mmap array (`index[node_id] = (lat, lon)`). Fastest when the working set fits in RAM. At planet scale (~16 GB touched after pass 0 filtering), requires ~30+ GB free memory to avoid page cache thrashing.
 - **`sparse`** — Planetiler-inspired chunk-indexed sparse array. ~540 MB RAM for chunk index + compact on-disk values file (~16 GB for planet). Way lookups are batched and sorted by file offset, converting random I/O into sequential scans. Works on memory-constrained hosts (tested on 30 GB host with planet). ~1.85x slower than dense on Denmark (all fits in RAM, overhead is pure CPU).
-- **`external`** — External join via double radix permutation. Bounded memory (<1 GB), all sequential I/O. Uses ~4 GB temp disk at Denmark scale, ~224 GB at planet. Best for memory-constrained hosts where dense thrashes and sparse is too slow. Denmark: 25s (3.5x dense). Japan: 143s (2x dense). Requires sorted PBF input.
+- **`external`** — External join via double radix permutation. Bounded memory (~1.4 GB at Europe scale), all sequential I/O. Uses ~4 GB temp disk at Denmark scale, ~112 GB at Europe. Best for memory-constrained hosts where dense thrashes and sparse is too slow. Denmark: 11s (stages 1-3). Europe: 480s (stages 1-3, commit `cf350a9`). Stage 4 assembly temporarily disabled (PrimitiveBlock churn OOM — fix in progress). Requires sorted PBF input. Uses node-only wire-format scanner (no PrimitiveBlock) for stage 2 and scatter buffer for stage 3.
 
 ## Verify subcommands
 

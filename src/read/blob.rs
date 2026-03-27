@@ -475,6 +475,11 @@ impl Blob {
         decompress_blob(&self.blob, None)
     }
 
+    /// Decompress with buffer pool reuse, without constructing a `PrimitiveBlock`.
+    pub(crate) fn decompress_pooled(&self, pool: &Arc<DecompressPool>) -> Result<Bytes> {
+        decompress_blob(&self.blob, Some(pool))
+    }
+
     /// Returns the blob-level index from the header's `indexdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs

@@ -264,19 +264,24 @@ against osmium via `brokkr verify add-locations-to-ways`.
 |-------|---------|-------|--------|--------|
 | dense | 8,168 ms | 72s | 2,565s (43m) | `034422c` |
 | external (old, 256× re-read) | 302s (5m) | — | — | `034422c` |
-| **external (single-pass merge)** | **25s** | **143s** | **2,060s (34m)** | `a334c72` |
+| external (single-pass merge) | 25s | 143s | 2,060s (34m) | `a334c72` |
+| **external (node-only scanner + scatter)** | **11s** | — | **480s (8m, stages 1-3)** | `cf350a9` |
 
-The original external join was 37x slower than dense on Denmark due to
-stage 2 re-reading ALL node blobs 256 times. The single-pass node merge
-(commit `a334c72`) reads PBF nodes exactly once — a **12x speedup on
-Denmark** (302s → 25s).
+**Optimization arc (commit `cf350a9`):**
+- Stage 2: replaced pipelined PrimitiveBlock iteration with node-only
+  sequential wire-format scanner. Eliminates 25+ GB heap retention from
+  PrimitiveBlock cross-thread allocation churn. RSS: 1.4 GB stable.
+- Stage 3: replaced 4.69B individual pwrite calls with scatter buffer
+  (one write_all per bucket, no sort). 1079s → 72s (15x speedup).
+- Stage 4: temporarily disabled (PrimitiveBlock churn OOM — same root
+  cause as stage 2 but in assembly path). Fix in progress.
 
-**Europe: external is 20% faster than dense.** At the scale where the dense
-mmap working set (~16 GB) exceeds available RAM, external's sequential I/O
-wins. The crossover is between Japan (2.4 GB, dense 2x faster) and Europe
-(33.6 GB, external 20% faster).
+**Europe stages 1-3: 480s (8 min).** Previous full run: 2,060s (34 min).
+When stage 4 is fixed, full pipeline estimated ~730-830s (~12-14 min).
 
-See [altw-partitioned.md](altw-partitioned.md) for full design and benchmarks.
+See [altw-partitioned.md](altw-partitioned.md) for full design and
+[external-join-oom-investigation.md](external-join-oom-investigation.md)
+for the complete OOM investigation.
 
 ### 4. Larger swap / 64 GB host (infrastructure)
 
@@ -295,7 +300,9 @@ See [altw-partitioned.md](altw-partitioned.md) for full design and benchmarks.
 - [x] Verify external join correctness on Denmark — identical to dense
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark external join on Japan — 143s (2.0x dense)
-- [x] Benchmark external join on Europe — **2,060s (34m), 20% faster than dense**
-- [ ] Benchmark external join on planet (87.7 GB) — estimated ~90 min
+- [x] Benchmark external join on Europe — 2,060s (34m) → **480s (8m, stages 1-3)** commit `cf350a9`
+- [ ] Fix stage 4 assembly OOM (PrimitiveBlock churn) — sequential reader approach
+- [ ] Full end-to-end Europe measurement (stages 1-4)
+- [ ] Benchmark external join on planet (87.7 GB)
 - [ ] Add O_DIRECT support to bucket file I/O
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

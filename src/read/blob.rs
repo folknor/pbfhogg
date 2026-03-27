@@ -96,9 +96,12 @@ impl DecompressPool {
 
 impl Drop for DecompressPool {
     fn drop(&mut self) {
-        let drops = self.pool_full_drops.load(std::sync::atomic::Ordering::Relaxed);
-        if drops > 0 {
-            eprintln!("  DecompressPool: {drops} buffers dropped (pool full)");
+        #[cfg(feature = "debug-logging")]
+        {
+            let drops = self.pool_full_drops.load(std::sync::atomic::Ordering::Relaxed);
+            if drops > 0 {
+                eprintln!("  DecompressPool: {drops} buffers dropped (pool full)");
+            }
         }
     }
 }

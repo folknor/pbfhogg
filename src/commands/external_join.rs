@@ -17,6 +17,15 @@
 //! Memory at every stage: <1 GB. All I/O sequential. No mmap, no random access.
 //! See `notes/altw-partitioned.md` for the full design.
 
+/// Debug logging for stage timing, RSS, and progress. Gated behind
+/// the `debug-logging` feature to avoid noise in production.
+macro_rules! debug_log {
+    ($($arg:tt)*) => {
+        #[cfg(feature = "debug-logging")]
+        debug_log!($($arg)*);
+    };
+}
+
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -393,7 +402,7 @@ fn stage1_way_pass(
         }
         block_count += 1;
         if block_count.is_multiple_of(1000) {
-            eprintln!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+            debug_log!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
         }
     }
 
@@ -481,7 +490,7 @@ fn stage2_node_join(
         return Ok(0); // No COO pairs at all
     }
 
-    eprintln!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
+    debug_log!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
 
     // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
     // per-block heap allocations (WireStringTable entries, group_ranges) that
@@ -493,7 +502,7 @@ fn stage2_node_join(
     let _ = blob_reader.next(); // skip header blob
     blob_reader.set_parse_indexdata(true); // re-enable for blob filter
 
-    eprintln!("  stage2: reader open, rss={}MB", read_rss_kb() / 1024);
+    debug_log!("  stage2: reader open, rss={}MB", read_rss_kb() / 1024);
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
@@ -514,7 +523,7 @@ fn stage2_node_join(
 
         block_count += 1;
         if block_count.is_multiple_of(1000) {
-            eprintln!("  stage2: {block_count} blocks, {resolved_count} resolved, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+            debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
         }
 
         // Parse PrimitiveBlock wire format inline — extract only granularity,
@@ -578,7 +587,7 @@ fn stage2_node_join(
                 // Advance to the bucket that covers this node ID.
                 while id >= bucket_max_id {
                     if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
-                        eprintln!(
+                        debug_log!(
                             "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, rss={}MB {})",
                             sorted_pairs.len(),
                             read_rss_kb() / 1024,
@@ -591,7 +600,7 @@ fn stage2_node_join(
                         &mut bucket_max_id, node_buckets, range_size,
                     )?;
                     if !has {
-                        eprintln!("  node join: complete ({resolved_count} resolved)");
+                        debug_log!("  node join: complete ({resolved_count} resolved)");
                         return Ok(resolved_count);
                     }
                 }
@@ -623,7 +632,7 @@ fn stage2_node_join(
         }
     }
 
-    eprintln!("  node join: complete ({resolved_count} resolved)");
+    debug_log!("  node join: complete ({resolved_count} resolved)");
 
     Ok(resolved_count)
 }
@@ -735,7 +744,7 @@ fn stage3_slot_reorder(
         next_slot = bucket_end;
 
         if bucket_idx % 16 == 0 {
-            eprintln!(
+            debug_log!(
                 "  slot reorder: bucket {}/{}",
                 bucket_idx + 1,
                 NUM_BUCKETS
@@ -912,7 +921,7 @@ fn stage4_assembly(
 
             block_count += BATCH_SIZE as u64;
             if block_count.is_multiple_of(1000) {
-                eprintln!("  stage4: {block_count} blocks, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+                debug_log!("  stage4: {block_count} blocks, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
             }
         }
     }
@@ -931,7 +940,7 @@ fn stage4_assembly(
 
     writer.flush()?;
     if skipped_node_blobs > 0 {
-        eprintln!("  stage4: skipped {skipped_node_blobs} untagged node blobs (no decompress)");
+        debug_log!("  stage4: skipped {skipped_node_blobs} untagged node blobs (no decompress)");
     }
     Ok(stats)
 }
@@ -1162,39 +1171,39 @@ pub fn external_join(
 
     // --- Stage 1: Way pass ---
     let t1 = std::time::Instant::now();
-    eprintln!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
+    debug_log!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
     let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
     let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets)?;
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
     let stage1_ms = t1.elapsed().as_millis();
-    eprintln!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
-    eprintln!("stage1_ms={stage1_ms}");
-    eprintln!("  rss_after_stage1_mb={}", read_rss_kb() / 1024);
+    debug_log!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
+    debug_log!("stage1_ms={stage1_ms}");
+    debug_log!("  rss_after_stage1_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 2: Node join ---
     let t2 = std::time::Instant::now();
-    eprintln!("external join: stage 2 — node join (merge-join per bucket)...");
+    debug_log!("external join: stage 2 — node join (merge-join per bucket)...");
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
     let resolved_count =
         stage2_node_join(input, direct_io, &node_buckets, &mut slot_buckets, total_slots)?;
     slot_buckets.finish()?;
     node_buckets.cleanup();
     let stage2_ms = t2.elapsed().as_millis();
-    eprintln!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
-    eprintln!("stage2_ms={stage2_ms}");
-    eprintln!("  rss_after_stage2_mb={}", read_rss_kb() / 1024);
+    debug_log!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
+    debug_log!("stage2_ms={stage2_ms}");
+    debug_log!("  rss_after_stage2_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 3: Slot reorder ---
     let t3 = std::time::Instant::now();
-    eprintln!("external join: stage 3 — slot reorder, building coord_slots file...");
+    debug_log!("external join: stage 3 — slot reorder, building coord_slots file...");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
     stage3_slot_reorder(&slot_buckets, &coord_slots_path, total_slots)?;
     slot_buckets.cleanup();
     let stage3_ms = t3.elapsed().as_millis();
-    eprintln!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
-    eprintln!("stage3_ms={stage3_ms}");
-    eprintln!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
+    debug_log!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
+    debug_log!("stage3_ms={stage3_ms}");
+    debug_log!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
 
     // Collect relation member node IDs (for node filtering in stage 4).
     // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
@@ -1205,11 +1214,11 @@ pub fn external_join(
             input, direct_io,
         )?)
     };
-    eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
+    debug_log!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
 
     // --- Stage 4: Assembly ---
     let t4 = std::time::Instant::now();
-    eprintln!("external join: stage 4 — assembling enriched PBF...");
+    debug_log!("external join: stage 4 — assembling enriched PBF...");
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
     let stats = stage4_assembly(
         input,
@@ -1222,11 +1231,11 @@ pub fn external_join(
         overrides,
     )?;
     let stage4_ms = t4.elapsed().as_millis();
-    eprintln!("  assembly complete ({stage4_ms}ms)");
-    eprintln!("stage4_ms={stage4_ms}");
-    eprintln!("total_slots={total_slots}");
-    eprintln!("resolved_count={resolved_count}");
-    eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
+    debug_log!("  assembly complete ({stage4_ms}ms)");
+    debug_log!("stage4_ms={stage4_ms}");
+    debug_log!("total_slots={total_slots}");
+    debug_log!("resolved_count={resolved_count}");
+    debug_log!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
 
     // scratch_dir dropped here → cleanup all temp files.
     Ok(stats)

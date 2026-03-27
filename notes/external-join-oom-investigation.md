@@ -384,5 +384,70 @@ That would be 6.5x faster than the original 2,060s and 7.5x faster than dense (2
 - [x] BATCH_SIZE sweep: 128 → 26 GB + slower (448s), 32 → 27 GB, 64 → 27 GB. Irrelevant — pipelined reader's decode_ahead=32 channel dominates.
 - [x] `--compression none` output: 294s (was 461s). **36% of stage 4 is output zlib compression.** Anon=1559 MB flat. Assembly itself is only 294s.
 - [x] `zlib:1` output: 432s (was 461s). Only -29s — compression already overlapped with assembly.
-- [x] P1b tagdata node blob skipping: **BLOCKED.** Europe PBF has indexdata but no tagdata (generated via passthrough `cat`, not decode+reencode `cat --type`). Without tagdata, can't determine tag emptiness without decompressing. Requires regenerating PBF via `cat --type node,way,relation` which embeds tagdata in blob headers. Estimated: ~5-8 min for Europe. For planet (87 GB), `cat --type` OOMs on 30 GB host.
+- [x] P1b tagdata node blob skipping: **zero blobs skipped.** Regenerated PBF with tagdata (cat --type, 123s). But 96% drop rate is per-node, not per-blob — ~320 tagged nodes per blob means nearly every blob has tags.
 - [ ] Planet benchmark — 87.7 GB PBF
+
+## Final state
+
+**Europe: ~921s (15 min) with zlib:6, ~754s (12.5 min) with --compression none.**
+**2.8x faster than dense (2,565s). Bounded memory: 1.6 GB anon flat.**
+
+All easy and medium-effort optimizations exhausted. Remaining wins are
+architectural (parallel decompress) and deferred to next cycle.
+
+## Next cycle: parallel decompress
+
+### P2b: Parallel tuples for stage 2 (301s → est. 55-80s)
+
+**Goal:** Parallelize zlib decompression of node blobs in stage 2.
+
+**Design (reviewer consensus):**
+- IO thread: BlobReader reads raw blobs → channel(16)
+- Rayon workers (N threads): each worker owns thread-local decompress
+  Vec<u8>. Decompresses blob, parses dense nodes via extract_node_tuples(),
+  produces Vec<NodeTuple>. All heavy alloc/free stays on the worker thread.
+- Consumer: receives Vec<NodeTuple> in file order (reorder buffer), runs
+  merge-join against sorted_pairs.
+
+**Critical design constraint (from perf-Codex):** Do NOT allocate fresh
+Vec<NodeTuple> per block and free on consumer. Recycle worker-owned buffers
+back to the same worker to avoid recreating the cross-thread alloc/free
+problem. Use a return channel or map_init with thread-local buffers.
+
+**extract_node_tuples() already exists** — factored out during this
+investigation. NodeTuple struct defined. Ready to use.
+
+**Risk:** The tuple intermediary regressed +11s on the sequential path
+(extra memory pass). The parallel version avoids the single-thread zlib
+bottleneck but adds channel + reorder overhead. Net gain uncertain.
+
+### P2c: Parallel assembly for stage 4 (461s → est. 150-200s)
+
+**Goal:** Parallelize zlib decompression of all blobs in stage 4.
+
+**Design:**
+- IO thread: BlobReader reads raw blobs → channel
+- Rayon workers: decompress → PrimitiveBlock → assemble_block → OwnedBlocks.
+  Full lifecycle on one thread. No PrimitiveBlock crosses thread boundary.
+- Consumer: receives OwnedBlocks in order, sends to pipelined PbfWriter.
+
+**Blocker: slot_pos pre-scan.** Each way's refs advance a global counter
+(`slot_pos`). Assembly needs each block's starting slot_pos. Currently
+requires decompressing blocks to count way refs — which IS the bottleneck.
+
+**Solution (reviewer consensus):** Store per-blob way-ref counts during
+stage 1. Stage 1 already iterates every way ref to emit COO pairs — add
+a parallel Vec<u64> recording ref count per blob (indexed by blob sequence
+number). ~16K way blobs × 8 bytes = 128 KB. Stage 4 reads this array and
+computes prefix sums for per-block slot_pos starts. Zero decompression
+needed for pre-scan.
+
+**Implementation:** Either a scratch sidecar file (perf-Codex) or a new
+field in indexdata (planet-Claude, planet-Codex). Sidecar is simpler for
+now; indexdata change is better long-term.
+
+### Priority order
+
+1. **P2b** (stage 2) — cleaner target, no slot_pos dependency, extract_node_tuples ready
+2. **P2c** (stage 4) — bigger target (50% of total), but needs per-blob ref count infrastructure first
+3. **Planet benchmark** — validate the pipeline at 87 GB

@@ -123,9 +123,8 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        // TEMPORARY: skip cleanup to preserve coord_slots for stage 4 iteration.
-        eprintln!("  scratch dir preserved: {}", self.path.display());
-        // drop(std::fs::remove_dir_all(&self.path));
+        // Best-effort cleanup. Ignore errors (crash leaves stale dir, user can clean).
+        drop(std::fs::remove_dir_all(&self.path));
     }
 }
 
@@ -1160,39 +1159,6 @@ pub fn external_join(
             return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
                         The single-pass node merge depends on ascending node ID order."
                 .into());
-        }
-    }
-
-    // TEMPORARY: skip stages 1-3 for stage 4 iteration testing.
-    // Usage: SKIP_TO_STAGE4=/path/to/coord_slots:total_slots
-    if let Ok(skip_val) = std::env::var("SKIP_TO_STAGE4") {
-        if let Some((path_str, slots_str)) = skip_val.split_once(':') {
-            let coord_slots_path = std::path::PathBuf::from(path_str);
-            let total_slots: u64 = slots_str.parse()
-                .map_err(|e| format!("SKIP_TO_STAGE4: invalid total_slots: {e}"))?;
-            eprintln!("SKIP_TO_STAGE4: coord_slots={}, total_slots={total_slots}", coord_slots_path.display());
-
-            let relation_member_node_ids = if keep_untagged_nodes {
-                None
-            } else {
-                Some(super::add_locations_to_ways::collect_relation_member_node_ids(
-                    input, direct_io,
-                )?)
-            };
-            eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
-
-            let t4 = std::time::Instant::now();
-            eprintln!("external join: stage 4 — assembling enriched PBF...");
-            let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
-            let stats = stage4_assembly(
-                input, output, &coord_slots, keep_untagged_nodes,
-                relation_member_node_ids.as_ref(), compression, direct_io, overrides,
-            )?;
-            let stage4_ms = t4.elapsed().as_millis();
-            eprintln!("  assembly complete ({stage4_ms}ms)");
-            eprintln!("stage4_ms={stage4_ms}");
-            eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
-            return Ok(stats);
         }
     }
 

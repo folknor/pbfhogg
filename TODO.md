@@ -77,31 +77,40 @@ But fadvise doesn't need O_DIRECT — it's a separate concern. Should be gated o
 `target_os = "linux"` with `libc` as a direct dependency for the fadvise path,
 so buffered-only Linux builds also get page cache eviction.
 
-## ALTW external join: stage 4 assembly OOM
+## ALTW external join: parallel decompress (next cycle)
 
-External join stages 1-3 work at Europe scale (480s, 1.4 GB RSS). Stage 4
-(assembly) OOMs due to PrimitiveBlock cross-thread alloc/free churn —
-same root cause as stage 2's original OOM.
+External join works end-to-end at Europe scale: 921s (15 min), 1.6 GB RSS,
+2.8x faster than dense. All easy/medium optimizations exhausted. Remaining
+wins require parallel input decompression.
 
-**Fix:** Sequential read + batch parallel encode. Read blocks sequentially
-(no cross-thread buffer ownership), accumulate batch, `par_iter` for
-BlockBuilder encoding. Same `assemble_batch` pattern, fed by sequential
-reader instead of pipelined. Estimated: ~250-350s.
+See [notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md)
+for the full investigation, optimization matrix, and next cycle plan.
 
-See [notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md).
+**P2b: Parallel tuples for stage 2 (301s → est. 55-80s)**
+- Rayon workers decompress + extract (id,lat,lon) tuples, thread-local buffers
+- Consumer receives tuples in order, runs merge-join
+- extract_node_tuples() and NodeTuple already implemented
+- Critical: recycle worker buffers (don't free cross-thread)
+
+**P2c: Parallel assembly for stage 4 (461s → est. 150-200s)**
+- Workers own full decompress → PrimitiveBlock → assemble → OwnedBlock lifecycle
+- **Requires per-blob way-ref counts** (for slot_pos pre-computation)
+- Store during stage 1 as sidecar file or new indexdata field
+- Without this, stage 4 must decompress sequentially to count refs
+
+**Priority:** P2b first (simpler), P2c second (needs ref count infrastructure).
 
 ## ALTW memory optimization
 
 See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 
-**Status**: External join (`--index-type external`) is the primary solution
-for memory-constrained hosts. Europe stages 1-3: 480s, 1.4 GB RSS (commit
-`cf350a9`). Sparse index remains available but 2.5x slower than dense.
+**Status**: External join (`--index-type external`) works end-to-end at
+Europe scale. 921s, 1.6 GB RSS, 2.8x faster than dense (2,565s).
 
-**Next steps**:
-- [x] ~~Test pread + fadvise~~ — perf reviewer consensus: won't help
-- [ ] Fix stage 4 assembly OOM (see above)
-- [ ] Full end-to-end Europe measurement
+**Done**:
+- [x] ~~Test pread + fadvise~~ — won't help
+- [x] Fix stage 4 assembly OOM — sequential reader
+- [x] Full end-to-end Europe — 921s
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
 - [ ] Planet benchmark (87.7 GB)
 

@@ -254,6 +254,14 @@ use super::clean_metadata;
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
+    crate::debug_log!(
+        "cat(filtered): start files={} output={} filter={} clean={} {}",
+        files.len(),
+        output.display(),
+        filter,
+        clean.any(),
+        crate::debug::rss_line(),
+    );
     let tf = TypeFilter::parse(filter);
 
     let single_file = files.len() == 1;
@@ -277,6 +285,11 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     let mut max_batch_bytes: usize = 0;
     let mut total_byte_limited: u64 = 0;
     for file in files {
+        crate::debug_log!(
+            "cat(filtered): file start path={} {}",
+            file.display(),
+            crate::debug::rss_line(),
+        );
         let reader = ElementReader::open(file, direct_io)?;
         let blocks_iter = reader.with_blob_filter(blob_filter.clone()).into_blocks_pipelined();
         for_each_primitive_block_batch_budgeted(blocks_iter, BATCH_SIZE, Some(DECODE_BATCH_BYTE_BUDGET), &mut |batch| {
@@ -302,11 +315,28 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
             elements += batch_elements;
             Ok(())
         })?;
+        crate::debug_log!(
+            "cat(filtered): file done path={} batches={} decoded_blobs={} elements={} {}",
+            file.display(),
+            batch_count,
+            blobs_decoded,
+            elements,
+            crate::debug::rss_line(),
+        );
     }
     eprintln!("[cat] batches: {batch_count}, max_blocks/batch: {max_batch_blocks}, max_bytes/batch: {:.1} MiB, byte-limited: {total_byte_limited}",
         max_batch_bytes as f64 / (1024.0 * 1024.0));
 
     writer.flush()?;
+    crate::debug_log!(
+        "cat(filtered): complete batches={} decoded_blobs={} elements={} max_batch_blocks={} max_batch_bytes_mib={:.1} {}",
+        batch_count,
+        blobs_decoded,
+        elements,
+        max_batch_blocks,
+        max_batch_bytes as f64 / (1024.0 * 1024.0),
+        crate::debug::rss_line(),
+    );
 
     Ok(CatStats {
         blobs_passthrough: 0,

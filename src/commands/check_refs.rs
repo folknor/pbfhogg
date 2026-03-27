@@ -103,6 +103,13 @@ impl RefCheckResult {
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
+    crate::debug_log!(
+        "check-refs: start path={} check_relations={} show_ids={} {}",
+        path.display(),
+        check_relations,
+        show_ids,
+        crate::debug::rss_line(),
+    );
     let reader = ElementReader::open(path, direct_io)?;
     // Skip relation blobs when not checking relation references.
     let reader = if check_relations {
@@ -143,8 +150,20 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
     };
+    let mut progress_count: u64 = 0;
 
     reader.for_each_pipelined(|element| {
+        progress_count += 1;
+        if progress_count.is_multiple_of(1_000_000) {
+            crate::debug_log!(
+                "check-refs: scanned={progress_count} nodes={} ways={} relations={} deferred_rel_refs={} {}",
+                result.node_count,
+                result.way_count,
+                result.relation_count,
+                deferred_relation_refs.len(),
+                crate::debug::rss_line(),
+            );
+        }
         match element {
             Element::DenseNode(dn) => {
                 node_ids.insert(dn.id() .cast_unsigned());
@@ -230,6 +249,11 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // Deduplicate missing IDs via RoaringTreemap to count unique missing
     // relation IDs, consistent with node/way counting above.
     if check_relations {
+        crate::debug_log!(
+            "check-refs: resolving deferred relation refs count={} {}",
+            deferred_relation_refs.len(),
+            crate::debug::rss_line(),
+        );
         let mut missing_relation_members_set = RoaringTreemap::new();
         let mut occurrences: u64 = 0;
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
@@ -252,5 +276,14 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
 
     result.missing_refs = missing_refs;
 
+    crate::debug_log!(
+        "check-refs: complete nodes={} ways={} relations={} missing_total={} missing_relation_occurrences={} {}",
+        result.node_count,
+        result.way_count,
+        result.relation_count,
+        result.total_missing(),
+        result.missing_relation_member_occurrences,
+        crate::debug::rss_line(),
+    );
     Ok(result)
 }

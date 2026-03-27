@@ -62,6 +62,7 @@ impl Default for PipelineConfig {
 /// The closure runs on the calling thread and may hold mutable state.
 /// PBF ordering (nodes → ways → relations) is preserved.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub(crate) fn run_pipeline<R, F>(
     mut blob_reader: BlobReader<R>,
@@ -83,6 +84,15 @@ where
     let has_tag_filter = blob_filter.as_ref().is_some_and(BlobFilter::has_tag_filter);
     blob_reader.set_parse_tagdata(has_tag_filter);
     blob_reader.set_parse_indexdata(blob_filter.is_some());
+    crate::debug_log!(
+        "pipeline: start read_ahead={} decode_ahead={} decode_threads={:?} blob_filter={} tag_filter={} {}",
+        pipeline_config.read_ahead,
+        pipeline_config.decode_ahead,
+        decode_thread_count,
+        blob_filter.is_some(),
+        has_tag_filter,
+        crate::debug::rss_line(),
+    );
     let blob_filter = blob_filter.map(Arc::new);
     let (raw_tx, raw_rx) = sync_channel::<RawItem>(pipeline_config.read_ahead);
     let (decoded_tx, decoded_rx) = sync_channel::<DecodedItem>(pipeline_config.decode_ahead);
@@ -197,18 +207,40 @@ where
         let mut pending: ReorderBuffer<Option<Result<PrimitiveBlock>>> =
             ReorderBuffer::with_capacity(pipeline_config.decode_ahead);
 
+        let mut delivered_blocks: u64 = 0;
+        #[cfg(feature = "debug-logging")]
+        let mut skipped_blobs: u64 = 0;
         for (seq, item) in decoded_rx {
             pending.push(seq, item);
 
             // Drain all consecutive ready blocks from the front.
             while let Some(item) = pending.pop_ready() {
                 match item {
-                    Some(Ok(block)) => block_fn(block)?,
+                    Some(Ok(block)) => {
+                        delivered_blocks += 1;
+                        if delivered_blocks.is_multiple_of(10_000) {
+                            crate::debug_log!(
+                                "pipeline: delivered {delivered_blocks} blocks (seq={seq}) {}",
+                                crate::debug::rss_line(),
+                            );
+                        }
+                        block_fn(block)?;
+                    }
                     Some(Err(e)) => return Err(e),
-                    None => {} // header or unknown blob — skip
+                    None => {
+                        #[cfg(feature = "debug-logging")]
+                        {
+                            skipped_blobs += 1;
+                        }
+                    } // header or unknown blob — skip
                 }
             }
         }
+
+        crate::debug_log!(
+            "pipeline: complete delivered_blocks={delivered_blocks} skipped_blobs={skipped_blobs} {}",
+            crate::debug::rss_line(),
+        );
 
         Ok(())
     })

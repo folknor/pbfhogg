@@ -798,6 +798,12 @@ fn classify_block_simple(
 
 #[allow(clippy::too_many_arguments)]
 fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
+    crate::debug_log!(
+        "extract(simple): start input={} output={} {}",
+        input.display(),
+        output.display(),
+        crate::debug::rss_line(),
+    );
     // Check if input is sorted — if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header) instead of a full ElementReader.
@@ -816,6 +822,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     };
 
     if is_sorted {
+        crate::debug_log!("extract(simple): sorted single-pass path {}", crate::debug::rss_line());
         return extract_simple_single_pass(input, output, region, set_bounds, clean, compression, direct_io, overrides);
     }
 
@@ -837,13 +844,25 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(spatial_blob_filter(&bbox_int));
+    let mut pass1_blocks: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        pass1_blocks += 1;
         classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
         );
+        if pass1_blocks.is_multiple_of(1_000) {
+            crate::debug_log!(
+                "extract(simple): unsorted pass1 blocks={pass1_blocks} {}",
+                crate::debug::rss_line(),
+            );
+        }
     }
+    crate::debug_log!(
+        "extract(simple): unsorted pass1 done blocks={pass1_blocks} {}",
+        crate::debug::rss_line(),
+    );
 
     let all_way_node_ids = IdSetDense::new();
     let reader = ElementReader::open(input, direct_io)?;
@@ -869,6 +888,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     })?;
 
     writer.flush()?;
+    crate::debug_log!("extract(simple): complete {}", crate::debug::rss_line());
     Ok(stats)
 }
 
@@ -894,6 +914,7 @@ fn extract_simple_single_pass(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
+    crate::debug_log!("extract(simple): single-pass start {}", crate::debug::rss_line());
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -923,8 +944,10 @@ fn extract_simple_single_pass(
     })?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut block_count: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
+        block_count += 1;
         let has_matches = classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
@@ -944,6 +967,15 @@ fn extract_simple_single_pass(
             process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
             batch.clear();
         }
+        if block_count.is_multiple_of(1_000) {
+            crate::debug_log!(
+                "extract(simple): single-pass blocks={block_count} matched_nodes={} matched_ways={} matched_relations={} {}",
+                stats.nodes_in_bbox,
+                stats.ways_written,
+                stats.relations_written,
+                crate::debug::rss_line(),
+            );
+        }
     }
     if !batch.is_empty() {
         let ids = ExtractPass2IdSets {
@@ -956,6 +988,10 @@ fn extract_simple_single_pass(
     }
 
     writer.flush()?;
+    crate::debug_log!(
+        "extract(simple): single-pass done blocks={block_count} {}",
+        crate::debug::rss_line(),
+    );
     Ok(stats)
 }
 
@@ -965,6 +1001,12 @@ fn extract_simple_single_pass(
 
 #[allow(clippy::too_many_arguments)]
 fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
+    crate::debug_log!(
+        "extract(complete_ways): start input={} output={} {}",
+        input.display(),
+        output.display(),
+        crate::debug::rss_line(),
+    );
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -979,6 +1021,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    crate::debug_log!("extract(complete_ways): pass1 done {}", crate::debug::rss_line());
 
     // --- Pass 2: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -1005,6 +1048,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     })?;
 
     writer.flush()?;
+    crate::debug_log!("extract(complete_ways): complete {}", crate::debug::rss_line());
     Ok(stats)
 }
 
@@ -1243,6 +1287,10 @@ fn collect_pass1_generic<H: RelationHandler>(
     direct_io: bool,
     handler: &mut H,
 ) -> Result<Pass1Result> {
+    crate::debug_log!(
+        "extract: pass1 collector start sorted_hint? pending {}",
+        crate::debug::rss_line(),
+    );
     let mut bbox_node_ids = IdSetDense::new();
     let mut matched_way_ids = IdSetDense::new();
     let mut all_way_node_ids = IdSetDense::new();
@@ -1252,8 +1300,10 @@ fn collect_pass1_generic<H: RelationHandler>(
     let is_sorted = reader.header().is_sorted();
     let filter = spatial_blob_filter(bbox_int);
     if !is_sorted {
+        let mut block_count: u64 = 0;
         for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
             let block = block_result?;
+            block_count += 1;
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
@@ -1283,7 +1333,17 @@ fn collect_pass1_generic<H: RelationHandler>(
                     _ => {}
                 }
             }
+            if block_count.is_multiple_of(1_000) {
+                crate::debug_log!(
+                    "extract: pass1 unsorted blocks={block_count} {}",
+                    crate::debug::rss_line(),
+                );
+            }
         }
+        crate::debug_log!(
+            "extract: pass1 unsorted done blocks={block_count} {}",
+            crate::debug::rss_line(),
+        );
         return Ok(Pass1Result {
             bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
         });
@@ -1291,12 +1351,14 @@ fn collect_pass1_generic<H: RelationHandler>(
 
     let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut block_count: u64 = 0;
     for block_result in reader
         .with_blob_filter(filter)
         .decode_threads(1)
         .into_blocks_pipelined()
     {
         let block = block_result?;
+        block_count += 1;
         match block.block_type() {
             BlockType::DenseNodes | BlockType::Nodes => {
                 if !way_batch.is_empty() {
@@ -1428,6 +1490,12 @@ fn collect_pass1_generic<H: RelationHandler>(
                 }
             }
         }
+        if block_count.is_multiple_of(1_000) {
+            crate::debug_log!(
+                "extract: pass1 sorted blocks={block_count} {}",
+                crate::debug::rss_line(),
+            );
+        }
     }
 
     if !way_batch.is_empty() {
@@ -1447,6 +1515,10 @@ fn collect_pass1_generic<H: RelationHandler>(
         );
     }
 
+    crate::debug_log!(
+        "extract: pass1 sorted done blocks={block_count} {}",
+        crate::debug::rss_line(),
+    );
     Ok(Pass1Result {
         bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
     })
@@ -1594,6 +1666,12 @@ fn extract_smart(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
+    crate::debug_log!(
+        "extract(smart): start input={} output={} {}",
+        input.display(),
+        output.display(),
+        crate::debug::rss_line(),
+    );
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -1609,14 +1687,17 @@ fn extract_smart(
     let mut handler = SmartRelationHandler::new();
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     let mut extra_node_ids = handler.extra_node_ids;
+    crate::debug_log!("extract(smart): pass1 done {}", crate::debug::rss_line());
 
     // --- Pass 2: Resolve extra way node deps ---
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
     // BlobFilter skips node and relation blobs (only ways are needed here).
     let reader = ElementReader::open(input, direct_io)?;
+    let mut pass2_blocks: u64 = 0;
     for block in reader.with_blob_filter(BlobFilter::new(false, true, false)).into_blocks_pipelined() {
         let block = block?;
+        pass2_blocks += 1;
         for group in block.groups() {
             for w in group.ways() {
                 let wid = w.id();
@@ -1627,7 +1708,17 @@ fn extract_smart(
                 }
             }
         }
+        if pass2_blocks.is_multiple_of(1_000) {
+            crate::debug_log!(
+                "extract(smart): pass2 blocks={pass2_blocks} {}",
+                crate::debug::rss_line(),
+            );
+        }
     }
+    crate::debug_log!(
+        "extract(smart): pass2 done blocks={pass2_blocks} {}",
+        crate::debug::rss_line(),
+    );
 
     // --- Pass 3: Write matching elements in file order ---
     let reader = ElementReader::open(input, direct_io)?;
@@ -1656,6 +1747,7 @@ fn extract_smart(
     })?;
 
     writer.flush()?;
+    crate::debug_log!("extract(smart): complete {}", crate::debug::rss_line());
     Ok(stats)
 }
 

@@ -17,15 +17,6 @@
 //! Memory at every stage: <1 GB. All I/O sequential. No mmap, no random access.
 //! See `notes/altw-partitioned.md` for the full design.
 
-/// Debug logging for stage timing, RSS, and progress. Gated behind
-/// the `debug-logging` feature to avoid noise in production.
-macro_rules! debug_log {
-    ($($arg:tt)*) => {
-        #[cfg(feature = "debug-logging")]
-        debug_log!($($arg)*);
-    };
-}
-
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +25,7 @@ use rayon::prelude::*;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
 use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::debug_log;
 
 use super::add_locations_to_ways::Stats;
 use super::id_set_dense::IdSetDense;
@@ -43,42 +35,6 @@ use super::{
     flush_local, require_indexdata, writer_from_header,
     HeaderOverrides, Result, BATCH_SIZE,
 };
-
-// ---------------------------------------------------------------------------
-// RSS tracking
-// ---------------------------------------------------------------------------
-
-/// Read current RSS in kilobytes from `/proc/self/statm`.
-fn read_rss_kb() -> u64 {
-    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
-        return 0;
-    };
-    let Some(resident_str) = statm.split_whitespace().nth(1) else {
-        return 0;
-    };
-    let Ok(pages) = resident_str.parse::<u64>() else {
-        return 0;
-    };
-    pages * 4 // page size = 4 KB on x86_64
-}
-
-/// Read RSS breakdown (anon vs file) from `/proc/self/status`.
-fn read_rss_detail() -> String {
-    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
-        return String::new();
-    };
-    let mut anon_kb: u64 = 0;
-    let mut file_kb: u64 = 0;
-    for line in status.lines() {
-        if let Some(v) = line.strip_prefix("RssAnon:") {
-            anon_kb = v.trim().strip_suffix(" kB").unwrap_or("0").trim().parse().unwrap_or(0);
-        }
-        if let Some(v) = line.strip_prefix("RssFile:") {
-            file_kb = v.trim().strip_suffix(" kB").unwrap_or("0").trim().parse().unwrap_or(0);
-        }
-    }
-    format!("anon={}MB file={}MB", anon_kb / 1024, file_kb / 1024)
-}
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -402,7 +358,7 @@ fn stage1_way_pass(
         }
         block_count += 1;
         if block_count.is_multiple_of(1000) {
-            debug_log!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+            debug_log!("  stage1: {block_count} blocks, {slot_pos} refs, {}", crate::debug::rss_line());
         }
     }
 
@@ -490,7 +446,7 @@ fn stage2_node_join(
         return Ok(0); // No COO pairs at all
     }
 
-    debug_log!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
+    debug_log!("  stage2: after bucket load, {}", crate::debug::rss_line());
 
     // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
     // per-block heap allocations (WireStringTable entries, group_ranges) that
@@ -502,7 +458,7 @@ fn stage2_node_join(
     let _ = blob_reader.next(); // skip header blob
     blob_reader.set_parse_indexdata(true); // re-enable for blob filter
 
-    debug_log!("  stage2: reader open, rss={}MB", read_rss_kb() / 1024);
+    debug_log!("  stage2: reader open, {}", crate::debug::rss_line());
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
@@ -523,7 +479,7 @@ fn stage2_node_join(
 
         block_count += 1;
         if block_count.is_multiple_of(1000) {
-            debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+            debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, {}", crate::debug::rss_line());
         }
 
         // Parse PrimitiveBlock wire format inline — extract only granularity,
@@ -588,10 +544,9 @@ fn stage2_node_join(
                 while id >= bucket_max_id {
                     if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
                         debug_log!(
-                            "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, rss={}MB {})",
+                            "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, {})",
                             sorted_pairs.len(),
-                            read_rss_kb() / 1024,
-                            read_rss_detail(),
+                            crate::debug::rss_line(),
                         );
                     }
                     bucket_idx += 1;
@@ -921,7 +876,7 @@ fn stage4_assembly(
 
             block_count += BATCH_SIZE as u64;
             if block_count.is_multiple_of(1000) {
-                debug_log!("  stage4: {block_count} blocks, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+                debug_log!("  stage4: {block_count} blocks, {}", crate::debug::rss_line());
             }
         }
     }
@@ -1177,9 +1132,12 @@ pub fn external_join(
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
     let stage1_ms = t1.elapsed().as_millis();
+    #[cfg(not(feature = "debug-logging"))]
+    let _ = (total_coo, stage1_ms);
     debug_log!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
     debug_log!("stage1_ms={stage1_ms}");
-    debug_log!("  rss_after_stage1_mb={}", read_rss_kb() / 1024);
+    debug_log!("rss_after_stage1_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
+    debug_log!("  rss_after_stage1={}", crate::debug::rss_line());
 
     // --- Stage 2: Node join ---
     let t2 = std::time::Instant::now();
@@ -1190,9 +1148,12 @@ pub fn external_join(
     slot_buckets.finish()?;
     node_buckets.cleanup();
     let stage2_ms = t2.elapsed().as_millis();
+    #[cfg(not(feature = "debug-logging"))]
+    let _ = (resolved_count, stage2_ms);
     debug_log!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
     debug_log!("stage2_ms={stage2_ms}");
-    debug_log!("  rss_after_stage2_mb={}", read_rss_kb() / 1024);
+    debug_log!("rss_after_stage2_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
+    debug_log!("  rss_after_stage2={}", crate::debug::rss_line());
 
     // --- Stage 3: Slot reorder ---
     let t3 = std::time::Instant::now();
@@ -1201,9 +1162,12 @@ pub fn external_join(
     stage3_slot_reorder(&slot_buckets, &coord_slots_path, total_slots)?;
     slot_buckets.cleanup();
     let stage3_ms = t3.elapsed().as_millis();
+    #[cfg(not(feature = "debug-logging"))]
+    let _ = stage3_ms;
     debug_log!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
     debug_log!("stage3_ms={stage3_ms}");
-    debug_log!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
+    debug_log!("rss_after_stage3_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
+    debug_log!("  rss_after_stage3={}", crate::debug::rss_line());
 
     // Collect relation member node IDs (for node filtering in stage 4).
     // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
@@ -1214,7 +1178,7 @@ pub fn external_join(
             input, direct_io,
         )?)
     };
-    debug_log!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
+    debug_log!("  rss_after_relation_scan={}", crate::debug::rss_line());
 
     // --- Stage 4: Assembly ---
     let t4 = std::time::Instant::now();
@@ -1231,11 +1195,14 @@ pub fn external_join(
         overrides,
     )?;
     let stage4_ms = t4.elapsed().as_millis();
+    #[cfg(not(feature = "debug-logging"))]
+    let _ = stage4_ms;
     debug_log!("  assembly complete ({stage4_ms}ms)");
     debug_log!("stage4_ms={stage4_ms}");
     debug_log!("total_slots={total_slots}");
     debug_log!("resolved_count={resolved_count}");
-    debug_log!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
+    debug_log!("rss_after_stage4_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
+    debug_log!("  rss_after_stage4={}", crate::debug::rss_line());
 
     // scratch_dir dropped here → cleanup all temp files.
     Ok(stats)

@@ -239,6 +239,13 @@ fn filter_by_id(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
+    crate::debug_log!(
+        "getid(filter): start input={} output={} include={} {}",
+        input.display(),
+        output.display(),
+        include,
+        crate::debug::rss_line(),
+    );
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Skip blob types with no matching IDs (getid only — removeid needs all types).
@@ -269,6 +276,13 @@ fn filter_by_id(
         })?;
 
     writer.flush()?;
+    crate::debug_log!(
+        "getid(filter): complete nodes={} ways={} relations={} {}",
+        stats.nodes_written,
+        stats.ways_written,
+        stats.relations_written,
+        crate::debug::rss_line(),
+    );
     Ok(stats)
 }
 
@@ -277,6 +291,13 @@ fn filter_by_id(
 // ---------------------------------------------------------------------------
 
 fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<GetidStats> {
+    crate::debug_log!(
+        "getid(with-refs): start input={} output={} remove_tags={} {}",
+        input.display(),
+        output.display(),
+        opts.remove_tags,
+        crate::debug::rss_line(),
+    );
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -291,8 +312,10 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     if !ids.way_ids.is_empty() {
         let reader = ElementReader::open(input, direct_io)?
             .with_blob_filter(BlobFilter::only_ways());
+        let mut pass1_blocks: u64 = 0;
         for block in reader.into_blocks_pipelined() {
             let block = block?;
+            pass1_blocks += 1;
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
                     && ids.way_ids.contains(&w.id())
@@ -303,7 +326,19 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
                     }
                 }
             }
+            if pass1_blocks.is_multiple_of(1_000) {
+                crate::debug_log!(
+                    "getid(with-refs): pass1 blocks={pass1_blocks} has_dep_nodes={} {}",
+                    has_dep_nodes,
+                    crate::debug::rss_line(),
+                );
+            }
         }
+        crate::debug_log!(
+            "getid(with-refs): pass1 done blocks={pass1_blocks} has_dep_nodes={} {}",
+            has_dep_nodes,
+            crate::debug::rss_line(),
+        );
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.contains(&id).
@@ -334,6 +369,13 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         })?;
 
     writer.flush()?;
+    crate::debug_log!(
+        "getid(with-refs): complete nodes={} ways={} relations={} {}",
+        stats.nodes_written,
+        stats.ways_written,
+        stats.relations_written,
+        crate::debug::rss_line(),
+    );
     Ok(stats)
 }
 

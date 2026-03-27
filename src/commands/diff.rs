@@ -119,6 +119,7 @@ impl DiffMeta for OwnedRelation {
 /// Streams through both files in constant memory (~3 MB overhead per cursor)
 /// using pipelined block iterators. Requires both inputs to declare
 /// `Sort.Type_then_ID` — returns an actionable error if either is unsorted.
+#[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn diff(
     old_path: &Path,
@@ -127,6 +128,12 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
 ) -> Result<DiffStats> {
+    crate::debug_log!(
+        "diff: start old={} new={} {}",
+        old_path.display(),
+        new_path.display(),
+        crate::debug::rss_line(),
+    );
     let _ = (options.ignore_changeset, options.ignore_uid, options.ignore_user);
     let filter = match options.type_filter.as_deref() {
         Some(s) => TypeFilter::parse(s),
@@ -165,40 +172,82 @@ pub fn diff(
     // Phase 1: Nodes
     // Each phase uses local buffers — T changes between phases so they cannot
     // be shared. Allocation is negligible (one block's worth, up to 8000 elements).
-    let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
-
     if filter.nodes {
+        crate::debug_log!("diff: phase nodes start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        run_diff_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut ctx, write_node_details,
-        )?;
+        {
+            let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
+            run_diff_phase(
+                &mut old_src, &mut ob, &mut new_src, &mut nb,
+                &mut ctx, write_node_details,
+            )?;
+        }
+        crate::debug_log!(
+            "diff: phase nodes done common={} created={} modified={} deleted={} {}",
+            stats.common,
+            stats.created,
+            stats.modified,
+            stats.deleted,
+            crate::debug::rss_line(),
+        );
     } else {
         drain_phase::<OwnedNode>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 2: Ways
     if filter.ways {
+        crate::debug_log!("diff: phase ways start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        run_diff_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut ctx, write_way_details,
-        )?;
+        {
+            let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
+            run_diff_phase(
+                &mut old_src, &mut ob, &mut new_src, &mut nb,
+                &mut ctx, write_way_details,
+            )?;
+        }
+        crate::debug_log!(
+            "diff: phase ways done common={} created={} modified={} deleted={} {}",
+            stats.common,
+            stats.created,
+            stats.modified,
+            stats.deleted,
+            crate::debug::rss_line(),
+        );
     } else {
         drain_phase::<OwnedWay>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 3: Relations
     if filter.relations {
+        crate::debug_log!("diff: phase relations start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        run_diff_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut ctx, write_relation_details,
-        )?;
+        {
+            let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
+            run_diff_phase(
+                &mut old_src, &mut ob, &mut new_src, &mut nb,
+                &mut ctx, write_relation_details,
+            )?;
+        }
+        crate::debug_log!(
+            "diff: phase relations done common={} created={} modified={} deleted={} {}",
+            stats.common,
+            stats.created,
+            stats.modified,
+            stats.deleted,
+            crate::debug::rss_line(),
+        );
     } else {
         drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
     }
 
+    crate::debug_log!(
+        "diff: complete common={} created={} modified={} deleted={} {}",
+        stats.common,
+        stats.created,
+        stats.modified,
+        stats.deleted,
+        crate::debug::rss_line(),
+    );
     Ok(stats)
 }
 

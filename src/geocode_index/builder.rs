@@ -194,6 +194,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Pass 1: Relations — collect admin boundary metadata + way member IDs
     // (Runs first so we know which way IDs to collect in pass 3.)
     // -----------------------------------------------------------------------
+    crate::debug::emit_marker("GEOCODE_PASS1_START");
     eprintln!("Pass 1: Relations...");
     crate::debug_log!("geocode-index: pass1 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
@@ -289,6 +290,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // sequentially on the caller thread — no concurrent data structure changes
     // needed. Decompression is overlapped with I/O in the pipeline's rayon pool.
     // -----------------------------------------------------------------------
+    crate::debug::emit_marker("GEOCODE_PASS1_END");
+    crate::debug::emit_marker("GEOCODE_PASS2_START");
     eprintln!("Pass 2: Nodes + Ways (pipelined)...");
     crate::debug_log!("geocode-index: pass2 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
@@ -608,6 +611,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
 
     // -----------------------------------------------------------------------
+    crate::debug::emit_marker("GEOCODE_PASS2_END");
+    crate::debug::emit_marker("GEOCODE_PASS3_START");
     // Pass 3: Bucketed S2 cell assignment + write cell index files
     //
     // Instead of accumulating all cell entries in RAM (~19 GB at planet),
@@ -716,6 +721,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             eprintln!("peak_rss_kb={rss_kb}");
         }
     }
+    crate::debug::emit_marker("GEOCODE_PASS3_END");
     crate::debug_log!("geocode-index: complete {}", crate::debug::rss_line());
 
     Ok(BuildStats {

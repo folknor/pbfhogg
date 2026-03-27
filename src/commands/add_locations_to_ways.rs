@@ -774,9 +774,13 @@ pub fn add_locations_to_ways(
     // Pass 0: collect the set of node IDs referenced by ways. Only these
     // nodes need coordinate lookups, so only these get indexed. At planet
     // scale this reduces touched mmap pages from ~80 GB to ~16 GB.
+    crate::debug::emit_marker("ALTW_PASS0_START");
     let referenced = collect_way_referenced_node_ids(input, direct_io)?;
+    crate::debug::emit_marker("ALTW_PASS0_END");
 
+    crate::debug::emit_marker("ALTW_PASS1_START");
     let index = build_node_index(input, direct_io, scratch_dir, &referenced, index_type)?;
+    crate::debug::emit_marker("ALTW_PASS1_END");
     drop(referenced);
 
     let relation_member_node_ids = if keep_untagged_nodes {
@@ -784,7 +788,8 @@ pub fn add_locations_to_ways(
     } else {
         Some(collect_relation_member_node_ids(input, direct_io)?)
     };
-    write_output_checked(
+    crate::debug::emit_marker("ALTW_PASS2_START");
+    let result = write_output_checked(
         input,
         output,
         &index,
@@ -794,7 +799,9 @@ pub fn add_locations_to_ways(
         direct_io,
         indexdata_present,
         overrides,
-    )
+    );
+    crate::debug::emit_marker("ALTW_PASS2_END");
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -803,7 +810,6 @@ pub fn add_locations_to_ways(
 
 /// Number of decoded `PrimitiveBlock`s collected before dispatching to rayon
 /// for parallel node index population.
-
 fn build_node_index(
     input: &Path,
     direct_io: bool,

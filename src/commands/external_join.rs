@@ -1039,6 +1039,7 @@ pub fn external_join(
     let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")))?;
 
     // --- Stage 1: Way pass ---
+    crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let t1 = std::time::Instant::now();
     debug_log!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
     let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
@@ -1054,6 +1055,8 @@ pub fn external_join(
     debug_log!("  rss_after_stage1={}", crate::debug::rss_line());
 
     // --- Stage 2: Node join ---
+    crate::debug::emit_marker("EXTJOIN_STAGE1_END");
+    crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let t2 = std::time::Instant::now();
     debug_log!("external join: stage 2 — node join (merge-join per bucket)...");
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
@@ -1070,6 +1073,8 @@ pub fn external_join(
     debug_log!("  rss_after_stage2={}", crate::debug::rss_line());
 
     // --- Stage 3: Slot reorder ---
+    crate::debug::emit_marker("EXTJOIN_STAGE2_END");
+    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
     let t3 = std::time::Instant::now();
     debug_log!("external join: stage 3 — slot reorder, building coord_slots file...");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
@@ -1095,6 +1100,8 @@ pub fn external_join(
     debug_log!("  rss_after_relation_scan={}", crate::debug::rss_line());
 
     // --- Stage 4: Assembly ---
+    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
+    crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let t4 = std::time::Instant::now();
     debug_log!("external join: stage 4 — assembling enriched PBF...");
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
@@ -1111,6 +1118,7 @@ pub fn external_join(
     let stage4_ms = t4.elapsed().as_millis();
     #[cfg(not(feature = "debug-logging"))]
     let _ = stage4_ms;
+    crate::debug::emit_marker("EXTJOIN_STAGE4_END");
     debug_log!("  assembly complete ({stage4_ms}ms)");
     debug_log!("stage4_ms={stage4_ms}");
     debug_log!("total_slots={total_slots}");

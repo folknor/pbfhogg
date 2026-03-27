@@ -38,6 +38,48 @@ pub(crate) fn rss_line() -> String {
     }
 }
 
+/// Emit a named phase marker to the sidecar profiler (if active).
+///
+/// The marker is timestamped with CLOCK_MONOTONIC microseconds since process
+/// start and written to the FIFO at `PBFHOGG_MARKER_FIFO`. If no sidecar is
+/// running (env var absent), this is a no-op. If the FIFO buffer is full,
+/// the marker is silently dropped (O_NONBLOCK).
+pub(crate) fn emit_marker(name: &str) {
+    use std::io::Write;
+    use std::sync::OnceLock;
+
+    static STATE: OnceLock<Option<(std::fs::File, std::time::Instant)>> = OnceLock::new();
+
+    let state = STATE.get_or_init(|| {
+        let path = std::env::var("PBFHOGG_MARKER_FIFO").ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // O_NONBLOCK = 0x800 on Linux, 0x0004 on macOS
+            #[cfg(target_os = "linux")]
+            const O_NONBLOCK: i32 = 0x800;
+            #[cfg(target_os = "macos")]
+            const O_NONBLOCK: i32 = 0x0004;
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(O_NONBLOCK)
+                .open(&path)
+                .ok()?;
+            Some((f, std::time::Instant::now()))
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            None
+        }
+    });
+
+    if let Some((f, start)) = state.as_ref() {
+        let us = start.elapsed().as_micros();
+        drop((&*f).write_all(format!("{us} {name}\n").as_bytes()));
+    }
+}
+
 #[macro_export]
 macro_rules! debug_log {
     ($($arg:tt)*) => {{

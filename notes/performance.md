@@ -160,9 +160,14 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 | Dataset | Dense | Sparse | External | Commit |
 |---------|-------|--------|----------|--------|
 | Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
-| Japan (2.4 GB) | **72s** | 72s | — | — |
-| Europe (33.6 GB) | 2,565s (43m) | 6,453s (107m) | **921s (15m)** | `ee9b19f` |
+| Japan (2.4 GB) | **42s** | — | — | `b3e8bf7` (node scanner) |
+| Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **921s (15m)** | `ee9b19f` |
 | Planet (87.7 GB) | 5,773s (96m)* | — | ~45-60m (est.) | — |
+
+*Dense at Europe scale thrashes on 30 GB host (mmap working set ~16 GB > available
+RAM). Japan 42s is with node-only scanner for pass 1 (commit `b3e8bf7`, previously
+72s with pipelined PrimitiveBlock). Europe 2,940s is also with node scanner but
+mmap thrashing dominates.
 
 *Planet with dense thrashes on 30 GB host (memory-latency-bound).
 
@@ -352,12 +357,24 @@ Reverse geocoding index build. 4-pass pipeline: nodes (address points + dense
 node index), ways (streets, buildings, interpolation), relations (admin boundary
 assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14).
 
-Commit `ed34092`, plantasjen.
+| Dataset | PBF size | Time | Index size | Addr points | Streets | Admin | Commit |
+|---------|----------|------|------------|-------------|---------|-------|--------|
+| Denmark | 465 MB | **13.7s** | 172 MB | 2.6M | 314K | 2K | `5776b67` |
+| Japan | 2.4 GB | **57s** | — | — | — | — | `5776b67` (sidecar) |
+| Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
-| Dataset | PBF size | Time | Index size | Addr points | Streets | Admin |
-|---------|----------|------|------------|-------------|---------|-------|
-| Denmark | 465 MB | **20.8s** | 172 MB | 2.6M | 314K | 2K |
-| Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K |
+### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
+
+| Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |
+|-------|----------|----------|-----------|-----------|------------|--------|
+| Pass 1 (relations) | 0.9s | 9 MB | 5 MB | 2.3 GB | 0 | 0 |
+| Pass 2 (nodes+ways) | 55-60s | **19 GB** | **325 MB** | — | — | 1.3M (plateau, no thrash) |
+| Pass 3 (S2 cells) | 1.9s | 352 MB | 273 MB | — | 539 MB | — |
+
+Sequential reader (commit `5776b67`) keeps anon bounded at 325 MB — no
+PrimitiveBlock cross-thread retention. The 19 GB peak RSS is the DenseMmapIndex
+mmap (file-backed, fits in RAM at Japan scale). At Europe/planet scale this
+mmap would thrash (same as dense ALTW).
 
 Denmark: 0 interpolation ways (Scandinavian precise addressing). Germany: 78
 interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.

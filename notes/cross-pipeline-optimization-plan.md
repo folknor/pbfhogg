@@ -11,15 +11,15 @@ the full investigation that produced these findings.
 Ordered by impact and dependency. Items within a group can be done in any order.
 
 **Group 1: Infrastructure (unblocks everything else)**
-1. Document PrimitiveBlock retention footgun in pipeline.rs
-2. Move `extract_node_tuples` / `NodeTuple` to shared location
-3. Move `read_rss_detail()` to shared command utilities
+1. ~~Document PrimitiveBlock retention footgun in pipeline.rs~~ — Done (commit `a067759`)
+2. ~~Move `extract_node_tuples` / `NodeTuple` to shared location~~ — Done (`commands/node_scanner.rs`, commit `b3e8bf7`)
+3. ~~Move `read_rss_detail()` to shared command utilities~~ — Done (`debug.rs`, done by user)
 4. BlobReader fadvise: gate on `target_os = "linux"` instead of `linux-direct-io`
 
 **Group 2: Planet blockers (things that will OOM at planet scale)**
-5. build-geocode-index: sequential reader for pass 2 node phase
-6. ALTW dense pass 1: node-only scanner for node index build
-7. ALTW sparse pass 1: same as dense
+5. ~~build-geocode-index: sequential reader for pass 2 node phase~~ — Done (commit `5776b67`). Sidecar confirmed: anon=325 MB, 19 GB mmap RSS at Japan.
+6. ~~ALTW dense pass 1: node-only scanner for node index build~~ — Done (commit `b3e8bf7`). Japan 69s → 42s (-39%).
+7. ~~ALTW sparse pass 1: same as dense~~ — Done (commit `a067759`). Denmark verified.
 8. diff: sequential readers for both pipelines
 
 **Group 3: External join next cycle (P2b/P2c)**
@@ -68,7 +68,7 @@ Every command using pipelined PrimitiveBlock decode at Europe/planet scale:
 | check-refs | `for_each_pipelined` | ~520K | RoaringTreemap (~3 GB) | High |
 | tags-filter | `into_blocks_pipelined` (up to 4 passes) | ~520K per pass | Up to 7 IdSetDense (~10.5 GB) | High |
 | getid / getparents | `into_blocks_pipelined` | ~520K (often blob-filtered) | Minimal | Medium |
-| build-geocode-index pass 1+2 | `for_each_block_pipelined` | ~520K | DenseMmapIndex (~16 GB) | **Very high — next victim** |
+| build-geocode-index pass 1+2 | sequential BlobReader (commit `5776b67`) | ~520K | DenseMmapIndex (~16 GB) | **Fixed** — anon bounded at 325 MB. Mmap RSS remains. |
 | diff / derive-changes | `into_blocks_pipelined` (two files) | ~520K x 2 | 2x retention | Very high |
 | ALTW dense pass 0/1 | `into_blocks_pipelined` | ~520K (filtered) | 16 GB mmap | Medium (mmap dominates) |
 | ALTW sparse pass 0/1 | `into_blocks_pipelined` | ~520K (filtered) | 540 MB + 16 GB values | Medium |
@@ -96,7 +96,7 @@ pattern from the external join investigation.
 | Priority | Command | Fix | Effort |
 |----------|---------|-----|--------|
 | 1 | pipeline.rs | Document footgun: add warning comment about 400K+ block retention | Trivial |
-| 2 | build-geocode-index | Sequential reader for pass 2 node phase (next planet-scale victim) | Medium |
+| ~~2~~ | ~~build-geocode-index~~ | ~~Sequential reader for pass 2 node phase~~ | **Done (commit `5776b67`). Sidecar confirmed: anon=325 MB flat at Japan scale. 19 GB peak RSS is DenseMmapIndex mmap (file-backed). Mmap thrashing is the remaining bottleneck at Europe/planet, not PrimitiveBlock retention.** |
 | 3 | ALTW dense pass 1 | Node-only scanner for node index build | Medium |
 | 4 | extract pass 1 | Node-only scanner for bbox node classification (sorted path) | Medium |
 | 5 | check-refs | Sequential reader or batch-bounded consumption | Low |

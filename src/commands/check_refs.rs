@@ -4,7 +4,7 @@ use std::path::Path;
 
 use roaring::RoaringTreemap;
 
-use crate::{BlobFilter, Element, ElementReader, MemberId};
+use crate::{Element, MemberId};
 
 use super::Result;
 
@@ -100,7 +100,7 @@ impl RefCheckResult {
 /// RoaringTreemap (not RoaringBitmap) is required because RoaringBitmap only
 /// supports `u32` (max ~4.3B), which cannot hold current node IDs exceeding
 /// 10 billion.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
     crate::debug_log!(
@@ -110,13 +110,16 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         show_ids,
         crate::debug::rss_line(),
     );
-    let reader = ElementReader::open(path, direct_io)?;
-    // Skip relation blobs when not checking relation references.
-    let reader = if check_relations {
-        reader
-    } else {
-        reader.with_blob_filter(BlobFilter::new(true, true, false))
-    };
+    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
+    // retention (25+ GB at Europe/planet scale). check-refs does lightweight
+    // per-element work (RoaringTreemap inserts) — the pipelined reader's
+    // parallel decode creates cross-thread churn that dominates at scale.
+    // See notes/cross-pipeline-optimization-plan.md.
+    let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
 
     let mut node_ids = RoaringTreemap::new();
     let mut way_ids = RoaringTreemap::new();
@@ -152,7 +155,22 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     };
     let mut progress_count: u64 = 0;
 
-    reader.for_each_pipelined(|element| {
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        // Skip relation blobs when not checking relation references.
+        if !check_relations {
+            if let Some(idx) = blob.index() {
+                if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                    continue;
+                }
+            }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new(decompressed)?;
+        for element in block.elements_skip_metadata() {
         progress_count += 1;
         if progress_count.is_multiple_of(1_000_000) {
             crate::debug_log!(
@@ -239,7 +257,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 }
             }
         }
-    })?;
+    } } // for element, for blob_result
 
     result.missing_node_refs = missing_node_refs_set.len();
     result.missing_node_members = missing_node_members_set.len();

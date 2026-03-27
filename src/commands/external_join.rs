@@ -811,11 +811,20 @@ fn stage4_assembly(
         blobs_decoded: 0,
     };
 
-    let reader = ElementReader::open(input, direct_io)?;
+    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free churn.
+    // The pipelined reader causes 25+ GB heap retention at Europe scale because
+    // rayon decode threads allocate WireStringTable/group_ranges Boxes that are
+    // freed on the consumer thread. Sequential decode keeps all alloc/free on
+    // one thread. Batch parallel assembly still uses rayon for BlockBuilder work.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+
     let mut writer = writer_from_header(
         output,
         compression,
-        reader.header(),
+        &header,
         true,
         overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
@@ -823,9 +832,17 @@ fn stage4_assembly(
 
     let mut slot_pos: u64 = 0;
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    let mut block_count: u64 = 0;
 
-    for block in reader.into_blocks_pipelined() {
-        batch.push(block?);
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        let decompressed = blob.decompress_raw()?;
+        let block = PrimitiveBlock::new(decompressed)?;
+        batch.push(block);
+
         if batch.len() >= BATCH_SIZE {
             let batch_stats = assemble_batch(
                 &batch,
@@ -837,6 +854,11 @@ fn stage4_assembly(
             )?;
             merge_stats(&mut stats, &batch_stats);
             batch.clear();
+
+            block_count += BATCH_SIZE as u64;
+            if block_count.is_multiple_of(1000) {
+                eprintln!("  stage4: {block_count} blocks, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+            }
         }
     }
 
@@ -1115,25 +1137,38 @@ pub fn external_join(
     eprintln!("stage3_ms={stage3_ms}");
     eprintln!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
 
-    // TEMPORARY: skip stage 4 while testing stage 1-3 optimizations.
-    // Stage 4 assembly has a separate PrimitiveBlock churn OOM that needs
-    // sequential iteration — fix independently.
-    eprintln!("EARLY EXIT after stage 3 (stage 4 disabled for testing)");
+    // Collect relation member node IDs (for node filtering in stage 4).
+    // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
+    let relation_member_node_ids = if keep_untagged_nodes {
+        None
+    } else {
+        Some(super::add_locations_to_ways::collect_relation_member_node_ids(
+            input, direct_io,
+        )?)
+    };
+    eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
+
+    // --- Stage 4: Assembly ---
+    let t4 = std::time::Instant::now();
+    eprintln!("external join: stage 4 — assembling enriched PBF...");
+    let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
+    let stats = stage4_assembly(
+        input,
+        output,
+        &coord_slots,
+        keep_untagged_nodes,
+        relation_member_node_ids.as_ref(),
+        compression,
+        direct_io,
+        overrides,
+    )?;
+    let stage4_ms = t4.elapsed().as_millis();
+    eprintln!("  assembly complete ({stage4_ms}ms)");
+    eprintln!("stage4_ms={stage4_ms}");
     eprintln!("total_slots={total_slots}");
     eprintln!("resolved_count={resolved_count}");
-    // TODO: stage 4 disabled — PrimitiveBlock churn OOMs at Europe scale.
-    // Fix via sequential iteration or decode_threads(1), then re-enable.
-    eprintln!("TEMPORARY: stage 4 disabled, exiting after stage 3");
-    eprintln!("total_slots={total_slots}");
-    eprintln!("resolved_count={resolved_count}");
-    Ok(Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    })
+    eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
+
+    // scratch_dir dropped here → cleanup all temp files.
+    Ok(stats)
 }

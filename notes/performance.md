@@ -159,40 +159,51 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
 | Dataset | Dense | Sparse | External | Commit |
 |---------|-------|--------|----------|--------|
-| Denmark (465 MB) | **6.8s** | 14.1s | 22s | `165cbb2` |
-| Japan (2.4 GB) | **72s** | 72s | 143s | `a334c72` |
-| Europe (33.6 GB) | 2,565s (43m) | 6,453s (107m) | **1,824s (30m)** | `165cbb2` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | ~80m (est.) | — |
+| Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
+| Japan (2.4 GB) | **72s** | 72s | — | — |
+| Europe (33.6 GB) | 2,565s (43m) | 6,453s (107m) | **921s (15m)** | `ee9b19f` |
+| Planet (87.7 GB) | 5,773s (96m)* | — | ~45-60m (est.) | — |
 
 *Planet with dense thrashes on 30 GB host (memory-latency-bound).
 
-Dense is fastest when the working set fits in RAM. External uses <1 GB RAM
-at any scale via bucketed sequential I/O (4-stage radix join pipeline).
+Dense is fastest when the working set fits in RAM. External uses ~1.6 GB
+anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
+scanner for stage 2, scatter buffer for stage 3, sequential reader for
+stage 4).
 
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
-(33.6 GB, external 29% faster). At Europe scale, dense's mmap working set
-(~16 GB) exceeds available RAM after page cache pressure from the 33.6 GB
-input file, causing thrashing. External's sequential I/O stays bounded.
+(33.6 GB, external 2.8x faster). At Europe scale, dense's mmap working set
+(~16 GB) exceeds available RAM, causing thrashing. External's sequential
+I/O stays bounded.
 
-Planet extrapolation: external ~80 min (2.6× Europe) vs dense 96 min
-(measured, thrashing). External should be ~17% faster at planet scale
-while using <1 GB RSS vs dense's 16 GB mmap. See `notes/altw-partitioned.md`.
+### External join stage breakdown (Europe, commit `ee9b19f`, plantasjen)
 
-fadvise(DONTNEED) on bucket files + mmap coord_slots with MADV_SEQUENTIAL
-(commit `165cbb2`): Denmark 25→22s, Europe 2060→1824s (-11%). fadvise
-prevents bucket writes from evicting PBF pages; mmap eliminates per-ref
-pread syscalls in the assembly stage.
+| Stage | Time | RSS (anon) | Description |
+|-------|------|-----------|-------------|
+| Stage 1 (way pass) | 81s | 69 MB post | Pipelined reader + BufWriter buckets |
+| Stage 2 (node join) | 301s | 69 MB post | Node-only sequential scanner + merge-join |
+| Stage 3 (slot reorder) | 78s | 69 MB post | Scatter buffer (was 1079s with pwrite) |
+| Stage 4 (assembly) | 461s | 1.6 GB flat | Sequential reader + batch parallel assembly |
+| **Total** | **921s** | | With `--compression none`: ~754s |
 
-Sparse is slower than dense at all scales. At Europe scale the overhead
-ratio *increases* (2.5x vs 2.1x) — the 16 GB on-disk values mmap thrashes
-just like the dense mmap, with additional sort+hash CPU cost on top.
+### External join optimization history
 
-The external join was dramatically improved by a single-pass node merge
-(commit `a334c72`): Denmark 302s → 25s (12x). The previous implementation
-re-read ALL PBF node blobs 256 times (once per bucket); the new version
-reads them exactly once.
+| Version | Denmark | Europe | Commit |
+|---------|---------|--------|--------|
+| Original (256x re-read) | 302s | — | `034422c` |
+| Single-pass merge | 25s | 2,060s | `a334c72` |
+| + fadvise + mmap coord_slots | 22s | 1,824s | `165cbb2` |
+| Node-only scanner + scatter buffer | 14s | 921s | `ee9b19f` |
+| + blob skip + pool reuse | 14s | ~901s | `d272b49` |
 
-See [altw-memory.md](altw-memory.md) for full analysis and next steps.
+Key optimizations: node-only wire scanner (bypasses PrimitiveBlock, eliminates
+25 GB heap retention), scatter buffer (eliminates sort + 4.69B pwrite calls,
+15x speedup), BlobReader fadvise(DONTNEED) (general infrastructure), deferred
+IdSetDense, buffer reuse in bucket loads.
+
+See [external-join-oom-investigation.md](external-join-oom-investigation.md)
+for the full investigation and [altw-memory.md](altw-memory.md) for the
+memory optimization research log.
 
 ## CLI commands
 

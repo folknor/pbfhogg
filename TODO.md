@@ -77,6 +77,16 @@ But fadvise doesn't need O_DIRECT — it's a separate concern. Should be gated o
 `target_os = "linux"` with `libc` as a direct dependency for the fadvise path,
 so buffered-only Linux builds also get page cache eviction.
 
+## Cross-pipeline optimization
+
+PrimitiveBlock cross-thread alloc/free retention affects every command using
+the pipelined reader at 400K+ blocks (Europe/planet scale). The geocode builder
+is the predicted next victim (16 GB DenseMmapIndex + 25 GB retention = OOM).
+
+See [notes/cross-pipeline-optimization-plan.md](notes/cross-pipeline-optimization-plan.md)
+for the complete plan: 20 items across 5 priority groups, covering infrastructure
+fixes, planet blockers, external join P2b/P2c, and all affected commands.
+
 ## ALTW external join: parallel decompress (next cycle)
 
 External join works end-to-end at Europe scale: 921s (15 min), 1.6 GB RSS,

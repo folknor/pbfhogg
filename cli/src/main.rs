@@ -359,7 +359,15 @@ enum Command {
         /// Keep all untagged nodes in output (default: drop untagged nodes unless referenced by a relation)
         #[arg(long)]
         keep_untagged_nodes: bool,
-        /// Node coordinate index type: 'dense' (fast, high memory) or 'sparse' (bounded memory)
+        /// Node coordinate index type:
+        ///   dense    - direct-mapped mmap array. Fastest when working set fits in RAM.
+        ///              Works on any PBF (sorted or unsorted).
+        ///   sparse   - chunk-indexed sparse array. Bounded memory (~540 MB), slower.
+        ///              Works on any PBF. No temp disk needed.
+        ///   external - double radix permutation. Bounded memory (~1.6 GB), all sequential I/O.
+        ///              2.8x faster than dense at Europe scale. Requires sorted PBF
+        ///              (Sort.Type_then_ID) and indexdata. Uses ~112 GB temp disk at Europe,
+        ///              ~224 GB at planet.
         #[arg(long, default_value = "dense")]
         index_type: String,
         #[command(flatten)]

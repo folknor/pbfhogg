@@ -140,32 +140,20 @@ pub fn diff(
         None => TypeFilter::all(),
     };
 
-    // Open readers and check sorted headers before applying any filters.
-    let old_reader = ElementReader::open(old_path, direct_io)?;
-    let new_reader = ElementReader::open(new_path, direct_io)?;
+    // Check sorted headers before opening sequential readers.
+    {
+        let old_reader = ElementReader::from_path(old_path)?;
+        let new_reader = ElementReader::from_path(new_path)?;
+        require_sorted(old_reader.header(), old_path, "Old PBF")?;
+        require_sorted(new_reader.header(), new_path, "New PBF")?;
+    }
 
-    require_sorted(old_reader.header(), old_path, "Old PBF")?;
-    require_sorted(new_reader.header(), new_path, "New PBF")?;
-
-    // Apply blob filter for type-filtered queries (skips decompressing
-    // irrelevant blob types when indexdata is present).
-    let blob_filter = if filter.nodes && filter.ways && filter.relations {
-        None
-    } else {
-        Some(BlobFilter::new(filter.nodes, filter.ways, filter.relations))
-    };
-    let old_reader = match blob_filter.clone() {
-        Some(f) => old_reader.with_blob_filter(f),
-        None => old_reader,
-    };
-    let new_reader = match blob_filter {
-        Some(f) => new_reader.with_blob_filter(f),
-        None => new_reader,
-    };
-
-    // Build streaming cursors — two concurrent pipelined decoders.
-    let mut old_src = StreamingBlocks::new(old_reader.into_blocks_pipelined());
-    let mut new_src = StreamingBlocks::new(new_reader.into_blocks_pipelined());
+    // Sequential readers to avoid PrimitiveBlock cross-thread alloc/free
+    // retention. diff runs two concurrent pipelines — with pipelined readers
+    // that's 2× the 25+ GB retention at Europe scale.
+    // See notes/cross-pipeline-optimization-plan.md.
+    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
     let mut stats = DiffStats { common: 0, created: 0, modified: 0, deleted: 0 };
 

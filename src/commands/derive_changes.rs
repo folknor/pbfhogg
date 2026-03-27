@@ -69,16 +69,17 @@ pub fn derive_changes(
         output.display(),
         crate::debug::rss_line(),
     );
-    // Open readers and verify sorted headers.
-    let old_reader = ElementReader::open(old_path, direct_io)?;
-    let new_reader = ElementReader::open(new_path, direct_io)?;
+    // Check sorted headers before opening sequential readers.
+    {
+        let old_reader = ElementReader::from_path(old_path)?;
+        let new_reader = ElementReader::from_path(new_path)?;
+        require_sorted(old_reader.header(), old_path, "Old PBF")?;
+        require_sorted(new_reader.header(), new_path, "New PBF")?;
+    }
 
-    require_sorted(old_reader.header(), old_path, "Old PBF")?;
-    require_sorted(new_reader.header(), new_path, "New PBF")?;
-
-    // Build streaming cursors — two concurrent pipelined decoders.
-    let mut old_src = StreamingBlocks::new(old_reader.into_blocks_pipelined());
-    let mut new_src = StreamingBlocks::new(new_reader.into_blocks_pipelined());
+    // Sequential readers to avoid 2× PrimitiveBlock cross-thread retention.
+    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
     // Collect changes by action type.
     let mut creates = Changes::new();

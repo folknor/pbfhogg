@@ -20,13 +20,43 @@ use super::Result;
 /// type doesn't match the current phase, it is stashed for the next phase
 /// rather than being dropped.
 pub(crate) struct StreamingBlocks {
-    blocks: PipelinedBlocks,
+    blocks: Box<dyn Iterator<Item = crate::error::Result<PrimitiveBlock>>>,
     stashed: Option<PrimitiveBlock>,
 }
 
 impl StreamingBlocks {
     pub(crate) fn new(blocks: PipelinedBlocks) -> Self {
-        Self { blocks, stashed: None }
+        Self { blocks: Box::new(blocks), stashed: None }
+    }
+
+    /// Create from a sequential BlobReader. Avoids PrimitiveBlock cross-thread
+    /// alloc/free retention from the pipelined reader.
+    pub(crate) fn new_sequential(
+        path: &std::path::Path,
+        direct_io: bool,
+    ) -> crate::error::Result<Self> {
+        let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let pool = crate::blob::DecompressPool::new();
+        let iter = std::iter::from_fn(move || {
+            loop {
+                let blob = match blob_reader.next()? {
+                    Ok(b) => b,
+                    Err(e) => return Some(Err(e)),
+                };
+                if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                    continue;
+                }
+                let decompressed = match blob.decompress_pooled(&pool) {
+                    Ok(d) => d,
+                    Err(e) => return Some(Err(e)),
+                };
+                return Some(crate::block::PrimitiveBlock::new(decompressed));
+            }
+        });
+        Ok(Self { blocks: Box::new(iter), stashed: None })
     }
 
     fn next_block(&mut self) -> Result<Option<PrimitiveBlock>> {

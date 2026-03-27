@@ -123,8 +123,9 @@ impl ScratchDir {
 
 impl Drop for ScratchDir {
     fn drop(&mut self) {
-        // Best-effort cleanup. Ignore errors (crash leaves stale dir, user can clean).
-        drop(std::fs::remove_dir_all(&self.path));
+        // TEMPORARY: skip cleanup to preserve coord_slots for stage 4 iteration.
+        eprintln!("  scratch dir preserved: {}", self.path.display());
+        // drop(std::fs::remove_dir_all(&self.path));
     }
 }
 
@@ -188,6 +189,94 @@ impl BucketWriters {
             drop(std::fs::remove_file(path));
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// NodeTuple: compact (id, lat, lon) for parallel node scanning
+// ---------------------------------------------------------------------------
+
+/// Compact node coordinate tuple for cross-thread transfer.
+/// Used by the parallel node scanner to send only essential data through
+/// the channel — decompression buffers stay on the worker thread.
+#[derive(Clone, Copy)]
+struct NodeTuple {
+    id: i64,
+    lat: i32,
+    lon: i32,
+}
+
+/// Extract (id, lat, lon) tuples from decompressed PrimitiveBlock bytes.
+/// Zero heap allocations — reads wire format inline, appends to caller's Vec.
+/// This is the core of the node-only scanner, factored out so it can run on
+/// either the main thread (sequential) or rayon workers (parallel).
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+fn extract_node_tuples(
+    decompressed: &[u8],
+    out: &mut Vec<NodeTuple>,
+) -> Result<()> {
+    use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+
+    let buffer = decompressed;
+    let mut cursor = Cursor::new(buffer);
+    let mut granularity: i64 = 100;
+    let mut lat_offset: i64 = 0;
+    let mut lon_offset: i64 = 0;
+    let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
+    let mut group_count: usize = 0;
+
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited()?;
+                let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
+                if group_count < 8 {
+                    group_starts[group_count] = (offset, data.len());
+                    group_count += 1;
+                }
+            }
+            (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
+            (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
+            (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
+            _ => { cursor.skip_field(wire_type)?; }
+        }
+    }
+
+    for &(off, len) in &group_starts[..group_count] {
+        let group_data = &buffer[off..off + len];
+        let mut gcursor = Cursor::new(group_data);
+        let mut dense_data: Option<&[u8]> = None;
+        while let Some((field, wire_type)) = gcursor.read_tag()? {
+            if field == 2 && wire_type == WIRE_LEN {
+                dense_data = Some(gcursor.read_len_delimited()?);
+                break;
+            }
+            gcursor.skip_field(wire_type)?;
+        }
+
+        let Some(dd) = dense_data else { continue };
+        let dense = WireDenseNodes::parse(dd)?;
+
+        let mut ids = PackedSint64Iter::new(dense.id_data);
+        let mut lats = PackedSint64Iter::new(dense.lat_data);
+        let mut lons = PackedSint64Iter::new(dense.lon_data);
+        let mut cum_id: i64 = 0;
+        let mut cum_lat: i64 = 0;
+        let mut cum_lon: i64 = 0;
+
+        while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
+            cum_id += did;
+            cum_lat += dlat;
+            cum_lon += dlon;
+            out.push(NodeTuple {
+                id: cum_id,
+                lat: ((lat_offset + granularity * cum_lat) / 100) as i32,
+                lon: ((lon_offset + granularity * cum_lon) / 100) as i32,
+            });
+        }
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -399,41 +488,30 @@ fn stage2_node_join(
     // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
     // per-block heap allocations (WireStringTable entries, group_ranges) that
     // cause 25+ GB of allocator retention at Europe scale.
-    //
-    // Reads blobs sequentially, decompresses into a reusable buffer, and walks
-    // the wire format directly for dense node id/lat/lon. Zero per-block heap
-    // allocations beyond the reusable decompression buffer.
     use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(false);
-    // Skip the header blob.
-    let _ = blob_reader.next();
+    let _ = blob_reader.next(); // skip header blob
+    blob_reader.set_parse_indexdata(true); // re-enable for blob filter
 
     eprintln!("  stage2: reader open, rss={}MB", read_rss_kb() / 1024);
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
-    // Single-thread pool for decompression buffer reuse.
     let decompress_pool = crate::blob::DecompressPool::new();
-
-    // Re-enable indexdata parsing so we can skip non-node blobs.
-    blob_reader.set_parse_indexdata(true);
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        // Skip non-node blobs using indexdata. Stage 2 only needs nodes —
-        // decompressing way/relation blobs (~50% of file) is pure waste.
         if let Some(idx) = blob.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
                 continue;
             }
         }
 
-        // Decompress with buffer reuse (no PrimitiveBlock construction).
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
 
         block_count += 1;
@@ -448,13 +526,12 @@ fn stage2_node_join(
         let mut granularity: i64 = 100;
         let mut lat_offset: i64 = 0;
         let mut lon_offset: i64 = 0;
-        // Collect group byte ranges on the stack (typical: 1 group per block).
         let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
         let mut group_count: usize = 0;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
             match (field, wire_type) {
-                (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; } // skip stringtable
+                (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; }
                 (2, WIRE_LEN) => {
                     let data = cursor.read_len_delimited()?;
                     let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
@@ -471,11 +548,8 @@ fn stage2_node_join(
             }
         }
 
-        // Iterate dense nodes in each group.
         for &(off, len) in &group_starts[..group_count] {
             let group_data = &buffer[off..off + len];
-
-            // Find DenseNodes sub-message (field 2 in PrimitiveGroup).
             let mut gcursor = Cursor::new(group_data);
             let mut dense_data: Option<&[u8]> = None;
             while let Some((field, wire_type)) = gcursor.read_tag()? {
@@ -489,7 +563,6 @@ fn stage2_node_join(
             let Some(dd) = dense_data else { continue };
             let dense = WireDenseNodes::parse(dd)?;
 
-            // Delta-decode id/lat/lon.
             let mut ids = PackedSint64Iter::new(dense.id_data);
             let mut lats = PackedSint64Iter::new(dense.lat_data);
             let mut lons = PackedSint64Iter::new(dense.lon_data);
@@ -507,8 +580,6 @@ fn stage2_node_join(
                 #[allow(clippy::cast_possible_truncation)]
                 let lon = ((lon_offset + granularity * cum_lon) / 100) as i32;
 
-                // --- merge-join logic (same as before) ---
-
                 // Advance to the bucket that covers this node ID.
                 while id >= bucket_max_id {
                     if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
@@ -525,8 +596,6 @@ fn stage2_node_join(
                         &mut bucket_max_id, node_buckets, range_size,
                     )?;
                     if !has {
-                        // No more buckets — done. Break all the way out.
-                        // Remaining nodes have no COO pairs.
                         eprintln!("  node join: complete ({resolved_count} resolved)");
                         return Ok(resolved_count);
                     }
@@ -775,21 +844,15 @@ fn stage4_assembly(
         blobs_decoded: 0,
     };
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free churn.
-    // The pipelined reader causes 25+ GB heap retention at Europe scale because
-    // rayon decode threads allocate WireStringTable/group_ranges Boxes that are
-    // freed on the consumer thread. Sequential decode keeps all alloc/free on
-    // one thread. Batch parallel assembly still uses rayon for BlockBuilder work.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(false);
-    let header_blob = blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let header = header_blob.to_headerblock()?;
-
+    // Pipelined reader with decode_threads(1) — overlaps IO with single-thread
+    // decode. One decode thread limits cross-thread alloc/free churn from
+    // PrimitiveBlock construction (WireStringTable + group_ranges Boxes).
+    let reader = ElementReader::open(input, direct_io)?
+        .decode_threads(1);
     let mut writer = writer_from_header(
         output,
         compression,
-        &header,
+        reader.header(),
         true,
         overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
@@ -798,18 +861,9 @@ fn stage4_assembly(
     let mut slot_pos: u64 = 0;
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut block_count: u64 = 0;
-    // Single-thread pool for decompression buffer reuse — no cross-thread issue
-    // since the sequential reader keeps all alloc/free on this thread.
-    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        batch.push(block);
+    for block in reader.into_blocks_pipelined() {
+        batch.push(block?);
 
         if batch.len() >= BATCH_SIZE {
             let batch_stats = assemble_batch(
@@ -1040,6 +1094,7 @@ fn assemble_block(
 /// planet scale. See module docs for the algorithm.
 #[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
+#[allow(clippy::too_many_lines)]
 pub fn external_join(
     input: &Path,
     output: &Path,
@@ -1064,6 +1119,39 @@ pub fn external_join(
             return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
                         The single-pass node merge depends on ascending node ID order."
                 .into());
+        }
+    }
+
+    // TEMPORARY: skip stages 1-3 for stage 4 iteration testing.
+    // Usage: SKIP_TO_STAGE4=/path/to/coord_slots:total_slots
+    if let Ok(skip_val) = std::env::var("SKIP_TO_STAGE4") {
+        if let Some((path_str, slots_str)) = skip_val.split_once(':') {
+            let coord_slots_path = std::path::PathBuf::from(path_str);
+            let total_slots: u64 = slots_str.parse()
+                .map_err(|e| format!("SKIP_TO_STAGE4: invalid total_slots: {e}"))?;
+            eprintln!("SKIP_TO_STAGE4: coord_slots={}, total_slots={total_slots}", coord_slots_path.display());
+
+            let relation_member_node_ids = if keep_untagged_nodes {
+                None
+            } else {
+                Some(super::add_locations_to_ways::collect_relation_member_node_ids(
+                    input, direct_io,
+                )?)
+            };
+            eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
+
+            let t4 = std::time::Instant::now();
+            eprintln!("external join: stage 4 — assembling enriched PBF...");
+            let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
+            let stats = stage4_assembly(
+                input, output, &coord_slots, keep_untagged_nodes,
+                relation_member_node_ids.as_ref(), compression, direct_io, overrides,
+            )?;
+            let stage4_ms = t4.elapsed().as_millis();
+            eprintln!("  assembly complete ({stage4_ms}ms)");
+            eprintln!("stage4_ms={stage4_ms}");
+            eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
+            return Ok(stats);
         }
     }
 

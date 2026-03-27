@@ -216,9 +216,14 @@ Stage 2 improvement: skip non-node blobs + DecompressPool reuse (-30s, -9%).
 | End-to-end (all 4 stages) | 14s | 901s (15m) | `ee9b19f` |
 | + blob skip + pool reuse | 14s | ~871s (est.) | `d272b49` |
 | Full baseline (measured) | 14s | 930s | post-`d272b49` |
-| **+ decode_threads(1) stage 4** | 14s | **~834s (est.)** | pending commit |
+| decode_threads(1) stage 4 | — | 383s stage 4 but 27 GB peak anon | reverted |
+| **--compression none output** | — | **294s stage 4, ~763s est. total** | sequential reader |
 
-Dense ALTW at Europe scale: 2,565s (43 min). **External is ~3.1x faster.**
+Dense ALTW at Europe scale: 2,565s (43 min). **External is ~2.8x faster (zlib), ~3.4x (no compression).**
+
+Key finding: 36% of stage 4 (167s) is output zlib compression. The PbfWriter
+may be using sync (single-threaded) compression. Pipelined compression could
+overlap this with assembly work — potential large win without touching the read path.
 
 ## What we shipped
 
@@ -274,8 +279,10 @@ Dense ALTW at Europe scale: 2,565s (43 min). **External is ~3.1x faster.**
 | Stage 2 (node join) | 331s → **301s** (commit `d272b49`) | 74 MB |
 | Stage 3 (slot reorder) | 73s | 74 MB |
 | Relation scan | — | 1342 MB |
-| Stage 4 (assembly) | 392s → **383s** (decode_threads(1)) | 10587 MB → **1804 MB** |
-| **Total** | **~834s (est.)** | |
+| Stage 4 (assembly, zlib output) | 392s → 461s (sequential reader) | anon=1573 MB flat |
+| Stage 4 (assembly, no compression) | — → **294s** | anon=1559 MB flat |
+| **Total (zlib output)** | **~930s** | |
+| **Total (no compression)** | **~763s (est.)** | |
 
 Output: 3.7B nodes read, 149M written, 454M ways, 8.2M relations, 0 missing.
 DecompressPool: 103 drops (stage 1), 12 drops (stage 4).
@@ -319,15 +326,15 @@ Baseline: Europe end-to-end 901s (commit `ee9b19f`, plantasjen).
 |----|-----------|------------|----------|------|--------|
 | P4a | jemalloc | All stages | Unknown throughput delta (memory bounded). May help stage 4's 10.6 GB from allocator churn. | Low | Trivial (feature flag) |
 | P4b | `--direct-io` reads | Stages 1, 2, 4 | May hurt (bypasses readahead) or help. BlobReader fadvise already active. | Low | Trivial (CLI flag) |
-| P4c | BATCH_SIZE tuning | Stage 4 | Larger = more rayon parallelism. Affects RSS. Currently 32. | Low | Trivial |
+| ~~P4c~~ | ~~BATCH_SIZE tuning~~ | ~~Stage 4~~ | ~~Larger batches~~ | ~~Done~~ | **128 slower (448s, 26 GB), 32 same (27 GB), 64 same (27 GB). Irrelevant — decode_ahead dominates.** |
 | P4d | Pipeline config tuning | Stages 1, 4 | `read_ahead`, `decode_ahead` values. | Low | Trivial |
-| P4e | Output compression mode | Stage 4 | `--compression none` for timing vs `zlib` for production. | Low | Trivial |
+| ~~P4e~~ | ~~Output compression~~ | ~~Stage 4~~ | ~~`--compression none`~~ | ~~Done~~ | **294s (was 461s). 36% of stage 4 is output zlib. Assembly itself = 294s. Anon flat at 1.6 GB.** |
 
 ### Priority 5: Architectural (low payoff)
 
 | ID | Approach | Expected | Risk | Effort |
 |----|----------|----------|------|--------|
-| ~~P5a~~ | ~~Stage 4 decode_threads(1)~~ | ~~IO overlap without full cross-thread churn.~~ | ~~10-15%~~ | ~~Done~~ | **Measured: 383s (-17%, -78s). RSS 1.8 GB (was 11.8 GB).** |
+| ~~P5a~~ | ~~Stage 4 decode_threads(1)~~ | ~~IO overlap with single decode thread.~~ | ~~Done~~ | ~~Reverted~~ | **383s (-17%) but 27 GB peak anon during run. Initial 1.8 GB was post-run settled RSS — misleading. Unsafe.** |
 | P5b | Way-only scanner for stage 1 | Skip string table. Stage 1 is 9% — low payoff. | ~10-20% of 82s | Low | Medium |
 | P5c | Parallel stage 3 bucket processing | rayon over 256 buckets. Stage 3 is 8% — low payoff. | ~2-4x of 73s | Low | Low |
 | P5d | Planet coord_slots windowed reader | Sequential windowed reader instead of 64 GB mmap at planet scale. | Planet safety only | Low | Medium |
@@ -372,7 +379,8 @@ That would be 6.5x faster than the original 2,060s and 7.5x faster than dense (2
 - [x] Precomputed slot_range_size — **regression** (+24s), reverted
 - [x] Tuple intermediary (extract_node_tuples) — **regression** (+11s), reverted for sequential path. Function kept for parallel version.
 - [x] jemalloc — no throughput difference on sequential path
-- [x] decode_threads(1) for stage 4 — 461s → 383s (-17%), anon RSS 1.6 GB flat (was 11.8 GB)
-- [x] decode_threads(2) tested — 320s but 27 GB peak anon. Unsafe for planet. Rejected.
-- [x] Periodic RSS logging confirmed decode_threads(1) anon=1574 MB flat for 520K blocks
+- [x] decode_threads(1) for stage 4 — 383s but **27 GB peak anon during run** (NOT 1.6 GB as initially reported — that was post-run settled RSS). Unsafe. Reverted.
+- [x] decode_threads(2) tested — 320s, 27 GB peak anon. Same churn. Rejected.
+- [x] BATCH_SIZE sweep: 128 → 26 GB + slower (448s), 32 → 27 GB, 64 → 27 GB. Irrelevant — pipelined reader's decode_ahead=32 channel dominates.
+- [x] `--compression none` output: 294s (was 461s). **36% of stage 4 is output zlib compression.** Anon=1559 MB flat. Assembly itself is only 294s.
 - [ ] Planet benchmark — 87.7 GB PBF

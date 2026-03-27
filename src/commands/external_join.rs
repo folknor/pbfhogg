@@ -849,7 +849,9 @@ fn stage4_assembly(
     // causes 27 GB peak anon RSS from cross-thread PrimitiveBlock allocation
     // retention. Not safe on memory-constrained hosts.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(false);
+    // Enable both indexdata and tagdata parsing for blob-level filtering.
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.set_parse_tagdata(true);
     let header_blob = blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
@@ -866,6 +868,7 @@ fn stage4_assembly(
     let mut slot_pos: u64 = 0;
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut block_count: u64 = 0;
+    let mut skipped_node_blobs: u64 = 0;
     let decompress_pool = crate::blob::DecompressPool::new();
 
     for blob_result in &mut blob_reader {
@@ -873,6 +876,29 @@ fn stage4_assembly(
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
+
+        // P1b: skip node blobs that contain only untagged non-member nodes.
+        // These blobs would be fully dropped during assembly anyway.
+        if !keep_untagged_nodes {
+            if let Some(idx) = blob.index() {
+                if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                    // Check tagdata: empty keys = no tagged nodes in this blob.
+                    let has_tags = blob.tag_index()
+                        .map_or(true, |ti| !ti.keys_empty());
+                    if !has_tags {
+                        // Check if any node in this blob is a relation member.
+                        let has_members = relation_member_node_ids
+                            .map_or(false, |ids| ids.any_in_range(idx.min_id, idx.max_id));
+                        if !has_members {
+                            skipped_node_blobs += 1;
+                            // Node blobs don't contain ways, so slot_pos unchanged.
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
         let block = PrimitiveBlock::new(decompressed)?;
         batch.push(block);
@@ -909,6 +935,9 @@ fn stage4_assembly(
     }
 
     writer.flush()?;
+    if skipped_node_blobs > 0 {
+        eprintln!("  stage4: skipped {skipped_node_blobs} untagged node blobs (no decompress)");
+    }
     Ok(stats)
 }
 

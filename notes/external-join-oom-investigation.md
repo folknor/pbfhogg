@@ -299,7 +299,7 @@ Baseline: Europe end-to-end 901s (commit `ee9b19f`, plantasjen).
 | ID | Stage | Approach | Expected | Risk | Effort |
 |----|-------|----------|----------|------|--------|
 | ~~P1a~~ | ~~Stage 2 (331s)~~ | ~~**Skip non-node blobs.** Check indexdata, skip non-node blobs before decompression.~~ | ~~15-20%~~ | ~~Done~~ | **Measured: 301s (-9%, -30s). commit `d272b49`** |
-| P1b | Stage 4 (392s) | **Tagdata-based node blob skipping.** With `keep_untagged_nodes=false` (default), node blobs whose tagdata shows zero tag keys contain only untagged nodes → skip entirely. 96% of nodes are dropped in Europe. Could skip 90%+ of node blob decompression. | **Up to 75% of stage 4 node processing** | Medium — needs tagdata parsing | Medium |
+| P1b | Stage 4 (461s) | **Tagdata-based node blob skipping.** Skip node blobs with empty tagdata + no relation member nodes. 96% of nodes dropped. | **Up to 75% of stage 4 node decode** | **BLOCKED** | **Requires tagdata in PBF. Current Europe PBF (passthrough `cat`) has indexdata but no tagdata. Needs regeneration via `cat --type` (~5-8 min Europe, OOMs at planet on 30 GB host). Code implemented, ready to test on tagdata-enabled PBF.** |
 | P1c | Stage 4 (392s) | **Relation blob passthrough.** Relation blobs don't need coordinate enrichment. With indexdata, skip decompression and pass through raw. ~600 blobs at Europe. | Small (~few seconds) | Low | Low |
 
 ### Priority 2: Alloc/decompress optimization
@@ -383,4 +383,6 @@ That would be 6.5x faster than the original 2,060s and 7.5x faster than dense (2
 - [x] decode_threads(2) tested — 320s, 27 GB peak anon. Same churn. Rejected.
 - [x] BATCH_SIZE sweep: 128 → 26 GB + slower (448s), 32 → 27 GB, 64 → 27 GB. Irrelevant — pipelined reader's decode_ahead=32 channel dominates.
 - [x] `--compression none` output: 294s (was 461s). **36% of stage 4 is output zlib compression.** Anon=1559 MB flat. Assembly itself is only 294s.
+- [x] `zlib:1` output: 432s (was 461s). Only -29s — compression already overlapped with assembly.
+- [x] P1b tagdata node blob skipping: **BLOCKED.** Europe PBF has indexdata but no tagdata (generated via passthrough `cat`, not decode+reencode `cat --type`). Without tagdata, can't determine tag emptiness without decompressing. Requires regenerating PBF via `cat --type node,way,relation` which embeds tagdata in blob headers. Estimated: ~5-8 min for Europe. For planet (87 GB), `cat --type` OOMs on 30 GB host.
 - [ ] Planet benchmark — 87.7 GB PBF

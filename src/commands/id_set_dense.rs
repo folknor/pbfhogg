@@ -52,6 +52,44 @@ impl IdSetDense {
         }
     }
 
+    /// Check if any ID in the range [min_id, max_id] is set.
+    /// Uses chunk-level granularity for IDs outside a single chunk boundary,
+    /// and bit-level for IDs within a chunk. Fast for the common case where
+    /// the range spans 1-2 chunks.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn any_in_range(&self, min_id: i64, max_id: i64) -> bool {
+        if min_id > max_id {
+            return false;
+        }
+        let min_id = min_id as u64;
+        let max_id = max_id as u64;
+        let min_chunk = (min_id >> (CHUNK_BITS + 3)) as usize;
+        let max_chunk = (max_id >> (CHUNK_BITS + 3)) as usize;
+
+        for cid in min_chunk..=max_chunk {
+            if cid >= self.chunks.len() {
+                return false;
+            }
+            if let Some(chunk) = &self.chunks[cid] {
+                // Determine the bit range within this chunk.
+                let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
+                let range_start = if min_id > chunk_base { min_id - chunk_base } else { 0 };
+                let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
+                let range_end = if max_id < chunk_end { max_id - chunk_base } else { (CHUNK_SIZE as u64) << 3 - 1 };
+
+                // Check byte range for any set bits.
+                let start_byte = (range_start >> 3) as usize;
+                let end_byte = ((range_end >> 3) as usize).min(CHUNK_SIZE - 1);
+                for byte in &chunk[start_byte..=end_byte] {
+                    if *byte != 0 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Merge another IdSetDense into this one via bitwise OR.
     ///
     /// For non-overlapping chunks (common in sorted PBFs where each rayon thread

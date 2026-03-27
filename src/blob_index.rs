@@ -649,6 +649,11 @@ impl TagIndex {
         Some(TagIndex { keys })
     }
 
+    /// Returns `true` if the tag index has no keys (blob contains no tagged elements).
+    pub fn keys_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Returns `true` if any of the given keys is present in this tag index.
     pub fn has_any_key(&self, required: &[Box<[u8]>]) -> bool {
         required.iter().any(|rk| self.keys.iter().any(|k| k == rk))

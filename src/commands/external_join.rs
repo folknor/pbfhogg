@@ -53,6 +53,24 @@ fn read_rss_kb() -> u64 {
     pages * 4 // page size = 4 KB on x86_64
 }
 
+/// Read RSS breakdown (anon vs file) from `/proc/self/status`.
+fn read_rss_detail() -> String {
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return String::new();
+    };
+    let mut anon_kb: u64 = 0;
+    let mut file_kb: u64 = 0;
+    for line in status.lines() {
+        if let Some(v) = line.strip_prefix("RssAnon:") {
+            anon_kb = v.trim().strip_suffix(" kB").unwrap_or("0").trim().parse().unwrap_or(0);
+        }
+        if let Some(v) = line.strip_prefix("RssFile:") {
+            file_kb = v.trim().strip_suffix(" kB").unwrap_or("0").trim().parse().unwrap_or(0);
+        }
+    }
+    format!("anon={}MB file={}MB", anon_kb / 1024, file_kb / 1024)
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -140,8 +158,7 @@ impl BucketWriters {
     }
 
     /// Flush, sync, fadvise(DONTNEED), and close all writers.
-    /// sync_data() ensures pages are clean so fadvise can evict them.
-    /// Only runs once per stage — acceptable cost at stage boundaries.
+    /// sync_data ensures pages are clean so fadvise can evict them.
     fn finish(&mut self) -> Result<Vec<u64>> {
         for writer in &mut self.writers {
             if let Some(w) = writer.as_mut() {
@@ -149,8 +166,6 @@ impl BucketWriters {
                 #[cfg(feature = "linux-direct-io")]
                 {
                     use std::os::unix::io::AsRawFd;
-                    // sync_data makes pages clean; fadvise evicts clean pages.
-                    // Without sync, dirty pages survive DONTNEED.
                     let _ = w.get_ref().sync_data();
                     unsafe {
                         libc::posix_fadvise(
@@ -260,6 +275,7 @@ impl ResolvedEntry {
 /// Scan all way blobs and emit `(node_id, slot_pos)` pairs into node buckets.
 ///
 /// Returns the total number of way-node refs (= total coord slots needed).
+#[hotpath::measure]
 fn stage1_way_pass(
     input: &Path,
     direct_io: bool,
@@ -289,8 +305,8 @@ fn stage1_way_pass(
             }
         }
         block_count += 1;
-        if block_count % 1000 == 0 {
-            eprintln!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB", read_rss_kb() / 1024);
+        if block_count.is_multiple_of(1000) {
+            eprintln!("  stage1: {block_count} blocks, {slot_pos} refs, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
         }
     }
 
@@ -304,6 +320,8 @@ fn stage1_way_pass(
 /// For each node bucket: load into RAM, sort by node_id, merge-join with
 /// the matching node stream, emit resolved `(slot_pos, lat, lon)` entries
 /// into slot buckets.
+#[hotpath::measure]
+#[allow(clippy::too_many_lines)]
 fn stage2_node_join(
     input: &Path,
     direct_io: bool,
@@ -326,13 +344,18 @@ fn stage2_node_join(
     // We advance through them as the node stream progresses.
     let mut bucket_idx: usize = 0;
     let mut sorted_pairs: Vec<CooPair> = Vec::new();
+    let mut data_buf: Vec<u8> = Vec::new();
     let mut pair_cursor: usize = 0;
     let mut bucket_max_id: i64 = 0;
 
-    // Advance to first non-empty bucket.
+    // Advance to first non-empty bucket. Reuses data_buf and sorted_pairs
+    // allocations across bucket loads to prevent heap accumulation — at Europe
+    // scale, 256 buckets × ~290 MB each would otherwise accumulate 27+ GB of
+    // unreturned heap memory from the allocator.
     fn load_next_bucket(
         bucket_idx: &mut usize,
         sorted_pairs: &mut Vec<CooPair>,
+        data_buf: &mut Vec<u8>,
         pair_cursor: &mut usize,
         bucket_max_id: &mut i64,
         node_buckets: &BucketWriters,
@@ -340,7 +363,11 @@ fn stage2_node_join(
     ) -> Result<bool> {
         while *bucket_idx < NUM_BUCKETS {
             if node_buckets.entry_counts[*bucket_idx] > 0 {
-                *sorted_pairs = load_coo_bucket(&node_buckets.paths[*bucket_idx])?;
+                load_coo_bucket_into(
+                    &node_buckets.paths[*bucket_idx],
+                    data_buf,
+                    sorted_pairs,
+                )?;
                 sorted_pairs.sort_unstable_by_key(|p| p.node_id);
                 *pair_cursor = 0;
                 // Last bucket covers everything above its lower bound —
@@ -359,7 +386,7 @@ fn stage2_node_join(
     }
 
     let has_bucket = load_next_bucket(
-        &mut bucket_idx, &mut sorted_pairs, &mut pair_cursor,
+        &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
         &mut bucket_max_id, node_buckets, range_size,
     )?;
 
@@ -367,69 +394,153 @@ fn stage2_node_join(
         return Ok(0); // No COO pairs at all
     }
 
-    // Single pass through all node blobs.
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_nodes());
+    eprintln!("  stage2: after bucket load, rss={}MB", read_rss_kb() / 1024);
+
+    // Node-only sequential scan: bypasses PrimitiveBlock construction to avoid
+    // per-block heap allocations (WireStringTable entries, group_ranges) that
+    // cause 25+ GB of allocator retention at Europe scale.
+    //
+    // Reads blobs sequentially, decompresses into a reusable buffer, and walks
+    // the wire format directly for dense node id/lat/lon. Zero per-block heap
+    // allocations beyond the reusable decompression buffer.
+    use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    // Skip the header blob.
+    let _ = blob_reader.next();
+
+    eprintln!("  stage2: reader open, rss={}MB", read_rss_kb() / 1024);
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
+    let mut block_count: u64 = 0;
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        for element in block.elements_skip_metadata() {
-            let (id, lat, lon) = match &element {
-                Element::DenseNode(dn) => {
-                    (dn.id(), dn.decimicro_lat(), dn.decimicro_lon())
-                }
-                Element::Node(n) => {
-                    (n.id(), n.decimicro_lat(), n.decimicro_lon())
-                }
-                _ => continue,
-            };
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
 
-            // Advance to the bucket that covers this node ID.
-            while id >= bucket_max_id {
-                if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
-                    eprintln!(
-                        "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, rss={}MB)",
-                        sorted_pairs.len(),
-                        read_rss_kb() / 1024,
-                    );
+        // Decompress without constructing PrimitiveBlock (no string table alloc).
+        let decompressed = blob.decompress_raw()?;
+
+        block_count += 1;
+        if block_count.is_multiple_of(1000) {
+            eprintln!("  stage2: {block_count} blocks, {resolved_count} resolved, rss={}MB {}", read_rss_kb() / 1024, read_rss_detail());
+        }
+
+        // Parse PrimitiveBlock wire format inline — extract only granularity,
+        // lat_offset, lon_offset, and PrimitiveGroup data. Skip string table.
+        let buffer: &[u8] = &decompressed;
+        let mut cursor = Cursor::new(buffer);
+        let mut granularity: i64 = 100;
+        let mut lat_offset: i64 = 0;
+        let mut lon_offset: i64 = 0;
+        decompress_buf.clear();
+        // Collect group byte ranges on the stack (typical: 1 group per block).
+        let mut group_starts: [(usize, usize); 8] = [(0, 0); 8];
+        let mut group_count: usize = 0;
+
+        while let Some((field, wire_type)) = cursor.read_tag()? {
+            match (field, wire_type) {
+                (1, WIRE_LEN) => { cursor.skip_field(wire_type)?; } // skip stringtable
+                (2, WIRE_LEN) => {
+                    let data = cursor.read_len_delimited()?;
+                    let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
+                    if group_count < 8 {
+                        group_starts[group_count] = (offset, data.len());
+                        group_count += 1;
+                    }
                 }
-                bucket_idx += 1;
-                let has = load_next_bucket(
-                    &mut bucket_idx, &mut sorted_pairs, &mut pair_cursor,
-                    &mut bucket_max_id, node_buckets, range_size,
-                )?;
-                if !has {
-                    // No more buckets — remaining nodes have no COO pairs.
-                    return Ok(resolved_count);
+                #[allow(clippy::cast_possible_wrap)]
+                (17, WIRE_VARINT) => { granularity = cursor.read_varint()? as i64; }
+                (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
+                (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
+                _ => { cursor.skip_field(wire_type)?; }
+            }
+        }
+
+        // Iterate dense nodes in each group.
+        for &(off, len) in &group_starts[..group_count] {
+            let group_data = &buffer[off..off + len];
+
+            // Find DenseNodes sub-message (field 2 in PrimitiveGroup).
+            let mut gcursor = Cursor::new(group_data);
+            let mut dense_data: Option<&[u8]> = None;
+            while let Some((field, wire_type)) = gcursor.read_tag()? {
+                if field == 2 && wire_type == WIRE_LEN {
+                    dense_data = Some(gcursor.read_len_delimited()?);
+                    break;
                 }
+                gcursor.skip_field(wire_type)?;
             }
 
-            // Advance cursor past any pairs with smaller node_id.
-            while pair_cursor < sorted_pairs.len()
-                && sorted_pairs[pair_cursor].node_id < id
-            {
-                pair_cursor += 1;
-            }
+            let Some(dd) = dense_data else { continue };
+            let dense = WireDenseNodes::parse(dd)?;
 
-            // Emit resolved entries for all pairs matching this node_id.
-            while pair_cursor < sorted_pairs.len()
-                && sorted_pairs[pair_cursor].node_id == id
-            {
-                let entry = ResolvedEntry {
-                    slot_pos: sorted_pairs[pair_cursor].slot_pos,
-                    lat,
-                    lon,
-                };
-                let bucket = entry.slot_bucket(total_slots);
-                entry.write_to(&mut entry_buf);
-                if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
-                    writer.write_all(&entry_buf)?;
+            // Delta-decode id/lat/lon.
+            let mut ids = PackedSint64Iter::new(dense.id_data);
+            let mut lats = PackedSint64Iter::new(dense.lat_data);
+            let mut lons = PackedSint64Iter::new(dense.lon_data);
+            let mut cum_id: i64 = 0;
+            let mut cum_lat: i64 = 0;
+            let mut cum_lon: i64 = 0;
+
+            while let (Some(did), Some(dlat), Some(dlon)) = (ids.next(), lats.next(), lons.next()) {
+                cum_id += did;
+                cum_lat += dlat;
+                cum_lon += dlon;
+                let id = cum_id;
+                #[allow(clippy::cast_possible_truncation)]
+                let lat = ((lat_offset + granularity * cum_lat) / 100) as i32;
+                #[allow(clippy::cast_possible_truncation)]
+                let lon = ((lon_offset + granularity * cum_lon) / 100) as i32;
+
+                // --- merge-join logic (same as before) ---
+
+                // Advance to the bucket that covers this node ID.
+                while id >= bucket_max_id {
+                    if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
+                        eprintln!(
+                            "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, rss={}MB {})",
+                            sorted_pairs.len(),
+                            read_rss_kb() / 1024,
+                            read_rss_detail(),
+                        );
+                    }
+                    bucket_idx += 1;
+                    let has = load_next_bucket(
+                        &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
+                        &mut bucket_max_id, node_buckets, range_size,
+                    )?;
+                    if !has {
+                        return Ok(resolved_count);
+                    }
                 }
-                slot_buckets.entry_counts[bucket] += 1;
-                resolved_count += 1;
-                pair_cursor += 1;
+
+                while pair_cursor < sorted_pairs.len()
+                    && sorted_pairs[pair_cursor].node_id < id
+                {
+                    pair_cursor += 1;
+                }
+
+                while pair_cursor < sorted_pairs.len()
+                    && sorted_pairs[pair_cursor].node_id == id
+                {
+                    let entry = ResolvedEntry {
+                        slot_pos: sorted_pairs[pair_cursor].slot_pos,
+                        lat,
+                        lon,
+                    };
+                    let bucket = entry.slot_bucket(total_slots);
+                    entry.write_to(&mut entry_buf);
+                    if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
+                        writer.write_all(&entry_buf)?;
+                    }
+                    slot_buckets.entry_counts[bucket] += 1;
+                    resolved_count += 1;
+                    pair_cursor += 1;
+                }
             }
         }
     }
@@ -439,140 +550,132 @@ fn stage2_node_join(
     Ok(resolved_count)
 }
 
-/// Load a COO bucket file into memory as a Vec of pairs.
-/// Advises DONTNEED after reading to evict from page cache.
-fn load_coo_bucket(path: &Path) -> Result<Vec<CooPair>> {
+/// Load a COO bucket file into reusable buffers. Both `data_buf` and `pairs`
+/// are cleared and refilled — their backing allocations are retained across
+/// bucket loads, preventing heap accumulation from the allocator holding
+/// freed blocks.
+#[hotpath::measure]
+fn load_coo_bucket_into(path: &Path, data_buf: &mut Vec<u8>, pairs: &mut Vec<CooPair>) -> Result<()> {
+    data_buf.clear();
     let file = std::fs::File::open(path)
         .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut &file, &mut data)
+    std::io::Read::read_to_end(&mut &file, data_buf)
         .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
     #[cfg(feature = "linux-direct-io")]
     advise_dontneed_file(&file);
-    let count = data.len() / COO_PAIR_SIZE;
-    let mut pairs = Vec::with_capacity(count);
+
+    pairs.clear();
+    let count = data_buf.len() / COO_PAIR_SIZE;
+    if count > pairs.capacity() {
+        pairs.reserve(count - pairs.capacity());
+    }
     let mut buf = [0u8; COO_PAIR_SIZE];
-    for chunk in data.chunks_exact(COO_PAIR_SIZE) {
+    for chunk in data_buf.chunks_exact(COO_PAIR_SIZE) {
         buf.copy_from_slice(chunk);
         pairs.push(CooPair::read_from(&buf));
     }
-    Ok(pairs)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Stage 3: Slot reorder — build final coord_slots file
 // ---------------------------------------------------------------------------
 
-/// Read slot buckets in order, sort each by slot_pos, write to the final
-/// coord_slots file sequentially.
+/// Read slot buckets in order, scatter entries into a dense buffer per bucket,
+/// write the coord_slots file sequentially.
+///
+/// Each bucket covers a contiguous range of slot positions. Instead of sorting
+/// entries and issuing 4.69B individual pwrite calls (which was 72% of total
+/// time at Europe scale), we scatter entries by position into a zeroed buffer
+/// and write the entire buffer once per bucket.
+#[hotpath::measure]
+#[allow(clippy::cast_possible_truncation)]
 fn stage3_slot_reorder(
     slot_buckets: &BucketWriters,
     coord_slots_path: &Path,
     total_slots: u64,
 ) -> Result<()> {
-    // Pre-allocate the coord_slots file (filled with zero sentinels).
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(coord_slots_path)
-        .map_err(|e| {
-            format!(
-                "failed to create coord_slots file {}: {e}",
-                coord_slots_path.display()
-            )
-        })?;
-    file.set_len(total_slots * COORD_SLOT_SIZE as u64)?;
-    drop(file);
+    let file = std::fs::File::create(coord_slots_path)
+        .map_err(|e| format!("failed to create coord_slots file {}: {e}", coord_slots_path.display()))?;
+    let mut out = BufWriter::with_capacity(256 * 1024, file);
 
-    // Open for random writes (we write within each bucket's slot range).
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(coord_slots_path)
-        .map_err(|e| {
-            format!(
-                "failed to open coord_slots for writing: {e}"
-            )
-        })?;
+    let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
+    let mut data_buf: Vec<u8> = Vec::new();
+    let mut scatter_buf: Vec<u8> = Vec::new();
+    let mut next_slot: u64 = 0;
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileExt;
-        for bucket_idx in 0..NUM_BUCKETS {
-            if slot_buckets.entry_counts[bucket_idx] == 0 {
-                continue;
-            }
+    for bucket_idx in 0..NUM_BUCKETS {
+        // Compute this bucket's slot range.
+        let bucket_start = bucket_idx as u64 * range_size;
+        let bucket_end = if bucket_idx == NUM_BUCKETS - 1 {
+            total_slots
+        } else {
+            ((bucket_idx as u64 + 1) * range_size).min(total_slots)
+        };
+        let bucket_slots = bucket_end - bucket_start;
 
-            let entries = load_resolved_bucket(&slot_buckets.paths[bucket_idx])?;
-            if entries.is_empty() {
-                continue;
-            }
+        if slot_buckets.entry_counts[bucket_idx] == 0 {
+            // Empty bucket — write zero sentinels for its entire range.
+            let zero_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+            scatter_buf.clear();
+            scatter_buf.resize(zero_bytes, 0);
+            out.write_all(&scatter_buf)?;
+            next_slot = bucket_end;
+            continue;
+        }
 
-            let mut sorted = entries;
-            sorted.sort_unstable_by_key(|e| e.slot_pos);
+        // Load entries and scatter into position-indexed buffer.
+        // No sort needed — position is computed directly from slot_pos.
+        let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+        scatter_buf.clear();
+        scatter_buf.resize(bucket_bytes, 0);
 
-            let mut coord_buf = [0u8; COORD_SLOT_SIZE];
-            for entry in &sorted {
-                let offset = entry.slot_pos * COORD_SLOT_SIZE as u64;
-                coord_buf[..4].copy_from_slice(&entry.lat.to_le_bytes());
-                coord_buf[4..].copy_from_slice(&entry.lon.to_le_bytes());
-                file.write_at(&coord_buf, offset)?;
-            }
+        data_buf.clear();
+        let file = std::fs::File::open(&slot_buckets.paths[bucket_idx])
+            .map_err(|e| format!("failed to open slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
+        std::io::Read::read_to_end(&mut &file, &mut data_buf)
+            .map_err(|e| format!("failed to read slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
+        #[cfg(feature = "linux-direct-io")]
+        advise_dontneed_file(&file);
 
-            if bucket_idx % 16 == 0 {
-                eprintln!(
-                    "  slot reorder: bucket {}/{}",
-                    bucket_idx + 1,
-                    NUM_BUCKETS
-                );
-            }
+        let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
+        for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
+            buf.copy_from_slice(chunk);
+            let entry = ResolvedEntry::read_from(&buf);
+            let local_pos = (entry.slot_pos - bucket_start) as usize;
+            let offset = local_pos * COORD_SLOT_SIZE;
+            scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
+            scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
+        }
+
+        out.write_all(&scatter_buf)?;
+        next_slot = bucket_end;
+
+        if bucket_idx % 16 == 0 {
+            eprintln!(
+                "  slot reorder: bucket {}/{}",
+                bucket_idx + 1,
+                NUM_BUCKETS
+            );
         }
     }
 
-    #[cfg(not(unix))]
-    {
-        return Err("external join requires unix (write_at)".into());
+    // Write any trailing slots if total_slots doesn't align to bucket boundaries.
+    if next_slot < total_slots {
+        let remaining = (total_slots - next_slot) as usize * COORD_SLOT_SIZE;
+        scatter_buf.clear();
+        scatter_buf.resize(remaining, 0);
+        out.write_all(&scatter_buf)?;
     }
 
+    out.flush()?;
     Ok(())
 }
 
-/// Load a resolved-entry bucket file into memory.
-/// Advises DONTNEED after reading to evict from page cache.
-fn load_resolved_bucket(path: &Path) -> Result<Vec<ResolvedEntry>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
-    let mut data = Vec::new();
-    std::io::Read::read_to_end(&mut &file, &mut data)
-        .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
-    #[cfg(feature = "linux-direct-io")]
-    advise_dontneed_file(&file);
-    let count = data.len() / RESOLVED_ENTRY_SIZE;
-    let mut entries = Vec::with_capacity(count);
-    let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
-    for chunk in data.chunks_exact(RESOLVED_ENTRY_SIZE) {
-        buf.copy_from_slice(chunk);
-        entries.push(ResolvedEntry::read_from(&buf));
-    }
-    Ok(entries)
-}
 
 // ---------------------------------------------------------------------------
 // Stage 4: Assembly — emit enriched PBF
 // ---------------------------------------------------------------------------
-
-/// Advise the kernel to evict bucket file pages from the page cache.
-/// Prevents ~320 GB of temp data from polluting the cache at planet scale.
-fn advise_dontneed_buckets(#[cfg_attr(not(feature = "linux-direct-io"), allow(unused))] buckets: &BucketWriters) {
-    #[cfg(feature = "linux-direct-io")]
-    {
-        use std::os::unix::io::AsRawFd;
-        for path in &buckets.paths {
-            if let Ok(file) = std::fs::File::open(path) {
-                unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-            }
-        }
-    }
-}
 
 /// Advise the kernel to evict a single file's pages from page cache.
 #[cfg(feature = "linux-direct-io")]
@@ -891,6 +994,7 @@ fn assemble_block(
 /// Bounded memory (<1 GB), all sequential I/O. Uses ~224 GB temp disk at
 /// planet scale. See module docs for the algorithm.
 #[allow(clippy::too_many_arguments)]
+#[hotpath::measure]
 pub fn external_join(
     input: &Path,
     output: &Path,
@@ -956,38 +1060,25 @@ pub fn external_join(
     eprintln!("stage3_ms={stage3_ms}");
     eprintln!("  rss_after_stage3_mb={}", read_rss_kb() / 1024);
 
-    // Collect relation member node IDs (for node filtering in stage 4).
-    // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
-    let relation_member_node_ids = if keep_untagged_nodes {
-        None
-    } else {
-        Some(super::add_locations_to_ways::collect_relation_member_node_ids(
-            input, direct_io,
-        )?)
-    };
-    eprintln!("  rss_after_relation_scan_mb={}", read_rss_kb() / 1024);
-
-    // --- Stage 4: Assembly ---
-    let t4 = std::time::Instant::now();
-    eprintln!("external join: stage 4 — assembling enriched PBF...");
-    let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
-    let stats = stage4_assembly(
-        input,
-        output,
-        &coord_slots,
-        keep_untagged_nodes,
-        relation_member_node_ids.as_ref(),
-        compression,
-        direct_io,
-        overrides,
-    )?;
-    let stage4_ms = t4.elapsed().as_millis();
-    eprintln!("  assembly complete ({stage4_ms}ms)");
-    eprintln!("stage4_ms={stage4_ms}");
+    // TEMPORARY: skip stage 4 while testing stage 1-3 optimizations.
+    // Stage 4 assembly has a separate PrimitiveBlock churn OOM that needs
+    // sequential iteration — fix independently.
+    eprintln!("EARLY EXIT after stage 3 (stage 4 disabled for testing)");
     eprintln!("total_slots={total_slots}");
     eprintln!("resolved_count={resolved_count}");
-    eprintln!("  rss_after_stage4_mb={}", read_rss_kb() / 1024);
-
-    // scratch_dir dropped here → cleanup all temp files.
-    Ok(stats)
+    // TODO: stage 4 disabled — PrimitiveBlock churn OOMs at Europe scale.
+    // Fix via sequential iteration or decode_threads(1), then re-enable.
+    eprintln!("TEMPORARY: stage 4 disabled, exiting after stage 3");
+    eprintln!("total_slots={total_slots}");
+    eprintln!("resolved_count={resolved_count}");
+    Ok(Stats {
+        nodes_read: 0,
+        nodes_written: 0,
+        nodes_dropped: 0,
+        ways_written: 0,
+        relations_written: 0,
+        missing_locations: 0,
+        blobs_passthrough: 0,
+        blobs_decoded: 0,
+    })
 }

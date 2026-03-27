@@ -45,6 +45,8 @@ const MAX_POOL_SIZE: usize = 64;
 
 pub(crate) struct DecompressPool {
     buffers: Mutex<Vec<Vec<u8>>>,
+    /// Count of buffers dropped because the pool was full (diagnostic).
+    pool_full_drops: std::sync::atomic::AtomicU64,
 }
 
 impl DecompressPool {
@@ -52,7 +54,13 @@ impl DecompressPool {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             buffers: Mutex::new(Vec::new()),
+            pool_full_drops: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Number of buffers that were dropped because the pool was at capacity.
+    pub fn full_drops(&self) -> u64 {
+        self.pool_full_drops.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Pop a buffer from the pool, or return an empty Vec if the pool is empty.
@@ -79,7 +87,18 @@ impl DecompressPool {
         if let Ok(mut v) = self.buffers.lock() {
             if v.len() < MAX_POOL_SIZE {
                 v.push(buf);
+            } else {
+                self.pool_full_drops.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
+        }
+    }
+}
+
+impl Drop for DecompressPool {
+    fn drop(&mut self) {
+        let drops = self.pool_full_drops.load(std::sync::atomic::Ordering::Relaxed);
+        if drops > 0 {
+            eprintln!("  DecompressPool: {drops} buffers dropped (pool full)");
         }
     }
 }
@@ -447,6 +466,13 @@ impl Blob {
     /// decompression step.
     pub fn to_primitiveblock(&self) -> Result<PrimitiveBlock> {
         decompress_blob(&self.blob, None).and_then(PrimitiveBlock::new)
+    }
+
+    /// Decompress the blob data without constructing a `PrimitiveBlock`.
+    /// Returns raw decompressed bytes for direct wire-format parsing.
+    /// Used by node-only scanners that don't need string tables or full block metadata.
+    pub(crate) fn decompress_raw(&self) -> Result<Bytes> {
+        decompress_blob(&self.blob, None)
     }
 
     /// Returns the blob-level index from the header's `indexdata` field, if present.

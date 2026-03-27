@@ -265,7 +265,7 @@ against osmium via `brokkr verify add-locations-to-ways`.
 | dense | 8,168 ms | 72s | 2,565s (43m) | `034422c` |
 | external (old, 256× re-read) | 302s (5m) | — | — | `034422c` |
 | external (single-pass merge) | 25s | 143s | 2,060s (34m) | `a334c72` |
-| **external (node-only scanner + scatter)** | **11s** | — | **480s (8m, stages 1-3)** | `cf350a9` |
+| **external (node-only scanner + scatter)** | **14s** | — | **901s (15m, end-to-end)** | `ee9b19f` |
 
 **Optimization arc (commit `cf350a9`):**
 - Stage 2: replaced pipelined PrimitiveBlock iteration with node-only
@@ -300,9 +300,9 @@ for the complete OOM investigation.
 - [x] Verify external join correctness on Denmark — identical to dense
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark external join on Japan — 143s (2.0x dense)
-- [x] Benchmark external join on Europe — 2,060s (34m) → **480s (8m, stages 1-3)** commit `cf350a9`
-- [ ] Fix stage 4 assembly OOM (PrimitiveBlock churn) — sequential reader approach
-- [ ] Full end-to-end Europe measurement (stages 1-4)
+- [x] Benchmark external join on Europe — 2,060s (34m) → **901s (15m, end-to-end)** commit `ee9b19f`
+- [x] Fix stage 4 assembly OOM — sequential reader (commit `2873919`)
+- [x] Full end-to-end Europe measurement — **901s, 2.8x faster than dense**
 - [ ] Benchmark external join on planet (87.7 GB)
 - [ ] Add O_DIRECT support to bucket file I/O
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

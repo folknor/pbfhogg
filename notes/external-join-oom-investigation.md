@@ -257,11 +257,32 @@ May not fully fix the retention.
 - **BlobReader fadvise(DONTNEED)** — general infrastructure improvement for
   all single-pass forward scans.
 
+## Europe end-to-end result (commit `ee9b19f`, plantasjen)
+
+| Stage | Time | RSS post-finish |
+|-------|------|-----------------|
+| Stage 1 (way pass) | 82s | 74 MB |
+| Stage 2 (node join) | 331s | 74 MB |
+| Stage 3 (slot reorder) | 73s | 74 MB |
+| Relation scan | — | 1342 MB |
+| Stage 4 (assembly) | 392s | 10587 MB |
+| **Total** | **901s (15 min)** | |
+
+Output: 3.7B nodes read, 149M written, 454M ways, 8.2M relations, 0 missing.
+DecompressPool: 103 drops (stage 1), 12 drops (stage 4).
+
+Comparison: dense at Europe scale = 2,565s (43 min). External = **2.8x faster.**
+Previous external (single-pass merge, `a334c72`) = 2,060s (34 min). **2.3x faster.**
+
 ## Next steps
 
-1. **Fix stage 4** — sequential read + batch parallel encode. Same
-   `assemble_batch` pattern, fed by sequential reader.
-2. **Full end-to-end Europe measurement** (stages 1-4).
-3. **Stage 2 parallelism** — approach B (thread-local decompress, send tuples)
-   if the stage 4 fix suggests the right pattern.
-4. **Planet benchmark** — full pipeline on 87.7 GB PBF.
+1. ~~Fix stage 4~~ — done (commit `2873919`, sequential reader)
+2. ~~Full end-to-end Europe measurement~~ — done (901s, commit `ee9b19f`)
+3. **Stage 2 parallelism** — approach B (thread-local decompress, send tuples).
+   Stage 2 is 37% of total time (331s/901s). Parallel decompression could
+   bring it to ~55-80s, total to ~620-650s (~10 min).
+4. **Stage 4 optimization** — 44% of total time (392s/901s). Currently
+   sequential decode. Similar parallel approach as stage 2, but needs full
+   PrimitiveBlock (not node-only). RSS peaked at 10.6 GB — room for more
+   in-flight blocks if parallelized carefully.
+5. **Planet benchmark** — full pipeline on 87.7 GB PBF.

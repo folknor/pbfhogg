@@ -834,34 +834,60 @@ fn build_node_index_dense(
         capacity: index.capacity,
     };
 
-    let reader = ElementReader::open(input, direct_io)?;
-    if reader.header().has_locations_on_ways() {
-        eprintln!(
-            "Warning: input PBF already declares LocationsOnWays. \
-             Existing way-node coordinates will be overwritten."
-        );
-    }
-    let reader = reader.with_blob_filter(BlobFilter::only_nodes());
-
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(INDEX_BATCH_SIZE);
-    let mut block_count: u64 = 0;
-    for block in reader.into_blocks_pipelined() {
-        block_count += 1;
-        batch.push(block?);
-        if batch.len() >= INDEX_BATCH_SIZE {
-            index_batch_dense(&batch, &writer, referenced);
-            batch.clear();
-            if block_count.is_multiple_of(1_000) {
-                crate::debug_log!(
-                    "add-locations-to-ways: dense index blocks={block_count} capacity={} {}",
-                    index.capacity,
-                    crate::debug::rss_line(),
-                );
-            }
+    // Check for existing LocationsOnWays before consuming the reader.
+    {
+        let reader = ElementReader::from_path(input)?;
+        if reader.header().has_locations_on_ways() {
+            eprintln!(
+                "Warning: input PBF already declares LocationsOnWays. \
+                 Existing way-node coordinates will be overwritten."
+            );
         }
     }
-    if !batch.is_empty() {
-        index_batch_dense(&batch, &writer, referenced);
+
+    // Node-only sequential scanner: bypasses PrimitiveBlock construction to avoid
+    // cross-thread alloc/free retention (25+ GB at Europe/planet scale).
+    // See notes/cross-pipeline-optimization-plan.md.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let _ = blob_reader.next(); // skip header blob
+
+    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+    let mut block_count: u64 = 0;
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        // Skip non-node blobs using indexdata.
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                continue;
+            }
+        }
+
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        tuples.clear();
+        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples)?;
+
+        // Insert into mmap index. SharedDenseWriter is safe for concurrent access
+        // (direct mmap slot writes to disjoint positions).
+        tuples.par_iter().for_each(|t| {
+            if referenced.get(t.id) {
+                writer.insert(t.id, t.lat, t.lon);
+            }
+        });
+
+        block_count += 1;
+        if block_count.is_multiple_of(1_000) {
+            crate::debug_log!(
+                "add-locations-to-ways: dense index blocks={block_count} capacity={} {}",
+                index.capacity,
+                crate::debug::rss_line(),
+            );
+        }
     }
 
     crate::debug_log!(

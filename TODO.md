@@ -99,7 +99,7 @@ See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md) and
   Stage 4: 432s→**136s** (-68%). Total: 866s→**577s** (-33%). 4.5x faster than dense.
 
 **Remaining:**
-- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk, ~27 min estimated.
+- [x] Planet benchmark — **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense.** Validated on 30 GB host.
 
 ## ALTW memory optimization
 
@@ -114,8 +114,8 @@ See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 - [x] Full end-to-end Europe — **577s** (commit `6b09796`), 4.5x faster than dense
 - [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
 - [x] P2c parallel assembly — stage 4: 432s→136s (-68%), 7.3 GB anon
+- [x] Planet benchmark — **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense**
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
-- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk needed
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 

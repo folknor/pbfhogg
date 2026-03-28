@@ -27,7 +27,7 @@ Ordered by impact and dependency. Items within a group can be done in any order.
 9. ~~P2b: parallel tuples for external join stage 2~~ — Done. P2b-v2 (commit `80e227b`): pread-from-workers, all alloc thread-local. Europe stage 2: 301s→216s (-28%), anon 20.4 GB→**1.4 GB** (-93%). Planet-safe (~3.9 GB extrapolated).
 10. ~~External join stage 1: sequential reader~~ — Done (commit `4daf995`). Anon 11 GB→70 MB. Stage 1: 82s→128s (+54%).
 11. ~~P2c: parallel assembly for external join stage 4~~ — Done (commit `6b09796`). Ref count sidecar from stage 1, pread-from-workers with dedicated thread pool. Europe stage 4: 432s→**136s** (-68%), 7.3 GB anon. Total: 866s→**577s** (-33%). 4.5x faster than dense.
-12. Planet benchmark for external join
+12. ~~Planet benchmark for external join~~ — Done (sidecar `98e71e2b`). **1,462s (24.4 min), 16.7 GB peak anon.** Dense: 5,773s (96 min). 3.9x faster. Validated on 30 GB host.
 
 **Group 4: Remaining commands at Europe/planet scale**
 12. extract pass 1: node-only scanner for bbox classification (sorted path)

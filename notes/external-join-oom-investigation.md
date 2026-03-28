@@ -231,6 +231,13 @@ Stage 4: **136s** / 7.3 GB anon (pread-from-workers + parallel assembly).
 
 Dense ALTW at Europe: 2,565s. **External is 4.5x faster.**
 
+Planet (87 GB, commit `19ac253`, sidecar `98e71e2b`):
+Stage 1: 333s / 74 MB anon.
+Stage 2: 612s / 2.9 GB anon.
+Stage 3: 247s.
+Stage 4: 269s / **16.7 GB anon**.
+**Total: 1,462s (24.4 min).** Dense: 5,773s (96 min). **3.9x faster.**
+
 Dense ALTW at Europe scale: 2,565s (43 min). **External is ~2.8x faster (zlib), ~3.4x (no compression).**
 
 Key finding: 36% of stage 4 (167s) is output zlib compression. The PbfWriter

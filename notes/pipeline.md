@@ -210,18 +210,18 @@ Requires sorted PBF with indexdata. Uses temp disk (~4 GB Denmark, ~112 GB Europ
 - Denmark (465 MB): 12.3s, ~4 GB temp disk
 - Europe (32.4 GB, commit `6b09796`): **577s (9.6 min)**, ~112 GB temp disk. Dense ALTW: 2,565s. **4.5x faster.**
 
-**Planet-scale resource estimates (87 GB, ~13B node refs, not yet validated):**
+**Planet (87 GB, sidecar `98e71e2b`): 1,462s (24.4 min). Dense: 5,773s (96 min). 3.9x faster.**
 
-| Resource | Europe (measured) | Planet (extrapolated) |
-|----------|------------------|----------------------|
-| Peak anon RSS | 7.3 GB (stage 4) | ~20 GB |
-| Temp disk | ~112 GB | **~300 GB** |
-| Wall time | 577s (9.6 min) | ~1600s (27 min) |
+| Resource | Europe (measured) | Planet (measured) |
+|----------|------------------|------------------|
+| Peak anon RSS | 7.3 GB (stage 4) | **16.7 GB** (stage 4) |
+| Temp disk | ~112 GB | ~300 GB |
+| Wall time | 577s (9.6 min) | **1,462s (24.4 min)** |
 
 Memory is bounded by design: pread-from-workers with thread-local buffers
 (stages 2/4), sequential reader (stage 1), one bucket at a time (stages 2/3).
-Peak anon is stage 4's parallel PrimitiveBlock construction (~7.3 GB Europe,
-~20 GB planet). Safe on a 32 GB host.
+Peak anon is stage 4's parallel PrimitiveBlock construction (7.3 GB Europe,
+16.7 GB planet). Validated on 30 GB host.
 
 Temp disk is the main constraint at planet scale. The 256 node buckets hold all
 `(node_id, slot_pos)` COO pairs (16 bytes each, ~13B pairs = ~208 GB), plus 256

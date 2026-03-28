@@ -292,10 +292,17 @@ elements, 0 differences. Cross-validated against osmium via
 | Stage 3 (slot reorder) | 91s | — | Scatter buffer |
 | Stage 4 (assembly) | **136s** | **7.3 GB** | Pread-from-workers, parallel assembly |
 
-**Planet-scale safety:** all stages use pread-from-workers with
-thread-local buffers. Peak anon ~20 GB at planet (stage 4, extrapolated
-from 7.3 GB at Europe). Fits on 32 GB host but tighter than stages 1-3.
-Main constraint is temp disk (~300 GB at planet). Not yet validated.
+**Planet validated (sidecar `98e71e2b`): 1,462s (24.4 min), 16.7 GB peak anon.**
+Dense planet: 5,773s (96 min). **3.9x faster.**
+
+| Stage | Europe | Planet | Ratio |
+|-------|--------|--------|-------|
+| Stage 1 | 128s / 70 MB | 333s / 74 MB | 2.6x |
+| Stage 2 | 221s / 1.4 GB | 612s / 2.9 GB | 2.8x |
+| Stage 3 | 91s | 247s | 2.7x |
+| Stage 4 | 136s / 7.3 GB | 269s / 16.7 GB | 2.0x |
+
+Main constraint is temp disk (~300 GB at planet).
 
 See [altw-partitioned.md](altw-partitioned.md) for full design,
 [p2b-parallel-tuples-spec.md](p2b-parallel-tuples-spec.md) for P2b
@@ -324,5 +331,5 @@ for the complete OOM investigation.
 - [x] Full end-to-end Europe measurement — **577s, 4.5x faster than dense**
 - [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
 - [x] P2c parallel assembly — stage 4: 432s→136s (-68%), 7.3 GB anon
-- [ ] Benchmark external join on planet (87.7 GB) — ~300 GB temp disk needed
+- [x] Benchmark external join on planet (87 GB) — **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense**
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

@@ -16,7 +16,7 @@
 
 Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. Designed for planet-scale operations on normal hardware.
 
-Applying a daily diff to an 18.8 GB North America extract (2.58 billion elements, 645K changes) takes 12 seconds and uses under 600 MB of RAM. 92% of blobs pass through as raw bytes — no decompression, no re-encoding. The same pipeline targets full planet files (~80 GB) on a 32 GB machine — validation in progress.
+Applying a daily diff to an 18.8 GB North America extract (2.58 billion elements, 645K changes) takes 12 seconds and uses under 600 MB of RAM. 92% of blobs pass through as raw bytes — no decompression, no re-encoding. Enriching the full planet (87 GB) with way-node coordinates takes 24 minutes and 17 GB of RAM on a 30 GB machine — 3.9x faster than the mmap-based approach that thrashes at this scale.
 
 Developed on Linux, untested elsewhere. Production-relevant features (O_DIRECT, io_uring) are Linux-only.
 
@@ -135,7 +135,7 @@ Tags-filter uses OR semantics across expressions. In default mode (without `-R`)
 
 Apply-changes with `--locations-on-ways` preserves and updates inline way-node coordinates through OSC diffs, eliminating the need to re-run `add-locations-to-ways` after each merge. Requires a sorted base PBF with `LocationsOnWays` (bootstrap with `add-locations-to-ways` once). Surviving base ways forward existing coordinates as raw bytes; OSC ways look up node coordinates from a sparse index built from the diff and base PBF.
 
-Add-locations-to-ways supports two index strategies via `--index-type`: `dense` (default) uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID) — fastest when the working set fits in RAM. `sparse` uses a Planetiler-inspired chunk-indexed array with batched sorted lookups — ~540 MB RAM + compact on-disk values file, memory-bounded for planet on low-RAM hosts (~1.85x slower than dense when data fits in RAM).
+Add-locations-to-ways supports three index strategies via `--index-type`: `dense` (default) uses a file-backed mmap index (8 bytes/slot, direct addressing by node ID) — fastest when the working set fits in RAM. `sparse` uses a Planetiler-inspired chunk-indexed array with batched sorted lookups — ~540 MB RAM + compact on-disk values file. `external` uses a double radix permutation with bounded memory and all sequential I/O — best for memory-constrained hosts where dense thrashes. Requires sorted PBF input and ~300 GB temp disk at planet scale. Planet (87 GB): 24 min, 17 GB peak anon, 3.9x faster than dense (96 min).
 
 Getid supports `--add-referenced` to include way node refs (two-pass), `--id-file` / `--id-osm-file` to read IDs from files, and `--default-type` for bare numeric IDs. `--invert` reverses the selection (remove listed IDs, keep everything else).
 

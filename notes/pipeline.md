@@ -197,27 +197,31 @@ Requires sorted PBF with indexdata. Uses temp disk (~4 GB Denmark, ~112 GB Europ
 - Per slot bucket: load resolved entries, scatter by slot_pos into zeroed buffer, write_all
 - Eliminates sort + reduces syscalls (15x speedup over sorted pwrite)
 
-**Stage 4 — Assembly** (sequential BlobReader + DecompressPool):
-- Reads original PBF, enriches ways with coordinates from coord_slots file
-- P1b: skips node blobs without tagged/member nodes via indexdata + tagdata
-- Anon: 2.1 GB at Europe scale
+**Stage 4 — Assembly** (P2c, pread-from-workers):
+- Header-only pre-scan builds blob schedule with pre-computed slot_starts
+  (from ref count sidecar written in stage 1)
+- Dedicated worker threads pread + decompress + PrimitiveBlock + assemble
+- PrimitiveBlock lifecycle entirely on worker thread (no cross-thread retention)
+- P1b: skips node blobs without tagged/member nodes via header indexdata + tagdata
+- Consumer reorders + drains OwnedBlocks to pipelined PbfWriter
+- Anon: 7.3 GB at Europe scale (parallel in-flight PrimitiveBlocks + OwnedBlocks)
 
 **Measured results:**
-- Denmark (465 MB): 13.8s, ~4 GB temp disk
-- Europe (32.4 GB, commit `80e227b`): 866s (14.4 min), ~112 GB temp disk. Dense ALTW: 2,565s. **3.0x faster.**
+- Denmark (465 MB): 12.3s, ~4 GB temp disk
+- Europe (32.4 GB, commit `6b09796`): **577s (9.6 min)**, ~112 GB temp disk. Dense ALTW: 2,565s. **4.5x faster.**
 
 **Planet-scale resource estimates (87 GB, ~13B node refs, not yet validated):**
 
 | Resource | Europe (measured) | Planet (extrapolated) |
 |----------|------------------|----------------------|
-| Peak anon RSS | 1.4 GB (stage 2) | ~4 GB |
+| Peak anon RSS | 7.3 GB (stage 4) | ~20 GB |
 | Temp disk | ~112 GB | **~300 GB** |
-| Wall time | 866s (14 min) | ~2400s (40 min) |
+| Wall time | 577s (9.6 min) | ~1600s (27 min) |
 
-Memory is bounded by design: sequential readers (stages 1/3/4), pread-from-workers
-with all-thread-local buffers (stage 2), one bucket loaded at a time. Peak anon
-is the largest COO bucket sort — scales linearly with way-node refs per bucket.
-Safe on a 32 GB host.
+Memory is bounded by design: pread-from-workers with thread-local buffers
+(stages 2/4), sequential reader (stage 1), one bucket at a time (stages 2/3).
+Peak anon is stage 4's parallel PrimitiveBlock construction (~7.3 GB Europe,
+~20 GB planet). Safe on a 32 GB host.
 
 Temp disk is the main constraint at planet scale. The 256 node buckets hold all
 `(node_id, slot_pos)` COO pairs (16 bytes each, ~13B pairs = ~208 GB), plus 256

@@ -26,7 +26,7 @@ Ordered by impact and dependency. Items within a group can be done in any order.
 **Group 3: External join next cycle (P2b/P2c)**
 9. ~~P2b: parallel tuples for external join stage 2~~ — Done. P2b-v2 (commit `80e227b`): pread-from-workers, all alloc thread-local. Europe stage 2: 301s→216s (-28%), anon 20.4 GB→**1.4 GB** (-93%). Planet-safe (~3.9 GB extrapolated).
 10. ~~External join stage 1: sequential reader~~ — Done (commit `4daf995`). Anon 11 GB→70 MB. Stage 1: 82s→128s (+54%).
-11. P2c: parallel assembly for external join stage 4 (needs per-blob ref counts)
+11. ~~P2c: parallel assembly for external join stage 4~~ — Done (commit `6b09796`). Ref count sidecar from stage 1, pread-from-workers with dedicated thread pool. Europe stage 4: 432s→**136s** (-68%), 7.3 GB anon. Total: 866s→**577s** (-33%). 4.5x faster than dense.
 12. Planet benchmark for external join
 
 **Group 4: Remaining commands at Europe/planet scale**

@@ -287,6 +287,7 @@ the extra temp disk (~32 GB for referenced-only sidecar at planet).
 - [x] fadvise(DONTNEED) + mmap coord_slots (commit `165cbb2`): Denmark 25→22s
 - [x] Node-only scanner + scatter buffer for stages 2-3 (commit `cf350a9`)
 - [x] Sequential readers for stages 1/4, eliminate PrimitiveBlock retention
-- [x] P2b-v2 pread-from-workers: stage 2 anon 20.4 GB → 1.4 GB, planet-safe (commit `80e227b`)
-- [ ] Benchmark on planet (87.7 GB) — ~300 GB temp disk needed, ~40 min estimated
+- [x] P2b-v2 pread-from-workers: stage 2 anon 20.4 GB → 1.4 GB (commit `80e227b`)
+- [x] P2c parallel assembly: stage 4 432s→136s (-68%), total 866s→**577s** (commit `6b09796`)
+- [ ] Benchmark on planet (87.7 GB) — ~300 GB temp disk needed, ~27 min estimated
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

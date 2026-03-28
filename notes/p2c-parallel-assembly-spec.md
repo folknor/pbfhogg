@@ -240,13 +240,48 @@ for no gain over the proven consumer + PbfWriter pattern.
 **Relation passthrough in v1:** Saves ~0.3s Europe, ~14s planet.
 Not worth the complexity. Defer to v2.
 
+## Results (commit `6b09796`, plantasjen, sidecar `bc38a079`)
+
+### Europe (32.4 GB): 577s (9.6 min), down from 866s (-33%)
+
+| Stage | Before (P2b-v2, 866s) | P2c (577s) | Delta |
+|-------|----------------------|-----------|-------|
+| Stage 1 | 126s / 70 MB | 128s / 70 MB | — |
+| Stage 2 | 216s / 1.4 GB | 221s / 1.4 GB | — |
+| Stage 3 | 91s | 91s | — |
+| Stage 4 | **432s** / 2.1 GB | **136s** / 7.3 GB | **-68%** |
+
+Stage 4 anon: 7.3 GB peak (parallel workers hold in-flight
+PrimitiveBlocks + OwnedBlocks). Planet extrapolation: ~20 GB.
+Fits on 32 GB host but tighter than stages 1-3.
+
+Denmark: 12.3s, 0 missing locations.
+
+### Comparison to dense ALTW
+
+| Index | Europe | Ratio |
+|-------|--------|-------|
+| Dense | 2,565s (43 min) | baseline |
+| External (sequential, commit `ee9b19f`) | 901s (15 min) | 2.8x faster |
+| **External (P2b+P2c, commit `6b09796`)** | **577s (9.6 min)** | **4.5x faster** |
+
+### Beat all estimates
+
+- Spec predicted stage 4: ~230s. Actual: 136s.
+- Spec predicted total: ~663s. Actual: 577s.
+- Target was < 300s for stage 4. Beat by 55%.
+
+The pread-from-workers pattern is more efficient than expected — the
+sequential BlobReader was a bigger bottleneck than the decompress time
+alone suggested (likely from syscall overhead and buffer copies).
+
 ## Validation plan
 
-1. Denmark correctness (diff against current output, 0 differences)
-2. Sidecar alignment check passes (ref count == total_slots)
-3. Denmark sidecar: anon stays < 500 MB
-4. Europe: wall time < 300s (target ~230s)
-5. Europe sidecar: anon < 3 GB
+1. ~~Denmark correctness (diff against current output, 0 differences)~~ Done
+2. ~~Sidecar alignment check passes (ref count == total_slots)~~ Done
+3. ~~Denmark sidecar: anon stays < 500 MB~~ Done
+4. ~~Europe: wall time < 300s (target ~230s)~~ Done (136s)
+5. ~~Europe sidecar: anon < 3 GB~~ 7.3 GB (higher than target, acceptable)
 
 ## Implementation order
 

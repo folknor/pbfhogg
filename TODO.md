@@ -95,24 +95,25 @@ See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md) and
 - [x] P2b-v2: parallel tuples with pread-from-workers (commit `80e227b`).
   Stage 2: 301s→216s (-28%), anon 20.4 GB→1.4 GB (-93%).
 - [x] Sequential readers for stages 1/4 (commits `4daf995`, `2873919`).
+- [x] P2c: parallel assembly for stage 4 (commit `6b09796`).
+  Stage 4: 432s→**136s** (-68%). Total: 866s→**577s** (-33%). 4.5x faster than dense.
 
 **Remaining:**
-- [ ] P2c: parallel assembly for stage 4 (432s, largest stage). Needs per-blob
-  way-ref counts for slot_pos pre-computation.
-- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk, ~40 min estimated.
+- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk, ~27 min estimated.
 
 ## ALTW memory optimization
 
 See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 
-**Status**: External join (`--index-type external`) at Europe: **866s (14.4 min),
-1.4 GB peak anon, 3.0x faster than dense** (2,565s). Planet-safe architecture.
+**Status**: External join (`--index-type external`) at Europe: **577s (9.6 min),
+7.3 GB peak anon, 4.5x faster than dense** (2,565s). Planet-safe architecture.
 
 **Done**:
 - [x] ~~Test pread + fadvise~~ — won't help
 - [x] Fix stage 4 assembly OOM — sequential reader
-- [x] Full end-to-end Europe — 866s (commit `80e227b`)
+- [x] Full end-to-end Europe — **577s** (commit `6b09796`), 4.5x faster than dense
 - [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
+- [x] P2c parallel assembly — stage 4: 432s→136s (-68%), 7.3 GB anon
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
 - [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk needed
 

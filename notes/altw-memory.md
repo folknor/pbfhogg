@@ -266,7 +266,8 @@ elements, 0 differences. Cross-validated against osmium via
 | external (old, 256× re-read) | 302s (5m) | — | — | `034422c` |
 | external (single-pass merge) | 25s | 143s | 2,060s (34m) | `a334c72` |
 | external (node-only scanner + scatter) | 14s | — | 901s (15m) | `ee9b19f` |
-| **external (P2b-v2 pread-from-workers)** | **13.8s** | — | **866s (14.4m)** | `80e227b` |
+| external (P2b-v2 pread-from-workers) | 13.8s | — | 866s (14.4m) | `80e227b` |
+| **external (P2c parallel assembly)** | **12.3s** | — | **577s (9.6m)** | `6b09796` |
 
 **Optimization history:**
 - Stage 2 node-only scanner: replaced pipelined PrimitiveBlock with
@@ -282,19 +283,19 @@ elements, 0 differences. Cross-validated against osmium via
   Workers pread blob data from shared `Arc<File>`, no cross-thread
   ownership of any buffer. (`80e227b`)
 
-**Memory profile (sidecar `070086bb`, commit `80e227b`):**
+**Memory profile (sidecar `bc38a079`, commit `6b09796`):**
 
 | Stage | Duration | Anon peak | Notes |
 |-------|----------|----------|-------|
-| Stage 1 (way pass) | 126s | 70 MB | Sequential reader |
-| Stage 2 (node join) | 216s | 1.4 GB | Pread-from-workers, bucket sort |
+| Stage 1 (way pass) | 128s | 70 MB | Sequential reader + sidecar |
+| Stage 2 (node join) | 221s | 1.4 GB | Pread-from-workers, bucket sort |
 | Stage 3 (slot reorder) | 91s | — | Scatter buffer |
-| Stage 4 (assembly) | 432s | 2.1 GB | Sequential reader |
+| Stage 4 (assembly) | **136s** | **7.3 GB** | Pread-from-workers, parallel assembly |
 
-**Planet-scale safety:** all stages use sequential readers or
-pread-from-workers with thread-local buffers. Peak anon ~4 GB
-(extrapolated). Safe on 32 GB host. Main constraint is temp disk
-(~300 GB at planet). Not yet validated at planet scale.
+**Planet-scale safety:** all stages use pread-from-workers with
+thread-local buffers. Peak anon ~20 GB at planet (stage 4, extrapolated
+from 7.3 GB at Europe). Fits on 32 GB host but tighter than stages 1-3.
+Main constraint is temp disk (~300 GB at planet). Not yet validated.
 
 See [altw-partitioned.md](altw-partitioned.md) for full design,
 [p2b-parallel-tuples-spec.md](p2b-parallel-tuples-spec.md) for P2b
@@ -318,9 +319,10 @@ for the complete OOM investigation.
 - [x] Verify external join correctness on Denmark — identical to dense
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark external join on Japan — 143s (2.0x dense)
-- [x] Benchmark external join on Europe — 2,060s (34m) → 901s → **866s (14.4m)** commit `80e227b`
+- [x] Benchmark external join on Europe — 2,060s (34m) → 901s → 866s → **577s (9.6m)** commit `6b09796`
 - [x] Fix stage 4 assembly OOM — sequential reader (commit `2873919`)
-- [x] Full end-to-end Europe measurement — **866s, 3.0x faster than dense**
-- [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB, planet-safe
+- [x] Full end-to-end Europe measurement — **577s, 4.5x faster than dense**
+- [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
+- [x] P2c parallel assembly — stage 4: 432s→136s (-68%), 7.3 GB anon
 - [ ] Benchmark external join on planet (87.7 GB) — ~300 GB temp disk needed
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

@@ -46,21 +46,20 @@ commit `65bc639`).
 Converted all unbatched collection passes to sequential BlobReader +
 DecompressPool. Rewrite passes still use batched `par_iter` (safe).
 
-### Priority 2: Scanner family
+### ~~Priority 2: Scanner family~~ — DONE (partial)
 
-Way-ref-only and relation-member scanners would avoid full PrimitiveBlock
-construction in several passes that only need refs/members:
+| Target | Status | Commit |
+|--------|--------|--------|
+| ALTW pass 0 (`collect_way_referenced_node_ids`) | **Done** — way-ref scanner | `9b9d3f4` |
+| `collect_relation_member_node_ids` | **Done** — sequential reader | `9b9d3f4` |
+| Geocode pass 1.5 | Skipped — needs tag classification, can't use scanner |
+| merge `--locations-on-ways` node mining | Skipped — low priority, 92%+ passthrough |
 
-| Target | Current | Scanner needed |
-|--------|---------|---------------|
-| ALTW pass 0 (`collect_way_referenced_node_ids`) | Pipelined PrimitiveBlock | Way-ref scanner |
-| Geocode pass 1.5 (referenced node collection) | Sequential PrimitiveBlock | Way-ref scanner |
-| `collect_relation_member_node_ids` | Pipelined PrimitiveBlock | Relation-member scanner |
-| merge `--locations-on-ways` node mining | PrimitiveBlock | Node-coordinate scanner |
-
-These are lower priority — the pipelined passes process filtered blobs
-(30% for ways, 5% for relations) and the retention is bounded by pipeline
-depth. But a way-ref scanner would generalize nicely.
+New `way_scanner.rs`: wire-format scanner extracting way ID + refs without
+PrimitiveBlock (no string table, no group_ranges). Timing improvement
+marginal (pass 0 is small fraction of total). Main win is architectural:
+all collection passes now consistent (sequential/scanner, no pipelined
+PrimitiveBlock retention).
 
 ### Priority 3: Monitor at planet scale
 

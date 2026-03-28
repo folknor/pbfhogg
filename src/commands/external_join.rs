@@ -20,20 +20,18 @@
 use std::io::{BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
-
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
-use crate::writer::{Compression, PbfWriter};
+use crate::writer::Compression;
 use crate::{Element, ElementReader, PrimitiveBlock};
 use crate::debug_log;
 
 use super::add_locations_to_ways::Stats;
 use super::id_set_dense::IdSetDense;
 use super::{
-    dense_node_metadata, drain_batch_results, element_metadata,
+    dense_node_metadata, element_metadata,
     ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
     flush_local, require_indexdata, writer_from_header,
-    HeaderOverrides, Result, BATCH_SIZE,
+    HeaderOverrides, Result,
 };
 
 // ---------------------------------------------------------------------------
@@ -245,6 +243,7 @@ fn stage1_way_pass(
     input: &Path,
     direct_io: bool,
     node_buckets: &mut BucketWriters,
+    ref_count_sidecar: &Path,
 ) -> Result<u64> {
     // Sequential reader to avoid PrimitiveBlock cross-thread retention.
     // Pipelined reader retains ~11 GB anon at Europe scale (360K way blobs),
@@ -259,6 +258,16 @@ fn stage1_way_pass(
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
     let mut block_count: u64 = 0;
 
+    // P2c sidecar: per-way-blob ref counts for stage 4 slot_pos pre-computation.
+    // Stage 1 and stage 4 must see way blobs in the same file order (both filter
+    // by ElemKind::Way from the same indexdata). Changing blob ordering without
+    // updating both stages would silently corrupt the sidecar alignment.
+    let mut sidecar_writer = BufWriter::with_capacity(
+        64 * 1024,
+        std::fs::File::create(ref_count_sidecar)
+            .map_err(|e| format!("failed to create ref count sidecar: {e}"))?,
+    );
+
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -272,6 +281,7 @@ fn stage1_way_pass(
 
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
         let block = PrimitiveBlock::new(decompressed)?;
+        let blob_start_pos = slot_pos;
         for element in block.elements_skip_metadata() {
             if let Element::Way(w) = element {
                 for node_id in w.refs() {
@@ -286,11 +296,19 @@ fn stage1_way_pass(
                 }
             }
         }
+        // Write per-blob ref count to sidecar.
+        let blob_ref_count = slot_pos - blob_start_pos;
+        sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+
         block_count += 1;
         if block_count.is_multiple_of(1000) {
             debug_log!("  stage1: {block_count} blocks, {slot_pos} refs, {}", crate::debug::rss_line());
         }
     }
+
+    // Trailer: total ref count for alignment verification in stage 4.
+    sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
+    sidecar_writer.flush()?;
 
     Ok(slot_pos)
 }
@@ -767,8 +785,56 @@ impl CoordSlots {
     }
 }
 
+/// Blob descriptor for the stage 4 pre-scan schedule.
+struct BlobDescriptor {
+    seq: usize,
+    data_offset: u64,
+    data_size: usize,
+    slot_start: u64,
+}
+
+/// Load the ref-count sidecar and compute prefix sums for slot_start values.
+fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("failed to read ref count sidecar: {e}"))?;
+    if data.len() < 8 {
+        return Err("ref count sidecar is too small".into());
+    }
+    // Last 8 bytes are the trailer (total ref count).
+    let trailer_bytes: [u8; 8] = data[data.len() - 8..].try_into()
+        .map_err(|_| "ref count sidecar trailer read failed")?;
+    let trailer_total = u64::from_le_bytes(trailer_bytes);
+    if trailer_total != total_slots {
+        return Err(format!(
+            "ref count sidecar total ({trailer_total}) != stage 1 total_slots ({total_slots})"
+        ).into());
+    }
+
+    let entry_bytes = &data[..data.len() - 8];
+    if entry_bytes.len() % 8 != 0 {
+        return Err("ref count sidecar has non-aligned entries".into());
+    }
+    let num_entries = entry_bytes.len() / 8;
+    let mut slot_starts = Vec::with_capacity(num_entries);
+    let mut cumulative: u64 = 0;
+    for chunk in entry_bytes.chunks_exact(8) {
+        slot_starts.push(cumulative);
+        let count = u64::from_le_bytes(chunk.try_into()
+            .map_err(|_| "ref count sidecar entry read failed")?);
+        cumulative += count;
+    }
+    if cumulative != total_slots {
+        return Err(format!(
+            "ref count sidecar cumulative ({cumulative}) != total_slots ({total_slots})"
+        ).into());
+    }
+    Ok(slot_starts)
+}
+
 /// Assembly pass: re-read the PBF, attach coordinates from coord_slots to ways.
-#[allow(clippy::too_many_arguments)]
+/// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
+/// See notes/p2c-parallel-assembly-spec.md.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage4_assembly(
     input: &Path,
     output: &Path,
@@ -776,31 +842,99 @@ fn stage4_assembly(
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
-    direct_io: bool,
+    _direct_io: bool,
     overrides: &HeaderOverrides,
+    ref_count_sidecar: &Path,
+    total_slots: u64,
 ) -> Result<Stats> {
-    let mut stats = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    use std::os::unix::fs::FileExt;
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free churn.
-    // Pipelined reader with decode_threads(1) is 17% faster (383s vs 461s) but
-    // causes 27 GB peak anon RSS from cross-thread PrimitiveBlock allocation
-    // retention. Not safe on memory-constrained hosts.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    // Enable both indexdata and tagdata parsing for blob-level filtering.
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.set_parse_tagdata(true);
-    let header_blob = blob_reader.next()
+    // Load sidecar and compute slot_start prefix sums.
+    let way_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
+    debug_log!("  stage4: loaded sidecar, {} way blobs", way_slot_starts.len());
+
+    // Header-only pre-scan: build the blob schedule.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.set_parse_tagdata(true);
+    // Skip OsmHeader.
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    // Also read the header for the writer (need a regular BlobReader for this).
+    let mut header_reader = crate::blob::BlobReader::open(input, false)?;
+    let header_blob = header_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
+    drop(header_reader);
+
+    let mut schedule: Vec<BlobDescriptor> = Vec::new();
+    let mut way_sidecar_idx: usize = 0;
+    let mut skipped_node_blobs: u64 = 0;
+    let mut seq: usize = 0;
+
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (header_entry, data_offset, data_size) = result?;
+        if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+
+        // P1b: skip node blobs with only untagged non-member nodes.
+        if !keep_untagged_nodes {
+            if let Some(idx) = header_entry.index() {
+                if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                    let has_tags = header_entry.tag_index()
+                        .is_none_or(|ti| !ti.keys_empty());
+                    if !has_tags {
+                        let has_members = relation_member_node_ids
+                            .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
+                        if !has_members {
+                            skipped_node_blobs += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Way blobs consume sidecar entries for slot_start.
+        let slot_start = if let Some(idx) = header_entry.index() {
+            if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                if way_sidecar_idx >= way_slot_starts.len() {
+                    return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
+                }
+                let start = way_slot_starts[way_sidecar_idx];
+                way_sidecar_idx += 1;
+                start
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start });
+        seq += 1;
+    }
+
+    // Verify all sidecar entries were consumed.
+    if way_sidecar_idx != way_slot_starts.len() {
+        return Err(format!(
+            "ref count sidecar has {} entries but only {} way blobs seen in PBF",
+            way_slot_starts.len(), way_sidecar_idx,
+        ).into());
+    }
+
+    debug_log!(
+        "  stage4: schedule built, {} blobs ({} skipped), {}",
+        schedule.len(), skipped_node_blobs, crate::debug::rss_line(),
+    );
+
+    // Open shared file for worker pread.
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
 
     let mut writer = writer_from_header(
         output,
@@ -811,80 +945,142 @@ fn stage4_assembly(
         |hb| hb.optional_feature("LocationsOnWays"),
     )?;
 
-    let mut slot_pos: u64 = 0;
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    let mut block_count: u64 = 0;
-    let mut skipped_node_blobs: u64 = 0;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
+    type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
-        // P1b: skip node blobs that contain only untagged non-member nodes.
-        // These blobs would be fully dropped during assembly anyway.
-        if !keep_untagged_nodes {
-            if let Some(idx) = blob.index() {
-                if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                    // Check tagdata: empty keys = no tagged nodes in this blob.
-                    let has_tags = blob.tag_index()
-                        .is_none_or(|ti| !ti.keys_empty());
-                    if !has_tags {
-                        // Check if any node in this blob is a relation member.
-                        let has_members = relation_member_node_ids
-                            .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
-                        if !has_members {
-                            skipped_node_blobs += 1;
-                            // Node blobs don't contain ways, so slot_pos unchanged.
-                            continue;
+    let mut total_stats = Stats {
+        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
+        ways_written: 0, relations_written: 0, missing_locations: 0,
+        blobs_passthrough: 0, blobs_decoded: 0,
+    };
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule into descriptor channel.
+        scope.spawn(move || {
+            for desc in schedule {
+                if desc_tx.send(desc).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Worker threads: pread → decompress → PrimitiveBlock → assemble.
+        // Dedicated threads, NOT global rayon (PbfWriter uses rayon for compression).
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = decoded_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+                let mut refs_buf: Vec<i64> = Vec::new();
+                let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+
+                loop {
+                    let desc = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
                         }
+                    };
+
+                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
+                        // Pread blob data.
+                        read_buf.resize(desc.data_size, 0);
+                        file.read_exact_at(&mut read_buf, desc.data_offset)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(e)
+                            ))?;
+
+                        // Decompress + parse into PrimitiveBlock.
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = PrimitiveBlock::new(
+                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
+                        )?;
+
+                        // Assemble.
+                        output_blocks.clear();
+                        let block_stats = assemble_block(
+                            &block,
+                            &mut bb,
+                            &mut output_blocks,
+                            coord_slots,
+                            desc.slot_start,
+                            keep_untagged_nodes,
+                            relation_member_node_ids,
+                            &mut refs_buf,
+                            &mut locations_buf,
+                        ).map_err(|e| crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(e))
+                        ))?;
+                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
+                            crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            )
+                        })?;
+
+                        // Reclaim the decompress buffer for reuse.
+                        // PrimitiveBlock took ownership via Bytes::from(take()),
+                        // but it's dropped now so we just need a fresh Vec.
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
+                    })();
+
+                    if tx.send((desc.seq, result)).is_err() {
+                        break;
                     }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(decoded_tx);
+
+        // Consumer: reorder + write to PbfWriter.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            crate::error::Result<(Vec<OwnedBlock>, Stats)>
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+        let mut block_count: u64 = 0;
+
+        for (seq_num, item) in decoded_rx {
+            reorder.push(seq_num, item);
+
+            while let Some(result) = reorder.pop_ready() {
+                let (blocks, block_stats) = result?;
+                merge_stats(&mut total_stats, &block_stats);
+
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(
+                        block_bytes, index, tagdata.as_deref(),
+                    )?;
+                }
+
+                block_count += 1;
+                if block_count.is_multiple_of(1000) {
+                    debug_log!("  stage4: {block_count} blobs, {}", crate::debug::rss_line());
                 }
             }
         }
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        batch.push(block);
-
-        if batch.len() >= BATCH_SIZE {
-            let batch_stats = assemble_batch(
-                &batch,
-                &mut writer,
-                coord_slots,
-                &mut slot_pos,
-                keep_untagged_nodes,
-                relation_member_node_ids,
-            )?;
-            merge_stats(&mut stats, &batch_stats);
-            batch.clear();
-
-            block_count += BATCH_SIZE as u64;
-            if block_count.is_multiple_of(1000) {
-                debug_log!("  stage4: {block_count} blocks, {}", crate::debug::rss_line());
-            }
-        }
-    }
-
-    if !batch.is_empty() {
-        let batch_stats = assemble_batch(
-            &batch,
-            &mut writer,
-            coord_slots,
-            &mut slot_pos,
-            keep_untagged_nodes,
-            relation_member_node_ids,
-        )?;
-        merge_stats(&mut stats, &batch_stats);
-    }
+        Ok(())
+    })?;
 
     writer.flush()?;
     if skipped_node_blobs > 0 {
         debug_log!("  stage4: skipped {skipped_node_blobs} untagged node blobs (no decompress)");
     }
-    Ok(stats)
+    Ok(total_stats)
 }
 
 fn merge_stats(dst: &mut Stats, src: &Stats) {
@@ -896,76 +1092,6 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
     dst.missing_locations += src.missing_locations;
     dst.blobs_passthrough += src.blobs_passthrough;
     dst.blobs_decoded += src.blobs_decoded;
-}
-
-/// Process one batch of blocks for assembly. Ways get coordinates from
-/// coord_slots; nodes are filtered; relations pass through.
-fn assemble_batch(
-    batch: &[PrimitiveBlock],
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    coord_slots: &CoordSlots,
-    slot_pos: &mut u64,
-    keep_untagged_nodes: bool,
-    relation_member_node_ids: Option<&IdSetDense>,
-) -> Result<Stats> {
-    // Snapshot the current slot_pos and compute per-block starting positions.
-    // Each way's refs advance slot_pos sequentially.
-    let mut block_slot_starts: Vec<u64> = Vec::with_capacity(batch.len());
-    let mut scan_pos = *slot_pos;
-    for block in batch {
-        block_slot_starts.push(scan_pos);
-        for element in block.elements_skip_metadata() {
-            if let Element::Way(w) = element {
-                scan_pos += w.refs().count() as u64;
-            }
-        }
-    }
-    *slot_pos = scan_pos;
-
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, Stats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .zip(block_slot_starts.par_iter())
-        .map_init(
-            || {
-                (
-                    BlockBuilder::new(),
-                    Vec::<i64>::new(),
-                    Vec::<(i32, i32)>::new(),
-                )
-            },
-            |(bb, refs_buf, locations_buf), (block, &block_start)| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = assemble_block(
-                    block,
-                    bb,
-                    &mut output,
-                    coord_slots,
-                    block_start,
-                    keep_untagged_nodes,
-                    relation_member_node_ids,
-                    refs_buf,
-                    locations_buf,
-                )?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-        )
-        .collect();
-
-    let mut total = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
-
-    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
-    Ok(total)
 }
 
 /// Process a single block for assembly.
@@ -1116,7 +1242,8 @@ pub fn external_join(
     let t1 = std::time::Instant::now();
     debug_log!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
     let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
-    let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets)?;
+    let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
+    let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets, &ref_count_sidecar)?;
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
     let stage1_ms = t1.elapsed().as_millis();
@@ -1187,6 +1314,8 @@ pub fn external_join(
         compression,
         direct_io,
         overrides,
+        &ref_count_sidecar,
+        total_slots,
     )?;
     let stage4_ms = t4.elapsed().as_millis();
     #[cfg(not(feature = "debug-logging"))]

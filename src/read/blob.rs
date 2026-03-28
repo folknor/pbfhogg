@@ -555,6 +555,14 @@ impl BlobHeader {
             .as_ref()
             .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
     }
+
+    /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
+    pub(crate) fn tag_index(&self) -> Option<crate::blob_index::TagIndex> {
+        self.header
+            .tagdata
+            .as_ref()
+            .and_then(|d| crate::blob_index::TagIndex::deserialize(d))
+    }
 }
 
 /// A reader for PBF files that allows iterating over [`Blob`]s.

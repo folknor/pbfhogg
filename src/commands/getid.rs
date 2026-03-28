@@ -299,10 +299,22 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     let mut has_dep_nodes = false;
 
     if !ids.way_ids.is_empty() {
-        let reader = ElementReader::open(input, direct_io)?
-            .with_blob_filter(BlobFilter::only_ways());
-        for block in reader.into_blocks_pipelined() {
-            let block = block?;
+        // Sequential reader to avoid PrimitiveBlock cross-thread retention.
+        // The unbatched per-block iteration would accumulate 8+ GB anon at
+        // Europe scale with the pipelined reader.
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = crate::block::PrimitiveBlock::new(decompressed)?;
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
                     && ids.way_ids.contains(&w.id())

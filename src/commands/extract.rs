@@ -897,7 +897,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
 /// dispatched for parallel writing via `process_extract_pass2_batch`. The
 /// pipeline (dedicated rayon pool) runs concurrently with the parallel write
 /// (global rayon pool) without contention.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn extract_simple_single_pass(
     input: &Path,
     output: &Path,
@@ -925,18 +925,10 @@ fn extract_simple_single_pass(
     let mut matched_relation_ids = IdSetDense::new();
     let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
 
-    // Sequential reader with node-only scanner for bbox classification.
-    // Node blobs: use extract_node_tuples (no string table) for fast bbox check.
-    // If matches found, decompress again into PrimitiveBlock for the write batch.
-    // Way/relation blobs: PrimitiveBlock directly.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let header = header_blob.to_headerblock()?;
-    super::warn_locations_on_ways_loss(&header);
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(spatial_blob_filter(&bbox_int));
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -945,66 +937,17 @@ fn extract_simple_single_pass(
         hb.sorted()
     })?;
 
-    let spatial_filter = spatial_blob_filter(&bbox_int);
-    let decompress_pool = crate::blob::DecompressPool::new();
-    let mut node_tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
-
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
+        let has_matches = classify_block_simple(
+            &block, region, &bbox_int,
+            &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
+        );
+        if !has_matches {
             continue;
         }
-
-        // Spatial blob filter: skip blobs whose bbox doesn't intersect.
-        if let Some(idx) = blob.index() {
-            if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                if !spatial_filter.want_nodes { continue; }
-                if let Some(ref filter_bbox) = spatial_filter.node_bbox {
-                    if let Some(ref blob_bbox) = idx.bbox {
-                        if !filter_bbox.intersects(blob_bbox) { continue; }
-                    }
-                }
-            }
-        }
-
-        // Node blobs: fast-path classification via node-only scanner.
-        let is_node_blob = blob.index()
-            .is_some_and(|idx| matches!(idx.kind, crate::blob_index::ElemKind::Node));
-        if is_node_blob {
-            // Decompress once for classification (no PrimitiveBlock, no string table).
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            node_tuples.clear();
-            super::node_scanner::extract_node_tuples(&decompressed, &mut node_tuples)
-                .map_err(|e| crate::error::new_error(
-                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                ))?;
-            let has_matches = node_tuples.iter().any(|t| {
-                region.contains_decimicro(&bbox_int, t.lat, t.lon)
-            });
-            if has_matches {
-                // Populate IdSetDense for way/relation classification.
-                for t in &node_tuples {
-                    if region.contains_decimicro(&bbox_int, t.lat, t.lon) {
-                        bbox_node_ids.set(t.id);
-                    }
-                }
-                // Need full PrimitiveBlock for writing — construct from same decompressed data.
-                let block = PrimitiveBlock::new(decompressed)?;
-                batch.push(block);
-            }
-        } else {
-            // Way/relation blobs: full PrimitiveBlock for classification + writing.
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
-            let has_matches = classify_block_simple(
-                &block, region, &bbox_int,
-                &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
-            );
-            if has_matches {
-                batch.push(block);
-            }
-        }
+        batch.push(block);
 
         if batch.len() >= BATCH_SIZE {
             let ids = ExtractPass2IdSets {

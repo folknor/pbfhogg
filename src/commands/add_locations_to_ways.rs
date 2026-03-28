@@ -1448,7 +1448,7 @@ fn write_output_passthrough(
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     let (header_bytes, _sorted) = read_header_raw(&mut reader, &mut file_offset, overrides)?;
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
 
     // Open second handle for copy_file_range (explicit offsets, thread-safe).
     #[cfg(feature = "linux-direct-io")]

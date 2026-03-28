@@ -828,7 +828,7 @@ fn stage4_assembly(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     // Also read the header for the writer (need a regular BlobReader for this).
-    let mut header_reader = crate::blob::BlobReader::open(input, false)?;
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
     let header_blob = header_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;

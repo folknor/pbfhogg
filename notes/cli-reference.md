@@ -372,4 +372,39 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--force` | Proceed without indexdata / overwrite existing index |
 
-Outputs 19 binary files. Denmark (465 MB PBF): ~21s, 172 MB index. Germany (4.5 GB PBF): ~30 min, ~1.8 GB index.
+Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 568s (9.5 min), 7.5 GB RSS.
+
+---
+
+## I/O capability matrix
+
+Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-uring`
+(io_uring async writes), and which paths are affected.
+
+| Command | Reads PBF | Writes PBF | `--direct-io` | `--io-uring` | Notes |
+|---------|:---------:|:----------:|:-------------:|:------------:|-------|
+| inspect | Yes | — | Yes | — | Read-only |
+| inspect tags | Yes | — | Yes | — | Read-only |
+| inspect --nodes | Yes | — | Yes | — | Read-only |
+| check --ids | Yes | — | Yes | — | Read-only |
+| check --refs | Yes | — | Yes | — | Read-only |
+| cat | Yes | Yes | Yes (R+W) | — | Passthrough + filtered paths |
+| cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
+| sort | Yes | Yes | Yes (R+W) | Yes | |
+| renumber | Yes | Yes | Yes (R+W) | — | |
+| extract | Yes | Yes | Yes (R+W) | — | All strategies |
+| tags-filter | Yes | Yes | Yes (R+W) | — | Both single-pass and two-pass |
+| getid | Yes | Yes | Yes (R+W) | — | Including --add-referenced |
+| getid --invert | Yes | Yes | Yes (R+W) | — | |
+| getparents | Yes | Yes | Yes (R+W) | — | |
+| time-filter | Yes | Yes | Yes (R+W) | — | |
+| add-locations-to-ways | Yes | Yes | Yes (R+W) | — | All index types |
+| apply-changes | Yes | Yes | Yes (R+W) | Yes | Production merge path |
+| diff | Yes | — | Yes | — | Read-only (text output) |
+| diff --format osc | Yes | — | Yes | — | Read-only (OSC XML output) |
+| derive-changes | Yes | — | Yes | — | Read-only (OSC XML output) |
+| build-geocode-index | Yes | — | Yes | — | Binary index output, not PBF |
+| merge-changes | — | — | — | — | OSC-only, no PBF I/O |
+
+**R+W** = `--direct-io` affects both PBF reads (via `BlobReader`) and PBF writes (via `PbfWriter`).
+**`--io-uring`** requires the `linux-io-uring` compile-time feature and sufficient `RLIMIT_MEMLOCK`.

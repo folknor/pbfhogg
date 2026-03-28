@@ -120,7 +120,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
     };
 
-    let mut writer = PbfWriter::to_path(output, compression, &header_bytes)?;
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
     let mut blobs: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 

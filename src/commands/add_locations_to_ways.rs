@@ -15,7 +15,7 @@ use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{Element, ElementReader, MemberId, PrimitiveBlock};
 
 use super::{
     build_output_header, drain_batch_results, ensure_node_capacity_local,
@@ -190,20 +190,6 @@ impl DenseMmapIndex {
         Ok(Self { mmap, _file: file, capacity })
     }
 
-    /// Insert a node's coordinates (sequential use only).
-    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    pub(crate) fn set(&mut self, node_id: i64, lat: i32, lon: i32) {
-        if node_id < 0 {
-            return;
-        }
-        let idx = node_id as usize;
-        if idx >= self.capacity {
-            return;
-        }
-        let offset = idx * ENTRY_SIZE;
-        let packed = (lat as u32 as u64) | ((lon as u32 as u64) << 32);
-        self.mmap[offset..offset + ENTRY_SIZE].copy_from_slice(&packed.to_le_bytes());
-    }
 }
 
 // ---------------------------------------------------------------------------

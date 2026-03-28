@@ -26,7 +26,7 @@ pub(crate) fn scan_way_refs(
     refs_buf: &mut Vec<i64>,
     mut callback: impl FnMut(i64, &[i64]),
 ) -> Result<()> {
-    use crate::read::wire::{Cursor, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+    use crate::read::wire::{Cursor, WIRE_LEN};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);

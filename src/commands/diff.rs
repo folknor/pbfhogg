@@ -22,7 +22,7 @@ use super::stream_merge::{
     merge_join_phase, MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
 use super::{require_sorted, Result, TypeFilter};
-use crate::{BlobFilter, ElementReader, MemberType};
+use crate::{ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
 // Public types

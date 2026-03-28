@@ -5,7 +5,7 @@
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
 
-use crate::{BlockType, Element, PipelinedBlocks, PrimitiveBlock};
+use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
 use super::Result;
@@ -25,10 +25,6 @@ pub(crate) struct StreamingBlocks {
 }
 
 impl StreamingBlocks {
-    pub(crate) fn new(blocks: PipelinedBlocks) -> Self {
-        Self { blocks: Box::new(blocks), stashed: None }
-    }
-
     /// Create from a sequential BlobReader. Avoids PrimitiveBlock cross-thread
     /// alloc/free retention from the pipelined reader.
     pub(crate) fn new_sequential(

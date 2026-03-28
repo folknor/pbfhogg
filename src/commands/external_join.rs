@@ -383,6 +383,13 @@ fn stage2_node_join(
     let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawItem>(16);
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
+    // Buffer pool for Vec<NodeTuple> recycling. Without this, 500K+ cross-thread
+    // alloc/free cycles cause glibc to retain ~25 GB anonymous heap (same pattern
+    // as PrimitiveBlock retention — see pipeline.rs). Workers take from pool,
+    // consumer returns after merge-join. ~32-64 Vecs × 128 KB = bounded memory.
+    let tuple_pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<NodeTuple>>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(64)));
+
     std::thread::scope(|scope| -> Result<()> {
         // IO thread: read blobs, filter to node blobs, assign contiguous seq numbers.
         scope.spawn(move || {
@@ -413,6 +420,7 @@ fn stage2_node_join(
 
         // Dispatch thread: receive raw blobs, spawn rayon decode tasks.
         let dispatch_tx = decoded_tx.clone();
+        let dispatch_pool = std::sync::Arc::clone(&tuple_pool);
         scope.spawn(move || {
             let decode_threads = std::thread::available_parallelism()
                 .map(|n| n.get().saturating_sub(2).max(1))
@@ -425,6 +433,7 @@ fn stage2_node_join(
             };
             for (seq, blob_result) in raw_rx {
                 let tx = dispatch_tx.clone();
+                let pool = std::sync::Arc::clone(&dispatch_pool);
                 decode_pool.spawn(move || {
                     let result = blob_result.and_then(|blob| {
                         // Thread-local decompress buffer: reused across blobs on this thread.
@@ -433,7 +442,10 @@ fn stage2_node_join(
                         }
                         DBUF.with_borrow_mut(|dbuf| {
                             blob.decompress_into(dbuf)?;
-                            let mut tuples = Vec::new();
+                            // Take a recycled buffer from the pool, or allocate fresh.
+                            let mut tuples = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop()
+                                .unwrap_or_default();
+                            tuples.clear();
                             extract_node_tuples(dbuf, &mut tuples)
                                 .map_err(|e| crate::error::new_error(
                                     crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
@@ -507,6 +519,9 @@ fn stage2_node_join(
                         pair_cursor += 1;
                     }
                 }
+
+                // Return buffer to pool for worker reuse (prevents cross-thread free retention).
+                tuple_pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tuples);
             }
         }
 

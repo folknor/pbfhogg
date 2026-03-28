@@ -7,6 +7,7 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 - Never chain commands with &&
 - Never chain commands with ;
 - Never pipe commands with |
+- Never capture stdout into env vars (`UUID=$(...)`) — shell state doesn't persist between tool calls. Read the output directly and use the value inline.
 - Never read or write from /tmp. All data lives in the project.
 - Never run raw cargo, curl, pkill. Use `brokkr`.
 
@@ -18,10 +19,9 @@ Every measurable command is a top-level subcommand. Mode flags control behavior:
 
 ```
 brokkr <command> [--dataset D] [--variant V]   # run once, print timing
-brokkr <command> [--dataset D] --bench          # 3 runs, store in DB
+brokkr <command> [--dataset D] --bench          # 3 runs, store in DB + sidecar profiler (100ms /proc sampling + markers)
 brokkr <command> [--dataset D] --hotpath        # function-level timing
 brokkr <command> [--dataset D] --alloc          # allocation tracking
-brokkr <command> [--dataset D] --bench --sidecar  # bench + sidecar profiler (100ms /proc sampling + markers)
 ```
 
 pbfhogg commands (every CLI command is a brokkr subcommand):
@@ -34,8 +34,19 @@ pbfhogg commands (every CLI command is a brokkr subcommand):
 Utility commands (unchanged):
 - `brokkr check [-- args]` — run clippy + tests. Supports `--features`, `--no-default-features`, `--package` / `-p`.
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
-- `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report).
+- `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report + sidecar profile data).
 - `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [-n N] [--top N]` — query/compare benchmark results from SQLite.
+- `brokkr results <UUID> --timeline` — raw JSONL samples (t in fractional seconds). Query flags compose:
+  `--summary` (per-phase table), `--fields rss,anon,majflt` (project fields),
+  `--where "majflt>0"` (filter), `--every 50` (downsample), `--head N` / `--tail N`,
+  `--stat anon` (min/max/avg/p50/p95), `--phase STAGE2` (filter to marker phase),
+  `--range 10.0..82.0` (time window). Example: `--phase STAGE2 --stat anon`.
+- `brokkr results <UUID> --markers` — raw JSONL marker events.
+  `--durations` for START/END pair timing. `--phases` for durations + peak RSS/anon/majflt.
+- `brokkr results --compare-timeline <uuid_a> <uuid_b>` — phase-aligned delta table.
+- `brokkr results dirty` — access sidecar data from the most recent run, even if it was OOM-killed or crashed.
+  Useful for inspecting memory trajectory of failed runs: `brokkr results dirty --timeline --stat anon`,
+  `brokkr results dirty --timeline --fields anon --every 100`.
 - `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik.
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history.

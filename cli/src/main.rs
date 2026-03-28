@@ -360,14 +360,14 @@ enum Command {
         #[arg(long)]
         keep_untagged_nodes: bool,
         /// Node coordinate index type:
+        ///   auto     - external if sorted + indexed, dense otherwise (recommended).
         ///   dense    - direct-mapped mmap array. Fastest when working set fits in RAM.
         ///              Works on any PBF (sorted or unsorted).
         ///   sparse   - chunk-indexed sparse array. Bounded memory (~540 MB), slower.
         ///              Works on any PBF. No temp disk needed.
-        ///   external - double radix permutation. Bounded memory (~1.6 GB), all sequential I/O.
-        ///              2.8x faster than dense at Europe scale. Requires sorted PBF
-        ///              (Sort.Type_then_ID) and indexdata. Uses ~112 GB temp disk at Europe,
-        ///              ~224 GB at planet.
+        ///   external - double radix permutation. Bounded memory (~17 GB planet),
+        ///              all sequential I/O. 3.9x faster than dense at planet scale.
+        ///              Requires sorted PBF and indexdata. ~300 GB temp disk at planet.
         #[arg(long, default_value = "dense")]
         index_type: String,
         #[command(flatten)]

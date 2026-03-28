@@ -113,6 +113,16 @@ Dense remains the "fast when RAM fits" path. See [notes/altw-optimization-histor
 - [ ] **Planet cat --type** — fixes landed (batch byte budget + bounded writer).
   `brokkr cat-way --dataset planet --bench 1`
 
+### Planet read benchmark (partial, commit `f42da6e`)
+
+- [x] Sequential: 583s (9.7 min), 87 GB, 10.4B nodes. ~149 MB/s decode throughput.
+- [ ] Parallel (`par_map_reduce`): **OOM at 23.6 GB anon** within 10s. Classic
+  PrimitiveBlock cross-thread retention. Not a production issue — no command
+  uses `par_map_reduce` at planet scale. All production commands use sequential
+  readers, scanners, or batched pipelined readers.
+- [ ] Pipelined: not run (blocked by parallel OOM). Likely same retention issue.
+- [ ] BlobReader: not run (blocked by parallel OOM). Should be fine (no PrimitiveBlock).
+
 ### merge --locations-on-ways node scanner (6/10 reviewers)
 
 Still builds full PrimitiveBlock to mine node coordinates from passthrough

@@ -274,7 +274,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     let first_reader = ElementReader::open(files[0], direct_io)?;
     super::warn_locations_on_ways_loss(first_reader.header());
     let header = first_reader.header().clone();
-    let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb, direct_io, false)?;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 

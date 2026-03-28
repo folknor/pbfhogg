@@ -868,7 +868,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
             hb
         };
         hb.sorted()
-    })?;
+    }, direct_io, false)?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &bbox_node_ids,
@@ -936,7 +936,7 @@ fn extract_simple_single_pass(
             hb
         };
         hb.sorted()
-    })?;
+    }, direct_io, false)?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for block in reader.into_blocks_pipelined() {
@@ -1012,7 +1012,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
             hb
         };
         hb.sorted()
-    })?;
+    }, direct_io, false)?;
 
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &result.bbox_node_ids,
@@ -1669,7 +1669,7 @@ fn extract_smart(
             hb
         };
         hb.sorted()
-    })?;
+    }, direct_io, false)?;
 
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &result.bbox_node_ids,

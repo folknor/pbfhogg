@@ -136,8 +136,8 @@ pub fn diff(
 
     // Check sorted headers before opening sequential readers.
     {
-        let old_reader = ElementReader::from_path(old_path)?;
-        let new_reader = ElementReader::from_path(new_path)?;
+        let old_reader = ElementReader::open(old_path, direct_io)?;
+        let new_reader = ElementReader::open(new_path, direct_io)?;
         require_sorted(old_reader.header(), old_path, "Old PBF")?;
         require_sorted(new_reader.header(), new_path, "New PBF")?;
     }

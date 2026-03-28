@@ -68,7 +68,7 @@ pub fn time_filter(
 
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
         hb.replication_timestamp(cutoff_timestamp)
-    })?;
+    }, direct_io, false)?;
     let mut bb = BlockBuilder::new();
     let mut stats = TimeFilterStats {
         versions_seen: 0,

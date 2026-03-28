@@ -562,6 +562,8 @@ enum Command {
         #[arg(long, default_value = "1000")]
         coarse_search_radius: f32,
         #[command(flatten)]
+        io: DirectIoArg,
+        #[command(flatten)]
         force: ForceArg,
     },
 }
@@ -1108,6 +1110,7 @@ fn main() {
             max_admin_vertices,
             search_radius,
             coarse_search_radius,
+            io,
             force,
         } => run_build_geocode_index(
             &file,
@@ -1118,6 +1121,7 @@ fn main() {
             max_admin_vertices,
             search_radius,
             coarse_search_radius,
+            io.direct_io,
             force.force,
         ),
         Command::BenchRead { file, mode } => run_bench_read(&file, &mode),
@@ -1151,12 +1155,14 @@ fn run_build_geocode_index(
     max_admin_vertices: u16,
     search_radius: f32,
     coarse_search_radius: f32,
+    direct_io: bool,
     force: bool,
 ) -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = pbfhogg::geocode_index::builder::BuildConfig {
         input_path: file.to_path_buf(),
         output_dir: output_dir.to_path_buf(),
         force,
+        direct_io,
         street_level,
         coarse_level,
         admin_level,

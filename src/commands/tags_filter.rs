@@ -309,7 +309,7 @@ fn tags_filter_single_pass(
             None => reader,
         }
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -680,7 +680,7 @@ fn tags_filter_two_pass(
     } else {
         reader
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,

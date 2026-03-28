@@ -719,7 +719,7 @@ pub fn add_locations_to_ways(
 ) -> Result<Stats> {
     // Auto-select: external if sorted + indexed, dense otherwise.
     let index_type = if index_type == IndexType::Auto {
-        let reader = crate::ElementReader::from_path(input)?;
+        let reader = crate::ElementReader::open(input, direct_io)?;
         let sorted = reader.header().is_sorted();
         drop(reader);
         // Check indexdata presence without erroring (peek at first blob).
@@ -761,7 +761,7 @@ pub fn add_locations_to_ways(
 
     // Suggest external index for sorted indexed PBFs on sparse selection.
     if index_type == IndexType::Sparse && indexdata_present {
-        let reader = crate::ElementReader::from_path(input)?;
+        let reader = crate::ElementReader::open(input, direct_io)?;
         if reader.header().is_sorted() {
             eprintln!(
                 "hint: this sorted indexed PBF is eligible for --index-type external, \
@@ -854,7 +854,7 @@ fn build_node_index_dense(
 
     // Check for existing LocationsOnWays before consuming the reader.
     {
-        let reader = ElementReader::from_path(input)?;
+        let reader = ElementReader::open(input, direct_io)?;
         if reader.header().has_locations_on_ways() {
             eprintln!(
                 "Warning: input PBF already declares LocationsOnWays. \
@@ -1050,6 +1050,8 @@ fn write_output_decode_all(
         true,
         overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
+        direct_io,
+        false,
     )?;
 
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);

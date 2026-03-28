@@ -510,6 +510,10 @@ pub(crate) fn build_output_header(
 }
 
 /// Open a pipelined writer from an input header.
+///
+/// Supports O_DIRECT and io_uring when the corresponding features are compiled
+/// in and the flags are set. Pass `false, false` for default buffered I/O.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn writer_from_header(
     output: &Path,
     compression: Compression,
@@ -517,9 +521,11 @@ pub(crate) fn writer_from_header(
     preserve_sorted: bool,
     overrides: &HeaderOverrides,
     configure: impl FnOnce(HeaderBuilder) -> HeaderBuilder,
+    direct_io: bool,
+    io_uring: bool,
 ) -> Result<PbfWriter<FileWriter>> {
     let header_bytes = build_output_header(header, preserve_sorted, overrides, configure)?;
-    Ok(PbfWriter::to_path(output, compression, &header_bytes)?)
+    writer_from_header_bytes(output, compression, &header_bytes, direct_io, io_uring)
 }
 
 /// Open an output writer from prebuilt header bytes with optional direct-io/io_uring modes.

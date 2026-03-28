@@ -34,6 +34,7 @@ pub struct BuildConfig {
     pub input_path: PathBuf,
     pub output_dir: PathBuf,
     pub force: bool,
+    pub direct_io: bool,
     pub street_level: u8,
     pub coarse_level: u8,
     pub admin_level: u8,
@@ -54,6 +55,7 @@ impl Default for BuildConfig {
             max_admin_vertices: 500,
             fine_search_radius_m: 75.0,
             coarse_search_radius_m: 1000.0,
+            direct_io: false,
         }
     }
 }
@@ -172,13 +174,13 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     // Validate input
     crate::commands::require_indexdata(
-        &config.input_path, false, config.force,
+        &config.input_path, config.direct_io, config.force,
         "input PBF has no blob-level indexdata. Without indexdata, \
          every blob must be decompressed (significantly slower).",
     )?;
 
     // Read PBF header
-    let reader = ElementReader::from_path(&config.input_path)?;
+    let reader = ElementReader::open(&config.input_path, config.direct_io)?;
     let pbf_header = reader.header();
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let repl_seq = pbf_header.osmosis_replication_sequence_number().unwrap_or(0) as u32;
@@ -200,7 +202,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     let mut admin_relations: Vec<RawAdminRelation> = Vec::new();
     {
-        let reader = ElementReader::from_path(&config.input_path)?;
+        let reader = ElementReader::open(&config.input_path, config.direct_io)?;
         reader.with_blob_filter(BlobFilter::only_relations())
             .for_each_block_pipelined(|block| {
             for element in block.elements_skip_metadata() {
@@ -285,7 +287,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
     {
-        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, false)?;
+        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, config.direct_io)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
@@ -400,7 +402,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         // node-only scanner here. But sequential decode keeps all alloc/free
         // on one thread, bounding heap to ~1.6 GB.
         // See notes/cross-pipeline-optimization-plan.md.
-        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, false)?;
+        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, config.direct_io)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;

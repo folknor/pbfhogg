@@ -128,7 +128,7 @@ impl BucketWriters {
                 #[cfg(feature = "linux-direct-io")]
                 {
                     use std::os::unix::io::AsRawFd;
-                    let _ = w.get_ref().sync_data();
+                    drop(w.get_ref().sync_data());
                     unsafe {
                         libc::posix_fadvise(
                             w.get_ref().as_raw_fd(),
@@ -810,7 +810,7 @@ fn stage4_assembly(
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
-    _direct_io: bool,
+    direct_io: bool,
     overrides: &HeaderOverrides,
     ref_count_sidecar: &Path,
     total_slots: u64,
@@ -904,6 +904,8 @@ fn stage4_assembly(
         true,
         overrides,
         |hb| hb.optional_feature("LocationsOnWays"),
+        direct_io,
+        false,
     )?;
 
     let decode_threads = std::thread::available_parallelism()
@@ -1182,7 +1184,7 @@ pub fn external_join(
     // The single-pass node merge in stage 2 requires sorted PBF input
     // (nodes in ascending ID order). Verify the header declares Sort.Type_then_ID.
     {
-        let reader = ElementReader::from_path(input)?;
+        let reader = ElementReader::open(input, direct_io)?;
         if !reader.header().is_sorted() {
             return Err("external join requires a sorted PBF (Sort.Type_then_ID). \
                         The single-pass node merge depends on ascending node ID order."

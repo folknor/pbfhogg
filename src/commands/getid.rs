@@ -259,7 +259,7 @@ fn filter_by_id(
     } else {
         reader
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
@@ -343,7 +343,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         true,
         !ids.relation_ids.is_empty(),
     ));
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
 
     let dep_ref = if has_dep_nodes { Some(&dep_node_ids) } else { None };
 

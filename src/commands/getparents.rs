@@ -55,7 +55,7 @@ pub fn getparents(
 ) -> Result<GetparentsStats> {
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
+    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
     let mut stats = GetparentsStats {
         nodes_written: 0,
         ways_written: 0,

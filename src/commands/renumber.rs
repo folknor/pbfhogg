@@ -58,7 +58,7 @@ pub fn renumber(
 
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
         hb.sorted()
-    })?;
+    }, direct_io, false)?;
     let mut bb = BlockBuilder::new();
 
     let mut node_map: HashMap<i64, i64> = HashMap::new();

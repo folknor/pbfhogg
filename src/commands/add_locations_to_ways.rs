@@ -47,6 +47,8 @@ pub enum IndexType {
     /// all sequential I/O. Uses ~224 GB temp disk at planet scale. Best for
     /// memory-constrained hosts where dense thrashes and sparse is too slow.
     External,
+    /// Auto-select: external if sorted + indexed, dense otherwise.
+    Auto,
 }
 
 /// Parse error for [`IndexType`].
@@ -69,8 +71,9 @@ impl FromStr for IndexType {
             "dense" => Ok(Self::Dense),
             "sparse" => Ok(Self::Sparse),
             "external" => Ok(Self::External),
+            "auto" => Ok(Self::Auto),
             _ => Err(ParseIndexTypeError(format!(
-                "unknown index type '{s}': expected 'dense', 'sparse', or 'external'"
+                "unknown index type '{s}': expected 'dense', 'sparse', 'external', or 'auto'"
             ))),
         }
     }
@@ -82,6 +85,7 @@ impl std::fmt::Display for IndexType {
             Self::Dense => f.write_str("dense"),
             Self::Sparse => f.write_str("sparse"),
             Self::External => f.write_str("external"),
+            Self::Auto => f.write_str("auto"),
         }
     }
 }
@@ -753,6 +757,31 @@ pub fn add_locations_to_ways(
     overrides: &HeaderOverrides,
     index_type: IndexType,
 ) -> Result<Stats> {
+    // Auto-select: external if sorted + indexed, dense otherwise.
+    let index_type = if index_type == IndexType::Auto {
+        let reader = crate::ElementReader::from_path(input)?;
+        let sorted = reader.header().is_sorted();
+        drop(reader);
+        // Check indexdata presence without erroring (peek at first blob).
+        let has_index = (|| -> Option<bool> {
+            let mut r = crate::blob::BlobReader::open(input, direct_io).ok()?;
+            r.set_parse_indexdata(true);
+            r.next()?.ok()?; // skip header
+            let blob = r.next()?.ok()?;
+            Some(blob.index().is_some())
+        })().unwrap_or(false);
+
+        let chosen = if sorted && has_index {
+            IndexType::External
+        } else {
+            IndexType::Dense
+        };
+        eprintln!("auto-selected --index-type {chosen} (sorted={sorted}, indexed={has_index})");
+        chosen
+    } else {
+        index_type
+    };
+
     // External join has its own pipeline — dispatch early.
     if index_type == IndexType::External {
         return super::external_join::external_join(
@@ -769,6 +798,20 @@ pub fn add_locations_to_ways(
     let indexdata_present = require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed and re-encoded (significantly slower).")?;
+
+    // Suggest external index for sorted indexed PBFs on sparse selection.
+    if index_type == IndexType::Sparse && indexdata_present {
+        let reader = crate::ElementReader::from_path(input)?;
+        if reader.header().is_sorted() {
+            eprintln!(
+                "hint: this sorted indexed PBF is eligible for --index-type external, \
+                 which uses bounded memory and sequential I/O (3.9x faster than dense \
+                 at planet scale). Sparse is slower than both dense and external on \
+                 sorted inputs."
+            );
+        }
+    }
+
     let scratch_dir = output.parent().unwrap_or(Path::new("."));
 
     // Pass 0: collect the set of node IDs referenced by ways. Only these
@@ -826,7 +869,7 @@ fn build_node_index(
             build_node_index_sparse(input, direct_io, scratch_dir, referenced)
                 .map(NodeIndex::Sparse)
         }
-        IndexType::External => unreachable!("external dispatched before build_node_index"),
+        IndexType::External | IndexType::Auto => unreachable!("resolved before build_node_index"),
     }
 }
 

@@ -182,19 +182,20 @@ Write throughput — decode all 59M elements then write through `BlockBuilder` +
 
 With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies). `Compression::None` on erofs is the target production config.
 
-CLI commands — Denmark (487 MB, 59M elements, commit `23862d1`, add-locations `46f7388`, inspect `fc76dfb`):
+CLI commands — Denmark (487 MB, 59M elements, commit `6fc1283`, osmium from `23862d1`):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexdata) | **0.036s** | — | **109x** vs full decode |
-| sort (sorted, indexdata) | **0.14s** | 11.6s | **83x** |
-| apply-changes (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
-| tags-filter w/highway=primary -R | **0.24s** | 0.56s | **2.3x** |
-| tags-filter amenity=restaurant -R | **0.58s** | 1.19s | **2.1x** |
-| cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
-| inspect tags --type way (indexdata) | **0.34s** | 0.59s | **1.7x** |
-| getid (9 elements) | **0.53s** | 0.83s | **1.6x** |
-| add-locations-to-ways | **6.5s** | 12.1s | **1.9x** |
+| inspect (indexdata) | **0.1s** | — | index-only fast path |
+| sort (sorted, indexdata) | **0.7s** | 11.6s | **17x** |
+| apply-changes (indexdata + zlib) | **0.6s** | 7.2s | **12x** |
+| tags-filter w/highway=primary -R | **0.2s** | 0.56s | **2.8x** |
+| tags-filter amenity=restaurant -R | **0.5s** | 1.19s | **2.4x** |
+| cat --type way (indexdata) | **0.7s** | 2.22s | **3.2x** |
+| inspect tags --type way (indexdata) | **0.4s** | 0.59s | **1.5x** |
+| getid (9 elements) | **0.6s** | 0.83s | **1.4x** |
+| add-locations-to-ways (dense) | **9.9s** | 12.1s | **1.2x** |
+| add-locations-to-ways (external) | **9.7s** | 12.1s | **1.2x** |
 
 Filter commands (cat, tags-filter, inspect tags, getid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Apply-changes uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation. add-locations-to-ways uses parallel node index building (batch-and-dispatch to rayon) and blob passthrough for unchanged node/relation blobs on indexed PBFs.
 

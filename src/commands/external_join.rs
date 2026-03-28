@@ -24,7 +24,7 @@ use rayon::prelude::*;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use crate::{Element, ElementReader, PrimitiveBlock};
 use crate::debug_log;
 
 use super::add_locations_to_ways::Stats;
@@ -246,15 +246,32 @@ fn stage1_way_pass(
     direct_io: bool,
     node_buckets: &mut BucketWriters,
 ) -> Result<u64> {
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_ways());
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention.
+    // Pipelined reader retains ~11 GB anon at Europe scale (360K way blobs),
+    // which carries into stage 2 and pushes peak to 20 GB.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
+    let decompress_pool = crate::blob::DecompressPool::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
     let mut block_count: u64 = 0;
 
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                continue;
+            }
+        }
+
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
         for element in block.elements_skip_metadata() {
             if let Element::Way(w) = element {
                 for node_id in w.refs() {

@@ -281,18 +281,90 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass1_kb={rss}"); }
 
     // -----------------------------------------------------------------------
-    // Pass 2: Nodes + Ways (fused single scan, pipelined)
+    // Pass 1.5: Referenced node collection (planet-scale memory optimization)
     //
-    // Sorted PBFs (Sort.Type_then_ID) guarantee all node blobs come before
-    // way blobs. A single pipelined scan processes nodes first (populating
-    // the dense coordinate index + address points), then ways (streets,
-    // buildings, interpolation, admin geometry). The pipelined closure runs
-    // sequentially on the caller thread — no concurrent data structure changes
-    // needed. Decompression is overlapped with I/O in the pipeline's rayon pool.
+    // Scan way blobs to collect node IDs referenced by geocode-relevant ways
+    // (streets, building addresses, interpolation, admin members). The dense
+    // node index in pass 2 only populates entries for these nodes, reducing
+    // page cache working set from ~83 GB (all 10.4B nodes) to ~16 GB (~2B
+    // referenced). Same pattern as ALTW pass 0.
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_END");
+    crate::debug::emit_marker("GEOCODE_PASS1_5_START");
+    eprintln!("Pass 1.5: Referenced node collection...");
+    crate::debug_log!("geocode-index: pass1.5 start {}", crate::debug::rss_line());
+
+    let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, false)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                    continue;
+                }
+            }
+
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = crate::block::PrimitiveBlock::new(decompressed)?;
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(way) = element {
+                    let mut highway = false;
+                    let mut name = false;
+                    let mut hn = false;
+                    let mut addr_st = false;
+                    let mut building = false;
+                    let mut interp = false;
+                    let mut highway_val: Option<&str> = None;
+
+                    for (k, _v) in way.tags() {
+                        match k {
+                            "highway" => { highway = true; highway_val = Some(_v); }
+                            "name" => name = true,
+                            "addr:housenumber" => hn = true,
+                            "addr:street" => addr_st = true,
+                            "building" => building = true,
+                            "addr:interpolation" => interp = true,
+                            _ => {}
+                        }
+                    }
+
+                    let is_street = highway && name
+                        && !EXCLUDED_HIGHWAYS.contains(&highway_val.unwrap_or(""));
+                    let is_building_addr = building && hn && addr_st;
+                    let is_interp = interp && addr_st;
+                    let is_admin = needed_admin_ways.get(way.id());
+
+                    if is_street || is_building_addr || is_interp || is_admin {
+                        for nid in way.refs() {
+                            referenced_nodes.set(nid);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    crate::debug_log!("geocode-index: pass1.5 done {}", crate::debug::rss_line());
+    crate::debug::emit_marker("GEOCODE_PASS1_5_END");
+
+    // -----------------------------------------------------------------------
+    // Pass 2: Nodes + Ways (fused single scan)
+    //
+    // Sorted PBFs (Sort.Type_then_ID) guarantee all node blobs come before
+    // way blobs. A single sequential scan processes nodes first (populating
+    // the dense coordinate index for referenced nodes + address points), then
+    // ways (streets, buildings, interpolation, admin geometry).
+    // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_START");
-    eprintln!("Pass 2: Nodes + Ways (pipelined)...");
+    eprintln!("Pass 2: Nodes + Ways...");
     crate::debug_log!("geocode-index: pass2 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
@@ -354,7 +426,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                     Element::DenseNode(node) => {
                         let lat_e7 = node.decimicro_lat();
                         let lon_e7 = node.decimicro_lon();
-                        node_index.set(node.id(), lat_e7, lon_e7);
+                        // Only index nodes referenced by geocode-relevant ways
+                        // (pass 1.5). Reduces page cache from ~83 GB to ~16 GB
+                        // at planet scale.
+                        if referenced_nodes.get(node.id()) {
+                            node_index.set(node.id(), lat_e7, lon_e7);
+                        }
 
                         let mut hn: Option<&str> = None;
                         let mut st: Option<&str> = None;
@@ -534,6 +611,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass2_scan_kb={rss}"); }
     drop(needed_admin_ways);
+    drop(referenced_nodes);
     drop(node_index);
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass2_drop_kb={rss}"); }

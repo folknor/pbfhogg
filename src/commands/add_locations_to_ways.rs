@@ -372,6 +372,7 @@ impl SparseArrayIndex {
 /// Writes values sequentially to a temp file, tracking chunk boundaries.
 /// Nodes must arrive in ascending ID order (guaranteed by sorted PBFs).
 /// Only nodes present in `referenced` are stored.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
 fn build_node_index_sparse(
     input: &Path,
@@ -852,6 +853,7 @@ fn build_node_index(
 /// Only nodes present in `referenced` are inserted — at planet scale this
 /// reduces touched pages from ~80 GB (all 10.4B nodes) to ~16 GB (~2B
 /// way-referenced nodes).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn build_node_index_dense(
     input: &Path,
     direct_io: bool,
@@ -920,6 +922,7 @@ fn build_node_index_dense(
 /// Scans only way blobs (via `BlobFilter`) and builds a bitset of every node
 /// ID that appears in any way's refs list. At planet scale (~2B unique node
 /// refs), this costs ~1.6 GB — far less than indexing all 10.4B nodes.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
     // Way-ref scanner: bypasses PrimitiveBlock construction (no string table,
     // no group_ranges). Only extracts way refs for IdSetDense population.
@@ -950,6 +953,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
 }
 
 /// Collect all node IDs referenced by relation members.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
     // Sequential reader — only ~2K relation blobs at Europe scale, so retention
     // is negligible, but sequential is consistent with the other collection passes.
@@ -1029,6 +1033,7 @@ fn write_output_checked(
 // Pass 2a: Decode-all fallback (no indexdata)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn write_output_decode_all(
     input: &Path,
@@ -1191,6 +1196,7 @@ fn resolve_batch_locations(
 
 /// Process a single `PrimitiveBlock`, writing elements into the thread-local
 /// `BlockBuilder` and flushing complete blocks into `output`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn process_block(
     block: &PrimitiveBlock,
@@ -1295,6 +1301,7 @@ fn process_block(
 ///
 /// For sparse indexes: pre-resolves all way node coordinates via sorted
 /// sequential scan before parallel processing (avoids random mmap I/O).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn process_batch(
     batch: &[PrimitiveBlock],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -1427,6 +1434,7 @@ fn read_header_raw<R: Read>(
     Err("no OSMHeader blob found".into())
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn write_output_passthrough(
     input: &Path,

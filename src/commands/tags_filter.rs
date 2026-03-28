@@ -286,6 +286,7 @@ fn filter_block_parallel(
     Ok(stats)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines)]
 fn tags_filter_single_pass(
     input: &Path,
@@ -522,6 +523,7 @@ fn process_pass2_batch(
 // Two-pass filter (default mode, include references)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
 fn tags_filter_two_pass(
@@ -723,6 +725,7 @@ struct RelationClosureSummary {
 /// Starts from already-included relation IDs and repeatedly scans relation blobs:
 /// included relation -> include member nodes/ways/relations.
 /// Recursion terminates when no new relation IDs are discovered.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_relation_member_closure(
     input: &Path,
     direct_io: bool,
@@ -785,6 +788,7 @@ fn collect_relation_member_closure(
 }
 
 /// Scan all way blobs and add node refs for ways selected for output.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_way_node_dependencies(
     input: &Path,
     direct_io: bool,

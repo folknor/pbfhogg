@@ -897,6 +897,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
 /// dispatched for parallel writing via `process_extract_pass2_batch`. The
 /// pipeline (dedicated rayon pool) runs concurrently with the parallel write
 /// (global rayon pool) without contention.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn extract_simple_single_pass(
     input: &Path,
@@ -979,6 +980,7 @@ fn extract_simple_single_pass(
 // Complete-ways strategy (two passes)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
     let mut stats = ExtractStats {
@@ -1603,6 +1605,7 @@ fn process_extract_pass2_batch(
 // Smart strategy (three passes)
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn extract_smart(
     input: &Path,

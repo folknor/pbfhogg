@@ -864,6 +864,7 @@ fn spawn_reader_thread(
 
 /// Collect a byte-budgeted batch of raw frames from the reader channel.
 /// Returns the estimated in-flight byte cost of the batch.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_batch(
     frame_rx: &mpsc::Receiver<RawBlobFrame>,
     ranges: &DiffRanges,
@@ -1149,6 +1150,7 @@ fn fallback_index(block: &PrimitiveBlock) -> BlobIndex {
 
 /// Classify a blob for single-pass merge. Returns whether the blob can be
 /// passed through raw or needs rewriting.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn classify_only(
     frame: &RawBlobFrame,
     ranges: &DiffRanges,

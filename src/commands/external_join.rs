@@ -801,6 +801,7 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
 /// Assembly pass: re-read the PBF, attach coordinates from coord_slots to ways.
 /// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
 /// See notes/p2c-parallel-assembly-spec.md.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage4_assembly(
     input: &Path,
@@ -1048,6 +1049,7 @@ fn merge_stats(dst: &mut Stats, src: &Stats) {
 }
 
 /// Process a single block for assembly.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn assemble_block(
     block: &PrimitiveBlock,

@@ -10,7 +10,6 @@ use rustc_hash::FxHashMap;
 use s2::cellid::CellID;
 use s2::latlng::LatLng;
 
-use crate::commands::add_locations_to_ways::DenseMmapIndex;
 use crate::{BlobFilter, Element, ElementReader, MemberId};
 
 use super::format::*;
@@ -369,7 +368,18 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
-    let mut node_index = DenseMmapIndex::new(16_000_000_000, &config.output_dir)?;
+    // Compact rank-indexed coord array. Instead of a 128 GB sparse DenseMmapIndex
+    // (direct-addressed by node ID), allocate only referenced_count × 8 bytes and
+    // index by rank. Writes are sequential (sorted PBF → monotonic ranks). Reads
+    // during way processing have good locality (contiguous pages, not scattered).
+    // Planet: ~16 GB contiguous vs ~83 GB scattered page cache.
+    referenced_nodes.build_rank_index();
+    let referenced_count = referenced_nodes.total_count();
+    eprintln!("  {referenced_count} referenced nodes, compact index = {} MB",
+        referenced_count * 8 / 1_000_000);
+    #[allow(clippy::cast_possible_truncation)]
+    let coord_array_len = referenced_count as usize * 8; // 8 bytes per (lat_e7: i32, lon_e7: i32)
+    let mut coord_mmap = memmap2::MmapMut::map_anon(coord_array_len.max(1))?;
     let mut way_geom: rustc_hash::FxHashMap<i64, Vec<(i32, i32)>> = rustc_hash::FxHashMap::default();
 
     // Streaming output: write data files directly during the scan instead
@@ -426,11 +436,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                     Element::DenseNode(node) => {
                         let lat_e7 = node.decimicro_lat();
                         let lon_e7 = node.decimicro_lon();
-                        // Only index nodes referenced by geocode-relevant ways
-                        // (pass 1.5). Reduces page cache from ~83 GB to ~16 GB
-                        // at planet scale.
                         if referenced_nodes.get(node.id()) {
-                            node_index.set(node.id(), lat_e7, lon_e7);
+                            #[allow(clippy::cast_possible_truncation)]
+                            let r = referenced_nodes.rank(node.id()) as usize;
+                            let off = r * 8;
+                            coord_mmap[off..off + 4].copy_from_slice(&lat_e7.to_le_bytes());
+                            coord_mmap[off + 4..off + 8].copy_from_slice(&lon_e7.to_le_bytes());
                         }
 
                         let mut hn: Option<&str> = None;
@@ -498,7 +509,15 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                         }
 
                         let coords: Vec<(i32, i32)> = way.refs()
-                            .filter_map(|nid| node_index.get(nid))
+                            .filter_map(|nid| {
+                                if !referenced_nodes.get(nid) { return None; }
+                                #[allow(clippy::cast_possible_truncation)]
+                                let r = referenced_nodes.rank(nid) as usize;
+                                let off = r * 8;
+                                let lat = i32::from_le_bytes(coord_mmap[off..off+4].try_into().ok()?);
+                                let lon = i32::from_le_bytes(coord_mmap[off+4..off+8].try_into().ok()?);
+                                if lat == 0 && lon == 0 { None } else { Some((lat, lon)) }
+                            })
                             .collect();
                         if coords.is_empty() { continue; }
 
@@ -612,7 +631,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass2_scan_kb={rss}"); }
     drop(needed_admin_ways);
     drop(referenced_nodes);
-    drop(node_index);
+    drop(coord_mmap);
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass2_drop_kb={rss}"); }
 

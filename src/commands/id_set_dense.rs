@@ -14,6 +14,12 @@
 /// (12B node IDs): ~364 chunks = 1.5GB.
 pub(crate) struct IdSetDense {
     chunks: Vec<Option<Box<[u8; CHUNK_SIZE]>>>,
+    /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
+    /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
+    /// `block_prefix[cid][block]` = set bits in chunk `cid` before block `block`.
+    /// Block size = 256 bytes (2048 bits, 32 u64 words). Max 32 words scanned per rank().
+    rank_chunk_prefix: Option<Vec<u64>>,
+    rank_block_prefix: Option<Vec<Option<Vec<u32>>>>,
 }
 
 const CHUNK_BITS: usize = 22;
@@ -21,7 +27,7 @@ const CHUNK_SIZE: usize = 1 << CHUNK_BITS;
 
 impl IdSetDense {
     pub fn new() -> Self {
-        Self { chunks: Vec::new() }
+        Self { chunks: Vec::new(), rank_chunk_prefix: None, rank_block_prefix: None }
     }
 
     #[allow(clippy::cast_sign_loss)]
@@ -88,6 +94,107 @@ impl IdSetDense {
             }
         }
         false
+    }
+
+    /// Build the prefix-sum index for O(1) `rank()` queries.
+    /// Must be called after all `set()` calls are complete.
+    /// Invalidated by subsequent `set()` or `merge()` calls.
+    pub fn build_rank_index(&mut self) {
+        const BLOCK_BYTES: usize = 256; // 32 u64 words = 2048 bits per block
+        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
+        const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_BYTES;
+
+        let mut chunk_prefix = Vec::with_capacity(self.chunks.len() + 1);
+        let mut block_prefix = Vec::with_capacity(self.chunks.len());
+        let mut cumulative: u64 = 0;
+
+        for chunk in &self.chunks {
+            chunk_prefix.push(cumulative);
+            if let Some(data) = chunk {
+                let words: &[u64] = unsafe {
+                    std::slice::from_raw_parts(
+                        data.as_ptr().cast::<u64>(),
+                        CHUNK_SIZE / 8,
+                    )
+                };
+                let mut bp = Vec::with_capacity(BLOCKS_PER_CHUNK);
+                let mut within_chunk: u32 = 0;
+                for block_idx in 0..BLOCKS_PER_CHUNK {
+                    bp.push(within_chunk);
+                    let start = block_idx * WORDS_PER_BLOCK;
+                    for &w in &words[start..start + WORDS_PER_BLOCK] {
+                        within_chunk += w.count_ones();
+                    }
+                }
+                cumulative += u64::from(within_chunk);
+                block_prefix.push(Some(bp));
+            } else {
+                block_prefix.push(None);
+            }
+        }
+        chunk_prefix.push(cumulative); // sentinel for total count
+
+        self.rank_chunk_prefix = Some(chunk_prefix);
+        self.rank_block_prefix = Some(block_prefix);
+    }
+
+    /// Returns the rank (0-based position among all set IDs) of `id`.
+    /// Requires `build_rank_index()` to have been called first.
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn rank(&self, id: i64) -> u64 {
+        const BLOCK_BYTES: usize = 256;
+        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
+
+        let chunk_prefix = self.rank_chunk_prefix.as_ref()
+            .expect("rank() called without build_rank_index()");
+        let block_prefix = self.rank_block_prefix.as_ref()
+            .expect("rank() called without build_rank_index()");
+
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        let mut r = chunk_prefix[cid];
+
+        if let Some(chunk) = &self.chunks[cid] {
+            let bit_offset = (id & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
+            let target_byte = bit_offset >> 3;
+            let target_bit = bit_offset & 7;
+            let block_idx = target_byte / BLOCK_BYTES;
+
+            // Add pre-computed block prefix sum.
+            if let Some(bp) = &block_prefix[cid] {
+                r += u64::from(bp[block_idx]);
+            }
+
+            // Scan only the remaining words within the block (max 31 words).
+            let words: &[u64] = unsafe {
+                std::slice::from_raw_parts(
+                    chunk.as_ptr().cast::<u64>(),
+                    CHUNK_SIZE / 8,
+                )
+            };
+            let block_start_word = block_idx * WORDS_PER_BLOCK;
+            let target_word = target_byte / 8;
+            for &w in &words[block_start_word..target_word] {
+                r += u64::from(w.count_ones());
+            }
+
+            // Count bits in the partial word up to (but not including) target bit.
+            let word = words[target_word];
+            let bit_in_word = ((target_byte & 7) << 3) + target_bit;
+            if bit_in_word > 0 {
+                let mask = (1u64 << bit_in_word) - 1;
+                r += u64::from((word & mask).count_ones());
+            }
+        }
+
+        r
+    }
+
+    /// Returns the total number of set IDs. Requires `build_rank_index()`.
+    pub fn total_count(&self) -> u64 {
+        let prefix = self.rank_chunk_prefix.as_ref()
+            .expect("total_count() called without build_rank_index()");
+        prefix[self.chunks.len()]
     }
 
     /// Merge another IdSetDense into this one via bitwise OR.

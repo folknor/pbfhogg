@@ -161,6 +161,11 @@ xxhash = "1f1c5da73006766adf72428155ed9978"
 [plantasjen.datasets.europe]
 origin = "Geofabrik"
 download_date = "2026-03-07"
+bbox = "-25.0,34.0,45.0,72.0"
+
+[plantasjen.datasets.europe.osc.4715]
+file = "europe-20260307-seq4715.osc.gz"
+xxhash = "e1dbee1bce50ca61baea6cd1b14c2dbd"
 
 [plantasjen.datasets.europe.pbf.indexed]
 file = "europe-20260301-seq4714-with-indexdata.osm.pbf"

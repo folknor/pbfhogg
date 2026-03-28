@@ -379,12 +379,6 @@ fn build_node_index_sparse(
     scratch_dir: &Path,
     referenced: &IdSetDense,
 ) -> Result<SparseArrayIndex> {
-    crate::debug_log!(
-        "add-locations-to-ways: sparse index build start input={} scratch={} {}",
-        input.display(),
-        scratch_dir.display(),
-        crate::debug::rss_line(),
-    );
     // Pre-size for planet-scale: max node ID ~12.5B → ~49M chunks.
     let initial_chunks = 50_000_000;
     let mut offsets: Vec<u64> = Vec::new();
@@ -424,9 +418,6 @@ fn build_node_index_sparse(
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
 
-    let mut block_count: u64 = 0;
-    #[cfg(feature = "debug-logging")]
-    let mut stored_nodes: u64 = 0;
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -442,7 +433,6 @@ fn build_node_index_sparse(
         tuples.clear();
         super::node_scanner::extract_node_tuples(&decompressed, &mut tuples)?;
 
-        block_count += 1;
         for &super::node_scanner::NodeTuple { id, lat, lon } in &tuples {
             if !referenced.get(id) {
                 continue;
@@ -497,19 +487,8 @@ fn build_node_index_sparse(
             let mut buf = [0u8; ENTRY_SIZE];
             buf[..4].copy_from_slice(&lat.to_le_bytes());
             buf[4..].copy_from_slice(&lon.to_le_bytes());
-            #[cfg(feature = "debug-logging")]
-            {
-                stored_nodes += 1;
-            }
             writer.write_all(&buf)?;
             byte_pos += ENTRY_SIZE as u64;
-        }
-        if block_count.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "add-locations-to-ways: sparse index blocks={block_count} stored_nodes={stored_nodes} chunks={} {}",
-                offsets.len(),
-                crate::debug::rss_line(),
-            );
         }
     }
 
@@ -531,12 +510,6 @@ fn build_node_index_sparse(
             .map_err(|e| format!("failed to mmap sparse index values: {e}"))?
     };
 
-    crate::debug_log!(
-        "add-locations-to-ways: sparse index build done blocks={block_count} stored_nodes={stored_nodes} chunks={} values_bytes={} {}",
-        offsets.len(),
-        byte_pos,
-        crate::debug::rss_line(),
-    );
     Ok(SparseArrayIndex {
         offsets,
         start_pad,
@@ -885,12 +858,6 @@ fn build_node_index_dense(
     scratch_dir: &Path,
     referenced: &IdSetDense,
 ) -> Result<DenseMmapIndex> {
-    crate::debug_log!(
-        "add-locations-to-ways: dense index build start input={} scratch={} {}",
-        input.display(),
-        scratch_dir.display(),
-        crate::debug::rss_line(),
-    );
     let mut index = DenseMmapIndex::new(DENSE_INDEX_DEFAULT_CAPACITY, scratch_dir)?;
     let writer = SharedDenseWriter {
         base: index.mmap.as_mut_ptr(),
@@ -918,7 +885,6 @@ fn build_node_index_dense(
 
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
-    let mut block_count: u64 = 0;
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -944,21 +910,8 @@ fn build_node_index_dense(
             }
         });
 
-        block_count += 1;
-        if block_count.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "add-locations-to-ways: dense index blocks={block_count} capacity={} {}",
-                index.capacity,
-                crate::debug::rss_line(),
-            );
-        }
     }
 
-    crate::debug_log!(
-        "add-locations-to-ways: dense index build done blocks={block_count} capacity={} {}",
-        index.capacity,
-        crate::debug::rss_line(),
-    );
     Ok(index)
 }
 
@@ -968,18 +921,11 @@ fn build_node_index_dense(
 /// ID that appears in any way's refs list. At planet scale (~2B unique node
 /// refs), this costs ~1.6 GB — far less than indexing all 10.4B nodes.
 fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    crate::debug_log!(
-        "add-locations-to-ways: collect way-referenced node ids start input={} {}",
-        input.display(),
-        crate::debug::rss_line(),
-    );
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_ways());
     let mut referenced = IdSetDense::new();
-    let mut block_count: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        block_count += 1;
         for element in block.elements_skip_metadata() {
             if let Element::Way(w) = element {
                 for node_id in w.refs() {
@@ -989,34 +935,17 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
                 }
             }
         }
-        if block_count.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "add-locations-to-ways: way-ref scan blocks={block_count} {}",
-                crate::debug::rss_line(),
-            );
-        }
     }
-    crate::debug_log!(
-        "add-locations-to-ways: collect way-referenced node ids done blocks={block_count} {}",
-        crate::debug::rss_line(),
-    );
     Ok(referenced)
 }
 
 /// Collect all node IDs referenced by relation members.
 pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    crate::debug_log!(
-        "add-locations-to-ways: collect relation member node ids start input={} {}",
-        input.display(),
-        crate::debug::rss_line(),
-    );
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::only_relations());
     let mut member_node_ids = IdSetDense::new();
-    let mut block_count: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        block_count += 1;
         for element in block.elements_skip_metadata() {
             if let Element::Relation(r) = element {
                 for member in r.members() {
@@ -1028,17 +957,7 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
                 }
             }
         }
-        if block_count.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "add-locations-to-ways: relation-member scan blocks={block_count} {}",
-                crate::debug::rss_line(),
-            );
-        }
     }
-    crate::debug_log!(
-        "add-locations-to-ways: collect relation member node ids done blocks={block_count} {}",
-        crate::debug::rss_line(),
-    );
     Ok(member_node_ids)
 }
 

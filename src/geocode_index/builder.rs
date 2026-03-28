@@ -195,7 +195,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_START");
     eprintln!("Pass 1: Relations...");
-    crate::debug_log!("geocode-index: pass1 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
     let pass1_start = std::time::Instant::now();
 
@@ -260,12 +259,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         })?;
     }
     eprintln!("  {} admin relations", admin_relations.len());
-    crate::debug_log!(
-        "geocode-index: pass1 done admin_relations={} strings_unique={} {}",
-        admin_relations.len(),
-        strings.index.len(),
-        crate::debug::rss_line(),
-    );
 
     // Build set of way IDs needed for admin boundary geometry
     let mut needed_admin_ways = crate::commands::id_set_dense::IdSetDense::new();
@@ -291,7 +284,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     crate::debug::emit_marker("GEOCODE_PASS1_END");
     crate::debug::emit_marker("GEOCODE_PASS1_5_START");
     eprintln!("Pass 1.5: Referenced node collection...");
-    crate::debug_log!("geocode-index: pass1.5 start {}", crate::debug::rss_line());
 
     let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
     {
@@ -351,7 +343,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             }
         }
     }
-    crate::debug_log!("geocode-index: pass1.5 done {}", crate::debug::rss_line());
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
@@ -364,7 +355,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_START");
     eprintln!("Pass 2: Nodes + Ways...");
-    crate::debug_log!("geocode-index: pass2 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
@@ -619,14 +609,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     eprintln!("  {} addr, {} streets, {} interp, {} admin way geoms",
         addr_point_count, street_way_count, interp_ways.len(), way_geom.len());
-    crate::debug_log!(
-        "geocode-index: pass2 scan done addr_points={} street_ways={} interp_ways={} admin_way_geoms={} {}",
-        addr_point_count,
-        street_way_count,
-        interp_ways.len(),
-        way_geom.len(),
-        crate::debug::rss_line(),
-    );
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_pass2_scan_kb={rss}"); }
     drop(needed_admin_ways);
@@ -657,11 +639,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_polygons = assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
-    crate::debug_log!(
-        "geocode-index: assembly done admin_polygons={} {}",
-        admin_polygons.len(),
-        crate::debug::rss_line(),
-    );
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_assembly_kb={rss}"); }
 
@@ -675,12 +652,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         &mut interp_ways, &addr_points_mmap, &interp_nodes_mmap, &strings, config.street_level,
     );
     eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
-    crate::debug_log!(
-        "geocode-index: interpolation done resolved={} total={} {}",
-        resolved,
-        interp_ways.len(),
-        crate::debug::rss_line(),
-    );
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_interp_kb={rss}"); }
 
@@ -717,7 +688,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // entries to temp bucket files, then process one bucket at a time.
     // -----------------------------------------------------------------------
     eprintln!("Pass 3: S2 cells + write (bucketed)...");
-    crate::debug_log!("geocode-index: pass3 start {}", crate::debug::rss_line());
     #[cfg(feature = "hotpath")]
     let pass4_start = std::time::Instant::now();
 
@@ -749,13 +719,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_count = write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
 
     eprintln!("  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells");
-    crate::debug_log!(
-        "geocode-index: pass3 done fine_cells={} coarse_cells={} admin_cells={} {}",
-        fine_count,
-        coarse_count,
-        admin_count,
-        crate::debug::rss_line(),
-    );
     #[cfg(feature = "hotpath")]
     if let Some(rss) = crate::debug::read_rss_kb() { eprintln!("  rss_after_cell_assign_kb={rss}"); }
 
@@ -819,7 +782,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         }
     }
     crate::debug::emit_marker("GEOCODE_PASS3_END");
-    crate::debug_log!("geocode-index: complete {}", crate::debug::rss_line());
 
     Ok(BuildStats {
         addr_points: u64::from(addr_point_count),

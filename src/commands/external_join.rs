@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::Compression;
 use crate::{Element, ElementReader, PrimitiveBlock};
-use crate::debug_log;
 
 use super::add_locations_to_ways::Stats;
 use super::id_set_dense::IdSetDense;
@@ -256,7 +255,6 @@ fn stage1_way_pass(
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
-    let mut block_count: u64 = 0;
 
     // P2c sidecar: per-way-blob ref counts for stage 4 slot_pos pre-computation.
     // Stage 1 and stage 4 must see way blobs in the same file order (both filter
@@ -299,11 +297,6 @@ fn stage1_way_pass(
         // Write per-blob ref count to sidecar.
         let blob_ref_count = slot_pos - blob_start_pos;
         sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
-
-        block_count += 1;
-        if block_count.is_multiple_of(1000) {
-            debug_log!("  stage1: {block_count} blocks, {slot_pos} refs, {}", crate::debug::rss_line());
-        }
     }
 
     // Trailer: total ref count for alignment verification in stage 4.
@@ -394,8 +387,6 @@ fn stage2_node_join(
         return Ok(0); // No COO pairs at all
     }
 
-    debug_log!("  stage2: after bucket load, {}", crate::debug::rss_line());
-
     // P2b-v2: Parallel node-only scan with worker-side pread. IO thread reads
     // only headers (~50 bytes), filters by indexdata, sends lightweight descriptors.
     // Workers pread blob data from shared file, decompress + extract tuples with
@@ -417,10 +408,7 @@ fn stage2_node_join(
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?
     );
 
-    debug_log!("  stage2: reader open, {}", crate::debug::rss_line());
-
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
-    let mut block_count: u64 = 0;
 
     // Descriptor: (seq, data_offset, data_size)
     type Descriptor = (usize, u64, usize);
@@ -535,28 +523,15 @@ fn stage2_node_join(
             while let Some(result) = reorder.pop_ready() {
                 let tuples = result?;
 
-                block_count += 1;
-                if block_count.is_multiple_of(1000) {
-                    debug_log!("  stage2: {block_count} blocks, {resolved_count} resolved, {}", crate::debug::rss_line());
-                }
-
                 for &NodeTuple { id, lat, lon } in &tuples {
                     // Advance to the bucket that covers this node ID.
                     while id >= bucket_max_id {
-                        if bucket_idx.is_multiple_of(16) && bucket_idx > 0 {
-                            debug_log!(
-                                "  node join: bucket {bucket_idx}/{NUM_BUCKETS} ({resolved_count} resolved, {} pairs loaded, {})",
-                                sorted_pairs.len(),
-                                crate::debug::rss_line(),
-                            );
-                        }
                         bucket_idx += 1;
                         let has = load_next_bucket(
                             &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
                             &mut bucket_max_id, node_buckets, range_size,
                         )?;
                         if !has {
-                            debug_log!("  node join: complete ({resolved_count} resolved)");
                             return Ok(());
                         }
                     }
@@ -590,7 +565,6 @@ fn stage2_node_join(
             }
         }
 
-        debug_log!("  node join: complete ({resolved_count} resolved)");
         Ok(())
     })?;
 
@@ -703,13 +677,6 @@ fn stage3_slot_reorder(
         out.write_all(&scatter_buf)?;
         next_slot = bucket_end;
 
-        if bucket_idx % 16 == 0 {
-            debug_log!(
-                "  slot reorder: bucket {}/{}",
-                bucket_idx + 1,
-                NUM_BUCKETS
-            );
-        }
     }
 
     // Write any trailing slots if total_slots doesn't align to bucket boundaries.
@@ -851,8 +818,6 @@ fn stage4_assembly(
 
     // Load sidecar and compute slot_start prefix sums.
     let way_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
-    debug_log!("  stage4: loaded sidecar, {} way blobs", way_slot_starts.len());
-
     // Header-only pre-scan: build the blob schedule.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -924,11 +889,6 @@ fn stage4_assembly(
             way_slot_starts.len(), way_sidecar_idx,
         ).into());
     }
-
-    debug_log!(
-        "  stage4: schedule built, {} blobs ({} skipped), {}",
-        schedule.len(), skipped_node_blobs, crate::debug::rss_line(),
-    );
 
     // Open shared file for worker pread.
     let shared_file = std::sync::Arc::new(
@@ -1051,7 +1011,6 @@ fn stage4_assembly(
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             crate::error::Result<(Vec<OwnedBlock>, Stats)>
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
-        let mut block_count: u64 = 0;
 
         for (seq_num, item) in decoded_rx {
             reorder.push(seq_num, item);
@@ -1065,11 +1024,6 @@ fn stage4_assembly(
                         block_bytes, index, tagdata.as_deref(),
                     )?;
                 }
-
-                block_count += 1;
-                if block_count.is_multiple_of(1000) {
-                    debug_log!("  stage4: {block_count} blobs, {}", crate::debug::rss_line());
-                }
             }
         }
 
@@ -1077,9 +1031,8 @@ fn stage4_assembly(
     })?;
 
     writer.flush()?;
-    if skipped_node_blobs > 0 {
-        debug_log!("  stage4: skipped {skipped_node_blobs} untagged node blobs (no decompress)");
-    }
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
     Ok(total_stats)
 }
 
@@ -1239,54 +1192,34 @@ pub fn external_join(
 
     // --- Stage 1: Way pass ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
-    let t1 = std::time::Instant::now();
-    debug_log!("external join: stage 1 — scanning ways, emitting COO pairs into node buckets...");
     let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets, &ref_count_sidecar)?;
     let node_counts = node_buckets.finish()?;
     let total_coo: u64 = node_counts.iter().sum();
-    let stage1_ms = t1.elapsed().as_millis();
-    #[cfg(not(feature = "debug-logging"))]
-    let _ = (total_coo, stage1_ms);
-    debug_log!("  {total_slots} way-node refs → {total_coo} COO pairs in {NUM_BUCKETS} buckets ({stage1_ms}ms)");
-    debug_log!("stage1_ms={stage1_ms}");
-    debug_log!("rss_after_stage1_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
-    debug_log!("  rss_after_stage1={}", crate::debug::rss_line());
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
+        crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
+    }
 
     // --- Stage 2: Node join ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-    let t2 = std::time::Instant::now();
-    debug_log!("external join: stage 2 — node join (merge-join per bucket)...");
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
     let resolved_count =
         stage2_node_join(input, direct_io, &node_buckets, &mut slot_buckets, total_slots)?;
     slot_buckets.finish()?;
     node_buckets.cleanup();
-    let stage2_ms = t2.elapsed().as_millis();
-    #[cfg(not(feature = "debug-logging"))]
-    let _ = (resolved_count, stage2_ms);
-    debug_log!("  {resolved_count} coordinates resolved ({stage2_ms}ms)");
-    debug_log!("stage2_ms={stage2_ms}");
-    debug_log!("rss_after_stage2_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
-    debug_log!("  rss_after_stage2={}", crate::debug::rss_line());
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
 
     // --- Stage 3: Slot reorder ---
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
     crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-    let t3 = std::time::Instant::now();
-    debug_log!("external join: stage 3 — slot reorder, building coord_slots file...");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
     stage3_slot_reorder(&slot_buckets, &coord_slots_path, total_slots)?;
     slot_buckets.cleanup();
-    let stage3_ms = t3.elapsed().as_millis();
-    #[cfg(not(feature = "debug-logging"))]
-    let _ = stage3_ms;
-    debug_log!("  coord_slots: {total_slots} slots, {} bytes ({stage3_ms}ms)", total_slots * COORD_SLOT_SIZE as u64);
-    debug_log!("stage3_ms={stage3_ms}");
-    debug_log!("rss_after_stage3_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
-    debug_log!("  rss_after_stage3={}", crate::debug::rss_line());
 
     // Collect relation member node IDs (for node filtering in stage 4).
     // Deferred to here to avoid holding ~1.4 GB (Europe) during stages 1-3.
@@ -1297,13 +1230,9 @@ pub fn external_join(
             input, direct_io,
         )?)
     };
-    debug_log!("  rss_after_relation_scan={}", crate::debug::rss_line());
-
     // --- Stage 4: Assembly ---
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
-    let t4 = std::time::Instant::now();
-    debug_log!("external join: stage 4 — assembling enriched PBF...");
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
     let stats = stage4_assembly(
         input,
@@ -1317,16 +1246,7 @@ pub fn external_join(
         &ref_count_sidecar,
         total_slots,
     )?;
-    let stage4_ms = t4.elapsed().as_millis();
-    #[cfg(not(feature = "debug-logging"))]
-    let _ = stage4_ms;
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
-    debug_log!("  assembly complete ({stage4_ms}ms)");
-    debug_log!("stage4_ms={stage4_ms}");
-    debug_log!("total_slots={total_slots}");
-    debug_log!("resolved_count={resolved_count}");
-    debug_log!("rss_after_stage4_mb={}", crate::debug::read_rss_kb().unwrap_or(0) / 1024);
-    debug_log!("  rss_after_stage4={}", crate::debug::rss_line());
 
     // scratch_dir dropped here → cleanup all temp files.
     Ok(stats)

@@ -53,13 +53,6 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
-    crate::debug_log!(
-        "getparents: start input={} output={} add_self={} {}",
-        input.display(),
-        output.display(),
-        opts.add_self,
-        crate::debug::rss_line(),
-    );
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb)?;
@@ -80,13 +73,6 @@ pub fn getparents(
     })?;
 
     writer.flush()?;
-    crate::debug_log!(
-        "getparents: complete nodes={} ways={} relations={} {}",
-        stats.nodes_written,
-        stats.ways_written,
-        stats.relations_written,
-        crate::debug::rss_line(),
-    );
     Ok(stats)
 }
 

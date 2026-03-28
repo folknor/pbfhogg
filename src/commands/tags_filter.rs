@@ -278,13 +278,6 @@ fn tags_filter_single_pass(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
-    crate::debug_log!(
-        "tags-filter(single-pass): start input={} output={} invert={} {}",
-        input.display(),
-        output.display(),
-        invert,
-        crate::debug::rss_line(),
-    );
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Blob-level filtering can't help in invert mode — we want non-matching blobs.
@@ -312,13 +305,6 @@ fn tags_filter_single_pass(
     })?;
 
     writer.flush()?;
-    crate::debug_log!(
-        "tags-filter(single-pass): complete nodes={} ways={} relations={} {}",
-        stats.nodes_matched,
-        stats.ways_matched,
-        stats.relations_matched,
-        crate::debug::rss_line(),
-    );
     Ok(stats)
 }
 
@@ -528,14 +514,6 @@ fn tags_filter_two_pass(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
-    crate::debug_log!(
-        "tags-filter(two-pass): start input={} output={} invert={} remove_tags={} {}",
-        input.display(),
-        output.display(),
-        invert,
-        remove_tags,
-        crate::debug::rss_line(),
-    );
     let mut stats = TagsFilterStats {
         nodes_matched: 0,
         nodes_from_ways: 0,
@@ -572,10 +550,8 @@ fn tags_filter_two_pass(
             None => reader,
         }
     };
-    let mut pass1_blocks: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        pass1_blocks += 1;
         let mut tags_buf: Vec<(&str, &str)> = Vec::new();
         for element in block.elements_skip_metadata() {
             match &element {
@@ -618,17 +594,7 @@ fn tags_filter_two_pass(
                 }
             }
         }
-        if pass1_blocks.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "tags-filter(two-pass): pass1 blocks={pass1_blocks} {}",
-                crate::debug::rss_line(),
-            );
-        }
     }
-    crate::debug_log!(
-        "tags-filter(two-pass): pass1 done blocks={pass1_blocks} {}",
-        crate::debug::rss_line(),
-    );
 
     // Expand relation-member closure:
     // - matched relation -> include member nodes/ways/relations
@@ -640,12 +606,6 @@ fn tags_filter_two_pass(
         &mut included_way_ids,
         &mut relation_dep_node_ids,
     )?;
-    crate::debug_log!(
-        "tags-filter(two-pass): relation closure done has_way={} has_relation={} {}",
-        closure.has_way,
-        closure.has_relation,
-        crate::debug::rss_line(),
-    );
     has_included_way |= closure.has_way;
     has_included_relation |= closure.has_relation;
 
@@ -657,10 +617,6 @@ fn tags_filter_two_pass(
         Some(&direct_way_ids),
         &mut relation_dep_node_ids,
     )?;
-    crate::debug_log!(
-        "tags-filter(two-pass): way dependency scan done {}",
-        crate::debug::rss_line(),
-    );
 
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
@@ -692,13 +648,6 @@ fn tags_filter_two_pass(
     })?;
 
     writer.flush()?;
-    crate::debug_log!(
-        "tags-filter(two-pass): complete nodes={} ways={} relations={} {}",
-        stats.nodes_matched + stats.nodes_from_ways + stats.nodes_from_relations,
-        stats.ways_matched + stats.ways_from_relations,
-        stats.relations_matched + stats.relations_from_relations,
-        crate::debug::rss_line(),
-    );
     Ok(stats)
 }
 
@@ -734,22 +683,14 @@ fn collect_relation_member_closure(
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
-    #[cfg(feature = "debug-logging")]
-    let mut pass: u64 = 0;
 
     loop {
-        #[cfg(feature = "debug-logging")]
-        {
-            pass += 1;
-        }
         let mut added_relations = 0_u64;
         let reader = ElementReader::open(input, direct_io)?
             .with_blob_filter(BlobFilter::only_relations());
-        let mut block_count: u64 = 0;
 
         for block in reader.into_blocks_pipelined() {
             let block = block?;
-            block_count += 1;
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     if !included_relation_ids.get(r.id()) {
@@ -776,18 +717,8 @@ fn collect_relation_member_closure(
                     }
                 }
             }
-            if block_count.is_multiple_of(1_000) {
-                crate::debug_log!(
-                    "tags-filter: relation closure pass={pass} blocks={block_count} added_relations={added_relations} {}",
-                    crate::debug::rss_line(),
-                );
-            }
         }
 
-        crate::debug_log!(
-            "tags-filter: relation closure pass={pass} done blocks={block_count} added_relations={added_relations} {}",
-            crate::debug::rss_line(),
-        );
         if added_relations == 0 {
             break;
         }
@@ -806,10 +737,8 @@ fn collect_way_node_dependencies(
 ) -> Result<()> {
     let reader = ElementReader::open(input, direct_io)?
         .with_blob_filter(BlobFilter::new(false, true, false));
-    let mut block_count: u64 = 0;
     for block in reader.into_blocks_pipelined() {
         let block = block?;
-        block_count += 1;
         for element in block.elements_skip_metadata() {
             if let Element::Way(w) = &element
                 && included_way_ids.get(w.id())
@@ -824,17 +753,7 @@ fn collect_way_node_dependencies(
                 }
             }
         }
-        if block_count.is_multiple_of(1_000) {
-            crate::debug_log!(
-                "tags-filter: way dependency scan blocks={block_count} {}",
-                crate::debug::rss_line(),
-            );
-        }
     }
-    crate::debug_log!(
-        "tags-filter: way dependency scan done blocks={block_count} {}",
-        crate::debug::rss_line(),
-    );
     Ok(())
 }
 

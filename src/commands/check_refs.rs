@@ -103,13 +103,6 @@ impl RefCheckResult {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
-    crate::debug_log!(
-        "check-refs: start path={} check_relations={} show_ids={} {}",
-        path.display(),
-        check_relations,
-        show_ids,
-        crate::debug::rss_line(),
-    );
     // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
     // retention (25+ GB at Europe/planet scale). check-refs does lightweight
     // per-element work (RoaringTreemap inserts) — the pipelined reader's
@@ -153,8 +146,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
     };
-    let mut progress_count: u64 = 0;
-
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
@@ -171,17 +162,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
         let block = crate::block::PrimitiveBlock::new(decompressed)?;
         for element in block.elements_skip_metadata() {
-        progress_count += 1;
-        if progress_count.is_multiple_of(1_000_000) {
-            crate::debug_log!(
-                "check-refs: scanned={progress_count} nodes={} ways={} relations={} deferred_rel_refs={} {}",
-                result.node_count,
-                result.way_count,
-                result.relation_count,
-                deferred_relation_refs.len(),
-                crate::debug::rss_line(),
-            );
-        }
         match element {
             Element::DenseNode(dn) => {
                 node_ids.insert(dn.id() .cast_unsigned());
@@ -267,11 +247,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // Deduplicate missing IDs via RoaringTreemap to count unique missing
     // relation IDs, consistent with node/way counting above.
     if check_relations {
-        crate::debug_log!(
-            "check-refs: resolving deferred relation refs count={} {}",
-            deferred_relation_refs.len(),
-            crate::debug::rss_line(),
-        );
         let mut missing_relation_members_set = RoaringTreemap::new();
         let mut occurrences: u64 = 0;
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
@@ -294,14 +269,5 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
 
     result.missing_refs = missing_refs;
 
-    crate::debug_log!(
-        "check-refs: complete nodes={} ways={} relations={} missing_total={} missing_relation_occurrences={} {}",
-        result.node_count,
-        result.way_count,
-        result.relation_count,
-        result.total_missing(),
-        result.missing_relation_member_occurrences,
-        crate::debug::rss_line(),
-    );
     Ok(result)
 }

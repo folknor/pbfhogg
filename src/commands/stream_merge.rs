@@ -298,31 +298,30 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
 ) -> Result<()> {
     let mut old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
     let mut new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
-    let mut compared: u64 = 0;
 
     loop {
         match (&old_elem, &new_elem) {
             (None, None) => break,
             (Some(o), None) => {
                 on_action(MergeJoinAction::OldOnly(o))?;
-                compared += 1;
+
                 old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
             }
             (None, Some(n)) => {
                 on_action(MergeJoinAction::NewOnly(n))?;
-                compared += 1;
+
                 new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
             }
             (Some(o), Some(n)) => {
                 match super::osm_id_cmp(o.id(), n.id()) {
                     std::cmp::Ordering::Less => {
                         on_action(MergeJoinAction::OldOnly(o))?;
-                        compared += 1;
+        
                         old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                     }
                     std::cmp::Ordering::Greater => {
                         on_action(MergeJoinAction::NewOnly(n))?;
-                        compared += 1;
+        
                         new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
                     }
                     std::cmp::Ordering::Equal => {
@@ -331,25 +330,13 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                         } else {
                             on_action(MergeJoinAction::Modified(o, n))?;
                         }
-                        compared += 1;
+        
                         old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                         new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
                     }
                 }
             }
         }
-        if compared.is_multiple_of(250_000) && compared > 0 {
-            crate::debug_log!(
-                "merge-join<{}>: compared={compared} {}",
-                std::any::type_name::<T>(),
-                crate::debug::rss_line(),
-            );
-        }
     }
-    crate::debug_log!(
-        "merge-join<{}>: complete compared={compared} {}",
-        std::any::type_name::<T>(),
-        crate::debug::rss_line(),
-    );
     Ok(())
 }

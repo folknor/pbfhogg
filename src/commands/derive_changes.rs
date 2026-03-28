@@ -62,13 +62,6 @@ pub fn derive_changes(
     increment_version: bool,
     update_timestamp: bool,
 ) -> Result<DeriveChangesStats> {
-    crate::debug_log!(
-        "derive-changes: start old={} new={} output={} {}",
-        old_path.display(),
-        new_path.display(),
-        output.display(),
-        crate::debug::rss_line(),
-    );
     // Check sorted headers before opening sequential readers.
     {
         let old_reader = ElementReader::from_path(old_path)?;
@@ -88,53 +81,29 @@ pub fn derive_changes(
 
     // Phase 1: Nodes
     {
-        crate::debug_log!("derive-changes: phase nodes start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.nodes, &mut modifies.nodes, &mut deletes.nodes,
         )?;
-        crate::debug_log!(
-            "derive-changes: phase nodes done create={} modify={} delete={} {}",
-            creates.nodes.len(),
-            modifies.nodes.len(),
-            deletes.nodes.len(),
-            crate::debug::rss_line(),
-        );
     }
 
     // Phase 2: Ways
     {
-        crate::debug_log!("derive-changes: phase ways start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.ways, &mut modifies.ways, &mut deletes.ways,
         )?;
-        crate::debug_log!(
-            "derive-changes: phase ways done create={} modify={} delete={} {}",
-            creates.ways.len(),
-            modifies.ways.len(),
-            deletes.ways.len(),
-            crate::debug::rss_line(),
-        );
     }
 
     // Phase 3: Relations
     {
-        crate::debug_log!("derive-changes: phase relations start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         collect_changes_phase(
             &mut old_src, &mut ob, &mut new_src, &mut nb,
             &mut creates.relations, &mut modifies.relations, &mut deletes.relations,
         )?;
-        crate::debug_log!(
-            "derive-changes: phase relations done create={} modify={} delete={} {}",
-            creates.relations.len(),
-            modifies.relations.len(),
-            deletes.relations.len(),
-            crate::debug::rss_line(),
-        );
     }
 
     let stats = DeriveChangesStats {
@@ -145,13 +114,6 @@ pub fn derive_changes(
 
     write_osc(output, &creates, &modifies, &deletes, increment_version, update_timestamp)?;
 
-    crate::debug_log!(
-        "derive-changes: complete creates={} modifies={} deletes={} {}",
-        stats.creates,
-        stats.modifies,
-        stats.deletes,
-        crate::debug::rss_line(),
-    );
     Ok(stats)
 }
 

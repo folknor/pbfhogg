@@ -128,12 +128,6 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
 ) -> Result<DiffStats> {
-    crate::debug_log!(
-        "diff: start old={} new={} {}",
-        old_path.display(),
-        new_path.display(),
-        crate::debug::rss_line(),
-    );
     let _ = (options.ignore_changeset, options.ignore_uid, options.ignore_user);
     let filter = match options.type_filter.as_deref() {
         Some(s) => TypeFilter::parse(s),
@@ -161,7 +155,6 @@ pub fn diff(
     // Each phase uses local buffers — T changes between phases so they cannot
     // be shared. Allocation is negligible (one block's worth, up to 8000 elements).
     if filter.nodes {
-        crate::debug_log!("diff: phase nodes start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         {
             let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
@@ -170,21 +163,12 @@ pub fn diff(
                 &mut ctx, write_node_details,
             )?;
         }
-        crate::debug_log!(
-            "diff: phase nodes done common={} created={} modified={} deleted={} {}",
-            stats.common,
-            stats.created,
-            stats.modified,
-            stats.deleted,
-            crate::debug::rss_line(),
-        );
     } else {
         drain_phase::<OwnedNode>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 2: Ways
     if filter.ways {
-        crate::debug_log!("diff: phase ways start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         {
             let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
@@ -193,21 +177,12 @@ pub fn diff(
                 &mut ctx, write_way_details,
             )?;
         }
-        crate::debug_log!(
-            "diff: phase ways done common={} created={} modified={} deleted={} {}",
-            stats.common,
-            stats.created,
-            stats.modified,
-            stats.deleted,
-            crate::debug::rss_line(),
-        );
     } else {
         drain_phase::<OwnedWay>(&mut old_src, &mut new_src)?;
     }
 
     // Phase 3: Relations
     if filter.relations {
-        crate::debug_log!("diff: phase relations start {}", crate::debug::rss_line());
         let (mut ob, mut nb) = (Vec::new(), Vec::new());
         {
             let mut ctx = DiffPhaseCtx { output, opts: options, stats: &mut stats };
@@ -216,26 +191,10 @@ pub fn diff(
                 &mut ctx, write_relation_details,
             )?;
         }
-        crate::debug_log!(
-            "diff: phase relations done common={} created={} modified={} deleted={} {}",
-            stats.common,
-            stats.created,
-            stats.modified,
-            stats.deleted,
-            crate::debug::rss_line(),
-        );
     } else {
         drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
     }
 
-    crate::debug_log!(
-        "diff: complete common={} created={} modified={} deleted={} {}",
-        stats.common,
-        stats.created,
-        stats.modified,
-        stats.deleted,
-        crate::debug::rss_line(),
-    );
     Ok(stats)
 }
 

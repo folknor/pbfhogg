@@ -275,31 +275,27 @@ During the build, the following files coexist on disk:
 The temp bucket files are created during pass 3 and deleted as each bucket is
 consumed. Peak temp disk is ~19 GB.
 
-## Implementation order
+## Implementation status
 
-1. **Per-phase RSS reporting.** Add `read_rss_kb()` between every phase boundary,
-   gated behind `#[cfg(feature = "hotpath")]`. Run Germany to establish baseline.
+1. ~~**Per-phase RSS reporting.**~~ Done. Sidecar profiler + emit_marker at phase boundaries.
 
-2. **Stream data files during pass 2.** Write street_nodes.bin, street_ways.bin,
-   addr_points.bin, interp_nodes.bin during the scan. Defer interp_ways.bin to
-   after interpolation resolution. Mmap output files for cell assignment. Drop
-   the `RawStreetWay` / `RawAddrPoint` Vecs entirely. Validate: identical output
-   on Denmark, lower RSS on Germany.
+2. ~~**Stream data files during pass 2.**~~ Done. street_nodes.bin, street_ways.bin,
+   addr_points.bin, interp_nodes.bin written during scan. Mmap'd for cell assignment.
 
-3. **Bucketed cell assignment.** Replace global cell entry Vecs with 256 temp-file
-   buckets per level (fine + coarse). Mutex'd BufWriters per bucket. Process
-   buckets sequentially in order. Validate: identical output, bounded RSS.
+3. ~~**Bucketed cell assignment.**~~ Done. 256 temp-file buckets per level.
 
-4. **Referenced node collection (pass 1.5).** Add way-only scan before pass 2
-   to collect referenced node IDs into IdSetDense. Filter dense index writes.
-   This is part of planet mode, not a conditional fallback.
+4. ~~**Referenced node collection (pass 1.5).**~~ Done (commit `c5c44b1`). Way-only
+   scan collects referenced node IDs into IdSetDense. Japan RSS: 19 GB → 4.4 GB.
 
-5. **Mode split.** Add `--planet` flag (or auto-detect from input size). Regional
-   mode uses the current in-memory builder. Planet mode uses steps 2-4.
+5. ~~**Compact rank-indexed coord array.**~~ Done (commit `7cf2239`). Replaced 128 GB
+   sparse DenseMmapIndex with contiguous mmap indexed by IdSetDense rank (two-level
+   prefix sums + popcount). Europe: 3,411s → 568s (6x), RSS 24.5 GB → 7.5 GB.
 
-6. **Test on Germany.** Expect ~1-2 GB RSS.
+6. **Mode split** deferred — compact index works at all scales, no separate mode needed.
 
-7. **Test on planet.** Expect ~2.5 GB peak heap + ~12 GB page cache.
+7. ~~**Test on Europe.**~~ Done. 568s (9.5 min), 7.5 GB RSS. Planet extrapolation: ~20 GB.
+
+8. **Test on planet.** Not yet run. Estimated ~20 GB RSS, fits on 30 GB host.
 
 ## Risks
 

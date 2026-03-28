@@ -216,17 +216,15 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
 
 ### Geocode index builder: planet-scale architecture
 
-The builder currently holds all intermediate data in RAM. Denmark (309 MB RSS)
-and Germany (~4 GB RSS) work. Planet would OOM on a 30 GB host.
+Streaming data files + bucketed cell assignment + pass 1.5 referenced node
+collection + compact rank-indexed coord array. Europe: 568s (9.5 min),
+7.5 GB RSS. Planet extrapolation: ~20 GB RSS, fits on 30 GB host.
 
-- [ ] Stream street_ways/interp_ways/addr_points to temp files during pass 2
-  instead of retaining in memory
-- [ ] Compute S2 cell entries during pass 2 (while coordinates are hot) and
-  append unsorted to temp files
-- [ ] External merge sort for cell entries instead of in-memory sort
-- [ ] Referenced-node-only dense index (prefilter node IDs from ways, as ALTW
-  does) instead of indexing every node
-- [ ] Chunk-sort cell entries on disk (write sorted chunks, k-way merge)
+- [x] Stream data files during pass 2 (street_ways, addr_points, etc.)
+- [x] Bucketed cell assignment (256 temp files per level)
+- [x] Referenced-node-only index via pass 1.5 IdSetDense (commit `c5c44b1`)
+- [x] Compact rank-indexed coord array replacing DenseMmapIndex (commit `7cf2239`)
+- [ ] Planet validation run
 
 ### README badges (after publishing)
 

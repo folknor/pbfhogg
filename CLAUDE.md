@@ -184,7 +184,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 **Geocode index:** `geocode_index/` module
 - `format.rs`: on-disk binary format (19 files, header/cells/entries/data/strings). Manual byte-level serialization, no `#[repr(C)]`.
 - `reader.rs`: mmap reader with two-layer API. `query()` (allocation-free, nearest-of-each-type) and `candidates()` (Vec-backed, all matches). S2 cell neighborhood lookup, binary search on sorted cell arrays, segment-level distance scoring.
-- `builder.rs`: 4-pass build pipeline. Pass 1: nodes (address points + dense mmap index). Pass 2: ways (streets, building centroids, interpolation). Pass 3: relations (admin boundary assembly + simplification). Pass 4: S2 cell assignment at fine+coarse levels, sorted index writing. Interpolation endpoint resolution via spatial join against address points.
+- `builder.rs`: 4-pass build pipeline. Pass 1: relations (admin boundaries). Pass 1.5: referenced node collection (IdSetDense). Pass 2: nodes + ways fused scan (compact rank-indexed coord array via IdSetDense rank, streaming data files to disk). Pass 3: bucketed S2 cell assignment (256 temp-file buckets per level). Interpolation endpoint resolution via spatial join against address points. Europe: 568s (9.5 min), 7.5 GB RSS.
 
 **Geometry:** `geo.rs` — shared primitives (point-in-ring, antimeridian handling, point-in-polygon with holes, Douglas-Peucker simplification, ring assembly, cos-projection distance).
 

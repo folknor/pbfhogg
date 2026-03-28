@@ -36,19 +36,15 @@ commit `65bc639`).
 
 ## Remaining work
 
-### Priority 1: Unbatched pipelined consumers (planet retention risk)
+### ~~Priority 1: Unbatched pipelined consumers~~ — DONE
 
-Sweep review (perf-Claude) identified two commands with unbatched
-`into_blocks_pipelined()` iteration — per-block processing without batch
-boundaries. At planet scale (~1.4M blocks), these would accumulate ~14 GB
-cross-thread retention.
+| Command | Before | After | Commit |
+|---------|--------|-------|--------|
+| tags-filter two-pass (pass 1 + closure + way deps) | OOM (24.3 GB anon) | **2.2 GB** | `c6c13ff` |
+| getid --add-referenced (pass 1) | 8.3 GB anon | **357 MB** | `142d7eb` |
 
-| Command | Pass | Path | Fix |
-|---------|------|------|-----|
-| tags-filter | pass 1 (collection) | `into_blocks_pipelined` per-block | Sequential reader |
-| getid | pass 1 (ID collection) | `into_blocks_pipelined` per-block | Sequential reader |
-
-The rewrite passes of these commands use batched `par_iter` and are safe.
+Converted all unbatched collection passes to sequential BlobReader +
+DecompressPool. Rewrite passes still use batched `par_iter` (safe).
 
 ### Priority 2: Scanner family
 

@@ -79,21 +79,19 @@ PrimitiveBlock cross-thread alloc/free retention affects every command using
 the pipelined reader at 400K+ blocks (Europe/planet scale). The geocode builder
 is the predicted next victim (16 GB DenseMmapIndex + 25 GB retention = OOM).
 
-See [notes/cross-pipeline-optimization-plan.md](notes/cross-pipeline-optimization-plan.md)
+See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 
 ## ALTW external join — COMPLETE
 
 Planet validated: **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense.**
-See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md),
-[notes/p2c-parallel-assembly-spec.md](notes/p2c-parallel-assembly-spec.md), and
-[notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md).
+See [notes/altw-optimization-history.md](notes/altw-optimization-history.md).
 
 ## ALTW memory optimization — COMPLETE
 
 External join ships as `--index-type external` (or `auto`).
-Dense remains the "fast when RAM fits" path. See [notes/altw-memory.md](notes/altw-memory.md).
+Dense remains the "fast when RAM fits" path. See [notes/altw-optimization-history.md](notes/altw-optimization-history.md).
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 
@@ -147,8 +145,7 @@ pipelined decode parallelism). See [notes/extract-passthrough-findings.md](notes
 - [ ] Write-path throughput (arch-Codex) — BlockBuilder/PbfWriter is the next
   bottleneck after read-path optimizations. SIMD varint, compression tuning.
   See [notes/SIMD.md](notes/SIMD.md).
-- [ ] Dead code cleanup: `Blob::decompress_raw`, `decompress_into`,
-  `DecompressPool::full_drops`, `DenseMmapIndex::set`, `StreamingBlocks::new`.
+- [x] Dead code cleanup (commit `428e73b`). Zero lib warnings.
 
 ## Release prep
 

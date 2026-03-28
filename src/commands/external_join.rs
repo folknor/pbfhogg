@@ -306,7 +306,7 @@ fn stage1_way_pass(
 #[allow(clippy::too_many_lines)]
 fn stage2_node_join(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     node_buckets: &BucketWriters,
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
@@ -378,102 +378,133 @@ fn stage2_node_join(
 
     debug_log!("  stage2: after bucket load, {}", crate::debug::rss_line());
 
-    // P2b: Parallel node-only scan. IO thread reads blobs, dispatch thread fans
-    // out to rayon workers for parallel decompression + tuple extraction. Consumer
-    // merge-joins tuples in file order. Decompression buffers stay thread-local.
-    // See notes/p2b-parallel-tuples-spec.md.
+    // P2b-v2: Parallel node-only scan with worker-side pread. IO thread reads
+    // only headers (~50 bytes), filters by indexdata, sends lightweight descriptors.
+    // Workers pread blob data from shared file, decompress + extract tuples with
+    // all alloc/free thread-local. Eliminates cross-thread Blob ownership that
+    // caused 20 GB retention in P2b-v1. See notes/p2b-parallel-tuples-spec.md.
     use super::node_scanner::{NodeTuple, extract_node_tuples};
+    use std::os::unix::fs::FileExt;
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    // Seekable reader for header-only iteration.
+    let mut blob_reader = crate::blob::BlobReader::seekable_from_path(input)?;
     blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+    // Skip the OsmHeader blob.
+    blob_reader.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    // Shared file for worker pread access.
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
 
     debug_log!("  stage2: reader open, {}", crate::debug::rss_line());
 
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
     let mut block_count: u64 = 0;
 
-    type RawItem = (usize, crate::error::Result<crate::blob::Blob>);
+    // Descriptor: (seq, data_offset, data_size)
+    type Descriptor = (usize, u64, usize);
     type DecodedItem = (usize, crate::error::Result<Vec<NodeTuple>>);
 
-    let (raw_tx, raw_rx) = std::sync::mpsc::sync_channel::<RawItem>(16);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<Descriptor>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
-    // Buffer pool for Vec<NodeTuple> recycling. Without this, 500K+ cross-thread
-    // alloc/free cycles cause glibc to retain ~25 GB anonymous heap (same pattern
-    // as PrimitiveBlock retention — see pipeline.rs). Workers take from pool,
-    // consumer returns after merge-join. ~32-64 Vecs × 128 KB = bounded memory.
-    let tuple_pool: std::sync::Arc<std::sync::Mutex<Vec<Vec<NodeTuple>>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(Vec::with_capacity(64)));
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
 
     std::thread::scope(|scope| -> Result<()> {
-        // IO thread: read blobs, filter to node blobs, assign contiguous seq numbers.
+        // IO thread: read headers only, filter to node blobs, send descriptors.
         scope.spawn(move || {
             let mut seq: usize = 0;
-            for blob_result in &mut blob_reader {
-                match blob_result {
-                    Ok(blob) => {
-                        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            while let Some(result) = blob_reader.next_header_with_data_offset() {
+                match result {
+                    Ok((header, data_offset, data_size)) => {
+                        if !matches!(header.blob_type(), crate::blob::BlobType::OsmData) {
                             continue;
                         }
-                        if let Some(idx) = blob.index() {
+                        if let Some(idx) = header.index() {
                             if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
                                 continue;
                             }
                         }
-                        if raw_tx.send((seq, Ok(blob))).is_err() {
+                        if desc_tx.send((seq, data_offset, data_size)).is_err() {
                             break;
                         }
                         seq += 1;
                     }
-                    Err(e) => {
-                        drop(raw_tx.send((seq, Err(e))));
-                        break;
-                    }
+                    Err(_) => break,
                 }
             }
         });
 
-        // Dispatch thread: receive raw blobs, spawn rayon decode tasks.
-        let dispatch_tx = decoded_tx.clone();
-        let dispatch_pool = std::sync::Arc::clone(&tuple_pool);
-        scope.spawn(move || {
-            let decode_threads = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                .unwrap_or(4);
-            let Ok(decode_pool) = rayon::ThreadPoolBuilder::new()
-                .num_threads(decode_threads)
-                .build()
-            else {
-                return;
-            };
-            for (seq, blob_result) in raw_rx {
-                let tx = dispatch_tx.clone();
-                let pool = std::sync::Arc::clone(&dispatch_pool);
-                decode_pool.spawn(move || {
-                    let result = blob_result.and_then(|blob| {
-                        // Thread-local decompress buffer: reused across blobs on this thread.
-                        thread_local! {
-                            static DBUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+        // Worker threads: pread blob data, decompress, extract tuples.
+        // Each worker owns all its buffers — zero cross-thread alloc/free.
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = decoded_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut tuples: Vec<NodeTuple> = Vec::new();
+
+                loop {
+                    let (seq, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(item) => item,
+                            Err(_) => break, // channel closed
                         }
-                        DBUF.with_borrow_mut(|dbuf| {
-                            blob.decompress_into(dbuf)?;
-                            // Take a recycled buffer from the pool, or allocate fresh.
-                            let mut tuples = pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).pop()
-                                .unwrap_or_default();
-                            tuples.clear();
-                            extract_node_tuples(dbuf, &mut tuples)
-                                .map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                                ))?;
-                            Ok(tuples)
-                        })
-                    });
-                    drop(tx.send((seq, result)));
-                });
-            }
-        });
+                    };
+                    let result = (|| -> crate::error::Result<Vec<NodeTuple>> {
+                        // pread blob data — no shared file offset mutation.
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(e)
+                            ))?;
+
+                        // Evict pages we just read (worker-side, safe from races).
+                        #[cfg(target_os = "linux")]
+                        {
+                            use std::os::unix::io::AsRawFd;
+                            #[allow(clippy::cast_possible_wrap)]
+                            unsafe {
+                                libc::posix_fadvise(
+                                    file.as_raw_fd(),
+                                    data_offset as i64,
+                                    data_size as i64,
+                                    libc::POSIX_FADV_DONTNEED,
+                                );
+                            }
+                        }
+
+                        // Parse wire blob + decompress into thread-local buffer.
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+
+                        // Extract node tuples into thread-local Vec.
+                        tuples.clear();
+                        extract_node_tuples(&decompress_buf, &mut tuples)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
+                            ))?;
+
+                        // Move tuples out, replace with empty Vec. The consumer
+                        // drops the Vec — but only ~32 are in flight (channel
+                        // capacity), so this is bounded cross-thread churn.
+                        Ok(std::mem::take(&mut tuples))
+                    })();
+                    if tx.send((seq, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(desc_rx); // allow workers to see channel close
         drop(decoded_tx);
 
         // Consumer: reorder + merge-join.
@@ -537,8 +568,7 @@ fn stage2_node_join(
                     }
                 }
 
-                // Return buffer to pool for worker reuse (prevents cross-thread free retention).
-                tuple_pool.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(tuples);
+                drop(tuples);
             }
         }
 

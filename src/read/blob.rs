@@ -547,6 +547,14 @@ impl BlobHeader {
     pub fn get_blob_size(&self) -> i32 {
         self.header.datasize
     }
+
+    /// Returns the blob-level index from the header's `indexdata` field, if present.
+    pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
+        self.header
+            .indexdata
+            .as_ref()
+            .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
+    }
 }
 
 /// A reader for PBF files that allows iterating over [`Blob`]s.
@@ -978,6 +986,44 @@ impl<R: Read + Seek + Send> BlobReader<R> {
 
         Some(Ok((BlobHeader::new(header), prev_offset)))
     }
+
+    /// Like [`next_header_skip_blob`], but also returns the file offset where the
+    /// blob data begins and its size. Used by parallel pipelines where workers
+    /// `pread` blob data themselves from a shared file descriptor.
+    ///
+    /// Returns `(BlobHeader, blob_data_offset, blob_data_size)`.
+    pub(crate) fn next_header_with_data_offset(&mut self) -> Option<Result<(BlobHeader, u64, usize)>> {
+        if !self.last_blob_ok {
+            return None;
+        }
+
+        let header = match self.read_blob_header() {
+            Some(Ok(header)) => header,
+            Some(Err(err)) => return Some(Err(err)),
+            None => return None,
+        };
+
+        // After read_blob_header, self.offset points to the start of blob data.
+        let data_offset = match self.offset {
+            Some(o) => o.0,
+            None => {
+                self.last_blob_ok = false;
+                return Some(Err(new_blob_error(BlobError::InvalidDataSize {
+                    size: header.datasize,
+                })));
+            }
+        };
+        #[allow(clippy::cast_sign_loss)] // datasize validated non-negative above
+        let data_size = header.datasize as usize;
+
+        // Skip past blob data.
+        if let Err(err) = self.seek_raw(SeekFrom::Current(header.datasize as i64)) {
+            self.last_blob_ok = false;
+            return Some(Err(err));
+        }
+
+        Some(Ok((BlobHeader::new(header), data_offset, data_size)))
+    }
 }
 
 impl BlobReader<BufReader<File>> {
@@ -1090,6 +1136,72 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
         }
         None => Err(new_blob_error(BlobError::Empty)),
     }
+}
+
+/// Decompress raw blob bytes (from pread) into a caller-owned buffer.
+///
+/// Parses the blob wire format inline and decompresses the payload without
+/// constructing intermediate `WireBlob` or `Bytes` objects. Used by parallel
+/// pipelines where workers read blob data via pread and need all alloc/free
+/// to stay thread-local.
+pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    use super::wire::Cursor;
+    buf.clear();
+
+    let mut cursor = Cursor::new(raw_blob);
+    let mut raw_size: Option<i32> = None;
+    let mut found = false;
+
+    while let Some((field, wire_type)) = cursor.read_tag()? {
+        match field {
+            1 => {
+                // raw (uncompressed): bytes
+                let slice = cursor.read_len_delimited()?;
+                let size = slice.len() as u64;
+                if size >= MAX_BLOB_MESSAGE_SIZE {
+                    return Err(new_blob_error(BlobError::MessageTooBig { size }));
+                }
+                buf.extend_from_slice(slice);
+                return Ok(());
+            }
+            2 => {
+                // raw_size: int32
+                #[allow(clippy::cast_possible_truncation)]
+                { raw_size = Some(cursor.read_varint()? as i32); }
+            }
+            3 => {
+                // zlib_data: bytes
+                let slice = cursor.read_len_delimited()?;
+                if let Some(rs) = raw_size {
+                    if rs > 0 {
+                        #[allow(clippy::cast_sign_loss)]
+                        buf.reserve((rs as usize).saturating_sub(buf.capacity()));
+                    }
+                }
+                zlib_decompress_into(slice, buf)?;
+                found = true;
+            }
+            7 => {
+                // zstd_data: bytes
+                let slice = cursor.read_len_delimited()?;
+                if let Some(rs) = raw_size {
+                    if rs > 0 {
+                        #[allow(clippy::cast_sign_loss)]
+                        buf.reserve((rs as usize).saturating_sub(buf.capacity()));
+                    }
+                }
+                zstd::stream::copy_decode(std::io::Cursor::new(slice), &mut *buf)?;
+                let size = buf.len() as u64;
+                if size > MAX_BLOB_MESSAGE_SIZE {
+                    return Err(new_blob_error(BlobError::MessageTooBig { size }));
+                }
+                found = true;
+            }
+            _ => cursor.skip_field(wire_type)?,
+        }
+    }
+
+    if found { Ok(()) } else { Err(new_blob_error(BlobError::Empty)) }
 }
 
 /// Parse already-decompressed bytes into a [`PrimitiveBlock`].

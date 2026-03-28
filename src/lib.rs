@@ -120,7 +120,7 @@ pub mod geo;
 pub mod geocode_index;  // format is always available; reader requires geocode-reader feature
 pub mod osc;
 pub(crate) mod blob_index;
-pub(crate) mod debug;
+pub mod debug;
 mod error;
 pub(crate) mod reorder_buffer;
 

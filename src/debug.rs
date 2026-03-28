@@ -44,7 +44,7 @@ pub(crate) fn rss_line() -> String {
 /// start and written to the FIFO at `BROKKR_MARKER_FIFO`. If no sidecar is
 /// running (env var absent), this is a no-op. If the FIFO buffer is full,
 /// the marker is silently dropped (O_NONBLOCK).
-pub(crate) fn emit_marker(name: &str) {
+pub fn emit_marker(name: &str) {
     use std::io::Write;
     use std::sync::OnceLock;
 

@@ -20,6 +20,8 @@ Applying a daily diff to an 18.8 GB North America extract (2.58 billion elements
 
 Developed on Linux, untested elsewhere. Production-relevant features (O_DIRECT, io_uring) are Linux-only.
 
+Built with LLMs. See [LLM.md](LLM.md).
+
 ## Features
 
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder

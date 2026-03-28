@@ -1457,6 +1457,8 @@ pub fn merge(
 
                 if !passthrough_scan.is_empty() {
                     let needed_set = &idx.needed_set;
+                    // Node-only scanner: extract (id, lat, lon) without PrimitiveBlock
+                    // construction. Skips string table and group_ranges allocation.
                     let extracted: Vec<Vec<(i64, (i32, i32))>> = passthrough_scan
                         .par_iter()
                         .filter_map(|&i| {
@@ -1465,27 +1467,16 @@ pub fn merge(
                             {
                                 return None;
                             }
-                            let bytes_owned = Bytes::from(buf);
-                            let block =
-                                parse_primitive_block_from_bytes_owned(&bytes_owned).ok()?;
-                            let mut found = Vec::new();
-                            for element in block.elements_skip_metadata() {
-                                match &element {
-                                    Element::DenseNode(dn) if needed_set.contains(&dn.id()) => {
-                                        found.push((
-                                            dn.id(),
-                                            (dn.decimicro_lat(), dn.decimicro_lon()),
-                                        ));
-                                    }
-                                    Element::Node(n) if needed_set.contains(&n.id()) => {
-                                        found.push((
-                                            n.id(),
-                                            (n.decimicro_lat(), n.decimicro_lon()),
-                                        ));
-                                    }
-                                    _ => {}
-                                }
+                            let mut tuples = Vec::new();
+                            if super::node_scanner::extract_node_tuples(&buf, &mut tuples).is_err()
+                            {
+                                return None;
                             }
+                            let found: Vec<(i64, (i32, i32))> = tuples
+                                .iter()
+                                .filter(|t| needed_set.contains(&t.id))
+                                .map(|t| (t.id, (t.lat, t.lon)))
+                                .collect();
                             Some(found)
                         })
                         .collect();

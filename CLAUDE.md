@@ -22,11 +22,18 @@ brokkr <command> [--dataset D] [--variant V]   # run once, print timing
 brokkr <command> [--dataset D] --bench          # 3 runs, store in DB + sidecar profiler (100ms /proc sampling + markers)
 brokkr <command> [--dataset D] --hotpath        # function-level timing
 brokkr <command> [--dataset D] --alloc          # allocation tracking
+brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg binary
+brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg binary
 ```
+
+I/O mode flags (`--direct-io`, `--io-uring`) are passed through to the pbfhogg binary and
+create named variants in results (e.g., `add-locations-to-ways+direct-io`). Combine with
+`--bench` for stored comparisons: `brokkr results --compare-last --variant add-locations-to-ways`.
 
 pbfhogg commands (every CLI command is a brokkr subcommand):
 - `brokkr inspect-tags --dataset denmark`
 - `brokkr add-locations-to-ways --dataset europe --index-type external --bench`
+- `brokkr add-locations-to-ways --dataset europe --direct-io --bench` — O_DIRECT variant
 - `brokkr build-geocode-index --dataset denmark --hotpath`
 - `brokkr read --bench` — multi-variant read benchmark
 - `brokkr suite pbfhogg --bench` — full suite

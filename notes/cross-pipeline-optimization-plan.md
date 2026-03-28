@@ -10,22 +10,24 @@ the full investigation that produced these findings.
 
 Ordered by impact and dependency. Items within a group can be done in any order.
 
-**Group 1: Infrastructure (unblocks everything else)**
+**Group 1: Infrastructure (unblocks everything else)** — ALL DONE
 1. ~~Document PrimitiveBlock retention footgun in pipeline.rs~~ — Done (commit `a067759`)
 2. ~~Move `extract_node_tuples` / `NodeTuple` to shared location~~ — Done (`commands/node_scanner.rs`, commit `b3e8bf7`)
 3. ~~Move `read_rss_detail()` to shared command utilities~~ — Done (`debug.rs`, done by user)
-4. BlobReader fadvise: gate on `target_os = "linux"` instead of `linux-direct-io`
+4. ~~BlobReader fadvise: gate on `target_os = "linux"`~~ — Done (commit `7acbb1a`). libc now non-optional.
 
-**Group 2: Planet blockers (things that will OOM at planet scale)**
-5. ~~build-geocode-index: sequential reader for pass 2 node phase~~ — Done (commit `5776b67`). Sidecar confirmed: anon=325 MB, 19 GB mmap RSS at Japan.
-6. ~~ALTW dense pass 1: node-only scanner for node index build~~ — Done (commit `b3e8bf7`). Japan 69s → 42s (-39%).
-7. ~~ALTW sparse pass 1: same as dense~~ — Done (commit `a067759`). Denmark verified.
-8. diff: sequential readers for both pipelines
+**Group 2: Planet blockers** — ALL DONE
+5. ~~build-geocode-index: sequential reader for pass 2~~ — Done (commit `5776b67`). Sidecar: anon=325 MB.
+6. ~~ALTW dense pass 1: node-only scanner~~ — Done (commit `b3e8bf7`). Japan 69s→42s (-39%).
+7. ~~ALTW sparse pass 1: same~~ — Done (commit `a067759`).
+8. ~~diff + derive-changes: sequential readers~~ — Done (commit `6d996f6`).
+9. ~~check-refs: sequential reader~~ — Done (commit `fb8dd3c`). Sidecar: anon 2.9 GB→581 MB (5x).
 
 **Group 3: External join next cycle (P2b/P2c)**
-9. P2b: parallel tuples for external join stage 2
-10. P2c: parallel assembly for external join stage 4 (needs per-blob ref counts)
-11. Planet benchmark for external join
+9. ~~P2b: parallel tuples for external join stage 2~~ — Done. P2b-v2 (commit `80e227b`): pread-from-workers, all alloc thread-local. Europe stage 2: 301s→216s (-28%), anon 20.4 GB→**1.4 GB** (-93%). Planet-safe (~3.9 GB extrapolated).
+10. ~~External join stage 1: sequential reader~~ — Done (commit `4daf995`). Anon 11 GB→70 MB. Stage 1: 82s→128s (+54%).
+11. P2c: parallel assembly for external join stage 4 (needs per-blob ref counts)
+12. Planet benchmark for external join
 
 **Group 4: Remaining commands at Europe/planet scale**
 12. extract pass 1: node-only scanner for bbox classification (sorted path)
@@ -93,17 +95,20 @@ pattern from the external join investigation.
 
 ### Implementation plan
 
-| Priority | Command | Fix | Effort |
+| Priority | Command | Fix | Status |
 |----------|---------|-----|--------|
-| 1 | pipeline.rs | Document footgun: add warning comment about 400K+ block retention | Trivial |
-| ~~2~~ | ~~build-geocode-index~~ | ~~Sequential reader for pass 2 node phase~~ | **Done (commit `5776b67`). Sidecar confirmed: anon=325 MB flat at Japan scale. 19 GB peak RSS is DenseMmapIndex mmap (file-backed). Mmap thrashing is the remaining bottleneck at Europe/planet, not PrimitiveBlock retention.** |
-| 3 | ALTW dense pass 1 | Node-only scanner for node index build | Medium |
-| 4 | extract pass 1 | Node-only scanner for bbox node classification (sorted path) | Medium |
-| 5 | check-refs | Sequential reader or batch-bounded consumption | Low |
-| 6 | tags-filter | Sequential reader for planet-scale runs | Low |
-| 7 | cat --type | Sequential reader fallback for large files | Low |
-| 8 | diff | Sequential reader for both pipelines | Medium |
-| 9 | getid / getparents | Sequential reader (often blob-filtered, lower priority) | Low |
+| ~~1~~ | ~~pipeline.rs~~ | ~~Document footgun~~ | **Done** (commit `a067759`) |
+| ~~2~~ | ~~build-geocode-index~~ | ~~Sequential reader for pass 2~~ | **Done** (commit `5776b67`). Sidecar: anon=325 MB flat. |
+| ~~3~~ | ~~ALTW dense pass 1~~ | ~~Node-only scanner~~ | **Done** (commit `b3e8bf7`). Japan 69s→42s (-39%). |
+| ~~4~~ | ~~ALTW sparse pass 1~~ | ~~Node-only scanner~~ | **Done** (commit `a067759`). |
+| ~~5~~ | ~~check-refs~~ | ~~Sequential reader~~ | **Done** (commit `fb8dd3c`). Sidecar: anon 2.9 GB→581 MB (5x). |
+| ~~6~~ | ~~diff~~ | ~~Sequential readers (2x)~~ | **Done** (commit `6d996f6`). |
+| ~~7~~ | ~~derive-changes~~ | ~~Sequential readers (2x)~~ | **Done** (commit `6d996f6`). |
+| 8 | extract pass 1 | Node-only scanner for bbox classification | **Deprioritized** — sidecar showed flat anon (batched, 2.2 GB). |
+| 9 | tags-filter | Sequential reader | **Deprioritized** — sidecar showed flat anon (batched, 2.7 GB). |
+| 10 | cat --type | Sequential reader | **Deprioritized** — sidecar showed flat anon (batched, 46 MB). |
+| 11 | getid / getparents | Sequential reader | **Deprioritized** — blob-filtered, low block count. |
+| 12 | merge --locations-on-ways | Node-only scanner | Niche — merge passthrough handles 92%+. |
 
 ## Pattern 2: Node-only wire scanner
 
@@ -179,8 +184,7 @@ we chased page cache fixes for hours when the problem was heap.
 Already shipped (commit `4ab6976`). Evicts page cache behind read head after each
 blob. Benefits all pipelined reader consumers automatically.
 
-**TODO:** Gate on `target_os = "linux"` instead of `linux-direct-io` feature, so
-buffered-only Linux builds also get eviction. See TODO.md.
+Done (commit `7acbb1a`). Gated on `target_os = "linux"`, libc now non-optional.
 
 ## Sparse deprecation plan
 

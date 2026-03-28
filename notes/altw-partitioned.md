@@ -283,8 +283,10 @@ the extra temp disk (~32 GB for referenced-only sidecar at planet).
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark optimized external on Denmark — 25s (3.5x dense)
 - [x] Benchmark on Japan — 143s (2.0x dense)
-- [x] Benchmark on Europe — **1824s (30m), 29% faster than dense (43m)**
-- [x] fadvise(DONTNEED) + mmap coord_slots (commit `165cbb2`): Denmark 25→22s, Europe 2060→1824s
-- [ ] Benchmark on planet (87.7 GB) — estimated ~80 min
-- [ ] Add O_DIRECT support to bucket file I/O (planet-scale page cache bypass)
+- [x] Benchmark on Europe — 2060s → 901s → **866s (14.4m), 3.0x faster than dense**
+- [x] fadvise(DONTNEED) + mmap coord_slots (commit `165cbb2`): Denmark 25→22s
+- [x] Node-only scanner + scatter buffer for stages 2-3 (commit `cf350a9`)
+- [x] Sequential readers for stages 1/4, eliminate PrimitiveBlock retention
+- [x] P2b-v2 pread-from-workers: stage 2 anon 20.4 GB → 1.4 GB, planet-safe (commit `80e227b`)
+- [ ] Benchmark on planet (87.7 GB) — ~300 GB temp disk needed, ~40 min estimated
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

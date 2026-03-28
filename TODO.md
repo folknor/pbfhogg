@@ -69,13 +69,9 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   cat --type (zlib): 61.8s, 10.9 GB RSS, 240 GB cumulative alloc (175 MB net).
   Full results in `notes/performance.md`.
 
-## BlobReader fadvise: gate on `target_os = "linux"` instead of `linux-direct-io`
+## ~~BlobReader fadvise: gate on `target_os = "linux"` instead of `linux-direct-io`~~ DONE
 
-The per-blob `fadvise(DONTNEED)` in `BlobReader` (commit `4ab6976`) is gated
-behind `#[cfg(feature = "linux-direct-io")]` because that's what provides `libc`.
-But fadvise doesn't need O_DIRECT — it's a separate concern. Should be gated on
-`target_os = "linux"` with `libc` as a direct dependency for the fadvise path,
-so buffered-only Linux builds also get page cache eviction.
+Done in commit `7acbb1a`. libc now non-optional, fadvise gated on `target_os = "linux"`.
 
 ## Cross-pipeline optimization
 
@@ -87,42 +83,38 @@ See [notes/cross-pipeline-optimization-plan.md](notes/cross-pipeline-optimizatio
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 
-## ALTW external join: parallel decompress (next cycle)
+## ALTW external join: next cycle
 
-External join works end-to-end at Europe scale: 921s (15 min), 1.6 GB RSS,
-2.8x faster than dense. All easy/medium optimizations exhausted. Remaining
-wins require parallel input decompression.
+External join at Europe: 866s (14.4 min), 1.4 GB peak anon, 3.0x faster than
+dense. P2b-v2 (pread-from-workers) eliminated cross-thread retention — planet-safe.
 
-See [notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md)
-for the full investigation, optimization matrix, and next cycle plan.
+See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md) and
+[notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md).
 
-**P2b: Parallel tuples for stage 2 (301s → est. 55-80s)**
-- Rayon workers decompress + extract (id,lat,lon) tuples, thread-local buffers
-- Consumer receives tuples in order, runs merge-join
-- extract_node_tuples() and NodeTuple already implemented
-- Critical: recycle worker buffers (don't free cross-thread)
+**Done:**
+- [x] P2b-v2: parallel tuples with pread-from-workers (commit `80e227b`).
+  Stage 2: 301s→216s (-28%), anon 20.4 GB→1.4 GB (-93%).
+- [x] Sequential readers for stages 1/4 (commits `4daf995`, `2873919`).
 
-**P2c: Parallel assembly for stage 4 (461s → est. 150-200s)**
-- Workers own full decompress → PrimitiveBlock → assemble → OwnedBlock lifecycle
-- **Requires per-blob way-ref counts** (for slot_pos pre-computation)
-- Store during stage 1 as sidecar file or new indexdata field
-- Without this, stage 4 must decompress sequentially to count refs
-
-**Priority:** P2b first (simpler), P2c second (needs ref count infrastructure).
+**Remaining:**
+- [ ] P2c: parallel assembly for stage 4 (432s, largest stage). Needs per-blob
+  way-ref counts for slot_pos pre-computation.
+- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk, ~40 min estimated.
 
 ## ALTW memory optimization
 
 See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 
-**Status**: External join (`--index-type external`) works end-to-end at
-Europe scale. 921s, 1.6 GB RSS, 2.8x faster than dense (2,565s).
+**Status**: External join (`--index-type external`) at Europe: **866s (14.4 min),
+1.4 GB peak anon, 3.0x faster than dense** (2,565s). Planet-safe architecture.
 
 **Done**:
 - [x] ~~Test pread + fadvise~~ — won't help
 - [x] Fix stage 4 assembly OOM — sequential reader
-- [x] Full end-to-end Europe — 921s
+- [x] Full end-to-end Europe — 866s (commit `80e227b`)
+- [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
 - [ ] Test dense on 64 GB host (may solve the problem without code changes)
-- [ ] Planet benchmark (87.7 GB)
+- [ ] Planet benchmark (87.7 GB) — ~300 GB temp disk needed
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 

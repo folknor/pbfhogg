@@ -217,7 +217,20 @@ Stage 2 improvement: skip non-node blobs + DecompressPool reuse (-30s, -9%).
 | + blob skip + pool reuse | 14s | ~871s (est.) | `d272b49` |
 | Full baseline (measured) | 14s | 930s | post-`d272b49` |
 | decode_threads(1) stage 4 | — | 383s stage 4 but 27 GB peak anon | reverted |
-| **--compression none output** | — | **294s stage 4, ~763s est. total** | sequential reader |
+| --compression none output | — | 294s stage 4, ~763s est. total | sequential reader |
+| P2b-v1 parallel tuples + buffer pool | 12.5s | 828s | `3051dd7` |
+| + sequential stage 1 | 16s | 836s (14m) | `4daf995` |
+| **P2b-v2 pread-from-workers** | **13.8s** | **866s (14.4m)** | `80e227b` |
+
+P2b-v2 stage breakdown (commit `80e227b`, sidecar `070086bb`):
+Stage 1: 126s / 70 MB anon (sequential reader).
+Stage 2: 216s / **1.4 GB anon** (pread-from-workers, all alloc thread-local).
+Stage 3: 91s.
+Stage 4: 432s / 2.1 GB anon (sequential reader).
+
+Stage 2 anon reduced 93% (20.4 GB → 1.4 GB) by eliminating cross-thread
+Blob data transfer. 1.4 GB is the bucket sort data — irreducible for this
+algorithm. Planet extrapolation: ~3.9 GB. Safe on 32 GB host.
 
 Dense ALTW at Europe scale: 2,565s (43 min). **External is ~2.8x faster (zlib), ~3.4x (no compression).**
 

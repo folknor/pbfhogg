@@ -3,223 +3,164 @@
 ## Goal
 
 Parallelize zlib decompression in external join stage 2 (node join).
-Currently single-threaded at 301s Europe, zlib-bound. The merge-join
+Previously single-threaded at 301s Europe, zlib-bound. The merge-join
 consumer is inherently sequential (global cursor through sorted bucket
 pairs), so only decompression + wire parsing can be parallelized.
 
-## Realistic expectations
+## Results
 
-Stage 2 breaks down as ~160s decompression + ~141s merge-join.
-Parallel decompression with 6 threads: ~27s. Merge-join stays ~141s.
-Tuple overhead from double iteration: ~11s.
+### P2b-v2 (commit `80e227b`, plantasjen, sidecar `070086bb`)
 
-**Expected: 301s → ~179s (-40%).** Not 4-6x — merge-join is 47% of
-stage 2 and cannot be parallelized without fusing it into workers
-(much more complex, future work).
+**Europe (32.4 GB): 866s (14.4 min), down from 901s (-4%).**
 
-At planet scale: ~1000s → ~600s. Saves ~400s.
+| Stage | Baseline (901s) | P2b-v2 (866s) | Anon peak | Delta |
+|-------|----------------|--------------|----------|-------|
+| Stage 1 | 82s | 126s | 70 MB | +54% (sequential reader) |
+| Stage 2 | 301s | **216s** | **1.4 GB** | **-28%** |
+| Stage 3 | 73s | 91s | — | +25% |
+| Stage 4 | 392s | 432s | 2.1 GB | +10% |
 
-## Architecture
+Denmark (465 MB): 13.8s, 0 missing locations.
+
+Stage 2 anon 1.4 GB is the bucket sort data — irreducible minimum for
+this algorithm. Planet extrapolation: ~3.9 GB. Safe on 32 GB host.
+
+### P2b-v1 (commit `3051dd7`, superseded)
+
+Europe: 836s. Stage 2: 215s / **20.4 GB anon**. OOM risk at planet
+scale (~56 GB extrapolated). Fixed by v2's pread-from-workers.
+
+## Root cause: cross-thread Blob data + non-affine pool
+
+Two sources of cross-thread alloc/free in the current P2b implementation:
+
+1. **Compressed Blob data**: IO thread allocates `Vec<u8>` (~32 KB per
+   blob), wraps in `Bytes`, sends through channel. Rayon workers free it
+   after decompression. 500K blobs × 32 KB = ~16 GB cross-thread churn.
+   Same retention pattern as PrimitiveBlock.
+
+2. **Global tuple pool**: `Arc<Mutex<Vec<Vec<NodeTuple>>>>` doesn't
+   preserve worker affinity. Consumer returns buffers, any worker pops
+   them — still cross-thread free from the allocator's perspective.
+
+Both identified by perf-Claude and perf-Codex reviews.
+
+## Architecture (current, commit `3051dd7`)
 
 ```
 IO thread: BlobReader reads raw compressed blobs
   │ skip non-OsmData, skip non-node via indexdata
-  │ fadvise(DONTNEED) behind read head (existing)
-  │ assign sequence numbers ONLY to blobs that pass filter
+  │ fadvise(DONTNEED) behind read head
+  │ assign sequence numbers to node blobs
   ▼
-sync_channel(16) — (usize, Blob) objects
+sync_channel(16) — (usize, Blob) objects  ← PROBLEM: Blob crosses threads
   │
   ▼
 Dispatch thread: receives raw blobs, spawns rayon tasks
   │
   ▼
 Rayon workers (via rayon::spawn + thread_local!):
-  │ thread-local: decompress_buf: Vec<u8> (reused via Blob::decompress_into)
-  │ per-block: tuples: Vec<NodeTuple> (fresh allocation, ~128 KB)
+  │ thread-local: decompress_buf: Vec<u8> (reused)
+  │ per-block: tuples from Arc<Mutex> pool  ← PROBLEM: non-affine pool
   │ blob.decompress_into(&mut decompress_buf)
   │ extract_node_tuples(&decompress_buf, &mut tuples)
   │ send (seq, Ok(tuples)) through channel
-  │ on error: send (seq, Err(e)) through channel
   ▼
 sync_channel(32) — (usize, Result<Vec<NodeTuple>>)
   │
   ▼
-Consumer (main thread):
-  │ ReorderBuffer delivers tuples in file order
-  │ propagates first error from any worker
-  │ for each block's tuples:
-  │   for each NodeTuple { id, lat, lon }:
-  │     merge-join against sorted_pairs (same logic as current)
-  │     emit resolved entries to slot buckets
-  │ early exit when all buckets exhausted (drops receiver,
-  │   rayon tasks finish silently — bounded wasted work)
+Consumer: ReorderBuffer → merge-join → return tuples to pool
+```
+
+## Next: pread-from-workers (P2b-v2)
+
+Reviewed by perf-Claude, perf-Codex, planet-Claude, planet-Codex. All
+agree this is the right fix.
+
+### Architecture
+
+```
+IO thread: BlobReader reads only headers (~50 bytes)
+  │ skip non-OsmData, skip non-node via indexdata
+  │ NO fadvise (workers handle their own pages)
+  │ send (seq, blob_data_offset, datasize) through channel
   ▼
-Slot bucket files (same as current)
+sync_channel(16) — (usize, u64, usize) lightweight descriptors
+  │
+  ▼
+Workers (fixed threads, not rayon):
+  │ shared: Arc<File> for pread (FileExt::read_at)
+  │ thread-local: read_buf: Vec<u8> (~32 KB, reused)
+  │ thread-local: decompress_buf: Vec<u8> (~2 MB, reused)
+  │ thread-local: tuples: Vec<NodeTuple> (~128 KB, reused)
+  │
+  │ read_at(&mut read_buf, offset)  — all alloc/free thread-local
+  │ parse WireBlob from read_buf
+  │ decompress into decompress_buf
+  │ extract_node_tuples into tuples
+  │ fadvise(DONTNEED, offset, size)  — worker evicts own pages
+  │ send (seq, tuples) through channel  — tuples Vec ownership transfer
+  ▼
+sync_channel(32) — (usize, Result<Vec<NodeTuple>>)
+  │
+  ▼
+Consumer: ReorderBuffer → merge-join → drop tuples (same-thread as send)
 ```
 
-**Note:** 4 threads total: IO, dispatch, rayon workers, consumer. Same
-pattern as pipeline.rs.
+### Key changes from current P2b
 
-## Key design decisions
+1. **No Blob objects cross threads.** IO thread sends lightweight
+   descriptors (offset + size). Workers read their own data via pread.
+   Zero cross-thread alloc/free for compressed data.
 
-### Buffer ownership
+2. **Worker-local tuple Vecs.** Each worker reuses its own tuples Vec
+   (clear between blocks). No shared pool needed. The Vec does cross
+   to the consumer for merge-join, but with only ~32 Vecs in flight
+   total (channel capacity), this is bounded.
 
-Workers own the decompress buffer (thread-local, reused via `map_init`).
-Workers create a fresh `Vec<NodeTuple>` per block (~128 KB for ~8000 nodes).
-This Vec crosses the thread boundary to the consumer. Consumer drops it
-after merge-join.
+3. **Worker-side fadvise.** Each worker calls DONTNEED after its own
+   pread. IO thread does NOT call fadvise (would race with workers).
+   Per planet reviewers: track completion watermark if needed, but
+   per-blob DONTNEED from workers is the simplest safe approach.
 
-This is cross-thread alloc/free of ~128 KB Vecs. At 500K Europe blocks,
-that's 64 GB cumulative churn. Based on the OOM investigation:
+4. **Fixed worker threads, not rayon.** Per perf-Codex: explicit
+   `std::thread::scope` workers give cleaner buffer ownership than
+   rayon::spawn with thread_local!. 4-6 workers.
 
-- PrimitiveBlock retention was from `Box<[(u32,u32)]>` at ~10 KB with
-  varying sizes (stringtable entries). The allocator couldn't reuse slots.
-- Uniform 128 KB `Vec<NodeTuple>` allocations should reuse size-class slots
-  efficiently. The allocator sees the same size every time.
+5. **Bound in-flight by bytes, not just count.** Per planet-Codex:
+   cap compressed bytes in flight to tens of MB to prevent page cache
+   speculation.
 
-**Start simple.** Validate with sidecar (`--sidecar`, check anon RSS stays
-flat). If retention shows up, add an `ArrayQueue<Vec<NodeTuple>>` object pool
-shared between workers and consumer.
+### Prerequisites
 
-### Blob filter
+Need a BlobReader method that returns blob data offset + datasize
+without reading the blob body. Current `next_header_skip_blob` returns
+the header but doesn't expose the data offset. Options:
+- Add `next_header_with_data_offset() -> (BlobHeader, u64, usize)`
+- Or compute from `offset + 4 + header_proto_size`
 
-The IO thread skips non-node blobs using indexdata (same as current):
-```rust
-if let Some(idx) = blob.index() {
-    if !matches!(idx.kind, ElemKind::Node) { continue; }
-}
-```
-This halves the blobs sent through the raw channel (~50% of Europe's PBF
-is way/relation blobs).
+### Validation plan
 
-### Reorder buffer
+1. Denmark correctness (diff against current output)
+2. Denmark sidecar: anon stays < 100 MB throughout stage 2
+3. Europe sidecar: anon stays < 1 GB in stage 2
+4. Europe timing: stage 2 < 200s (same or better than current 215s)
+5. Planet sidecar: anon stays bounded on 32 GB host
 
-Same `ReorderBuffer` from `pipeline.rs`. Workers may complete out of order
-(rayon scheduling). The reorder buffer delivers tuple Vecs in file order.
-Capacity matches the decoded channel (32).
+### Planet-scale concerns (from planet reviewers)
 
-Since the PBF is sorted and dense nodes are delta-encoded in ascending
-order within each block, the tuples within each Vec are already sorted
-by node ID. File-order delivery guarantees global ascending order for
-the merge-join.
+- Concurrent pread on shared fd is safe (pread is atomic, no seek)
+- NVMe handles 4-6 concurrent 32 KB reads efficiently (deep hw queues)
+- Kernel readahead may weaken with multiple streams on same fd —
+  monitor majflt in sidecar, increase read_ahead_kb if needed
+- Do NOT use O_DIRECT for this pattern (small reads, CPU-bound)
+- NUMA: only matters on multi-socket, use numactl --interleave if needed
 
-### Merge-join integration
+## History
 
-The consumer's merge-join loop is identical to the current code, except
-it iterates `&tuples` instead of inline-decoded nodes:
-
-```rust
-for result in reorder_rx {
-    let tuples = result?;
-    for &NodeTuple { id, lat, lon } in &tuples {
-        // ... exact same bucket advance + cursor + emit logic ...
-    }
-}
-```
-
-The +11s overhead from the tuple intermediary (measured on sequential path)
-is the cost of this extra iteration. In the parallel version, this cost
-is amortized against the ~120s saved from parallel decompression.
-
-## Rayon integration
-
-Use `rayon::spawn` with a dedicated thread pool (same pattern as pipeline.rs
-stage 2 dispatch):
-
-```rust
-let decode_pool = rayon::ThreadPoolBuilder::new()
-    .num_threads(decode_threads)
-    .build()?;
-
-for (seq, blob) in raw_rx {
-    let tx = decoded_tx.clone();
-    decode_pool.spawn(move || {
-        // Thread-local init via thread_local! or manual tracking
-        thread_local! {
-            static DBUF: RefCell<Vec<u8>> = RefCell::new(Vec::new());
-        }
-        DBUF.with_borrow_mut(|dbuf| {
-            dbuf.clear();
-            // decompress blob into dbuf
-            // extract_node_tuples(dbuf, &mut tuples)
-            // send (seq, tuples)
-        });
-    });
-}
-```
-
-Alternative: use `std::thread::scope` with explicit worker threads (per
-perf-Codex suggestion). Simpler lifetime management, no rayon dependency
-for the decode pool. But rayon is already used for stage 1's pipelined
-reader and stage 4's batch assembly — adding another pool is consistent.
-
-## Prerequisites
-
-### Blob::decompress_into
-
-New method needed on `Blob`:
-```rust
-pub(crate) fn decompress_into(&self, buf: &mut Vec<u8>) -> Result<()>
-```
-
-Decompresses the blob's data into a caller-owned Vec (clear + refill).
-Enables thread-local buffer reuse — without it, each decompress allocates
-a fresh ~2 MB Vec (500K × 2 MB = 1 TB allocator churn at Europe scale).
-
-Delegates to the existing `decompress_blob_data_into(&self.blob, buf)`
-internal function. ~3 lines of code.
-
-## What changes from current code
-
-### Stage 2 function signature — unchanged
-`stage2_node_join(input, direct_io, node_buckets, slot_buckets, total_slots)`
-
-### Inside stage2_node_join:
-
-**Remove:**
-- Sequential BlobReader loop
-- Inline wire parsing (granularity, lat_offset, lon_offset, group_starts)
-- `use crate::read::wire::...` imports
-
-**Add:**
-- IO thread (reads blobs, filters by indexdata)
-- Rayon decode pool (decompresses, calls `extract_node_tuples`)
-- Decoded channel with reorder buffer
-- Consumer loop iterating `Vec<NodeTuple>` instead of inline decode
-
-**Keep:**
-- `load_next_bucket` / `load_coo_bucket_into` (bucket loading, unchanged)
-- Merge-join logic (bucket advance, cursor, slot bucket writes)
-- All debug_log! and emit_marker calls
-
-### Shared code used:
-- `commands::node_scanner::extract_node_tuples` (already shared)
-- `commands::node_scanner::NodeTuple` (already shared)
-- `reorder_buffer::ReorderBuffer` (already shared)
-- `blob::BlobReader`, `blob::BlobType`, `blob_index::ElemKind`
-
-## Validation plan
-
-1. **Denmark correctness**: diff output against current sequential result (0 diffs expected)
-2. **Denmark sidecar**: `--bench --sidecar`, check anon RSS flat, no retention growth
-3. **Japan bench**: compare wall time to sequential baseline (42s for dense, ~6s for Denmark external)
-4. **Europe sidecar**: `--bench --sidecar` on stages 1-2 (early exit after stage 2), check:
-   - anon RSS stays bounded (~500 MB, not growing linearly)
-   - Wall time ~179s (down from 301s)
-   - Resolved count matches (4.69B)
-5. If anon RSS grows: add `ArrayQueue` object pool, re-validate
-
-## Future: fusing merge-join into workers
-
-The merge-join is 47% of stage 2. If P2b shows this is the new bottleneck,
-the next step is fusing merge-join into workers: each worker decompresses +
-parses + merge-joins against the relevant portion of sorted_pairs for its
-blob's node ID range. This requires:
-
-- Sharing `sorted_pairs` across workers (read-only after sort)
-- Knowing each blob's min/max node ID (from indexdata) to determine which
-  bucket range it falls into
-- Per-worker slot bucket writes (or a shared channel to the consumer)
-
-This is significantly more complex and should only be attempted after P2b
-proves the parallel decompress pattern works.
+- **901s** — sequential node-only scanner (commit `ee9b19f`)
+- **836s** — P2b-v1 with IO-thread Blob transfer + global pool
+  (commit `3051dd7`). Stage 2: 215s (-29%). But 20.4 GB anon from
+  cross-thread retention. Not planet-safe.
+- **866s** — P2b-v2 with worker-side pread (commit `80e227b`).
+  Stage 2: 216s (-28%), **1.4 GB anon** (was 20.4 GB). Planet-safe.

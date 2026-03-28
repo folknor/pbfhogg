@@ -138,21 +138,22 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides, index_type)`
 
-Two-pass algorithm that embeds node coordinates directly into way elements. `NodeIndex` enum dispatches between two index strategies:
+Three index strategies that embeds node coordinates directly into way elements:
 
 - **`Dense`** (`DenseMmapIndex`): file-backed anonymous mmap, 8 bytes/slot, direct addressing by node ID. 128 GB virtual address space, ~16 GB touched at planet (after pass 0 filtering). Fastest when working set fits in RAM.
 - **`Sparse`** (`SparseArrayIndex`): Planetiler-inspired chunk-indexed sparse array (chunk size 256). RAM: `offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk: compact packed (lat, lon) values file via read-only mmap (~16 GB for planet). Way lookups use batched sorted access — collect all node refs from a batch, sort by file offset, sequential scan into `FxHashMap`, then process blocks with pre-resolved coordinates. Memory-bounded for planet on low-RAM hosts.
+- **`External`** (`external_join`): double radix permutation via temp disk. Bounded memory (~1.4 GB stages 1-3, ~2.1 GB stage 4 at Europe). See Pipeline 4b below.
+
+### Dense/Sparse path (2-pass + pass 0)
 
 **Pass 0 — Way-referenced node IDs (both index types):**
 - Scans way blobs to build `IdSetDense` bitset (~1.6 GB for planet's ~2B unique way-node refs)
 - Dense: filters which mmap slots to populate. Sparse: determines which nodes to store.
 
-**Pass 1 — Parallel node index building:**
-- Pipelined read with `BlobFilter::only_nodes()` — skips way/relation blobs entirely
-- Batch-and-dispatch: collects `INDEX_BATCH_SIZE=64` blocks, then `par_iter` on rayon global pool
-- Uses `elements_skip_metadata()` — skips metadata parsing (only needs id/lat/lon)
-- **Dense path**: `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free.
-- **Sparse path**: `build_node_index_sparse` writes chunk-indexed entries sequentially to a temp file via `BufWriter`. Each chunk stores only present nodes (dense within the chunk). Trailing sentinel padding per chunk. File mmapped read-only after build.
+**Pass 1 — Node index building:**
+- Node-only wire scanner (`extract_node_tuples`) — bypasses PrimitiveBlock, zero per-block heap alloc
+- **Dense path**: `par_iter` over `NodeTuple` batches. `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free.
+- **Sparse path**: sequential insertion via node-only scanner into chunk-indexed temp file.
 
 **Pass 2 — Output with locations on ways:**
 - **Indexed PBF (fast path)**: reads raw blob frames, classifies by `BlobIndex.kind` from BlobHeader indexdata
@@ -168,6 +169,61 @@ Two-pass algorithm that embeds node coordinates directly into way elements. `Nod
 **Passthrough ratios** (Denmark, indexed PBF):
 - Default (drop untagged): 6 passthrough / 7390 decoded (only relation blobs passthrough)
 - `--keep-untagged-nodes`: 6568 passthrough / 828 decoded (~89% passthrough)
+
+## Pipeline 4b: External Join (add-locations-to-ways --index-type external)
+
+**Entry**: `src/commands/external_join.rs`
+
+4-stage sequential I/O pipeline with bounded memory. No mmap, no random access.
+Requires sorted PBF with indexdata. Uses temp disk (~4 GB Denmark, ~112 GB Europe).
+
+**Stage 1 — Way pass** (sequential BlobReader + DecompressPool):
+- Reads way blobs via indexdata filter, iterates way refs
+- Emits `(node_id, slot_pos)` COO pairs into 256 node buckets (radix by high byte of node_id)
+- Anon: 70 MB at Europe scale
+
+**Stage 2 — Node join** (P2b-v2, pread-from-workers):
+- IO thread reads only blob headers (~50 bytes), filters to node blobs via indexdata
+- Sends lightweight descriptors `(seq, data_offset, data_size)` to worker threads
+- Workers `pread` blob data from shared `Arc<File>`, decompress via `decompress_blob_raw()`,
+  extract `NodeTuple`s — all alloc/free thread-local, zero cross-thread ownership
+- Workers call `fadvise(DONTNEED)` after each pread (worker-side eviction)
+- Consumer reorders via `ReorderBuffer`, merge-joins against one sorted COO bucket at a time
+- Emits `(slot_pos, lat, lon)` resolved entries into 256 slot buckets
+- Anon: 1.4 GB at Europe scale (bucket sort data, irreducible)
+- Europe: 216s (was 301s sequential, -28%)
+
+**Stage 3 — Slot reorder** (scatter buffer):
+- Per slot bucket: load resolved entries, scatter by slot_pos into zeroed buffer, write_all
+- Eliminates sort + reduces syscalls (15x speedup over sorted pwrite)
+
+**Stage 4 — Assembly** (sequential BlobReader + DecompressPool):
+- Reads original PBF, enriches ways with coordinates from coord_slots file
+- P1b: skips node blobs without tagged/member nodes via indexdata + tagdata
+- Anon: 2.1 GB at Europe scale
+
+**Measured results:**
+- Denmark (465 MB): 13.8s, ~4 GB temp disk
+- Europe (32.4 GB, commit `80e227b`): 866s (14.4 min), ~112 GB temp disk. Dense ALTW: 2,565s. **3.0x faster.**
+
+**Planet-scale resource estimates (87 GB, ~13B node refs, not yet validated):**
+
+| Resource | Europe (measured) | Planet (extrapolated) |
+|----------|------------------|----------------------|
+| Peak anon RSS | 1.4 GB (stage 2) | ~4 GB |
+| Temp disk | ~112 GB | **~300 GB** |
+| Wall time | 866s (14 min) | ~2400s (40 min) |
+
+Memory is bounded by design: sequential readers (stages 1/3/4), pread-from-workers
+with all-thread-local buffers (stage 2), one bucket loaded at a time. Peak anon
+is the largest COO bucket sort — scales linearly with way-node refs per bucket.
+Safe on a 32 GB host.
+
+Temp disk is the main constraint at planet scale. The 256 node buckets hold all
+`(node_id, slot_pos)` COO pairs (16 bytes each, ~13B pairs = ~208 GB), plus 256
+slot buckets with resolved `(slot_pos, lat, lon)` entries (16 bytes each), plus
+the final coord_slots file (8 bytes per ref). Total ~300 GB scratch. Cleaned up
+on completion (or crash — `ScratchDir` has `Drop` impl).
 
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 

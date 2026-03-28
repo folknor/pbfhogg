@@ -248,15 +248,15 @@ Pre-compute the way-node join using sequential I/O and bounded memory.
 Emit COO pairs `(node_id, slot_pos)` from ways, radix-bucket by node_id,
 merge-join with nodes, re-bucket by slot_pos, assemble sequentially.
 
-- Memory: <1 GB (one bucket in RAM at a time, ~500 MB max)
-- Temp disk: ~224 GB peak (bucket files + coord slots), all sequential I/O
+- Memory: ~1.4 GB peak (one bucket sort at a time in stage 2)
+- Temp disk: ~112 GB Europe, ~300 GB planet (bucket files + coord slots)
 - No mmap, no random access, no page fault thrashing
 - Both permutations use integer-keyed radix bucketing (no comparison sort)
-- Implementation: `src/commands/external_join.rs` (~580 lines)
+- Implementation: `src/commands/external_join.rs`
 
 **Correctness**: verified identical to dense output on Denmark — 10,175,884
-elements, 0 differences (commit `034422c`, plantasjen). Cross-validated
-against osmium via `brokkr verify add-locations-to-ways`.
+elements, 0 differences. Cross-validated against osmium via
+`brokkr verify add-locations-to-ways`.
 
 **Results** (plantasjen):
 
@@ -265,22 +265,40 @@ against osmium via `brokkr verify add-locations-to-ways`.
 | dense | 8,168 ms | 72s | 2,565s (43m) | `034422c` |
 | external (old, 256× re-read) | 302s (5m) | — | — | `034422c` |
 | external (single-pass merge) | 25s | 143s | 2,060s (34m) | `a334c72` |
-| **external (node-only scanner + scatter)** | **14s** | — | **901s (15m, end-to-end)** | `ee9b19f` |
+| external (node-only scanner + scatter) | 14s | — | 901s (15m) | `ee9b19f` |
+| **external (P2b-v2 pread-from-workers)** | **13.8s** | — | **866s (14.4m)** | `80e227b` |
 
-**Optimization arc (commit `cf350a9`):**
-- Stage 2: replaced pipelined PrimitiveBlock iteration with node-only
-  sequential wire-format scanner. Eliminates 25+ GB heap retention from
-  PrimitiveBlock cross-thread allocation churn. RSS: 1.4 GB stable.
-- Stage 3: replaced 4.69B individual pwrite calls with scatter buffer
-  (one write_all per bucket, no sort). 1079s → 72s (15x speedup).
-- Stage 4: temporarily disabled (PrimitiveBlock churn OOM — same root
-  cause as stage 2 but in assembly path). Fix in progress.
+**Optimization history:**
+- Stage 2 node-only scanner: replaced pipelined PrimitiveBlock with
+  wire-format scanner. Eliminated 25+ GB heap retention. (`cf350a9`)
+- Stage 3 scatter buffer: replaced 4.69B pwrite calls with single
+  write_all per bucket. 15x speedup. (`cf350a9`)
+- Stage 4 sequential reader: avoided PrimitiveBlock cross-thread
+  retention. 2.1 GB anon, bounded. (`2873919`)
+- Stage 1 sequential reader: eliminated 11 GB PrimitiveBlock retention
+  from pipelined reader. 70 MB anon. (`4daf995`)
+- P2b-v2 pread-from-workers: parallel decompression with all alloc/free
+  thread-local. Stage 2: 301s→216s (-28%), anon 20.4 GB→1.4 GB (-93%).
+  Workers pread blob data from shared `Arc<File>`, no cross-thread
+  ownership of any buffer. (`80e227b`)
 
-**Europe stages 1-3: 480s (8 min).** Previous full run: 2,060s (34 min).
-When stage 4 is fixed, full pipeline estimated ~730-830s (~12-14 min).
+**Memory profile (sidecar `070086bb`, commit `80e227b`):**
 
-See [altw-partitioned.md](altw-partitioned.md) for full design and
-[external-join-oom-investigation.md](external-join-oom-investigation.md)
+| Stage | Duration | Anon peak | Notes |
+|-------|----------|----------|-------|
+| Stage 1 (way pass) | 126s | 70 MB | Sequential reader |
+| Stage 2 (node join) | 216s | 1.4 GB | Pread-from-workers, bucket sort |
+| Stage 3 (slot reorder) | 91s | — | Scatter buffer |
+| Stage 4 (assembly) | 432s | 2.1 GB | Sequential reader |
+
+**Planet-scale safety:** all stages use sequential readers or
+pread-from-workers with thread-local buffers. Peak anon ~4 GB
+(extrapolated). Safe on 32 GB host. Main constraint is temp disk
+(~300 GB at planet). Not yet validated at planet scale.
+
+See [altw-partitioned.md](altw-partitioned.md) for full design,
+[p2b-parallel-tuples-spec.md](p2b-parallel-tuples-spec.md) for P2b
+architecture, and [external-join-oom-investigation.md](external-join-oom-investigation.md)
 for the complete OOM investigation.
 
 ### 4. Larger swap / 64 GB host (infrastructure)
@@ -300,9 +318,9 @@ for the complete OOM investigation.
 - [x] Verify external join correctness on Denmark — identical to dense
 - [x] **Optimize stage 2**: single-pass node merge (commit `a334c72`, 12x speedup)
 - [x] Benchmark external join on Japan — 143s (2.0x dense)
-- [x] Benchmark external join on Europe — 2,060s (34m) → **901s (15m, end-to-end)** commit `ee9b19f`
+- [x] Benchmark external join on Europe — 2,060s (34m) → 901s → **866s (14.4m)** commit `80e227b`
 - [x] Fix stage 4 assembly OOM — sequential reader (commit `2873919`)
-- [x] Full end-to-end Europe measurement — **901s, 2.8x faster than dense**
-- [ ] Benchmark external join on planet (87.7 GB)
-- [ ] Add O_DIRECT support to bucket file I/O
+- [x] Full end-to-end Europe measurement — **866s, 3.0x faster than dense**
+- [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB, planet-safe
+- [ ] Benchmark external join on planet (87.7 GB) — ~300 GB temp disk needed
 - [ ] Test dense on 64 GB host — may solve the problem without code changes

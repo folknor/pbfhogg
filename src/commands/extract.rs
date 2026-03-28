@@ -926,10 +926,18 @@ fn extract_simple_single_pass(
     let mut matched_relation_ids = IdSetDense::new();
     let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
 
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(spatial_blob_filter(&bbox_int));
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention.
+    // The pipelined reader OOM'd at Europe scale (25.7 GB anon, 520K blobs)
+    // when most blobs match the extract region. The batch pattern does not
+    // bound retention when every blob is decoded through the pipeline.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -938,9 +946,25 @@ fn extract_simple_single_pass(
         hb.sorted()
     }, direct_io, false)?;
 
+    let spatial_filter = spatial_blob_filter(&bbox_int);
+    let decompress_pool = crate::blob::DecompressPool::new();
+
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        // Spatial blob filter: skip node blobs outside extract region.
+        if let Some(idx) = blob.index() {
+            if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                if let Some(ref filter_bbox) = spatial_filter.node_bbox {
+                    if let Some(ref blob_bbox) = idx.bbox {
+                        if !filter_bbox.intersects(blob_bbox) { continue; }
+                    }
+                }
+            }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
         let has_matches = classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,

@@ -12,6 +12,7 @@ pub mod getparents;
 pub mod inspect;
 pub(crate) mod id_set_dense;
 pub(crate) mod node_scanner;
+pub(crate) mod way_scanner;
 pub mod merge;
 pub mod merge_changes;
 pub mod merge_pbf;

@@ -921,31 +921,53 @@ fn build_node_index_dense(
 /// ID that appears in any way's refs list. At planet scale (~2B unique node
 /// refs), this costs ~1.6 GB — far less than indexing all 10.4B nodes.
 fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_ways());
+    // Way-ref scanner: bypasses PrimitiveBlock construction (no string table,
+    // no group_ranges). Only extracts way refs for IdSetDense population.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
     let mut referenced = IdSetDense::new();
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        for element in block.elements_skip_metadata() {
-            if let Element::Way(w) = element {
-                for node_id in w.refs() {
-                    if node_id >= 0 {
-                        referenced.set(node_id);
-                    }
+    let mut refs_buf: Vec<i64> = Vec::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, |_way_id, refs| {
+            for &node_id in refs {
+                if node_id >= 0 {
+                    referenced.set(node_id);
                 }
             }
-        }
+        })?;
     }
     Ok(referenced)
 }
 
 /// Collect all node IDs referenced by relation members.
 pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::only_relations());
+    // Sequential reader — only ~2K relation blobs at Europe scale, so retention
+    // is negligible, but sequential is consistent with the other collection passes.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
     let mut member_node_ids = IdSetDense::new();
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new(decompressed)?;
         for element in block.elements_skip_metadata() {
             if let Element::Relation(r) = element {
                 for member in r.members() {

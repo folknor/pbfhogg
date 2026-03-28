@@ -559,20 +559,42 @@ fn tags_filter_two_pass(
     let mut has_included_way = false;
     let mut has_included_relation = false;
 
-    // Pass 1: skip blob types that no expression targets.
-    // In invert mode, we need all blob types since non-matching elements are kept.
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
-    let reader = if invert {
-        reader
-    } else {
-        match blob_filter_from_expressions(expressions) {
-            Some(filter) => reader.with_blob_filter(filter),
-            None => reader,
+    // Pass 1: sequential reader to avoid PrimitiveBlock cross-thread retention.
+    // The unbatched per-block iteration would accumulate 24+ GB anon at Europe
+    // scale with the pipelined reader. Sequential keeps all alloc/free on one thread.
+    {
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    // Read header for locations-on-ways warning.
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?);
+    let decompress_pool = crate::blob::DecompressPool::new();
+    let expr_filter = if invert { None } else { blob_filter_from_expressions(expressions) };
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
         }
-    };
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+        // Skip blob types that no expression targets (unless invert mode).
+        if let Some(ref filter) = expr_filter {
+            if let Some(idx) = blob.index() {
+                let dominated = matches!(
+                    idx.kind,
+                    crate::blob_index::ElemKind::Node if !filter.want_nodes
+                ) || matches!(
+                    idx.kind,
+                    crate::blob_index::ElemKind::Way if !filter.want_ways
+                ) || matches!(
+                    idx.kind,
+                    crate::blob_index::ElemKind::Relation if !filter.want_relations
+                );
+                if dominated { continue; }
+            }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new(decompressed)?;
         let mut tags_buf: Vec<(&str, &str)> = Vec::new();
         for element in block.elements_skip_metadata() {
             match &element {
@@ -616,6 +638,7 @@ fn tags_filter_two_pass(
             }
         }
     }
+    } // sequential reader scope
 
     crate::debug::emit_marker("TAGSFILTER_PASS1_END");
 
@@ -711,11 +734,20 @@ fn collect_relation_member_closure(
 
     loop {
         let mut added_relations = 0_u64;
-        let reader = ElementReader::open(input, direct_io)?
-            .with_blob_filter(BlobFilter::only_relations());
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
 
-        for block in reader.into_blocks_pipelined() {
-            let block = block?;
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = crate::block::PrimitiveBlock::new(decompressed)?;
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     if !included_relation_ids.get(r.id()) {
@@ -760,10 +792,20 @@ fn collect_way_node_dependencies(
     skip_way_ids: Option<&IdSetDense>,
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<()> {
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(BlobFilter::new(false, true, false));
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new(decompressed)?;
         for element in block.elements_skip_metadata() {
             if let Element::Way(w) = &element
                 && included_way_ids.get(w.id())

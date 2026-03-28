@@ -897,7 +897,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
 /// dispatched for parallel writing via `process_extract_pass2_batch`. The
 /// pipeline (dedicated rayon pool) runs concurrently with the parallel write
 /// (global rayon pool) without contention.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments)]
 fn extract_simple_single_pass(
     input: &Path,
     output: &Path,
@@ -923,25 +923,12 @@ fn extract_simple_single_pass(
     let mut bbox_node_ids = IdSetDense::new();
     let mut matched_way_ids = IdSetDense::new();
     let mut matched_relation_ids = IdSetDense::new();
-    let all_way_node_ids = IdSetDense::new();
+    let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
 
-    // Raw-frame reader for blob-level passthrough of fully-contained node blobs.
-    // Tier 2 passthrough: bbox regions only, clean is no-op, v2 bbox indexdata.
-    let extract_blob_bbox = crate::BlobBbox::new(
-        bbox_int.min_lat, bbox_int.max_lat, bbox_int.min_lon, bbox_int.max_lon,
-    );
-    let can_passthrough = matches!(region, Region::Bbox(_)) && !clean.any();
-
-    let mut reader = crate::file_reader::FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
-
-    // Read header.
-    let header_frame = super::read_raw_frame(&mut reader, &mut file_offset)?
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))?;
-    let header = crate::blob::decode_blob_to_headerblock(header_frame.blob_bytes())?;
-    super::warn_locations_on_ways_loss(&header);
+    let reader = ElementReader::open(input, direct_io)?
+        .with_blob_filter(spatial_blob_filter(&bbox_int));
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -950,74 +937,9 @@ fn extract_simple_single_pass(
         hb.sorted()
     })?;
 
-    let decompress_pool = crate::blob::DecompressPool::new();
-    let mut node_tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-
-    while let Some(frame) = super::read_raw_frame(&mut reader, &mut file_offset)? {
-        if !matches!(frame.blob_type, crate::blob::BlobKind::OsmData) {
-            continue;
-        }
-
-        // Tier 1: skip node blobs outside extract region.
-        if let Some(ref idx) = frame.index {
-            if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                if let Some(ref blob_bbox) = idx.bbox {
-                    if !extract_blob_bbox.intersects(blob_bbox) { continue; }
-                }
-            }
-        }
-
-        // Tier 2: fully-contained node blob → scan IDs + raw passthrough.
-        // Skip PrimitiveBlock, BlockBuilder, and output recompression.
-        let is_contained_node = can_passthrough
-            && frame.index.as_ref().is_some_and(|idx|
-                matches!(idx.kind, crate::blob_index::ElemKind::Node)
-                && idx.bbox.as_ref().is_some_and(|bb| extract_blob_bbox.contains(bb))
-            );
-
-        if is_contained_node {
-            // Flush pending decoded batch to preserve file order.
-            if !batch.is_empty() {
-                let ids = ExtractPass2IdSets {
-                    bbox_node_ids: &bbox_node_ids,
-                    all_way_node_ids: &all_way_node_ids,
-                    matched_way_ids: &matched_way_ids,
-                    matched_relation_ids: &matched_relation_ids,
-                };
-                process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
-                batch.clear();
-            }
-
-            // Decompress for ID scan (no PrimitiveBlock, no string table).
-            let decompressed = crate::blob::decompress_blob(
-                &crate::blob::WireBlob::parse_slice(frame.blob_bytes())?,
-                Some(&decompress_pool),
-            )?;
-            node_tuples.clear();
-            super::node_scanner::extract_node_tuples(&decompressed, &mut node_tuples)
-                .map_err(|e| crate::error::new_error(
-                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                ))?;
-
-            // All nodes in this blob are in the bbox.
-            for t in &node_tuples {
-                bbox_node_ids.set(t.id);
-            }
-            #[allow(clippy::cast_possible_wrap)]
-            { stats.nodes_in_bbox += node_tuples.len() as u64; }
-
-            // Write raw frame — no re-encode, no recompress.
-            writer.write_raw_owned(frame.frame_bytes)?;
-            continue;
-        }
-
-        // Tier 3: partial overlap or way/relation — full decode path.
-        let decompressed = crate::blob::decompress_blob(
-            &crate::blob::WireBlob::parse_slice(frame.blob_bytes())?,
-            Some(&decompress_pool),
-        )?;
-        let block = PrimitiveBlock::new(decompressed)?;
+    for block in reader.into_blocks_pipelined() {
+        let block = block?;
         let has_matches = classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,

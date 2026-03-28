@@ -43,14 +43,6 @@ impl BlobBbox {
             && self.min_lon <= other.max_lon
             && self.max_lon >= other.min_lon
     }
-
-    /// Returns `true` if `inner` is fully contained within this bbox.
-    pub fn contains(&self, inner: &BlobBbox) -> bool {
-        self.min_lat <= inner.min_lat
-            && self.max_lat >= inner.max_lat
-            && self.min_lon <= inner.min_lon
-            && self.max_lon >= inner.max_lon
-    }
 }
 
 /// Blob-level index: element type, ID range, element count, and optional spatial bbox.

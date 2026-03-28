@@ -83,39 +83,17 @@ See [notes/cross-pipeline-optimization-plan.md](notes/cross-pipeline-optimizatio
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 
-## ALTW external join: next cycle
+## ALTW external join — COMPLETE
 
-External join at Europe: 866s (14.4 min), 1.4 GB peak anon, 3.0x faster than
-dense. P2b-v2 (pread-from-workers) eliminated cross-thread retention — planet-safe.
-
-See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md) and
+Planet validated: **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense.**
+See [notes/p2b-parallel-tuples-spec.md](notes/p2b-parallel-tuples-spec.md),
+[notes/p2c-parallel-assembly-spec.md](notes/p2c-parallel-assembly-spec.md), and
 [notes/external-join-oom-investigation.md](notes/external-join-oom-investigation.md).
 
-**Done:**
-- [x] P2b-v2: parallel tuples with pread-from-workers (commit `80e227b`).
-  Stage 2: 301s→216s (-28%), anon 20.4 GB→1.4 GB (-93%).
-- [x] Sequential readers for stages 1/4 (commits `4daf995`, `2873919`).
-- [x] P2c: parallel assembly for stage 4 (commit `6b09796`).
-  Stage 4: 432s→**136s** (-68%). Total: 866s→**577s** (-33%). 4.5x faster than dense.
+## ALTW memory optimization — COMPLETE
 
-**Remaining:**
-- [x] Planet benchmark — **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense.** Validated on 30 GB host.
-
-## ALTW memory optimization
-
-See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
-
-**Status**: External join (`--index-type external`) at Europe: **577s (9.6 min),
-7.3 GB peak anon, 4.5x faster than dense** (2,565s). Planet-safe architecture.
-
-**Done**:
-- [x] ~~Test pread + fadvise~~ — won't help
-- [x] Fix stage 4 assembly OOM — sequential reader
-- [x] Full end-to-end Europe — **577s** (commit `6b09796`), 4.5x faster than dense
-- [x] P2b-v2 pread-from-workers — stage 2 anon 20.4 GB → 1.4 GB
-- [x] P2c parallel assembly — stage 4: 432s→136s (-68%), 7.3 GB anon
-- [x] Planet benchmark — **1,462s (24.4 min), 16.7 GB peak anon, 3.9x faster than dense**
-- [ ] Test dense on 64 GB host (may solve the problem without code changes)
+External join ships as `--index-type external` (or `auto`).
+Dense remains the "fast when RAM fits" path. See [notes/altw-memory.md](notes/altw-memory.md).
 
 ### Measured baselines (commit `69a127f`, plantasjen, 30 GB RAM + 8 GB swap)
 
@@ -125,6 +103,52 @@ See [notes/altw-memory.md](notes/altw-memory.md) for full research log.
 | Europe | 33.6 GB | 4.2B | 2611s (43m) | `--direct-io` (+2%, no benefit), commit `69a127f` |
 | Europe | 33.6 GB | 4.2B | 2631s (44m) | buffered, post `3677069` (with pass 0), +2.6% noise |
 | Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound, commit `69a127f` |
+
+## Next (from 10-reviewer sweep)
+
+### Planet validation runs (run when AFK — takes 25-60 min each)
+
+- [ ] **Planet geocode build** — estimated 25 min, ~20 GB RSS. Validates compact
+  rank-indexed array at planet scale. `brokkr build-geocode-index --dataset planet --bench 1`
+- [ ] **Planet merge/apply-changes** — production daily path. Batched pattern
+  should bound retention. `brokkr merge --dataset planet --bench 1`
+- [ ] **Planet cat --type** — fixes landed (batch byte budget + bounded writer).
+  `brokkr cat-way --dataset planet --bench 1`
+
+### merge --locations-on-ways node scanner (6/10 reviewers)
+
+Still builds full PrimitiveBlock to mine node coordinates from passthrough
+node blobs (merge.rs ~line 1437). Node-coordinate scanner (`extract_node_tuples`)
+already exists and fits directly. Localized, low-risk, production-relevant
+(nidhogg steady state once locations_on_ways is enabled).
+
+### Hybrid pipeline for extract (7/10 reviewers, separate project)
+
+Only credible path to closing the 1.65x osmium gap on simple extract.
+New `PipelineOutput` enum in pipeline.rs: `Decoded(PrimitiveBlock)` or
+`Passthrough(RawBlobFrame)`. Pipeline's blob filter checks `BlobBbox::contains`
+and skips decompression for fully-contained node blobs. Consumer writes
+passthrough blobs via `write_raw_owned`, decoded blobs via existing batch path.
+
+Benefits extract, cat --type, tags-filter — any command with spatial selectivity.
+~200 lines in pipeline.rs + blob.rs. Two attempts without this regressed (lost
+pipelined decode parallelism). See [notes/extract-passthrough-findings.md](notes/extract-passthrough-findings.md).
+
+### Smaller items (from reviewer sweep)
+
+- [ ] `node_stats.rs` — still on `for_each_pipelined`, pure node-coordinate
+  analytics. Natural node-only scanner candidate. Low user impact.
+- [ ] `getid::parse_ids_from_pbf` — full-block decode for ID-only scan.
+  Could use a simpler scanner. Low priority.
+- [ ] `tags_count.rs` — still pipelined. Analytics-only, low priority.
+- [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all`) — last
+  pipelined path processing all ~1.4M blocks. Only triggers with `--force` on
+  non-indexed PBFs. Niche but the last 25+ GB retention path.
+- [ ] Write-path throughput (arch-Codex) — BlockBuilder/PbfWriter is the next
+  bottleneck after read-path optimizations. SIMD varint, compression tuning.
+  See [notes/SIMD.md](notes/SIMD.md).
+- [ ] Dead code cleanup: `Blob::decompress_raw`, `decompress_into`,
+  `DecompressPool::full_drops`, `DenseMmapIndex::set`, `StreamingBlocks::new`.
 
 ## Release prep
 
@@ -214,17 +238,10 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
 **sort, cat** (no action):
 - Already optimal — blob-level passthrough, single-pass, or need full metadata for output.
 
-### Geocode index builder: planet-scale architecture
+### Geocode index builder — DONE (planet validation pending)
 
-Streaming data files + bucketed cell assignment + pass 1.5 referenced node
-collection + compact rank-indexed coord array. Europe: 568s (9.5 min),
-7.5 GB RSS. Planet extrapolation: ~20 GB RSS, fits on 30 GB host.
-
-- [x] Stream data files during pass 2 (street_ways, addr_points, etc.)
-- [x] Bucketed cell assignment (256 temp files per level)
-- [x] Referenced-node-only index via pass 1.5 IdSetDense (commit `c5c44b1`)
-- [x] Compact rank-indexed coord array replacing DenseMmapIndex (commit `7cf2239`)
-- [ ] Planet validation run
+Europe: 568s (9.5 min), 7.5 GB RSS. Planet estimated ~20 GB RSS.
+Planet validation listed above under "Planet validation runs".
 
 ### README badges (after publishing)
 

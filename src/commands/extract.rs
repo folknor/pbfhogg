@@ -670,11 +670,21 @@ pub fn extract(
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
              filter is a no-op — all blobs are decompressed (significantly slower).")?;
     }
-    match strategy {
+    let result = match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io, overrides),
         ExtractStrategy::CompleteWays => extract_complete_ways(input, output, region, set_bounds, clean, compression, direct_io, overrides),
         ExtractStrategy::Smart => extract_smart(input, output, region, set_bounds, clean, compression, direct_io, overrides),
+    }?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extract_nodes_in_bbox", result.nodes_in_bbox as i64);
+        crate::debug::emit_counter("extract_nodes_from_ways", result.nodes_from_ways as i64);
+        crate::debug::emit_counter("extract_nodes_from_relations", result.nodes_from_relations as i64);
+        crate::debug::emit_counter("extract_ways_written", result.ways_written as i64);
+        crate::debug::emit_counter("extract_ways_from_relations", result.ways_from_relations as i64);
+        crate::debug::emit_counter("extract_relations_written", result.relations_written as i64);
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -820,6 +830,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     }
 
     // --- Unsorted fallback: two passes (collect IDs, then write) ---
+    crate::debug::emit_marker("EXTRACT_PASS1_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -844,7 +855,9 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
         );
     }
+    crate::debug::emit_marker("EXTRACT_PASS1_END");
 
+    crate::debug::emit_marker("EXTRACT_PASS2_START");
     let all_way_node_ids = IdSetDense::new();
     let reader = ElementReader::open(input, direct_io)?;
     let bbox = region.bbox();
@@ -869,6 +882,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("EXTRACT_PASS2_END");
     Ok(stats)
 }
 
@@ -894,6 +908,7 @@ fn extract_simple_single_pass(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<ExtractStats> {
+    crate::debug::emit_marker("EXTRACT_SCAN_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -956,6 +971,7 @@ fn extract_simple_single_pass(
     }
 
     writer.flush()?;
+    crate::debug::emit_marker("EXTRACT_SCAN_END");
     Ok(stats)
 }
 
@@ -976,11 +992,14 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     };
 
     // --- Pass 1: Collect matches ---
+    crate::debug::emit_marker("EXTRACT_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    crate::debug::emit_marker("EXTRACT_PASS1_END");
 
     // --- Pass 2: Write matching elements in file order ---
+    crate::debug::emit_marker("EXTRACT_PASS2_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     let bbox = region.bbox();
@@ -1005,6 +1024,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("EXTRACT_PASS2_END");
     Ok(stats)
 }
 
@@ -1605,12 +1625,15 @@ fn extract_smart(
     };
 
     // --- Pass 1: Collect matches + smart relation deps ---
+    crate::debug::emit_marker("EXTRACT_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     let mut extra_node_ids = handler.extra_node_ids;
+    crate::debug::emit_marker("EXTRACT_PASS1_END");
 
     // --- Pass 2: Resolve extra way node deps ---
+    crate::debug::emit_marker("EXTRACT_PASS2_START");
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
     // BlobFilter skips node and relation blobs (only ways are needed here).
@@ -1629,7 +1652,10 @@ fn extract_smart(
         }
     }
 
+    crate::debug::emit_marker("EXTRACT_PASS2_END");
+
     // --- Pass 3: Write matching elements in file order ---
+    crate::debug::emit_marker("EXTRACT_PASS3_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     let bbox = region.bbox();
@@ -1656,6 +1682,7 @@ fn extract_smart(
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("EXTRACT_PASS3_END");
     Ok(stats)
 }
 

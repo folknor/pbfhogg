@@ -82,11 +82,20 @@ pub fn cat(
         }
     }
 
-    match (type_filter, clean.any()) {
+    crate::debug::emit_marker("CAT_SCAN_START");
+    let result = match (type_filter, clean.any()) {
         (None, false) => cat_passthrough(files, output, compression, direct_io, overrides),
         (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io, overrides),
         (Some(filter), _) => cat_filtered(files, output, filter, clean, compression, direct_io, overrides),
+    }?;
+    crate::debug::emit_marker("CAT_SCAN_END");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("cat_blobs_passthrough", result.blobs_passthrough as i64);
+        crate::debug::emit_counter("cat_blobs_decoded", result.blobs_decoded as i64);
+        crate::debug::emit_counter("cat_elements_written", result.elements_written as i64);
     }
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------

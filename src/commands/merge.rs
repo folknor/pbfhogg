@@ -1270,6 +1270,7 @@ pub fn merge(
          decompressed to classify elements (significantly slower).")?;
 
     // Step 1: Parse the diff
+    crate::debug::emit_marker("MERGE_DIFFPARSE_START");
     #[cfg(feature = "hotpath")]
     let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());
@@ -1296,6 +1297,8 @@ pub fn merge(
     {
         phase_rss.after_osc_parse = read_rss_kb();
     }
+
+    crate::debug::emit_marker("MERGE_DIFFPARSE_END");
 
     // Step 2: Pre-compute sorted ID ranges for fast overlap checking
     let ranges = Arc::new(DiffRanges::from_diff(&diff));
@@ -1325,6 +1328,7 @@ pub fn merge(
     )?;
 
     // Step 5: Spawn reader thread with read-ahead
+    crate::debug::emit_marker("MERGE_LOOP_START");
     let (reader_thread, frame_rx) = spawn_reader_thread(base_pbf, direct_io);
 
     // Open second handle for copy_file_range.
@@ -1729,6 +1733,7 @@ pub fn merge(
     }
 
     writer.flush()?;
+    crate::debug::emit_marker("MERGE_LOOP_END");
     #[cfg(feature = "hotpath")]
     {
         phase_rss.after_flush = read_rss_kb();
@@ -1741,6 +1746,17 @@ pub fn merge(
     }
 
     stats.print_summary();
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("merge_blobs_passthrough", stats.blobs_passthrough as i64);
+        crate::debug::emit_counter("merge_blobs_rewritten", stats.blobs_rewritten as i64);
+        crate::debug::emit_counter("merge_total_elements", stats.total_elements() as i64);
+        crate::debug::emit_counter("merge_deleted", stats.deleted as i64);
+        crate::debug::emit_counter("merge_diff_nodes", stats.diff_nodes as i64);
+        crate::debug::emit_counter("merge_diff_ways", stats.diff_ways as i64);
+        crate::debug::emit_counter("merge_diff_relations", stats.diff_relations as i64);
+    }
 
     #[cfg(feature = "hotpath")]
     {

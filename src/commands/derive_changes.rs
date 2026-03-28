@@ -71,6 +71,7 @@ pub fn derive_changes(
     }
 
     // Sequential readers to avoid 2× PrimitiveBlock cross-thread retention.
+    crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
@@ -106,13 +107,24 @@ pub fn derive_changes(
         )?;
     }
 
+    crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
+
     let stats = DeriveChangesStats {
         creates: (creates.nodes.len() + creates.ways.len() + creates.relations.len()) as u64,
         modifies: (modifies.nodes.len() + modifies.ways.len() + modifies.relations.len()) as u64,
         deletes: (deletes.nodes.len() + deletes.ways.len() + deletes.relations.len()) as u64,
     };
 
+    crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
     write_osc(output, &creates, &modifies, &deletes, increment_version, update_timestamp)?;
+    crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("derivechanges_creates", stats.creates as i64);
+        crate::debug::emit_counter("derivechanges_modifies", stats.modifies as i64);
+        crate::debug::emit_counter("derivechanges_deletes", stats.deletes as i64);
+    }
 
     Ok(stats)
 }

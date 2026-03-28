@@ -103,6 +103,7 @@ impl RefCheckResult {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
+    crate::debug::emit_marker("CHECKREFS_SCAN_START");
     // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
     // retention (25+ GB at Europe/planet scale). check-refs does lightweight
     // per-element work (RoaringTreemap inserts) — the pipelined reader's
@@ -268,6 +269,18 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     }
 
     result.missing_refs = missing_refs;
+
+    crate::debug::emit_marker("CHECKREFS_SCAN_END");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("checkrefs_node_count", result.node_count as i64);
+        crate::debug::emit_counter("checkrefs_way_count", result.way_count as i64);
+        crate::debug::emit_counter("checkrefs_relation_count", result.relation_count as i64);
+        crate::debug::emit_counter("checkrefs_missing_node_refs", result.missing_node_refs as i64);
+        crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs as i64);
+        crate::debug::emit_counter("checkrefs_missing_node_members", result.missing_node_members as i64);
+        crate::debug::emit_counter("checkrefs_missing_relation_members", result.missing_relation_members as i64);
+    }
 
     Ok(result)
 }

@@ -169,9 +169,27 @@ pub fn tags_filter(
 
     let expressions = parse_expressions(opts.expression_strs)?;
     if opts.omit_referenced {
-        tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io, overrides)
+        let result = tags_filter_single_pass(input, output, &expressions, opts.invert, opts.compression, opts.direct_io, overrides)?;
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched as i64);
+            crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched as i64);
+            crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched as i64);
+        }
+        Ok(result)
     } else {
-        tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io, overrides)
+        let result = tags_filter_two_pass(input, output, &expressions, opts.invert, opts.remove_tags, opts.compression, opts.direct_io, overrides)?;
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("tagsfilter_matched_nodes", result.nodes_matched as i64);
+            crate::debug::emit_counter("tagsfilter_matched_ways", result.ways_matched as i64);
+            crate::debug::emit_counter("tagsfilter_matched_relations", result.relations_matched as i64);
+            crate::debug::emit_counter("tagsfilter_nodes_from_ways", result.nodes_from_ways as i64);
+            crate::debug::emit_counter("tagsfilter_nodes_from_relations", result.nodes_from_relations as i64);
+            crate::debug::emit_counter("tagsfilter_ways_from_relations", result.ways_from_relations as i64);
+            crate::debug::emit_counter("tagsfilter_relations_from_relations", result.relations_from_relations as i64);
+        }
+        Ok(result)
     }
 }
 
@@ -278,6 +296,7 @@ fn tags_filter_single_pass(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TagsFilterStats> {
+    crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Blob-level filtering can't help in invert mode — we want non-matching blobs.
@@ -305,6 +324,7 @@ fn tags_filter_single_pass(
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("TAGSFILTER_SCAN_END");
     Ok(stats)
 }
 
@@ -525,6 +545,7 @@ fn tags_filter_two_pass(
     };
 
     // --- Pass 1: Collect match results and way dependencies ---
+    crate::debug::emit_marker("TAGSFILTER_PASS1_START");
     //
     // IdSetDense: O(1) set/get, 1 bit per ID, ~1.5 GB max for planet-scale node IDs.
     // No sort/dedup step needed between passes (bitset deduplicates inherently).
@@ -596,6 +617,8 @@ fn tags_filter_two_pass(
         }
     }
 
+    crate::debug::emit_marker("TAGSFILTER_PASS1_END");
+
     // Expand relation-member closure:
     // - matched relation -> include member nodes/ways/relations
     // - member relations recurse transitively (cycle-safe via set membership)
@@ -619,6 +642,7 @@ fn tags_filter_two_pass(
     )?;
 
     // --- Pass 2: Write matching elements in file order (parallel batches) ---
+    crate::debug::emit_marker("TAGSFILTER_PASS2_START");
     // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
     let reader = ElementReader::open(input, direct_io)?;
     let reader = if invert {
@@ -648,6 +672,7 @@ fn tags_filter_two_pass(
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("TAGSFILTER_PASS2_END");
     Ok(stats)
 }
 

@@ -146,6 +146,7 @@ pub fn diff(
     // retention. diff runs two concurrent pipelines — with pipelined readers
     // that's 2× the 25+ GB retention at Europe scale.
     // See notes/cross-pipeline-optimization-plan.md.
+    crate::debug::emit_marker("DIFF_SCAN_START");
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
@@ -193,6 +194,15 @@ pub fn diff(
         }
     } else {
         drain_phase::<OwnedRelation>(&mut old_src, &mut new_src)?;
+    }
+
+    crate::debug::emit_marker("DIFF_SCAN_END");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("diff_common", stats.common as i64);
+        crate::debug::emit_counter("diff_created", stats.created as i64);
+        crate::debug::emit_counter("diff_modified", stats.modified as i64);
+        crate::debug::emit_counter("diff_deleted", stats.deleted as i64);
     }
 
     Ok(stats)

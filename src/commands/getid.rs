@@ -212,11 +212,18 @@ pub fn getid(
          based on requested ID types is a no-op — all blobs are decompressed \
          (significantly slower).")?;
 
-    if opts.add_referenced {
+    let result = if opts.add_referenced {
         getid_with_refs(input, output, ids, opts, compression, direct_io, overrides)
     } else {
         filter_by_id(input, output, ids, true, compression, direct_io, overrides)
+    }?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("getid_nodes_written", result.nodes_written as i64);
+        crate::debug::emit_counter("getid_ways_written", result.ways_written as i64);
+        crate::debug::emit_counter("getid_relations_written", result.relations_written as i64);
     }
+    Ok(result)
 }
 
 /// Remove elements matching the given IDs (output everything else).
@@ -239,6 +246,7 @@ fn filter_by_id(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
+    crate::debug::emit_marker("GETID_SCAN_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Skip blob types with no matching IDs (getid only — removeid needs all types).
@@ -269,6 +277,7 @@ fn filter_by_id(
         })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("GETID_SCAN_END");
     Ok(stats)
 }
 
@@ -285,6 +294,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
 
     // Pass 1: Collect ref node IDs from matching ways. Uses IdSetDense for O(1)
     // lookups in pass 2 instead of BTreeSet's O(log n).
+    crate::debug::emit_marker("GETID_PASS1_START");
     let mut dep_node_ids = super::id_set_dense::IdSetDense::new();
     let mut has_dep_nodes = false;
 
@@ -308,8 +318,10 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.contains(&id).
     let strip_tags = opts.remove_tags && has_dep_nodes;
+    crate::debug::emit_marker("GETID_PASS1_END");
 
     // Pass 2: Write matching elements + dependent nodes (parallel batches).
+    crate::debug::emit_marker("GETID_PASS2_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
@@ -334,6 +346,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("GETID_PASS2_END");
     Ok(stats)
 }
 

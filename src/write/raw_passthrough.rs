@@ -43,25 +43,25 @@ pub(crate) fn frame_raw_block(
 
     // Field 17: granularity (varint, default 100)
     if granularity != 100 {
-        encode_varint(out, ((17 << 3) | 0) as u64); // field 17, wire type 0
+        encode_varint(out, ((17 << 3) ) as u64); // field 17, wire type 0
         encode_varint(out, granularity as u64);
     }
 
     // Field 18: date_granularity (varint, default 1000)
     if date_granularity != 1000 {
-        encode_varint(out, ((18 << 3) | 0) as u64);
+        encode_varint(out, ((18 << 3) ) as u64);
         encode_varint(out, date_granularity as u64);
     }
 
     // Field 19: lat_offset (varint, default 0)
     if lat_offset != 0 {
-        encode_varint(out, ((19 << 3) | 0) as u64);
+        encode_varint(out, ((19 << 3) ) as u64);
         encode_varint(out, lat_offset as u64);
     }
 
     // Field 20: lon_offset (varint, default 0)
     if lon_offset != 0 {
-        encode_varint(out, ((20 << 3) | 0) as u64);
+        encode_varint(out, ((20 << 3) ) as u64);
         encode_varint(out, lon_offset as u64);
     }
 }

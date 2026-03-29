@@ -709,16 +709,27 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 ///
 /// The closure captures the caller's ID sets and clean reference.
 /// Blob descriptor for pread schedule.
-#[allow(dead_code)]
 struct BlobDesc {
     seq: usize,
     offset: u64,
     size: usize,
     kind: Option<crate::blob_index::ElemKind>,
+    /// True if this blob can be passed through raw (no decode/re-encode).
+    /// Set by the schedule builder based on blob bbox containment.
+    raw_passthrough: bool,
 }
 
 /// Build a blob schedule from a header-only scan.
 fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
+    build_blob_schedule_with_passthrough(input, None)
+}
+
+/// Build a blob schedule, optionally tagging node blobs eligible for raw passthrough.
+/// A node blob is eligible if its bbox is fully contained in the extract bbox.
+fn build_blob_schedule_with_passthrough(
+    input: &Path,
+    extract_bbox: Option<&crate::BlobBbox>,
+) -> Result<Vec<BlobDesc>> {
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.next_header_skip_blob()
@@ -729,14 +740,25 @@ fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let kind = hdr.index().map(|idx| idx.kind);
-        schedule.push(BlobDesc { seq, offset: data_offset, size: data_size, kind });
+        let idx = hdr.index();
+        let kind = idx.as_ref().map(|i| i.kind);
+
+        // Tag node blobs for raw passthrough if fully contained in extract bbox.
+        let raw_passthrough = extract_bbox.is_some_and(|ebbox| {
+            idx.as_ref().is_some_and(|i|
+                matches!(i.kind, crate::blob_index::ElemKind::Node)
+                && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
+            )
+        });
+
+        schedule.push(BlobDesc { seq, offset: data_offset, size: data_size, kind, raw_passthrough });
         seq += 1;
     }
     Ok(schedule)
 }
 
 /// Execute a pread-from-workers write pass on a pre-built schedule.
+#[allow(clippy::too_many_lines)]
 fn pread_execute<F>(
     input: &Path,
     schedule: &[BlobDesc],
@@ -764,11 +786,11 @@ where
         .unwrap_or(4);
 
     type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
-    // Re-number sequence for the reorder buffer (schedule may be a subset).
-    let schedule_items: Vec<(usize, u64, usize)> = schedule.iter()
+    // Descriptor: (seq, offset, size, raw_passthrough)
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize, bool)>(16);
+    let schedule_items: Vec<(usize, u64, usize, bool)> = schedule.iter()
         .enumerate()
-        .map(|(i, d)| (i, d.offset, d.size))
+        .map(|(i, d)| (i, d.offset, d.size, d.raw_passthrough))
         .collect();
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
@@ -776,12 +798,13 @@ where
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule.
         scope.spawn(move || {
-            for (s, off, sz) in schedule_items {
-                if desc_tx.send((s, off, sz)).is_err() { break; }
+            for item in schedule_items {
+                if desc_tx.send(item).is_err() { break; }
             }
         });
 
         // Workers: pread → decompress → PrimitiveBlock → extract → OwnedBlocks.
+        // For raw_passthrough blobs: pread → decompress → frame_raw_block (no PrimitiveBlock).
         for _ in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
@@ -791,13 +814,11 @@ where
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut bb = BlockBuilder::new();
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-                // Per-worker pool for decompress buffer reuse. PrimitiveBlock drops
-                // on this worker thread → buffer returns to pool → next iteration
-                // reuses it. Zero alloc churn after warmup.
                 let worker_pool = crate::blob::DecompressPool::new();
+                let mut raw_frame_buf: Vec<u8> = Vec::new();
 
                 loop {
-                    let (s, data_offset, data_size) = {
+                    let (s, data_offset, data_size, raw_passthrough) = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(d) => d,
@@ -809,8 +830,47 @@ where
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        // Decompress into pool-obtained buffer, parse inline, wrap pooled.
-                        // On PrimitiveBlock drop (same thread), buffer returns to pool.
+
+                        // Raw passthrough: decompress, extract raw components, frame directly.
+                        // No PrimitiveBlock construction, no BlockBuilder, no recompress overhead.
+                        if raw_passthrough {
+                            let mut decompress_buf: Vec<u8> = Vec::new();
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                            // Parse just enough to get the raw components.
+                            let meta = crate::read::wire::WireBlock::parse_and_inline(&mut decompress_buf)?;
+                            let buffer: &[u8] = &decompress_buf;
+                            let block = crate::read::wire::WireBlock::from_inline(buffer, &meta);
+                            // Collect raw group bytes.
+                            let groups: Vec<&[u8]> = (0..block.group_count())
+                                .map(|i| block.group(i))
+                                .collect();
+                            // Frame as raw block.
+                            crate::write::raw_passthrough::frame_raw_block(
+                                block.raw_stringtable(),
+                                &groups,
+                                block.granularity,
+                                block.lat_offset,
+                                block.lon_offset,
+                                block.date_granularity,
+                                &mut raw_frame_buf,
+                            );
+                            // Scan for indexdata (need BlobIndex for the OwnedBlock).
+                            let index = crate::blob_index::scan_block_ids(&raw_frame_buf)
+                                .expect("scan_block_ids failed on raw passthrough block");
+                            let tagdata = crate::blob_index::scan_block_tags(&raw_frame_buf);
+                            let owned = (
+                                std::mem::take(&mut raw_frame_buf),
+                                index,
+                                tagdata.map(|t| t.serialize()),
+                            );
+                            return Ok((vec![owned], ExtractStats {
+                                nodes_in_bbox: 0, nodes_from_ways: 0, nodes_from_relations: 0,
+                                ways_written: 0, ways_from_relations: 0, relations_written: 0,
+                                strategy: "",
+                            }));
+                        }
+
+                        // Normal path: full decode + extract.
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
                         let block = PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
@@ -1129,7 +1189,15 @@ fn extract_simple_single_pass(
     let spatial_filter = spatial_blob_filter(&bbox_int);
 
     // Build schedule once, partition by element type.
-    let full_schedule = build_blob_schedule(input)?;
+    // Tag node blobs for raw passthrough if bbox region + no clean.
+    let passthrough_bbox = if matches!(region, Region::Bbox(_)) && !clean.any() {
+        Some(crate::BlobBbox::new(
+            bbox_int.min_lat, bbox_int.max_lat, bbox_int.min_lon, bbox_int.max_lon,
+        ))
+    } else {
+        None
+    };
+    let full_schedule = build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref())?;
     let node_schedule: Vec<&BlobDesc> = full_schedule.iter()
         .filter(|d| {
             // Include node blobs that pass spatial filter.
@@ -1200,7 +1268,7 @@ fn extract_simple_single_pass(
     }
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: d.raw_passthrough })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1240,7 +1308,7 @@ fn extract_simple_single_pass(
     }
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
     let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1283,7 +1351,7 @@ fn extract_simple_single_pass(
         }
     }
     let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false })
         .collect();
     {
         let ids = ExtractPass2IdSets {

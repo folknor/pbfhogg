@@ -36,6 +36,14 @@ impl BlobBbox {
         Self { min_lat, max_lat, min_lon, max_lon }
     }
 
+    /// Returns `true` if `inner` is fully contained within this bbox.
+    pub fn contains(&self, inner: &BlobBbox) -> bool {
+        self.min_lat <= inner.min_lat
+            && self.max_lat >= inner.max_lat
+            && self.min_lon <= inner.min_lon
+            && self.max_lon >= inner.max_lon
+    }
+
     /// Returns `true` if this bbox intersects `other` (AABB intersection test).
     pub fn intersects(&self, other: &BlobBbox) -> bool {
         self.min_lat <= other.max_lat

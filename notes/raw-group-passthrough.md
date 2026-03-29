@@ -9,115 +9,111 @@ The gap is on the write side: pbfhogg fully decodes every matching element
 osmium copies raw protobuf group bytes for matching elements, modifying
 only the string table.
 
-## How osmium does it
+## Approach: phased rollout, blob-level first
 
-libosmium (via protozero) identifies matching PrimitiveGroups within a
-PrimitiveBlock. For groups where all elements match, it copies the raw
-protobuf bytes into the output block. Only the StringTable is rebuilt
-(subset of referenced entries). No per-element decode or re-encode.
+### Phase 1: Blob-level raw passthrough for node blobs (v1)
 
-For groups with partial matches (some elements match, some don't), osmium
-falls back to element-level processing.
+For node blobs whose indexdata bbox is fully contained in the extract
+region (`BlobBbox::contains`), write the raw decompressed blob bytes
+directly — zero decode, zero re-encode.
 
-## Proposed approach
+The decision is per-blob, not per-group:
+- **Fully contained**: `extract_bbox.contains(blob_bbox)` → raw passthrough
+- **Partially overlapping**: existing decode + re-encode path
+- **Outside**: skipped by spatial blob filter (existing)
 
-After classification (which elements match), the write pass examines each
-PrimitiveGroup in the block:
+This is the simplest implementation (O(1) bbox check per blob) and covers
+the highest-volume case. In sorted PBFs, node blobs have tight geographic
+bboxes (~0.01° spread). For regional extracts, ~90% of intersection node
+blobs are interior (fully contained).
 
-**All-match group:** Every element in the group is selected for output.
-Copy the group's raw protobuf bytes. No decode, no BlockBuilder.
+**String table**: copied whole. No subsetting — unused entries add ~1-5 KB
+per block, negligible waste (<1% of output). Subsetting would require
+scanning raw bytes for string table indices and rewriting them.
 
-**Partial-match group:** Some elements match. Fall back to current path:
-decode elements, filter, re-encode via BlockBuilder.
+**No mixing of raw and re-encoded groups in the same block.** If any group
+in a block needs partial re-encode, the entire block goes through the
+existing path. This avoids string table index alignment issues between
+raw groups (original indices) and BlockBuilder groups (fresh indices).
+Node blocks in sorted PBFs have exactly one DenseNodes group, so
+per-block = per-group for nodes.
 
-**No-match group:** Skip entirely.
+**`--clean` guard**: raw passthrough disabled when any metadata cleaning
+is active (raw bytes preserve original metadata).
 
-In sorted PBFs, node groups are geographically local (~0.01° spread per
-group). For regional extracts, most node groups in the bbox interior are
-all-match. Way and relation groups are less predictable (sorted by way/
-relation ID, not geography).
+**`Region::Bbox` only**: blob bbox containment is only valid for
+rectangular extracts. Polygon extracts fall back to element-level
+classification (a blob bbox inside the polygon's bbox is not necessarily
+inside the polygon itself).
 
-## String table handling
+### Phase 2: Per-group passthrough for way/relation blobs (later)
 
-Each PrimitiveBlock has one StringTable shared by all groups. If we copy
-raw group bytes, the output block needs a StringTable containing at least
-the entries referenced by the copied groups.
+After phase 1 ships and counters show the all-match ratio, decide
+whether way/relation group passthrough is worth the complexity.
 
-Three options:
-1. **Copy the full StringTable.** Simple, correct, slightly wasteful
-   (unused entries add ~1-5 KB per block). No string table analysis needed.
-2. **Subset the StringTable.** Scan copied groups for string table indices,
-   build a minimal table, remap indices in copied group bytes. Complex —
-   requires rewriting varint-encoded indices in the raw bytes.
-3. **Keep original + append new.** For partial-match groups that are
-   re-encoded, BlockBuilder creates new string table entries. Merge with
-   the original table. Complex.
+Way/relation groups are sorted by element ID, not geography. The
+all-match ratio depends on the extract region size relative to the PBF.
+For large regions (Europe from planet), most way groups are all-match.
+For small regions (Tokyo from Japan), way groups are more likely partial.
 
-Option 1 is the right starting point. The waste is negligible (<1% of
-output size). Option 2 is a later optimization if output size matters.
+Classification requires scanning element IDs in each group:
+- Ways: read field 1 (varint ID) from each Way message, check `matched_way_ids`
+- Relations: read field 1 from each Relation message, check `matched_relation_ids`
+- Early exit: return `Partial` as soon as both a match and non-match are seen
 
-## Implementation sketch
+Low-level ID scanners should be shared (`src/read/wire.rs` or similar).
+The classification decision logic stays in `extract.rs`.
 
-```rust
-fn write_block_with_passthrough(
-    block: &PrimitiveBlock,
-    // ... IDs, clean, etc ...
-) -> Vec<u8> {
-    // Classify each group: all-match, partial, no-match
-    for group_idx in 0..block.group_count() {
-        let group_data = block.raw_group_bytes(group_idx);
-        match classify_group(group_idx, &ids) {
-            GroupMatch::All => {
-                // Copy raw group bytes to output
-                output_groups.push(group_data);
-            }
-            GroupMatch::Partial => {
-                // Decode + filter + re-encode (current path)
-                // BlockBuilder produces new group bytes
-            }
-            GroupMatch::None => {
-                // Skip
-            }
-        }
-    }
-    // Assemble output: StringTable (copied) + output groups
-    frame_raw_block(string_table_bytes, &output_groups)
-}
-```
+## Infrastructure (committed)
 
-## What needs to exist
+Four primitives already exist (commit `1ad821e`):
+- `PrimitiveBlock::raw_group_bytes(index)` — raw PrimitiveGroup bytes
+- `PrimitiveBlock::raw_stringtable_bytes()` — raw StringTable bytes
+- `PrimitiveBlock::block_scalars()` — granularity, lat/lon offset
+- `frame_raw_block()` — assemble PrimitiveBlock from raw components
 
-1. **`PrimitiveBlock::raw_group_bytes(index)`** — access raw protobuf bytes
-   for a group. WireBlock already stores `(offset, length)` per group.
-   This is a slice into the decompressed buffer.
+`BlobBbox::contains()` exists for the containment check.
 
-2. **`PrimitiveBlock::raw_stringtable_bytes()`** — raw StringTable protobuf
-   bytes. WireBlock already has this during parse (field 1).
+## Integration points
 
-3. **`classify_group()`** — determine all-match/partial/none for a group.
-   For node groups: check all node IDs against bbox_node_ids. For way
-   groups: check all way IDs against matched_way_ids. This requires
-   iterating the group's elements but only reading IDs (not tags/metadata).
+### 3-phase simple extract (sorted single-pass)
 
-4. **`frame_raw_block()`** — assemble a PrimitiveBlock protobuf from raw
-   StringTable bytes + raw/re-encoded group bytes + scalar fields
-   (granularity, lat_offset, lon_offset). Write the protobuf framing
-   (field tags + length delimiters) around the raw content.
+Phase 1 (node write): the pread_execute workers check the blob's
+indexdata bbox. If fully contained in the extract bbox and `!clean.any()`
+and `Region::Bbox`: skip PrimitiveBlock construction entirely, call
+`frame_raw_block` with the raw proto bytes and write the result.
 
-5. **Integration with `--clean`** — if metadata cleaning is active, raw
-   passthrough must be disabled (raw bytes preserve original metadata).
+Workers need the blob's indexdata for the containment check. Currently
+`pread_execute` doesn't pass indexdata to workers. Options:
+- Include the `BlobDesc.kind` + bbox in the descriptor
+- Workers parse the BlobHeader themselves (cheap, ~50 bytes)
+- Pre-classify in the schedule builder and tag each descriptor as
+  passthrough/decode
+
+Pre-classify is cleanest: the schedule builder already has the BlobHeader
+from `next_header_with_data_offset`. Extend `BlobDesc` with a
+`passthrough: bool` field. Workers check it before deciding to decode.
+
+### Complete/smart write passes
+
+Same integration via `pread_write_pass`. The block function closure
+checks the passthrough flag and either copies raw bytes or does the
+full extract_block_pass2/pass3.
 
 ## Expected impact
 
-At Japan scale (Tokyo bbox): most node groups in the bbox interior are
-all-match. ~60% of node blobs could use raw passthrough. Way and relation
-groups less likely to be all-match. Estimate: 40-60% of output bytes
-written via raw passthrough, saving the decode + re-encode cost for those.
+Node blobs are ~60% of a PBF by volume. At Japan scale with ~90%
+all-match node blobs, phase 1 saves decode + re-encode for ~54% of
+total output bytes. Estimated: 18s → ~10-12s for simple extract.
 
-Simple extract: 18s → ~10-12s estimated (closing to within 1.5x of osmium).
+At Europe scale (full-continent bbox): nearly all node blobs are
+interior. Phase 1 saves even more proportionally.
 
-## Dependencies
+## Reviewer sign-off
 
-None on current infrastructure. This is a write-path optimization,
-independent of the read-path pread-from-workers work. Can be prototyped
-on top of the current 3-phase simple extract.
+4/4 reviewers (perf-Claude, perf-Codex, planet-Claude, planet-Codex):
+- Phase 1 blob-level passthrough for nodes is the right v1
+- Copy full string table, no subsetting
+- Don't mix raw and re-encoded groups in same block
+- Add counters for passthrough/decode per blob type before phase 2
+- Way/relation group passthrough deferred until counters justify it

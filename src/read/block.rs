@@ -485,6 +485,28 @@ impl PrimitiveBlock {
         BlockElementsIter::new_skip_metadata(&self.block)
     }
 
+    /// Returns the raw protobuf bytes of a PrimitiveGroup by index.
+    /// Used by raw group passthrough to copy all-match groups without re-encoding.
+    pub(crate) fn raw_group_bytes(&self, index: usize) -> &[u8] {
+        self.block.group(index)
+    }
+
+    /// Returns the number of PrimitiveGroups in this block.
+    pub(crate) fn group_count(&self) -> usize {
+        self.block.group_count()
+    }
+
+    /// Returns the raw StringTable protobuf bytes (field 1 of PrimitiveBlock).
+    /// Used by raw group passthrough to copy the string table into output blocks.
+    pub(crate) fn raw_stringtable_bytes(&self) -> &[u8] {
+        self.block.raw_stringtable()
+    }
+
+    /// Returns the scalar fields needed to reconstruct a PrimitiveBlock frame.
+    pub(crate) fn block_scalars(&self) -> (i32, i64, i64, i32) {
+        (self.block.granularity, self.block.lat_offset, self.block.lon_offset, self.block.date_granularity)
+    }
+
     /// Returns the number of entries in this block's string table.
     pub fn string_table_len(&self) -> usize {
         self.block.stringtable.len()

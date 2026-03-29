@@ -97,6 +97,9 @@ impl<'a> WireStringTable<'a> {
 pub(crate) struct WireBlock<'a> {
     buffer: &'a [u8],
     pub stringtable: WireStringTable<'a>,
+    /// Raw StringTable protobuf bytes location (for raw group passthrough).
+    st_raw_offset: u32,
+    st_raw_len: u32,
     group_ranges_offset: u32,
     group_ranges_count: u32,
     pub granularity: i32,
@@ -188,8 +191,11 @@ impl<'a> WireBlock<'a> {
         }
 
         // Phase 1 temp Vecs drop here — same-thread free, no cross-thread retention.
+        #[allow(clippy::cast_possible_truncation)]
         Ok(WireBlockMeta {
             proto_len,
+            st_raw_offset: stringtable_offset as u32,
+            st_raw_len: stringtable_len as u32,
             st_inline_offset,
             st_inline_count,
             gr_inline_offset,
@@ -206,6 +212,8 @@ impl<'a> WireBlock<'a> {
         Self {
             buffer,
             stringtable: WireStringTable::new(buffer, meta.st_inline_offset, meta.st_inline_count),
+            st_raw_offset: meta.st_raw_offset,
+            st_raw_len: meta.st_raw_len,
             group_ranges_offset: meta.gr_inline_offset,
             group_ranges_count: meta.gr_inline_count,
             granularity: meta.granularity,
@@ -220,6 +228,20 @@ impl<'a> WireBlock<'a> {
     #[inline]
     pub fn group_count(&self) -> usize {
         self.group_ranges_count as usize
+    }
+
+    /// Raw StringTable protobuf bytes (field 1 of PrimitiveBlock).
+    /// Used by raw group passthrough to copy the string table into output blocks.
+    #[inline]
+    pub fn raw_stringtable(&self) -> &'a [u8] {
+        &self.buffer[self.st_raw_offset as usize..self.st_raw_offset as usize + self.st_raw_len as usize]
+    }
+
+    /// Raw protobuf bytes for the entire PrimitiveBlock (before inline entries).
+    /// The first `proto_len` bytes of the buffer.
+    #[inline]
+    pub fn raw_proto(&self) -> &'a [u8] {
+        &self.buffer[..self.proto_len as usize]
     }
 
     #[inline]
@@ -241,6 +263,9 @@ impl<'a> WireBlock<'a> {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WireBlockMeta {
     pub proto_len: u32,
+    /// Raw StringTable protobuf bytes: offset and length within the proto region.
+    pub st_raw_offset: u32,
+    pub st_raw_len: u32,
     pub st_inline_offset: u32,
     pub st_inline_count: u32,
     pub gr_inline_offset: u32,

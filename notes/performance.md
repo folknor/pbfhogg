@@ -229,12 +229,12 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | getparents | 400 ms |
 | tags-filter amenity=* | 438 ms |
 | apply-changes | 517 ms |
-| cat --type way | 614 ms |
+| cat --type way | 239 ms |
 | merge-changes | 107 ms |
 | inspect-tags | 1.61s |
 | inspect-nodes | 1.73s |
 | check --ids | 1.87s |
-| getid --invert | 1.87s |
+| getid --invert | 0.5s |
 | extract --simple | 2.48s |
 | extract --complete | 2.40s |
 | tags-filter two-pass | 2.62s |
@@ -260,14 +260,14 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | tags-filter amenity=* | 2.20s |
 | inspect-tags --type way | 2.43s |
 | apply-changes | 2.53s |
-| cat --type way | 3.45s |
+| cat --type way | 0.7s |
 | inspect-tags | 4.82s |
-| getid --invert | 8.55s |
+| getid --invert | 1.3s |
 | inspect-nodes | 9.14s |
 | extract --simple | 9.36s |
 | check --ids | 10.4s |
-| extract --complete | 4.8s |
-| extract --smart | 9.0s |
+| extract --complete | 4.4s |
+| extract --smart | 5.2s |
 | tags-filter two-pass | 13.7s |
 | check --refs | 38.7s |
 | time-filter | 43.8s |
@@ -312,7 +312,7 @@ Previous commit data (commit `46f7388`):
 | sort (sorted, indexdata) | **0.14s** | 11.6s | **83x** |
 | apply-changes (indexdata + zlib) | **2.7s** | 7.2s | **2.7x** |
 | tags-filter w/highway=primary -R | **0.24s** | 0.56s | **2.3x** |
-| cat --type way (indexdata) | **1.1s** | 2.22s | **2.0x** |
+| cat --type way (indexdata, raw passthrough) | **0.24s** | 2.22s | **9.3x** |
 | add-locations-to-ways | **8.3s** | 12.6s | **1.5x** |
 | check --refs | **4.8s** | 4.5s | 0.94x |
 
@@ -323,7 +323,7 @@ Plantasjen. Best of 3 runs, indexed PBFs.
 | Dataset | Size | simple | complete | smart |
 |---------|------|--------|----------|-------|
 | Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms |
-| Japan | 2.4 GB | **4,400 ms** | **4,816 ms** | **8,976 ms** |
+| Japan | 2.4 GB | **4,400 ms** | **4,400 ms** | **5,200 ms** |
 | Europe | 32.4 GB | **100s** | — | — |
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
@@ -337,12 +337,13 @@ simple: 100s (was 350s sequential, was OOM with pipelined reader).
 
 Complete-ways and smart pass 1 (`collect_pass1_generic`) uses three-phase
 parallel pread classification (nodes → ways → relations) via a reusable
-`parallel_classify_phase` helper. Workers pread + decompress + classify
-in parallel, sending compact results back to the consumer. Replaces the
-old sequential BlobReader + batch-rayon-merge approach. Japan complete:
-19.7s → 4.8s (4.1x), smart: 24.3s → 9.0s (2.7x). Both now beat osmium
-(complete 2.3x faster, smart 1.5x faster). Pass 2+ write passes remain
-pread-from-workers with full PrimitiveBlock lifecycle per worker.
+`parallel_classify_phase` helper. Smart pass 2 (way dependency resolution)
+also uses `parallel_classify_phase`, replacing the old sequential BlobReader
+scan. Workers pread + decompress + classify in parallel, sending compact
+results back to the consumer. Japan complete: 19.7s → 4.4s (4.5x), smart:
+24.3s → 5.2s (4.7x). Both beat osmium (complete 2.5x faster, smart 2.6x
+faster). Write passes use pread-from-workers with full PrimitiveBlock
+lifecycle per worker.
 
 Europe simple phase breakdown (commit `b95e5ab`):
 - Node classify: 13s, Node write: 11s
@@ -357,20 +358,18 @@ by the parallel classify + raw frame passthrough architecture.
 ## Tags-filter
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel
-classification + lightweight scanner), pass 2 writes matching elements.
+classification + lightweight scanner), closure + way dep scans also
+parallelized via `parallel_classify_phase`, pass 2 writes matching
+elements.
 
-| Dataset | Sequential (old) | Two-pass | Speedup | Commit |
-|---------|-----------------|----------|---------|--------|
-| Europe (33.6 GB) | 363s | **158s** | -57% | latest |
-
-Europe two-pass phase breakdown:
-- Pass 1 (parallel classification): 39s
-- Closure + deps: 88s
-- Pass 2 (write): 31s
+| Dataset | Sequential (old) | Two-pass (pass 1 only) | Two-pass (all parallel) | Commit |
+|---------|-----------------|------------------------|------------------------|--------|
+| Europe (33.6 GB) | 363s | 158s | **107.5s** (-70%) | latest |
 
 Previously OOM with pipelined reader. Sequential fix (commit `2a8a649`)
-brought it to 363s. Parallel classification for pass 1 brings the total
-to 158s.
+brought it to 363s. Parallel classification for pass 1 brought it to
+158s. Parallelizing closure + way dep scans brings the total to 107.5s.
+Full journey: 366.7s → 107.5s (3.4x total improvement).
 
 ## Pipeline end-to-end
 

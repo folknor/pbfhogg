@@ -18,8 +18,8 @@ via `parallel_classify_phase`. Pass 2 write via `pread_write_pass` (workers
 own full PrimitiveBlock lifecycle).
 
 **Smart (three-pass):** Pass 1 same as complete (parallel pread classification).
-Pass 2 way closure (sequential, mutates extra ID sets). Pass 3 write via
-`pread_write_pass`.
+Pass 2 way dependency scan via `parallel_classify_phase` (replaces sequential
+BlobReader). Pass 3 write via `pread_write_pass`.
 
 ## Results
 
@@ -48,22 +48,22 @@ trivial (2s) because few relations match a bbox extract.
 | Strategy | pbfhogg | osmium | Ratio |
 |----------|---------|--------|-------|
 | simple | **4.4s** | 7.2s | **1.6x faster** |
-| complete | **4.8s** | 11.0s | **2.3x faster** |
-| smart | **9.0s** | 13.4s | **1.5x faster** |
+| complete | **4.4s** | 11.0s | **2.5x faster** |
+| smart | **5.2s** | 13.4s | **2.6x faster** |
 
 ### Improvement arc
 
 | Strategy | All-sequential | Pread (prev) | Parallel classify (current) |
 |----------|---------------|--------------|----------------------------|
 | simple (Europe) | 362s | 350s | **100s** (-72%) |
-| complete (Japan) | — | 19.7s | **4.8s** (-76%, 4.1x) |
-| smart (Japan) | — | 24.3s | **9.0s** (-63%, 2.7x) |
+| complete (Japan) | — | 19.7s | **4.4s** (-78%, 4.5x) |
+| smart (Japan) | — | 24.3s | **5.2s** (-79%, 4.7x) |
 
 The parallel classify + raw frame passthrough architecture delivered a 3.5x
-speedup for simple extract. Complete and smart pass 1 now uses three-phase
-parallel pread classification via `parallel_classify_phase`, replacing the
-old sequential BlobReader + batch-rayon-merge approach. pbfhogg beats osmium
-on all three extract strategies.
+speedup for simple extract. Complete and smart pass 1 uses three-phase
+parallel pread classification via `parallel_classify_phase`. Smart pass 2
+(way dependency scan) also parallelized via `parallel_classify_phase`.
+pbfhogg beats osmium on all three extract strategies (1.6-2.6x faster).
 
 ## How extract beats osmium
 
@@ -75,21 +75,22 @@ decode). Matching blobs are written as raw compressed frames — zero
 decompression, zero re-compression. osmium must decompress every blob to
 inspect individual elements, then re-compress matching groups.
 
-**Complete/smart:** Pass 1 classification now uses three-phase parallel pread
-classification (nodes → ways → relations). Workers pread + decompress +
+**Complete/smart:** Pass 1 classification uses three-phase parallel pread
+classification (nodes → ways → relations). Smart pass 2 (way dependency
+resolution) also uses `parallel_classify_phase`. Workers pread + decompress +
 classify blobs in parallel, sending compact results (matched IDs) back to
-the consumer. This replaces the old sequential BlobReader + batch-rayon-merge
-approach, which serialized I/O and classification. The parallelism delivers
-4.1x speedup for complete and 2.7x for smart.
+the consumer. The parallelism delivers 4.5x speedup for complete and 4.7x
+for smart.
 
 ## Remaining opportunities
 
 - **Relation classify parallelization:** 13s at Europe (13% of simple total).
   Could parallelize but marginal return.
-- **Raw group passthrough for other commands:** cat --type, tags-filter, getid,
-  renumber, time-filter still fully decode+re-encode. Extending the raw frame
-  approach would help, but these commands need element-level filtering within
-  groups (partial matches), making blob-level passthrough less applicable.
+- **Raw group passthrough for other commands:** tags-filter, renumber,
+  time-filter still fully decode+re-encode. cat --type and getid --invert
+  now use blob-level raw passthrough. Remaining commands need element-level
+  filtering within groups (partial matches), making blob-level passthrough
+  less applicable.
 - **Complete/smart write path:** Pass 2+ still decode+re-encode via BlockBuilder.
   Raw group passthrough would help for groups where all elements are selected.
 

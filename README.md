@@ -193,23 +193,23 @@ CLI commands — Denmark (487 MB, 59M elements, commit `6fc1283`, osmium from `2
 | apply-changes (indexdata + zlib) | **0.6s** | 7.2s | **12x** |
 | tags-filter w/highway=primary -R | **0.2s** | 0.56s | **2.8x** |
 | tags-filter amenity=restaurant -R | **0.5s** | 1.19s | **2.4x** |
-| cat --type way (indexdata) | **0.7s** | 2.22s | **3.2x** |
+| cat --type way (raw passthrough) | **0.24s** | 2.22s | **9.3x** |
 | inspect tags --type way (indexdata) | **0.4s** | 0.59s | **1.5x** |
 | getid (9 elements) | **0.6s** | 0.83s | **1.4x** |
 | add-locations-to-ways (dense) | **9.9s** | 12.1s | **1.2x** |
 | add-locations-to-ways (external) | **9.7s** | 12.1s | **1.2x** |
 
-Filter commands (cat, tags-filter, inspect tags, getid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Apply-changes uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation. add-locations-to-ways uses parallel node index building (batch-and-dispatch to rayon) and blob passthrough for unchanged node/relation blobs on indexed PBFs.
+Filter commands use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. `cat --type` uses raw frame passthrough for matching blobs (zero decompression) and skips non-matching blobs entirely via indexdata. `getid --invert` passes through blobs whose ID range has no intersection with requested IDs as raw frames. `getid` (include mode) skips decompression of blobs whose ID range doesn't intersect the requested IDs. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Apply-changes uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation. add-locations-to-ways uses parallel node index building (batch-and-dispatch to rayon) and blob passthrough for unchanged node/relation blobs on indexed PBFs.
 
 Extract — Japan (2.4 GB, 344M elements, Tokyo bbox):
 
 | Strategy | pbfhogg | osmium | ratio |
 |----------|---------|--------|-------|
 | simple | **4.4s** | 7.2s | **1.6x faster** |
-| complete-ways | **4.8s** | 11.0s | **2.3x faster** |
-| smart | **9.0s** | 13.4s | **1.5x faster** |
+| complete-ways | **4.4s** | 11.0s | **2.5x faster** |
+| smart | **5.2s** | 13.4s | **2.6x faster** |
 
-Simple extract uses a 3-phase barrier pipeline with parallel classification and raw frame passthrough — each phase (nodes, ways, relations) classifies blobs in parallel then writes matching raw frames via pread workers. No decode+re-encode for matching blobs. Complete-ways and smart pass 1 uses three-phase parallel pread classification (nodes, ways, relations) via a reusable `parallel_classify_phase` helper, replacing the old sequential read + batch merge approach. Pass 2 (and pass 3 for smart) uses pread-from-workers write passes with full PrimitiveBlock lifecycle per worker. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
+Simple extract uses a 3-phase barrier pipeline with parallel classification and raw frame passthrough — each phase (nodes, ways, relations) classifies blobs in parallel then writes matching raw frames via pread workers. No decode+re-encode for matching blobs. Complete-ways and smart pass 1 uses three-phase parallel pread classification (nodes, ways, relations) via a reusable `parallel_classify_phase` helper. Smart pass 2 (way dependency resolution) also uses `parallel_classify_phase`, replacing the old sequential BlobReader scan. Pass 2 write (and pass 3 for smart) uses pread-from-workers write passes with full PrimitiveBlock lifecycle per worker. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
 
 Apply-changes with `--locations-on-ways` — Denmark (501 MB with LocationsOnWays, daily diff, commit `e7bbfa2`):
 

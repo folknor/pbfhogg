@@ -31,10 +31,11 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   The old sequential BlobReader + batch-rayon-merge approach
   (`merge_way_batch_parallel`, `merge_relation_batch_parallel`, etc.) has been
   removed. `collect_pass1_generic` now uses `parallel_classify_phase` for each
-  element type (nodes → ways → relations). Japan complete: 19.7s → 4.8s (4.1x),
-  smart: 24.3s → 9.0s (2.7x). All sub-issues (1-5) are moot — the batch
-  helpers, Vec-per-block allocation, and `decode_threads(1)` tradeoff no longer
-  exist in the new architecture.
+  element type (nodes → ways → relations). Smart pass 2 (way dep scan) also
+  parallelized via `parallel_classify_phase`. Japan complete: 19.7s → 4.4s
+  (4.5x), smart: 24.3s → 5.2s (4.7x). All sub-issues (1-5) are moot — the
+  batch helpers, Vec-per-block allocation, and `decode_threads(1)` tradeoff
+  no longer exist in the new architecture.
 
 - [x] **`merge --locations-on-ways`: parallelize Phase 2.5 blob scans** —
   Passthrough node blob decompression dispatched to rayon pool. At Denmark
@@ -109,17 +110,17 @@ pipeline classifies blobs in parallel and writes matching raw frames via
 pread workers, bypassing decode+re-encode entirely. Simple extract now
 beats osmium (4.4s vs 7.2s Japan, 100s vs 350s Europe sequential baseline).
 
-Raw frame passthrough is now also shipped for cat --type — matching blobs
-(by indexdata ElemKind) are written as raw compressed frames, non-matching
-blobs skipped entirely. Planet cat --type way: 207s → 43s (4.8x faster).
+Raw frame passthrough is now shipped for cat --type (matching blobs
+written as raw compressed frames, planet 207s → 43s, 4.8x) and
+getid --invert (blobs with no ID-range intersection pass through raw,
+Denmark 1.9s → 0.5s, Japan 8.6s → 1.3s). getid include mode skips
+decompression of non-intersecting blobs (planet 71.5s → 32.5s, 2.2x).
 
 The remaining opportunity is extending raw passthrough to other
-re-encoding commands: tags-filter, getid, renumber, time-filter.
+re-encoding commands: tags-filter, renumber, time-filter.
 These still fully decode and re-encode via BlockBuilder.
 For tags-filter: blobs where ALL elements match the tag expression
 could be passed through raw (requires blob-level tag index check).
-For getid: most blobs have zero matching IDs and are already skipped
-via BlobFilter; the few matching blobs need element-level filtering.
 For renumber/time-filter: every element is modified, so raw passthrough
 does not apply — the win here is write-path throughput instead.
 See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
@@ -146,14 +147,14 @@ The parallel pread + lightweight scanner + send compact results pattern
 from simple extract applies to any sequential collection pass:
 
 - [x] **tags-filter two-pass pass 1** — parallel classification for pass 1.
-  Europe: 363s → 39s pass 1, 158s total (-57%). Pass 1 uses parallel
-  pread + decompress + tag check. Closure+deps 88s, pass 2 write 31s.
+  Europe: 363s → 39s pass 1. Closure+deps scans also parallelized
+  (88s → parallel). Total: 363s → 107.5s (-70%). Pass 2 write 31s.
 - [x] **extract complete/smart pass 1** — `collect_pass1_generic` in
   `src/commands/extract.rs` now uses three-phase parallel pread
-  classification (nodes → ways → relations). Japan: complete
-  19,701ms → 4,816ms (4.1x), smart 24,300ms → 8,976ms (2.7x).
-  Uses the `parallel_classify_phase` helper (reusable for other
-  commands). Verified via `brokkr verify extract` (all strategies pass).
+  classification (nodes → ways → relations). Smart pass 2 (way dep
+  scan) also parallelized via `parallel_classify_phase`. Japan:
+  complete 19,701ms → 4,400ms (4.5x), smart 24,300ms → 5,200ms
+  (4.7x). Verified via `brokkr verify extract` (all strategies pass).
 - [x] **getid --add-referenced pass 1** — scans ways for ref collection.
   Converted to parallel pread classification via `parallel_classify_phase`.
   Workers scan way blobs for matching IDs and collect node refs.
@@ -166,9 +167,15 @@ from simple extract applies to any sequential collection pass:
   parallel decompress+extract. No PrimitiveBlock construction.
 - [ ] `node_stats.rs` — uses `for_each_pipelined` (cross-thread PrimitiveBlock).
   Only needs id/lat/lon. Convert to node-only scanner for planet safety.
-- [ ] `getid::parse_ids_from_pbf` (`src/commands/getid.rs` ~line 132) —
-  full PrimitiveBlock decode for an ID-only scan. Could use a lightweight
-  wire-format scanner that extracts only element IDs.
+- [x] `getid::parse_ids_from_pbf` (`src/commands/getid.rs`) —
+  converted to `parallel_classify_phase`, eliminating cross-thread
+  PrimitiveBlock retention for `--id-file` PBF parsing.
+- [x] **getid --invert raw frame passthrough** — blobs whose ID range
+  has no intersection with requested IDs pass through as raw frames.
+  Denmark 1.9s → 0.5s (3.8x), Japan 8.6s → 1.3s (6.6x).
+- [x] **getid include ID-range blob skip** — skip decompression of
+  blobs whose ID range doesn't intersect requested IDs. Planet
+  71.5s → 32.5s (2.2x).
 - [ ] **getid include: pread skip for non-matching blobs** — the include
   path now skips decompression via ID-range filtering (planet 71.5s →
   32.5s), but still sequentially reads the entire file to check each
@@ -190,7 +197,9 @@ from simple extract applies to any sequential collection pass:
   `collect_relation_member_closure` and `collect_way_node_dependencies`
   converted to `parallel_classify_phase`. Closure uses collect-then-merge
   to avoid borrow conflict (workers read `included_relation_ids`,
-  merge phase writes). Verified via `brokkr verify tags-filter`.
+  merge phase writes). Europe two-pass: 157.6s → 107.5s. Full journey
+  from sequential: 366.7s → 107.5s (3.4x). Verified via `brokkr verify
+  tags-filter`.
 
 ## Milestone 3: Beyond the benchmark
 
@@ -352,15 +361,13 @@ disagreements, not bugs — but should be investigated and either fixed or docum
 before release.
 
 - [x] **Planet-scale merge on 32 GB host** — **762s (12.7 min), 1.8 GB RSS.** 86% rewrite, 3.4M diff entries. Validated.
-- [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:
-  1. Batch-side (commit `abe2782`): `DECODE_BATCH_BYTE_BUDGET = 32 MiB` caps
-     decompressed bytes per batch via `for_each_primitive_block_batch_budgeted`.
-  2. Writer-side: compression moved into the `par_iter` parallel phase, then
-     `write_raw_owned` feeds the writer thread's bounded `sync_channel(32)`.
-     Eliminates the unbounded `rayon::spawn` queue that was the main OOM cause.
-  Europe (33.6 GB) completes in 121s, 224/8200 batches byte-limited.
-  **Planet validation still pending.** Strip `eprintln!` instrumentation
-  in `cat_filtered` after planet run.
+- [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Raw frame
+  passthrough shipped: matching blobs written as raw compressed frames,
+  non-matching blobs skipped entirely (zero decompression). Planet cat
+  --type way: 207s → 43s (4.8x). Denmark: 614ms → 239ms (2.6x).
+  Previous OOM fixes (batch budget, bounded channel) may no longer be
+  needed since the raw passthrough path avoids decode+re-encode entirely.
+  **Planet validation of the raw passthrough path still pending.**
 
 ### Cross-pipeline optimization audit (commit `398b1a4`)
 

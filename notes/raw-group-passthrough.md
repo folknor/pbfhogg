@@ -34,15 +34,49 @@ used by the blob-level approach):
 - `PrimitiveBlock::block_scalars()` — granularity, lat/lon offset
 - `frame_raw_block()` — assemble PrimitiveBlock from raw components
 
+## Additional raw passthrough shipped
+
+### cat --type raw frame passthrough
+
+Matching blobs (by indexdata ElemKind) are written as raw compressed
+frames — zero decompression, zero re-compression. Non-matching blobs
+skipped entirely.
+
+| Dataset | Before | After | Speedup |
+|---------|--------|-------|---------|
+| Denmark | 614ms | **239ms** | 2.6x |
+| Planet | 207s | **43s** | 4.8x |
+
+### getid --invert raw frame passthrough
+
+Blobs whose ID range has no intersection with requested IDs pass through
+as raw compressed frames.
+
+| Dataset | Before | After | Speedup |
+|---------|--------|-------|---------|
+| Denmark | 1.9s | **0.5s** | 3.8x |
+| Japan | 8.6s | **1.3s** | 6.6x |
+| Planet | — | **82.7s** | I/O limited |
+
+### getid include ID-range blob skip
+
+Skip decompression of blobs whose ID range doesn't intersect requested
+IDs.
+
+| Dataset | Before | After | Speedup |
+|---------|--------|-------|---------|
+| Planet | 71.5s | **32.5s** | 2.2x |
+
 ## What remains
 
 ### For extract
 
 - **Relation classify parallelization**: 13s at Europe (13% of simple total).
   Marginal return.
-- **Complete/smart pass 1**: now uses three-phase parallel pread classification
-  via `parallel_classify_phase` (Japan complete 19.7s → 4.8s, smart 24.3s → 9.0s).
-  All three strategies now beat osmium.
+- **Complete/smart pass 1**: uses three-phase parallel pread classification
+  via `parallel_classify_phase`. Smart pass 2 (way dep scan) also
+  parallelized. Japan complete: 19.7s → 4.4s (4.5x), smart: 24.3s → 5.2s
+  (4.7x). All three strategies beat osmium.
 - **Complete/smart write paths (pass 2+)**: still use pread-from-workers with full
   decode + re-encode. Raw group passthrough would help for groups where
   all elements are selected, but complete/smart do element-level filtering
@@ -50,13 +84,15 @@ used by the blob-level approach):
 
 ### For other commands
 
-The four per-group primitives could be used by: cat --type, tags-filter,
-getid, renumber, time-filter. These still fully decode + re-encode via
-BlockBuilder. The approach: classify each group as all-match/partial/none,
-copy all-match groups raw, re-encode partial groups.
+The four per-group primitives could be used by: tags-filter, renumber,
+time-filter. These still fully decode + re-encode via BlockBuilder.
+The approach: classify each group as all-match/partial/none, copy
+all-match groups raw, re-encode partial groups. cat --type and getid
+--invert now use blob-level raw passthrough (above). getid include
+uses blob-level skip (no decode of non-matching blobs).
 
-Lower priority now that the highest-impact command (extract simple) already
-beats osmium.
+Lower priority now that the highest-impact commands (extract simple,
+cat --type, getid) already beat osmium or are I/O-limited.
 
 ## Why the original per-group approach wasn't needed for extract
 

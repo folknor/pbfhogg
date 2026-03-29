@@ -106,12 +106,13 @@ Dense remains the "fast when RAM fits" path. See [notes/altw-optimization-histor
 
 ### Planet validation runs (run when AFK — takes 25-60 min each)
 
-- [ ] **Planet geocode build** — estimated 25 min, ~20 GB RSS. Validates compact
-  rank-indexed array at planet scale. `brokkr build-geocode-index --dataset planet --bench 1`
-- [ ] **Planet merge/apply-changes** — production daily path. Batched pattern
-  should bound retention. `brokkr merge --dataset planet --bench 1`
-- [ ] **Planet cat --type** — fixes landed (batch byte budget + bounded writer).
-  `brokkr cat-way --dataset planet --bench 1`
+- [x] **Planet geocode build** — **1,346s (22.4 min), 14.6 GB anon, 17.8 GB RSS.**
+  Compact rank-indexed array validated at planet scale. Sidecar `6887288a`.
+- [ ] **Planet merge/apply-changes** — needs planet OSC diff configured in brokkr.toml.
+- [x] **Planet cat --type way** — 207s (3.5 min). O_DIRECT variant: 240s (+16%, slower).
+- [x] **Planet check-refs** — 1,254s (20.9 min), 1.7 GB anon. Sequential reader works.
+- [x] **Planet inspect-tags, tags-filter-way, getid** — all completed.
+- [x] **Planet read** — sequential 583s. Parallel/pipelined OOM'd (expected, documented).
 
 ### Planet read benchmark (partial, commit `f42da6e`)
 
@@ -245,10 +246,11 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
 **sort, cat** (no action):
 - Already optimal — blob-level passthrough, single-pass, or need full metadata for output.
 
-### Geocode index builder — DONE (planet validation pending)
+### Geocode index builder — COMPLETE
 
-Europe: 568s (9.5 min), 7.5 GB RSS. Planet estimated ~20 GB RSS.
-Planet validation listed above under "Planet validation runs".
+Planet validated: **1,346s (22.4 min), 14.6 GB anon, 17.8 GB RSS.**
+Europe: 568s (9.5 min), 7.5 GB RSS. O_DIRECT is 8% slower (page cache
+prefetch helps sequential reads). Sidecar `6887288a`.
 
 ### README badges (after publishing)
 

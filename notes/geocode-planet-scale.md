@@ -293,9 +293,11 @@ consumed. Peak temp disk is ~19 GB.
 
 6. **Mode split** deferred — compact index works at all scales, no separate mode needed.
 
-7. ~~**Test on Europe.**~~ Done. 568s (9.5 min), 7.5 GB RSS. Planet extrapolation: ~20 GB.
+7. ~~**Test on Europe.**~~ Done. 568s (9.5 min), 7.5 GB RSS.
 
-8. **Test on planet.** Not yet run. Estimated ~20 GB RSS, fits on 30 GB host.
+8. ~~**Test on planet.**~~ Done. **1,346s (22.4 min), 14.6 GB anon, 17.8 GB RSS.**
+   Fits on 30 GB host with 12 GB headroom. O_DIRECT variant: 1,460s (+8%, slower).
+   Sidecar `6887288a`.
 
 ## Risks
 

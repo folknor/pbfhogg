@@ -561,27 +561,36 @@ fn tags_filter_two_pass(
     let mut has_included_way = false;
     let mut has_included_relation = false;
 
-    // Pass 1: sequential reader to avoid PrimitiveBlock cross-thread retention.
-    // The unbatched per-block iteration would accumulate 24+ GB anon at Europe
-    // scale with the pipelined reader. Sequential keeps all alloc/free on one thread.
+    // Pass 1: parallel classification via pread-from-workers.
+    // Workers own the full PrimitiveBlock lifecycle (pread → decompress →
+    // PrimitiveBlock → tag match → send compact results). Consumer merges
+    // matching IDs into the IdSetDense collections.
     {
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
+    use std::os::unix::fs::FileExt as _;
+
     // Read header for locations-on-ways warning.
-    let header_blob = blob_reader.next()
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    header_reader.set_parse_indexdata(true);
+    let header_blob = header_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     super::warn_locations_on_ways_loss(&header_blob.to_headerblock()?);
-    let decompress_pool = crate::blob::DecompressPool::new();
+    drop(header_reader);
+
+    // Build schedule from header-only scan.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
     let expr_filter = if invert { None } else { blob_filter_from_expressions(expressions) };
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        // Skip blob types that no expression targets (unless invert mode).
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(ref filter) = expr_filter {
-            if let Some(idx) = blob.index() {
+            if let Some(idx) = hdr.index() {
                 let dominated = matches!(
                     idx.kind,
                     crate::blob_index::ElemKind::Node if !filter.want_nodes
@@ -595,52 +604,140 @@ fn tags_filter_two_pass(
                 if dominated { continue; }
             }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new(decompressed)?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) != invert {
-                        matched_node_ids.set(dn.id());
-                    }
-                }
-                Element::Node(n) => {
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
-                    if element_matches(expressions, &tags_buf, true, false, false) != invert {
-                        matched_node_ids.set(n.id());
-                    }
-                }
-                Element::Way(w) => {
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
-                    if element_matches(expressions, &tags_buf, false, true, false) != invert {
-                        direct_way_ids.set(w.id());
-                        if set_if_absent(&mut included_way_ids, w.id()) {
-                            has_included_way = true;
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    /// Per-blob classification result from a worker.
+    struct ClassifyResult {
+        matched_nodes: Vec<i64>,
+        matched_ways: Vec<(i64, Vec<i64>)>, // (way_id, refs)
+        matched_relations: Vec<i64>,
+    }
+
+    type WorkerOutput = (usize, crate::error::Result<ClassifyResult>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerOutput>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for item in schedule {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        let expressions_ref = expressions;
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
                         }
-                        for r in w.refs() {
-                            way_dep_node_ids.set(r);
+                    };
+
+                    let r: crate::error::Result<ClassifyResult> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec(
+                            std::mem::take(&mut decompress_buf)
+                        )?;
+
+                        let mut result = ClassifyResult {
+                            matched_nodes: Vec::new(),
+                            matched_ways: Vec::new(),
+                            matched_relations: Vec::new(),
+                        };
+                        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+                        for element in block.elements_skip_metadata() {
+                            match &element {
+                                Element::DenseNode(dn) => {
+                                    tags_buf.clear();
+                                    tags_buf.extend(dn.tags());
+                                    if element_matches(expressions_ref, &tags_buf, true, false, false) != invert {
+                                        result.matched_nodes.push(dn.id());
+                                    }
+                                }
+                                Element::Node(n) => {
+                                    tags_buf.clear();
+                                    tags_buf.extend(n.tags());
+                                    if element_matches(expressions_ref, &tags_buf, true, false, false) != invert {
+                                        result.matched_nodes.push(n.id());
+                                    }
+                                }
+                                Element::Way(w) => {
+                                    tags_buf.clear();
+                                    tags_buf.extend(w.tags());
+                                    if element_matches(expressions_ref, &tags_buf, false, true, false) != invert {
+                                        let refs: Vec<i64> = w.refs().collect();
+                                        result.matched_ways.push((w.id(), refs));
+                                    }
+                                }
+                                Element::Relation(r) => {
+                                    tags_buf.clear();
+                                    tags_buf.extend(r.tags());
+                                    if element_matches(expressions_ref, &tags_buf, false, false, true) != invert {
+                                        result.matched_relations.push(r.id());
+                                    }
+                                }
+                            }
                         }
-                    }
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+                        Ok(result)
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
                 }
-                Element::Relation(r) => {
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
-                    if element_matches(expressions, &tags_buf, false, false, true) != invert {
-                        direct_relation_ids.set(r.id());
-                        if set_if_absent(&mut included_relation_ids, r.id()) {
-                            has_included_relation = true;
-                        }
-                    }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        // Consumer: merge classification results.
+        for (_seq, result) in result_rx {
+            let cr = result?;
+            for id in cr.matched_nodes {
+                matched_node_ids.set(id);
+            }
+            for (way_id, refs) in cr.matched_ways {
+                direct_way_ids.set(way_id);
+                if set_if_absent(&mut included_way_ids, way_id) {
+                    has_included_way = true;
+                }
+                for r in refs {
+                    way_dep_node_ids.set(r);
+                }
+            }
+            for id in cr.matched_relations {
+                direct_relation_ids.set(id);
+                if set_if_absent(&mut included_relation_ids, id) {
+                    has_included_relation = true;
                 }
             }
         }
+        Ok(())
+    })?;
     }
-    } // sequential reader scope
 
     crate::debug::emit_marker("TAGSFILTER_PASS1_END");
 

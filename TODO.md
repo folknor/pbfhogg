@@ -149,6 +149,25 @@ See [notes/SIMD.md](notes/SIMD.md) for the varint research.
 Denmark/Japan/Europe/planet benchmarks for every command. Time, RSS,
 temp disk, compression mode. Regression CI to prevent backsliding.
 
+### Parallel classification for other commands
+
+The parallel pread + lightweight scanner + send compact results pattern
+from simple extract applies to any sequential collection pass:
+
+- [ ] **tags-filter two-pass pass 1** — scans for matching elements by tag
+  expression. Currently sequential (363s Europe after OOM fix). Workers
+  could pread + decompress + check tags + send matching element IDs.
+  Needs full PrimitiveBlock (tag access), not just scanners — but workers
+  own the lifecycle (same as pread_write_pass).
+- [ ] **extract complete/smart pass 1** — `collect_pass1_generic` in
+  `src/commands/extract.rs` scans for bbox nodes + matching ways +
+  matching relations. Currently sequential BlobReader. The sorted path
+  uses `decode_threads(1)`. Parallel classification would speed up the
+  collection phase (currently ~100-150s at Europe for complete).
+- [ ] **getid --add-referenced pass 1** — scans ways for ref collection.
+  Currently sequential BlobReader. Workers scan refs in parallel, same
+  pattern as the way classify phase in simple extract.
+
 ### Smaller items
 
 - [ ] `merge --locations-on-ways` node scanner — `src/commands/merge.rs` ~line

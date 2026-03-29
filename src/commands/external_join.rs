@@ -428,7 +428,7 @@ fn stage2_node_join(
             let mut seq: usize = 0;
             while let Some(result) = blob_reader.next_header_with_data_offset() {
                 match result {
-                    Ok((header, data_offset, data_size)) => {
+                    Ok((header, _, data_offset, data_size)) => {
                         if !matches!(header.blob_type(), crate::blob::BlobType::OsmData) {
                             continue;
                         }
@@ -840,7 +840,7 @@ fn stage4_assembly(
     let mut seq: usize = 0;
 
     while let Some(result) = scanner.next_header_with_data_offset() {
-        let (header_entry, data_offset, data_size) = result?;
+        let (header_entry, _, data_offset, data_size) = result?;
         if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
             continue;
         }

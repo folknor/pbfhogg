@@ -992,10 +992,16 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     /// `pread` blob data themselves from a shared file descriptor.
     ///
     /// Returns `(BlobHeader, blob_data_offset, blob_data_size)`.
-    pub(crate) fn next_header_with_data_offset(&mut self) -> Option<Result<(BlobHeader, u64, usize)>> {
+    /// Returns `(BlobHeader, frame_offset, data_offset, data_size)`.
+    /// `frame_offset` is the start of the 4-byte length prefix (for raw frame passthrough).
+    /// `data_offset` is the start of the Blob protobuf (for pread workers).
+    pub(crate) fn next_header_with_data_offset(&mut self) -> Option<Result<(BlobHeader, u64, u64, usize)>> {
         if !self.last_blob_ok {
             return None;
         }
+
+        // Frame starts at current offset (before 4-byte length prefix).
+        let frame_offset = self.offset.map(|o| o.0).unwrap_or(0);
 
         let header = match self.read_blob_header() {
             Some(Ok(header)) => header,
@@ -1013,7 +1019,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
                 })));
             }
         };
-        #[allow(clippy::cast_sign_loss)] // datasize validated non-negative above
+        #[allow(clippy::cast_sign_loss)]
         let data_size = header.datasize as usize;
 
         // Skip past blob data.
@@ -1022,7 +1028,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             return Some(Err(err));
         }
 
-        Some(Ok((BlobHeader::new(header), data_offset, data_size)))
+        Some(Ok((BlobHeader::new(header), frame_offset, data_offset, data_size)))
     }
 }
 

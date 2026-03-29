@@ -1256,7 +1256,7 @@ fn extract_simple_single_pass(
     let all_way_node_ids = IdSetDense::new();
 
     // --- Phase 1: Classify nodes (scanner) + write nodes (pread-from-workers) ---
-    // Classification first: node bbox check is a pure function, use node-only scanner.
+    crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_START");
     {
         let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
         blob_reader.set_parse_indexdata(true);
@@ -1288,7 +1288,9 @@ fn extract_simple_single_pass(
             }
         }
     }
+    crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
+    crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
     let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
         .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
@@ -1306,7 +1308,9 @@ fn extract_simple_single_pass(
         })?;
     }
 
+    crate::debug::emit_marker("SIMPLE_NODE_WRITE_END");
     // --- Phase 2: Classify ways (scanner) + write ways (pread-from-workers) ---
+    crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_START");
     {
         let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
         blob_reader.set_parse_indexdata(true);
@@ -1328,7 +1332,9 @@ fn extract_simple_single_pass(
             })?;
         }
     }
+    crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
+    crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
     let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
         .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
@@ -1346,7 +1352,9 @@ fn extract_simple_single_pass(
         })?;
     }
 
+    crate::debug::emit_marker("SIMPLE_WAY_WRITE_END");
     // --- Phase 3: Classify relations + write (pread-from-workers) ---
+    crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
     // Relation classification needs full PrimitiveBlock (member access). Sequential scan.
     let mut matched_relation_ids = IdSetDense::new();
     {
@@ -1372,6 +1380,8 @@ fn extract_simple_single_pass(
             }
         }
     }
+    crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
+    crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
     let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
         .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
@@ -1389,6 +1399,7 @@ fn extract_simple_single_pass(
         })?;
     }
 
+    crate::debug::emit_marker("SIMPLE_REL_WRITE_END");
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_SCAN_END");
     Ok(stats)

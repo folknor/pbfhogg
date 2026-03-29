@@ -318,18 +318,35 @@ Previous commit data (commit `46f7388`):
 
 ## Extract
 
-Commit `1b10bfd`, plantasjen. Best of 3 runs, indexed PBFs.
+Commit `b95e5ab`, plantasjen. Best of 3 runs, indexed PBFs.
 
 | Dataset | Size | simple | complete | smart |
 |---------|------|--------|----------|-------|
 | Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms |
-| Japan | 2.4 GB | 11,643 ms | 12,213 ms | 13,893 ms |
+| Japan | 2.4 GB | **4,400 ms** | 12,213 ms | 13,893 ms |
+| Europe | 32.4 GB | **100s** | ~390s | ~460s |
 
-Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`.
+Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
+Europe full-continent bbox.
 
-Sorted pass1 optimization (commit `37b7c19`) impact on simple strategy:
+Simple extract uses a 3-phase barrier pipeline with parallel classification
+and raw frame passthrough. Each phase (nodes, ways, relations) classifies
+blobs in parallel then writes matching raw frames via pread workers — no
+decode+re-encode. Japan simple: 4.4s vs osmium 7.2s (1.6x faster). Europe
+simple: 100s (was 350s sequential, was OOM with pipelined reader).
+
+Europe simple phase breakdown (commit `b95e5ab`):
+- Node classify: 13s, Node write: 11s
+- Way classify: 6s, Way write: 40s
+- Rel classify: 13s, Rel write: 2s
+
+Complete and smart are unchanged — pread-from-workers write passes with
+full PrimitiveBlock lifecycle per worker.
+
+Historical: sorted pass1 optimization (commit `37b7c19`) impact on simple:
 Denmark -14% (2625→2259ms), Japan -8% (12,619→11,643ms). Single-pass
-classification on sorted input eliminates the second file read.
+classification on sorted input eliminates the second file read. Superseded
+by the parallel classify + raw frame passthrough architecture.
 
 ## Pipeline end-to-end
 

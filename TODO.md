@@ -118,15 +118,19 @@ Every production step validated on 87 GB planet PBF on a 30 GB host:
 Goal: fastest or equal on every PBF transform operation, with published
 benchmarks. The write path is the remaining frontier.
 
-### Raw group passthrough (priority 1)
+### Raw group passthrough
 
-Copy raw PrimitiveGroup bytes for groups where all elements are selected.
-Partial-match groups fall back to decode + re-encode. String table copied
-whole. Applies to every re-encoding command: extract, cat --type,
-tags-filter, sort, getid, renumber, time-filter.
+Raw frame passthrough is shipped for extract simple — the 3-phase barrier
+pipeline classifies blobs in parallel and writes matching raw frames via
+pread workers, bypassing decode+re-encode entirely. Simple extract now
+beats osmium (4.4s vs 7.2s Japan, 100s vs 350s Europe sequential baseline).
 
-Four primitives needed: `raw_group_bytes`, `raw_stringtable_bytes`,
-`classify_group`, `frame_raw_block`. Independent of read-path work.
+The remaining opportunity is extending raw group passthrough to other
+re-encoding commands: cat --type, tags-filter, getid, renumber, time-filter.
+These still fully decode and re-encode via BlockBuilder. The four primitives
+(`raw_group_bytes`, `raw_stringtable_bytes`, `classify_group`,
+`frame_raw_block`) apply here. Less critical now that the highest-impact
+command (extract simple) is already faster than osmium.
 See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
 
 ### Write-path throughput
@@ -164,6 +168,9 @@ temp disk, compression mode. Regression CI to prevent backsliding.
   `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.
   Only triggers with `--force` on non-indexed PBFs. Niche but the last
   unmitigated retention path.
+- [ ] Extract relation classify parallelization — rel classify is 13s at
+  Europe scale (13% of simple extract total 100s). Could parallelize but
+  marginal return given it's the smallest phase.
 
 ## Milestone 3: Beyond the benchmark
 

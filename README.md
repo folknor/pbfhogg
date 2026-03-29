@@ -201,15 +201,15 @@ CLI commands — Denmark (487 MB, 59M elements, commit `6fc1283`, osmium from `2
 
 Filter commands (cat, tags-filter, inspect tags, getid) use parallel element processing — each rayon thread owns a `BlockBuilder` and processes decoded blocks in parallel, then results are written sequentially. PBFs with blob-level indexdata skip decompression of irrelevant blob types; PBFs with tagdata additionally skip blobs that provably lack required tag keys. Apply-changes uses blob passthrough (zero decode for unmodified blobs). Sort uses streaming sweep merge — for sorted inputs with indexdata, blobs pass through as raw bytes; unsorted inputs use blob-level permutation. add-locations-to-ways uses parallel node index building (batch-and-dispatch to rayon) and blob passthrough for unchanged node/relation blobs on indexed PBFs.
 
-Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `23862d1`):
+Extract — Japan (2.4 GB, 344M elements, Tokyo bbox, commit `b95e5ab`):
 
 | Strategy | pbfhogg | osmium | ratio |
 |----------|---------|--------|-------|
-| simple | 12.9s | **7.2s** | 1.79x |
+| simple | **4.4s** | 7.2s | **1.6x faster** |
 | complete-ways | 13.3s | **11.0s** | 1.21x |
 | smart | 14.9s | **13.4s** | 1.11x |
 
-Extract uses pipelined parallel decoding with metadata skipping in scan-only passes. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Complete-ways and smart are within 10-16% of osmium. Simple uses a single-pass fast path on sorted inputs (`Sort.Type_then_ID`) — classify and write in one file scan — and falls back to two passes on unsorted inputs. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
+Simple extract uses a 3-phase barrier pipeline with parallel classification and raw frame passthrough — each phase (nodes, ways, relations) classifies blobs in parallel then writes matching raw frames via pread workers. No decode+re-encode for matching blobs. Complete-ways and smart use pread-from-workers write passes with full PrimitiveBlock lifecycle per worker. Smart Pass 2 (way dependency resolution) iterates only way groups, skipping all node and relation blocks. Spatial blob filtering skips decompression of node blobs outside the extract region when indexdata is present.
 
 Apply-changes with `--locations-on-ways` — Denmark (501 MB with LocationsOnWays, daily diff, commit `e7bbfa2`):
 

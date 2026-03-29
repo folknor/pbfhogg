@@ -292,32 +292,93 @@ fn filter_by_id(
         return filter_by_id_invert(input, output, ids, compression, direct_io, overrides);
     }
 
+    use crate::blob::{decode_blob_to_headerblock, BlobKind};
+    use crate::file_reader::FileReader;
+    use super::read_raw_frame;
+
     crate::debug::emit_marker("GETID_SCAN_START");
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
-    // Skip blob types with no matching IDs.
-    let reader = reader.with_blob_filter(BlobFilter::new(
-        !ids.node_ids.is_empty(),
-        !ids.way_ids.is_empty(),
-        !ids.relation_ids.is_empty(),
-    ));
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
+
+    let header_bytes = {
+        let mut reader = FileReader::open(input, direct_io)?;
+        let mut file_offset: u64 = 0;
+        let mut hdr_bytes = None;
+        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+            if frame.blob_type == BlobKind::OsmHeader {
+                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                super::warn_locations_on_ways_loss(&header);
+                hdr_bytes = Some(super::build_output_header(&header, true, overrides, |hb| hb)?);
+                break;
+            }
+        }
+        hdr_bytes.ok_or("no OSMHeader blob found")?
+    };
+
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
     let mut stats = GetidStats {
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
     };
+    let blob_filter = BlobFilter::new(
+        !ids.node_ids.is_empty(),
+        !ids.way_ids.is_empty(),
+        !ids.relation_ids.is_empty(),
+    );
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-            let (nodes, ways, relations) = process_filter_batch(
-                batch, &mut writer, ids, true, None, false,
-            )?;
-            stats.nodes_written += nodes;
-            stats.ways_written += ways;
-            stats.relations_written += relations;
-            Ok(())
-        })?;
+    let mut reader = FileReader::open(input, direct_io)?;
+    let mut file_offset: u64 = 0;
+    let mut blobs_skipped: u64 = 0;
 
+    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+        match &frame.blob_type {
+            BlobKind::OsmHeader => {}
+            BlobKind::OsmData => {
+                if let Some(ref idx) = frame.index {
+                    // Skip blob types with no matching IDs.
+                    if !blob_filter.wants_index(idx) {
+                        blobs_skipped += 1;
+                        continue;
+                    }
+                    // Skip blobs whose ID range has no intersection with requested IDs.
+                    let has_match = match idx.kind {
+                        crate::blob_index::ElemKind::Node =>
+                            ids_intersect_range(&ids.node_ids, idx.min_id, idx.max_id),
+                        crate::blob_index::ElemKind::Way =>
+                            ids_intersect_range(&ids.way_ids, idx.min_id, idx.max_id),
+                        crate::blob_index::ElemKind::Relation =>
+                            ids_intersect_range(&ids.relation_ids, idx.min_id, idx.max_id),
+                    };
+                    if !has_match {
+                        blobs_skipped += 1;
+                        continue;
+                    }
+                }
+                // Blob might contain matching IDs: decode and filter.
+                let blob_bytes = frame.blob_bytes();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                crate::blob::decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
+                let block = PrimitiveBlock::new(decompress_buf.into())?;
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
+                let (nodes, ways, relations) = process_block(
+                    &block, &mut bb, &mut output_blocks, ids, true, None, false,
+                ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                flush_local(&mut bb, &mut output_blocks)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                for (block_bytes, index, tagdata) in output_blocks {
+                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+                stats.nodes_written += nodes;
+                stats.ways_written += ways;
+                stats.relations_written += relations;
+            }
+            _ => {}
+        }
+    }
+
+    if blobs_skipped > 0 {
+        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
+    }
     writer.flush()?;
     crate::debug::emit_marker("GETID_SCAN_END");
     Ok(stats)

@@ -26,31 +26,15 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   alternatives (`paralight`, `orx-parallel`, `chili`, `forte`, `spindle`).
   Revisit only if rayon becomes a proven bottleneck.
 
-- [ ] **Extract sorted pass1 (`37b7c19`): benchmark and clean up.** Parallelizes
-  way/relation ID collection for sorted PBFs by batching blocks and using
-  `par_iter` with thread-local Vecs. Algorithm is correct but has open issues:
-  1. ~~**No benchmark data.**~~ Benchmarked (commit `1b10bfd`): Denmark simple
-     2259ms (-14% from 2625ms baseline), Japan simple 11,643ms (-8% from
-     12,619ms). Sorted pass1 optimization validated — single-pass eliminates
-     second file read. Full results in `notes/performance.md`.
-  2. ~~**~300 lines of duplication** between `collect_pass1` and `collect_pass1_smart`.~~
-     Refactored into `collect_pass1_generic<H: RelationHandler>` with
-     `CompleteRelationHandler` (no-op) and `SmartRelationHandler` (collects
-     extra way/node IDs). Net -144 lines. Verified via `brokkr verify extract`.
-  3. ~~**`Mixed | Empty` handler is a full sequential fallback.**~~
-     Split Empty from Mixed (commit `ff29c1f`). Empty blocks now skip without
-     flushing batches. Mixed blocks retain sequential fallback — rare in
-     production PBFs, not worth parallelizing (perf reviewer consensus).
-  4. ~~**Vec-per-block allocation in batch helpers.**~~ Closed. Alloc profiling
-     showed 1.7 GB cumulative churn (52% of extract budget), but RSS stayed
-     under 200 MB — the allocator recycles pages efficiently. Three fix
-     attempts failed: IdSetDense fold+merge (15x wall time regression,
-     merge is O(id_space)), Vec fold (rayon splits at same granularity,
-     no reduction), map_init (can't return ownership without losing capacity).
-     The original per-block Vec pattern is the correct tradeoff.
-  5. **`decode_threads(1)` may under-utilize.** Reduces pipeline decode to one
-     thread since the consumer does its own parallelism. Sensible tradeoff but
-     may leave the I/O thread idle waiting for the single decoder.
+- [x] **Extract sorted pass1 (`37b7c19`): benchmark and clean up.** Superseded
+  by three-phase parallel pread classification in `collect_pass1_generic`.
+  The old sequential BlobReader + batch-rayon-merge approach
+  (`merge_way_batch_parallel`, `merge_relation_batch_parallel`, etc.) has been
+  removed. `collect_pass1_generic` now uses `parallel_classify_phase` for each
+  element type (nodes → ways → relations). Japan complete: 19.7s → 4.8s (4.1x),
+  smart: 24.3s → 9.0s (2.7x). All sub-issues (1-5) are moot — the batch
+  helpers, Vec-per-block allocation, and `decode_threads(1)` tradeoff no longer
+  exist in the new architecture.
 
 - [x] **`merge --locations-on-ways`: parallelize Phase 2.5 blob scans** —
   Passthrough node blob decompression dispatched to rayon pool. At Denmark
@@ -157,11 +141,12 @@ from simple extract applies to any sequential collection pass:
 - [x] **tags-filter two-pass pass 1** — parallel classification for pass 1.
   Europe: 363s → 39s pass 1, 158s total (-57%). Pass 1 uses parallel
   pread + decompress + tag check. Closure+deps 88s, pass 2 write 31s.
-- [ ] **extract complete/smart pass 1** — `collect_pass1_generic` in
-  `src/commands/extract.rs` scans for bbox nodes + matching ways +
-  matching relations. Currently sequential BlobReader. The sorted path
-  uses `decode_threads(1)`. Parallel classification would speed up the
-  collection phase (currently ~100-150s at Europe for complete).
+- [x] **extract complete/smart pass 1** — `collect_pass1_generic` in
+  `src/commands/extract.rs` now uses three-phase parallel pread
+  classification (nodes → ways → relations). Japan: complete
+  19,701ms → 4,816ms (4.1x), smart 24,300ms → 8,976ms (2.7x).
+  Uses the `parallel_classify_phase` helper (reusable for other
+  commands). Verified via `brokkr verify extract` (all strategies pass).
 - [ ] **getid --add-referenced pass 1** — scans ways for ref collection.
   Currently sequential BlobReader. Workers scan refs in parallel, same
   pattern as the way classify phase in simple extract.
@@ -246,6 +231,71 @@ become GeoJSON properties) needs a configuration model.
 - [ ] API documentation for library consumers.
 - [ ] PyO3 Python bindings (read/write API for the Python ecosystem).
 - [ ] Packaged "planet on 32 GB" reference pipeline (documented, runnable).
+
+### Non-traditional optimization exploration
+
+- [ ] **Columnar batch processing** — Decode PrimitiveBlock fields into separate
+  contiguous arrays (all IDs, then all lats, then all lons) instead of
+  element-by-element. Contiguous arrays are friendlier to hardware prefetchers,
+  enable autovectorization for coordinate math (bbox checks as packed
+  comparisons), and reduce cache misses from interleaved access patterns.
+  Primary candidates: dense node decoding in `src/read/block.rs`, coordinate
+  processing in extract bbox classification, ALTW node scans. The tag path
+  is harder (variable-length strings) but tag key indices could be columnar.
+
+- [ ] **Custom allocators (per-block arena)** — PrimitiveBlock decoding allocates
+  many small, short-lived objects (tag strings, ref vecs, string table entries)
+  that all die together when the block is done. A bump/arena allocator per block
+  decode would make allocation nearly free (pointer bump) and deallocation instant
+  (reset the arena). Candidates: string table construction in `block.rs`,
+  `Element` tag storage, `Way` ref vectors. Rust options: `bumpalo` for
+  lifetime-scoped arenas, or a simple `Vec<u8>` bump allocator for byte slices.
+  Measure current alloc overhead with `brokkr <command> --alloc` first to
+  quantify the opportunity before committing to the complexity.
+
+- [ ] **GPU-accelerated point-in-polygon for geocode builder** — Pass 2 of the
+  geocode builder tests billions of nodes against admin boundary polygons.
+  This is a classic "many points, few polygons" workload that GPUs excel at.
+  NVIDIA's cuSpatial (`rapidsai/cuspatial`) has production-quality PIP using
+  winding number algorithm, handles complex polygons with holes correctly.
+  The polygon set is small (~100 MB of admin boundary geometry, uploaded
+  once), the point set is huge (planet: 2.5B nodes streamed in batches).
+  Published benchmarks show 40-200x speedup over CPU for this pattern.
+  Rust interop via `cudarc` crate: write CUDA kernels in `.cu`, compile
+  to PTX, load and launch from Rust. Feature-gate behind a `cuda` feature
+  flag (same pattern as `linux-io-uring`). Depends on columnar batch
+  processing (contiguous coordinate arrays for efficient host-to-device
+  transfer). PCIe 4.0 x16 gives ~25 GB/s — at planet scale (~56 GB of
+  node coordinates) streaming is required since data exceeds GPU memory
+  on most cards. Only worthwhile at Europe/planet scale; Denmark is too
+  small (transfer overhead dominates). No precedent in OSM tooling —
+  osmium, Planetiler, osm2pgsql are all CPU-only.
+
+- [ ] **NUMA-aware memory placement** — On multi-socket servers, cross-socket
+  memory traffic kills throughput for planet-scale workloads. Currently rayon
+  decodes blocks on arbitrary cores and consumers may run on different sockets,
+  causing implicit cross-socket data migration. The "born-local" approach
+  (inspired by [forkrun](https://github.com/jkool702/forkrun)): use
+  `set_mempolicy(MPOL_BIND)` or `mbind()` to pin allocations to the NUMA
+  node where the consuming worker lives, ensuring decoded PrimitiveBlocks
+  stay socket-local. Candidates: pipelined reader's decode pool (pin decode
+  workers and their output buffers to the same node as the consumer),
+  dense ALTW index (interleave or partition across nodes), external join
+  scatter buffers (node-local temp allocations). Also consider
+  `fallocate(PUNCH_HOLE)` on external join scratch files to reclaim disk
+  behind completed stages without waiting for full file deletion. Measure
+  with `numastat -p` and `perf stat -e node-load-misses` to quantify
+  cross-socket traffic before investing. Linux-only, gated on
+  `target_os = "linux"`.
+
+- [ ] **Huge pages for large mmap'd structures** — `MAP_HUGETLB` (2 MB pages)
+  reduces TLB misses when scanning multi-GB memory-mapped regions. Primary
+  candidates: dense ALTW index (`DenseMmapIndex`, up to 16 GB touched at
+  planet scale), geocode index mmap reader (19 files, largest cell arrays
+  are hundreds of MB), external join temp files. Requires transparent huge
+  pages (THP) or explicit `madvise(MADV_HUGEPAGE)` hints. Measure TLB miss
+  rates with `perf stat -e dTLB-load-misses` before and after. Linux-only,
+  gated on `target_os = "linux"`.
 
 ### Research / stretch ideas
 

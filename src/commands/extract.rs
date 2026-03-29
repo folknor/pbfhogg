@@ -1578,125 +1578,88 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1 ID collection helpers
+// Pass 1: parallel classification helper
 // ---------------------------------------------------------------------------
 
-#[hotpath::measure]
-fn merge_way_batch_parallel(
-    batch: &[PrimitiveBlock],
-    bbox_node_ids: &IdSetDense,
-    matched_way_ids: &mut IdSetDense,
-    all_way_node_ids: &mut IdSetDense,
-) {
-    // Per-worker aggregate Vecs via fold: one (Vec, Vec) per rayon worker
-    // accumulates across all blocks in the batch. ~6 Vecs instead of ~64
-    // (one per block), cutting allocation churn ~10x while keeping
-    // O(matched_elements) work (no IdSetDense::merge).
-    let partials: Vec<(Vec<i64>, Vec<i64>)> = batch
-        .par_iter()
-        .fold(
-            || (Vec::new(), Vec::new()),
-            |(mut local_way_ids, mut local_node_ids), block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(w) = &element
-                        && w.refs().any(|r| bbox_node_ids.get(r))
-                    {
-                        local_way_ids.push(w.id());
-                        local_node_ids.extend(w.refs());
-                    }
-                }
-                (local_way_ids, local_node_ids)
-            },
-        )
-        .collect();
+/// Run a parallel classification phase: pread workers decompress and classify
+/// blobs, sending compact results to a consumer that merges them into ID sets.
+///
+/// Each entry in `schedule` is `(seq, data_offset, data_size)`. Workers pread
+/// the compressed blob data, decompress, build a `PrimitiveBlock`, run the
+/// `classify` closure, and send the result. The consumer calls `merge` for
+/// each result. No reorder buffer — ID set merges are order-independent.
+fn parallel_classify_phase<R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    classify: impl Fn(&PrimitiveBlock) -> R + Send + Sync,
+    mut merge: impl FnMut(R),
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
 
-    for (way_ids, node_ids) in partials {
-        for id in way_ids {
-            matched_way_ids.set(id);
-        }
-        for id in node_ids {
-            all_way_node_ids.set(id);
-        }
-    }
-}
+    if schedule.is_empty() { return Ok(()); }
 
-#[hotpath::measure]
-fn merge_relation_batch_parallel(
-    batch: &[PrimitiveBlock],
-    bbox_node_ids: &IdSetDense,
-    matched_way_ids: &IdSetDense,
-    matched_relation_ids: &mut IdSetDense,
-) {
-    let partials: Vec<Vec<i64>> = batch
-        .par_iter()
-        .fold(
-            Vec::new,
-            |mut local, block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                    {
-                        local.push(r.id());
-                    }
-                }
-                local
-            },
-        )
-        .collect();
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
 
-    for relation_ids in partials {
-        for id in relation_ids {
-            matched_relation_ids.set(id);
-        }
-    }
-}
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
 
-#[hotpath::measure]
-fn merge_relation_batch_smart_parallel(
-    batch: &[PrimitiveBlock],
-    bbox_node_ids: &IdSetDense,
-    matched_way_ids: &IdSetDense,
-    matched_relation_ids: &mut IdSetDense,
-    extra_way_ids: &mut IdSetDense,
-    extra_node_ids: &mut IdSetDense,
-) {
-    let partials: Vec<(Vec<i64>, Vec<i64>, Vec<i64>)> = batch
-        .par_iter()
-        .fold(
-            || (Vec::new(), Vec::new(), Vec::new()),
-            |(mut local_rels, mut local_ways, mut local_nodes), block| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Relation(r) = &element
-                        && relation_has_matched_member(r, bbox_node_ids, matched_way_ids)
-                    {
-                        local_rels.push(r.id());
-                        if is_smart_relation(r) {
-                            for m in r.members() {
-                                match m.id {
-                                    MemberId::Way(id) => local_ways.push(id),
-                                    MemberId::Node(id) => local_nodes.push(id),
-                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
-                                }
-                            }
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for &item in schedule {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let classify_ref = &classify;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
                         }
-                    }
-                }
-                (local_rels, local_ways, local_nodes)
-            },
-        )
-        .collect();
+                    };
 
-    for (relation_ids, way_ids, node_ids) in partials {
-        for id in relation_ids {
-            matched_relation_ids.set(id);
+                    let r: crate::error::Result<R> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec(
+                            std::mem::take(&mut decompress_buf)
+                        )?;
+                        let result = classify_ref(&block);
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+                        Ok(result)
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
         }
-        for id in way_ids {
-            extra_way_ids.set(id);
+        drop(desc_rx);
+        drop(result_tx);
+
+        for (_seq, result) in result_rx {
+            let r = result?;
+            merge(r);
         }
-        for id in node_ids {
-            extra_node_ids.set(id);
-        }
-    }
+        Ok(())
+    })?;
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1718,34 +1681,27 @@ struct Pass1Result {
 /// - `SmartRelationHandler`: additionally collects way/node member IDs from
 ///   multipolygon/boundary relations
 trait RelationHandler {
+    /// Whether workers should collect extra way/node member IDs from smart
+    /// relations (multipolygon/boundary). Compile-time constant — the compiler
+    /// eliminates the dead branch in `CompleteRelationHandler`.
+    const COLLECT_MEMBER_IDS: bool;
+
     /// Process a single matched relation in the unsorted/mixed fallback path.
     /// Called after the relation ID has already been added to `matched_relation_ids`.
     fn handle_relation(&mut self, r: &crate::Relation);
 
-    /// Merge a batch of relation blocks in parallel (sorted path).
-    fn merge_relation_batch(
-        &mut self,
-        batch: &[PrimitiveBlock],
-        bbox_node_ids: &IdSetDense,
-        matched_way_ids: &IdSetDense,
-        matched_relation_ids: &mut IdSetDense,
-    );
+    /// Merge extra way/node IDs from parallel workers (sorted path phase 3).
+    fn merge_worker_extras(&mut self, extra_way_ids: Vec<i64>, extra_node_ids: Vec<i64>);
 }
 
 struct CompleteRelationHandler;
 
 impl RelationHandler for CompleteRelationHandler {
+    const COLLECT_MEMBER_IDS: bool = false;
+
     fn handle_relation(&mut self, _r: &crate::Relation) {}
 
-    fn merge_relation_batch(
-        &mut self,
-        batch: &[PrimitiveBlock],
-        bbox_node_ids: &IdSetDense,
-        matched_way_ids: &IdSetDense,
-        matched_relation_ids: &mut IdSetDense,
-    ) {
-        merge_relation_batch_parallel(batch, bbox_node_ids, matched_way_ids, matched_relation_ids);
-    }
+    fn merge_worker_extras(&mut self, _extra_way_ids: Vec<i64>, _extra_node_ids: Vec<i64>) {}
 }
 
 struct SmartRelationHandler {
@@ -1763,6 +1719,8 @@ impl SmartRelationHandler {
 }
 
 impl RelationHandler for SmartRelationHandler {
+    const COLLECT_MEMBER_IDS: bool = true;
+
     fn handle_relation(&mut self, r: &crate::Relation) {
         if is_smart_relation(r) {
             for m in r.members() {
@@ -1775,21 +1733,13 @@ impl RelationHandler for SmartRelationHandler {
         }
     }
 
-    fn merge_relation_batch(
-        &mut self,
-        batch: &[PrimitiveBlock],
-        bbox_node_ids: &IdSetDense,
-        matched_way_ids: &IdSetDense,
-        matched_relation_ids: &mut IdSetDense,
-    ) {
-        merge_relation_batch_smart_parallel(
-            batch,
-            bbox_node_ids,
-            matched_way_ids,
-            matched_relation_ids,
-            &mut self.extra_way_ids,
-            &mut self.extra_node_ids,
-        );
+    fn merge_worker_extras(&mut self, extra_way_ids: Vec<i64>, extra_node_ids: Vec<i64>) {
+        for id in extra_way_ids {
+            self.extra_way_ids.set(id);
+        }
+        for id in extra_node_ids {
+            self.extra_node_ids.set(id);
+        }
     }
 }
 
@@ -1870,165 +1820,134 @@ fn collect_pass1_generic<H: RelationHandler>(
         });
     }
 
-    let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
+    // Sorted path: parallel three-phase classification via pread-from-workers.
+    // Phase 1: nodes (bbox check) → bbox_node_ids
+    // Phase 2: ways (ref check against bbox_node_ids) → matched_way_ids + all_way_node_ids
+    // Phase 3: relations (member check) → matched_relation_ids + handler extras
+    drop(blob_reader);
+    drop(decompress_pool);
+
+    // Build per-type schedules from header-only scan.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut relation_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
             if !filter.wants_index(&idx) { continue; }
+            match idx.kind {
+                crate::blob_index::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
+                crate::blob_index::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
+                crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+            }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        match block.block_type() {
-            BlockType::DenseNodes | BlockType::Nodes => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
+        seq += 1;
+    }
+    drop(scanner);
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    // Phase 1: Classify nodes by region containment.
+    parallel_classify_phase(
+        &shared_file,
+        &node_schedule,
+        |block| {
+            let mut ids = Vec::new();
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn)
+                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                    {
+                        ids.push(dn.id());
+                    }
+                    Element::Node(n)
+                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                    {
+                        ids.push(n.id());
+                    }
+                    _ => {}
                 }
-                if !relation_batch.is_empty() {
-                    handler.merge_relation_batch(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(dn.id());
-                        }
-                        Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(n.id());
-                        }
-                        _ => {}
+            }
+            ids
+        },
+        |ids| {
+            for id in ids {
+                bbox_node_ids.set(id);
+            }
+        },
+    )?;
+
+    // Phase 2: Classify ways by ref intersection with bbox nodes.
+    parallel_classify_phase(
+        &shared_file,
+        &way_schedule,
+        |block| {
+            let mut way_ids = Vec::new();
+            let mut node_ids = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element {
+                    if w.refs().any(|r| bbox_node_ids.get(r)) {
+                        way_ids.push(w.id());
+                        node_ids.extend(w.refs());
                     }
                 }
             }
-            BlockType::Ways => {
-                if !relation_batch.is_empty() {
-                    handler.merge_relation_batch(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                way_batch.push(block);
-                if way_batch.len() >= BATCH_SIZE {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
+            (way_ids, node_ids)
+        },
+        |(way_ids, node_ids)| {
+            for id in way_ids {
+                matched_way_ids.set(id);
             }
-            BlockType::Relations => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-                relation_batch.push(block);
-                if relation_batch.len() >= BATCH_SIZE {
-                    handler.merge_relation_batch(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
+            for id in node_ids {
+                all_way_node_ids.set(id);
             }
-            BlockType::Empty => {
-                // Empty blocks have no elements — skip without flushing batches.
-            }
-            BlockType::Mixed => {
-                if !way_batch.is_empty() {
-                    merge_way_batch_parallel(
-                        &way_batch,
-                        &bbox_node_ids,
-                        &mut matched_way_ids,
-                        &mut all_way_node_ids,
-                    );
-                    way_batch.clear();
-                }
-                if !relation_batch.is_empty() {
-                    handler.merge_relation_batch(
-                        &relation_batch,
-                        &bbox_node_ids,
-                        &matched_way_ids,
-                        &mut matched_relation_ids,
-                    );
-                    relation_batch.clear();
-                }
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(dn.id());
-                        }
-                        Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                        {
-                            bbox_node_ids.set(n.id());
-                        }
-                        Element::Way(w)
-                            if w.refs().any(|r| bbox_node_ids.get(r)) =>
-                        {
-                            matched_way_ids.set(w.id());
-                            for r in w.refs() {
-                                all_way_node_ids.set(r);
+        },
+    )?;
+
+    // Phase 3: Classify relations by member intersection.
+    let collect_member_ids = H::COLLECT_MEMBER_IDS;
+    parallel_classify_phase(
+        &shared_file,
+        &relation_schedule,
+        |block| {
+            let mut rel_ids = Vec::new();
+            let mut extra_way_ids: Vec<i64> = Vec::new();
+            let mut extra_node_ids: Vec<i64> = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element {
+                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
+                        rel_ids.push(r.id());
+                        if collect_member_ids && is_smart_relation(r) {
+                            for m in r.members() {
+                                match m.id {
+                                    MemberId::Way(id) => extra_way_ids.push(id),
+                                    MemberId::Node(id) => extra_node_ids.push(id),
+                                    MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                }
                             }
                         }
-                        Element::Relation(r)
-                            if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) =>
-                        {
-                            matched_relation_ids.set(r.id());
-                            handler.handle_relation(r);
-                        }
-                        _ => {}
                     }
                 }
             }
-        }
-    }
-
-    if !way_batch.is_empty() {
-        merge_way_batch_parallel(
-            &way_batch,
-            &bbox_node_ids,
-            &mut matched_way_ids,
-            &mut all_way_node_ids,
-        );
-    }
-    if !relation_batch.is_empty() {
-        handler.merge_relation_batch(
-            &relation_batch,
-            &bbox_node_ids,
-            &matched_way_ids,
-            &mut matched_relation_ids,
-        );
-    }
+            (rel_ids, extra_way_ids, extra_node_ids)
+        },
+        |(rel_ids, extra_way_ids, extra_node_ids)| {
+            for id in rel_ids {
+                matched_relation_ids.set(id);
+            }
+            handler.merge_worker_extras(extra_way_ids, extra_node_ids);
+        },
+    )?;
 
     Ok(Pass1Result {
         bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,

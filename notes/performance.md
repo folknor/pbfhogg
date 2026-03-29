@@ -266,8 +266,8 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | inspect-nodes | 9.14s |
 | extract --simple | 9.36s |
 | check --ids | 10.4s |
-| extract --complete | 11.6s |
-| extract --smart | 12.9s |
+| extract --complete | 4.8s |
+| extract --smart | 9.0s |
 | tags-filter two-pass | 13.7s |
 | check --refs | 38.7s |
 | time-filter | 43.8s |
@@ -318,13 +318,13 @@ Previous commit data (commit `46f7388`):
 
 ## Extract
 
-Commit `b95e5ab`, plantasjen. Best of 3 runs, indexed PBFs.
+Plantasjen. Best of 3 runs, indexed PBFs.
 
 | Dataset | Size | simple | complete | smart |
 |---------|------|--------|----------|-------|
 | Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms |
-| Japan | 2.4 GB | **4,400 ms** | 12,213 ms | 13,893 ms |
-| Europe | 32.4 GB | **100s** | ~390s | ~460s |
+| Japan | 2.4 GB | **4,400 ms** | **4,816 ms** | **8,976 ms** |
+| Europe | 32.4 GB | **100s** | — | — |
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
 Europe full-continent bbox.
@@ -335,13 +335,19 @@ blobs in parallel then writes matching raw frames via pread workers — no
 decode+re-encode. Japan simple: 4.4s vs osmium 7.2s (1.6x faster). Europe
 simple: 100s (was 350s sequential, was OOM with pipelined reader).
 
+Complete-ways and smart pass 1 (`collect_pass1_generic`) uses three-phase
+parallel pread classification (nodes → ways → relations) via a reusable
+`parallel_classify_phase` helper. Workers pread + decompress + classify
+in parallel, sending compact results back to the consumer. Replaces the
+old sequential BlobReader + batch-rayon-merge approach. Japan complete:
+19.7s → 4.8s (4.1x), smart: 24.3s → 9.0s (2.7x). Both now beat osmium
+(complete 2.3x faster, smart 1.5x faster). Pass 2+ write passes remain
+pread-from-workers with full PrimitiveBlock lifecycle per worker.
+
 Europe simple phase breakdown (commit `b95e5ab`):
 - Node classify: 13s, Node write: 11s
 - Way classify: 6s, Way write: 40s
 - Rel classify: 13s, Rel write: 2s
-
-Complete and smart are unchanged — pread-from-workers write passes with
-full PrimitiveBlock lifecycle per worker.
 
 Historical: sorted pass1 optimization (commit `37b7c19`) impact on simple:
 Denmark -14% (2625→2259ms), Japan -8% (12,619→11,643ms). Single-pass

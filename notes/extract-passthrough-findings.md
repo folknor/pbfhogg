@@ -13,11 +13,13 @@ pread workers. No decode+re-encode — matching blobs are written as raw bytes.
 - Beats osmium: 4.4s vs 7.2s at Japan (1.6x faster)
 
 **Complete (two-pass):** Pass 1 classification via `collect_pass1_generic`
-(sequential BlobReader). Pass 2 write via `pread_write_pass` (workers own
-full PrimitiveBlock lifecycle).
+using three-phase parallel pread classification (nodes → ways → relations)
+via `parallel_classify_phase`. Pass 2 write via `pread_write_pass` (workers
+own full PrimitiveBlock lifecycle).
 
-**Smart (three-pass):** Pass 1 same as complete. Pass 2 way closure
-(sequential, mutates extra ID sets). Pass 3 write via `pread_write_pass`.
+**Smart (three-pass):** Pass 1 same as complete (parallel pread classification).
+Pass 2 way closure (sequential, mutates extra ID sets). Pass 3 write via
+`pread_write_pass`.
 
 ## Results
 
@@ -41,35 +43,44 @@ Way write dominates (40s / 40% of total) — raw frame I/O for the largest
 element type. Node and relation classify are 13s each. Relation write is
 trivial (2s) because few relations match a bbox extract.
 
-### Japan (2.4 GB, Tokyo bbox, commit `b95e5ab`)
+### Japan (2.4 GB, Tokyo bbox)
 
 | Strategy | pbfhogg | osmium | Ratio |
 |----------|---------|--------|-------|
 | simple | **4.4s** | 7.2s | **1.6x faster** |
-| complete | ~13s | 11.0s | 1.2x slower |
-| smart | ~15s | 13.4s | 1.1x slower |
+| complete | **4.8s** | 11.0s | **2.3x faster** |
+| smart | **9.0s** | 13.4s | **1.5x faster** |
 
 ### Improvement arc
 
 | Strategy | All-sequential | Pread (prev) | Parallel classify (current) |
 |----------|---------------|--------------|----------------------------|
 | simple (Europe) | 362s | 350s | **100s** (-72%) |
-| complete (Europe) | 553s | ~385s | ~390s (unchanged) |
-| smart (Europe) | 633s | ~450s | ~460s (unchanged) |
+| complete (Japan) | — | 19.7s | **4.8s** (-76%, 4.1x) |
+| smart (Japan) | — | 24.3s | **9.0s** (-63%, 2.7x) |
 
 The parallel classify + raw frame passthrough architecture delivered a 3.5x
-speedup for simple extract. Complete and smart are unchanged — they require
-full PrimitiveBlock decode for element-level filtering and re-encoding.
+speedup for simple extract. Complete and smart pass 1 now uses three-phase
+parallel pread classification via `parallel_classify_phase`, replacing the
+old sequential BlobReader + batch-rayon-merge approach. pbfhogg beats osmium
+on all three extract strategies.
 
-## How simple extract beats osmium
+## How extract beats osmium
 
-The key insight: for simple bbox extract on sorted PBFs with indexdata, the
+**Simple:** For simple bbox extract on sorted PBFs with indexdata, the
 classification decision (include/exclude) can be made at the blob level
 without decoding elements. Node blobs have bbox metadata in indexdata; way
 blobs need only a lightweight ref scan (no string table, no tags, no metadata
 decode). Matching blobs are written as raw compressed frames — zero
 decompression, zero re-compression. osmium must decompress every blob to
 inspect individual elements, then re-compress matching groups.
+
+**Complete/smart:** Pass 1 classification now uses three-phase parallel pread
+classification (nodes → ways → relations). Workers pread + decompress +
+classify blobs in parallel, sending compact results (matched IDs) back to
+the consumer. This replaces the old sequential BlobReader + batch-rayon-merge
+approach, which serialized I/O and classification. The parallelism delivers
+4.1x speedup for complete and 2.7x for smart.
 
 ## Remaining opportunities
 
@@ -79,7 +90,7 @@ inspect individual elements, then re-compress matching groups.
   renumber, time-filter still fully decode+re-encode. Extending the raw frame
   approach would help, but these commands need element-level filtering within
   groups (partial matches), making blob-level passthrough less applicable.
-- **Complete/smart write path:** Still decode+re-encode via BlockBuilder.
+- **Complete/smart write path:** Pass 2+ still decode+re-encode via BlockBuilder.
   Raw group passthrough would help for groups where all elements are selected.
 
 ## Infrastructure shipped

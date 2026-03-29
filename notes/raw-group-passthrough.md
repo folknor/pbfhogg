@@ -38,9 +38,12 @@ used by the blob-level approach):
 
 ### For extract
 
-- **Relation classify parallelization**: 13s at Europe (13% of 100s total).
+- **Relation classify parallelization**: 13s at Europe (13% of simple total).
   Marginal return.
-- **Complete/smart write paths**: still use pread-from-workers with full
+- **Complete/smart pass 1**: now uses three-phase parallel pread classification
+  via `parallel_classify_phase` (Japan complete 19.7s → 4.8s, smart 24.3s → 9.0s).
+  All three strategies now beat osmium.
+- **Complete/smart write paths (pass 2+)**: still use pread-from-workers with full
   decode + re-encode. Raw group passthrough would help for groups where
   all elements are selected, but complete/smart do element-level filtering
   (partial matches common), making blob-level passthrough less applicable.

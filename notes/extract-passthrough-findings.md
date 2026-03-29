@@ -1,99 +1,75 @@
-# Extract performance: findings and current state
+# Extract performance: final state
 
-## Current state (commit `de63fd7`)
+## Current architecture (commit `774d3c0`)
 
-Hybrid approach: sequential BlobReader for classification passes,
-pread-from-workers for write passes (complete pass 2, smart pass 3).
-Simple single-pass stays sequential (classification needs shared mutable state).
+Three strategies, each planet-safe with bounded memory:
+
+**Simple (sorted single-pass):** 3-phase barrier pipeline. Each phase:
+classify (lightweight scanner) → write (pread-from-workers).
+- Phase 1: node-only scanner for bbox IDs + pread write matching nodes
+- Phase 2: way-ref scanner against frozen bbox_node_ids + pread write
+- Phase 3: sequential relation classify + pread write
+
+**Complete (two-pass):** Pass 1 classification via `collect_pass1_generic`
+(sequential BlobReader). Pass 2 write via `pread_write_pass` (workers own
+full PrimitiveBlock lifecycle).
+
+**Smart (three-pass):** Pass 1 same as complete. Pass 2 way closure
+(sequential, mutates extra ID sets). Pass 3 write via `pread_write_pass`.
+
+## Results
 
 ### Europe (32.4 GB, full-continent bbox)
 
 | Strategy | Time | Anon peak | Planet-safe |
 |----------|------|----------|-------------|
-| simple | 357s | 2.4 GB | Yes |
-| complete | 382s | ~4 GB | Yes |
-| smart | 441s | 4.7 GB | Yes |
-
-### Improvement from pread-from-workers write passes
-
-| Strategy | All-sequential | Pread write passes | Improvement |
-|----------|---------------|-------------------|-------------|
-| simple | 362s | 357s | — (still sequential) |
-| complete | 553s | **382s** | **-31%** |
-| smart | 633s | **441s** | **-30%** |
+| simple | 350s | 2.7 GB | Yes |
+| complete | ~385s | ~4 GB | Yes |
+| smart | ~450s | ~5 GB | Yes |
 
 ### Japan (2.4 GB, Tokyo bbox)
 
-| Strategy | Original pipelined | Current | osmium |
-|----------|-------------------|---------|--------|
-| simple | 11.9s | ~20s | 7.2s |
-| complete | 12.9s | ~16s (est.) | 11.0s |
-| smart | 14.4s | ~18s (est.) | 13.4s |
+| Strategy | Current | osmium | Ratio |
+|----------|---------|--------|-------|
+| simple | 18.1s | 7.2s | 2.5x |
+| complete | ~16s | 11.0s | 1.5x |
+| smart | ~18s | 13.4s | 1.3x |
 
-## Architecture
+### Improvement from all-sequential baseline
 
-**Simple (sorted single-pass):** Sequential BlobReader. Classification mutates
-shared IdSetDense — can't parallelize. The full single-pass interleaves
-classify + write. Pread-from-workers would require splitting into workers
-sending classification results + consumer updating ID sets.
-
-**Complete (two passes):** Pass 1 (classification) uses `collect_pass1_generic`
-with sequential BlobReader. Pass 2 (write) uses **pread-from-workers**: workers
-own full PrimitiveBlock lifecycle (pread → decompress → extract_block_pass2 →
-OwnedBlocks). ID sets are read-only. Consumer reorders + writes.
-
-**Smart (three passes):** Pass 1 same as complete. Pass 2 (way closure)
-sequential — mutates extra_way_ids/extra_node_ids. Pass 3 (write) uses
-**pread-from-workers** same as complete pass 2 but with ExtractPass3IdSets.
-
-## Root cause investigation
-
-The pipelined reader (`into_blocks_pipelined`) caused 25+ GB retention at
-Europe scale from two sources:
-1. `WireStringTable::entries: Box<[(u32,u32)]>` — cross-thread alloc/free
-2. Decompressed `Bytes` buffer — cross-thread alloc/free when pool overflows
-
-### Experiments tried
-
-| Approach | Simple result | Complete result | Smart result |
-|----------|-------------|----------------|-------------|
-| Sequential BlobReader | 362s / 2.4 GB | 553s / 4.1 GB | 633s / 4.5 GB |
-| decode_ahead=4 | OOM 25.9 GB | — | — |
-| Inline entries (no pool) | 220s / 27.3 GB | 337s / OOM | — |
-| Inline entries + pool | 234s / 27.2 GB | 269s / 27.5 GB | OOM 27.6 GB |
-| Hybrid pipelined + seq | 224s / 27 GB | 269s / 27 GB | 507s mixed |
-| **Pread-from-workers write** | 357s / 2.4 GB | **382s / ~4 GB** | **441s / 4.7 GB** |
-
-### Key findings
-
-- **decode_ahead reduction doesn't help** — retention is cumulative across
-  all blobs, not bounded by the pipeline window.
-- **Inline entries eliminate Box retention** (~5 GB) but the ~2 MB
-  decompressed buffer retention remains dominant.
-- **Pool recycling helps** but 64 slots can't absorb 520K+ blobs.
-  Buffers that overflow the pool are freed cross-thread.
-- **Pread-from-workers is the real fix** — workers own the buffer lifecycle.
-  PrimitiveBlock created and dropped on the same thread. Only compact
-  OwnedBlocks cross the thread boundary.
-
-## Infrastructure shipped
-
-- **Inline string table entries** (wire.rs) — `WireStringTable` and
-  `group_ranges` entries appended as raw LE bytes in the decompressed
-  buffer. Zero separate Box allocations. Used by pipeline.rs for all
-  pipelined commands.
-- **Pool-recycled inline path** (blob.rs) — `to_primitiveblock_inline(&pool)`
-  uses DecompressPool for buffer recycling. On drop, Bytes returns Vec to
-  pool via PooledBuffer. Benefits all pipelined commands at moderate scale.
-- **Pread-from-workers for extract write passes** — complete pass 2 and
-  smart pass 3. Workers own full PrimitiveBlock lifecycle. Planet-safe.
+| Strategy | All-sequential | Current | Improvement |
+|----------|---------------|---------|-------------|
+| simple (Europe) | 362s | 350s | -3% |
+| complete (Europe) | 553s | ~385s | -30% |
+| smart (Europe) | 633s | ~450s | -29% |
 
 ## Remaining gap vs osmium
 
-Simple extract is the biggest gap (~2.75x at Japan). The sequential reader
-is the bottleneck — no parallel decode. Fixing this requires either:
-1. Pread-from-workers for classification (workers send compact results)
-2. The hybrid pipeline (PipelineOutput enum in pipeline.rs)
+Simple extract: 2.5x at Japan. The gap is structural — osmium copies raw
+protobuf group bytes for matching elements (zero-copy), pbfhogg fully decodes
+and re-encodes via BlockBuilder. Closing this requires raw group passthrough
+(different project from the pipeline/memory work).
 
-Both are significant infrastructure changes. Complete and smart are closer
-to osmium at larger scales where the multi-pass algorithm is competitive.
+Complete and smart are within 1.3-1.5x of osmium at Japan. The multi-pass
+algorithm overhead is competitive.
+
+## Infrastructure shipped
+
+- **Inline string table entries** (wire.rs) — unified inline-only path, branchless
+  get()/group(). Zero Box allocations per PrimitiveBlock.
+- **Pool-recycled inline path** (blob.rs) — pipeline uses pooled inline constructor.
+- **Per-worker DecompressPool** in pread_write_pass — zero alloc churn after warmup.
+- **Shared pread_write_pass helper** — schedule building + worker dispatch + reorder.
+  `pread_execute` for multi-phase use (no flush), `pread_write_pass` for single-use.
+- **build_blob_schedule** with ElemKind tags — partition by element type for phased execution.
+- **BlobBbox::contains** — blob-level full containment check.
+
+## Experiments tried (for the record)
+
+1. Sequential BlobReader — works, planet-safe, 30-118% slower
+2. decode_ahead=4 — no help (retention is cumulative)
+3. Inline entries (no pool) — eliminated Box retention, buffer retention remained
+4. Inline entries + pool — 27 GB anon, barely survived simple, OOM'd complete
+5. Hybrid pipelined simple/complete + sequential smart — fragile at 27 GB
+6. Pread-from-workers write passes — 30% faster for complete/smart, planet-safe
+7. 3-phase barrier pipeline for simple — marginal improvement, planet-safe

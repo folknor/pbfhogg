@@ -1851,13 +1851,20 @@ fn extract_smart(
     crate::debug::emit_marker("EXTRACT_PASS2_END");
 
     // --- Pass 3: Write matching elements in file order ---
+    // --- Pass 3: Write via pread-from-workers (same pattern as complete pass 2) ---
     crate::debug::emit_marker("EXTRACT_PASS3_START");
+    use std::os::unix::fs::FileExt as _;
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader.next()
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = header_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
+    drop(header_reader);
     super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
@@ -1878,22 +1885,104 @@ fn extract_smart(
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    let decompress_pool = crate::blob::DecompressPool::new();
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        batch.push(block);
-        if batch.len() >= BATCH_SIZE {
-            process_extract_pass3_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
-            batch.clear();
+    // Build blob schedule.
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq_num: usize = 0;
+    while let Some(r) = scanner.next_header_with_data_offset() {
+        let (hdr, data_offset, data_size) = r?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        schedule.push((seq_num, data_offset, data_size));
+        seq_num += 1;
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    type WorkerResult3 = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult3>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for (s, off, sz) in schedule {
+                if desc_tx.send((s, off, sz)).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            let ids_ref = &ids;
+            let clean_ref = clean;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = PrimitiveBlock::new(
+                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
+                        )?;
+                        output_blocks.clear();
+                        let block_stats = extract_block_pass3(
+                            &block, ids_ref, clean_ref, &mut bb, &mut output_blocks,
+                        ).map_err(|e| crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(e))
+                        ))?;
+                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
+                            crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            )
+                        })?;
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
         }
-    }
-    if !batch.is_empty() {
-        process_extract_pass3_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
-    }
+        drop(desc_rx);
+        drop(result_tx);
+
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+            while let Some(r) = reorder.pop_ready() {
+                let (blocks, block_stats) = r?;
+                merge_extract_stats(&mut stats, &block_stats);
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    })?;
 
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_PASS3_END");

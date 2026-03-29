@@ -701,6 +701,136 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
     target.relations_written += source.relations_written;
 }
 
+/// Shared pread-from-workers write pass used by complete pass 2 and smart pass 3.
+///
+/// Workers pread blob data from a shared file descriptor, decompress, parse into
+/// `PrimitiveBlock`, call the provided `block_fn` closure to extract matching
+/// elements, and send `OwnedBlock`s back for ordered writing.
+///
+/// The closure captures the caller's ID sets and clean reference.
+fn pread_write_pass<F>(
+    input: &Path,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    block_fn: F,
+) -> Result<()>
+where
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+{
+    use std::os::unix::fs::FileExt as _;
+
+    // Header-only scan to build the blob schedule. Uses buffered I/O (not O_DIRECT)
+    // because this is a small sequential scan of blob headers only — O_DIRECT would
+    // add alignment overhead with negligible benefit.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    // Build blob schedule from header-only scan.
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+
+    // Shared file for pread. Uses buffered (non-O_DIRECT) I/O because O_DIRECT
+    // requires aligned buffers for pread, which we don't have — our read buffers
+    // are plain Vec<u8> without alignment guarantees.
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule.
+        scope.spawn(move || {
+            for (s, off, sz) in schedule {
+                if desc_tx.send((s, off, sz)).is_err() { break; }
+            }
+        });
+
+        // Workers: pread → decompress → PrimitiveBlock → extract → OwnedBlocks.
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            let block_fn_ref = &block_fn;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+                        output_blocks.clear();
+                        let block_stats = block_fn_ref(
+                            &block, &mut bb, &mut output_blocks,
+                        ).map_err(|e| crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(e))
+                        ))?;
+                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
+                            crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            )
+                        })?;
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        // Consumer: reorder + write.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+            while let Some(r) = reorder.pop_ready() {
+                let (blocks, block_stats) = r?;
+                merge_extract_stats(stats, &block_stats);
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    writer.flush()?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Simple strategy (single pass for sorted inputs, two-pass fallback for unsorted)
 // ---------------------------------------------------------------------------
@@ -1055,16 +1185,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     crate::debug::emit_marker("EXTRACT_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
-    // Workers own the full PrimitiveBlock lifecycle: pread → decompress →
-    // PrimitiveBlock → extract_block_pass2 → OwnedBlocks. No cross-thread
-    // PrimitiveBlock or decompressed buffer retention. ID sets are read-only.
     crate::debug::emit_marker("EXTRACT_PASS2_START");
-    use std::os::unix::fs::FileExt;
-
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
     let header_blob = header_reader.next()
@@ -1089,110 +1210,10 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    // Build blob schedule from header-only scan.
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new(); // (seq, offset, size)
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
-
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-
-    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
-
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed schedule.
-        scope.spawn(move || {
-            for (s, off, sz) in schedule {
-                if desc_tx.send((s, off, sz)).is_err() { break; }
-            }
-        });
-
-        // Workers: pread → decompress → PrimitiveBlock → extract → OwnedBlocks.
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = result_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            let ids_ref = &ids;
-            let clean_ref = clean;
-            scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-
-                loop {
-                    let (s, data_offset, data_size) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-
-                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::new(
-                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
-                        )?;
-                        output_blocks.clear();
-                        let block_stats = extract_block_pass2(
-                            &block, ids_ref, clean_ref, &mut bb, &mut output_blocks,
-                        ).map_err(|e| crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(e))
-                        ))?;
-                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            )
-                        })?;
-                        if decompress_buf.capacity() == 0 {
-                            decompress_buf = Vec::new();
-                        }
-                        Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })();
-                    if tx.send((s, r)).is_err() { break; }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(result_tx);
-
-        // Consumer: reorder + write.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>
-        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
-
-        for (s, item) in result_rx {
-            reorder.push(s, item);
-            while let Some(r) = reorder.pop_ready() {
-                let (blocks, block_stats) = r?;
-                merge_extract_stats(&mut stats, &block_stats);
-                for (block_bytes, index, tagdata) in blocks {
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-                }
-            }
-        }
-        Ok(())
+    pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
+        extract_block_pass2(block, &ids, clean, bb, output_blocks)
     })?;
 
-    writer.flush()?;
     crate::debug::emit_marker("EXTRACT_PASS2_END");
     Ok(stats)
 }
@@ -1851,14 +1872,8 @@ fn extract_smart(
     crate::debug::emit_marker("EXTRACT_PASS2_END");
 
     // --- Pass 3: Write matching elements in file order ---
-    // --- Pass 3: Write via pread-from-workers (same pattern as complete pass 2) ---
+    // --- Pass 3: Write matching elements via pread-from-workers ---
     crate::debug::emit_marker("EXTRACT_PASS3_START");
-    use std::os::unix::fs::FileExt as _;
-
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
     let header_blob = header_reader.next()
@@ -1885,106 +1900,10 @@ fn extract_smart(
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    // Build blob schedule.
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq_num: usize = 0;
-    while let Some(r) = scanner.next_header_with_data_offset() {
-        let (hdr, data_offset, data_size) = r?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        schedule.push((seq_num, data_offset, data_size));
-        seq_num += 1;
-    }
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
-
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-
-    type WorkerResult3 = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult3>(32);
-
-    std::thread::scope(|scope| -> Result<()> {
-        scope.spawn(move || {
-            for (s, off, sz) in schedule {
-                if desc_tx.send((s, off, sz)).is_err() { break; }
-            }
-        });
-
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = result_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            let ids_ref = &ids;
-            let clean_ref = clean;
-            scope.spawn(move || {
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-
-                loop {
-                    let (s, data_offset, data_size) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-                    let r: crate::error::Result<(Vec<OwnedBlock>, ExtractStats)> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::new(
-                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
-                        )?;
-                        output_blocks.clear();
-                        let block_stats = extract_block_pass3(
-                            &block, ids_ref, clean_ref, &mut bb, &mut output_blocks,
-                        ).map_err(|e| crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(e))
-                        ))?;
-                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
-                            crate::error::new_error(
-                                crate::error::ErrorKind::Io(std::io::Error::other(e))
-                            )
-                        })?;
-                        if decompress_buf.capacity() == 0 {
-                            decompress_buf = Vec::new();
-                        }
-                        Ok((std::mem::take(&mut output_blocks), block_stats))
-                    })();
-                    if tx.send((s, r)).is_err() { break; }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(result_tx);
-
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>
-        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
-
-        for (s, item) in result_rx {
-            reorder.push(s, item);
-            while let Some(r) = reorder.pop_ready() {
-                let (blocks, block_stats) = r?;
-                merge_extract_stats(&mut stats, &block_stats);
-                for (block_bytes, index, tagdata) in blocks {
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-                }
-            }
-        }
-        Ok(())
+    pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
+        extract_block_pass3(block, &ids, clean, bb, output_blocks)
     })?;
 
-    writer.flush()?;
     crate::debug::emit_marker("EXTRACT_PASS3_END");
     Ok(stats)
 }

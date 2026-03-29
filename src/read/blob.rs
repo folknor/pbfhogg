@@ -1240,53 +1240,6 @@ pub(crate) fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Resul
     crate::HeaderBlock::parse_from_bytes(&raw)
 }
 
-/// Decompress a blob's data into `Bytes` without parsing it as a protobuf message.
-///
-/// This is the PrimitiveBlock hot path: decompress -> wrap as Bytes ->
-/// pass to `PrimitiveBlock::new()` which does zero-copy wire-format parsing.
-/// Decompress a blob into an owned Vec<u8>. No pool reuse — the caller owns the Vec
-/// and can mutate it (e.g., to append inline string table entries).
-#[allow(clippy::cast_sign_loss)]
-fn decompress_blob_to_vec(blob: &WireBlob) -> Result<Vec<u8>> {
-    match &blob.data {
-        Some(BlobData::Raw(bytes)) => {
-            let size = bytes.len() as u64;
-            if size < MAX_BLOB_MESSAGE_SIZE {
-                Ok(bytes.to_vec())
-            } else {
-                Err(new_blob_error(BlobError::MessageTooBig { size }))
-            }
-        }
-        Some(BlobData::Zlib(bytes)) => {
-            #[allow(clippy::cast_sign_loss)]
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut buf = Vec::with_capacity(capacity);
-            zlib_decompress_into(bytes, &mut buf)?;
-            Ok(buf)
-        }
-        Some(BlobData::Zstd(bytes)) => {
-            #[allow(clippy::cast_sign_loss)]
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
-            let mut buf = Vec::with_capacity(capacity);
-            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut buf)?;
-            let size = buf.len() as u64;
-            if size > MAX_BLOB_MESSAGE_SIZE {
-                return Err(new_blob_error(BlobError::MessageTooBig { size }));
-            }
-            Ok(buf)
-        }
-        None => Err(new_blob_error(BlobError::Empty)),
-    }
-}
-
 pub(crate) fn decompress_blob(
     blob: &WireBlob,
     pool: Option<&Arc<DecompressPool>>,

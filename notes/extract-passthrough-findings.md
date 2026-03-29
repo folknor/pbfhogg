@@ -1,122 +1,115 @@
 # Extract performance: findings and next steps
 
-## Current state (commit `2a8a649`)
+## Current state (commit `f28ae61`)
 
-Sequential BlobReader for all extract strategies. Fixes Europe OOM (25.7 GB → 2.4-4.5 GB anon).
-Japan regressed significantly from losing pipelined decode parallelism.
+Sequential BlobReader for all extract strategies. Fixes Europe OOM.
+Inline string table entries + pool recycling shipped in pipeline.rs
+but not sufficient for extract at scale.
+
+### Europe (32.4 GB, full-continent bbox)
+
+| Strategy | Sequential (current) | Anon peak |
+|----------|---------------------|----------|
+| simple | 362s | 2.4 GB |
+| complete | 553s | 4.1 GB |
+| smart | 633s | 4.5 GB |
 
 ### Japan (2.4 GB, Tokyo bbox)
 
-| Strategy | Pipelined (before) | Sequential (current) | Delta | osmium |
-|----------|-------------------|---------------------|-------|--------|
+| Strategy | Pipelined (old) | Sequential (current) | Delta | osmium |
+|----------|----------------|---------------------|-------|--------|
 | simple | 11.9s | 19.8s | +66% | 7.2s |
 | complete | 12.9s | 26.0s | +102% | 11.0s |
 | smart | 14.4s | 31.4s | +118% | 13.4s |
 
-### Europe (32.4 GB, full-continent bbox)
+## Root cause: cross-thread decompressed buffer retention
 
-| Strategy | Pipelined | Sequential | Anon peak |
-|----------|----------|-----------|----------|
-| simple | OOM (25.7 GB) | 362s | 2.4 GB |
-| complete | would OOM | 553s | 4.1 GB |
-| smart | would OOM | 633s | 4.5 GB |
+The pipelined reader's per-block lifecycle:
+1. IO thread reads compressed blob → `Bytes`
+2. Decode thread decompresses into pooled `Vec<u8>` → wraps as `Bytes`
+3. PrimitiveBlock sent to consumer via channel
+4. Consumer drops PrimitiveBlock → `Bytes` drops → pool return or cross-thread free
 
-## Why the pipelined reader OOMs
+The `DecompressPool` holds 64 buffers. At 520K blobs (Europe full bbox),
+~519K buffers overflow the pool and are freed cross-thread (~2 MB each).
+glibc retains ~22-27 GB of freed pages.
 
-`WireStringTable::entries: Box<[(u32, u32)]>` — 500-2000 entries per block,
-4-16 KB per allocation. Allocated on rayon decode threads, freed on consumer
-thread via `batch.clear()`. glibc retains freed pages in per-thread arenas.
-At 520K blocks × ~10 KB average: ~5 GB cumulative cross-thread churn.
-Combined with raw blob `Bytes` retention (~16 GB), total reaches 25+ GB.
+## Experiments (all on Europe, full-continent bbox)
 
-### decode_ahead=4 experiment
+### 1. Sequential BlobReader (current, committed)
+All strategies: works, 2-4 GB anon. 38-118% slower than pipelined.
 
-Reduced pipeline buffer from 32 to 4 in-flight decoded blocks. Result:
-25.9 GB anon — no improvement. Confirms retention scales with total blob
-count (cumulative cross-thread frees), not in-flight window.
+### 2. decode_ahead=4
+25.9 GB anon — same as default. Retention scales with total blob count, not window.
 
-### Why osmium doesn't OOM
+### 3. Inline string table entries (no pool)
+Simple: 220s, 27.3 GB. Complete: 337s, OOM at 27.5 GB.
+Eliminated Box retention (~5 GB) but decompressed Vec retention remains.
 
-osmium (libosmium + protozero) uses zero-copy decoding — string table
-references are byte offsets into the decompressed buffer, no separate
-`Box` allocation per block. One large allocation (decompressed buffer)
-crosses threads, not hundreds of small ones. glibc handles one large
-cross-thread free per block efficiently; hundreds of small ones fragment
-arenas.
+### 4. Inline entries + pool recycling (committed in pipeline.rs)
+Simple: 234s, 27.2 GB. Complete: 269s, 27.5 GB. Smart: OOM at 27.6 GB.
+Pool helps but 64 slots can't absorb 520K buffers. Completed on 30 GB
+host but no headroom — not planet-safe (~1.4M blobs would OOM anywhere).
 
-## Approaches tried and failed
+### 5. Hybrid: pipelined simple/complete, sequential smart
+Simple: 224s. Complete: 269s. Smart: 507s.
+Best performance but 27+ GB anon on simple/complete — fragile at Europe,
+would OOM at planet. Reverted.
 
-1. **Sequential BlobReader + node-only scanner** for classification.
-   Japan: 16.5s (+39%). Lost decode parallelism.
+## Why osmium doesn't have this problem
 
-2. **Raw-frame reader + blob-level passthrough** for fully-contained nodes.
-   Japan: 20.4s (+72%). Lost all decode parallelism.
+osmium (libosmium + protozero) uses zero-copy decoding. String table
+references are byte offsets into the decompressed buffer — no separate
+Box allocation. The decompressed buffer is the only cross-thread object.
+And libosmium's `osmium::memory::Buffer` pools/recycles more effectively
+than our 64-slot DecompressPool.
 
-3. **Reduced decode_ahead (4 instead of 32)**.
-   Europe: 25.9 GB, still OOM. Retention is cumulative, not bounded by window.
+Additionally, osmium copies raw protobuf group bytes for matching
+elements instead of full decode → re-encode via BlockBuilder.
 
-## Viable next approaches (priority order)
+## The fix: pread-from-workers for extract
 
-### 1. Eliminate cross-thread allocation in WireStringTable (best fix)
+The only approach that fully eliminates cross-thread retention:
 
-The root cause is `entries: Box<[(u32, u32)]>` allocated on decode threads.
-Three sub-approaches:
+**Workers own the full lifecycle.** IO thread reads headers only. Workers
+pread blob data from `Arc<File>`, decompress into thread-local buffer,
+construct PrimitiveBlock, and either:
+- Send classification results (compact `Vec<i64>`) for ID-collection passes
+- Send `OwnedBlock` results for write passes
 
-**a) Inline entries into the decompressed buffer.** During `WireBlock::parse`,
-append the `(u32, u32)` entry pairs after the protobuf data in the same `Vec<u8>`.
-`WireStringTable` stores `(entries_offset: u32, entries_count: u32)` — 8 bytes
-fixed, zero separate heap allocation. `get()` reads entries from the buffer.
+The decompressed buffer never crosses threads. PrimitiveBlock is created
+and dropped entirely on the worker thread.
 
-Requires: `WireBlock::parse` takes `&mut Vec<u8>` instead of `&[u8]`.
-The buffer grows by ~4-16 KB per block (the entries data). This is fine — the
-buffer is 1-2 MB already. Total overhead: <1%.
+### Challenges for extract
 
-`group_ranges` can use the same approach (append to buffer), or switch to
-`SmallVec<[(u32, u32); 8]>` (inline, no heap, 99% of blocks have ≤4 groups).
+**Classification needs shared mutable state.** Simple single-pass and
+pass 1 of complete/smart mutate `IdSetDense` (bbox_node_ids,
+matched_way_ids, etc.) sequentially in file order. Workers can't classify
+independently.
 
-Impact: eliminates ALL cross-thread Box allocations in PrimitiveBlock.
-The pipelined reader becomes safe at any scale. Every command benefits.
+**Possible approach:** Workers send lightweight classification results
+instead of PrimitiveBlocks:
+- Node blobs: `Vec<i64>` of IDs in bbox (via node-only scanner)
+- Way blobs: `(way_id, has_bbox_ref: bool)` for each way
+- Relation blobs: `(relation_id, has_matched_member: bool)`
 
-**b) Vec pool for entries.** `DecompressPool`-style shared pool for
-`Vec<(u32, u32)>`. Decode workers take from pool, consumer returns.
-Same pattern as P2b tuple pool. Less architectural change than (a) but
-still has cross-thread Vec ownership (pool mitigates but doesn't eliminate).
+Consumer updates IdSetDense from these compact results. Then for the
+write pass (simple single-pass or complete/smart pass 2-3), workers
+own the full decode → rewrite → OwnedBlock lifecycle since ID sets
+are read-only by then.
 
-**c) Thread-local entries Vec via `thread_local!` in decode workers.**
-Workers reuse a thread-local Vec for entries, `mem::take` to move into
-WireStringTable. Consumer drops the taken Vec (cross-thread free of the
-Vec itself, but only one per block instead of one per string table).
-Simpler than (b) but still one small cross-thread free per block.
+### For complete/smart write passes
 
-### 2. Pread-from-workers for extract write passes
+After pass 1, ID sets are read-only. Workers can do:
+pread → decompress → PrimitiveBlock → filter/rewrite → OwnedBlock.
+Same pattern as external join P2c. This is the highest-confidence
+next step.
 
-For complete/smart: after pass 1 builds ID sets, the write pass can use
-P2c pattern — workers own full PrimitiveBlock lifecycle (pread → decompress
-→ rewrite → OwnedBlock). ID sets are read-only during the write pass.
+## Infrastructure shipped
 
-For simple single-pass: harder — classification mutates shared IdSetDense
-during the scan. Workers can't classify. Would need either (a) the
-WireStringTable fix from approach 1, or (b) workers send classification
-results (compact Vec<i64>) instead of PrimitiveBlocks.
-
-### 3. Hybrid pipeline (PipelineOutput enum)
-
-`PipelineOutput::Decoded(PrimitiveBlock) | Passthrough(RawBlobFrame)`.
-Pipeline decides per-blob. Fully-contained node blobs skip decode entirely.
-Most impactful for simple extract with spatial selectivity.
-
-Requires approach 1 or 2 to be safe — the `Decoded` variant still has
-the cross-thread PrimitiveBlock problem. The hybrid pipeline optimizes
-the passthrough portion but doesn't fix the decode retention.
-
-## Recommendation
-
-**Approach 1a (inline entries) is the real fix.** It eliminates the root
-cause at the wire-format level. Every command benefits automatically —
-no per-command pipeline changes needed. The pipelined reader becomes
-planet-safe. Extract recovers its pipelined performance. The osmium gap
-closes because we're no longer paying for cross-thread Box fragmentation.
-
-Estimated effort: ~100 lines in wire.rs + block.rs. The `Bytes::from(vec)`
-ownership model already gives the consumer a mutable-ish buffer. The
-parse just needs to write the entries table into the same buffer.
+The inline entries + pool recycling work is committed and active in
+`pipeline.rs` for all pipelined commands. It reduces per-block
+retention from ~50 KB (Box entries + group_ranges) to ~0 KB. This
+benefits every command that uses the pipelined reader at moderate
+scale. Extract is the outlier because it processes 520K+ full-size
+blobs where the ~2 MB decompressed buffer retention dominates.

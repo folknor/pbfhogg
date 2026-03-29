@@ -7,12 +7,12 @@ use rayon::prelude::*;
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::cat::CleanAttrs;
 use crate::writer::{Compression, PbfWriter};
-use crate::{BlobFilter, BlockType, Element, ElementReader, MemberId, PrimitiveBlock};
+use crate::{BlobFilter, BlockType, Element, MemberId, PrimitiveBlock};
 
 use super::{Result, BATCH_SIZE};
 
 use super::{
-    drain_batch_results, flush_local, for_each_primitive_block_batch, require_indexdata,
+    drain_batch_results, flush_local, require_indexdata,
     writer_from_header, ensure_node_capacity_local, ensure_way_capacity_local,
     ensure_relation_capacity_local, HeaderOverrides,
 };
@@ -846,10 +846,22 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     let mut matched_relation_ids = IdSetDense::new();
 
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(spatial_blob_filter(&bbox_int));
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    let spatial_filter = spatial_blob_filter(&bbox_int);
+
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !spatial_filter.wants_index(&idx) { continue; }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
         classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
@@ -859,9 +871,14 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
 
     crate::debug::emit_marker("EXTRACT_PASS2_START");
     let all_way_node_ids = IdSetDense::new();
-    let reader = ElementReader::open(input, direct_io)?;
+
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -877,9 +894,22 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
         matched_relation_ids: &matched_relation_ids,
     };
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_extract_pass2_batch(batch, &ids, clean, &mut writer, &mut stats)
-    })?;
+    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
+        batch.push(block);
+        if batch.len() >= BATCH_SIZE {
+            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+    }
 
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_PASS2_END");
@@ -926,10 +956,18 @@ fn extract_simple_single_pass(
     let mut matched_relation_ids = IdSetDense::new();
     let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
 
-    let reader = ElementReader::open(input, direct_io)?
-        .with_blob_filter(spatial_blob_filter(&bbox_int));
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention.
+    // The pipelined reader OOM'd at Europe scale (25.7 GB anon, 520K blobs)
+    // when most blobs match the extract region. The batch pattern does not
+    // bound retention when every blob is decoded through the pipeline.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -938,9 +976,25 @@ fn extract_simple_single_pass(
         hb.sorted()
     }, direct_io, false)?;
 
+    let spatial_filter = spatial_blob_filter(&bbox_int);
+    let decompress_pool = crate::blob::DecompressPool::new();
+
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        // Spatial blob filter: skip node blobs outside extract region.
+        if let Some(idx) = blob.index() {
+            if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                if let Some(ref filter_bbox) = spatial_filter.node_bbox {
+                    if let Some(ref blob_bbox) = idx.bbox {
+                        if !filter_bbox.intersects(blob_bbox) { continue; }
+                    }
+                }
+            }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
         let has_matches = classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
@@ -1002,10 +1056,15 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 
     // --- Pass 2: Write matching elements in file order ---
     crate::debug::emit_marker("EXTRACT_PASS2_START");
-    let reader = ElementReader::open(input, direct_io)?;
-    super::warn_locations_on_ways_loss(reader.header());
+
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
-    let mut writer = writer_from_header(output, compression, reader.header(), false, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
         let hb = if set_bounds {
             hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
         } else {
@@ -1021,9 +1080,22 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
         matched_relation_ids: &result.matched_relation_ids,
     };
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_extract_pass2_batch(batch, &ids, clean, &mut writer, &mut stats)
-    })?;
+    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
+        batch.push(block);
+        if batch.len() >= BATCH_SIZE {
+            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+    }
 
     writer.flush()?;
     crate::debug::emit_marker("EXTRACT_PASS2_END");
@@ -1248,7 +1320,7 @@ impl RelationHandler for SmartRelationHandler {
 
 /// Collect pass 1 ID sets with strategy-specific relation handling.
 ///
-/// Reads all elements via pipelined decode, collecting:
+/// Reads all elements via sequential BlobReader + DecompressPool, collecting:
 /// - `bbox_node_ids`: nodes within the bounding box
 /// - `matched_way_ids`: ways referencing at least one bbox node
 /// - `all_way_node_ids`: all node refs from matched ways (for pass 2)
@@ -1270,12 +1342,24 @@ fn collect_pass1_generic<H: RelationHandler>(
     let mut all_way_node_ids = IdSetDense::new();
     let mut matched_relation_ids = IdSetDense::new();
 
-    let reader = ElementReader::open(input, direct_io)?;
-    let is_sorted = reader.header().is_sorted();
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention OOM.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let is_sorted = header_blob.to_headerblock()?.is_sorted();
     let filter = spatial_blob_filter(bbox_int);
+    let decompress_pool = crate::blob::DecompressPool::new();
+
     if !is_sorted {
-        for block_result in reader.with_blob_filter(filter).into_blocks_pipelined() {
-            let block = block_result?;
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !filter.wants_index(&idx) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = PrimitiveBlock::new(decompressed)?;
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
@@ -1313,12 +1397,14 @@ fn collect_pass1_generic<H: RelationHandler>(
 
     let mut way_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     let mut relation_batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for block_result in reader
-        .with_blob_filter(filter)
-        .decode_threads(1)
-        .into_blocks_pipelined()
-    {
-        let block = block_result?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !filter.wants_index(&idx) { continue; }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
         match block.block_type() {
             BlockType::DenseNodes | BlockType::Nodes => {
                 if !way_batch.is_empty() {

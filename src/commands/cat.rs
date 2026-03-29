@@ -86,7 +86,8 @@ pub fn cat(
     let result = match (type_filter, clean.any()) {
         (None, false) => cat_passthrough(files, output, compression, direct_io, overrides),
         (None, true) => cat_filtered(files, output, "node,way,relation", clean, compression, direct_io, overrides),
-        (Some(filter), _) => cat_filtered(files, output, filter, clean, compression, direct_io, overrides),
+        (Some(filter), false) => cat_type_passthrough(files, output, filter, compression, direct_io, overrides),
+        (Some(filter), true) => cat_filtered(files, output, filter, clean, compression, direct_io, overrides),
     }?;
     crate::debug::emit_marker("CAT_SCAN_END");
     #[allow(clippy::cast_possible_wrap)]
@@ -171,6 +172,88 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         blobs_passthrough: blobs,
         blobs_decoded: 0,
         elements_written: 0,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Type-filtered passthrough: raw frame copy for matching blob types
+// ---------------------------------------------------------------------------
+
+/// Type-filtered cat via raw frame passthrough. Matching blobs (by indexdata
+/// ElemKind) are written as-is — zero decompression, zero re-encoding.
+/// Non-matching blobs are skipped. Blobs without indexdata fall back to full
+/// decode + re-encode.
+fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
+    let tf = TypeFilter::parse(filter);
+    let single_file = files.len() == 1;
+    let blob_filter = BlobFilter::new(tf.nodes, tf.ways, tf.relations);
+
+    let header_bytes = {
+        let mut reader = FileReader::open(files[0], direct_io)?;
+        let mut file_offset: u64 = 0;
+        let mut hdr_bytes = None;
+        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+            if frame.blob_type == BlobKind::OsmHeader {
+                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
+                super::warn_locations_on_ways_loss(&header);
+                hdr_bytes = Some(build_output_header(&header, single_file, overrides, |hb| hb)?);
+                break;
+            }
+        }
+        hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
+    };
+
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
+    let mut blobs_passthrough: u64 = 0;
+    let mut blobs_decoded: u64 = 0;
+    let mut elements_written: u64 = 0;
+
+    let clean = CleanAttrs::default(); // no-op clean
+
+    for file in files {
+        let mut reader = FileReader::open(file, direct_io)?;
+        let mut file_offset: u64 = 0;
+
+        while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
+            match &frame.blob_type {
+                BlobKind::OsmHeader => {}
+                BlobKind::OsmData => {
+                    if let Some(ref idx) = frame.index {
+                        // Indexed blob: check type filter.
+                        if !blob_filter.wants_index(idx) {
+                            continue; // skip non-matching
+                        }
+                        // Matching type: raw passthrough.
+                        writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
+                        blobs_passthrough += 1;
+                    } else {
+                        // No indexdata: must decode to filter by element type.
+                        let blob_bytes = frame.blob_bytes();
+                        let mut decompress_buf: Vec<u8> = Vec::new();
+                        decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
+                        let block = PrimitiveBlock::new(decompress_buf.into())?;
+                        let mut bb = BlockBuilder::new();
+                        let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+                        let count = process_block(&block, &mut bb, &mut output_blocks, &tf, &clean)?;
+                        flush_local(&mut bb, &mut output_blocks)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                        for (block_bytes, index, tagdata) in output_blocks {
+                            writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                        }
+                        blobs_decoded += 1;
+                        elements_written += count;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    writer.flush()?;
+    Ok(CatStats {
+        blobs_passthrough,
+        blobs_decoded,
+        elements_written,
     })
 }
 

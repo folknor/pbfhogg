@@ -427,6 +427,32 @@ impl PrimitiveBlock {
         Ok(PrimitiveBlock { buffer: bytes, block })
     }
 
+    /// Like [`from_vec`] but wraps the buffer with pool recycling.
+    /// On drop, the Vec returns to the DecompressPool instead of being freed.
+    /// This eliminates cross-thread Vec retention in the pipelined reader.
+    pub(crate) fn from_vec_pooled(
+        mut buffer: Vec<u8>,
+        pool: &std::sync::Arc<crate::blob::DecompressPool>,
+    ) -> Result<PrimitiveBlock> {
+        let meta = WireBlock::parse_and_inline(&mut buffer)?;
+        let bytes = crate::blob::pool_wrap(buffer, Some(pool));
+        let data: &[u8] = &bytes;
+        let block = WireBlock::from_inline(data, &meta);
+
+        for index in 0..block.stringtable.len() {
+            if let Some(raw) = block.stringtable.get(index) {
+                std::str::from_utf8(raw)
+                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
+            }
+        }
+
+        #[allow(clippy::transmute_undefined_repr)]
+        let block =
+            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
+
+        Ok(PrimitiveBlock { buffer: bytes, block })
+    }
+
     /// Returns the size of the decompressed protobuf payload in bytes.
     ///
     /// This is the raw decompressed data backing this block — useful for

@@ -118,7 +118,7 @@ fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> Vec<u8> {
 }
 
 /// Wrap decoded bytes as `Bytes` — returning to pool on drop if pooled.
-fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
+pub(crate) fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
     match pool {
         Some(p) => Bytes::from_owner(PooledBuffer {
             vec: decoded,
@@ -489,13 +489,17 @@ impl Blob {
     /// Decompress and construct PrimitiveBlock with inline string table entries.
     ///
     /// Eliminates cross-thread `Box<[(u32, u32)]>` allocations by appending the
-    /// entry table directly into the decompressed buffer. Used by the pipelined
-    /// reader to prevent 25+ GB heap retention at Europe/planet scale.
+    /// entry table directly into the decompressed buffer. Uses pool for buffer
+    /// recycling — prevents both Box retention AND decompressed Vec retention.
     pub(crate) fn to_primitiveblock_inline(
         &self,
+        pool: &Arc<DecompressPool>,
     ) -> Result<PrimitiveBlock> {
-        let buf = decompress_blob_to_vec(&self.blob)?;
-        PrimitiveBlock::from_vec(buf)
+        #[allow(clippy::cast_sign_loss)]
+        let capacity = self.blob.raw_size.unwrap_or(0).max(0) as usize;
+        let mut buf = pool_get(Some(pool), capacity);
+        decompress_parsed_blob_into(&self.blob, &mut buf)?;
+        PrimitiveBlock::from_vec_pooled(buf, pool)
     }
 }
 

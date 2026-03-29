@@ -373,28 +373,11 @@ impl PrimitiveBlock {
     /// UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf wire format is invalid.
     #[hotpath::measure]
     pub fn new(buffer: Bytes) -> Result<PrimitiveBlock> {
-        let data: &[u8] = &buffer;
-        let block = WireBlock::parse(data)?;
-
-        // Validate every stringtable entry once at construction time.
-        for index in 0..block.stringtable.len() {
-            if let Some(bytes) = block.stringtable.get(index) {
-                std::str::from_utf8(bytes)
-                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
-            }
-        }
-
-        // SAFETY: `block` borrows exclusively from `buffer` which is:
-        // - immutable (Bytes is a read-only reference-counted buffer)
-        // - stored in the same struct (cannot outlive the buffer)
-        // - never exposed mutably (PrimitiveBlock has no &mut self methods on buffer)
-        // WireBlock<'a> is covariant in 'a (contains only &'a [u8] references),
-        // so transmuting the lifetime is sound.
-        #[allow(clippy::transmute_undefined_repr)]
-        let block =
-            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
-
-        Ok(PrimitiveBlock { buffer, block })
+        // Use the inline path: copy buffer to Vec, append string table entries
+        // and group ranges inline. Avoids separate Box allocations. The ~2 MB
+        // copy is acceptable for the public API (not at pipeline scale — the
+        // pipeline uses from_vec / from_vec_pooled directly).
+        Self::from_vec(buffer.to_vec())
     }
 
     /// Parse from a mutable Vec, inlining string table entries and group ranges

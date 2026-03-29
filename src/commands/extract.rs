@@ -770,9 +770,12 @@ where
             let block_fn_ref = &block_fn;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut bb = BlockBuilder::new();
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+                // Per-worker pool for decompress buffer reuse. PrimitiveBlock drops
+                // on this worker thread → buffer returns to pool → next iteration
+                // reuses it. Zero alloc churn after warmup.
+                let worker_pool = crate::blob::DecompressPool::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -787,8 +790,11 @@ where
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
+                        // Decompress into pool-obtained buffer, parse inline, wrap pooled.
+                        // On PrimitiveBlock drop (same thread), buffer returns to pool.
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
                         output_blocks.clear();
                         let block_stats = block_fn_ref(
                             &block, &mut bb, &mut output_blocks,

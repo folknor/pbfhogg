@@ -117,6 +117,13 @@ fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> Vec<u8> {
     }
 }
 
+/// Get a buffer from the pool (or allocate fresh). Public for pread-from-workers.
+pub(crate) fn pool_get_pub(pool: &Arc<DecompressPool>, capacity: usize) -> Vec<u8> {
+    let mut buf = pool.get();
+    buf.reserve(capacity.saturating_sub(buf.capacity()));
+    buf
+}
+
 /// Wrap decoded bytes as `Bytes` — returning to pool on drop if pooled.
 pub(crate) fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
     match pool {

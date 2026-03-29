@@ -15,25 +15,20 @@ use crate::error::Result;
 // WireStringTable — zero-copy indexed string table
 // ---------------------------------------------------------------------------
 
-/// String table storing buffer-relative offsets instead of `&[u8]` slices.
+/// String table storing buffer-relative offsets as inline LE bytes in the
+/// decompressed buffer. Zero separate heap allocations.
 ///
 /// Offsets are relative to the decompressed buffer, not the StringTable message,
 /// because `PrimitiveBlock` in `block.rs` transmutes `WireBlock<'a>` to
-/// `WireBlock<'static>` for self-referential ownership — storing slices directly
-/// would create dangling references after the lifetime erasure.
+/// `WireBlock<'static>` for self-referential ownership.
 ///
-/// Two storage modes:
-/// - **Boxed** (`entries` is `Some`): traditional heap-allocated entry array.
-///   Used by `PrimitiveBlock::new(Bytes)` for backward compatibility.
-/// - **Inline** (`entries` is `None`, `entries_offset`/`entries_count` set):
-///   entries are appended as raw LE bytes in the decompressed buffer itself.
-///   Zero separate heap allocation. Used by `PrimitiveBlock::from_vec()`.
-///   Eliminates cross-thread Box alloc/free retention that caused 25+ GB OOM.
+/// The (u32, u32) entry pairs (offset, length) are appended to the buffer
+/// after the protobuf data by `WireBlock::parse_and_inline`. This eliminates
+/// the cross-thread Box alloc/free retention that caused 25+ GB OOM at
+/// Europe/planet scale with the pipelined reader.
 #[derive(Clone, Debug)]
 pub(crate) struct WireStringTable<'a> {
     buffer: &'a [u8],
-    /// Boxed entries for backward-compat path. None when using inline storage.
-    entries: Option<Box<[(u32, u32)]>>,
     /// Byte offset into buffer where inline (u32, u32) LE entries start.
     entries_offset: u32,
     /// Number of inline entries.
@@ -41,31 +36,8 @@ pub(crate) struct WireStringTable<'a> {
 }
 
 impl<'a> WireStringTable<'a> {
-    /// Parse string table entries into a heap-allocated Box (legacy path).
-    #[hotpath::measure]
-    fn parse(data: &'a [u8], buffer: &'a [u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(data);
-        let mut entries = Vec::new();
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            if field == 1 && wire_type == WIRE_LEN {
-                let bytes = cursor.read_len_delimited()?;
-                let offset = bytes.as_ptr() as usize - buffer.as_ptr() as usize;
-                #[allow(clippy::cast_possible_truncation)]
-                entries.push((offset as u32, bytes.len() as u32));
-            } else {
-                cursor.skip_field(wire_type)?;
-            }
-        }
-        Ok(Self {
-            buffer,
-            entries: Some(entries.into_boxed_slice()),
-            entries_offset: 0,
-            entries_count: 0,
-        })
-    }
-
     /// Scan string table entries from protobuf data, collecting into caller's Vec.
-    /// Used by the inline path: caller appends the Vec contents to the buffer afterward.
+    /// Caller appends the Vec contents to the buffer afterward.
     fn scan_entries(data: &[u8], buffer: &[u8], out: &mut Vec<(u32, u32)>) -> Result<()> {
         let mut cursor = Cursor::new(data);
         out.clear();
@@ -82,42 +54,30 @@ impl<'a> WireStringTable<'a> {
         Ok(())
     }
 
-    /// Create an inline WireStringTable that reads entries from the buffer itself.
-    fn inline(buffer: &'a [u8], entries_offset: u32, entries_count: u32) -> Self {
-        Self { buffer, entries: None, entries_offset, entries_count }
+    /// Create a WireStringTable that reads entries from the buffer itself.
+    fn new(buffer: &'a [u8], entries_offset: u32, entries_count: u32) -> Self {
+        Self { buffer, entries_offset, entries_count }
     }
 
     #[inline]
     pub fn len(&self) -> usize {
-        if let Some(ref e) = self.entries {
-            e.len()
-        } else {
-            self.entries_count as usize
-        }
+        self.entries_count as usize
     }
 
     #[inline]
     pub fn get(&self, index: usize) -> Option<&'a [u8]> {
-        if let Some(ref entries) = self.entries {
-            // Boxed path
-            entries.get(index).map(|&(off, len)| {
-                &self.buffer[off as usize..off as usize + len as usize]
-            })
-        } else {
-            // Inline path: read (u32, u32) from buffer at entries_offset + index * 8
-            if index >= self.entries_count as usize { return None; }
-            let base = self.entries_offset as usize + index * 8;
-            if base + 8 > self.buffer.len() { return None; }
-            let off = u32::from_le_bytes([
-                self.buffer[base], self.buffer[base + 1],
-                self.buffer[base + 2], self.buffer[base + 3],
-            ]);
-            let len = u32::from_le_bytes([
-                self.buffer[base + 4], self.buffer[base + 5],
-                self.buffer[base + 6], self.buffer[base + 7],
-            ]);
-            Some(&self.buffer[off as usize..off as usize + len as usize])
-        }
+        if index >= self.entries_count as usize { return None; }
+        let base = self.entries_offset as usize + index * 8;
+        if base + 8 > self.buffer.len() { return None; }
+        let off = u32::from_le_bytes([
+            self.buffer[base], self.buffer[base + 1],
+            self.buffer[base + 2], self.buffer[base + 3],
+        ]);
+        let len = u32::from_le_bytes([
+            self.buffer[base + 4], self.buffer[base + 5],
+            self.buffer[base + 6], self.buffer[base + 7],
+        ]);
+        Some(&self.buffer[off as usize..off as usize + len as usize])
     }
 }
 
@@ -137,8 +97,6 @@ impl<'a> WireStringTable<'a> {
 pub(crate) struct WireBlock<'a> {
     buffer: &'a [u8],
     pub stringtable: WireStringTable<'a>,
-    /// Group ranges: boxed for legacy path, inline offset+count for inline path.
-    group_ranges_box: Option<Box<[(u32, u32)]>>,
     group_ranges_offset: u32,
     group_ranges_count: u32,
     pub granularity: i32,
@@ -150,60 +108,6 @@ pub(crate) struct WireBlock<'a> {
 }
 
 impl<'a> WireBlock<'a> {
-    /// Parse a PrimitiveBlock using heap-allocated string table and group ranges (legacy path).
-    /// Used by `PrimitiveBlock::new(Bytes)` for backward compatibility.
-    #[hotpath::measure]
-    pub fn parse(buffer: &'a [u8]) -> Result<Self> {
-        let mut cursor = Cursor::new(buffer);
-        let mut stringtable_data: Option<&'a [u8]> = None;
-        let mut group_ranges = Vec::new();
-        let mut granularity: i32 = 100;
-        let mut lat_offset: i64 = 0;
-        let mut lon_offset: i64 = 0;
-        let mut date_granularity: i32 = 1000;
-
-        while let Some((field, wire_type)) = cursor.read_tag()? {
-            match (field, wire_type) {
-                (1, WIRE_LEN) => {
-                    stringtable_data = Some(cursor.read_len_delimited()?);
-                }
-                (2, WIRE_LEN) => {
-                    let data = cursor.read_len_delimited()?;
-                    let offset = data.as_ptr() as usize - buffer.as_ptr() as usize;
-                    #[allow(clippy::cast_possible_truncation)]
-                    group_ranges.push((offset as u32, data.len() as u32));
-                }
-                (17, WIRE_VARINT) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    { granularity = cursor.read_varint()? as i32; }
-                }
-                (19, WIRE_VARINT) => { lat_offset = cursor.read_varint_i64()?; }
-                (20, WIRE_VARINT) => { lon_offset = cursor.read_varint_i64()?; }
-                (18, WIRE_VARINT) => {
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-                    { date_granularity = cursor.read_varint()? as i32; }
-                }
-                _ => cursor.skip_field(wire_type)?,
-            }
-        }
-
-        let st_data = stringtable_data.unwrap_or(&[]);
-        let stringtable = WireStringTable::parse(st_data, buffer)?;
-
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(Self {
-            buffer,
-            stringtable,
-            group_ranges_box: Some(group_ranges.into_boxed_slice()),
-            group_ranges_offset: 0,
-            group_ranges_count: 0,
-            granularity,
-            lat_offset,
-            lon_offset,
-            date_granularity,
-            proto_len: buffer.len() as u32,
-        })
-    }
 
     /// Parse and inline: scan protobuf, then append string table entries and group
     /// ranges as raw LE bytes to the buffer. Zero separate heap allocations.
@@ -301,8 +205,7 @@ impl<'a> WireBlock<'a> {
     pub fn from_inline(buffer: &'a [u8], meta: &WireBlockMeta) -> Self {
         Self {
             buffer,
-            stringtable: WireStringTable::inline(buffer, meta.st_inline_offset, meta.st_inline_count),
-            group_ranges_box: None,
+            stringtable: WireStringTable::new(buffer, meta.st_inline_offset, meta.st_inline_count),
             group_ranges_offset: meta.gr_inline_offset,
             group_ranges_count: meta.gr_inline_count,
             granularity: meta.granularity,
@@ -316,30 +219,21 @@ impl<'a> WireBlock<'a> {
     /// Number of primitive groups in this block.
     #[inline]
     pub fn group_count(&self) -> usize {
-        if let Some(ref b) = self.group_ranges_box {
-            b.len()
-        } else {
-            self.group_ranges_count as usize
-        }
+        self.group_ranges_count as usize
     }
 
     #[inline]
     pub fn group(&self, index: usize) -> &'a [u8] {
-        if let Some(ref b) = self.group_ranges_box {
-            let (off, len) = b[index];
-            &self.buffer[off as usize..off as usize + len as usize]
-        } else {
-            let base = self.group_ranges_offset as usize + index * 8;
-            let off = u32::from_le_bytes([
-                self.buffer[base], self.buffer[base + 1],
-                self.buffer[base + 2], self.buffer[base + 3],
-            ]);
-            let len = u32::from_le_bytes([
-                self.buffer[base + 4], self.buffer[base + 5],
-                self.buffer[base + 6], self.buffer[base + 7],
-            ]);
-            &self.buffer[off as usize..off as usize + len as usize]
-        }
+        let base = self.group_ranges_offset as usize + index * 8;
+        let off = u32::from_le_bytes([
+            self.buffer[base], self.buffer[base + 1],
+            self.buffer[base + 2], self.buffer[base + 3],
+        ]);
+        let len = u32::from_le_bytes([
+            self.buffer[base + 4], self.buffer[base + 5],
+            self.buffer[base + 6], self.buffer[base + 7],
+        ]);
+        &self.buffer[off as usize..off as usize + len as usize]
     }
 }
 

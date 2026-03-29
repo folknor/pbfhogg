@@ -54,7 +54,12 @@ Utility commands (unchanged):
 - `brokkr results dirty` — access sidecar data from the most recent run, even if it was OOM-killed or crashed.
   Useful for inspecting memory trajectory of failed runs: `brokkr results dirty --timeline --stat anon`,
   `brokkr results dirty --timeline --fields anon --every 100`.
-- `brokkr download <region> [--osc-url url]` — download region datasets from Geofabrik.
+- `brokkr download <region> [--osc-seq N]` — download region datasets from Geofabrik.
+  Downloads PBF (if no variant exists), generates indexed PBF, fetches OSC diffs.
+  `--osc-seq N` downloads all missing diffs from last configured seq+1 through N.
+  Planet uses planet.openstreetmap.org replication; everything else uses Geofabrik.
+  Short aliases (denmark, europe, japan) or full paths (europe/france, asia/japan/kanto).
+  Re-running is safe (only writes entries that don't already exist in brokkr.toml).
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history.
 - `brokkr verify <command> [--dataset name]` — cross-validate against reference tools.

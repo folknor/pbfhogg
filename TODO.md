@@ -131,17 +131,18 @@ node blobs (merge.rs ~line 1437). Node-coordinate scanner (`extract_node_tuples`
 already exists and fits directly. Localized, low-risk, production-relevant
 (nidhogg steady state once locations_on_ways is enabled).
 
-### Hybrid pipeline for extract (7/10 reviewers, separate project)
+### Raw group passthrough for extract (beat osmium)
 
-Only credible path to closing the 1.65x osmium gap on simple extract.
-New `PipelineOutput` enum in pipeline.rs: `Decoded(PrimitiveBlock)` or
-`Passthrough(RawBlobFrame)`. Pipeline's blob filter checks `BlobBbox::contains`
-and skips decompression for fully-contained node blobs. Consumer writes
-passthrough blobs via `write_raw_owned`, decoded blobs via existing batch path.
+The last osmium gap: simple extract 2.5x slower (18s vs 7.2s Japan). The gap
+is write-side: pbfhogg fully decodes + re-encodes via BlockBuilder. osmium
+copies raw protobuf group bytes for all-match groups.
 
-Benefits extract, cat --type, tags-filter — any command with spatial selectivity.
-~200 lines in pipeline.rs + blob.rs. Two attempts without this regressed (lost
-pipelined decode parallelism). See [notes/extract-passthrough-findings.md](notes/extract-passthrough-findings.md).
+Copy raw PrimitiveGroup bytes for groups where all elements are selected.
+Partial-match groups fall back to decode + re-encode. String table copied
+whole. Four primitives needed: raw_group_bytes, raw_stringtable_bytes,
+classify_group, frame_raw_block.
+
+Independent of read-path work. See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
 
 ### Smaller items (from reviewer sweep)
 

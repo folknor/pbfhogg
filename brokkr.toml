@@ -208,3 +208,7 @@ source = "nvme"
 data = "nvme"
 scratch = "nvme"
 target = "nvme"
+
+[plantasjen.datasets.planet.osc.4913]
+file = "planet-20260329-seq4913.osc.gz"
+xxhash = "e75c2eb5e8b98c0ceb66baf70b4c34a2"

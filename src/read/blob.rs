@@ -485,6 +485,18 @@ impl Blob {
     ) -> Result<PrimitiveBlock> {
         decompress_blob(&self.blob, Some(pool)).and_then(PrimitiveBlock::new)
     }
+
+    /// Decompress and construct PrimitiveBlock with inline string table entries.
+    ///
+    /// Eliminates cross-thread `Box<[(u32, u32)]>` allocations by appending the
+    /// entry table directly into the decompressed buffer. Used by the pipelined
+    /// reader to prevent 25+ GB heap retention at Europe/planet scale.
+    pub(crate) fn to_primitiveblock_inline(
+        &self,
+    ) -> Result<PrimitiveBlock> {
+        let buf = decompress_blob_to_vec(&self.blob)?;
+        PrimitiveBlock::from_vec(buf)
+    }
 }
 
 /// A blob header.
@@ -1228,8 +1240,49 @@ pub(crate) fn decode_blob_to_headerblock_from_bytes(blob_bytes: &Bytes) -> Resul
 ///
 /// This is the PrimitiveBlock hot path: decompress -> wrap as Bytes ->
 /// pass to `PrimitiveBlock::new()` which does zero-copy wire-format parsing.
+/// Decompress a blob into an owned Vec<u8>. No pool reuse — the caller owns the Vec
+/// and can mutate it (e.g., to append inline string table entries).
 #[allow(clippy::cast_sign_loss)]
-#[hotpath::measure]
+fn decompress_blob_to_vec(blob: &WireBlob) -> Result<Vec<u8>> {
+    match &blob.data {
+        Some(BlobData::Raw(bytes)) => {
+            let size = bytes.len() as u64;
+            if size < MAX_BLOB_MESSAGE_SIZE {
+                Ok(bytes.to_vec())
+            } else {
+                Err(new_blob_error(BlobError::MessageTooBig { size }))
+            }
+        }
+        Some(BlobData::Zlib(bytes)) => {
+            #[allow(clippy::cast_sign_loss)]
+            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
+                blob.raw_size.unwrap_or(0) as usize
+            } else {
+                bytes.len() * 4
+            };
+            let mut buf = Vec::with_capacity(capacity);
+            zlib_decompress_into(bytes, &mut buf)?;
+            Ok(buf)
+        }
+        Some(BlobData::Zstd(bytes)) => {
+            #[allow(clippy::cast_sign_loss)]
+            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
+                blob.raw_size.unwrap_or(0) as usize
+            } else {
+                bytes.len() * 4
+            };
+            let mut buf = Vec::with_capacity(capacity);
+            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut buf)?;
+            let size = buf.len() as u64;
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                return Err(new_blob_error(BlobError::MessageTooBig { size }));
+            }
+            Ok(buf)
+        }
+        None => Err(new_blob_error(BlobError::Empty)),
+    }
+}
+
 pub(crate) fn decompress_blob(
     blob: &WireBlob,
     pool: Option<&Arc<DecompressPool>>,
@@ -1244,6 +1297,7 @@ pub(crate) fn decompress_blob(
             }
         }
         Some(BlobData::Zlib(bytes)) => {
+            #[allow(clippy::cast_sign_loss)]
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {
@@ -1254,6 +1308,7 @@ pub(crate) fn decompress_blob(
             Ok(pool_wrap(decoded_bytes, pool))
         }
         Some(BlobData::Zstd(bytes)) => {
+            #[allow(clippy::cast_sign_loss)]
             let capacity = if blob.raw_size.unwrap_or(0) > 0 {
                 blob.raw_size.unwrap_or(0) as usize
             } else {

@@ -169,7 +169,7 @@ where
             let buffer_pool = DecompressPool::new();
             for (seq, blob_result) in raw_rx {
                 let tx = dispatch_tx.clone();
-                let bp = Arc::clone(&buffer_pool);
+                let _bp = Arc::clone(&buffer_pool);
                 match blob_result {
                     Ok(blob) => {
                         let bf = blob_filter.clone();
@@ -182,7 +182,7 @@ where
                                         {
                                             return None;
                                         }
-                                        Some(blob.to_primitiveblock_pooled(&bp))
+                                        Some(blob.to_primitiveblock_inline())
                                     }
                                     _ => None,
                                 }

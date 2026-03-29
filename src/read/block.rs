@@ -354,7 +354,7 @@ pub struct PrimitiveBlock {
 impl std::fmt::Debug for PrimitiveBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrimitiveBlock")
-            .field("groups", &self.block.group_ranges.len())
+            .field("groups", &self.block.group_count())
             .field("stringtable_entries", &self.block.stringtable.len())
             .field("granularity", &self.block.granularity)
             .finish()
@@ -397,12 +397,44 @@ impl PrimitiveBlock {
         Ok(PrimitiveBlock { buffer, block })
     }
 
+    /// Parse from a mutable Vec, inlining string table entries and group ranges
+    /// into the buffer itself. Zero separate heap allocations beyond the buffer.
+    ///
+    /// This eliminates the cross-thread `Box<[(u32, u32)]>` retention that caused
+    /// 25+ GB OOM at Europe scale (520K blocks) with the pipelined reader.
+    /// The temp Vecs during parsing are allocated and freed on the calling thread.
+    ///
+    /// The buffer is extended with inline entry data. After conversion to `Bytes`,
+    /// the block references both the protobuf data and the appended entries.
+    pub(crate) fn from_vec(mut buffer: Vec<u8>) -> Result<PrimitiveBlock> {
+        let meta = WireBlock::parse_and_inline(&mut buffer)?;
+        let bytes = Bytes::from(buffer);
+        let data: &[u8] = &bytes;
+        let block = WireBlock::from_inline(data, &meta);
+
+        // Validate every stringtable entry once at construction time.
+        for index in 0..block.stringtable.len() {
+            if let Some(raw) = block.stringtable.get(index) {
+                std::str::from_utf8(raw)
+                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
+            }
+        }
+
+        #[allow(clippy::transmute_undefined_repr)]
+        let block =
+            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
+
+        Ok(PrimitiveBlock { buffer: bytes, block })
+    }
+
     /// Returns the size of the decompressed protobuf payload in bytes.
     ///
     /// This is the raw decompressed data backing this block — useful for
-    /// byte-budget accounting in batched processing pipelines.
+    /// byte-budget accounting in batched processing pipelines. When inline
+    /// entries are used, returns the original protobuf size (not the extended
+    /// buffer).
     pub fn decompressed_size(&self) -> usize {
-        self.buffer.len()
+        self.block.proto_len as usize
     }
 
     /// Returns the element type contained in this block.
@@ -417,7 +449,7 @@ impl PrimitiveBlock {
     /// [`Mixed`](BlockType::Mixed).
     pub fn block_type(&self) -> BlockType {
         let mut result: Option<BlockType> = None;
-        for i in 0..self.block.group_ranges.len() {
+        for i in 0..self.block.group_count() {
             let group_data = self.block.group(i);
             let group_type = classify_group(group_data);
             match result {
@@ -567,7 +599,7 @@ impl<'a> BlockElementsIter<'a> {
             block,
             state: ElementsIterState::Group,
             group_index: 0,
-            group_count: block.group_ranges.len(),
+            group_count: block.group_count(),
             dense_nodes: DenseNodeIter::empty(block),
             nodes: WireMessageIter::empty(),
             ways: WireMessageIter::empty(),
@@ -581,7 +613,7 @@ impl<'a> BlockElementsIter<'a> {
             block,
             state: ElementsIterState::Group,
             group_index: 0,
-            group_count: block.group_ranges.len(),
+            group_count: block.group_count(),
             dense_nodes: DenseNodeIter::empty(block),
             nodes: WireMessageIter::empty(),
             ways: WireMessageIter::empty(),
@@ -685,7 +717,7 @@ impl<'a> GroupIter<'a> {
         GroupIter {
             block,
             index: 0,
-            count: block.group_ranges.len(),
+            count: block.group_count(),
         }
     }
 }

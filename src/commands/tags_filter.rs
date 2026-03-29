@@ -773,53 +773,94 @@ struct RelationClosureSummary {
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_relation_member_closure(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     included_relation_ids: &mut IdSetDense,
     included_way_ids: &mut IdSetDense,
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
+    // Build schedule once — reused across convergence iterations.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+        }
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+    drop(scanner);
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    struct ClosureResult {
+        node_ids: Vec<i64>,
+        way_ids: Vec<i64>,
+        relation_ids: Vec<i64>,
+    }
+
     loop {
         let mut added_relations = 0_u64;
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
 
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
-            }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = crate::block::PrimitiveBlock::new(decompressed)?;
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element {
-                    if !included_relation_ids.get(r.id()) {
-                        continue;
-                    }
-                    summary.has_relation = true;
-                    for member in r.members() {
-                        match member.id {
-                            MemberId::Node(id) => {
-                                relation_dep_node_ids.set(id);
+        // Classify phase: workers read included_relation_ids (immutable).
+        // Results collected into a Vec — merge phase runs after with mutable access.
+        let mut results: Vec<ClosureResult> = Vec::new();
+        super::parallel_classify_phase(
+            &shared_file,
+            &schedule,
+            |block| {
+                let mut result = ClosureResult {
+                    node_ids: Vec::new(),
+                    way_ids: Vec::new(),
+                    relation_ids: Vec::new(),
+                };
+                for element in block.elements_skip_metadata() {
+                    if let Element::Relation(r) = &element {
+                        if !included_relation_ids.get(r.id()) {
+                            continue;
+                        }
+                        for member in r.members() {
+                            match member.id {
+                                MemberId::Node(id) => result.node_ids.push(id),
+                                MemberId::Way(id) => result.way_ids.push(id),
+                                MemberId::Relation(id) => result.relation_ids.push(id),
+                                MemberId::Unknown(..) => {}
                             }
-                            MemberId::Way(id) => {
-                                if set_if_absent(included_way_ids, id) {
-                                    summary.has_way = true;
-                                }
-                            }
-                            MemberId::Relation(id) => {
-                                if set_if_absent(included_relation_ids, id) {
-                                    added_relations += 1;
-                                }
-                            }
-                            MemberId::Unknown(..) => {}
                         }
                     }
+                }
+                result
+            },
+            |cr| results.push(cr),
+        )?;
+
+        // Merge phase: mutate included sets.
+        for cr in results {
+            if !cr.node_ids.is_empty() || !cr.way_ids.is_empty() || !cr.relation_ids.is_empty() {
+                summary.has_relation = true;
+            }
+            for id in cr.node_ids {
+                relation_dep_node_ids.set(id);
+            }
+            for id in cr.way_ids {
+                if set_if_absent(included_way_ids, id) {
+                    summary.has_way = true;
+                }
+            }
+            for id in cr.relation_ids {
+                if set_if_absent(included_relation_ids, id) {
+                    added_relations += 1;
                 }
             }
         }
@@ -836,40 +877,60 @@ fn collect_relation_member_closure(
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_way_node_dependencies(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     included_way_ids: &IdSetDense,
     skip_way_ids: Option<&IdSetDense>,
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<()> {
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new(decompressed)?;
-        for element in block.elements_skip_metadata() {
-            if let Element::Way(w) = &element
-                && included_way_ids.get(w.id())
-            {
-                if let Some(skip) = skip_way_ids
-                    && skip.get(w.id())
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+    drop(scanner);
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    super::parallel_classify_phase(
+        &shared_file,
+        &schedule,
+        |block| {
+            let mut node_ids = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element
+                    && included_way_ids.get(w.id())
                 {
-                    continue;
-                }
-                for node_id in w.refs() {
-                    relation_dep_node_ids.set(node_id);
+                    if let Some(skip) = skip_way_ids {
+                        if skip.get(w.id()) {
+                            continue;
+                        }
+                    }
+                    node_ids.extend(w.refs());
                 }
             }
-        }
-    }
+            node_ids
+        },
+        |node_ids| {
+            for id in node_ids {
+                relation_dep_node_ids.set(id);
+            }
+        },
+    )?;
+
     Ok(())
 }
 

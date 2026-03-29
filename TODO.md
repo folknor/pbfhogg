@@ -109,12 +109,19 @@ pipeline classifies blobs in parallel and writes matching raw frames via
 pread workers, bypassing decode+re-encode entirely. Simple extract now
 beats osmium (4.4s vs 7.2s Japan, 100s vs 350s Europe sequential baseline).
 
-The remaining opportunity is extending raw group passthrough to other
-re-encoding commands: cat --type, tags-filter, getid, renumber, time-filter.
-These still fully decode and re-encode via BlockBuilder. The four primitives
-(`raw_group_bytes`, `raw_stringtable_bytes`, `classify_group`,
-`frame_raw_block`) apply here. Less critical now that the highest-impact
-command (extract simple) is already faster than osmium.
+Raw frame passthrough is now also shipped for cat --type — matching blobs
+(by indexdata ElemKind) are written as raw compressed frames, non-matching
+blobs skipped entirely. Planet cat --type way: 207s → 43s (4.8x faster).
+
+The remaining opportunity is extending raw passthrough to other
+re-encoding commands: tags-filter, getid, renumber, time-filter.
+These still fully decode and re-encode via BlockBuilder.
+For tags-filter: blobs where ALL elements match the tag expression
+could be passed through raw (requires blob-level tag index check).
+For getid: most blobs have zero matching IDs and are already skipped
+via BlobFilter; the few matching blobs need element-level filtering.
+For renumber/time-filter: every element is modified, so raw passthrough
+does not apply — the win here is write-path throughput instead.
 See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
 
 ### Write-path throughput
@@ -162,6 +169,12 @@ from simple extract applies to any sequential collection pass:
 - [ ] `getid::parse_ids_from_pbf` (`src/commands/getid.rs` ~line 132) —
   full PrimitiveBlock decode for an ID-only scan. Could use a lightweight
   wire-format scanner that extracts only element IDs.
+- [ ] **getid include: pread skip for non-matching blobs** — the include
+  path now skips decompression via ID-range filtering (planet 71.5s →
+  32.5s), but still sequentially reads the entire file to check each
+  blob's header. A header-only scan + pread of only matching blobs
+  would reduce planet from 32.5s to under 1s (only 3-9 blobs need
+  reading). Low priority — 32.5s is already fast for planet-scale.
 - [ ] `tags_count.rs` — uses `for_each_primitive_block_batch` (pipelined).
   At planet scale with 520K+ blobs the retention pattern applies. Convert
   to sequential BlobReader if planet-scale tag analytics is needed.
@@ -173,6 +186,11 @@ from simple extract applies to any sequential collection pass:
 - [ ] Extract relation classify parallelization — rel classify is 13s at
   Europe scale (13% of simple extract total 100s). Could parallelize but
   marginal return given it's the smallest phase.
+- [x] **tags-filter closure + way dep scans** —
+  `collect_relation_member_closure` and `collect_way_node_dependencies`
+  converted to `parallel_classify_phase`. Closure uses collect-then-merge
+  to avoid borrow conflict (workers read `included_relation_ids`,
+  merge phase writes). Verified via `brokkr verify tags-filter`.
 
 ## Milestone 3: Beyond the benchmark
 

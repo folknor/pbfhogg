@@ -129,24 +129,66 @@ pub fn parse_ids_from_file_with_default_type(
 /// Reads every node, way, and relation in the file and adds its ID to the
 /// returned `IdSet`. No member or reference IDs are collected — only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
-pub fn parse_ids_from_pbf(path: &Path, direct_io: bool) -> Result<IdSet> {
-    let reader = ElementReader::open(path, direct_io)?;
+pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     let mut set = IdSet {
         node_ids: BTreeSet::new(),
         way_ids: BTreeSet::new(),
         relation_ids: BTreeSet::new(),
     };
-    for block in reader.into_blocks_pipelined() {
-        let block = block?;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) => { set.node_ids.insert(dn.id()); }
-                Element::Node(n) => { set.node_ids.insert(n.id()); }
-                Element::Way(w) => { set.way_ids.insert(w.id()); }
-                Element::Relation(r) => { set.relation_ids.insert(r.id()); }
-            }
-        }
+
+    // Build schedule from header-only scan.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(path)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
     }
+    drop(scanner);
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(path)
+            .map_err(|e| format!("failed to open {}: {e}", path.display()))?
+    );
+
+    struct IdBatch {
+        node_ids: Vec<i64>,
+        way_ids: Vec<i64>,
+        relation_ids: Vec<i64>,
+    }
+
+    super::parallel_classify_phase(
+        &shared_file,
+        &schedule,
+        |block| {
+            let mut batch = IdBatch {
+                node_ids: Vec::new(),
+                way_ids: Vec::new(),
+                relation_ids: Vec::new(),
+            };
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn) => batch.node_ids.push(dn.id()),
+                    Element::Node(n) => batch.node_ids.push(n.id()),
+                    Element::Way(w) => batch.way_ids.push(w.id()),
+                    Element::Relation(r) => batch.relation_ids.push(r.id()),
+                }
+            }
+            batch
+        },
+        |batch| {
+            set.node_ids.extend(batch.node_ids);
+            set.way_ids.extend(batch.way_ids);
+            set.relation_ids.extend(batch.relation_ids);
+        },
+    )?;
+
     Ok(set)
 }
 

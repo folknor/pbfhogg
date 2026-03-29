@@ -708,8 +708,38 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 /// elements, and send `OwnedBlock`s back for ordered writing.
 ///
 /// The closure captures the caller's ID sets and clean reference.
-fn pread_write_pass<F>(
+/// Blob descriptor for pread schedule.
+#[allow(dead_code)]
+struct BlobDesc {
+    seq: usize,
+    offset: u64,
+    size: usize,
+    kind: Option<crate::blob_index::ElemKind>,
+}
+
+/// Build a blob schedule from a header-only scan.
+fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut schedule = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        let kind = hdr.index().map(|idx| idx.kind);
+        schedule.push(BlobDesc { seq, offset: data_offset, size: data_size, kind });
+        seq += 1;
+    }
+    Ok(schedule)
+}
+
+/// Execute a pread-from-workers write pass on a pre-built schedule.
+fn pread_execute<F>(
     input: &Path,
+    schedule: &[BlobDesc],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
@@ -719,23 +749,7 @@ where
 {
     use std::os::unix::fs::FileExt as _;
 
-    // Header-only scan to build the blob schedule. Uses buffered I/O (not O_DIRECT)
-    // because this is a small sequential scan of blob headers only — O_DIRECT would
-    // add alignment overhead with negligible benefit.
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    // Build blob schedule from header-only scan.
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
+    if schedule.is_empty() { return Ok(()); }
 
     // Shared file for pread. Uses buffered (non-O_DIRECT) I/O because O_DIRECT
     // requires aligned buffers for pread, which we don't have — our read buffers
@@ -751,13 +765,18 @@ where
 
     type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    // Re-number sequence for the reorder buffer (schedule may be a subset).
+    let schedule_items: Vec<(usize, u64, usize)> = schedule.iter()
+        .enumerate()
+        .map(|(i, d)| (i, d.offset, d.size))
+        .collect();
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule.
         scope.spawn(move || {
-            for (s, off, sz) in schedule {
+            for (s, off, sz) in schedule_items {
                 if desc_tx.send((s, off, sz)).is_err() { break; }
             }
         });
@@ -833,6 +852,23 @@ where
         Ok(())
     })?;
 
+    Ok(())
+}
+
+/// Convenience: build schedule + execute + flush. Used by complete/smart write passes.
+/// Flushes the writer after execution (assumes single-use — don't call on a writer
+/// that will be reused for subsequent phases).
+fn pread_write_pass<F>(
+    input: &Path,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    block_fn: F,
+) -> Result<()>
+where
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+{
+    let schedule = build_blob_schedule(input)?;
+    pread_execute(input, &schedule, writer, stats, block_fn)?;
     writer.flush()?;
     Ok(())
 }
@@ -1052,19 +1088,22 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     Ok(stats)
 }
 
-/// Single-pass simple extract for sorted inputs.
+/// 3-phase barrier pipeline for sorted simple extract.
 ///
-/// For PBFs with `Sort.Type_then_ID`, classification and writing happen in one
-/// file pass. Blocks arrive in type order (nodes → ways → relations), so by
-/// the time ways appear, all bbox node IDs are known; by the time relations
-/// appear, all matched way IDs are known.
+/// Exploits the sorted PBF guarantee (nodes → ways → relations) to parallelize
+/// both classification and writing. Each phase runs pread-from-workers:
 ///
-/// Each batch of blocks is classified sequentially (populating ID sets), then
-/// dispatched for parallel writing via `process_extract_pass2_batch`. The
-/// pipeline (dedicated rayon pool) runs concurrently with the parallel write
-/// (global rayon pool) without contention.
+/// Phase 1 (nodes): workers classify (bbox check, pure function) + write matches.
+///   Consumer collects bbox_node_ids. No shared mutable state needed by workers.
+/// Phase 2 (ways): workers check refs against frozen &bbox_node_ids + write matches.
+///   Consumer collects matched_way_ids.
+/// Phase 3 (relations): workers check members against frozen ID sets + write matches.
+///
+/// ID sets become read-only after each phase barrier. Workers share them via
+/// references in thread::scope. Single file scan (schedule built once from
+/// header-only pass), three execution phases.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn extract_simple_single_pass(
     input: &Path,
     output: &Path,
@@ -1087,20 +1126,29 @@ fn extract_simple_single_pass(
     };
 
     let bbox_int = BboxInt::from_bbox(region.bbox());
-    let mut bbox_node_ids = IdSetDense::new();
-    let mut matched_way_ids = IdSetDense::new();
-    let mut matched_relation_ids = IdSetDense::new();
-    let all_way_node_ids = IdSetDense::new(); // empty — simple doesn't include extra way nodes
+    let spatial_filter = spatial_blob_filter(&bbox_int);
 
-    // Sequential reader to avoid PrimitiveBlock cross-thread retention.
-    // The pipelined reader OOM'd at Europe scale (25.7 GB anon, 520K blobs)
-    // when most blobs match the extract region. The batch pattern does not
-    // bound retention when every blob is decoded through the pipeline.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    let header_blob = blob_reader.next()
+    // Build schedule once, partition by element type.
+    let full_schedule = build_blob_schedule(input)?;
+    let node_schedule: Vec<&BlobDesc> = full_schedule.iter()
+        .filter(|d| {
+            // Include node blobs that pass spatial filter.
+            matches!(d.kind, Some(crate::blob_index::ElemKind::Node) | None)
+        })
+        .collect();
+    let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
+        .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Way) | None))
+        .collect();
+    let relation_schedule: Vec<&BlobDesc> = full_schedule.iter()
+        .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Relation) | None))
+        .collect();
+
+    // Open writer.
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = header_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let header = header_blob.to_headerblock()?;
+    drop(header_reader);
     super::warn_locations_on_ways_loss(&header);
     let bbox = region.bbox();
     let mut writer = writer_from_header(output, compression, &header, false, overrides, |hb| {
@@ -1112,53 +1160,143 @@ fn extract_simple_single_pass(
         hb.sorted()
     }, direct_io, false)?;
 
-    let spatial_filter = spatial_blob_filter(&bbox_int);
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut bbox_node_ids = IdSetDense::new();
+    let mut matched_way_ids = IdSetDense::new();
+    let empty_relation_ids = IdSetDense::new(); // placeholder for node/way phases
+    let all_way_node_ids = IdSetDense::new();
 
-    let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        // Spatial blob filter: skip node blobs outside extract region.
-        if let Some(idx) = blob.index() {
-            if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+    // --- Phase 1: Classify nodes (scanner) + write nodes (pread-from-workers) ---
+    // Classification first: node bbox check is a pure function, use node-only scanner.
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        let mut node_tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
                 if let Some(ref filter_bbox) = spatial_filter.node_bbox {
                     if let Some(ref blob_bbox) = idx.bbox {
                         if !filter_bbox.intersects(blob_bbox) { continue; }
                     }
                 }
             }
-        }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        let has_matches = classify_block_simple(
-            &block, region, &bbox_int,
-            &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
-        );
-        if !has_matches {
-            continue;
-        }
-        batch.push(block);
-
-        if batch.len() >= BATCH_SIZE {
-            let ids = ExtractPass2IdSets {
-                bbox_node_ids: &bbox_node_ids,
-                all_way_node_ids: &all_way_node_ids,
-                matched_way_ids: &matched_way_ids,
-                matched_relation_ids: &matched_relation_ids,
-            };
-            process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
-            batch.clear();
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            node_tuples.clear();
+            super::node_scanner::extract_node_tuples(&decompressed, &mut node_tuples)
+                .map_err(|e| crate::error::new_error(
+                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
+                ))?;
+            for t in &node_tuples {
+                if region.contains_decimicro(&bbox_int, t.lat, t.lon) {
+                    bbox_node_ids.set(t.id);
+                }
+            }
         }
     }
-    if !batch.is_empty() {
+    // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
+    let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .collect();
+    {
+        let ids = ExtractPass2IdSets {
+            bbox_node_ids: &bbox_node_ids,
+            all_way_node_ids: &all_way_node_ids,
+            matched_way_ids: &matched_way_ids,
+            matched_relation_ids: &empty_relation_ids,
+        };
+        pread_execute(input, &node_descs, &mut writer, &mut stats, |block, bb, output| {
+            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            flush_local(bb, output)?;
+            Ok(s)
+        })?;
+    }
+
+    // --- Phase 2: Classify ways (scanner) + write ways (pread-from-workers) ---
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, |way_id, refs| {
+                if refs.iter().any(|&r| bbox_node_ids.get(r)) {
+                    matched_way_ids.set(way_id);
+                }
+            })?;
+        }
+    }
+    // matched_way_ids frozen. Write matching ways via pread-from-workers.
+    let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .collect();
+    {
+        let ids = ExtractPass2IdSets {
+            bbox_node_ids: &bbox_node_ids,
+            all_way_node_ids: &all_way_node_ids,
+            matched_way_ids: &matched_way_ids,
+            matched_relation_ids: &empty_relation_ids,
+        };
+        pread_execute(input, &way_descs, &mut writer, &mut stats, |block, bb, output| {
+            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            flush_local(bb, output)?;
+            Ok(s)
+        })?;
+    }
+
+    // --- Phase 3: Classify relations + write (pread-from-workers) ---
+    // Relation classification needs full PrimitiveBlock (member access). Sequential scan.
+    let mut matched_relation_ids = IdSetDense::new();
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = PrimitiveBlock::new(decompressed)?;
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element {
+                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
+                        matched_relation_ids.set(r.id());
+                    }
+                }
+            }
+        }
+    }
+    let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind })
+        .collect();
+    {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
             all_way_node_ids: &all_way_node_ids,
             matched_way_ids: &matched_way_ids,
             matched_relation_ids: &matched_relation_ids,
         };
-        process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
+        pread_execute(input, &rel_descs, &mut writer, &mut stats, |block, bb, output| {
+            let s = extract_block_pass2(block, &ids, clean, bb, output)?;
+            flush_local(bb, output)?;
+            Ok(s)
+        })?;
     }
 
     writer.flush()?;

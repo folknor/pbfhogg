@@ -412,6 +412,91 @@ pub(crate) fn ensure_relation_capacity_local(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Parallel classification helper
+// ---------------------------------------------------------------------------
+
+/// Run a parallel classification phase: pread workers decompress and classify
+/// blobs, sending compact results to a consumer that merges them into ID sets.
+///
+/// Each entry in `schedule` is `(seq, data_offset, data_size)`. Workers pread
+/// the compressed blob data, decompress, build a `PrimitiveBlock`, run the
+/// `classify` closure, and send the result. The consumer calls `merge` for
+/// each result. No reorder buffer — ID set merges are order-independent.
+pub(crate) fn parallel_classify_phase<R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    classify: impl Fn(&crate::PrimitiveBlock) -> R + Send + Sync,
+    mut merge: impl FnMut(R),
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    if schedule.is_empty() { return Ok(()); }
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for &item in schedule {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let classify_ref = &classify;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<R> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec(
+                            std::mem::take(&mut decompress_buf)
+                        )?;
+                        let result = classify_ref(&block);
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+                        Ok(result)
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        for (_seq, result) in result_rx {
+            let r = result?;
+            merge(r);
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
 /// Warn if the input header declares `LocationsOnWays` — inline way-node
 /// coordinates are not propagated through re-encoding.
 pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {

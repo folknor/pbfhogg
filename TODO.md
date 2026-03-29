@@ -147,16 +147,16 @@ from simple extract applies to any sequential collection pass:
   19,701ms → 4,816ms (4.1x), smart 24,300ms → 8,976ms (2.7x).
   Uses the `parallel_classify_phase` helper (reusable for other
   commands). Verified via `brokkr verify extract` (all strategies pass).
-- [ ] **getid --add-referenced pass 1** — scans ways for ref collection.
-  Currently sequential BlobReader. Workers scan refs in parallel, same
-  pattern as the way classify phase in simple extract.
+- [x] **getid --add-referenced pass 1** — scans ways for ref collection.
+  Converted to parallel pread classification via `parallel_classify_phase`.
+  Workers scan way blobs for matching IDs and collect node refs.
+  Verified via `brokkr verify getid-removeid`.
 
 ### Smaller items
 
-- [ ] `merge --locations-on-ways` node scanner — `src/commands/merge.rs` ~line
-  1460 decompresses passthrough node blobs into full PrimitiveBlock just to
-  collect (id, lat, lon). Replace with `extract_node_tuples` from
-  `src/commands/node_scanner.rs` (same pattern as ALTW pass 1).
+- [x] `merge --locations-on-ways` node scanner — already uses
+  `extract_node_tuples` from `node_scanner.rs` with `par_iter` for
+  parallel decompress+extract. No PrimitiveBlock construction.
 - [ ] `node_stats.rs` — uses `for_each_pipelined` (cross-thread PrimitiveBlock).
   Only needs id/lat/lon. Convert to node-only scanner for planet safety.
 - [ ] `getid::parse_ids_from_pbf` (`src/commands/getid.rs` ~line 132) —

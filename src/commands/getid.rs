@@ -299,33 +299,52 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     let mut has_dep_nodes = false;
 
     if !ids.way_ids.is_empty() {
-        // Sequential reader to avoid PrimitiveBlock cross-thread retention.
-        // The unbatched per-block iteration would accumulate 8+ GB anon at
-        // Europe scale with the pipelined reader.
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
+        // Parallel classification: pread workers scan way blobs for matching
+        // way IDs and collect their node refs.
+        let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+        scanner.set_parse_indexdata(true);
+        scanner.next_header_skip_blob()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
+
+        let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+        let mut seq: usize = 0;
+        while let Some(result_item) = scanner.next_header_with_data_offset() {
+            let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+            if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = hdr.index() {
                 if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
             }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = crate::block::PrimitiveBlock::new(decompressed)?;
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(w) = &element
-                    && ids.way_ids.contains(&w.id())
-                {
-                    for node_id in w.refs() {
-                        dep_node_ids.set(node_id);
-                        has_dep_nodes = true;
+            schedule.push((seq, data_offset, data_size));
+            seq += 1;
+        }
+        drop(scanner);
+
+        let shared_file = std::sync::Arc::new(
+            std::fs::File::open(input)
+                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+        );
+
+        super::parallel_classify_phase(
+            &shared_file,
+            &schedule,
+            |block| {
+                let mut node_ids = Vec::new();
+                for element in block.elements_skip_metadata() {
+                    if let Element::Way(w) = &element
+                        && ids.way_ids.contains(&w.id())
+                    {
+                        node_ids.extend(w.refs());
                     }
                 }
-            }
-        }
+                node_ids
+            },
+            |node_ids| {
+                for id in node_ids {
+                    dep_node_ids.set(id);
+                    has_dep_nodes = true;
+                }
+            },
+        )?;
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
     // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.contains(&id).

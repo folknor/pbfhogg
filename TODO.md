@@ -154,11 +154,9 @@ temp disk, compression mode. Regression CI to prevent backsliding.
 The parallel pread + lightweight scanner + send compact results pattern
 from simple extract applies to any sequential collection pass:
 
-- [ ] **tags-filter two-pass pass 1** — scans for matching elements by tag
-  expression. Currently sequential (363s Europe after OOM fix). Workers
-  could pread + decompress + check tags + send matching element IDs.
-  Needs full PrimitiveBlock (tag access), not just scanners — but workers
-  own the lifecycle (same as pread_write_pass).
+- [x] **tags-filter two-pass pass 1** — parallel classification for pass 1.
+  Europe: 363s → 39s pass 1, 158s total (-57%). Pass 1 uses parallel
+  pread + decompress + tag check. Closure+deps 88s, pass 2 write 31s.
 - [ ] **extract complete/smart pass 1** — `collect_pass1_generic` in
   `src/commands/extract.rs` scans for bbox nodes + matching ways +
   matching relations. Currently sequential BlobReader. The sorted path

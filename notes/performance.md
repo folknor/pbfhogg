@@ -348,6 +348,24 @@ Denmark -14% (2625→2259ms), Japan -8% (12,619→11,643ms). Single-pass
 classification on sorted input eliminates the second file read. Superseded
 by the parallel classify + raw frame passthrough architecture.
 
+## Tags-filter
+
+Two-pass architecture: pass 1 classifies blobs in parallel (parallel
+classification + lightweight scanner), pass 2 writes matching elements.
+
+| Dataset | Sequential (old) | Two-pass | Speedup | Commit |
+|---------|-----------------|----------|---------|--------|
+| Europe (33.6 GB) | 363s | **158s** | -57% | latest |
+
+Europe two-pass phase breakdown:
+- Pass 1 (parallel classification): 39s
+- Closure + deps: 88s
+- Pass 2 (write): 31s
+
+Previously OOM with pipelined reader. Sequential fix (commit `2a8a649`)
+brought it to 363s. Parallel classification for pass 1 brings the total
+to 158s.
+
 ## Pipeline end-to-end
 
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.

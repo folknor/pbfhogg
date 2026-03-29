@@ -16,7 +16,7 @@
 
 Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. Designed for planet-scale operations on normal hardware.
 
-Applying a daily diff to an 18.8 GB North America extract (2.58 billion elements, 645K changes) takes 12 seconds and uses under 600 MB of RAM. 92% of blobs pass through as raw bytes — no decompression, no re-encoding. Enriching the full planet (87 GB) with way-node coordinates takes 24 minutes and 17 GB of RAM on a 30 GB machine — 3.9x faster than the mmap-based approach that thrashes at this scale.
+Applying a daily diff to the full planet (87 GB, 3.4M changes, 86% rewrite fraction) takes 13 minutes and 1.8 GB of RAM on a 30 GB machine. Enriching the planet with way-node coordinates takes 24 minutes and 17 GB. Building a reverse geocoding index takes 22 minutes and 18 GB. The entire production pipeline runs on normal hardware — no 128 GB server required.
 
 Developed on Linux, untested elsewhere. Production-relevant features (O_DIRECT, io_uring) are Linux-only.
 

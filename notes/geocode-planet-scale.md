@@ -1,5 +1,7 @@
 # Planet-Scale Geocode Index Builder
 
+**Historical design document** -- planet build validated at 1,346s (22.4 min), 17.8 GB RSS. Implementation deviated from some spec details (compact rank-indexed array instead of DenseMmapIndex, sequential readers instead of pipelined).
+
 Spec for evolving the geocode index builder from an in-memory regional pipeline
 to a streaming pipeline that fits in 30 GB RAM for planet (~87 GB PBF).
 

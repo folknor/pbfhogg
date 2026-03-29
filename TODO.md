@@ -102,62 +102,143 @@ Dense remains the "fast when RAM fits" path. See [notes/altw-optimization-histor
 | Europe | 33.6 GB | 4.2B | 2631s (44m) | buffered, post `3677069` (with pass 0), +2.6% noise |
 | Planet | 87.7 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) | 5773s (96m) | buffered, memory-latency-bound, commit `69a127f` |
 
-## Next (from 10-reviewer sweep)
+## Milestone 1: Planet-safe production pipeline — COMPLETE
 
-### Planet validation runs (run when AFK — takes 25-60 min each)
+Every production step validated on 87 GB planet PBF on a 30 GB host:
 
-- [x] **Planet geocode build** — **1,346s (22.4 min), 14.6 GB anon, 17.8 GB RSS.**
-  Compact rank-indexed array validated at planet scale. Sidecar `6887288a`.
-- [ ] **Planet merge/apply-changes** — needs planet OSC diff configured in brokkr.toml.
-- [x] **Planet cat --type way** — 207s (3.5 min). O_DIRECT variant: 240s (+16%, slower).
-- [x] **Planet check-refs** — 1,254s (20.9 min), 1.7 GB anon. Sequential reader works.
-- [x] **Planet inspect-tags, tags-filter-way, getid** — all completed.
-- [x] **Planet read** — sequential 583s. Parallel/pipelined OOM'd (expected, documented).
+| Step | Time | RSS |
+|------|------|-----|
+| cat (indexdata generation) | 497s (8.3 min) | minimal |
+| add-locations-to-ways (external) | 1,462s (24.4 min) | 16.7 GB |
+| build-geocode-index | 1,346s (22.4 min) | 17.8 GB |
+| apply-changes (daily merge, zlib) | 762s (12.7 min) | 1.8 GB |
 
-### Planet read benchmark (partial, commit `f42da6e`)
+## Milestone 2: Performance supremacy
 
-- [x] Sequential: 583s (9.7 min), 87 GB, 10.4B nodes. ~149 MB/s decode throughput.
-- [ ] Parallel (`par_map_reduce`): **OOM at 23.6 GB anon** within 10s. Classic
-  PrimitiveBlock cross-thread retention. Not a production issue — no command
-  uses `par_map_reduce` at planet scale. All production commands use sequential
-  readers, scanners, or batched pipelined readers.
-- [ ] Pipelined: not run (blocked by parallel OOM). Likely same retention issue.
-- [ ] BlobReader: not run (blocked by parallel OOM). Should be fine (no PrimitiveBlock).
+Goal: fastest or equal on every PBF transform operation, with published
+benchmarks. The write path is the remaining frontier.
 
-### merge --locations-on-ways node scanner (6/10 reviewers)
-
-Still builds full PrimitiveBlock to mine node coordinates from passthrough
-node blobs (merge.rs ~line 1437). Node-coordinate scanner (`extract_node_tuples`)
-already exists and fits directly. Localized, low-risk, production-relevant
-(nidhogg steady state once locations_on_ways is enabled).
-
-### Raw group passthrough for extract (beat osmium)
-
-The last osmium gap: simple extract 2.5x slower (18s vs 7.2s Japan). The gap
-is write-side: pbfhogg fully decodes + re-encodes via BlockBuilder. osmium
-copies raw protobuf group bytes for all-match groups.
+### Raw group passthrough (priority 1)
 
 Copy raw PrimitiveGroup bytes for groups where all elements are selected.
 Partial-match groups fall back to decode + re-encode. String table copied
-whole. Four primitives needed: raw_group_bytes, raw_stringtable_bytes,
-classify_group, frame_raw_block.
+whole. Applies to every re-encoding command: extract, cat --type,
+tags-filter, sort, getid, renumber, time-filter.
 
-Independent of read-path work. See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
+Four primitives needed: `raw_group_bytes`, `raw_stringtable_bytes`,
+`classify_group`, `frame_raw_block`. Independent of read-path work.
+See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
 
-### Smaller items (from reviewer sweep)
+### Write-path throughput
 
-- [ ] `node_stats.rs` — still on `for_each_pipelined`, pure node-coordinate
-  analytics. Natural node-only scanner candidate. Low user impact.
-- [ ] `getid::parse_ids_from_pbf` — full-block decode for ID-only scan.
-  Could use a simpler scanner. Low priority.
-- [ ] `tags_count.rs` — still pipelined. Analytics-only, low priority.
-- [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all`) — last
-  pipelined path processing all ~1.4M blocks. Only triggers with `--force` on
-  non-indexed PBFs. Niche but the last 25+ GB retention path.
-- [ ] Write-path throughput (arch-Codex) — BlockBuilder/PbfWriter is the next
-  bottleneck after read-path optimizations. SIMD varint, compression tuning.
-  See [notes/SIMD.md](notes/SIMD.md).
-- [x] Dead code cleanup (commit `428e73b`). Zero lib warnings.
+After raw group passthrough, `BlockBuilder` (`src/write/block_builder.rs`)
+and `PbfWriter` (`src/write/writer.rs`) are the next bottleneck for commands
+that must re-encode partial-match groups. Opportunities: SIMD varint encoding
+in `src/write/wire.rs` (the write-side protobuf primitives), zlib compression
+level tuning (currently hardcoded level 6), and reducing per-element overhead
+in `BlockBuilder::add_node/add_way/add_relation` (string table construction
+is the hot path — FxHashMap lookup + Rc<str> alloc per unique string).
+See [notes/SIMD.md](notes/SIMD.md) for the varint research.
+
+### Published benchmark matrix
+
+Denmark/Japan/Europe/planet benchmarks for every command. Time, RSS,
+temp disk, compression mode. Regression CI to prevent backsliding.
+
+### Smaller items
+
+- [ ] `merge --locations-on-ways` node scanner — `src/commands/merge.rs` ~line
+  1460 decompresses passthrough node blobs into full PrimitiveBlock just to
+  collect (id, lat, lon). Replace with `extract_node_tuples` from
+  `src/commands/node_scanner.rs` (same pattern as ALTW pass 1).
+- [ ] `node_stats.rs` — uses `for_each_pipelined` (cross-thread PrimitiveBlock).
+  Only needs id/lat/lon. Convert to node-only scanner for planet safety.
+- [ ] `getid::parse_ids_from_pbf` (`src/commands/getid.rs` ~line 132) —
+  full PrimitiveBlock decode for an ID-only scan. Could use a lightweight
+  wire-format scanner that extracts only element IDs.
+- [ ] `tags_count.rs` — uses `for_each_primitive_block_batch` (pipelined).
+  At planet scale with 520K+ blobs the retention pattern applies. Convert
+  to sequential BlobReader if planet-scale tag analytics is needed.
+- [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
+  `src/commands/add_locations_to_ways.rs` ~line 1045) — uses
+  `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.
+  Only triggers with `--force` on non-indexed PBFs. Niche but the last
+  unmitigated retention path.
+
+## Milestone 3: Beyond the benchmark
+
+Goal: the obvious choice for every OSM data processing task, not just
+the fastest one.
+
+### Multi-extract
+
+Produce 200+ regional extracts from a single planet pass. The CLI already
+has `extract --config` (`src/commands/extract.rs`, `ExtractConfig` struct)
+for multiple bbox/polygon regions from a JSON config file. Current
+implementation runs each extract sequentially. The optimization: read the
+PBF once, classify each element against all N regions simultaneously, and
+route to N `PbfWriter` instances. The pread-from-workers infrastructure
+(`pread_write_pass`) could dispatch workers per-region or per-blob with
+multi-region classification. At planet scale, this avoids N × 87 GB of
+redundant I/O — critical for data distributors maintaining regional extracts.
+
+### Export (GeoJSON/GeoPackage)
+
+The bridge to the GIS ecosystem. Streaming PBF → GeoJSON/GeoJSONSeq
+export. The pieces exist in the codebase:
+- Reader: `ElementReader` for element iteration
+- Geometry: `src/geo.rs` has point-in-polygon, ring assembly from way
+  refs, Douglas-Peucker simplification
+- Coordinates: `Way::node_locations()` from enriched PBFs (ALTW output),
+  or inline coordinate resolution via the dense/external index
+- Multipolygons: relation member assembly is in extract's smart strategy
+
+The export command would iterate elements, resolve geometry (points for
+nodes, linestrings for ways, polygons for multipolygon relations), and
+write GeoJSON features to stdout or a file. Tag mapping (which tags
+become GeoJSON properties) needs a configuration model.
+
+### Command surface
+
+- [ ] `show` — display a single element by ID with all metadata, tags, refs,
+  members. Human-readable output (like `osmium show`). Needs indexed lookup
+  via `IndexedReader` or sequential scan with early exit.
+- [ ] Resolve or document known semantic differences in verify output.
+  Three commands have known diffs: extract (relation inclusion criteria),
+  diff (14-element version comparison), check-refs (occurrences vs unique).
+  See `brokkr verify all` output and README cross-validation section.
+- [ ] Auto-selection: `--index-type auto` exists (dense vs external).
+  Extend to other decisions: sequential vs pread-from-workers based on
+  available RAM and blob count; compression level based on output target;
+  batch size based on core count. Config or heuristic, not manual flags.
+- [ ] Migration guide from other tools — command mapping table, behavioral
+  differences, indexdata workflow explanation. Build on existing
+  `notes/osmium-parity.md`.
+
+### Ecosystem
+
+- [ ] crates.io release (protohoggr + pbfhogg + pbfhogg-cli).
+- [ ] CI with benchmark regression guard.
+- [ ] API documentation for library consumers.
+- [ ] PyO3 Python bindings (read/write API for the Python ecosystem).
+- [ ] Packaged "planet on 32 GB" reference pipeline (documented, runnable).
+
+### Research / stretch ideas
+
+- [ ] Incremental geocode index update (daily diff → index patch, no full rebuild).
+- [ ] Incremental extract update (`extract --apply-changes` — base extract + OSC +
+  region → updated extract without re-reading planet).
+- [ ] Spatial indexing in PBF format (R-tree over blob offsets for
+  O(log N) spatial queries on planet files).
+- [ ] Streaming pipeline composition (pipe commands without intermediate
+  PBF encode/decode — library-level iterator API).
+- [ ] Zstd as default compression for internal pipelines (3-5x faster
+  decompress than zlib at equivalent ratios).
+- [ ] Dense ALTW compact rank-indexed array (same pattern as geocode builder —
+  better locality on hosts where dense currently works, reviewers split 1/8).
+- [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`
+  accept GeoJSON, or only .poly format?).
+- [ ] History-file support — decide in-scope or explicitly out-of-scope.
 
 ## Release prep
 
@@ -178,7 +259,7 @@ Three `brokkr verify` commands show known differences vs osmium. These are seman
 disagreements, not bugs — but should be investigated and either fixed or documented
 before release.
 
-- [ ] **Planet-scale merge on 32 GB host** — verify `apply-changes` on a full planet file (~80 GB) completes without OOM on the 32 GB dev machine. README claims this should work (adaptive in-flight budget, 600 MB RSS at NA scale). Must validate before release.
+- [x] **Planet-scale merge on 32 GB host** — **762s (12.7 min), 1.8 GB RSS.** 86% rewrite, 3.4M diff entries. Validated.
 - [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Two fixes landed:
   1. Batch-side (commit `abe2782`): `DECODE_BATCH_BYTE_BUDGET = 32 MiB` caps
      decompressed bytes per batch via `for_each_primitive_block_batch_budgeted`.

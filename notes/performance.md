@@ -99,10 +99,12 @@ Best results per dataset. Commit `a6ebbfe` (NA), `a65a198` (multi-region),
 | Japan | 2.4 GB | 1.87s | 2.88s | — | — |
 | Germany | 4.7 GB | 3.42s | 5.34s | 4.4s | 9.6s |
 | North America | 18.8 GB | 14.9s | 17.3s | **11.9s** | 15.2s |
+| Planet | 87 GB | 515s | 762s | — | — |
 
 Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
 North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
 rewritten blobs. All variants under 600 MB RSS.
+Planet (87 GB, daily diff): 86% rewrite, 1.8 GB RSS.
 
 io_uring crossover at ~4-5 GB input. Below that, page cache absorbs everything.
 At NA scale (18.8 GB exceeds 30 GB page cache), O_DIRECT + async I/O delivers
@@ -161,8 +163,8 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 |---------|-------|--------|----------|--------|
 | Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
 | Japan (2.4 GB) | **42s** | — | — | `b3e8bf7` (node scanner) |
-| Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **921s (15m)** | `ee9b19f` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | ~45-60m (est.) | — |
+| Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **577s (9.6m)** | `6b09796` |
+| Planet (87.7 GB) | 5,773s (96m)* | — | **1,462s (24.4 min)**, 16.7 GB peak anon | `98e71e2b` (sidecar) |
 
 *Dense at Europe scale thrashes on 30 GB host (mmap working set ~16 GB > available
 RAM). Japan 42s is with node-only scanner for pass 1 (commit `b3e8bf7`, previously
@@ -181,15 +183,15 @@ stage 4).
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
 I/O stays bounded.
 
-### External join stage breakdown (Europe, commit `ee9b19f`, plantasjen)
+### External join stage breakdown (Europe, commit `6b09796`, plantasjen)
 
 | Stage | Time | RSS (anon) | Description |
 |-------|------|-----------|-------------|
 | Stage 1 (way pass) | 81s | 69 MB post | Pipelined reader + BufWriter buckets |
-| Stage 2 (node join) | 301s | 69 MB post | Node-only sequential scanner + merge-join |
+| Stage 2 (node join) | 216s | 69 MB post | Node-only sequential scanner + merge-join |
 | Stage 3 (slot reorder) | 78s | 69 MB post | Scatter buffer (was 1079s with pwrite) |
-| Stage 4 (assembly) | 461s | 1.6 GB flat | Sequential reader + batch parallel assembly |
-| **Total** | **921s** | | With `--compression none`: ~754s |
+| Stage 4 (assembly) | 136s | 1.6 GB flat | Sequential reader + batch parallel assembly |
+| **Total** | **577s** | | With `--compression none`: ~754s |
 
 ### External join optimization history
 
@@ -206,9 +208,8 @@ Key optimizations: node-only wire scanner (bypasses PrimitiveBlock, eliminates
 15x speedup), BlobReader fadvise(DONTNEED) (general infrastructure), deferred
 IdSetDense, buffer reuse in bucket loads.
 
-See [external-join-oom-investigation.md](external-join-oom-investigation.md)
-for the full investigation and [altw-memory.md](altw-memory.md) for the
-memory optimization research log.
+See [altw-optimization-history.md](altw-optimization-history.md) for the
+full investigation and memory optimization research log.
 
 ## CLI commands
 
@@ -426,8 +427,7 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Germany (4.5 GB) | — | **9.8 min** | After optimization (was 30 min) |
 | Planet (~87 GB) | 8-10 hours (192 GB RAM) | — | Would OOM on 30 GB host |
 
-Extrapolated planet: ~19 × 10 min = ~3.2 hours build time, ~34 GB index (vs
-traccar's 18 GB). Our index is larger due to segment-level indexing (6 bytes
+Planet (validated): **1,346s (22.4 min), 17.8 GB RSS** (sidecar `6887288a`). Our index is larger due to segment-level indexing (6 bytes
 vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
 builder currently holds all intermediate data in RAM — planet requires
 streaming to temp files (not yet implemented).

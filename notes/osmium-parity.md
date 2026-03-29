@@ -206,10 +206,10 @@ These osmium flags have no pbfhogg equivalent:
 
 | osmium command | Status |
 |----------------|--------|
-| `export` | Not planned. GeoJSON/PG export is outside pbfhogg's scope. |
+| `export` | Planned for Milestone 3. Streaming PBF → GeoJSON/GeoJSONSeq. |
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
-| `show` | Not planned. `inspect` covers metadata; element-level display not implemented. |
+| `show` | Planned for Milestone 3. Element-level inspection by ID. |
 
 ## Indexdata
 
@@ -220,7 +220,7 @@ has no osmium equivalent.
 To create an indexed PBF:
 
 ```
-pbfhogg cat input.pbf --type node,way,relation -o indexed.pbf
+pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
 Commands that benefit from indexdata will error if it's missing. Use `--force`

@@ -372,7 +372,7 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--force` | Proceed without indexdata / overwrite existing index |
 
-Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 568s (9.5 min), 7.5 GB RSS.
+Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 568s (9.5 min), 7.5 GB RSS. Planet (87 GB): 1,346s (22.4 min), 17.8 GB RSS.
 
 ---
 
@@ -402,7 +402,7 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 | apply-changes | Yes | Yes | Yes (R+W) | Yes | Production merge path |
 | diff | Yes | — | Yes | — | Read-only (text output) |
 | diff --format osc | Yes | — | Yes | — | Read-only (OSC XML output) |
-| derive-changes | Yes | — | Yes | — | Read-only (OSC XML output) |
+| derive-changes (via `diff --format osc`) | Yes | — | Yes | — | Read-only (OSC XML output) |
 | build-geocode-index | Yes | — | Yes | — | Binary index output, not PBF |
 | merge-changes | — | — | — | — | OSC-only, no PBF I/O |
 

@@ -73,7 +73,8 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **PrimitiveBlock ownership** — `src/read/block.rs`:
 - Owns `Bytes` buffer (decompressed ~1.4 MB) + `WireBlock<'static>` (self-referential, unsafe transmute)
-- `WireBlock::parse()` — builds `WireStringTable` as `Vec<(u32,u32)>` (8 bytes/entry) and `group_ranges` as `Box<[(u32,u32)]>`
+- `WireBlock::parse()` — builds `WireStringTable` and `group_ranges` as inline (offset, count) into the decompressed buffer — zero separate allocation
+- `to_primitiveblock_inline()` with pool recycling: reuses `PrimitiveBlock` across blobs (string table Vec, group Vecs) via `clear_and_reuse()`
 
 **Element iteration** — zero-copy, zero-alloc:
 - `WireGroup` lazy scanner — scans protobuf on-the-fly
@@ -81,8 +82,8 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 **Key allocation sites per blob (read path):**
 - Decompression buffer: ~1.4 MB (pooled, reused)
-- `WireStringTable`: `Vec<(u32,u32)>` — 8 bytes x string count per block
-- `WireBlock` group_ranges: `Box<[(u32,u32)]>` — 8 bytes x group count
+- `WireStringTable`: inline (offset, count) into decompressed buffer — zero separate allocation
+- `WireBlock` group_ranges: inline (offset, count) into decompressed buffer — zero separate allocation
 - Element wrappers: stack-allocated (~24 bytes each)
 
 ## Pipeline 2: Merge (nidhogg only)
@@ -122,7 +123,7 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 **Passthrough ratios** (measured):
 - Denmark (465 MB, ~300K changes): ~92% passthrough, ~8% rewrite
 - Germany (4.5 GB, ~146K changes): ~82% passthrough, ~18% rewrite
-- Planet (80 GB, daily diff): ~8% passthrough, ~92% rewrite (most blobs touched)
+- Planet (87 GB, daily diff): ~8% passthrough, ~92% rewrite (most blobs touched)
 
 ## Pipeline 3: Cat (pbfhogg CLI, used to generate indexed PBFs)
 

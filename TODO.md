@@ -160,6 +160,106 @@ from simple extract applies to any sequential collection pass:
   Workers scan way blobs for matching IDs and collect node refs.
   Verified via `brokkr verify getid-removeid`.
 
+### Reviewer findings (2026-03-29, 10 reviewers across 5 archetypes)
+
+**Do ASAP:**
+
+- [x] **Simple extract node schedule missing spatial filter** — fixed:
+  `BlobDesc` now stores the blob bbox, and the node_schedule partition
+  applies the spatial bbox filter to skip node blobs outside the extract
+  region. Flagged by 8/10 reviewers.
+
+- [x] **`blob_index::scan_block_ids` collapses mixed-type blobs** — fixed:
+  `scan_block_ids` now returns `None` when groups have different element
+  types. Mixed-type blobs fall through to full decode in all fast paths.
+  Flagged by 3/10 reviewers.
+
+**Do soon:**
+
+- [ ] **Stats undercount for raw passthrough blobs** — raw passthrough
+  paths in extract (`pread_execute` ~line 905) and getid --invert
+  (~line 450) don't update element counts in stats. Output is correct
+  but the printed summary is wrong. For extract, `nodes_in_bbox` misses
+  passthrough node blobs. For getid --invert, `nodes_written` etc.
+  miss all passthrough blobs. Flagged by 5/10 reviewers.
+
+- [ ] **`parallel_classify_phase` doc comment: merge order** — the sequence
+  number is discarded (`_seq`), so merge is called in arbitrary
+  worker-completion order. All current callers are order-independent
+  (IdSetDense::set, BTreeSet::extend). But the generic signature
+  `merge: FnMut(R)` doesn't communicate this. Add a doc comment:
+  "merge is called in arbitrary order, not blob file order."
+  Flagged by 4/10 reviewers.
+
+- [ ] **Simple extract: non-indexed sorted blobs land in all three phase
+  schedules** — `kind == None` blobs match the node, way, AND relation
+  partitions (`extract.rs` ~line 1223-1230). On a sorted but non-indexed
+  input, every blob is processed three times. `extract_simple()` does not
+  require indexdata, so this is reachable. Flagged by 2/10 reviewers.
+
+- [ ] **`decompress_buf` not reused in `parallel_classify_phase`** —
+  `from_vec(take(&mut decompress_buf))` consumes the buffer each
+  iteration. The capacity-0 check (mod.rs ~line 478) is a no-op.
+  Each blob pays fresh allocation (~1.5 MB). At Europe scale (520K
+  blobs), that's ~780 GB cumulative alloc churn. Same-thread free
+  means the allocator recycles, but using `from_vec_pooled` with a
+  per-worker `DecompressPool` (like `pread_execute` does) would
+  eliminate the reallocation. Same issue in getid.rs and cat.rs
+  decode fallback paths. Flagged by 8/10 reviewers.
+
+**Do later:**
+
+- [ ] **`pread_execute` opens a new `Arc<File>` per call** — simple extract
+  calls it 3 times for the same input file. Could share the file handle
+  across phases. Minor (~1µs per open). Flagged by 1/10 reviewers.
+
+- [ ] **Simple extract phase 3 relation classify is sequential** — "needs
+  full PrimitiveBlock (member access)" comment at `extract.rs` ~line 1472.
+  Could use `parallel_classify_phase` like complete/smart phase 3.
+  Relations are ~2K blobs at Europe — small gain but inconsistent with
+  other strategies. Flagged by 1/10 reviewers.
+
+- [ ] **No `fadvise(DONTNEED)` after pread in `parallel_classify_phase`** —
+  external join's stage 2 workers call fadvise per pread, classify
+  workers don't. At Europe scale (~2 GB compressed) this is fine. At
+  planet scale (~87 GB) could accumulate page cache. Low priority since
+  current planet-scale paths don't use `parallel_classify_phase` for
+  heavy scans. Flagged by 1/10 reviewers.
+
+- [ ] **Schedule-building boilerplate dedup** — the 20-line pattern
+  (seekable BlobReader, filter to elem kind, build schedule Vec, open
+  Arc<File>) is repeated 8+ times across extract, tags-filter, getid.
+  A `build_typed_schedule(input, kind_filter) -> (schedule, Arc<File>)`
+  helper would deduplicate. Code quality, not performance.
+  Flagged by 1/10 reviewers.
+
+- [ ] **tags-filter pass 1 not exploiting blob-level tag index** — the
+  schedule builder only uses `idx.kind` for type domination
+  (`tags_filter.rs` ~line 588-603). It doesn't apply `tagdata` filtering,
+  even though `blob_filter_from_expressions()` already computes
+  key/prefix filters. Blobs that provably lack required tag keys could
+  be skipped without decompression. Flagged by 2/10 reviewers.
+
+- [ ] **`collect_relation_member_closure` early return on empty set** —
+  the function always does one full relation scan even when
+  `included_relation_ids` is empty. An early return at the call boundary
+  (~line 695) would save that scan for no-relation cases.
+  Flagged by 1/10 reviewers.
+
+- [ ] **`way_scanner` way_id parsing inconsistency** — line 80 uses
+  `read_varint()? as i64` while canonical WireWay uses
+  `read_varint_i64()`. Identical for positive IDs (all real OSM data)
+  but inconsistent. Flagged by 1/10 reviewers.
+
+- [ ] **Simple extract node_scanner skips non-dense Node messages** —
+  `node_scanner.rs` only parses DenseNodes (line 15, 43). On legacy
+  PBFs with field-1 Node messages, `bbox_node_ids` would be incomplete,
+  cascading into missing ways and relations. Not reachable in practice
+  (all modern PBFs use DenseNodes). Flagged by 1/10 reviewers.
+
+- [ ] **Duplicate comment in extract.rs** — lines 2091-2092 have
+  "--- Pass 3: Write matching elements..." twice. Flagged by 1/10.
+
 ### Smaller items
 
 - [x] `merge --locations-on-ways` node scanner — already uses

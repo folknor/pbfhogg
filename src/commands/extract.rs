@@ -718,6 +718,8 @@ struct BlobDesc {
     offset: u64,
     size: usize,
     kind: Option<crate::blob_index::ElemKind>,
+    /// Spatial bbox from indexdata (node blobs only, v2 format).
+    bbox: Option<crate::BlobBbox>,
     /// True if this blob can be passed through raw (no decode/re-encode).
     /// Set by the schedule builder based on blob bbox containment.
     raw_passthrough: bool,
@@ -755,9 +757,11 @@ fn build_blob_schedule_with_passthrough(
             )
         });
 
+        let bbox = idx.as_ref().and_then(|i| i.bbox);
+
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (data_offset - frame_offset) as usize + data_size;
-        schedule.push(BlobDesc { seq, frame_offset, frame_size, offset: data_offset, size: data_size, kind, raw_passthrough });
+        schedule.push(BlobDesc { seq, frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, raw_passthrough });
         seq += 1;
     }
     Ok(schedule)
@@ -1222,8 +1226,21 @@ fn extract_simple_single_pass(
     let full_schedule = build_blob_schedule_with_passthrough(input, passthrough_bbox.as_ref())?;
     let node_schedule: Vec<&BlobDesc> = full_schedule.iter()
         .filter(|d| {
-            // Include node blobs that pass spatial filter.
-            matches!(d.kind, Some(crate::blob_index::ElemKind::Node) | None)
+            match d.kind {
+                Some(crate::blob_index::ElemKind::Node) => {
+                    // Apply spatial bbox filter to skip node blobs outside extract region.
+                    if let Some(ref filter_bbox) = spatial_filter.node_bbox {
+                        match d.bbox {
+                            Some(ref bb) => filter_bbox.intersects(bb),
+                            None => true, // no bbox in indexdata — must include
+                        }
+                    } else {
+                        true // no spatial filter configured
+                    }
+                }
+                None => true, // no indexdata — must include
+                _ => false,
+            }
         })
         .collect();
     let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
@@ -1349,7 +1366,7 @@ fn extract_simple_single_pass(
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
     let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1450,7 +1467,7 @@ fn extract_simple_single_pass(
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
     let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1497,7 +1514,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
     crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
     let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {

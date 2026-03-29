@@ -353,6 +353,12 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
             result = Some(match result {
                 None => scan,
                 Some(mut prev) => {
+                    // Mixed-type blobs cannot be safely indexed — the fast paths
+                    // (raw passthrough, ID-range skip) trust `kind` as exact.
+                    // Return None so mixed blobs fall through to full decode.
+                    if prev.kind != scan.kind {
+                        return None;
+                    }
                     prev.min_id = prev.min_id.min(scan.min_id);
                     prev.max_id = prev.max_id.max(scan.max_id);
                     prev.count += scan.count;

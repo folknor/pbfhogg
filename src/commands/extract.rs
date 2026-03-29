@@ -2032,36 +2032,58 @@ fn extract_smart(
     let mut extra_node_ids = handler.extra_node_ids;
     crate::debug::emit_marker("EXTRACT_PASS1_END");
 
-    // --- Pass 2: Resolve extra way node deps ---
+    // --- Pass 2: Resolve extra way node deps (parallel pread) ---
     crate::debug::emit_marker("EXTRACT_PASS2_START");
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
     // Only way blobs are needed here — skip node and relation blobs via index.
-    let ways_only = BlobFilter::new(false, true, false);
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+    {
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = blob.index() {
-            if !ways_only.wants_index(&idx) { continue; }
+    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
-        for group in block.groups() {
-            for w in group.ways() {
-                let wid = w.id();
-                if handler.extra_way_ids.get(wid) && !result.matched_way_ids.get(wid) {
-                    for r in w.refs() {
-                        extra_node_ids.set(r);
+        way_schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+    drop(scanner);
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    let extra_way_ids_ref = &handler.extra_way_ids;
+    let matched_way_ids_ref = &result.matched_way_ids;
+    parallel_classify_phase(
+        &shared_file,
+        &way_schedule,
+        |block| {
+            let mut node_ids = Vec::new();
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element {
+                    let wid = w.id();
+                    if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
+                        node_ids.extend(w.refs());
                     }
                 }
             }
-        }
+            node_ids
+        },
+        |node_ids| {
+            for id in node_ids {
+                extra_node_ids.set(id);
+            }
+        },
+    )?;
     }
 
     crate::debug::emit_marker("EXTRACT_PASS2_END");

@@ -1255,38 +1255,95 @@ fn extract_simple_single_pass(
     let empty_relation_ids = IdSetDense::new(); // placeholder for node/way phases
     let all_way_node_ids = IdSetDense::new();
 
-    // --- Phase 1: Classify nodes (scanner) + write nodes (pread-from-workers) ---
+    // --- Phase 1: Classify nodes (parallel pread + scanner) ---
+    // Workers pread node blobs, decompress, scan with node-only scanner,
+    // check bbox (pure function), send matching IDs to consumer.
+    // Consumer merges into bbox_node_ids. No shared mutable state in workers.
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_START");
     {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        let mut node_tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
-                if let Some(ref filter_bbox) = spatial_filter.node_bbox {
-                    if let Some(ref blob_bbox) = idx.bbox {
-                        if !filter_bbox.intersects(blob_bbox) { continue; }
+        use std::os::unix::fs::FileExt as _;
+
+        // node_schedule already filtered to node blobs.
+
+        let classify_file = std::sync::Arc::new(
+            std::fs::File::open(input)
+                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+        );
+
+        let decode_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4);
+
+        type ClassifyResult = (usize, crate::error::Result<Vec<i64>>);
+        let (cls_tx, cls_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+        let cls_rx = std::sync::Arc::new(std::sync::Mutex::new(cls_rx));
+        let (ids_tx, ids_rx) = std::sync::mpsc::sync_channel::<ClassifyResult>(32);
+
+        std::thread::scope(|scope| -> Result<()> {
+            // Dispatcher: send node blob descriptors.
+            let descs: Vec<(usize, u64, usize)> = node_schedule.iter()
+                .enumerate()
+                .map(|(i, d)| (i, d.offset, d.size))
+                .collect();
+            scope.spawn(move || {
+                for item in descs {
+                    if cls_tx.send(item).is_err() { break; }
+                }
+            });
+
+            // Workers: pread → decompress → node scanner → bbox check → Vec<i64>.
+            let region_ref = region;
+            let bbox_int_ref = &bbox_int;
+            for _ in 0..decode_threads {
+                let rx = std::sync::Arc::clone(&cls_rx);
+                let tx = ids_tx.clone();
+                let file = std::sync::Arc::clone(&classify_file);
+                scope.spawn(move || {
+                    let mut read_buf: Vec<u8> = Vec::new();
+                    let mut decompress_buf: Vec<u8> = Vec::new();
+                    let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+
+                    loop {
+                        let (seq, data_offset, data_size) = {
+                            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match guard.recv() {
+                                Ok(d) => d,
+                                Err(_) => break,
+                            }
+                        };
+
+                        let r: crate::error::Result<Vec<i64>> = (|| {
+                            read_buf.resize(data_size, 0);
+                            file.read_exact_at(&mut read_buf, data_offset)
+                                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                            tuples.clear();
+                            super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples)
+                                .map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
+                                ))?;
+                            let matching: Vec<i64> = tuples.iter()
+                                .filter(|t| region_ref.contains_decimicro(bbox_int_ref, t.lat, t.lon))
+                                .map(|t| t.id)
+                                .collect();
+                            Ok(matching)
+                        })();
+                        if tx.send((seq, r)).is_err() { break; }
                     }
+                });
+            }
+            drop(cls_rx);
+            drop(ids_tx);
+
+            // Consumer: merge matching IDs into bbox_node_ids.
+            for (_seq, result) in ids_rx {
+                let matching_ids = result?;
+                for id in matching_ids {
+                    bbox_node_ids.set(id);
                 }
             }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            node_tuples.clear();
-            super::node_scanner::extract_node_tuples(&decompressed, &mut node_tuples)
-                .map_err(|e| crate::error::new_error(
-                    crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
-                ))?;
-            for t in &node_tuples {
-                if region.contains_decimicro(&bbox_int, t.lat, t.lon) {
-                    bbox_node_ids.set(t.id);
-                }
-            }
-        }
+            Ok(())
+        })?;
     }
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.

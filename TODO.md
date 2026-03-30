@@ -400,17 +400,15 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 **Milestone A: data layout + allocation (investigate together)**
 
 - [ ] **1. Custom allocators (per-block arena)** — 4/6 reviewers ranked 1st.
-  Per-block bump/arena allocator for all PrimitiveBlock working memory
-  (decompressed buffer, string table entries, group ranges, tag slices).
-  Freed as a unit when the block is done — no cross-thread retention by
-  construction. Would eliminate the `WireStringTable` dual-path (boxed vs
-  inline), subsume `DecompressPool`, and potentially re-enable the
-  pipelined reader for commands forced to sequential (recovering 30-100%
-  throughput). Rust options: `bumpalo`, or a simple `Vec<u8>` bump
-  allocator. Migration is incremental: start with `BlockBuilder` scratch
-  buffers (write path), then `WireStringTable` entries (read path), then
-  `PrimitiveBlock` itself. Measure current alloc overhead with
-  `brokkr <command> --alloc` first.
+  See [notes/arena-allocator-research.md](notes/arena-allocator-research.md)
+  for full landscape, alloc profiling data, and 5-step implementation plan.
+  Key finding: `parse_and_inline` generates ~829 MB alloc churn (Japan) /
+  ~14 GB (planet est.) from two temp `Vec<(u32, u32)>` per block. Step 1
+  (thread-local scratch Vecs) eliminates ~97% of this with zero risk.
+  Steps 2-5 escalate to bumpalo, columnar layout, pipelined reader
+  re-enablement. Top crate candidates: `bumpalo` (v3.20, zero deps,
+  stable), `bump-scope` (v2.2, scoped sub-allocations), or hand-rolled
+  50-line bump allocator.
 
 - [ ] **2. Columnar batch processing** — 2/6 reviewers ranked 1st, all
   ranked top 2. Decode PrimitiveBlock fields into contiguous arrays (all

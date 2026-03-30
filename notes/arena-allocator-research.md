@@ -193,30 +193,47 @@ is created, classified, and dropped within one iteration.
 
 ## Practical Approach: Incremental, Bottom-Up
 
-### Step 1: Thread-local scratch Vecs (immediate, zero risk)
+### Step 1: Thread-local scratch Vecs — DONE
 
-Replace the two per-block `Vec<(u32, u32)>` allocations in
-`parse_and_inline` with thread-local scratch buffers that `.clear()`
-between blocks. The Vecs keep their capacity across blocks — no
-malloc/free after the first few blocks.
+Added `parse_and_inline_with_scratch` and `from_vec_pooled_with_scratch`
+that accept caller-provided `Vec<(u32, u32)>` scratch buffers. Buffers
+are cleared per block but retain capacity across blocks.
 
-Expected impact: eliminates ~810 MB of the 829 MB alloc churn in
-`parse_and_inline` at Japan scale (~13.8 GB at planet). Zero new
-dependencies, zero API changes.
+Measured impact (Japan, tags-filter):
+- `parse_and_inline`: 829 MB → 48 MB (**94% reduction**)
+- Worker alloc per thread: 29 MB → 21 MB
+- Planet estimate: ~14 GB → ~800 MB churn eliminated
 
-Implementation: pass `&mut Vec<(u32, u32)>` scratch buffers into
-`parse_and_inline` from the worker's loop-local state in
-`parallel_classify_phase` and `pread_execute`.
+Coverage: all `parallel_classify_phase` workers, `pread_execute` workers,
+sequential BlobReader loops (node_stats, tags_count). Every
+PrimitiveBlock construction path uses scratch.
 
-### Step 2: BlockBuilder scratch reuse (low risk)
+### Step 1b: write_single_* scratch — BLOCKED on lifetime issue
 
-The `tags_buf: Vec<(&str, &str)>`, `refs_buf: Vec<i64>`,
-`members_buf: Vec<MemberData>` buffers used in write passes are already
-declared per-block in some paths but per-loop in others. Standardize
-on per-worker loop-local buffers (already done in `pread_execute`
-workers, not done in multi-extract write phases).
+`write_single_node/way/relation` in `elements_pbf.rs` allocate
+`tags.collect::<Vec<(&str, &str)>>()` per element. Called from sort
+(sweep merge) and merge_pbf (k-way merge) — ~10B elements at planet.
+Scratch reuse across calls fails: `Vec<(&str, &str)>` borrows `&str`
+from different `OwnedNode`/`OwnedWay` each iteration. The compiler
+can't verify that `.clear()` releases the old borrows before the next
+call fills new ones.
 
-Expected impact: eliminates the `take_owned` 76-292 MB churn.
+Fix options:
+1. Change `add_node`/`add_way`/`add_relation` in BlockBuilder to accept
+   iterators (`impl Iterator<Item = (&str, &str)>`) instead of slices.
+   Eliminates the intermediate Vec entirely. Larger API change.
+2. Use `SmallVec<[(&str, &str); 16]>` to stack-allocate for typical
+   tag counts (<16 tags). Avoids heap for the common case.
+3. Use `bumpalo` per-element arena (overkill for this pattern).
+
+### Step 2: Remaining scratch opportunities
+
+See TODO.md "Scratch buffer reuse audit" for the full list:
+- Remaining `PrimitiveBlock::new()` call sites (mechanical, `new_with_scratch` exists)
+- Geocode pass 3 bucket merge (3 Vecs × 20M iterations, ~1.4 GB)
+- `scan_block_ids`/`scan_block_tags` per-blob Vecs
+- Merge per-element Vecs (same lifetime issue as step 1b)
+- Scanner group_starts (tiny, low priority)
 
 ### Step 3: Evaluate bumpalo for broader per-block allocation (medium risk)
 

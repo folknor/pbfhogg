@@ -419,8 +419,12 @@ per-iteration allocations remain across the codebase, ordered by impact:
   `tags.iter().collect::<Vec>()`, `refs.iter().collect::<Vec>()`,
   `members.iter().collect::<Vec>()`. Called from sort (sweep merge) and
   merge_pbf (k-way merge). Planet: ~10B elements. Largest remaining
-  alloc churn source. Fix: accept `&mut Vec` scratch params, clear+reuse.
-  Callers in sort.rs and merge_pbf.rs hoist to loop-local.
+  alloc churn source. Scratch `Vec<(&str, &str)>` reuse across calls
+  fails due to lifetime mismatch — the `&str` refs borrow from different
+  `OwnedNode`/`OwnedWay` per iteration. Fix options: (a) change
+  `add_node`/`add_way`/`add_relation` in BlockBuilder to accept
+  iterators instead of slices, (b) use `SmallVec<[(&str, &str); 16]>`
+  to avoid heap for typical tag counts (<16).
 
 - [ ] **Pipelined reader `from_vec_pooled`** — rayon-spawned decode closures
   in `pipeline.rs:185` still use non-scratch `from_vec_pooled`. Planet:

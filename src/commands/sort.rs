@@ -434,14 +434,12 @@ fn sweep_merge_nodes(
     let mut frame_buf: Vec<u8> = Vec::new();
 
     for entry in entries {
-        // Flush elements guaranteed in final position: ID < this blob's min_id
         flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |node| {
             write_single_node(&node, bb, writer)?;
             stats.nodes += 1;
             Ok(())
         })?;
 
-        // Decode blob and push elements into heap
         read_frame_into(input_file, entry, &mut frame_buf)?;
         let blob_bytes = extract_blob_bytes(&frame_buf)?;
         let block = decode_blob_to_primitiveblock(blob_bytes)?;
@@ -454,7 +452,6 @@ fn sweep_merge_nodes(
         }
     }
 
-    // Drain remaining
     while let Some(Reverse(node)) = heap.pop() {
         write_single_node(&node, bb, writer)?;
         stats.nodes += 1;

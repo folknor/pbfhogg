@@ -24,13 +24,14 @@ use super::Result;
 pub(crate) fn scan_way_refs(
     decompressed: &[u8],
     refs_buf: &mut Vec<i64>,
+    group_starts: &mut Vec<(usize, usize)>,
     mut callback: impl FnMut(i64, &[i64]),
 ) -> Result<()> {
     use crate::read::wire::{Cursor, WIRE_LEN};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+    group_starts.clear();
 
     // Parse PrimitiveBlock top-level: only collect group offsets.
     while let Some((field, wire_type)) = cursor.read_tag()? {
@@ -44,7 +45,7 @@ pub(crate) fn scan_way_refs(
         }
     }
 
-    for &(off, len) in &group_starts {
+    for &(off, len) in group_starts.iter() {
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
 

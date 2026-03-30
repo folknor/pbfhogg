@@ -404,6 +404,7 @@ fn build_node_index_sparse(
 
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -418,7 +419,7 @@ fn build_node_index_sparse(
 
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples)?;
+        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples, &mut group_starts)?;
 
         for &super::node_scanner::NodeTuple { id, lat, lon } in &tuples {
             if !referenced.get(id) {
@@ -873,6 +874,7 @@ fn build_node_index_dense(
 
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -888,7 +890,7 @@ fn build_node_index_dense(
 
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples)?;
+        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples, &mut group_starts)?;
 
         // Insert into mmap index. SharedDenseWriter is safe for concurrent access
         // (direct mmap slot writes to disjoint positions).
@@ -919,6 +921,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut referenced = IdSetDense::new();
     let mut refs_buf: Vec<i64> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -927,7 +930,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
             if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
         }
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, |_way_id, refs| {
+        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, &mut group_starts, |_way_id, refs| {
             for &node_id in refs {
                 if node_id >= 0 {
                     referenced.set(node_id);

@@ -46,6 +46,7 @@ pub(crate) struct NodeTuple {
 pub(crate) fn extract_node_tuples(
     decompressed: &[u8],
     out: &mut Vec<NodeTuple>,
+    group_starts: &mut Vec<(usize, usize)>,
 ) -> Result<()> {
     use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
 
@@ -54,7 +55,7 @@ pub(crate) fn extract_node_tuples(
     let mut granularity: i64 = 100;
     let mut lat_offset: i64 = 0;
     let mut lon_offset: i64 = 0;
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+    group_starts.clear();
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
@@ -71,7 +72,7 @@ pub(crate) fn extract_node_tuples(
         }
     }
 
-    for &(off, len) in &group_starts {
+    for &(off, len) in group_starts.iter() {
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
         let mut dense_data: Option<&[u8]> = None;

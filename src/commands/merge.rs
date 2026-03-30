@@ -1461,7 +1461,8 @@ pub fn merge(
                                 return None;
                             }
                             let mut tuples = Vec::new();
-                            if super::node_scanner::extract_node_tuples(&buf, &mut tuples).is_err()
+                            let mut group_starts = Vec::new();
+                            if super::node_scanner::extract_node_tuples(&buf, &mut tuples, &mut group_starts).is_err()
                             {
                                 return None;
                             }

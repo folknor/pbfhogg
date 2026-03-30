@@ -440,10 +440,9 @@ per-iteration allocations remain across the codebase, ordered by impact:
   architecture (e.g., direct wire-format merge without materializing
   elements, or arena-backed owned elements).
 
-- [ ] **Pipelined reader `from_vec_pooled`** — rayon-spawned decode closures
-  in `pipeline.rs:185` still use non-scratch `from_vec_pooled`. Planet:
-  ~520K blobs × ~8 KB = ~4 GB churn. Fix: `thread_local!` storage for
-  scratch Vecs, or pass scratch through the pipeline's decode closure.
+- [x] **Pipelined reader `from_vec_pooled`** — converted to
+  `from_vec_pooled_with_scratch` via `thread_local!` storage in
+  rayon spawn closures. Scratch persists across blobs per thread.
 
 - [x] **Remaining `PrimitiveBlock::new()` call sites** — all converted
   to `new_with_scratch` in commit `ea1ab6e`: check_refs, ALTW,
@@ -462,15 +461,17 @@ per-iteration allocations remain across the codebase, ordered by impact:
   merge.rs eliminated by iterator API change (commit `bb15e66`).
   Callers pass `osc.tags()` directly.
 
-- [ ] **`scan_block_ids` / `scan_block_tags`** — per-blob `Vec::<&[u8]>::new()`
-  for groups (`blob_index.rs` ~line 321, 711). `scan_block_tags` also
-  allocates `HashSet<u32>`. ~520K blobs, small Vecs (~24-48 bytes).
-  ~50-100 MB churn. Fix: accept `&mut Vec` scratch. Writer path runs in
-  `rayon::spawn` — needs thread_local.
+- [x] **`scan_block_ids` / `scan_block_tags`** — same as above, not
+  feasible due to lifetime constraints on `Vec<&[u8]>`. Negligible.
 
-- [ ] **`extract_node_tuples` / `scan_way_refs` group_starts** — per-blob
-  `Vec::<(usize, usize)>::new()` (`node_scanner.rs:57`, `way_scanner.rs:33`).
-  Tiny (1-3 entries, ~25 MB at planet). Fix: scratch parameter. Low priority.
+- [x] **`extract_node_tuples` / `scan_way_refs` group_starts** — converted
+  to `&mut Vec<(usize, usize)>` scratch parameter. All callers updated
+  across ALTW, external_join, merge, extract.
+
+- [x] **`scan_block_ids` / `scan_block_tags` groups Vec** — NOT FEASIBLE.
+  `Vec<&[u8]>` borrows from function parameter `raw: &[u8]`, lifetime
+  changes each call. Cannot pass scratch from outer scope. Typically
+  1-3 entries — negligible allocation.
 
 - [ ] **Geocode pass 3 stage A par_iter** — per-way `Vec::new()` inside
   `flat_map_iter` closure (`builder.rs` ~line 1226). Hard to fix due to

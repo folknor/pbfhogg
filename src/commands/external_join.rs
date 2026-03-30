@@ -457,6 +457,7 @@ fn stage2_node_join(
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut tuples: Vec<NodeTuple> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                 loop {
                     let (seq, data_offset, data_size) = {
@@ -494,7 +495,7 @@ fn stage2_node_join(
 
                         // Extract node tuples into thread-local Vec.
                         tuples.clear();
-                        extract_node_tuples(&decompress_buf, &mut tuples)
+                        extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
                             ))?;

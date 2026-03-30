@@ -1734,6 +1734,7 @@ fn extract_simple_single_pass(
                     let mut read_buf: Vec<u8> = Vec::new();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
+                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                     loop {
                         let (seq, data_offset, data_size) = {
@@ -1750,7 +1751,7 @@ fn extract_simple_single_pass(
                                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             tuples.clear();
-                            super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples)
+                            super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
                                 .map_err(|e| crate::error::new_error(
                                     crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
                                 ))?;
@@ -1837,6 +1838,7 @@ fn extract_simple_single_pass(
                     let mut read_buf: Vec<u8> = Vec::new();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
+                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
                     loop {
                         let (seq, data_offset, data_size) = {
@@ -1853,7 +1855,7 @@ fn extract_simple_single_pass(
                                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                             let mut matching: Vec<i64> = Vec::new();
-                            super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, |way_id, refs| {
+                            super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |way_id, refs| {
                                 if refs.iter().any(|&r| bbox_ids_ref.get(r)) {
                                     matching.push(way_id);
                                 }

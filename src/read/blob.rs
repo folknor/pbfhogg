@@ -508,6 +508,22 @@ impl Blob {
         decompress_parsed_blob_into(&self.blob, &mut buf)?;
         PrimitiveBlock::from_vec_pooled(buf, pool)
     }
+
+    /// Like [`to_primitiveblock_inline`] but reuses caller-provided scratch buffers
+    /// for `parse_and_inline`. Used by the pipelined reader with thread-local scratch
+    /// to avoid per-blob `Vec<(u32, u32)>` allocations in rayon decode tasks.
+    pub(crate) fn to_primitiveblock_inline_with_scratch(
+        &self,
+        pool: &Arc<DecompressPool>,
+        st_scratch: &mut Vec<(u32, u32)>,
+        gr_scratch: &mut Vec<(u32, u32)>,
+    ) -> Result<PrimitiveBlock> {
+        #[allow(clippy::cast_sign_loss)]
+        let capacity = self.blob.raw_size.unwrap_or(0).max(0) as usize;
+        let mut buf = pool_get(Some(pool), capacity);
+        decompress_parsed_blob_into(&self.blob, &mut buf)?;
+        PrimitiveBlock::from_vec_pooled_with_scratch(buf, pool, st_scratch, gr_scratch)
+    }
 }
 
 /// A blob header.

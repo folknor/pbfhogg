@@ -8,6 +8,7 @@ use super::block::PrimitiveBlock;
 use crate::blob_index::BlobFilter;
 use crate::error::Result;
 use crate::reorder_buffer::ReorderBuffer;
+use std::cell::RefCell;
 use std::io::Read;
 use std::sync::mpsc::sync_channel;
 use std::sync::Arc;
@@ -174,6 +175,12 @@ where
                     Ok(blob) => {
                         let bf = blob_filter.clone();
                         decode_pool.spawn(move || {
+                            // Thread-local scratch buffers for parse_and_inline.
+                            // Avoids allocating fresh Vec<(u32, u32)> per blob.
+                            thread_local! {
+                                static ST_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+                                static GR_SCRATCH: RefCell<Vec<(u32, u32)>> = const { RefCell::new(Vec::new()) };
+                            }
                             let item = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                 match blob.get_type() {
                                     BlobType::OsmData => {
@@ -182,7 +189,11 @@ where
                                         {
                                             return None;
                                         }
-                                        Some(blob.to_primitiveblock_inline(&bp))
+                                        ST_SCRATCH.with_borrow_mut(|st| {
+                                            GR_SCRATCH.with_borrow_mut(|gr| {
+                                                Some(blob.to_primitiveblock_inline_with_scratch(&bp, st, gr))
+                                            })
+                                        })
                                     }
                                     _ => None,
                                 }

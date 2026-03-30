@@ -90,6 +90,8 @@ pub fn tags_count(
     let decompress_pool = crate::blob::DecompressPool::new();
 
     let mut counts: CountMap = FxHashMap::default();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -99,7 +101,7 @@ pub fn tags_count(
             }
         }
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
+        let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
         count_block_tags(&mut counts, &block, tf.nodes, tf.ways, tf.relations, &expressions);
     }
 

@@ -1248,6 +1248,8 @@ where
                 let mut bb = BlockBuilder::new();
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
                 let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -1266,7 +1268,9 @@ where
                         // Decode path: full PrimitiveBlock → extract → OwnedBlocks.
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
+                        let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                        )?;
                         output_blocks.clear();
                         let block_stats = block_fn_ref(
                             &block, &mut bb, &mut output_blocks,

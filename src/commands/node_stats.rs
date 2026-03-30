@@ -184,6 +184,8 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
 
     let mut lat_block = Vec::with_capacity(BLOCK_SIZE);
     let mut lon_block = Vec::with_capacity(BLOCK_SIZE);
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -192,7 +194,7 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
             if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
         }
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new(decompressed)?;
+        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
         for element in block.elements_skip_metadata() {
             let (lat_e7, lon_e7) = match &element {
                 Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),

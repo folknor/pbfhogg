@@ -373,11 +373,36 @@ impl PrimitiveBlock {
     /// UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf wire format is invalid.
     #[hotpath::measure]
     pub fn new(buffer: Bytes) -> Result<PrimitiveBlock> {
-        // Use the inline path: copy buffer to Vec, append string table entries
-        // and group ranges inline. Avoids separate Box allocations. The ~2 MB
-        // copy is acceptable for the public API (not at pipeline scale — the
-        // pipeline uses from_vec / from_vec_pooled directly).
         Self::from_vec(buffer.to_vec())
+    }
+
+    /// Like [`new`] but reuses caller-provided scratch buffers for
+    /// `parse_and_inline`. Sequential loops call this with loop-local
+    /// scratch to avoid per-block allocation.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn new_with_scratch(
+        buffer: Bytes,
+        st_scratch: &mut Vec<(u32, u32)>,
+        gr_scratch: &mut Vec<(u32, u32)>,
+    ) -> Result<PrimitiveBlock> {
+        let mut buf = buffer.to_vec();
+        let meta = WireBlock::parse_and_inline_with_scratch(&mut buf, st_scratch, gr_scratch)?;
+        let bytes = Bytes::from(buf);
+        let data: &[u8] = &bytes;
+        let block = WireBlock::from_inline(data, &meta);
+
+        for index in 0..block.stringtable.len() {
+            if let Some(raw) = block.stringtable.get(index) {
+                std::str::from_utf8(raw)
+                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
+            }
+        }
+
+        #[allow(clippy::transmute_undefined_repr)]
+        let block =
+            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
+
+        Ok(PrimitiveBlock { buffer: bytes, block })
     }
 
     /// Parse from a mutable Vec, inlining string table entries and group ranges

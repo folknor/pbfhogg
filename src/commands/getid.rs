@@ -310,6 +310,11 @@ fn filter_by_id(
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
     let mut blobs_skipped: u64 = 0;
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut bb = BlockBuilder::new();
+    let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
         match &frame.blob_type {
@@ -337,17 +342,19 @@ fn filter_by_id(
                 }
                 // Blob might contain matching IDs: decode and filter.
                 let blob_bytes = frame.blob_bytes();
-                let mut decompress_buf: Vec<u8> = Vec::new();
+                decompress_buf.clear();
                 crate::blob::decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                let block = PrimitiveBlock::new(decompress_buf.into())?;
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
+                let block = PrimitiveBlock::new_with_scratch(
+                    std::mem::take(&mut decompress_buf).into(),
+                    &mut st_scratch, &mut gr_scratch,
+                )?;
+                output_blocks.clear();
                 let (nodes, ways, relations) = process_block(
                     &block, &mut bb, &mut output_blocks, ids, true, None, false,
                 ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in output_blocks {
+                for (block_bytes, index, tagdata) in output_blocks.drain(..) {
                     writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                 }
                 stats.nodes_written += nodes;
@@ -415,6 +422,11 @@ fn filter_by_id_invert(
 
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut bb = BlockBuilder::new();
+    let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     while let Some(mut frame) = read_raw_frame(&mut reader, &mut file_offset)? {
         match &frame.blob_type {
@@ -444,17 +456,19 @@ fn filter_by_id_invert(
                 }
                 // Blob might contain matching IDs: decode and filter.
                 let blob_bytes = frame.blob_bytes();
-                let mut decompress_buf: Vec<u8> = Vec::new();
+                decompress_buf.clear();
                 crate::blob::decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                let block = PrimitiveBlock::new(decompress_buf.into())?;
-                let mut bb = BlockBuilder::new();
-                let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
+                let block = PrimitiveBlock::new_with_scratch(
+                    std::mem::take(&mut decompress_buf).into(),
+                    &mut st_scratch, &mut gr_scratch,
+                )?;
+                output_blocks.clear();
                 let (nodes, ways, relations) = process_block(
                     &block, &mut bb, &mut output_blocks, ids, false, None, false,
                 ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in output_blocks {
+                for (block_bytes, index, tagdata) in output_blocks.drain(..) {
                     writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                 }
                 stats.nodes_written += nodes;

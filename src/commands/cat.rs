@@ -211,6 +211,13 @@ fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compressio
 
     let clean = CleanAttrs::default(); // no-op clean
 
+    // Hoisted outside per-blob loop: reused across iterations.
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut bb = BlockBuilder::new();
+    let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
     for file in files {
         let mut reader = FileReader::open(file, direct_io)?;
         let mut file_offset: u64 = 0;
@@ -220,25 +227,24 @@ fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compressio
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
                     if let Some(ref idx) = frame.index {
-                        // Indexed blob: check type filter.
                         if !blob_filter.wants_index(idx) {
-                            continue; // skip non-matching
+                            continue;
                         }
-                        // Matching type: raw passthrough.
                         writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                         blobs_passthrough += 1;
                     } else {
-                        // No indexdata: must decode to filter by element type.
                         let blob_bytes = frame.blob_bytes();
-                        let mut decompress_buf: Vec<u8> = Vec::new();
+                        decompress_buf.clear();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::new(decompress_buf.into())?;
-                        let mut bb = BlockBuilder::new();
-                        let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+                        let block = PrimitiveBlock::new_with_scratch(
+                            std::mem::take(&mut decompress_buf).into(),
+                            &mut st_scratch, &mut gr_scratch,
+                        )?;
+                        output_blocks.clear();
                         let count = process_block(&block, &mut bb, &mut output_blocks, &tf, &clean)?;
                         flush_local(&mut bb, &mut output_blocks)
                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                        for (block_bytes, index, tagdata) in output_blocks {
+                        for (block_bytes, index, tagdata) in output_blocks.drain(..) {
                             writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                         }
                         blobs_decoded += 1;

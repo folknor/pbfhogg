@@ -147,12 +147,13 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
     };
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        // Skip relation blobs when not checking relation references.
         if !check_relations {
             if let Some(idx) = blob.index() {
                 if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
@@ -161,7 +162,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
             }
         }
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new(decompressed)?;
+        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
         for element in block.elements_skip_metadata() {
         match element {
             Element::DenseNode(dn) => {

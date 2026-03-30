@@ -949,6 +949,8 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut member_node_ids = IdSetDense::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -957,7 +959,7 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
             if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
         }
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new(decompressed)?;
+        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
         for element in block.elements_skip_metadata() {
             if let Element::Relation(r) = element {
                 for member in r.members() {

@@ -36,6 +36,8 @@ impl StreamingBlocks {
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let pool = crate::blob::DecompressPool::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         let iter = std::iter::from_fn(move || {
             loop {
                 let blob = match blob_reader.next()? {
@@ -49,7 +51,9 @@ impl StreamingBlocks {
                     Ok(d) => d,
                     Err(e) => return Some(Err(e)),
                 };
-                return Some(crate::block::PrimitiveBlock::new(decompressed));
+                return Some(crate::block::PrimitiveBlock::new_with_scratch(
+                    decompressed, &mut st_scratch, &mut gr_scratch,
+                ));
             }
         });
         Ok(Self { blocks: Box::new(iter), stashed: None })

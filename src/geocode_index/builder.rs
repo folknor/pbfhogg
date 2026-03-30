@@ -402,20 +402,21 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let decompress_pool = crate::blob::DecompressPool::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                 continue;
             }
-            // Skip relation blobs (already scanned in pass 1).
             if let Some(idx) = blob.index() {
                 if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
                     continue;
                 }
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = crate::block::PrimitiveBlock::new(decompressed)?;
+            let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
             for element in block.elements_skip_metadata() {
                 match element {
                     Element::DenseNode(node) => {
@@ -1329,6 +1330,9 @@ fn bucketed_cell_assignment(
 
         // Group by cell_id and write merged output
         let mut i = 0;
+        let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
+        let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
+        let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
         while i < entries.len() {
             let cell_id = entries[i].cell_id;
             let group_start = i;
@@ -1338,9 +1342,9 @@ fn bucketed_cell_assignment(
             let group = &entries[group_start..i];
 
             // Partition into typed sub-groups
-            let mut streets: Vec<&ParsedBucketEntry> = Vec::new();
-            let mut addrs: Vec<&ParsedBucketEntry> = Vec::new();
-            let mut interps: Vec<&ParsedBucketEntry> = Vec::new();
+            streets.clear();
+            addrs.clear();
+            interps.clear();
             for e in group {
                 match e.etype {
                     ENTRY_TYPE_STREET => streets.push(e),

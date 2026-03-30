@@ -563,6 +563,16 @@ pub fn extract_multi(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Vec<ExtractStats>> {
+    // Try single-pass multi-extract for simple strategy on sorted input.
+    if matches!(strategy, ExtractStrategy::Simple) && !clean.any() {
+        if let Some(stats) = try_extract_multi_single_pass(
+            input, slots, set_bounds, compression, direct_io, overrides,
+        )? {
+            return Ok(stats);
+        }
+    }
+
+    // Sequential fallback: one extract at a time.
     let mut all_stats = Vec::with_capacity(slots.len());
     for (i, slot) in slots.iter().enumerate() {
         eprintln!(
@@ -586,6 +596,246 @@ pub fn extract_multi(
         all_stats.push(stats);
     }
     Ok(all_stats)
+}
+
+// ---------------------------------------------------------------------------
+// Single-pass multi-extract (simple strategy, sorted input)
+// ---------------------------------------------------------------------------
+
+/// Try single-pass multi-extract: read the PBF once, classify each element
+/// against all N regions, write to N output files. Returns `None` to fall
+/// back to sequential if the input isn't sorted.
+///
+/// Simple strategy only (no per-region way/relation ID tracking beyond what
+/// fits in memory). Uses sync-mode PbfWriters (no per-writer thread).
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
+fn try_extract_multi_single_pass(
+    input: &Path,
+    slots: &[ExtractSlot],
+    set_bounds: bool,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+) -> Result<Option<Vec<ExtractStats>>> {
+    use std::io::BufWriter;
+
+    // Check if input is sorted.
+    let header = {
+        let mut br = crate::BlobReader::open(input, direct_io)?;
+        match br.next() {
+            Some(Ok(blob)) => match blob.decode()? {
+                crate::blob::BlobDecode::OsmHeader(h) => {
+                    super::warn_locations_on_ways_loss(&h);
+                    if !h.is_sorted() {
+                        return Ok(None); // fall back to sequential
+                    }
+                    h
+                }
+                _ => return Ok(None),
+            },
+            _ => return Ok(None),
+        }
+    };
+
+    let n = slots.len();
+    eprintln!("[multi-extract] single-pass: {n} regions, simple strategy");
+
+    // Precompute per-region integer bboxes.
+    let bbox_ints: Vec<BboxInt> = slots.iter()
+        .map(|s| BboxInt::from_bbox(s.region.bbox()))
+        .collect();
+
+    // Union bbox for blob-level spatial skip.
+    let union_bbox = BboxInt {
+        min_lon: bbox_ints.iter().map(|b| b.min_lon).min().unwrap_or(i32::MIN),
+        min_lat: bbox_ints.iter().map(|b| b.min_lat).min().unwrap_or(i32::MIN),
+        max_lon: bbox_ints.iter().map(|b| b.max_lon).max().unwrap_or(i32::MAX),
+        max_lat: bbox_ints.iter().map(|b| b.max_lat).max().unwrap_or(i32::MAX),
+    };
+    let spatial_filter = spatial_blob_filter(&union_bbox);
+
+    // Open N sync-mode writers.
+    let mut writers: Vec<PbfWriter<BufWriter<std::fs::File>>> = Vec::with_capacity(n);
+    for slot in slots {
+        let bbox = slot.region.bbox();
+        let header_bytes = super::build_output_header(&header, true, overrides, |hb| {
+            let hb = if set_bounds {
+                hb.bbox(bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat)
+            } else {
+                hb
+            };
+            hb.sorted()
+        })?;
+        let file = BufWriter::new(
+            std::fs::File::create(&slot.output)
+                .map_err(|e| format!("failed to create {}: {e}", slot.output.display()))?
+        );
+        let mut w = PbfWriter::new(file, compression);
+        w.write_header(&header_bytes)
+            .map_err(|e| format!("failed to write header to {}: {e}", slot.output.display()))?;
+        writers.push(w);
+    }
+
+    // Per-region ID sets and stats.
+    let mut bbox_node_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
+    let mut matched_way_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
+    let mut matched_relation_ids: Vec<IdSetDense> = (0..n).map(|_| IdSetDense::new()).collect();
+    let mut stats: Vec<ExtractStats> = (0..n).map(|_| ExtractStats {
+        nodes_in_bbox: 0,
+        nodes_from_ways: 0,
+        nodes_from_relations: 0,
+        ways_written: 0,
+        ways_from_relations: 0,
+        relations_written: 0,
+        strategy: "simple",
+    }).collect();
+
+    // Per-region BlockBuilders (one per element type per region).
+    let mut node_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+    let mut way_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+    let mut rel_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+
+    // Sequential reader — planet-safe, no cross-thread retention.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+
+        // Blob-level spatial skip (union bbox).
+        if let Some(idx) = blob.index() {
+            if !spatial_filter.wants_index(&idx) { continue; }
+        }
+
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
+
+        // Per-block buffers (borrow from block's string table).
+        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+        let mut refs_buf: Vec<i64> = Vec::new();
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
+        for element in block.elements() {
+            match &element {
+                Element::DenseNode(dn) => {
+                    let lat = dn.decimicro_lat();
+                    let lon = dn.decimicro_lon();
+                    let id = dn.id();
+                    for i in 0..n {
+                        if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                            bbox_node_ids[i].set(id);
+                            if !node_bbs[i].can_add_node() {
+                                if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
+                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                }
+                            }
+                            tags_buf.clear();
+                            tags_buf.extend(dn.tags());
+                            let meta = dense_node_metadata(dn);
+                            node_bbs[i].add_node(id, lat, lon, &tags_buf, meta.as_ref());
+                            stats[i].nodes_in_bbox += 1;
+                        }
+                    }
+                }
+                Element::Node(n_elem) => {
+                    let lat = n_elem.decimicro_lat();
+                    let lon = n_elem.decimicro_lon();
+                    let id = n_elem.id();
+                    for i in 0..n {
+                        if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                            bbox_node_ids[i].set(id);
+                            if !node_bbs[i].can_add_node() {
+                                if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
+                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                }
+                            }
+                            tags_buf.clear();
+                            tags_buf.extend(n_elem.tags());
+                            let meta = element_metadata(&n_elem.info());
+                            node_bbs[i].add_node(id, lat, lon, &tags_buf, meta.as_ref());
+                            stats[i].nodes_in_bbox += 1;
+                        }
+                    }
+                }
+                Element::Way(w) => {
+                    let wid = w.id();
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
+                    tags_buf.clear();
+                    tags_buf.extend(w.tags());
+                    let meta = element_metadata(&w.info());
+                    for i in 0..n {
+                        if refs_buf.iter().any(|r| bbox_node_ids[i].get(*r)) {
+                            matched_way_ids[i].set(wid);
+                            if !way_bbs[i].can_add_way() {
+                                if let Some((bytes, index, tagdata)) = way_bbs[i].take_owned()? {
+                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                }
+                            }
+                            way_bbs[i].add_way(wid, &tags_buf, &refs_buf, meta.as_ref());
+                            stats[i].ways_written += 1;
+                        }
+                    }
+                }
+                Element::Relation(r) => {
+                    let rid = r.id();
+                    for i in 0..n {
+                        if relation_has_matched_member(r, &bbox_node_ids[i], &matched_way_ids[i]) {
+                            matched_relation_ids[i].set(rid);
+                            if !rel_bbs[i].can_add_relation() {
+                                if let Some((bytes, index, tagdata)) = rel_bbs[i].take_owned()? {
+                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                }
+                            }
+                            tags_buf.clear();
+                            tags_buf.extend(r.tags());
+                            members_buf.clear();
+                            members_buf.extend(r.members().map(|m| MemberData {
+                                id: m.id,
+                                role: m.role().unwrap_or(""),
+                            }));
+                            let meta = element_metadata(&r.info());
+                            rel_bbs[i].add_relation(rid, &tags_buf, &members_buf, meta.as_ref());
+                            stats[i].relations_written += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Flush all remaining BlockBuilders.
+    for i in 0..n {
+        if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
+            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+        }
+        if let Some((bytes, index, tagdata)) = way_bbs[i].take_owned()? {
+            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+        }
+        if let Some((bytes, index, tagdata)) = rel_bbs[i].take_owned()? {
+            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+        }
+        writers[i].flush()
+            .map_err(|e| format!("failed to flush {}: {e}", slots[i].output.display()))?;
+    }
+
+    // Print per-region stats.
+    for (i, slot) in slots.iter().enumerate() {
+        let s = &stats[i];
+        let total = s.nodes_in_bbox + s.ways_written + s.relations_written;
+        eprintln!(
+            "  [{}] {}: {} elements ({} nodes, {} ways, {} relations)",
+            i + 1,
+            slot.output.file_name().and_then(|n| n.to_str()).unwrap_or("?"),
+            total, s.nodes_in_bbox, s.ways_written, s.relations_written,
+        );
+    }
+
+    Ok(Some(stats))
 }
 
 // ---------------------------------------------------------------------------

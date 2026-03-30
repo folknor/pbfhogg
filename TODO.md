@@ -348,9 +348,11 @@ become GeoJSON properties) needs a configuration model.
 
 ### Command surface
 
-- [ ] `show` — display a single element by ID with all metadata, tags, refs,
-  members. Human-readable output (like `osmium show`). Needs indexed lookup
-  via `IndexedReader` or sequential scan with early exit.
+- [ ] `inspect --show <id>` — display a single element by ID with all
+  metadata, tags, refs, members. Fits naturally alongside existing
+  `--nodes`, `--indexed`, `--locations` flags rather than a separate
+  `show` command. Needs indexed lookup via `IndexedReader` or sequential
+  scan with early exit.
 - [ ] Resolve or document known semantic differences in verify output.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
@@ -371,70 +373,82 @@ become GeoJSON properties) needs a configuration model.
 - [ ] PyO3 Python bindings (read/write API for the Python ecosystem).
 - [ ] Packaged "planet on 32 GB" reference pipeline (documented, runnable).
 
-### Non-traditional optimization exploration
+### Non-traditional optimization research
 
-- [ ] **Columnar batch processing** — Decode PrimitiveBlock fields into separate
-  contiguous arrays (all IDs, then all lats, then all lons) instead of
-  element-by-element. Contiguous arrays are friendlier to hardware prefetchers,
-  enable autovectorization for coordinate math (bbox checks as packed
-  comparisons), and reduce cache misses from interleaved access patterns.
-  Primary candidates: dense node decoding in `src/read/block.rs`, coordinate
-  processing in extract bbox classification, ALTW node scans. The tag path
-  is harder (variable-length strings) but tag key indices could be columnar.
+Ordered by reviewer consensus (6 reviewers, 3 archetypes: perf, arch, planet).
+The first three form a dependency chain. The last two are independent
+hardware-level tuning. Investigate allocators and columnar together as
+Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 
-- [ ] **Custom allocators (per-block arena)** — PrimitiveBlock decoding allocates
-  many small, short-lived objects (tag strings, ref vecs, string table entries)
-  that all die together when the block is done. A bump/arena allocator per block
-  decode would make allocation nearly free (pointer bump) and deallocation instant
-  (reset the arena). Candidates: string table construction in `block.rs`,
-  `Element` tag storage, `Way` ref vectors. Rust options: `bumpalo` for
-  lifetime-scoped arenas, or a simple `Vec<u8>` bump allocator for byte slices.
-  Measure current alloc overhead with `brokkr <command> --alloc` first to
-  quantify the opportunity before committing to the complexity.
+**Milestone A: data layout + allocation (investigate together)**
 
-- [ ] **GPU-accelerated point-in-polygon for geocode builder** — Pass 2 of the
-  geocode builder tests billions of nodes against admin boundary polygons.
-  This is a classic "many points, few polygons" workload that GPUs excel at.
-  NVIDIA's cuSpatial (`rapidsai/cuspatial`) has production-quality PIP using
-  winding number algorithm, handles complex polygons with holes correctly.
-  The polygon set is small (~100 MB of admin boundary geometry, uploaded
-  once), the point set is huge (planet: 2.5B nodes streamed in batches).
-  Published benchmarks show 40-200x speedup over CPU for this pattern.
-  Rust interop via `cudarc` crate: write CUDA kernels in `.cu`, compile
-  to PTX, load and launch from Rust. Feature-gate behind a `cuda` feature
-  flag (same pattern as `linux-io-uring`). Depends on columnar batch
-  processing (contiguous coordinate arrays for efficient host-to-device
-  transfer). PCIe 4.0 x16 gives ~25 GB/s — at planet scale (~56 GB of
-  node coordinates) streaming is required since data exceeds GPU memory
-  on most cards. Only worthwhile at Europe/planet scale; Denmark is too
-  small (transfer overhead dominates). No precedent in OSM tooling —
-  osmium, Planetiler, osm2pgsql are all CPU-only.
+- [ ] **1. Custom allocators (per-block arena)** — 4/6 reviewers ranked 1st.
+  Per-block bump/arena allocator for all PrimitiveBlock working memory
+  (decompressed buffer, string table entries, group ranges, tag slices).
+  Freed as a unit when the block is done — no cross-thread retention by
+  construction. Would eliminate the `WireStringTable` dual-path (boxed vs
+  inline), subsume `DecompressPool`, and potentially re-enable the
+  pipelined reader for commands forced to sequential (recovering 30-100%
+  throughput). Rust options: `bumpalo`, or a simple `Vec<u8>` bump
+  allocator. Migration is incremental: start with `BlockBuilder` scratch
+  buffers (write path), then `WireStringTable` entries (read path), then
+  `PrimitiveBlock` itself. Measure current alloc overhead with
+  `brokkr <command> --alloc` first.
 
-- [ ] **NUMA-aware memory placement** — On multi-socket servers, cross-socket
-  memory traffic kills throughput for planet-scale workloads. Currently rayon
-  decodes blocks on arbitrary cores and consumers may run on different sockets,
-  causing implicit cross-socket data migration. The "born-local" approach
-  (inspired by [forkrun](https://github.com/jkool702/forkrun)): use
-  `set_mempolicy(MPOL_BIND)` or `mbind()` to pin allocations to the NUMA
-  node where the consuming worker lives, ensuring decoded PrimitiveBlocks
-  stay socket-local. Candidates: pipelined reader's decode pool (pin decode
-  workers and their output buffers to the same node as the consumer),
-  dense ALTW index (interleave or partition across nodes), external join
-  scatter buffers (node-local temp allocations). Also consider
-  `fallocate(PUNCH_HOLE)` on external join scratch files to reclaim disk
-  behind completed stages without waiting for full file deletion. Measure
-  with `numastat -p` and `perf stat -e node-load-misses` to quantify
-  cross-socket traffic before investing. Linux-only, gated on
-  `target_os = "linux"`.
+- [ ] **2. Columnar batch processing** — 2/6 reviewers ranked 1st, all
+  ranked top 2. Decode PrimitiveBlock fields into contiguous arrays (all
+  IDs, then all lats, then all lons) instead of element-by-element. Cuts
+  classify memory bandwidth from ~1.5 MB/block to ~100-200 KB/block.
+  Enables autovectorization for bbox checks, ID lookups, coordinate math.
+  Arena allocation (item 1) provides the natural home for column arrays.
+  Primary candidates: dense node decoding in `src/read/block.rs`,
+  coordinate processing in extract bbox classification, ALTW node scans.
+  The tag path is harder (variable-length strings) but tag key indices
+  could be columnar. Planetiler uses this approach.
 
-- [ ] **Huge pages for large mmap'd structures** — `MAP_HUGETLB` (2 MB pages)
-  reduces TLB misses when scanning multi-GB memory-mapped regions. Primary
-  candidates: dense ALTW index (`DenseMmapIndex`, up to 16 GB touched at
-  planet scale), geocode index mmap reader (19 files, largest cell arrays
-  are hundreds of MB), external join temp files. Requires transparent huge
-  pages (THP) or explicit `madvise(MADV_HUGEPAGE)` hints. Measure TLB miss
-  rates with `perf stat -e dTLB-load-misses` before and after. Linux-only,
-  gated on `target_os = "linux"`.
+**Milestone B: vectorization (after columnar layout stabilizes)**
+
+- [ ] **3. SIMD** — universal agreement: comes after columnar. With
+  contiguous arrays, explicit AVX2/NEON targets:
+  - Varint decode: 4-8 varints per instruction via `pshufb` permutation
+    + `pmovmskb` continuation scanning. ~15-20% of parse time at planet.
+  - Bbox checks: `_mm256_cmpgt_epi32` does 8 coordinate comparisons per
+    instruction. Extract node classification inner loop ~8x faster.
+  - Delta decode: SIMD prefix-sum (`_mm256_add_epi64` cascaded) for
+    DenseNodes delta-encoded IDs/lats/lons, 4 deltas per instruction.
+  - Write-path: `BlockBuilder` packed varint encoding for refs, tag
+    indices, dense node deltas.
+  Without columnar layout, SIMD requires gather/scatter that negates
+  most throughput gain. See [notes/SIMD.md](notes/SIMD.md).
+
+**Milestone C: hardware-level tuning (where perf counters justify it)**
+
+- [ ] **4. Huge pages** — `MAP_HUGETLB` (2 MB pages) for large mmap'd
+  structures. Dense ALTW index (128 GB virtual, ~16 GB touched): 4 KB
+  pages cover 8 MB via TLB, 2 MB pages cover 4 GB. Geocode index mmap
+  reader, external join temp files. 5-15% speedup for random-access
+  patterns. Note: dense ALTW is deprecated at planet scale in favor of
+  external join. Requires hugepage availability (`sysctl` config) or
+  `madvise(MADV_HUGEPAGE)` for THP. Linux-only.
+
+- [ ] **5. NUMA-aware memory placement** — last by unanimous agreement
+  (6/6). Only matters on multi-socket servers. Current benchmark host
+  (plantasjen) is single-socket. Pread-from-workers pattern already has
+  natural NUMA affinity (thread-local allocations, first-touch policy).
+  `set_mempolicy(MPOL_BIND)` / `mbind()` for explicit placement.
+  Candidates: pipelined reader decode pool, dense ALTW index interleave,
+  external join scatter buffers. 10-20% on dual-socket, 0% on
+  single-socket. Requires per-host tuning and NUMA hardware to validate.
+
+**Separate track (GPU, independent of milestones A-C):**
+
+- [ ] **GPU-accelerated point-in-polygon for geocode builder** — Pass 2
+  tests billions of nodes against admin boundary polygons. NVIDIA's
+  cuSpatial has production-quality PIP (winding number, handles holes).
+  Depends on columnar batch processing for efficient host-to-device
+  transfer. Rust interop via `cudarc`. Feature-gate behind `cuda`.
+  Planet: 2.5B nodes, polygon set ~100 MB. Only worthwhile at
+  Europe/planet scale. No precedent in OSM tooling.
 
 ### Research / stretch ideas
 

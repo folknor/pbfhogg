@@ -1,5 +1,6 @@
 pub mod blob;
 pub mod block;
+pub(crate) mod columnar;
 pub mod dense;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_reader;

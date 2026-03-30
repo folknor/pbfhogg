@@ -564,6 +564,33 @@ impl PrimitiveBlock {
         })
     }
 
+    /// Batch-decode all dense nodes into columnar arrays (IDs, lats, lons).
+    ///
+    /// Reuses the provided `DenseNodeColumns` scratch buffer. Coordinates
+    /// are converted to decimicrodegrees. Returns the number of nodes decoded.
+    ///
+    /// This is the columnar alternative to iterating `elements()` / `elements_skip_metadata()`
+    /// for classification passes that only need ID + coordinates.
+    pub(crate) fn decode_dense_columns(
+        &self,
+        columns: &mut super::columnar::DenseNodeColumns,
+    ) -> usize {
+        columns.clear();
+        for group in self.groups() {
+            if let Ok(Some(dense_data)) = group.group.dense() {
+                if let Ok(dense) = super::wire::WireDenseNodes::parse(dense_data) {
+                    columns.decode(
+                        &dense,
+                        self.block.granularity,
+                        self.block.lat_offset,
+                        self.block.lon_offset,
+                    );
+                }
+            }
+        }
+        columns.len()
+    }
+
     /// Returns an iterator over the groups in this `PrimitiveBlock`.
     pub fn groups(&self) -> GroupIter<'_> {
         GroupIter::new(&self.block)

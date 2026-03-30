@@ -2210,27 +2210,49 @@ fn collect_pass1_generic<H: RelationHandler>(
     );
 
     // Phase 1: Classify nodes by region containment.
+    // For bbox-only regions, use columnar decode (batch IDs/lats/lons into
+    // contiguous arrays) for cache-friendly classification. Polygon regions
+    // fall back to element-by-element iteration.
+    let use_columnar = matches!(region, Region::Bbox(_));
     parallel_classify_phase(
         &shared_file,
         &node_schedule,
         |block| {
-            let mut ids = Vec::new();
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn)
-                        if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                    {
-                        ids.push(dn.id());
-                    }
-                    Element::Node(n)
-                        if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                    {
-                        ids.push(n.id());
-                    }
-                    _ => {}
+            if use_columnar {
+                // Columnar path: batch decode + tight i32 comparison loop.
+                // Worker-local scratch reused across blobs via thread_local.
+                use std::cell::RefCell;
+                thread_local! {
+                    static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
+                        RefCell::new(crate::read::columnar::DenseNodeColumns::new());
                 }
+                COLUMNS.with_borrow_mut(|columns| {
+                    block.decode_dense_columns(columns);
+                    columns.matching_ids_bbox(
+                        bbox_int.min_lat, bbox_int.max_lat,
+                        bbox_int.min_lon, bbox_int.max_lon,
+                    )
+                })
+            } else {
+                // Polygon path: element-by-element with point-in-polygon check.
+                let mut ids = Vec::new();
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            ids.push(dn.id());
+                        }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            ids.push(n.id());
+                        }
+                        _ => {}
+                    }
+                }
+                ids
             }
-            ids
         },
         |ids| {
             for id in ids {

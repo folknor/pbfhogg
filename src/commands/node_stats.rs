@@ -1,8 +1,6 @@
 use std::path::Path;
 
-use crate::reader::ElementReader;
 use crate::elements::Element;
-use crate::BlobFilter;
 
 use super::{require_indexdata, Result};
 
@@ -166,8 +164,14 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
          filter is a no-op — all blobs are decompressed (significantly slower).")?;
 
-    let reader = ElementReader::open(path, direct_io)?
-        .with_blob_filter(BlobFilter::only_nodes());
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention
+    // at planet scale (520K+ blobs). Diagnostic command — single-threaded
+    // decode is acceptable.
+    let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
 
     let mut node_count: u64 = 0;
     let mut min_lat = i32::MAX;
@@ -178,34 +182,42 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
     let mut lat_stats = CoordStats::new();
     let mut lon_stats = CoordStats::new();
 
-    // Buffers for accumulating 128-value blocks
     let mut lat_block = Vec::with_capacity(BLOCK_SIZE);
     let mut lon_block = Vec::with_capacity(BLOCK_SIZE);
 
-    reader.for_each_pipelined(|element| {
-        let (lat_e7, lon_e7) = match &element {
-            Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
-            Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
-            _ => return,
-        };
-
-        node_count += 1;
-
-        if lat_e7 < min_lat { min_lat = lat_e7; }
-        if lat_e7 > max_lat { max_lat = lat_e7; }
-        if lon_e7 < min_lon { min_lon = lon_e7; }
-        if lon_e7 > max_lon { max_lon = lon_e7; }
-
-        lat_block.push(lat_e7);
-        lon_block.push(lon_e7);
-
-        if lat_block.len() == BLOCK_SIZE {
-            lat_stats.record_block(&lat_block);
-            lon_stats.record_block(&lon_block);
-            lat_block.clear();
-            lon_block.clear();
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
         }
-    })?;
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new(decompressed)?;
+        for element in block.elements_skip_metadata() {
+            let (lat_e7, lon_e7) = match &element {
+                Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
+                Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+                _ => continue,
+            };
+
+            node_count += 1;
+
+            if lat_e7 < min_lat { min_lat = lat_e7; }
+            if lat_e7 > max_lat { max_lat = lat_e7; }
+            if lon_e7 < min_lon { min_lon = lon_e7; }
+            if lon_e7 > max_lon { max_lon = lon_e7; }
+
+            lat_block.push(lat_e7);
+            lon_block.push(lon_e7);
+
+            if lat_block.len() == BLOCK_SIZE {
+                lat_stats.record_block(&lat_block);
+                lon_stats.record_block(&lon_block);
+                lat_block.clear();
+                lon_block.clear();
+            }
+        }
+    }
 
     // Flush the last partial block
     if !lat_block.is_empty() {

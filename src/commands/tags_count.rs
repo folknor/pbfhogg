@@ -2,14 +2,13 @@
 
 use std::path::Path;
 
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use super::tag_expr::{tag_matches, parse_expressions, Expression};
-use super::{for_each_primitive_block_batch, require_indexdata, TypeFilter};
-use crate::{BlobFilter, Element, ElementReader, PrimitiveBlock};
+use super::{require_indexdata, TypeFilter};
+use crate::{BlobFilter, Element, PrimitiveBlock};
 
-use super::{Result, BATCH_SIZE};
+use super::Result;
 type CountMap = FxHashMap<String, FxHashMap<String, u64>>;
 
 /// A single tag count entry: key, value, count.
@@ -72,22 +71,36 @@ pub fn tags_count(
         Some(parse_expressions(opts.expressions)?)
     };
 
-    let reader = ElementReader::open(path, opts.direct_io)?;
-    let reader = match opts.type_filter {
-        Some("node") => reader.with_blob_filter(BlobFilter::only_nodes()),
-        Some("way") => reader.with_blob_filter(BlobFilter::only_ways()),
-        Some("relation") => reader.with_blob_filter(BlobFilter::only_relations()),
-        _ => reader,
+    // Sequential reader to avoid PrimitiveBlock cross-thread retention
+    // at planet scale (520K+ blobs). Diagnostic command — single-threaded
+    // decode is acceptable.
+    let tf = TypeFilter::from_single(opts.type_filter);
+    let blob_filter = match opts.type_filter {
+        Some("node") => Some(BlobFilter::only_nodes()),
+        Some("way") => Some(BlobFilter::only_ways()),
+        Some("relation") => Some(BlobFilter::only_relations()),
+        _ => None,
     };
 
-    let tf = TypeFilter::from_single(opts.type_filter);
+    let mut blob_reader = crate::blob::BlobReader::open(path, opts.direct_io)?;
+    blob_reader.set_parse_indexdata(true);
+    blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let decompress_pool = crate::blob::DecompressPool::new();
 
     let mut counts: CountMap = FxHashMap::default();
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        let batch_counts = count_batch(batch, tf.nodes, tf.ways, tf.relations, &expressions);
-        merge_counts(&mut counts, batch_counts);
-        Ok(())
-    })?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(ref filter) = blob_filter {
+            if let Some(idx) = blob.index() {
+                if !filter.wants_index(&idx) { continue; }
+            }
+        }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = PrimitiveBlock::new(decompressed)?;
+        count_block_tags(&mut counts, &block, tf.nodes, tf.ways, tf.relations, &expressions);
+    }
 
     let capacity: usize = counts.values().map(rustc_hash::FxHashMap::len).sum();
     let mut results: Vec<TagCount> = Vec::with_capacity(capacity);
@@ -129,25 +142,6 @@ pub fn tags_count(
     Ok(results)
 }
 
-/// Count tags across a batch of blocks in parallel using fold + reduce.
-fn count_batch(
-    batch: &[PrimitiveBlock],
-    filter_node: bool,
-    filter_way: bool,
-    filter_relation: bool,
-    expressions: &Option<Vec<Expression>>,
-) -> CountMap {
-    batch
-        .par_iter()
-        .fold(
-            FxHashMap::default,
-            |mut local: CountMap, block| {
-                count_block_tags(&mut local, block, filter_node, filter_way, filter_relation, expressions);
-                local
-            },
-        )
-        .reduce(FxHashMap::default, merge_two_maps)
-}
 
 /// Check if a tag matches any expression (respecting the element's type).
 fn matches_expression(expressions: &[Expression], key: &str, value: &str, is_node: bool, is_way: bool, is_relation: bool) -> bool {
@@ -220,26 +214,6 @@ fn count_block_tags(
     }
 }
 
-/// Merge map `b` into map `a`.
-fn merge_two_maps(mut a: CountMap, b: CountMap) -> CountMap {
-    for (key, inner_b) in b {
-        let inner_a = a.entry(key).or_default();
-        for (val, count) in inner_b {
-            *inner_a.entry(val).or_insert(0) += count;
-        }
-    }
-    a
-}
-
-/// Merge a complete batch result into the global accumulator.
-fn merge_counts(global: &mut CountMap, batch: CountMap) {
-    for (key, inner_b) in batch {
-        let inner_a = global.entry(key).or_default();
-        for (val, count) in inner_b {
-            *inner_a.entry(val).or_insert(0) += count;
-        }
-    }
-}
 
 /// Increment the count for a (key, value) pair, allocating only on first insert.
 #[inline]

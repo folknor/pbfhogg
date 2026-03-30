@@ -271,8 +271,9 @@ from simple extract applies to any sequential collection pass:
 - [x] `merge --locations-on-ways` node scanner — already uses
   `extract_node_tuples` from `node_scanner.rs` with `par_iter` for
   parallel decompress+extract. No PrimitiveBlock construction.
-- [ ] `node_stats.rs` — uses `for_each_pipelined` (cross-thread PrimitiveBlock).
-  Only needs id/lat/lon. Convert to node-only scanner for planet safety.
+- [x] `node_stats.rs` — converted from `for_each_pipelined` to sequential
+  BlobReader with DecompressPool. Eliminates cross-thread retention.
+  Diagnostic command — single-threaded decode is acceptable.
 - [x] `getid::parse_ids_from_pbf` (`src/commands/getid.rs`) —
   converted to `parallel_classify_phase`, eliminating cross-thread
   PrimitiveBlock retention for `--id-file` PBF parsing.
@@ -288,9 +289,10 @@ from simple extract applies to any sequential collection pass:
   blob's header. A header-only scan + pread of only matching blobs
   would reduce planet from 32.5s to under 1s (only 3-9 blobs need
   reading). Low priority — 32.5s is already fast for planet-scale.
-- [ ] `tags_count.rs` — uses `for_each_primitive_block_batch` (pipelined).
-  At planet scale with 520K+ blobs the retention pattern applies. Convert
-  to sequential BlobReader if planet-scale tag analytics is needed.
+- [x] `tags_count.rs` — converted from pipelined reader + rayon batch to
+  sequential BlobReader with DecompressPool. Removes rayon batch
+  infrastructure (count_batch, merge_two_maps, merge_counts). Diagnostic
+  command — single-threaded decode is acceptable.
 - [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
   `src/commands/add_locations_to_ways.rs` ~line 1045) — uses
   `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.

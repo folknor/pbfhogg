@@ -465,6 +465,7 @@ pub(crate) fn build_classify_schedule(
 /// **Note:** `merge` is called in arbitrary worker-completion order, not blob
 /// file order. All current callers use order-independent merge operations
 /// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_phase<R: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],

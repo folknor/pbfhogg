@@ -707,6 +707,7 @@ fn tags_filter_two_pass(
     // Expand relation-member closure (skip if no relations matched):
     // - matched relation -> include member nodes/ways/relations
     // - member relations recurse transitively (cycle-safe via set membership)
+    crate::debug::emit_marker("TAGSFILTER_CLOSURE_START");
     if has_included_relation {
         let closure = collect_relation_member_closure(
             input,
@@ -718,8 +719,10 @@ fn tags_filter_two_pass(
         has_included_way |= closure.has_way;
         has_included_relation |= closure.has_relation;
     }
+    crate::debug::emit_marker("TAGSFILTER_CLOSURE_END");
 
     // Any included way (direct match or pulled from relation members) contributes node deps.
+    crate::debug::emit_marker("TAGSFILTER_WAYDEPS_START");
     collect_way_node_dependencies(
         input,
         direct_io,
@@ -727,6 +730,7 @@ fn tags_filter_two_pass(
         Some(&direct_way_ids),
         &mut relation_dep_node_ids,
     )?;
+    crate::debug::emit_marker("TAGSFILTER_WAYDEPS_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
     // Way/relation blobs where ALL elements are included pass through as raw

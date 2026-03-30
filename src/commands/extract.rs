@@ -1182,6 +1182,7 @@ fn build_blob_schedule_with_passthrough(
 
 /// Execute a pread-from-workers write pass on a pre-built schedule.
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn pread_execute<F>(
     input: &Path,
     schedule: &[BlobDesc],

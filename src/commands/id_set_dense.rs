@@ -96,6 +96,58 @@ impl IdSetDense {
         false
     }
 
+    /// Count how many IDs in the range [min_id, max_id] are set.
+    /// Uses popcount over the byte range spanning the ID interval.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn count_in_range(&self, min_id: i64, max_id: i64) -> u64 {
+        if min_id > max_id {
+            return 0;
+        }
+        let min_id = min_id as u64;
+        let max_id = max_id as u64;
+        let min_chunk = (min_id >> (CHUNK_BITS + 3)) as usize;
+        let max_chunk = (max_id >> (CHUNK_BITS + 3)) as usize;
+        let mut total: u64 = 0;
+
+        for cid in min_chunk..=max_chunk {
+            if cid >= self.chunks.len() {
+                break;
+            }
+            if let Some(chunk) = &self.chunks[cid] {
+                let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
+                let range_start = min_id.saturating_sub(chunk_base);
+                let chunk_end = chunk_base + ((CHUNK_SIZE as u64) << 3);
+                let range_end = if max_id < chunk_end { max_id - chunk_base } else { ((CHUNK_SIZE as u64) << 3) - 1 };
+
+                let start_byte = (range_start >> 3) as usize;
+                let end_byte = ((range_end >> 3) as usize).min(CHUNK_SIZE - 1);
+
+                // Count set bits via u64 popcount for bulk, byte-level at edges.
+                let mut pos = start_byte;
+                // Byte-level head alignment to u64 boundary.
+                while pos <= end_byte && (pos & 7) != 0 {
+                    total += u64::from(chunk[pos].count_ones());
+                    pos += 1;
+                }
+                // u64 bulk popcount.
+                while pos + 8 <= end_byte + 1 {
+                    let word = u64::from_le_bytes([
+                        chunk[pos], chunk[pos+1], chunk[pos+2], chunk[pos+3],
+                        chunk[pos+4], chunk[pos+5], chunk[pos+6], chunk[pos+7],
+                    ]);
+                    total += word.count_ones() as u64;
+                    pos += 8;
+                }
+                // Byte-level tail.
+                while pos <= end_byte {
+                    total += u64::from(chunk[pos].count_ones());
+                    pos += 1;
+                }
+            }
+        }
+        total
+    }
+
     /// Build the prefix-sum index for O(1) `rank()` queries.
     /// Must be called after all `set()` calls are complete.
     /// Invalidated by subsequent `set()` or `merge()` calls.

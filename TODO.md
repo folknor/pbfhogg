@@ -200,6 +200,27 @@ from simple extract applies to any sequential collection pass:
 
 **Do later:**
 
+- [ ] **Hybrid batching for pread workers** — workers accumulate N
+  decode items (e.g., 8-16) from the descriptor channel before
+  processing, reducing mutex contention and channel send/recv overhead.
+  Could recover the ~8s tags-filter pass 2 regression from pipelined
+  reader → pread workers conversion. Applies to `parallel_classify_phase`
+  and tags-filter pass 2 workers. Flagged by 4/6 reviewers.
+
+- [ ] **Tags-filter raw passthrough via lightweight ID scanner** — the
+  `count_in_range >= blob_count` check was unsound (extraneous IDs from
+  other blobs inflate count). The correct approach: a cheap wire-format
+  ID-only scanner per blob that verifies every element ID is in the
+  included set without full PrimitiveBlock decode. If all match, raw
+  passthrough. Only worth implementing if broad filters (e.g.,
+  `building=*`) are a common use case. Flagged by 3/6 reviewers.
+
+- [ ] **Duplicated consumer drain in pread reorder patterns** — the
+  post-loop reorder buffer drain duplicates the inner-loop drain
+  verbatim (~28 lines). Exists in extract's `pread_execute` and
+  tags-filter pass 2. Could be a shared closure or helper.
+  Code quality only. Flagged by 1/6 reviewers.
+
 - [ ] **`pread_execute` opens a new `Arc<File>` per call** — simple extract
   calls it 3 times for the same input file. Could share the file handle
   across phases. Minor (~1µs per open). Flagged by 1/10 reviewers.

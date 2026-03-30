@@ -577,18 +577,21 @@ fn tags_filter_two_pass(
     // Build schedule from header-only scan.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
+    scanner.set_parse_tagdata(true);
     scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let expr_filter = if invert { None } else { blob_filter_from_expressions(expressions) };
 
     let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut blobs_skipped_by_tag: u64 = 0;
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(ref filter) = expr_filter {
             if let Some(idx) = hdr.index() {
+                // Skip blob types not needed by the expression.
                 let dominated = matches!(
                     idx.kind,
                     crate::blob_index::ElemKind::Node if !filter.want_nodes
@@ -601,9 +604,21 @@ fn tags_filter_two_pass(
                 );
                 if dominated { continue; }
             }
+            // Skip blobs whose tag index proves they lack required tag keys.
+            if filter.has_tag_filter() {
+                if let Some(tag_idx) = hdr.tag_index() {
+                    if !filter.wants_tag_index(&tag_idx) {
+                        blobs_skipped_by_tag += 1;
+                        continue;
+                    }
+                }
+            }
         }
         schedule.push((seq, data_offset, data_size));
         seq += 1;
+    }
+    if blobs_skipped_by_tag > 0 {
+        eprintln!("[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index");
     }
     drop(scanner);
 
@@ -711,21 +726,59 @@ fn tags_filter_two_pass(
         &mut relation_dep_node_ids,
     )?;
 
-    // --- Pass 2: Write matching elements in file order (parallel batches) ---
+    // --- Pass 2: Write matching elements via pread-from-workers ---
+    // Way/relation blobs where ALL elements are included pass through as raw
+    // frames (zero decompression + re-encoding). Remaining blobs are decoded
+    // and filtered by parallel workers.
     crate::debug::emit_marker("TAGSFILTER_PASS2_START");
-    // Pass 2 always needs nodes (for way deps) plus matched ways/relations.
-    let reader = ElementReader::open(input, direct_io)?;
-    let reader = if invert {
-        // Invert mode: need all blob types (most elements are kept).
-        reader
-    } else if blob_filter_from_expressions(expressions).is_some() {
-        // Nodes are always needed for dependency expansion.
-        // Ways/relations are included when either directly matched or pulled via relation closure.
-        reader.with_blob_filter(BlobFilter::new(true, has_included_way, has_included_relation))
+
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = header_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    drop(header_reader);
+    let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| hb, direct_io, false)?;
+
+    // Build pass 2 schedule. Skip blob types not needed (type filter only —
+    // no tag index filtering because elements can be included via relation
+    // closure without having the matching tag key).
+    let blob_filter: Option<BlobFilter> = if invert {
+        None
     } else {
-        reader
+        Some(BlobFilter::new(true, has_included_way, has_included_relation))
     };
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
+
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.set_parse_tagdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut schedule: Vec<(u64, usize)> = Vec::new(); // (data_offset, data_size)
+    let mut blobs_skipped: u64 = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+
+        // Type-only filter: skip blob types not needed (no tag index filtering
+        // in pass 2 — elements can be included via relation closure without
+        // having the matching tag key).
+        if let Some(ref filter) = blob_filter {
+            if let Some(idx) = hdr.index() {
+                if !filter.wants_index(&idx) {
+                    blobs_skipped += 1;
+                    continue;
+                }
+            }
+        }
+
+        schedule.push((data_offset, data_size));
+    }
+    drop(scanner);
+
+    if blobs_skipped > 0 {
+        eprintln!("[tags-filter] pass 2: {blobs_skipped} blobs skipped by type/tag index");
+    }
 
     let id_sets = Pass2IdSets {
         matched_node_ids: &matched_node_ids,
@@ -737,9 +790,126 @@ fn tags_filter_two_pass(
         relation_dep_node_ids: &relation_dep_node_ids,
     };
 
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
-        process_pass2_batch(batch, &id_sets, remove_tags, &mut writer, &mut stats)
+    // pread-from-workers: parallel decode + filter + write with reorder buffer.
+    // No raw passthrough — tag-based all-match detection requires per-element
+    // ID verification (count_in_range is unsound due to extraneous IDs from
+    // other blobs inflating the count). Pread workers are kept for planet
+    // safety (no cross-thread PrimitiveBlock retention).
+    {
+    use std::os::unix::fs::FileExt as _;
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let decode_items: Vec<(usize, u64, usize)> = schedule.iter().enumerate()
+        .map(|(i, &(data_offset, data_size))| (i, data_offset, data_size))
+        .collect();
+
+    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for item in decode_items {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            let ids_ref = &id_sets;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let worker_pool = crate::blob::DecompressPool::new();
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
+                        output_blocks.clear();
+                        let block_stats = filter_block_pass2(
+                            &block, ids_ref, remove_tags, &mut bb, &mut output_blocks,
+                        ).map_err(|e| crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(e))
+                        ))?;
+                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
+                            crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            )
+                        })?;
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        // Consumer: merge results via reorder buffer for file-order output.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+
+            while let Some(r) = reorder.pop_ready() {
+                let (blocks, block_stats) = r?;
+                stats.nodes_matched += block_stats.nodes_matched;
+                stats.nodes_from_ways += block_stats.nodes_from_ways;
+                stats.nodes_from_relations += block_stats.nodes_from_relations;
+                stats.ways_matched += block_stats.ways_matched;
+                stats.ways_from_relations += block_stats.ways_from_relations;
+                stats.relations_matched += block_stats.relations_matched;
+                stats.relations_from_relations += block_stats.relations_from_relations;
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+            }
+        }
+
+        while let Some(r) = reorder.pop_ready() {
+            let (blocks, block_stats) = r?;
+            stats.nodes_matched += block_stats.nodes_matched;
+            stats.nodes_from_ways += block_stats.nodes_from_ways;
+            stats.nodes_from_relations += block_stats.nodes_from_relations;
+            stats.ways_matched += block_stats.ways_matched;
+            stats.ways_from_relations += block_stats.ways_from_relations;
+            stats.relations_matched += block_stats.relations_matched;
+            stats.relations_from_relations += block_stats.relations_from_relations;
+            for (block_bytes, index, tagdata) in blocks {
+                writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+            }
+        }
+
+        Ok(())
     })?;
+    }
 
     writer.flush()?;
     crate::debug::emit_marker("TAGSFILTER_PASS2_END");

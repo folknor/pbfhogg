@@ -1,6 +1,6 @@
-# Raw passthrough for extract
+# Raw passthrough
 
-## Status: Phase 1 shipped, beats osmium
+## Status: shipped across extract, cat, getid; tags-filter planet-safe
 
 Simple extract now beats osmium (4.4s vs 7.2s Japan, 100s Europe) via a
 different approach than originally planned: parallel blob classification
@@ -82,17 +82,30 @@ IDs.
   all elements are selected, but complete/smart do element-level filtering
   (partial matches common), making blob-level passthrough less applicable.
 
+### Tags-filter
+
+Pass 2 converted from pipelined reader + rayon batch to pread-from-workers
++ reorder buffer for planet safety (no cross-thread PrimitiveBlock
+retention). Pass 1 schedule builder uses blob-level tag index filtering
+to skip blobs whose tagdata provably lacks required tag keys. Tag index
+filtering NOT applied in pass 2 (elements can be included via relation
+closure without having the matching tag key).
+
+Raw passthrough for all-match blobs was attempted but removed:
+`count_in_range >= blob_count` is unsound (extraneous IDs from other
+blobs inflate the count). The correct approach would be a lightweight
+per-blob ID scanner — see TODO.md. Europe: 366.7s → 105s (3.5x total).
+
 ### For other commands
 
-The four per-group primitives could be used by: tags-filter, renumber,
-time-filter. These still fully decode + re-encode via BlockBuilder.
-The approach: classify each group as all-match/partial/none, copy
-all-match groups raw, re-encode partial groups. cat --type and getid
---invert now use blob-level raw passthrough (above). getid include
-uses blob-level skip (no decode of non-matching blobs).
+The four per-group primitives could be used by: renumber, time-filter.
+These still fully decode + re-encode via BlockBuilder. The approach:
+classify each group as all-match/partial/none, copy all-match groups raw,
+re-encode partial groups.
 
-Lower priority now that the highest-impact commands (extract simple,
-cat --type, getid) already beat osmium or are I/O-limited.
+Lower priority — renumber/time-filter modify every element, so raw
+passthrough is not applicable. The remaining per-group opportunity is
+for partial-match blobs in extract boundaries.
 
 ## Why the original per-group approach wasn't needed for extract
 

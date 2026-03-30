@@ -413,8 +413,46 @@ pub(crate) fn ensure_relation_capacity_local(
 }
 
 // ---------------------------------------------------------------------------
-// Parallel classification helper
+// Schedule building + parallel classification
 // ---------------------------------------------------------------------------
+
+/// Build a classification schedule from a header-only scan, optionally
+/// filtering by element type. Returns `(schedule, shared_file)` ready for
+/// [`parallel_classify_phase`].
+///
+/// Each schedule entry is `(seq, data_offset, data_size)`. Only OsmData blobs
+/// are included. When `kind_filter` is `Some`, only blobs whose indexdata
+/// matches the given element type (plus blobs without indexdata) are included.
+pub(crate) fn build_classify_schedule(
+    input: &std::path::Path,
+    kind_filter: Option<crate::blob_index::ElemKind>,
+) -> Result<(Vec<(usize, u64, usize)>, std::sync::Arc<std::fs::File>)> {
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(filter_kind) = kind_filter {
+            if let Some(idx) = hdr.index() {
+                if idx.kind != filter_kind { continue; }
+            }
+        }
+        schedule.push((seq, data_offset, data_size));
+        seq += 1;
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    Ok((schedule, shared_file))
+}
 
 /// Run a parallel classification phase: pread workers decompress and classify
 /// blobs, sending compact results to a consumer that merges them into ID sets.

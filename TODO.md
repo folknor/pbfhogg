@@ -215,11 +215,9 @@ from simple extract applies to any sequential collection pass:
   passthrough. Only worth implementing if broad filters (e.g.,
   `building=*`) are a common use case. Flagged by 3/6 reviewers.
 
-- [ ] **Duplicated consumer drain in pread reorder patterns** — the
-  post-loop reorder buffer drain duplicates the inner-loop drain
-  verbatim (~28 lines). Exists in extract's `pread_execute` and
-  tags-filter pass 2. Could be a shared closure or helper.
-  Code quality only. Flagged by 1/6 reviewers.
+- [x] **Duplicated consumer drain in tags-filter pass 2** — refactored
+  into `drain_ready` closure. Extract's `pread_execute` still has the
+  duplication (different stats type). Flagged by 1/6 reviewers.
 
 - [ ] **`pread_execute` opens a new `Arc<File>` per call** — simple extract
   calls it 3 times for the same input file. Could share the file handle
@@ -238,12 +236,10 @@ from simple extract applies to any sequential collection pass:
   current planet-scale paths don't use `parallel_classify_phase` for
   heavy scans. Flagged by 1/10 reviewers.
 
-- [ ] **Schedule-building boilerplate dedup** — the 20-line pattern
-  (seekable BlobReader, filter to elem kind, build schedule Vec, open
-  Arc<File>) is repeated 8+ times across extract, tags-filter, getid.
-  A `build_typed_schedule(input, kind_filter) -> (schedule, Arc<File>)`
-  helper would deduplicate. Code quality, not performance.
-  Flagged by 1/10 reviewers.
+- [x] **Schedule-building boilerplate dedup** — `build_classify_schedule`
+  in `commands/mod.rs` replaces 5 inline copies across getid, tags-filter,
+  extract. Callers with custom filtering (spatial, tagdata) keep their
+  own schedule builders. Flagged by 1/10 reviewers.
 
 - [ ] **tags-filter pass 1 not exploiting blob-level tag index** — the
   schedule builder only uses `idx.kind` for type domination
@@ -252,11 +248,9 @@ from simple extract applies to any sequential collection pass:
   key/prefix filters. Blobs that provably lack required tag keys could
   be skipped without decompression. Flagged by 2/10 reviewers.
 
-- [ ] **`collect_relation_member_closure` early return on empty set** —
-  the function always does one full relation scan even when
-  `included_relation_ids` is empty. An early return at the call boundary
-  (~line 695) would save that scan for no-relation cases.
-  Flagged by 1/10 reviewers.
+- [x] **`collect_relation_member_closure` early return on empty set** —
+  call site guarded by `has_included_relation` check. Skips schedule
+  building + file open when no relations matched. Flagged by 1/10.
 
 - [ ] **`way_scanner` way_id parsing inconsistency** — line 80 uses
   `read_varint()? as i64` while canonical WireWay uses

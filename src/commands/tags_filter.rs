@@ -704,18 +704,20 @@ fn tags_filter_two_pass(
 
     crate::debug::emit_marker("TAGSFILTER_PASS1_END");
 
-    // Expand relation-member closure:
+    // Expand relation-member closure (skip if no relations matched):
     // - matched relation -> include member nodes/ways/relations
     // - member relations recurse transitively (cycle-safe via set membership)
-    let closure = collect_relation_member_closure(
-        input,
-        direct_io,
-        &mut included_relation_ids,
-        &mut included_way_ids,
-        &mut relation_dep_node_ids,
-    )?;
-    has_included_way |= closure.has_way;
-    has_included_relation |= closure.has_relation;
+    if has_included_relation {
+        let closure = collect_relation_member_closure(
+            input,
+            direct_io,
+            &mut included_relation_ids,
+            &mut included_way_ids,
+            &mut relation_dep_node_ids,
+        )?;
+        has_included_way |= closure.has_way;
+        has_included_relation |= closure.has_relation;
+    }
 
     // Any included way (direct match or pulled from relation members) contributes node deps.
     collect_way_node_dependencies(
@@ -875,11 +877,9 @@ fn tags_filter_two_pass(
             crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
-        for (s, item) in result_rx {
-            reorder.push(s, item);
-
+        let mut drain_ready = |reorder: &mut crate::reorder_buffer::ReorderBuffer<_>| -> Result<()> {
             while let Some(r) = reorder.pop_ready() {
-                let (blocks, block_stats) = r?;
+                let (blocks, block_stats): (Vec<OwnedBlock>, TagsFilterStats) = r?;
                 stats.nodes_matched += block_stats.nodes_matched;
                 stats.nodes_from_ways += block_stats.nodes_from_ways;
                 stats.nodes_from_relations += block_stats.nodes_from_relations;
@@ -891,21 +891,14 @@ fn tags_filter_two_pass(
                     writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                 }
             }
-        }
+            Ok(())
+        };
 
-        while let Some(r) = reorder.pop_ready() {
-            let (blocks, block_stats) = r?;
-            stats.nodes_matched += block_stats.nodes_matched;
-            stats.nodes_from_ways += block_stats.nodes_from_ways;
-            stats.nodes_from_relations += block_stats.nodes_from_relations;
-            stats.ways_matched += block_stats.ways_matched;
-            stats.ways_from_relations += block_stats.ways_from_relations;
-            stats.relations_matched += block_stats.relations_matched;
-            stats.relations_from_relations += block_stats.relations_from_relations;
-            for (block_bytes, index, tagdata) in blocks {
-                writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-            }
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+            drain_ready(&mut reorder)?;
         }
+        drain_ready(&mut reorder)?;
 
         Ok(())
     })?;
@@ -951,28 +944,9 @@ fn collect_relation_member_closure(
     let mut summary = RelationClosureSummary::default();
 
     // Build schedule once — reused across convergence iterations.
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
-        }
-        schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
-    drop(scanner);
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let (schedule, shared_file) = super::build_classify_schedule(
+        input, Some(crate::blob_index::ElemKind::Relation),
+    )?;
 
     struct ClosureResult {
         node_ids: Vec<i64>,
@@ -1052,28 +1026,9 @@ fn collect_way_node_dependencies(
     skip_way_ids: Option<&IdSetDense>,
     relation_dep_node_ids: &mut IdSetDense,
 ) -> Result<()> {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
-        }
-        schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
-    drop(scanner);
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let (schedule, shared_file) = super::build_classify_schedule(
+        input, Some(crate::blob_index::ElemKind::Way),
+    )?;
 
     super::parallel_classify_phase(
         &shared_file,

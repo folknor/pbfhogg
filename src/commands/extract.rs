@@ -2066,28 +2066,9 @@ fn extract_smart(
     // collect all node refs into extra_node_ids.
     // Only way blobs are needed here — skip node and relation blobs via index.
     {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
-        }
-        way_schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
-    drop(scanner);
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
+    let (way_schedule, shared_file) = super::build_classify_schedule(
+        input, Some(crate::blob_index::ElemKind::Way),
+    )?;
 
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;

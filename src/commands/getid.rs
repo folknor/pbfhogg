@@ -136,26 +136,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
         relation_ids: BTreeSet::new(),
     };
 
-    // Build schedule from header-only scan.
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(path)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-    let mut seq: usize = 0;
-    while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        schedule.push((seq, data_offset, data_size));
-        seq += 1;
-    }
-    drop(scanner);
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(path)
-            .map_err(|e| format!("failed to open {}: {e}", path.display()))?
-    );
+    let (schedule, shared_file) = super::build_classify_schedule(path, None)?;
 
     struct IdBatch {
         node_ids: Vec<i64>,
@@ -510,28 +491,9 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     if !ids.way_ids.is_empty() {
         // Parallel classification: pread workers scan way blobs for matching
         // way IDs and collect their node refs.
-        let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-        scanner.set_parse_indexdata(true);
-        scanner.next_header_skip_blob()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-        let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
-        let mut seq: usize = 0;
-        while let Some(result_item) = scanner.next_header_with_data_offset() {
-            let (hdr, _frame_offset, data_offset, data_size) = result_item?;
-            if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = hdr.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
-            }
-            schedule.push((seq, data_offset, data_size));
-            seq += 1;
-        }
-        drop(scanner);
-
-        let shared_file = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-        );
+        let (schedule, shared_file) = super::build_classify_schedule(
+            input, Some(crate::blob_index::ElemKind::Way),
+        )?;
 
         super::parallel_classify_phase(
             &shared_file,

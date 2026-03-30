@@ -443,6 +443,13 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Fix: declare `st_scratch`/`gr_scratch` outside loop, call
   `new_with_scratch`. Mechanical.
 
+- [ ] **cat/getid per-blob allocations inside loop** — `cat_type_passthrough`
+  (cat.rs ~line 232) and `filter_by_id`/`filter_by_id_invert` (getid.rs
+  ~line 339, 446) allocate `Vec::new()` for decompress_buf,
+  `BlockBuilder::new()`, and `Vec::new()` for output_blocks INSIDE the
+  per-blob while loop. Should be hoisted before the loop — the Vecs
+  `.clear()` and BlockBuilder resets between iterations. Mechanical fix.
+
 - [ ] **Geocode pass 3 bucket merge** — 3 `Vec::new()` (`streets`, `addrs`,
   `interps`) per cell group inside `while` loop (`builder.rs` ~line 1341).
   ~20M cell groups at planet = ~60M Vec allocs, ~1.4 GB churn. Fix:

@@ -81,6 +81,7 @@ impl StreamingBlocks {
 /// When a non-matching block is encountered, it is stashed for the next phase.
 /// Returns `true` if elements were added to the buffer, `false` if the phase
 /// is exhausted (EOF or only non-matching blocks remain).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn fill_buffer<T>(
     source: &mut StreamingBlocks,
     buffer: &mut Vec<T>,

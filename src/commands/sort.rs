@@ -96,6 +96,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
          decompressed to scan element IDs (significantly slower).")?;
 
     // Pass 1: Build blob index
+    crate::debug::emit_marker("SORT_PASS1_START");
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(input, direct_io)?;
     super::warn_locations_on_ways_loss(&header);
@@ -113,7 +114,10 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
         eprintln!("  {overlap_count} blobs in overlap runs (decode + re-encode)");
     }
 
+    crate::debug::emit_marker("SORT_PASS1_END");
+
     // Pass 2: Write in sorted order
+    crate::debug::emit_marker("SORT_PASS2_START");
     eprintln!("Pass 2: writing sorted output...");
     #[allow(clippy::redundant_closure_for_method_calls)]
     let header_bytes = build_output_header(&header, false, overrides, |hb| hb.sorted())?;
@@ -182,6 +186,7 @@ pub fn sort(input: &Path, output: &Path, opts: &SortOptions, overrides: &HeaderO
     }
 
     writer.flush()?;
+    crate::debug::emit_marker("SORT_PASS2_END");
     Ok(stats)
 }
 
@@ -400,6 +405,7 @@ fn count_entry(entry: &BlobEntry, stats: &mut SortStats) {
 /// and flushes elements when their ID is guaranteed to be in final position
 /// (i.e. smaller than all future blobs' min_id). Memory is O(overlap_depth)
 /// rather than O(total_elements_in_run).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn write_overlap_run(
     entries: &[BlobEntry],
     input_file: &mut File,
@@ -423,6 +429,7 @@ fn write_overlap_run(
 // Sweep merge per element type
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_nodes(
     entries: &[BlobEntry],
     input_file: &mut File,
@@ -459,6 +466,7 @@ fn sweep_merge_nodes(
     flush_block(bb, writer)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_ways(
     entries: &[BlobEntry],
     input_file: &mut File,
@@ -493,6 +501,7 @@ fn sweep_merge_ways(
     flush_block(bb, writer)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_rels(
     entries: &[BlobEntry],
     input_file: &mut File,

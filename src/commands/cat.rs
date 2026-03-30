@@ -183,6 +183,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 /// ElemKind) are written as-is — zero decompression, zero re-encoding.
 /// Non-matching blobs are skipped. Blobs without indexdata fall back to full
 /// decode + re-encode.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<CatStats> {
     let tf = TypeFilter::parse(filter);
     let single_file = files.len() == 1;

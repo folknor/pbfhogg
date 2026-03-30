@@ -260,6 +260,7 @@ pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compressi
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id(
     input: &Path,
     output: &Path,
@@ -374,6 +375,7 @@ fn ids_intersect_range(ids: &BTreeSet<i64>, min_id: i64, max_id: i64) -> bool {
 /// Inverted filter (removeid): raw frame passthrough for blobs whose ID range
 /// has no intersection with the requested IDs. Only blobs that could contain
 /// matching elements are decoded and filtered.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn filter_by_id_invert(
     input: &Path,
     output: &Path,

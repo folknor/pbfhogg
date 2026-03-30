@@ -422,7 +422,11 @@ pub(crate) fn ensure_relation_capacity_local(
 /// Each entry in `schedule` is `(seq, data_offset, data_size)`. Workers pread
 /// the compressed blob data, decompress, build a `PrimitiveBlock`, run the
 /// `classify` closure, and send the result. The consumer calls `merge` for
-/// each result. No reorder buffer — ID set merges are order-independent.
+/// each result.
+///
+/// **Note:** `merge` is called in arbitrary worker-completion order, not blob
+/// file order. All current callers use order-independent merge operations
+/// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
 pub(crate) fn parallel_classify_phase<R: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -455,7 +459,7 @@ pub(crate) fn parallel_classify_phase<R: Send>(
             let classify_ref = &classify;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
+                let worker_pool = crate::blob::DecompressPool::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -470,14 +474,10 @@ pub(crate) fn parallel_classify_phase<R: Send>(
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        let block = crate::block::PrimitiveBlock::from_vec(
-                            std::mem::take(&mut decompress_buf)
-                        )?;
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
                         let result = classify_ref(&block);
-                        if decompress_buf.capacity() == 0 {
-                            decompress_buf = Vec::new();
-                        }
                         Ok(result)
                     })();
                     if tx.send((s, r)).is_err() { break; }

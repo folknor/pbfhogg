@@ -720,6 +720,8 @@ struct BlobDesc {
     kind: Option<crate::blob_index::ElemKind>,
     /// Spatial bbox from indexdata (node blobs only, v2 format).
     bbox: Option<crate::BlobBbox>,
+    /// Element count from indexdata (for stats on raw passthrough blobs).
+    count: u64,
     /// True if this blob can be passed through raw (no decode/re-encode).
     /// Set by the schedule builder based on blob bbox containment.
     raw_passthrough: bool,
@@ -758,10 +760,11 @@ fn build_blob_schedule_with_passthrough(
         });
 
         let bbox = idx.as_ref().and_then(|i| i.bbox);
+        let count = idx.as_ref().map_or(0, |i| i.count);
 
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (data_offset - frame_offset) as usize + data_size;
-        schedule.push(BlobDesc { seq, frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, raw_passthrough });
+        schedule.push(BlobDesc { seq, frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, count, raw_passthrough });
         seq += 1;
     }
     Ok(schedule)
@@ -800,10 +803,10 @@ where
     // Split schedule: decode blobs go to workers, passthrough blobs handled by consumer.
     // Both are re-sequenced for the reorder buffer.
     let mut decode_items: Vec<(usize, u64, usize)> = Vec::new(); // (global_seq, data_offset, data_size)
-    let mut passthrough_items: Vec<(usize, u64, usize)> = Vec::new(); // (global_seq, frame_offset, frame_size)
+    let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new(); // (global_seq, frame_offset, frame_size, count)
     for (i, d) in schedule.iter().enumerate() {
         if d.raw_passthrough {
-            passthrough_items.push((i, d.frame_offset, d.frame_size));
+            passthrough_items.push((i, d.frame_offset, d.frame_size, d.count));
         } else {
             decode_items.push((i, d.offset, d.size));
         }
@@ -880,7 +883,7 @@ where
 
         enum ConsumerItem {
             Decoded(crate::error::Result<(Vec<OwnedBlock>, ExtractStats)>),
-            Passthrough(u64, usize), // (frame_offset, frame_size)
+            Passthrough(u64, usize, u64), // (frame_offset, frame_size, element_count)
         }
 
         let _total_blobs = schedule.len();
@@ -888,8 +891,8 @@ where
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
         // Pre-insert passthrough items into the reorder buffer.
-        for &(seq, frame_offset, frame_size) in &passthrough_items {
-            reorder.push(seq, ConsumerItem::Passthrough(frame_offset, frame_size));
+        for &(seq, frame_offset, frame_size, count) in &passthrough_items {
+            reorder.push(seq, ConsumerItem::Passthrough(frame_offset, frame_size, count));
         }
 
         // Drain worker results into the reorder buffer.
@@ -906,12 +909,13 @@ where
                             writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                         }
                     }
-                    ConsumerItem::Passthrough(frame_offset, frame_size) => {
+                    ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                         // Read raw frame directly and write without decode/re-encode.
                         frame_read_buf.resize(frame_size, 0);
                         shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                         writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
+                        stats.nodes_in_bbox += count;
                     }
                 }
             }
@@ -927,11 +931,12 @@ where
                         writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                     }
                 }
-                ConsumerItem::Passthrough(frame_offset, frame_size) => {
+                ConsumerItem::Passthrough(frame_offset, frame_size, count) => {
                     frame_read_buf.resize(frame_size, 0);
                     shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
                         .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                     writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
+                    stats.nodes_in_bbox += count;
                 }
             }
         }
@@ -1243,6 +1248,12 @@ fn extract_simple_single_pass(
             }
         })
         .collect();
+    // Non-indexed blobs (kind == None) are included in all three schedules
+    // because we can't determine their type without decompressing. Each phase's
+    // classify closure only processes its matching element type, so elements of
+    // other types are silently skipped. This means non-indexed blobs are
+    // decompressed up to 3 times — acceptable since indexed PBFs (production
+    // path) always have kind set and this path is only reachable via --force.
     let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
         .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Way) | None))
         .collect();
@@ -1366,7 +1377,7 @@ fn extract_simple_single_pass(
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
     let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1467,7 +1478,7 @@ fn extract_simple_single_pass(
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
     let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1514,7 +1525,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
     crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
     let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
         .collect();
     {
         let ids = ExtractPass2IdSets {

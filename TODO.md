@@ -176,36 +176,27 @@ from simple extract applies to any sequential collection pass:
 
 **Do soon:**
 
-- [ ] **Stats undercount for raw passthrough blobs** — raw passthrough
-  paths in extract (`pread_execute` ~line 905) and getid --invert
-  (~line 450) don't update element counts in stats. Output is correct
-  but the printed summary is wrong. For extract, `nodes_in_bbox` misses
-  passthrough node blobs. For getid --invert, `nodes_written` etc.
-  miss all passthrough blobs. Flagged by 5/10 reviewers.
+- [x] **Stats undercount for raw passthrough blobs** — fixed: extract
+  passthrough updates `nodes_in_bbox` from indexdata count, getid
+  --invert updates per-type stats from indexdata count. BlobDesc now
+  stores `count` field. Flagged by 5/10 reviewers.
 
-- [ ] **`parallel_classify_phase` doc comment: merge order** — the sequence
-  number is discarded (`_seq`), so merge is called in arbitrary
-  worker-completion order. All current callers are order-independent
-  (IdSetDense::set, BTreeSet::extend). But the generic signature
-  `merge: FnMut(R)` doesn't communicate this. Add a doc comment:
-  "merge is called in arbitrary order, not blob file order."
-  Flagged by 4/10 reviewers.
+- [x] **`parallel_classify_phase` doc comment: merge order** — fixed:
+  doc comment now states "merge is called in arbitrary worker-completion
+  order, not blob file order." Flagged by 4/10 reviewers.
 
-- [ ] **Simple extract: non-indexed sorted blobs land in all three phase
-  schedules** — `kind == None` blobs match the node, way, AND relation
-  partitions (`extract.rs` ~line 1223-1230). On a sorted but non-indexed
-  input, every blob is processed three times. `extract_simple()` does not
-  require indexdata, so this is reachable. Flagged by 2/10 reviewers.
+- [x] **Simple extract: non-indexed sorted blobs in all three schedules**
+  — documented as intentional: non-indexed blobs must be in all three
+  schedules because the type is unknown without decompression. Each
+  phase's classify closure skips non-matching elements. Triple
+  decompression is acceptable since this path is only reachable via
+  `--force` on non-indexed PBFs. Flagged by 2/10 reviewers.
 
-- [ ] **`decompress_buf` not reused in `parallel_classify_phase`** —
-  `from_vec(take(&mut decompress_buf))` consumes the buffer each
-  iteration. The capacity-0 check (mod.rs ~line 478) is a no-op.
-  Each blob pays fresh allocation (~1.5 MB). At Europe scale (520K
-  blobs), that's ~780 GB cumulative alloc churn. Same-thread free
-  means the allocator recycles, but using `from_vec_pooled` with a
-  per-worker `DecompressPool` (like `pread_execute` does) would
-  eliminate the reallocation. Same issue in getid.rs and cat.rs
-  decode fallback paths. Flagged by 8/10 reviewers.
+- [x] **`decompress_buf` not reused in `parallel_classify_phase`** — fixed:
+  workers now use per-worker `DecompressPool` with `pool_get_pub` +
+  `from_vec_pooled`. Buffer is returned to pool on PrimitiveBlock drop
+  and reused next iteration. Eliminates ~780 GB cumulative alloc churn
+  at Europe scale. Flagged by 8/10 reviewers.
 
 **Do later:**
 

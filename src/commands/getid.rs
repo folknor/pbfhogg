@@ -449,6 +449,11 @@ fn filter_by_id_invert(
                     };
                     if !has_match {
                         // No matching IDs in range: all elements are kept, raw passthrough.
+                        match idx.kind {
+                            crate::blob_index::ElemKind::Node => stats.nodes_written += idx.count,
+                            crate::blob_index::ElemKind::Way => stats.ways_written += idx.count,
+                            crate::blob_index::ElemKind::Relation => stats.relations_written += idx.count,
+                        }
                         writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                         blobs_passthrough += 1;
                         continue;

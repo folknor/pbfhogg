@@ -410,6 +410,61 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
   stable), `bump-scope` (v2.2, scoped sub-allocations), or hand-rolled
   50-line bump allocator.
 
+**Scratch buffer reuse audit (step 1 of arena research):**
+
+`parse_and_inline` scratch is done (829 MB → 48 MB, -94%). The following
+per-iteration allocations remain across the codebase, ordered by impact:
+
+- [ ] **`write_single_node/way/relation` in elements_pbf.rs** — per-element
+  `tags.iter().collect::<Vec>()`, `refs.iter().collect::<Vec>()`,
+  `members.iter().collect::<Vec>()`. Called from sort (sweep merge) and
+  merge_pbf (k-way merge). Planet: ~10B elements. Largest remaining
+  alloc churn source. Fix: accept `&mut Vec` scratch params, clear+reuse.
+  Callers in sort.rs and merge_pbf.rs hoist to loop-local.
+
+- [ ] **Pipelined reader `from_vec_pooled`** — rayon-spawned decode closures
+  in `pipeline.rs:185` still use non-scratch `from_vec_pooled`. Planet:
+  ~520K blobs × ~8 KB = ~4 GB churn. Fix: `thread_local!` storage for
+  scratch Vecs, or pass scratch through the pipeline's decode closure.
+
+- [ ] **Remaining `PrimitiveBlock::new()` call sites** — `new_with_scratch`
+  exists but these callers still use non-scratch `new()`:
+  - `check_refs.rs:164` — per-blob sequential loop
+  - `add_locations_to_ways.rs:960` — per-blob relation scan
+  - `stream_merge.rs:52` — per-blob, used by diff and derive_changes
+  - `geocode_index/builder.rs:418` — per-blob geocode pass 2
+  - `cat.rs:234` — per-blob type-filtered cat fallback
+  - `getid.rs:341,447` — per-blob getid workers
+  - `extract.rs` sequential paths (unsorted, multi-extract write phases)
+  Fix: declare `st_scratch`/`gr_scratch` outside loop, call
+  `new_with_scratch`. Mechanical.
+
+- [ ] **Geocode pass 3 bucket merge** — 3 `Vec::new()` (`streets`, `addrs`,
+  `interps`) per cell group inside `while` loop (`builder.rs` ~line 1341).
+  ~20M cell groups at planet = ~60M Vec allocs, ~1.4 GB churn. Fix:
+  declare before loop, `.clear()` each iteration.
+
+- [ ] **Merge per-element Vecs** — `write_osc_way()`, `write_osc_relation()`,
+  and inline code in `rewrite_block_parallel()` (`merge.rs`) allocate
+  `tags.collect::<Vec>()`, `refs.collect::<Vec>()` per modified element.
+  ~645K changes in a daily diff. Fix: scratch buffers. Lower priority
+  than sort/merge_pbf since element count is small.
+
+- [ ] **`scan_block_ids` / `scan_block_tags`** — per-blob `Vec::<&[u8]>::new()`
+  for groups (`blob_index.rs` ~line 321, 711). `scan_block_tags` also
+  allocates `HashSet<u32>`. ~520K blobs, small Vecs (~24-48 bytes).
+  ~50-100 MB churn. Fix: accept `&mut Vec` scratch. Writer path runs in
+  `rayon::spawn` — needs thread_local.
+
+- [ ] **`extract_node_tuples` / `scan_way_refs` group_starts** — per-blob
+  `Vec::<(usize, usize)>::new()` (`node_scanner.rs:57`, `way_scanner.rs:33`).
+  Tiny (1-3 entries, ~25 MB at planet). Fix: scratch parameter. Low priority.
+
+- [ ] **Geocode pass 3 stage A par_iter** — per-way `Vec::new()` inside
+  `flat_map_iter` closure (`builder.rs` ~line 1226). Hard to fix due to
+  parallel iterator ownership semantics. `SmallVec` could avoid heap
+  allocation for ways with few segments. Low priority.
+
 - [ ] **2. Columnar batch processing** — 2/6 reviewers ranked 1st, all
   ranked top 2. Decode PrimitiveBlock fields into contiguous arrays (all
   IDs, then all lats, then all lons) instead of element-by-element. Cuts

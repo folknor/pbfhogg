@@ -217,25 +217,25 @@ fn merge_multi_block_partial_rewrite() {
         let mut bb = BlockBuilder::new();
 
         // Block 1: nodes 1-3
-        bb.add_node(1, 100_000_000, 100_000_000, &[("block", "1")], None);
-        bb.add_node(2, 200_000_000, 200_000_000, &[], None);
-        bb.add_node(3, 300_000_000, 300_000_000, &[], None);
+        bb.add_node(1, 100_000_000, 100_000_000, [("block", "1")], None);
+        bb.add_node(2, 200_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(3, 300_000_000, 300_000_000, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 2: nodes 10-12 (these will be affected by the diff)
-        bb.add_node(10, 100_000_000, 100_000_000, &[("name", "old")], None);
-        bb.add_node(11, 110_000_000, 110_000_000, &[], None);
-        bb.add_node(12, 120_000_000, 120_000_000, &[], None);
+        bb.add_node(10, 100_000_000, 100_000_000, [("name", "old")], None);
+        bb.add_node(11, 110_000_000, 110_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(12, 120_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 3: nodes 20-22 (past max affected ID, should skip-decompress)
-        bb.add_node(20, 200_000_000, 200_000_000, &[("block", "3")], None);
-        bb.add_node(21, 210_000_000, 210_000_000, &[], None);
-        bb.add_node(22, 220_000_000, 220_000_000, &[], None);
+        bb.add_node(20, 200_000_000, 200_000_000, [("block", "3")], None);
+        bb.add_node(21, 210_000_000, 210_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(22, 220_000_000, 220_000_000, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
@@ -537,22 +537,22 @@ fn merge_delete_entire_block() {
         let mut bb = BlockBuilder::new();
 
         // Block 1: nodes 1-3 (will be entirely deleted)
-        bb.add_node(1, 100_000_000, 100_000_000, &[], None);
-        bb.add_node(2, 200_000_000, 200_000_000, &[], None);
-        bb.add_node(3, 300_000_000, 300_000_000, &[], None);
+        bb.add_node(1, 100_000_000, 100_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(2, 200_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
+        bb.add_node(3, 300_000_000, 300_000_000, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 2: nodes 10-11 (survive)
-        bb.add_node(10, 100_000_000, 100_000_000, &[("survivor", "yes")], None);
-        bb.add_node(11, 110_000_000, 110_000_000, &[], None);
+        bb.add_node(10, 100_000_000, 100_000_000, [("survivor", "yes")], None);
+        bb.add_node(11, 110_000_000, 110_000_000, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
 
         // Block 3: ways (survive)
-        bb.add_way(100, &[("highway", "path")], &[10, 11], None);
+        bb.add_way(100, [("highway", "path")], &[10, 11], None);
         writer
             .write_primitive_block(bb.take().expect("take").expect("bytes"))
             .expect("write");
@@ -659,7 +659,7 @@ fn merge_metadata_preservation() {
 
         bb.add_node(
             1, 100_000_000, 200_000_000,
-            &[("name", "one")],
+            [("name", "one")],
             Some(&block_builder::Metadata {
                 version: 5,
                 timestamp: 1_700_000_000,
@@ -671,7 +671,7 @@ fn merge_metadata_preservation() {
         );
         bb.add_node(
             2, 300_000_000, 400_000_000,
-            &[("name", "two")],
+            [("name", "two")],
             Some(&block_builder::Metadata {
                 version: 3,
                 timestamp: 1_600_000_000,
@@ -683,7 +683,7 @@ fn merge_metadata_preservation() {
         );
         bb.add_node(
             3, 500_000_000, 600_000_000,
-            &[("name", "three")],
+            [("name", "three")],
             Some(&block_builder::Metadata {
                 version: 1,
                 timestamp: 1_500_000_000,
@@ -915,7 +915,7 @@ fn write_test_pbf_with_locations(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -930,7 +930,7 @@ fn write_test_pbf_with_locations(
             writer.write_primitive_block(bytes).expect("write block");
         }
         let tag_refs: Vec<(&str, &str)> = tags.iter().map(|&(k, v)| (k, v)).collect();
-        bb.add_way_with_locations(id, &tag_refs, refs, locations, None);
+        bb.add_way_with_locations(id, tag_refs.iter().copied(), refs, locations, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -949,7 +949,7 @@ fn write_test_pbf_with_locations(
             .iter()
             .map(|m| block_builder::MemberData { id: m.id, role: m.role })
             .collect();
-        bb.add_relation(r.id, &r.tags, &members, None);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")

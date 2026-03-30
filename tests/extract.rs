@@ -516,7 +516,7 @@ fn write_multi_blob_pbf(path: &std::path::Path) {
 
     // Blob 1: Copenhagen area (lat ~55.7, lon ~12.5)
     for i in 1..=10_i64 {
-        bb.add_node(i, 557_000_000 + i as i32 * 1000, 125_000_000 + i as i32 * 1000, &[], None);
+        bb.add_node(i, 557_000_000 + i as i32 * 1000, 125_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -524,7 +524,7 @@ fn write_multi_blob_pbf(path: &std::path::Path) {
 
     // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) — far from Copenhagen
     for i in 11..=20_i64 {
-        bb.add_node(i, 593_000_000 + i as i32 * 1000, 180_000_000 + i as i32 * 1000, &[], None);
+        bb.add_node(i, 593_000_000 + i as i32 * 1000, 180_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -532,7 +532,7 @@ fn write_multi_blob_pbf(path: &std::path::Path) {
 
     // Blob 3: Berlin area (lat ~52.5, lon ~13.4) — far from Copenhagen
     for i in 21..=30_i64 {
-        bb.add_node(i, 525_000_000 + i as i32 * 1000, 134_000_000 + i as i32 * 1000, &[], None);
+        bb.add_node(i, 525_000_000 + i as i32 * 1000, 134_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");

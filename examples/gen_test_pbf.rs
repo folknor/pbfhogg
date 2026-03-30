@@ -26,9 +26,9 @@ fn main() {
         user: "test",
         visible: true,
     };
-    bb.add_node(1, 556_000_000, 125_600_000, &[("name", "Test Node")], Some(&meta));
-    bb.add_node(2, 556_001_000, 125_601_000, &[], Some(&meta));
-    bb.add_node(3, 556_002_000, 125_602_000, &[], Some(&meta));
+    bb.add_node(1, 556_000_000, 125_600_000, [("name", "Test Node")], Some(&meta));
+    bb.add_node(2, 556_001_000, 125_601_000, std::iter::empty::<(&str, &str)>(), Some(&meta));
+    bb.add_node(3, 556_002_000, 125_602_000, std::iter::empty::<(&str, &str)>(), Some(&meta));
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write nodes");
     }
@@ -37,7 +37,7 @@ fn main() {
     let mut bb = BlockBuilder::new();
     bb.add_way(
         1,
-        &[("building", "yes")],
+        [("building", "yes")],
         &[1, 2, 3],
         Some(&Metadata {
             version: 1,
@@ -56,7 +56,7 @@ fn main() {
     let mut bb = BlockBuilder::new();
     bb.add_relation(
         1,
-        &[("type", "multipolygon")],
+        [("type", "multipolygon")],
         &[MemberData {
             id: MemberId::Way(1),
             role: "outer",

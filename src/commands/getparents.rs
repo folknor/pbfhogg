@@ -91,7 +91,6 @@ fn process_block(
     let mut ways: u64 = 0;
     let mut relations: u64 = 0;
 
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -101,20 +100,16 @@ fn process_block(
                 // Nodes are never parents. Include only if --add-self and ID matches.
                 if add_self && ids.node_ids.contains(&dn.id()) {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                     nodes += 1;
                 }
             }
             Element::Node(n) => {
                 if add_self && ids.node_ids.contains(&n.id()) {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
                     nodes += 1;
                 }
             }
@@ -124,12 +119,10 @@ fn process_block(
                 let is_self = add_self && ids.way_ids.contains(&w.id());
                 if is_parent || is_self {
                     ensure_way_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
-                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                     ways += 1;
                 }
             }
@@ -144,15 +137,13 @@ fn process_block(
                 let is_self = add_self && ids.relation_ids.contains(&r.id());
                 if is_parent || is_self {
                     ensure_relation_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
                         role: m.role().unwrap_or(""),
                     }));
                     let meta = element_metadata(&r.info());
-                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                     relations += 1;
                 }
             }

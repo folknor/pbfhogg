@@ -1075,7 +1075,6 @@ fn assemble_block(
         blobs_decoded: 0,
     };
 
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -1088,10 +1087,8 @@ fn assemble_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -1105,10 +1102,8 @@ fn assemble_block(
                     || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
                 {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
                     stats.nodes_written += 1;
                 } else {
                     stats.nodes_dropped += 1;
@@ -1116,8 +1111,6 @@ fn assemble_block(
             }
             Element::Way(w) => {
                 ensure_way_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(w.tags());
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
@@ -1132,20 +1125,18 @@ fn assemble_block(
                     way_slot_pos += 1;
                 }
                 let meta = element_metadata(&w.info());
-                bb.add_way_with_locations(w.id(), &tags_buf, refs_buf, locations_buf, meta.as_ref());
+                bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
                 stats.ways_written += 1;
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(r.tags());
                 members_buf.clear();
                 members_buf.extend(r.members().map(|m| MemberData {
                     id: m.id,
                     role: m.role().unwrap_or(""),
                 }));
                 let meta = element_metadata(&r.info());
-                bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
             }
         }

@@ -97,8 +97,7 @@ impl IdSetDense {
     }
 
     /// Count how many IDs in the range [min_id, max_id] are set.
-    /// Uses popcount over the byte range spanning the ID interval.
-    #[allow(clippy::cast_sign_loss)]
+    #[allow(clippy::cast_sign_loss, clippy::too_many_lines)]
     pub fn count_in_range(&self, min_id: i64, max_id: i64) -> u64 {
         if min_id > max_id {
             return 0;

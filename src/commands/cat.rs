@@ -285,7 +285,6 @@ fn process_block(
 
     // Reusable buffers — same hoisting strategy as the old sequential path.
     // Grow to max element size in the block then stabilize.
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -293,53 +292,45 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(dn.tags());
                 let meta = clean_metadata(dense_node_metadata(dn), clean);
                 bb.add_node(
                     dn.id(),
                     dn.decimicro_lat(),
                     dn.decimicro_lon(),
-                    &tags_buf,
+                    dn.tags(),
                     meta.as_ref(),
                 );
                 count += 1;
             }
             Element::Node(n) if filter_node => {
                 ensure_node_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(n.tags());
                 let meta = clean_metadata(element_metadata(&n.info()), clean);
                 bb.add_node(
                     n.id(),
                     n.decimicro_lat(),
                     n.decimicro_lon(),
-                    &tags_buf,
+                    n.tags(),
                     meta.as_ref(),
                 );
                 count += 1;
             }
             Element::Way(w) if filter_way => {
                 ensure_way_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(w.tags());
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = clean_metadata(element_metadata(&w.info()), clean);
-                bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                 count += 1;
             }
             Element::Relation(r) if filter_relation => {
                 ensure_relation_capacity_local(bb, output)?;
-                tags_buf.clear();
-                tags_buf.extend(r.tags());
                 members_buf.clear();
                 members_buf.extend(r.members().map(|m| MemberData {
                     id: m.id,
                     role: m.role().unwrap_or(""),
                 }));
                 let meta = clean_metadata(element_metadata(&r.info()), clean);
-                bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 count += 1;
             }
             _ => {}

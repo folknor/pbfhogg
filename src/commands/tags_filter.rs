@@ -228,13 +228,8 @@ fn filter_block_parallel(
                 if element_matches(expressions, &tags_buf, true, false, false) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(
-                        dn.id(),
-                        dn.decimicro_lat(),
-                        dn.decimicro_lon(),
-                        &tags_buf,
-                        meta.as_ref(),
-                    );
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(),
+                        tags_buf.iter().copied(), meta.as_ref());
                     stats.nodes_matched += 1;
                 }
             }
@@ -244,13 +239,8 @@ fn filter_block_parallel(
                 if element_matches(expressions, &tags_buf, true, false, false) != invert {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
-                    bb.add_node(
-                        n.id(),
-                        n.decimicro_lat(),
-                        n.decimicro_lon(),
-                        &tags_buf,
-                        meta.as_ref(),
-                    );
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(),
+                        tags_buf.iter().copied(), meta.as_ref());
                     stats.nodes_matched += 1;
                 }
             }
@@ -262,7 +252,7 @@ fn filter_block_parallel(
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
-                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     stats.ways_matched += 1;
                 }
             }
@@ -277,7 +267,7 @@ fn filter_block_parallel(
                         role: m.role().unwrap_or(""),
                     }));
                     let meta = element_metadata(&r.info());
-                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(r.id(), tags_buf.iter().copied(), &members_buf, meta.as_ref());
                     stats.relations_matched += 1;
                 }
             }
@@ -375,6 +365,7 @@ struct Pass2IdSets<'a> {
 }
 
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
+#[allow(clippy::too_many_lines)]
 fn filter_block_pass2(
     block: &PrimitiveBlock,
     ids: &Pass2IdSets<'_>,
@@ -408,7 +399,8 @@ fn filter_block_pass2(
                         tags_buf.extend(dn.tags());
                     }
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(),
+                        tags_buf.iter().copied(), meta.as_ref());
                     if direct {
                         stats.nodes_matched += 1;
                     } else if from_way {
@@ -429,7 +421,8 @@ fn filter_block_pass2(
                         tags_buf.extend(n.tags());
                     }
                     let meta = element_metadata(&n.info());
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(),
+                        tags_buf.iter().copied(), meta.as_ref());
                     if direct {
                         stats.nodes_matched += 1;
                     } else if from_way {
@@ -450,7 +443,7 @@ fn filter_block_pass2(
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
-                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), tags_buf.iter().copied(), &refs_buf, meta.as_ref());
                     if direct {
                         stats.ways_matched += 1;
                     } else {
@@ -472,7 +465,7 @@ fn filter_block_pass2(
                         role: m.role().unwrap_or(""),
                     }));
                     let meta = element_metadata(&r.info());
-                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(r.id(), tags_buf.iter().copied(), &members_buf, meta.as_ref());
                     if direct {
                         stats.relations_matched += 1;
                     } else {
@@ -483,40 +476,6 @@ fn filter_block_pass2(
         }
     }
     Ok(stats)
-}
-
-/// Process a batch of blocks in parallel for Pass 2 of two-pass tag filtering.
-fn process_pass2_batch(
-    batch: &[PrimitiveBlock],
-    ids: &Pass2IdSets<'_>,
-    remove_tags: bool,
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    stats: &mut TagsFilterStats,
-) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, TagsFilterStats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = filter_block_pass2(block, ids, remove_tags, bb, &mut output)?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-        )
-        .collect();
-
-    drain_batch_results(results, writer, |s| {
-        stats.nodes_matched += s.nodes_matched;
-        stats.nodes_from_ways += s.nodes_from_ways;
-        stats.nodes_from_relations += s.nodes_from_relations;
-        stats.ways_matched += s.ways_matched;
-        stats.ways_from_relations += s.ways_from_relations;
-        stats.relations_matched += s.relations_matched;
-        stats.relations_from_relations += s.relations_from_relations;
-    })?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

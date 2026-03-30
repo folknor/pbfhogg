@@ -27,7 +27,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 
     // Blob 1: odd node IDs
     for id in (1..=9).step_by(2) {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
+        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -35,15 +35,15 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
 
     // Blob 2: even node IDs (overlapping range with blob 1)
     for id in (2..=10).step_by(2) {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
+        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Ways (already sorted)
-    bb.add_way(100, &[("highway", "residential")], &[1, 2, 3], None);
-    bb.add_way(200, &[("highway", "primary")], &[4, 5, 6], None);
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
@@ -51,7 +51,7 @@ fn write_unsorted_overlapping_pbf(path: &Path) {
     // Relation
     bb.add_relation(
         300,
-        &[("type", "route")],
+        [("type", "route")],
         &[pbfhogg::block_builder::MemberData { id: pbfhogg::MemberId::Way(100), role: "outer" }],
         None,
     );
@@ -75,15 +75,15 @@ fn write_type_unsorted_pbf(path: &Path) {
     let mut bb = BlockBuilder::new();
 
     // Ways first (wrong order — should come after nodes)
-    bb.add_way(100, &[("highway", "residential")], &[1, 2, 3], None);
-    bb.add_way(200, &[("highway", "primary")], &[4, 5, 6], None);
+    bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
+    bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
     // Then nodes
     for id in 1..=6 {
-        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, &[], None);
+        bb.add_node(id, id as i32 * 1_000_000, id as i32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
     }
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -92,7 +92,7 @@ fn write_type_unsorted_pbf(path: &Path) {
     // Then relations
     bb.add_relation(
         300,
-        &[("type", "route")],
+        [("type", "route")],
         &[pbfhogg::block_builder::MemberData { id: pbfhogg::MemberId::Way(100), role: "outer" }],
         None,
     );
@@ -316,7 +316,7 @@ fn sort_many_overlapping_blobs() {
     for blob_idx in 1..=10_i64 {
         for step in 0..10_i64 {
             let id = blob_idx + step * 10;
-            bb.add_node(id, id as i32 * 100_000, id as i32 * 200_000, &[], None);
+            bb.add_node(id, id as i32 * 100_000, id as i32 * 200_000, std::iter::empty::<(&str, &str)>(), None);
         }
         if let Some(bytes) = bb.take().expect("take") {
             writer.write_primitive_block(bytes).expect("write block");
@@ -368,7 +368,7 @@ fn sort_preserves_historical_information_feature() {
         2,
         20_000_000,
         20_000_000,
-        &[],
+        std::iter::empty::<(&str, &str)>(),
         Some(&Metadata {
             version: 2,
             timestamp: 1_700_000_000,
@@ -382,7 +382,7 @@ fn sort_preserves_historical_information_feature() {
         1,
         10_000_000,
         10_000_000,
-        &[],
+        std::iter::empty::<(&str, &str)>(),
         Some(&Metadata {
             version: 1,
             timestamp: 1_700_000_001,

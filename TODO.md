@@ -327,6 +327,15 @@ ways → relations) with per-region IdSetDense + BlockBuilder. Memory:
 N × ~1.5 GB at planet scale. Falls back to sequential for unsorted
 input or --clean. Verified via `brokkr verify multi-extract`.
 
+**Known issues:**
+
+- [ ] **strip-4 verify failure** — `brokkr verify multi-extract --regions 5`
+  on Denmark: strip-4 has 1 fewer node than sequential (41643 vs 41644).
+  Passes with 3 and 4 regions. Only fails with 5 regions where strip
+  boundaries fall at exact integer longitudes (8,9,10,11,12,13). Likely
+  a floating-point rounding issue in brokkr's bbox strip generation,
+  not a pbfhogg bug. Pre-existing since multi-extract shipped.
+
 **v2 improvements:**
 
 - [ ] **Parallel decode** — convert sequential BlobReader to
@@ -415,51 +424,43 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 `parse_and_inline` scratch is done (829 MB → 48 MB, -94%). The following
 per-iteration allocations remain across the codebase, ordered by impact:
 
-- [ ] **`write_single_node/way/relation` in elements_pbf.rs** — per-element
-  `tags.iter().collect::<Vec>()`, `refs.iter().collect::<Vec>()`,
-  `members.iter().collect::<Vec>()`. Called from sort (sweep merge) and
-  merge_pbf (k-way merge). Planet: ~10B elements. Largest remaining
-  alloc churn source. Scratch `Vec<(&str, &str)>` reuse across calls
-  fails due to lifetime mismatch — the `&str` refs borrow from different
-  `OwnedNode`/`OwnedWay` per iteration. Fix options: (a) change
-  `add_node`/`add_way`/`add_relation` in BlockBuilder to accept
-  iterators instead of slices, (b) use `SmallVec<[(&str, &str); 16]>`
-  to avoid heap for typical tag counts (<16).
+- [x] **`write_single_node/way/relation` tag Vec** — DONE. Iterator-based
+  BlockBuilder API (commit `bb15e66`) eliminates the per-element
+  `tags.collect::<Vec>()`. Callers pass `element.tags()` directly.
+  Dual-buffer single-pass encoding for way/relation tag fields.
+  See [notes/blockbuilder-iterator-api.md](notes/blockbuilder-iterator-api.md).
+
+- [ ] **`fill_buffer` owned element allocation (sort/merge sweep)** —
+  `read_dense_node`/`read_way`/`read_relation` in `elements_pbf.rs`
+  copy tags into `OwnedNode.tags: Vec<(String, String)>`. Measured:
+  `fill_buffer` = 80.7 GB cumulative alloc on Japan for diff (commit
+  `bb15e66`). The iterator API eliminated the downstream Vec but the
+  upstream String allocation dominates. Fix requires eliminating owned
+  element construction in the sort/merge sweep — fundamentally different
+  architecture (e.g., direct wire-format merge without materializing
+  elements, or arena-backed owned elements).
 
 - [ ] **Pipelined reader `from_vec_pooled`** — rayon-spawned decode closures
   in `pipeline.rs:185` still use non-scratch `from_vec_pooled`. Planet:
   ~520K blobs × ~8 KB = ~4 GB churn. Fix: `thread_local!` storage for
   scratch Vecs, or pass scratch through the pipeline's decode closure.
 
-- [ ] **Remaining `PrimitiveBlock::new()` call sites** — `new_with_scratch`
-  exists but these callers still use non-scratch `new()`:
-  - `check_refs.rs:164` — per-blob sequential loop
-  - `add_locations_to_ways.rs:960` — per-blob relation scan
-  - `stream_merge.rs:52` — per-blob, used by diff and derive_changes
-  - `geocode_index/builder.rs:418` — per-blob geocode pass 2
-  - `cat.rs:234` — per-blob type-filtered cat fallback
-  - `getid.rs:341,447` — per-blob getid workers
-  - `extract.rs` sequential paths (unsorted, multi-extract write phases)
-  Fix: declare `st_scratch`/`gr_scratch` outside loop, call
+- [x] **Remaining `PrimitiveBlock::new()` call sites** — all converted
+  to `new_with_scratch` in commit `ea1ab6e`: check_refs, ALTW,
+  stream_merge, geocode pass 2, cat fallback, getid workers.
   `new_with_scratch`. Mechanical.
 
-- [ ] **cat/getid per-blob allocations inside loop** — `cat_type_passthrough`
-  (cat.rs ~line 232) and `filter_by_id`/`filter_by_id_invert` (getid.rs
-  ~line 339, 446) allocate `Vec::new()` for decompress_buf,
-  `BlockBuilder::new()`, and `Vec::new()` for output_blocks INSIDE the
-  per-blob while loop. Should be hoisted before the loop — the Vecs
-  `.clear()` and BlockBuilder resets between iterations. Mechanical fix.
+- [x] **cat/getid per-blob allocations inside loop** — hoisted
+  decompress_buf, BlockBuilder, and output_blocks outside the per-blob
+  loop in cat_type_passthrough and filter_by_id/filter_by_id_invert
+  (commit `ea1ab6e`).
 
-- [ ] **Geocode pass 3 bucket merge** — 3 `Vec::new()` (`streets`, `addrs`,
-  `interps`) per cell group inside `while` loop (`builder.rs` ~line 1341).
-  ~20M cell groups at planet = ~60M Vec allocs, ~1.4 GB churn. Fix:
-  declare before loop, `.clear()` each iteration.
+- [x] **Geocode pass 3 bucket merge** — hoisted 3 partition Vecs
+  (streets, addrs, interps) outside while loop (commit `ea1ab6e`).
 
-- [ ] **Merge per-element Vecs** — `write_osc_way()`, `write_osc_relation()`,
-  and inline code in `rewrite_block_parallel()` (`merge.rs`) allocate
-  `tags.collect::<Vec>()`, `refs.collect::<Vec>()` per modified element.
-  ~645K changes in a daily diff. Fix: scratch buffers. Lower priority
-  than sort/merge_pbf since element count is small.
+- [x] **Merge per-element tag Vecs** — all `osc.tags().collect()` in
+  merge.rs eliminated by iterator API change (commit `bb15e66`).
+  Callers pass `osc.tags()` directly.
 
 - [ ] **`scan_block_ids` / `scan_block_tags`** — per-blob `Vec::<&[u8]>::new()`
   for groups (`blob_index.rs` ~line 321, 711). `scan_block_tags` also

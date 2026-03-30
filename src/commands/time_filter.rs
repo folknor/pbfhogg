@@ -150,7 +150,7 @@ fn write_owned_element(
                 writer.write_primitive_block(bytes)?;
             }
             let meta = owned_to_metadata(n.metadata.as_ref());
-            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, &n.tags_as_pairs(), meta.as_ref());
+            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, n.tags_as_pairs(), meta.as_ref());
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
@@ -159,7 +159,7 @@ fn write_owned_element(
                 writer.write_primitive_block(bytes)?;
             }
             let meta = owned_to_metadata(w.metadata.as_ref());
-            bb.add_way(w.id, &w.tags_as_pairs(), &w.refs, meta.as_ref());
+            bb.add_way(w.id, w.tags_as_pairs(), &w.refs, meta.as_ref());
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
@@ -169,7 +169,7 @@ fn write_owned_element(
             }
             let meta = owned_to_metadata(r.metadata.as_ref());
             let members = r.members_as_data();
-            bb.add_relation(r.id, &r.tags_as_pairs(), &members, meta.as_ref());
+            bb.add_relation(r.id, r.tags_as_pairs(), &members, meta.as_ref());
         }
     }
     Ok(())

@@ -786,13 +786,10 @@ fn try_extract_multi_single_pass(
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
             let block = PrimitiveBlock::new(decompressed)?;
-            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
             for element in block.elements() {
                 match &element {
                     Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
                         let id = dn.id();
-                        tags_buf.clear();
-                        tags_buf.extend(dn.tags());
                         let meta = dense_node_metadata(dn);
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
@@ -801,15 +798,13 @@ fn try_extract_multi_single_pass(
                                         writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
                                     }
                                 }
-                                node_bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                                node_bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                                 stats[i].nodes_in_bbox += 1;
                             }
                         }
                     }
                     Element::Node(nd) if bbox_node_ids.iter().any(|s| s.get(nd.id())) => {
                         let id = nd.id();
-                        tags_buf.clear();
-                        tags_buf.extend(nd.tags());
                         let meta = element_metadata(&nd.info());
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
@@ -818,7 +813,7 @@ fn try_extract_multi_single_pass(
                                         writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
                                     }
                                 }
-                                node_bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), &tags_buf, meta.as_ref());
+                                node_bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), nd.tags(), meta.as_ref());
                                 stats[i].nodes_in_bbox += 1;
                             }
                         }
@@ -870,14 +865,11 @@ fn try_extract_multi_single_pass(
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
             let block = PrimitiveBlock::new(decompressed)?;
-            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
             let mut refs_buf: Vec<i64> = Vec::new();
             for element in block.elements() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
                     if !matched_way_ids.iter().any(|s| s.get(wid)) { continue; }
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
@@ -888,7 +880,7 @@ fn try_extract_multi_single_pass(
                                     writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
                                 }
                             }
-                            way_bbs[i].add_way(wid, &tags_buf, &refs_buf, meta.as_ref());
+                            way_bbs[i].add_way(wid, w.tags(), &refs_buf, meta.as_ref());
                             stats[i].ways_written += 1;
                         }
                     }
@@ -938,14 +930,11 @@ fn try_extract_multi_single_pass(
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
             let block = PrimitiveBlock::new(decompressed)?;
-            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
             let mut members_buf: Vec<MemberData<'_>> = Vec::new();
             for element in block.elements() {
                 if let Element::Relation(r) = &element {
                     let rid = r.id();
                     if !matched_relation_ids.iter().any(|s| s.get(rid)) { continue; }
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
@@ -959,7 +948,7 @@ fn try_extract_multi_single_pass(
                                     writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
                                 }
                             }
-                            rel_bbs[i].add_relation(rid, &tags_buf, &members_buf, meta.as_ref());
+                            rel_bbs[i].add_relation(rid, r.tags(), &members_buf, meta.as_ref());
                             stats[i].relations_written += 1;
                         }
                     }
@@ -2346,7 +2335,6 @@ fn extract_block_pass2(
         relations_written: 0,
         strategy: "",
     };
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -2357,10 +2345,8 @@ fn extract_block_pass2(
                 let from_way = ids.all_way_node_ids.get(dn.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
                     let meta = clean_metadata(dense_node_metadata(dn), clean);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -2373,10 +2359,8 @@ fn extract_block_pass2(
                 let from_way = ids.all_way_node_ids.get(n.id());
                 if in_bbox || from_way {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
                     let meta = clean_metadata(element_metadata(&n.info()), clean);
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else {
@@ -2387,27 +2371,23 @@ fn extract_block_pass2(
             Element::Way(w) => {
                 if ids.matched_way_ids.get(w.id()) {
                     ensure_way_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = clean_metadata(element_metadata(&w.info()), clean);
-                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
                 }
             }
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
                         role: m.role().unwrap_or(""),
                     }));
                     let meta = clean_metadata(element_metadata(&r.info()), clean);
-                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }
@@ -2583,7 +2563,6 @@ fn extract_block_pass3(
         relations_written: 0,
         strategy: "",
     };
-    let mut tags_buf: Vec<(&str, &str)> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -2596,10 +2575,8 @@ fn extract_block_pass3(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
                     let meta = clean_metadata(dense_node_metadata(dn), clean);
-                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -2616,10 +2593,8 @@ fn extract_block_pass3(
                 let from_rel = ids.extra_node_ids.get(id);
                 if in_bbox || from_way || from_rel {
                     ensure_node_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
                     let meta = clean_metadata(element_metadata(&n.info()), clean);
-                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
                     if in_bbox {
                         stats.nodes_in_bbox += 1;
                     } else if from_way {
@@ -2634,12 +2609,10 @@ fn extract_block_pass3(
                 let in_extra = ids.extra_way_ids.get(w.id());
                 if in_matched || in_extra {
                     ensure_way_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs());
                     let meta = clean_metadata(element_metadata(&w.info()), clean);
-                    bb.add_way(w.id(), &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
                     if in_extra && !in_matched {
                         stats.ways_from_relations += 1;
                     } else {
@@ -2650,15 +2623,13 @@ fn extract_block_pass3(
             Element::Relation(r) => {
                 if ids.matched_relation_ids.get(r.id()) {
                     ensure_relation_capacity_local(bb, output)?;
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| MemberData {
                         id: m.id,
                         role: m.role().unwrap_or(""),
                     }));
                     let meta = clean_metadata(element_metadata(&r.info()), clean);
-                    bb.add_relation(r.id(), &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }

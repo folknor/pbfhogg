@@ -33,7 +33,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             1001,
             556_789_000, // 55.6789°
             126_543_000, // 12.6543°
-            &[("name", "TestNode"), ("highway", "bus_stop")],
+            [("name", "TestNode"), ("highway", "bus_stop")],
             Some(&Metadata {
                 version: 3,
                 timestamp: 1_700_000_000,
@@ -49,7 +49,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             2002,
             570_000_000,
             100_000_000,
-            &[],
+            std::iter::empty::<(&str, &str)>(),
             Some(&Metadata {
                 version: 1,
                 timestamp: 1_600_000_000,
@@ -65,7 +65,7 @@ fn roundtrip_dense_nodes_with_metadata() {
             3003,
             -335_000_000,
             -580_000_000,
-            &[("natural", "tree")],
+            [("natural", "tree")],
             Some(&Metadata {
                 version: 2,
                 timestamp: 1_500_000_000,
@@ -182,8 +182,8 @@ fn roundtrip_dense_nodes_no_metadata() {
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
-        bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
-        bb.add_node(2, -100_000_000, -200_000_000, &[], None);
+        bb.add_node(1, 100_000_000, 200_000_000, [("k", "v")], None);
+        bb.add_node(2, -100_000_000, -200_000_000, std::iter::empty::<(&str, &str)>(), None);
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
@@ -235,7 +235,7 @@ fn roundtrip_ways() {
         let mut bb = BlockBuilder::new();
         bb.add_way(
             5001,
-            &[("highway", "residential"), ("name", "Main St")],
+            [("highway", "residential"), ("name", "Main St")],
             &[100, 200, 300, 400],
             Some(&Metadata {
                 version: 1,
@@ -248,7 +248,7 @@ fn roundtrip_ways() {
         );
         bb.add_way(
             5002,
-            &[("building", "yes")],
+            [("building", "yes")],
             &[500, 501, 502, 500], // closed way
             None,
         );
@@ -312,7 +312,7 @@ fn roundtrip_relations() {
         let mut bb = BlockBuilder::new();
         bb.add_relation(
             9001,
-            &[("type", "multipolygon"), ("natural", "water")],
+            [("type", "multipolygon"), ("natural", "water")],
             &[
                 MemberData {
                     id: MemberId::Way(100),
@@ -390,7 +390,7 @@ fn block_builder_flush_at_8000() {
 
     for i in 0..8000 {
         assert!(!bb.should_flush(), "should not flush at {i}");
-        bb.add_node(i as i64, 0, 0, &[], None);
+        bb.add_node(i as i64, 0, 0, std::iter::empty::<(&str, &str)>(), None);
     }
     assert!(bb.should_flush());
     assert!(!bb.can_add_node());
@@ -418,12 +418,12 @@ fn roundtrip_multi_block() {
 
         // Block 1: nodes
         let mut bb = BlockBuilder::new();
-        bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
+        bb.add_node(1, 100_000_000, 200_000_000, [("k", "v")], None);
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
 
         // Block 2: ways
-        bb.add_way(10, &[("highway", "path")], &[1, 2, 3], None);
+        bb.add_way(10, [("highway", "path")], &[1, 2, 3], None);
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
 
@@ -476,7 +476,7 @@ fn roundtrip_way_with_locations() {
         let mut bb = BlockBuilder::new();
         bb.add_way_with_locations(
             100,
-            &[("highway", "primary")],
+            [("highway", "primary")],
             &[1, 2, 3],
             &[(550_000_000, 120_000_000), (551_000_000, 121_000_000), (552_000_000, 122_000_000)],
             None,
@@ -542,7 +542,7 @@ fn roundtrip_uncompressed() {
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
-        bb.add_node(42, 123_456_789, -987_654_321, &[("foo", "bar")], None);
+        bb.add_node(42, 123_456_789, -987_654_321, [("foo", "bar")], None);
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
         writer.flush().unwrap();
@@ -592,12 +592,12 @@ fn roundtrip_direct_io() {
     };
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(1, 100_000_000, 200_000_000, &[("k", "v")], None);
-    bb.add_node(2, -100_000_000, -200_000_000, &[], None);
+    bb.add_node(1, 100_000_000, 200_000_000, [("k", "v")], None);
+    bb.add_node(2, -100_000_000, -200_000_000, std::iter::empty::<(&str, &str)>(), None);
     let bytes = bb.take().unwrap().unwrap();
     writer.write_primitive_block(bytes).unwrap();
 
-    bb.add_way(10, &[("highway", "path")], &[1, 2, 3], None);
+    bb.add_way(10, [("highway", "path")], &[1, 2, 3], None);
     let bytes = bb.take().unwrap().unwrap();
     writer.write_primitive_block(bytes).unwrap();
 
@@ -682,7 +682,7 @@ fn roundtrip_pipelined_direct_io() {
             let id = i * 100 + j + 1;
             #[allow(clippy::cast_possible_truncation)]
             let id32 = id as i32;
-            bb.add_node(id, id32 * 1_000_000, id32 * 2_000_000, &[], None);
+            bb.add_node(id, id32 * 1_000_000, id32 * 2_000_000, std::iter::empty::<(&str, &str)>(), None);
         }
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
@@ -728,13 +728,13 @@ fn roundtrip_zstd() {
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
-        bb.add_node(100, 556_789_000, 126_543_000, &[("name", "ZstdNode")], None);
-        bb.add_node(200, -335_000_000, -580_000_000, &[("natural", "tree")], None);
+        bb.add_node(100, 556_789_000, 126_543_000, [("name", "ZstdNode")], None);
+        bb.add_node(200, -335_000_000, -580_000_000, [("natural", "tree")], None);
         let bytes = bb.take().unwrap().unwrap();
         writer.write_primitive_block(bytes).unwrap();
 
         let mut bb2 = BlockBuilder::new();
-        bb2.add_way(300, &[("highway", "residential")], &[100, 200], None);
+        bb2.add_way(300, [("highway", "residential")], &[100, 200], None);
         let bytes2 = bb2.take().unwrap().unwrap();
         writer.write_primitive_block(bytes2).unwrap();
         writer.flush().unwrap();
@@ -785,8 +785,8 @@ fn roundtrip_zstd() {
 #[should_panic(expected = "cannot add way: block full or wrong type")]
 fn block_builder_mixed_type_panics() {
     let mut bb = BlockBuilder::new();
-    bb.add_node(1, 0, 0, &[], None);
-    bb.add_way(10, &[], &[1, 2], None); // should panic
+    bb.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], None); // should panic
 }
 
 /// Mixed metadata: some nodes have metadata, others don't (like merge OSC replacements).
@@ -804,7 +804,7 @@ fn roundtrip_mixed_metadata() {
         // Node 1: with metadata (like a base PBF node)
         bb.add_node(
             1, 100_000_000, 200_000_000,
-            &[("name", "base")],
+            [("name", "base")],
             Some(&Metadata {
                 version: 5,
                 timestamp: 1_700_000_000,
@@ -816,12 +816,12 @@ fn roundtrip_mixed_metadata() {
         );
 
         // Node 2: NO metadata (like an OSC replacement)
-        bb.add_node(2, 110_000_000, 210_000_000, &[("name", "osc")], None);
+        bb.add_node(2, 110_000_000, 210_000_000, [("name", "osc")], None);
 
         // Node 3: with metadata again (back to base)
         bb.add_node(
             3, 120_000_000, 220_000_000,
-            &[("name", "base2")],
+            [("name", "base2")],
             Some(&Metadata {
                 version: 2,
                 timestamp: 1_600_000_000,
@@ -902,15 +902,15 @@ fn roundtrip_backfill_metadata() {
         let mut bb = BlockBuilder::new();
 
         // Node 1: NO metadata
-        bb.add_node(1, 100_000_000, 200_000_000, &[], None);
+        bb.add_node(1, 100_000_000, 200_000_000, std::iter::empty::<(&str, &str)>(), None);
 
         // Node 2: NO metadata
-        bb.add_node(2, 110_000_000, 210_000_000, &[], None);
+        bb.add_node(2, 110_000_000, 210_000_000, std::iter::empty::<(&str, &str)>(), None);
 
         // Node 3: WITH metadata (triggers backfill of nodes 1 and 2)
         bb.add_node(
             3, 120_000_000, 220_000_000,
-            &[("name", "first_with_meta")],
+            [("name", "first_with_meta")],
             Some(&Metadata {
                 version: 1,
                 timestamp: 1_700_000_000,

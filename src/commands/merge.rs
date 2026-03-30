@@ -587,7 +587,6 @@ fn write_osc_way(
     stats: &mut MergeStats,
 ) -> Result<()> {
     ensure_way_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = way.tags().collect();
     let refs: Vec<i64> = way.refs().collect();
     if let Some(locs) = loc_map {
         let mut locations: Vec<(i32, i32)> = Vec::with_capacity(refs.len());
@@ -600,9 +599,9 @@ fn write_osc_way(
                 }
             }
         }
-        bb.add_way_with_locations(way.id(), &tags, &refs, &locations, None);
+        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);
     } else {
-        bb.add_way(way.id(), &tags, &refs, None);
+        bb.add_way(way.id(), way.tags(), &refs, None);
     }
     Ok(())
 }
@@ -613,7 +612,6 @@ fn write_osc_relation(
     rel: &crate::osc::CompactRelationRef<'_>,
 ) -> Result<()> {
     ensure_relation_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = rel.tags().collect();
     let members: Vec<MemberData<'_>> = rel
         .members()
         .map(|(mt, ref_id, role)| MemberData {
@@ -621,7 +619,7 @@ fn write_osc_relation(
             role,
         })
         .collect();
-    bb.add_relation(rel.id(), &tags, &members, None);
+    bb.add_relation(rel.id(), rel.tags(), &members, None);
     Ok(())
 }
 
@@ -729,7 +727,6 @@ fn write_osc_way_local(
     stats: &mut MergeStats,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
-    let tags: Vec<(&str, &str)> = way.tags().collect();
     let refs: Vec<i64> = way.refs().collect();
 
     if let Some(locs) = loc_map {
@@ -743,9 +740,9 @@ fn write_osc_way_local(
                 }
             }
         }
-        bb.add_way_with_locations(way.id(), &tags, &refs, &locations, None);
+        bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);
     } else {
-        bb.add_way(way.id(), &tags, &refs, None);
+        bb.add_way(way.id(), way.tags(), &refs, None);
     }
     Ok(())
 }
@@ -937,8 +934,7 @@ fn emit_create_local(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> = osc.tags().collect();
-                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
+                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
                 stats.diff_nodes += 1;
             }
         }
@@ -951,7 +947,6 @@ fn emit_create_local(
         ElemKind::Relation => {
             if let Some(osc) = diff.get_relation(id) {
                 ensure_relation_capacity_local(bb, output)?;
-                let tags: Vec<(&str, &str)> = osc.tags().collect();
                 let members: Vec<MemberData<'_>> = osc
                     .members()
                     .map(|(mt, ref_id, role)| MemberData {
@@ -959,7 +954,7 @@ fn emit_create_local(
                         role,
                     })
                     .collect();
-                bb.add_relation(osc.id(), &tags, &members, None);
+                bb.add_relation(osc.id(), osc.tags(), &members, None);
                 stats.diff_relations += 1;
             }
         }
@@ -1014,8 +1009,7 @@ fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> = osc.tags().collect();
-                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
+                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -1029,8 +1023,7 @@ fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_node(id) {
                     ensure_node_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> = osc.tags().collect();
-                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
+                    bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
 
                     stats.diff_nodes += 1;
                 } else {
@@ -1060,7 +1053,6 @@ fn rewrite_block_parallel(
                     stats.deleted += 1;
                 } else if let Some(osc) = diff.get_relation(id) {
                     ensure_relation_capacity_local(bb, &mut output)?;
-                    let tags: Vec<(&str, &str)> = osc.tags().collect();
                     let members: Vec<MemberData<'_>> = osc
                         .members()
                         .map(|(mt, ref_id, role)| MemberData {
@@ -1068,7 +1060,7 @@ fn rewrite_block_parallel(
                             role,
                         })
                         .collect();
-                    bb.add_relation(osc.id(), &tags, &members, None);
+                    bb.add_relation(osc.id(), osc.tags(), &members, None);
 
                     stats.diff_relations += 1;
                 } else {
@@ -1211,8 +1203,7 @@ fn emit_create_for_output(
         ElemKind::Node => {
             if let Some(osc) = diff.get_node(id) {
                 ensure_node_capacity(bb, writer)?;
-                let tags: Vec<(&str, &str)> = osc.tags().collect();
-                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), &tags, None);
+                bb.add_node(osc.id(), osc.decimicro_lat(), osc.decimicro_lon(), osc.tags(), None);
                 stats.diff_nodes += 1;
             }
         }

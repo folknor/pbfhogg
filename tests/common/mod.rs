@@ -95,7 +95,7 @@ pub fn write_test_pbf(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -110,7 +110,7 @@ pub fn write_test_pbf(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        bb.add_way(w.id, &w.tags, &w.refs, None);
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -133,7 +133,7 @@ pub fn write_test_pbf(
                 role: m.role,
             })
             .collect();
-        bb.add_relation(r.id, &r.tags, &members, None);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -169,7 +169,7 @@ pub fn write_test_pbf_sorted(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        bb.add_node(n.id, n.lat, n.lon, &n.tags, None);
+        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -184,7 +184,7 @@ pub fn write_test_pbf_sorted(
         {
             writer.write_primitive_block(bytes).expect("write block");
         }
-        bb.add_way(w.id, &w.tags, &w.refs, None);
+        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")
@@ -207,7 +207,7 @@ pub fn write_test_pbf_sorted(
                 role: m.role,
             })
             .collect();
-        bb.add_relation(r.id, &r.tags, &members, None);
+        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
     }
     if !bb.is_empty()
         && let Some(bytes) = bb.take().expect("take")

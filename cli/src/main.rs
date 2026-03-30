@@ -2315,8 +2315,7 @@ fn bench_write_loop<W: std::io::Write>(
                                 writer.write_primitive_block(bytes)?;
                             }
                         }
-                        let tags: Vec<_> = dn.tags().collect();
-                        bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), &tags, None);
+                        bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), None);
                         nodes += 1;
                     }
                     pbfhogg::Element::Node(n) => {
@@ -2325,8 +2324,7 @@ fn bench_write_loop<W: std::io::Write>(
                                 writer.write_primitive_block(bytes)?;
                             }
                         }
-                        let tags: Vec<_> = n.tags().collect();
-                        bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), &tags, None);
+                        bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), None);
                         nodes += 1;
                     }
                     pbfhogg::Element::Way(w) => {
@@ -2335,9 +2333,8 @@ fn bench_write_loop<W: std::io::Write>(
                                 writer.write_primitive_block(bytes)?;
                             }
                         }
-                        let tags: Vec<_> = w.tags().collect();
                         let refs: Vec<_> = w.refs().collect();
-                        bb.add_way(w.id(), &tags, &refs, None);
+                        bb.add_way(w.id(), w.tags(), &refs, None);
                         ways += 1;
                     }
                     pbfhogg::Element::Relation(r) => {
@@ -2346,7 +2343,6 @@ fn bench_write_loop<W: std::io::Write>(
                                 writer.write_primitive_block(bytes)?;
                             }
                         }
-                        let tags: Vec<_> = r.tags().collect();
                         let members: Vec<_> = r
                             .members()
                             .map(|m| MemberData {
@@ -2354,7 +2350,7 @@ fn bench_write_loop<W: std::io::Write>(
                                 role: m.role().ok().unwrap_or_default(),
                             })
                             .collect();
-                        bb.add_relation(r.id(), &tags, &members, None);
+                        bb.add_relation(r.id(), r.tags(), &members, None);
                         rels += 1;
                     }
                     _ => {}

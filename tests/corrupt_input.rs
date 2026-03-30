@@ -36,7 +36,7 @@ fn write_one_block_pbf() -> Vec<u8> {
         writer.write_header(&header).unwrap();
 
         let mut bb = BlockBuilder::new();
-        bb.add_node(1, 0, 0, &[], None);
+        bb.add_node(1, 0, 0, std::iter::empty::<(&str, &str)>(), None);
         writer
             .write_primitive_block(bb.take().unwrap().unwrap())
             .unwrap();

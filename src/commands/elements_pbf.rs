@@ -292,13 +292,12 @@ pub(crate) fn write_single_node(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     super::ensure_node_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = node
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
     let meta = owned_to_metadata(node.metadata.as_ref());
-    bb.add_node(node.id, node.decimicro_lat, node.decimicro_lon, &tags, meta.as_ref());
+    bb.add_node(
+        node.id, node.decimicro_lat, node.decimicro_lon,
+        node.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        meta.as_ref(),
+    );
     Ok(())
 }
 
@@ -308,13 +307,13 @@ pub(crate) fn write_single_way(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     super::ensure_way_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = way
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
     let meta = owned_to_metadata(way.metadata.as_ref());
-    bb.add_way(way.id, &tags, &way.refs, meta.as_ref());
+    bb.add_way(
+        way.id,
+        way.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &way.refs,
+        meta.as_ref(),
+    );
     Ok(())
 }
 
@@ -324,17 +323,17 @@ pub(crate) fn write_single_relation(
     writer: &mut PbfWriter<FileWriter>,
 ) -> Result<()> {
     super::ensure_relation_capacity(bb, writer)?;
-    let tags: Vec<(&str, &str)> = rel
-        .tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
     let members: Vec<MemberData<'_>> = rel
         .members
         .iter()
         .map(|m| MemberData { id: m.id, role: &m.role })
         .collect();
     let meta = owned_to_metadata(rel.metadata.as_ref());
-    bb.add_relation(rel.id, &tags, &members, meta.as_ref());
+    bb.add_relation(
+        rel.id,
+        rel.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())),
+        &members,
+        meta.as_ref(),
+    );
     Ok(())
 }

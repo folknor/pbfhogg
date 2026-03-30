@@ -80,7 +80,6 @@ pub fn renumber(
     let blocks = reader.into_blocks_pipelined();
     for block in blocks {
         let block = block?;
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
         let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
@@ -89,10 +88,8 @@ pub fn renumber(
                     let new_id = next_node_id;
                     next_node_id += 1;
                     node_map.insert(dn.id(), new_id);
-                    tags_buf.clear();
-                    tags_buf.extend(dn.tags());
                     let meta = dense_node_metadata(dn);
-                    bb.add_node(new_id, dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
                     stats.nodes_written += 1;
                 }
                 Element::Node(n) => {
@@ -100,10 +97,8 @@ pub fn renumber(
                     let new_id = next_node_id;
                     next_node_id += 1;
                     node_map.insert(n.id(), new_id);
-                    tags_buf.clear();
-                    tags_buf.extend(n.tags());
                     let meta = element_metadata(&n.info());
-                    bb.add_node(new_id, n.decimicro_lat(), n.decimicro_lon(), &tags_buf, meta.as_ref());
+                    bb.add_node(new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
                     stats.nodes_written += 1;
                 }
                 Element::Way(w) => {
@@ -111,12 +106,10 @@ pub fn renumber(
                     let new_id = next_way_id;
                     next_way_id += 1;
                     way_map.insert(w.id(), new_id);
-                    tags_buf.clear();
-                    tags_buf.extend(w.tags());
                     refs_buf.clear();
                     refs_buf.extend(w.refs().map(|r| node_map.get(&r).copied().unwrap_or(r)));
                     let meta = element_metadata(&w.info());
-                    bb.add_way(new_id, &tags_buf, &refs_buf, meta.as_ref());
+                    bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
                 }
                 Element::Relation(r) => {
@@ -124,8 +117,6 @@ pub fn renumber(
                     let new_id = next_relation_id;
                     next_relation_id += 1;
                     relation_map.insert(r.id(), new_id);
-                    tags_buf.clear();
-                    tags_buf.extend(r.tags());
                     members_buf.clear();
                     members_buf.extend(r.members().map(|m| {
                         let remapped_id = match m.id {
@@ -137,7 +128,7 @@ pub fn renumber(
                         MemberData { id: remapped_id, role: m.role().unwrap_or("") }
                     }));
                     let meta = element_metadata(&r.info());
-                    bb.add_relation(new_id, &tags_buf, &members_buf, meta.as_ref());
+                    bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
                     stats.relations_written += 1;
                 }
             }

@@ -272,6 +272,7 @@ pub struct BlockBuilder {
     group_buf: Vec<u8>,       // per-block: all serialized way/relation messages
     elem_scratch: Vec<u8>,    // per-element body (cleared each add_way/add_relation call)
     packed_scratch: Vec<u8>,      // per-field packed content (refs in location path)
+    packed_vals_scratch: Vec<u8>, // tag values packed encoding (dual-buffer single-pass)
     packed_lat_scratch: Vec<u8>,  // way location lat encoding (single-pass)
     packed_lon_scratch: Vec<u8>,  // way location lon encoding (single-pass)
     info_scratch: Vec<u8>,        // Info sub-message body
@@ -360,6 +361,7 @@ impl BlockBuilder {
             group_buf: Vec::new(),
             elem_scratch: Vec::new(),
             packed_scratch: Vec::new(),
+            packed_vals_scratch: Vec::new(),
             packed_lat_scratch: Vec::new(),
             packed_lon_scratch: Vec::new(),
             info_scratch: Vec::new(),
@@ -445,12 +447,12 @@ impl BlockBuilder {
     /// matching the default PBF granularity of 100.
     #[hotpath::measure]
     #[allow(clippy::cast_possible_wrap)]
-    pub fn add_node(
+    pub fn add_node<'t>(
         &mut self,
         id: i64,
         decimicro_lat: i32,
         decimicro_lon: i32,
-        tags: &[(&str, &str)],
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         metadata: Option<&Metadata<'_>>,
     ) {
         assert!(
@@ -459,7 +461,6 @@ impl BlockBuilder {
         );
         self.block_type = Some(BlockType::DenseNodes);
 
-        // Delta-encode id, lat, lon
         let lat = i64::from(decimicro_lat);
         let lon = i64::from(decimicro_lon);
 
@@ -473,14 +474,14 @@ impl BlockBuilder {
         self.track_coords(decimicro_lat, decimicro_lon);
 
         // Tags: interleaved [key_sid, val_sid, ...] terminated by 0
-        for &(key, val) in tags {
+        for (key, val) in tags {
             let key_idx = self.string_table.add(key);
             self.tag_key_indices.insert(key_idx);
             self.dense_keys_vals.push(key_idx as i32);
             self.dense_keys_vals
                 .push(self.string_table.add(val) as i32);
         }
-        self.dense_keys_vals.push(0); // delimiter (even for tagless nodes)
+        self.dense_keys_vals.push(0);
 
         // Metadata — maintain parallel arrays with dense_ids.
         // When mixing nodes with and without metadata in the same block
@@ -579,10 +580,10 @@ impl BlockBuilder {
     ///
     /// `refs` are absolute node IDs (the builder handles delta encoding internally).
     #[hotpath::measure]
-    pub fn add_way(
+    pub fn add_way<'t>(
         &mut self,
         id: i64,
-        tags: &[(&str, &str)],
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         refs: &[i64],
         metadata: Option<&Metadata<'_>>,
     ) {
@@ -596,6 +597,7 @@ impl BlockBuilder {
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
+            &mut self.packed_vals_scratch,
             &mut self.info_scratch,
             &mut self.tag_key_indices,
             id,
@@ -613,10 +615,10 @@ impl BlockBuilder {
     /// Both slices must have the same length.
     #[hotpath::measure]
     #[allow(clippy::too_many_arguments)]
-    pub fn add_way_with_locations(
+    pub fn add_way_with_locations<'t>(
         &mut self,
         id: i64,
-        tags: &[(&str, &str)],
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         refs: &[i64],
         locations: &[(i32, i32)],
         metadata: Option<&Metadata<'_>>,
@@ -632,6 +634,7 @@ impl BlockBuilder {
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
+            &mut self.packed_vals_scratch,
             &mut self.packed_lat_scratch,
             &mut self.packed_lon_scratch,
             &mut self.info_scratch,
@@ -650,10 +653,10 @@ impl BlockBuilder {
     ///
     /// `members` are absolute member IDs (the builder handles delta encoding internally).
     #[hotpath::measure]
-    pub fn add_relation(
+    pub fn add_relation<'t>(
         &mut self,
         id: i64,
-        tags: &[(&str, &str)],
+        tags: impl IntoIterator<Item = (&'t str, &'t str)>,
         members: &[MemberData<'_>],
         metadata: Option<&Metadata<'_>>,
     ) {
@@ -667,6 +670,7 @@ impl BlockBuilder {
             &mut self.group_buf,
             &mut self.elem_scratch,
             &mut self.packed_scratch,
+            &mut self.packed_vals_scratch,
             &mut self.info_scratch,
             &mut self.tag_key_indices,
             id,
@@ -1180,15 +1184,16 @@ fn encode_info_to(
 
 /// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
-fn encode_way(
+fn encode_way<'t>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
-    packed: &mut Vec<u8>,
+    packed_keys: &mut Vec<u8>,
+    packed_vals: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
     tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
-    tags: &[(&str, &str)],
+    tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
     metadata: Option<&Metadata<'_>>,
 ) {
@@ -1197,21 +1202,18 @@ fn encode_way(
     // Field 1: id (int64)
     encode_int64_field(elem, 1, id);
 
-    // Fields 2+3: keys/vals (packed uint32)
-    if !tags.is_empty() {
-        packed.clear();
-        for &(key, _) in tags {
-            let key_idx = string_table.add(key);
-            tag_key_indices.insert(key_idx);
-            encode_varint(packed, u64::from(key_idx));
-        }
-        encode_bytes_field(elem, 2, packed);
-
-        packed.clear();
-        for &(_, val) in tags {
-            encode_varint(packed, u64::from(string_table.add(val)));
-        }
-        encode_bytes_field(elem, 3, packed);
+    // Fields 2+3: keys/vals (packed uint32) — single-pass dual-buffer
+    packed_keys.clear();
+    packed_vals.clear();
+    for (key, val) in tags {
+        let key_idx = string_table.add(key);
+        tag_key_indices.insert(key_idx);
+        encode_varint(packed_keys, u64::from(key_idx));
+        encode_varint(packed_vals, u64::from(string_table.add(val)));
+    }
+    if !packed_keys.is_empty() {
+        encode_bytes_field(elem, 2, packed_keys);
+        encode_bytes_field(elem, 3, packed_vals);
     }
 
     // Field 4: info (submessage)
@@ -1222,13 +1224,13 @@ fn encode_way(
 
     // Field 8: refs (packed sint64, delta-encoded)
     if !refs.is_empty() {
-        packed.clear();
+        packed_keys.clear();
         let mut last_ref: i64 = 0;
         for &r in refs {
-            encode_varint(packed, zigzag_encode_64(r - last_ref));
+            encode_varint(packed_keys, zigzag_encode_64(r - last_ref));
             last_ref = r;
         }
-        encode_bytes_field(elem, 8, packed);
+        encode_bytes_field(elem, 8, packed_keys);
     }
 
     // Wrap as PrimitiveGroup field 3 (Way submessage)
@@ -1240,17 +1242,19 @@ fn encode_way(
 /// Uses three packed buffers in a single zip loop for refs/lat/lon to avoid
 /// iterating the data three separate times.
 #[allow(clippy::too_many_arguments)]
-fn encode_way_with_locations(
+#[allow(clippy::too_many_arguments)]
+fn encode_way_with_locations<'t>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
     packed_refs: &mut Vec<u8>,
+    packed_vals: &mut Vec<u8>,
     packed_lats: &mut Vec<u8>,
     packed_lons: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
     tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
-    tags: &[(&str, &str)],
+    tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     refs: &[i64],
     locations: &[(i32, i32)],
     metadata: Option<&Metadata<'_>>,
@@ -1258,20 +1262,18 @@ fn encode_way_with_locations(
     elem.clear();
     encode_int64_field(elem, 1, id);
 
-    if !tags.is_empty() {
-        packed_refs.clear();
-        for &(key, _) in tags {
-            let key_idx = string_table.add(key);
-            tag_key_indices.insert(key_idx);
-            encode_varint(packed_refs, u64::from(key_idx));
-        }
+    // Fields 2+3: keys/vals — single-pass dual-buffer
+    packed_refs.clear();
+    packed_vals.clear();
+    for (key, val) in tags {
+        let key_idx = string_table.add(key);
+        tag_key_indices.insert(key_idx);
+        encode_varint(packed_refs, u64::from(key_idx));
+        encode_varint(packed_vals, u64::from(string_table.add(val)));
+    }
+    if !packed_refs.is_empty() {
         encode_bytes_field(elem, 2, packed_refs);
-
-        packed_refs.clear();
-        for &(_, val) in tags {
-            encode_varint(packed_refs, u64::from(string_table.add(val)));
-        }
-        encode_bytes_field(elem, 3, packed_refs);
+        encode_bytes_field(elem, 3, packed_vals);
     }
 
     if let Some(meta) = metadata {
@@ -1366,35 +1368,34 @@ fn encode_way_raw_bytes_with_locations(
 
 /// Encode a Relation and append it as `PrimitiveGroup.relations` (field 4) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
-fn encode_relation(
+fn encode_relation<'t>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,
     elem: &mut Vec<u8>,
     packed: &mut Vec<u8>,
+    packed_vals: &mut Vec<u8>,
     info_buf: &mut Vec<u8>,
     tag_key_indices: &mut FxHashSet<u32>,
     id: i64,
-    tags: &[(&str, &str)],
+    tags: impl IntoIterator<Item = (&'t str, &'t str)>,
     members: &[MemberData<'_>],
     metadata: Option<&Metadata<'_>>,
 ) {
     elem.clear();
     encode_int64_field(elem, 1, id);
 
-    if !tags.is_empty() {
-        packed.clear();
-        for &(key, _) in tags {
-            let key_idx = string_table.add(key);
-            tag_key_indices.insert(key_idx);
-            encode_varint(packed, u64::from(key_idx));
-        }
+    // Fields 2+3: keys/vals — single-pass dual-buffer
+    packed.clear();
+    packed_vals.clear();
+    for (key, val) in tags {
+        let key_idx = string_table.add(key);
+        tag_key_indices.insert(key_idx);
+        encode_varint(packed, u64::from(key_idx));
+        encode_varint(packed_vals, u64::from(string_table.add(val)));
+    }
+    if !packed.is_empty() {
         encode_bytes_field(elem, 2, packed);
-
-        packed.clear();
-        for &(_, val) in tags {
-            encode_varint(packed, u64::from(string_table.add(val)));
-        }
-        encode_bytes_field(elem, 3, packed);
+        encode_bytes_field(elem, 3, packed_vals);
     }
 
     if let Some(meta) = metadata {

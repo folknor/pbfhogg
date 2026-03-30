@@ -102,7 +102,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         dn.id(),
                         dn.decimicro_lat(),
                         dn.decimicro_lon(),
-                        &tags,
+                        tags.iter().copied(),
                         meta.as_ref(),
                     );
                 }
@@ -137,7 +137,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         user: "",
                         visible: info.visible(),
                     });
-                    bb.add_way(w.id(), &tags, &refs, meta.as_ref());
+                    bb.add_way(w.id(), tags.iter().copied(), &refs, meta.as_ref());
                 }
                 Element::Relation(r) => {
                     if last_type != Some("relation") {
@@ -169,7 +169,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
                         user: "",
                         visible: info.visible(),
                     });
-                    bb.add_relation(r.id(), &tags, &members, meta.as_ref());
+                    bb.add_relation(r.id(), tags.iter().copied(), &members, meta.as_ref());
                 }
                 _ => {}
             }

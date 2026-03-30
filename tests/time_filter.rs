@@ -134,10 +134,10 @@ fn write_history_input(path: &std::path::Path) {
         visible: true,
     };
 
-    bb.add_node(1, 10, 10, &[], Some(&m1));
-    bb.add_node(1, 11, 11, &[], Some(&m2));
-    bb.add_node(1, 12, 12, &[], Some(&m3));
-    bb.add_node(3, 33, 33, &[], Some(&m4));
+    bb.add_node(1, 10, 10, std::iter::empty::<(&str, &str)>(), Some(&m1));
+    bb.add_node(1, 11, 11, std::iter::empty::<(&str, &str)>(), Some(&m2));
+    bb.add_node(1, 12, 12, std::iter::empty::<(&str, &str)>(), Some(&m3));
+    bb.add_node(3, 33, 33, std::iter::empty::<(&str, &str)>(), Some(&m4));
 
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
@@ -243,15 +243,15 @@ fn write_history_with_ways_and_relations(path: &std::path::Path) {
         user: "u",
         visible: false,
     };
-    bb.add_way(10, &[], &[1, 2], Some(&w1));
+    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2], Some(&w1));
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
-    bb.add_way(10, &[], &[1, 2, 3], Some(&w2));
+    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[1, 2, 3], Some(&w2));
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
-    bb.add_way(10, &[], &[], Some(&w3));
+    bb.add_way(10, std::iter::empty::<(&str, &str)>(), &[], Some(&w3));
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
@@ -267,7 +267,7 @@ fn write_history_with_ways_and_relations(path: &std::path::Path) {
     };
     bb.add_relation(
         100,
-        &[("type", "multipolygon")],
+        [("type", "multipolygon")],
         &[MemberData {
             id: MemberId::Way(10),
             role: "outer",

@@ -26,16 +26,16 @@ fn write_test_pbf(path: &Path) {
     let mut bb = BlockBuilder::new();
 
     // Block 1: 3 nodes
-    bb.add_node(100, 550_000_000, 120_000_000, &[("name", "A")], None);
-    bb.add_node(200, 560_000_000, 130_000_000, &[("name", "B")], None);
-    bb.add_node(300, -330_000_000, -580_000_000, &[], None);
+    bb.add_node(100, 550_000_000, 120_000_000, [("name", "A")], None);
+    bb.add_node(200, 560_000_000, 130_000_000, [("name", "B")], None);
+    bb.add_node(300, -330_000_000, -580_000_000, std::iter::empty::<(&str, &str)>(), None);
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
 
     // Block 2: 2 ways
-    bb.add_way(1000, &[("highway", "primary")], &[100, 200, 300], None);
-    bb.add_way(2000, &[("building", "yes")], &[200, 300, 200], None);
+    bb.add_way(1000, [("highway", "primary")], &[100, 200, 300], None);
+    bb.add_way(2000, [("building", "yes")], &[200, 300, 200], None);
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
@@ -43,7 +43,7 @@ fn write_test_pbf(path: &Path) {
     // Block 3: 1 relation
     bb.add_relation(
         5000,
-        &[("type", "multipolygon")],
+        [("type", "multipolygon")],
         &[MemberData {
             id: MemberId::Way(1000),
             role: "outer",
@@ -349,9 +349,9 @@ fn write_sorted_pbf(path: &Path) {
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(1, 550_000_000, 120_000_000, &[], None);
-    bb.add_node(2, 560_000_000, 130_000_000, &[], None);
-    bb.add_node(3, 570_000_000, 140_000_000, &[], None);
+    bb.add_node(1, 550_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(2, 560_000_000, 130_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(3, 570_000_000, 140_000_000, std::iter::empty::<(&str, &str)>(), None);
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();
@@ -459,8 +459,8 @@ fn sorted_flag_but_unsorted_nodes_panics() {
     writer.write_header(&header).unwrap();
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(100, 550_000_000, 120_000_000, &[], None);
-    bb.add_node(50, 560_000_000, 130_000_000, &[], None); // out of order!
+    bb.add_node(100, 550_000_000, 120_000_000, std::iter::empty::<(&str, &str)>(), None);
+    bb.add_node(50, 560_000_000, 130_000_000, std::iter::empty::<(&str, &str)>(), None); // out of order!
     writer
         .write_primitive_block(bb.take().unwrap().unwrap())
         .unwrap();

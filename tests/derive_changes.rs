@@ -375,7 +375,7 @@ fn write_versioned_pbf(
         let meta = Metadata {
             version: ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true,
         };
-        bb.add_node(id, lat, lon, &[], Some(&meta));
+        bb.add_node(id, lat, lon, std::iter::empty::<(&str, &str)>(), Some(&meta));
     }
     if !bb.is_empty() {
         if let Some(bytes) = bb.take().expect("take") {
@@ -386,7 +386,7 @@ fn write_versioned_pbf(
         let meta = Metadata {
             version: *ver, timestamp: 0, changeset: 0, uid: 0, user: "", visible: true,
         };
-        bb.add_way(*id, &[], refs, Some(&meta));
+        bb.add_way(*id, std::iter::empty::<(&str, &str)>(), refs, Some(&meta));
     }
     if !bb.is_empty() {
         if let Some(bytes) = bb.take().expect("take") {

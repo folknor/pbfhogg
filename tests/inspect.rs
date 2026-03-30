@@ -31,7 +31,7 @@ fn write_nodes_blocks(path: &std::path::Path, blocks: &[usize]) {
     let mut next_id: i64 = 1;
     for &count in blocks {
         for _ in 0..count {
-            bb.add_node(next_id, 500_000_000, 100_000_000, &[], None);
+            bb.add_node(next_id, 500_000_000, 100_000_000, std::iter::empty::<(&str, &str)>(), None);
             next_id += 1;
         }
         if let Some(bytes) = bb.take().expect("take") {

@@ -73,7 +73,7 @@ impl DenseNodeColumns {
         // PBFs): eliminates the per-node multiply + divide entirely.
         // nano = offset + 100 * cumulative → decimicro = nano / 100
         //      = cumulative + offset / 100
-        if granularity == 100 {
+        if granularity == 100 && lat_offset % 100 == 0 && lon_offset % 100 == 0 {
             #[allow(clippy::cast_possible_wrap)]
             let lat_off_e7 = (lat_offset / 100) as i32;
             #[allow(clippy::cast_possible_wrap)]

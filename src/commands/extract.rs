@@ -2225,19 +2225,16 @@ fn collect_pass1_generic<H: RelationHandler>(
                 thread_local! {
                     static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
                         RefCell::new(crate::read::columnar::DenseNodeColumns::new());
-                    static IDS_BUF: RefCell<Vec<i64>> = RefCell::new(Vec::new());
                 }
                 COLUMNS.with_borrow_mut(|columns| {
                     block.decode_dense_columns(columns);
-                    IDS_BUF.with_borrow_mut(|ids| {
-                        ids.clear();
-                        columns.collect_matching_ids_bbox(
-                            bbox_int.min_lat, bbox_int.max_lat,
-                            bbox_int.min_lon, bbox_int.max_lon,
-                            ids,
-                        );
-                        std::mem::take(ids)
-                    })
+                    let mut ids = Vec::new();
+                    columns.collect_matching_ids_bbox(
+                        bbox_int.min_lat, bbox_int.max_lat,
+                        bbox_int.min_lon, bbox_int.max_lon,
+                        &mut ids,
+                    );
+                    ids
                 })
             } else {
                 // Polygon path: element-by-element with point-in-polygon check.

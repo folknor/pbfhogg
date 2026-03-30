@@ -1497,30 +1497,31 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_END");
     // --- Phase 3: Classify relations + write (pread-from-workers) ---
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_START");
-    // Relation classification needs full PrimitiveBlock (member access). Sequential scan.
     let mut matched_relation_ids = IdSetDense::new();
     {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
-            }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = &element {
-                    if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                        matched_relation_ids.set(r.id());
+        let (rel_classify_schedule, rel_classify_file) = super::build_classify_schedule(
+            input, Some(crate::blob_index::ElemKind::Relation),
+        )?;
+        parallel_classify_phase(
+            &rel_classify_file,
+            &rel_classify_schedule,
+            |block| {
+                let mut ids = Vec::new();
+                for element in block.elements_skip_metadata() {
+                    if let Element::Relation(r) = &element {
+                        if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
+                            ids.push(r.id());
+                        }
                     }
                 }
-            }
-        }
+                ids
+            },
+            |ids| {
+                for id in ids {
+                    matched_relation_ids.set(id);
+                }
+            },
+        )?;
     }
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
     crate::debug::emit_marker("SIMPLE_REL_WRITE_START");

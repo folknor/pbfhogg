@@ -296,9 +296,9 @@ from simple extract applies to any sequential collection pass:
   `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.
   Only triggers with `--force` on non-indexed PBFs. Niche but the last
   unmitigated retention path.
-- [ ] Extract relation classify parallelization — rel classify is 13s at
-  Europe scale (13% of simple extract total 100s). Could parallelize but
-  marginal return given it's the smallest phase.
+- [x] Extract relation classify parallelization — converted from sequential
+  BlobReader to `parallel_classify_phase` via `build_classify_schedule`.
+  Last sequential phase in simple extract eliminated.
 - [x] **tags-filter closure + way dep scans** —
   `collect_relation_member_closure` and `collect_way_node_dependencies`
   converted to `parallel_classify_phase`. Closure uses collect-then-merge
@@ -467,13 +467,10 @@ disagreements, not bugs — but should be investigated and either fixed or docum
 before release.
 
 - [x] **Planet-scale merge on 32 GB host** — **762s (12.7 min), 1.8 GB RSS.** 86% rewrite, 3.4M diff entries. Validated.
-- [ ] **`cat --type` OOM on planet (87 GB, 30 GB host)** — Raw frame
-  passthrough shipped: matching blobs written as raw compressed frames,
-  non-matching blobs skipped entirely (zero decompression). Planet cat
-  --type way: 207s → 43s (4.8x). Denmark: 614ms → 239ms (2.6x).
-  Previous OOM fixes (batch budget, bounded channel) may no longer be
-  needed since the raw passthrough path avoids decode+re-encode entirely.
-  **Planet validation of the raw passthrough path still pending.**
+- [x] **`cat --type` planet validated** — Raw frame passthrough: 43.7s,
+  no OOM, pure I/O-limited copy (commit `573ef71`, plantasjen). Previous
+  decode+re-encode path OOM'd at 30 GB host; raw passthrough avoids
+  decode entirely. Planet: 207s → 43s (4.8x).
 
 ### Cross-pipeline optimization audit (commit `398b1a4`)
 

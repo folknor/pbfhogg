@@ -52,8 +52,9 @@ pub struct TagCountOptions<'a> {
 /// If `expressions` is non-empty, only tags matching at least one
 /// expression are counted (same syntax as `tags-filter`).
 ///
-/// Element processing is parallelized: each rayon thread accumulates a
-/// local `FxHashMap`, then thread-local maps are merged via reduce.
+/// Uses sequential BlobReader to avoid cross-thread PrimitiveBlock
+/// retention at planet scale. Diagnostic command — single-threaded
+/// decode is acceptable.
 #[hotpath::measure]
 pub fn tags_count(
     path: &Path,
@@ -165,7 +166,7 @@ fn count_block_tags(
     filter_relation: bool,
     expressions: &Option<Vec<Expression>>,
 ) {
-    for element in block.elements() {
+    for element in block.elements_skip_metadata() {
         let dominated = match &element {
             Element::DenseNode(_) | Element::Node(_) => filter_node,
             Element::Way(_) => filter_way,

@@ -293,6 +293,10 @@ from simple extract applies to any sequential collection pass:
   sequential BlobReader with DecompressPool. Removes rayon batch
   infrastructure (count_batch, merge_two_maps, merge_counts). Diagnostic
   command — single-threaded decode is acceptable.
+- [ ] `tags_count.rs` parallel path — `parallel_classify_phase` with
+  per-worker CountMap accumulation. Tag counting is order-independent,
+  so the merge is straightforward. Would restore parallel decode for
+  unfiltered `inspect tags` on planet. Low priority.
 - [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
   `src/commands/add_locations_to_ways.rs` ~line 1045) — uses
   `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.

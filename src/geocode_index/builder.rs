@@ -287,61 +287,56 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
 
     let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
     {
-        let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, config.direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
+        let (schedule, shared_file) = crate::commands::build_classify_schedule(
+            &config.input_path, Some(crate::blob_index::ElemKind::Way),
+        )?;
 
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-                continue;
-            }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
-                    continue;
-                }
-            }
+        crate::commands::parallel_classify_phase(
+            &shared_file,
+            &schedule,
+            |block| {
+                let mut node_ids = Vec::new();
+                for element in block.elements_skip_metadata() {
+                    if let Element::Way(way) = element {
+                        let mut highway = false;
+                        let mut name = false;
+                        let mut hn = false;
+                        let mut addr_st = false;
+                        let mut building = false;
+                        let mut interp = false;
+                        let mut highway_val: Option<&str> = None;
 
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = crate::block::PrimitiveBlock::new(decompressed)?;
-            for element in block.elements_skip_metadata() {
-                if let Element::Way(way) = element {
-                    let mut highway = false;
-                    let mut name = false;
-                    let mut hn = false;
-                    let mut addr_st = false;
-                    let mut building = false;
-                    let mut interp = false;
-                    let mut highway_val: Option<&str> = None;
-
-                    for (k, _v) in way.tags() {
-                        match k {
-                            "highway" => { highway = true; highway_val = Some(_v); }
-                            "name" => name = true,
-                            "addr:housenumber" => hn = true,
-                            "addr:street" => addr_st = true,
-                            "building" => building = true,
-                            "addr:interpolation" => interp = true,
-                            _ => {}
+                        for (k, _v) in way.tags() {
+                            match k {
+                                "highway" => { highway = true; highway_val = Some(_v); }
+                                "name" => name = true,
+                                "addr:housenumber" => hn = true,
+                                "addr:street" => addr_st = true,
+                                "building" => building = true,
+                                "addr:interpolation" => interp = true,
+                                _ => {}
+                            }
                         }
-                    }
 
-                    let is_street = highway && name
-                        && !EXCLUDED_HIGHWAYS.contains(&highway_val.unwrap_or(""));
-                    let is_building_addr = building && hn && addr_st;
-                    let is_interp = interp && addr_st;
-                    let is_admin = needed_admin_ways.get(way.id());
+                        let is_street = highway && name
+                            && !EXCLUDED_HIGHWAYS.contains(&highway_val.unwrap_or(""));
+                        let is_building_addr = building && hn && addr_st;
+                        let is_interp = interp && addr_st;
+                        let is_admin = needed_admin_ways.get(way.id());
 
-                    if is_street || is_building_addr || is_interp || is_admin {
-                        for nid in way.refs() {
-                            referenced_nodes.set(nid);
+                        if is_street || is_building_addr || is_interp || is_admin {
+                            node_ids.extend(way.refs());
                         }
                     }
                 }
-            }
-        }
+                node_ids
+            },
+            |node_ids| {
+                for id in node_ids {
+                    referenced_nodes.set(id);
+                }
+            },
+        )?;
     }
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 

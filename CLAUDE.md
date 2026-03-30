@@ -35,6 +35,7 @@ pbfhogg commands (every CLI command is a brokkr subcommand):
 - `brokkr add-locations-to-ways --dataset europe --index-type external --bench`
 - `brokkr add-locations-to-ways --dataset europe --direct-io --bench` — O_DIRECT variant
 - `brokkr build-geocode-index --dataset denmark --hotpath`
+- `brokkr multi-extract --dataset japan --regions 5 --bench` — single-pass multi-extract
 - `brokkr read --bench` — multi-variant read benchmark
 - `brokkr suite pbfhogg --bench` — full suite
 
@@ -134,7 +135,8 @@ Cross-validate pbfhogg output against reference tools (osmium, osmosis, osmconve
 - `brokkr verify merge [--dataset name] [--variant V] [--osc-seq SEQ]` — apply-changes vs osmium/osmosis/osmconvert
 - `brokkr verify derive-changes [--dataset name] [--variant V] [--osc-seq SEQ]` — diff --format osc roundtrip vs osmium
 - `brokkr verify diff [--dataset name] [--variant V] [--osc-seq SEQ]` — diff summary vs osmium diff
-- `brokkr verify all [--dataset name] [--variant V] [--osc-seq SEQ] [--bbox bbox]` — run all verify commands sequentially
+- `brokkr verify multi-extract [--dataset name] [--regions N]` — single-pass vs sequential multi-extract element counts
+- `brokkr verify all [--dataset name] [--variant V] [--osc-seq SEQ] [--bbox bbox]` — run all verify commands sequentially (includes multi-extract)
 
 All `--variant` flags default to `indexed`. `--osc-seq` auto-selects if exactly one OSC is configured for the dataset.
 

@@ -695,82 +695,194 @@ fn try_extract_multi_single_pass(
     let mut way_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
     let mut rel_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
 
-    // Sequential reader — planet-safe, no cross-thread retention.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+    // Build schedules by element type for parallel classification.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-
-        // Blob-level spatial skip (union bbox).
-        if let Some(idx) = blob.index() {
+    let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut relation_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
             if !spatial_filter.wants_index(&idx) { continue; }
+            match idx.kind {
+                crate::blob_index::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
+                crate::blob_index::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
+                crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
+            }
+        } else {
+            // No indexdata — include in all schedules (conservative).
+            node_schedule.push((seq, data_offset, data_size));
+            way_schedule.push((seq, data_offset, data_size));
+            relation_schedule.push((seq, data_offset, data_size));
         }
+        seq += 1;
+    }
+    drop(scanner);
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
 
-        // Per-block buffers (borrow from block's string table).
-        let mut tags_buf: Vec<(&str, &str)> = Vec::new();
-        let mut refs_buf: Vec<i64> = Vec::new();
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    let lat = dn.decimicro_lat();
-                    let lon = dn.decimicro_lon();
-                    let id = dn.id();
-                    for i in 0..n {
-                        if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                            bbox_node_ids[i].set(id);
-                            if !node_bbs[i].can_add_node() {
-                                if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
-                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                }
+    // Phase 1: Parallel node classification → N bbox_node_ids.
+    parallel_classify_phase(
+        &shared_file,
+        &node_schedule,
+        |block| {
+            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+            for element in block.elements_skip_metadata() {
+                match &element {
+                    Element::DenseNode(dn) => {
+                        let lat = dn.decimicro_lat();
+                        let lon = dn.decimicro_lon();
+                        for i in 0..n {
+                            if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                region_ids[i].push(dn.id());
                             }
-                            tags_buf.clear();
-                            tags_buf.extend(dn.tags());
-                            let meta = dense_node_metadata(dn);
-                            node_bbs[i].add_node(id, lat, lon, &tags_buf, meta.as_ref());
-                            stats[i].nodes_in_bbox += 1;
+                        }
+                    }
+                    Element::Node(nd) => {
+                        let lat = nd.decimicro_lat();
+                        let lon = nd.decimicro_lon();
+                        for i in 0..n {
+                            if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                region_ids[i].push(nd.id());
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            region_ids
+        },
+        |region_ids| {
+            for (i, ids) in region_ids.into_iter().enumerate() {
+                for id in ids {
+                    bbox_node_ids[i].set(id);
+                }
+            }
+        },
+    )?;
+
+    // Phase 1 write: sequential decode, write matching nodes to N writers.
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
+                if !spatial_filter.wants_index(&idx) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = PrimitiveBlock::new(decompressed)?;
+            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+            for element in block.elements() {
+                match &element {
+                    Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
+                        let id = dn.id();
+                        tags_buf.clear();
+                        tags_buf.extend(dn.tags());
+                        let meta = dense_node_metadata(dn);
+                        for i in 0..n {
+                            if bbox_node_ids[i].get(id) {
+                                if !node_bbs[i].can_add_node() {
+                                    if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
+                                        writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                    }
+                                }
+                                node_bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), &tags_buf, meta.as_ref());
+                                stats[i].nodes_in_bbox += 1;
+                            }
+                        }
+                    }
+                    Element::Node(nd) if bbox_node_ids.iter().any(|s| s.get(nd.id())) => {
+                        let id = nd.id();
+                        tags_buf.clear();
+                        tags_buf.extend(nd.tags());
+                        let meta = element_metadata(&nd.info());
+                        for i in 0..n {
+                            if bbox_node_ids[i].get(id) {
+                                if !node_bbs[i].can_add_node() {
+                                    if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
+                                        writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
+                                    }
+                                }
+                                node_bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), &tags_buf, meta.as_ref());
+                                stats[i].nodes_in_bbox += 1;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Phase 2: Parallel way classification → N matched_way_ids.
+    parallel_classify_phase(
+        &shared_file,
+        &way_schedule,
+        |block| {
+            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+            for element in block.elements_skip_metadata() {
+                if let Element::Way(w) = &element {
+                    for i in 0..n {
+                        if w.refs().any(|r| bbox_node_ids[i].get(r)) {
+                            region_ids[i].push(w.id());
                         }
                     }
                 }
-                Element::Node(n_elem) => {
-                    let lat = n_elem.decimicro_lat();
-                    let lon = n_elem.decimicro_lon();
-                    let id = n_elem.id();
-                    for i in 0..n {
-                        if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                            bbox_node_ids[i].set(id);
-                            if !node_bbs[i].can_add_node() {
-                                if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
-                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                }
-                            }
-                            tags_buf.clear();
-                            tags_buf.extend(n_elem.tags());
-                            let meta = element_metadata(&n_elem.info());
-                            node_bbs[i].add_node(id, lat, lon, &tags_buf, meta.as_ref());
-                            stats[i].nodes_in_bbox += 1;
-                        }
-                    }
+            }
+            region_ids
+        },
+        |region_ids| {
+            for (i, ids) in region_ids.into_iter().enumerate() {
+                for id in ids {
+                    matched_way_ids[i].set(id);
                 }
-                Element::Way(w) => {
+            }
+        },
+    )?;
+
+    // Phase 2 write: sequential decode, write matching ways to N writers.
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = PrimitiveBlock::new(decompressed)?;
+            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+            let mut refs_buf: Vec<i64> = Vec::new();
+            for element in block.elements() {
+                if let Element::Way(w) = &element {
                     let wid = w.id();
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    if !matched_way_ids.iter().any(|s| s.get(wid)) { continue; }
                     tags_buf.clear();
                     tags_buf.extend(w.tags());
+                    refs_buf.clear();
+                    refs_buf.extend(w.refs());
                     let meta = element_metadata(&w.info());
                     for i in 0..n {
-                        if refs_buf.iter().any(|r| bbox_node_ids[i].get(*r)) {
-                            matched_way_ids[i].set(wid);
+                        if matched_way_ids[i].get(wid) {
                             if !way_bbs[i].can_add_way() {
                                 if let Some((bytes, index, tagdata)) = way_bbs[i].take_owned()? {
                                     writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
@@ -781,24 +893,72 @@ fn try_extract_multi_single_pass(
                         }
                     }
                 }
-                Element::Relation(r) => {
-                    let rid = r.id();
+            }
+        }
+    }
+
+    // Phase 3: Parallel relation classification → N matched_relation_ids.
+    parallel_classify_phase(
+        &shared_file,
+        &relation_schedule,
+        |block| {
+            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+            for element in block.elements_skip_metadata() {
+                if let Element::Relation(r) = &element {
                     for i in 0..n {
                         if relation_has_matched_member(r, &bbox_node_ids[i], &matched_way_ids[i]) {
-                            matched_relation_ids[i].set(rid);
+                            region_ids[i].push(r.id());
+                        }
+                    }
+                }
+            }
+            region_ids
+        },
+        |region_ids| {
+            for (i, ids) in region_ids.into_iter().enumerate() {
+                for id in ids {
+                    matched_relation_ids[i].set(id);
+                }
+            }
+        },
+    )?;
+
+    // Phase 3 write: sequential decode, write matching relations to N writers.
+    {
+        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        blob_reader.set_parse_indexdata(true);
+        blob_reader.next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let decompress_pool = crate::blob::DecompressPool::new();
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+            if let Some(idx) = blob.index() {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
+            }
+            let decompressed = blob.decompress_pooled(&decompress_pool)?;
+            let block = PrimitiveBlock::new(decompressed)?;
+            let mut tags_buf: Vec<(&str, &str)> = Vec::new();
+            let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+            for element in block.elements() {
+                if let Element::Relation(r) = &element {
+                    let rid = r.id();
+                    if !matched_relation_ids.iter().any(|s| s.get(rid)) { continue; }
+                    tags_buf.clear();
+                    tags_buf.extend(r.tags());
+                    members_buf.clear();
+                    members_buf.extend(r.members().map(|m| MemberData {
+                        id: m.id,
+                        role: m.role().unwrap_or(""),
+                    }));
+                    let meta = element_metadata(&r.info());
+                    for i in 0..n {
+                        if matched_relation_ids[i].get(rid) {
                             if !rel_bbs[i].can_add_relation() {
                                 if let Some((bytes, index, tagdata)) = rel_bbs[i].take_owned()? {
                                     writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
                                 }
                             }
-                            tags_buf.clear();
-                            tags_buf.extend(r.tags());
-                            members_buf.clear();
-                            members_buf.extend(r.members().map(|m| MemberData {
-                                id: m.id,
-                                role: m.role().unwrap_or(""),
-                            }));
-                            let meta = element_metadata(&r.info());
                             rel_bbs[i].add_relation(rid, &tags_buf, &members_buf, meta.as_ref());
                             stats[i].relations_written += 1;
                         }

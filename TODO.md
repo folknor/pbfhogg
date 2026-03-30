@@ -320,15 +320,32 @@ the fastest one.
 
 ### Multi-extract
 
-Produce 200+ regional extracts from a single planet pass. The CLI already
-has `extract --config` (`src/commands/extract.rs`, `ExtractConfig` struct)
-for multiple bbox/polygon regions from a JSON config file. Current
-implementation runs each extract sequentially. The optimization: read the
-PBF once, classify each element against all N regions simultaneously, and
-route to N `PbfWriter` instances. The pread-from-workers infrastructure
-(`pread_write_pass`) could dispatch workers per-region or per-blob with
-multi-region classification. At planet scale, this avoids N × 87 GB of
-redundant I/O — critical for data distributors maintaining regional extracts.
+Single-pass multi-extract shipped for simple strategy on sorted input
+(commit `542aad0`). Reads PBF once, classifies each element against N
+regions, writes to N sync-mode PbfWriters. 3-phase barrier (nodes →
+ways → relations) with per-region IdSetDense + BlockBuilder. Memory:
+N × ~1.5 GB at planet scale. Falls back to sequential for unsorted
+input or --clean. Verified via `brokkr verify multi-extract`.
+
+**v2 improvements:**
+
+- [ ] **Parallel decode** — convert sequential BlobReader to
+  pread-from-workers within each phase. Workers classify against N
+  regions simultaneously, consumer routes to N writers. Currently
+  single-threaded decode makes multi-extract slower than sequential
+  at small scale (Japan 34.9s vs 5 × 4.4s = 22s sequential) because
+  sequential gets parallel decode per-region. At planet scale with
+  10+ regions, the I/O savings (1× vs 10×) dominate.
+- [ ] **Spatial index** — grid or R-tree over regions for O(1)
+  per-element lookup instead of O(N). Required for 200+ regions where
+  linear scan becomes the bottleneck. Simple grid (3600×1800 cells of
+  0.1°, precompute overlapping regions per cell) is sufficient.
+- [ ] **Complete/smart strategies** — per-region way/relation ID
+  tracking. Memory: N × ~3 GB (bbox_node_ids + all_way_node_ids per
+  region). Feasible for ~10 regions on 30 GB host, ~40 on 128 GB.
+- [ ] **Raw passthrough** — node blobs fully contained in a region's
+  bbox passed through raw to that region's writer. Per-blob per-region
+  passthrough decisions (blob bbox contained in region bbox).
 
 ### Export (GeoJSON/GeoPackage)
 

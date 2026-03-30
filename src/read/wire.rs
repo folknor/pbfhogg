@@ -193,6 +193,10 @@ impl<'a> WireBlock<'a> {
         // Phase 1 temp Vecs are still alive but immutable borrow of buf is released.
 
         // Phase 2: append entries as raw LE bytes to the buffer.
+        // Pre-reserve exact capacity to avoid reallocation during extend.
+        let append_size = (st_entries.len() + group_entries.len()) * 8;
+        buf.reserve(append_size);
+
         let st_inline_offset = buf.len() as u32;
         let st_inline_count = st_entries.len() as u32;
         for &(off, len) in st_entries.iter() {

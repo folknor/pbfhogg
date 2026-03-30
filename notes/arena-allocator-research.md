@@ -208,7 +208,27 @@ Coverage: all `parallel_classify_phase` workers, `pread_execute` workers,
 sequential BlobReader loops (node_stats, tags_count). Every
 PrimitiveBlock construction path uses scratch.
 
-### Step 1b: write_single_* scratch — BLOCKED on lifetime issue
+### Step 1a: Pre-reserve buffer capacity — DONE
+
+Added `buf.reserve((st_entries.len() + group_entries.len()) * 8)` before
+Phase 2 appending. This was expected to eliminate the 12.1 GB alloc in
+`parse_and_inline_with_scratch`, but alloc profiling showed the 12.1 GB
+is actually the decompression buffer's initial allocation (from
+`pool_get_pub` or `decompress_pooled`), not growth during `extend`.
+The inline entries (~2 KB) are tiny vs decompressed data (~50 KB) —
+the pool-returned buffers already have sufficient capacity.
+
+**Conclusion:** `parse_and_inline` has no remaining optimization
+opportunity. The alloc churn is the decompression buffer itself,
+which is already pool-recycled. Arena allocation would not help here.
+pbfhogg is at libosmium parity for the decode path.
+
+### Step 1b: write_single_* tag Vec — DONE (iterator API)
+
+Iterator-based BlockBuilder API (commit `bb15e66`) eliminated the
+per-element `tags.collect::<Vec>()`. Callers pass `element.tags()`
+directly. Dual-buffer single-pass encoding for way/relation tag fields.
+See [notes/blockbuilder-iterator-api.md](blockbuilder-iterator-api.md).
 
 `write_single_node/way/relation` in `elements_pbf.rs` allocate
 `tags.collect::<Vec<(&str, &str)>>()` per element. Called from sort

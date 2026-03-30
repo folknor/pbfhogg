@@ -569,6 +569,10 @@ impl PrimitiveBlock {
     /// Reuses the provided `DenseNodeColumns` scratch buffer. Coordinates
     /// are converted to decimicrodegrees. Returns the number of nodes decoded.
     ///
+    /// Handles blocks with multiple dense groups (appends across groups).
+    /// Non-dense Node messages are NOT included — use element-by-element
+    /// iteration for blocks that may contain plain Node groups.
+    ///
     /// This is the columnar alternative to iterating `elements()` / `elements_skip_metadata()`
     /// for classification passes that only need ID + coordinates.
     pub(crate) fn decode_dense_columns(
@@ -579,7 +583,7 @@ impl PrimitiveBlock {
         for group in self.groups() {
             if let Ok(Some(dense_data)) = group.group.dense() {
                 if let Ok(dense) = super::wire::WireDenseNodes::parse(dense_data) {
-                    columns.decode(
+                    columns.decode_append(
                         &dense,
                         self.block.granularity,
                         self.block.lat_offset,

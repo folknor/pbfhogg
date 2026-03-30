@@ -2219,19 +2219,25 @@ fn collect_pass1_generic<H: RelationHandler>(
         &node_schedule,
         |block| {
             if use_columnar {
-                // Columnar path: batch decode + tight i32 comparison loop.
+                // Columnar path: batch decode + branchless bbox check.
                 // Worker-local scratch reused across blobs via thread_local.
                 use std::cell::RefCell;
                 thread_local! {
                     static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
                         RefCell::new(crate::read::columnar::DenseNodeColumns::new());
+                    static IDS_BUF: RefCell<Vec<i64>> = RefCell::new(Vec::new());
                 }
                 COLUMNS.with_borrow_mut(|columns| {
                     block.decode_dense_columns(columns);
-                    columns.matching_ids_bbox(
-                        bbox_int.min_lat, bbox_int.max_lat,
-                        bbox_int.min_lon, bbox_int.max_lon,
-                    )
+                    IDS_BUF.with_borrow_mut(|ids| {
+                        ids.clear();
+                        columns.collect_matching_ids_bbox(
+                            bbox_int.min_lat, bbox_int.max_lat,
+                            bbox_int.min_lon, bbox_int.max_lon,
+                            ids,
+                        );
+                        std::mem::take(ids)
+                    })
                 })
             } else {
                 // Polygon path: element-by-element with point-in-polygon check.

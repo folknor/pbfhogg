@@ -417,7 +417,21 @@ impl PrimitiveBlock {
         mut buffer: Vec<u8>,
         pool: &std::sync::Arc<crate::blob::DecompressPool>,
     ) -> Result<PrimitiveBlock> {
-        let meta = WireBlock::parse_and_inline(&mut buffer)?;
+        let mut st_scratch = Vec::new();
+        let mut gr_scratch = Vec::new();
+        Self::from_vec_pooled_with_scratch(buffer, pool, &mut st_scratch, &mut gr_scratch)
+    }
+
+    /// Like [`from_vec_pooled`] but reuses caller-provided scratch buffers
+    /// for `parse_and_inline`. Workers in `parallel_classify_phase` call this
+    /// with loop-local scratch to avoid per-block allocation.
+    pub(crate) fn from_vec_pooled_with_scratch(
+        mut buffer: Vec<u8>,
+        pool: &std::sync::Arc<crate::blob::DecompressPool>,
+        st_scratch: &mut Vec<(u32, u32)>,
+        gr_scratch: &mut Vec<(u32, u32)>,
+    ) -> Result<PrimitiveBlock> {
+        let meta = WireBlock::parse_and_inline_with_scratch(&mut buffer, st_scratch, gr_scratch)?;
         let bytes = crate::blob::pool_wrap(buffer, Some(pool));
         let data: &[u8] = &bytes;
         let block = WireBlock::from_inline(data, &meta);

@@ -499,6 +499,8 @@ pub(crate) fn parallel_classify_phase<R: Send>(
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
                 let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -515,7 +517,9 @@ pub(crate) fn parallel_classify_phase<R: Send>(
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
                         let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
                         crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
-                        let block = crate::block::PrimitiveBlock::from_vec_pooled(buf, &worker_pool)?;
+                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                        )?;
                         let result = classify_ref(&block);
                         Ok(result)
                     })();

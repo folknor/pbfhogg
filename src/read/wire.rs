@@ -123,11 +123,28 @@ impl<'a> WireBlock<'a> {
     #[hotpath::measure]
     #[allow(clippy::cast_possible_truncation)]
     pub fn parse_and_inline(buf: &mut Vec<u8>) -> Result<WireBlockMeta> {
+        let mut st_scratch = Vec::new();
+        let mut gr_scratch = Vec::new();
+        Self::parse_and_inline_with_scratch(buf, &mut st_scratch, &mut gr_scratch)
+    }
+
+    /// Like [`parse_and_inline`] but reuses caller-provided scratch buffers
+    /// to avoid per-block allocation. The scratch Vecs are cleared at the start
+    /// and may grow to accommodate the block's string table and group entries.
+    /// Between blocks, the capacity is retained — no malloc/free after the
+    /// first few blocks.
+    #[hotpath::measure]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn parse_and_inline_with_scratch(
+        buf: &mut Vec<u8>,
+        st_entries: &mut Vec<(u32, u32)>,
+        group_entries: &mut Vec<(u32, u32)>,
+    ) -> Result<WireBlockMeta> {
         let proto_len = buf.len() as u32;
 
-        // Phase 1: scan protobuf, collect into temp local Vecs (same-thread alloc/free).
-        let mut st_entries: Vec<(u32, u32)> = Vec::new();
-        let mut group_entries: Vec<(u32, u32)> = Vec::new();
+        // Phase 1: scan protobuf, collect into reusable scratch Vecs.
+        st_entries.clear();
+        group_entries.clear();
         let mut granularity: i32 = 100;
         let mut lat_offset: i64 = 0;
         let mut lon_offset: i64 = 0;
@@ -171,26 +188,26 @@ impl<'a> WireBlock<'a> {
             } else {
                 &[]
             };
-            WireStringTable::scan_entries(st_data, buffer, &mut st_entries)?;
+            WireStringTable::scan_entries(st_data, buffer, st_entries)?;
         }
         // Phase 1 temp Vecs are still alive but immutable borrow of buf is released.
 
         // Phase 2: append entries as raw LE bytes to the buffer.
         let st_inline_offset = buf.len() as u32;
         let st_inline_count = st_entries.len() as u32;
-        for &(off, len) in &st_entries {
+        for &(off, len) in st_entries.iter() {
             buf.extend_from_slice(&off.to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
 
         let gr_inline_offset = buf.len() as u32;
         let gr_inline_count = group_entries.len() as u32;
-        for &(off, len) in &group_entries {
+        for &(off, len) in group_entries.iter() {
             buf.extend_from_slice(&off.to_le_bytes());
             buf.extend_from_slice(&len.to_le_bytes());
         }
 
-        // Phase 1 temp Vecs drop here — same-thread free, no cross-thread retention.
+        // Scratch Vecs retain capacity for the next block (caller reuses them).
         #[allow(clippy::cast_possible_truncation)]
         Ok(WireBlockMeta {
             proto_len,

@@ -491,18 +491,29 @@ per-iteration allocations remain across the codebase, ordered by impact:
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 
-- [ ] **3. SIMD** — universal agreement: comes after columnar. With
-  contiguous arrays, explicit AVX2/NEON targets:
-  - Varint decode: 4-8 varints per instruction via `pshufb` permutation
-    + `pmovmskb` continuation scanning. ~15-20% of parse time at planet.
-  - Bbox checks: `_mm256_cmpgt_epi32` does 8 coordinate comparisons per
-    instruction. Extract node classification inner loop ~8x faster.
-  - Delta decode: SIMD prefix-sum (`_mm256_add_epi64` cascaded) for
-    DenseNodes delta-encoded IDs/lats/lons, 4 deltas per instruction.
-  - Write-path: `BlockBuilder` packed varint encoding for refs, tag
-    indices, dense node deltas.
-  Without columnar layout, SIMD requires gather/scatter that negates
-  most throughput gain. See [notes/SIMD.md](notes/SIMD.md).
+- [ ] **3. SIMD** — universal agreement: comes after columnar. Columnar
+  prototype shipped (commit `e0b0780`). ASM inspection confirms LLVM
+  does NOT autovectorize the bbox classify loop — even with branchless
+  `&` pattern, LLVM optimizes back to conditional jumps. The `push()`
+  side effect prevents vectorization entirely.
+
+  **Codegen finding:** explicit AVX2 intrinsics are the only path.
+  However, the bbox classify loop is only ~6.5s at Europe scale
+  (500K blobs × 8000 nodes × ~5 cycles). SIMD 8-wide would save ~5s
+  — **2.8% of total Europe extract time**. Not worth the complexity
+  (unsafe intrinsics, target_feature gates, non-AVX2 fallback) for
+  this specific loop alone.
+
+  SIMD becomes worthwhile when:
+  - The classify loop is a larger fraction of runtime (after write-path
+    optimization makes classify the bottleneck)
+  - Multiple consumers use columnar arrays (multi-region, polygon PIP)
+  - Batch varint decode in protohoggr (different SIMD target, broader
+    impact across all commands)
+
+  Varint SIMD research (notes/SIMD.md) previously closed — scalar beats
+  SIMD for individual LEB128 varints. Batch varint decode into contiguous
+  arrays is a different problem (columnar enables this).
 
 **Milestone C: hardware-level tuning (where perf counters justify it)**
 

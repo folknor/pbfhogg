@@ -208,6 +208,32 @@ Coverage: all `parallel_classify_phase` workers, `pread_execute` workers,
 sequential BlobReader loops (node_stats, tags_count). Every
 PrimitiveBlock construction path uses scratch.
 
+### Columnar decode codegen analysis (commit e0b0780)
+
+Assembly inspection (`RUSTFLAGS="-C target-cpu=native" --emit=asm`)
+of `collect_matching_ids_bbox` confirms:
+- **No autovectorization.** LLVM emits pure scalar: 4× `cmpl` + `jg`/`jl`
+  conditional jumps per element. No `vpcmpgtd` or `vpand`.
+- **Branchless `&` trick undone by LLVM.** The `(cmp) as u8 & (cmp) as u8`
+  pattern is optimized back to short-circuit conditional jumps. LLVM
+  sees through the `as u8` conversion.
+- **`out.push(ids[i])` prevents vectorization.** The conditional push
+  involves potential Vec reallocation — LLVM can't speculate past it.
+
+Conclusion: explicit AVX2 intrinsics are the only path to vectorization
+for this loop. However, the theoretical max gain is small:
+- 8000 nodes × 500K blobs × ~5 cycles/element = ~6.5s total
+- SIMD 8-wide would reduce to ~1s → saving ~5.5s
+- Out of 198s Europe complete: **2.8% max improvement**
+- Not worth the complexity (unsafe intrinsics, target_feature gates,
+  fallback paths for non-AVX2) for 2.8%.
+
+The columnar architecture is the right foundation — the win comes
+when the classify loop is a larger fraction of total time (e.g., if
+the write path is optimized and classify becomes the bottleneck),
+or when we add more consumers that benefit from contiguous arrays
+(multi-region classification, polygon PIP).
+
 ### Step 1a: Pre-reserve buffer capacity — DONE
 
 Added `buf.reserve((st_entries.len() + group_entries.len()) * 8)` before

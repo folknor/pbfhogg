@@ -3,16 +3,16 @@
 //! Single-pass sequential scan: assigns new IDs starting from configurable values
 //! and remaps all cross-references (way→node, relation→node/way/relation).
 
-use std::collections::HashMap;
 use std::path::Path;
 
 use super::{
     dense_node_metadata, element_metadata, ensure_node_capacity, ensure_relation_capacity,
     ensure_way_capacity, flush_block, require_sorted, writer_from_header, HeaderOverrides, Result,
 };
+use crate::blob::DecompressPool;
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::Compression;
-use crate::{Element, ElementReader, MemberId};
+use crate::{Element, MemberId};
 
 /// Configuration for the renumber command.
 pub struct RenumberOptions {
@@ -52,18 +52,21 @@ pub fn renumber(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
-    let reader = ElementReader::open(input, direct_io)?;
-    require_sorted(reader.header(), input, "Input PBF")?;
-    super::warn_locations_on_ways_loss(reader.header());
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = blob_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    require_sorted(&header, input, "Input PBF")?;
+    super::warn_locations_on_ways_loss(&header);
 
-    let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| {
+    let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
     let mut bb = BlockBuilder::new();
 
-    let mut node_map: HashMap<i64, i64> = HashMap::new();
-    let mut way_map: HashMap<i64, i64> = HashMap::new();
-    let mut relation_map: HashMap<i64, i64> = HashMap::new();
+    let mut node_map: rustc_hash::FxHashMap<i64, i64> = rustc_hash::FxHashMap::default();
+    let mut way_map: rustc_hash::FxHashMap<i64, i64> = rustc_hash::FxHashMap::default();
+    let mut relation_map: rustc_hash::FxHashMap<i64, i64> = rustc_hash::FxHashMap::default();
 
     let mut next_node_id = opts.start_node_id;
     let mut next_way_id = opts.start_way_id;
@@ -76,10 +79,15 @@ pub fn renumber(
     };
 
     let mut refs_buf: Vec<i64> = Vec::new();
+    let decompress_pool = DecompressPool::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    let blocks = reader.into_blocks_pipelined();
-    for block in blocks {
-        let block = block?;
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
         let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {

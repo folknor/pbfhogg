@@ -1,14 +1,3 @@
-// Optional allocator overrides. Benchmarked on Denmark (483 MB): both jemalloc and
-// mimalloc showed <1% wall time difference vs the system allocator. Kept as opt-in
-// features for consumers who want lower RSS at planet scale.
-#[cfg(feature = "jemalloc")]
-#[global_allocator]
-static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc_crate::MiMalloc = mimalloc_crate::MiMalloc;
-
 use std::path::PathBuf;
 use std::process;
 
@@ -423,6 +412,9 @@ enum Command {
         /// Extended scan: timestamp range, data bbox, metadata coverage, ordering
         #[arg(short, long)]
         extended: bool,
+        /// Show a single element by type/ID (e.g. "n123", "w456", "r789")
+        #[arg(long, value_name = "TYPE_ID")]
+        show: Option<String>,
         /// Get a single value by key path (e.g. "header.bbox", "data.timestamp.first")
         #[arg(short, long, value_name = "KEY")]
         get: Option<String>,
@@ -1004,6 +996,7 @@ fn main() {
             locations,
             anomalies,
             extended,
+            show,
             get,
             json,
             io,
@@ -1034,6 +1027,9 @@ fn main() {
                 )
             } else {
                 let file = file.ok_or("Input PBF file is required")?;
+                if let Some(ref show_id) = show {
+                    return run_show_element(&file, show_id, io.direct_io);
+                }
                 run_inspect(
                     &file,
                     indexed,
@@ -1994,6 +1990,57 @@ fn days_from_civil(year: i32, month: u32, day: u32) -> i64 {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146_097 + doe - 719_468
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn run_show_element(
+    path: &std::path::Path,
+    spec: &str,
+    direct_io: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let (elem_type, id) = parse_element_spec(spec)?;
+    let found = pbfhogg::inspect::show_element(path, elem_type, id, direct_io)?;
+    if !found {
+        eprintln!("Element not found: {spec}");
+        process::exit(1);
+    }
+    Ok(())
+}
+
+/// Parse "n123", "w456", "r789", "node/123", "way/456", "relation/789".
+fn parse_element_spec(
+    spec: &str,
+) -> Result<(pbfhogg::inspect::ShowElementType, i64), Box<dyn std::error::Error>> {
+    use pbfhogg::inspect::ShowElementType;
+
+    let (type_str, id_str) = if let Some(rest) = spec.strip_prefix("node/") {
+        ("n", rest)
+    } else if let Some(rest) = spec.strip_prefix("way/") {
+        ("w", rest)
+    } else if let Some(rest) = spec.strip_prefix("relation/") {
+        ("r", rest)
+    } else if spec.starts_with('n') || spec.starts_with('w') || spec.starts_with('r') {
+        spec.split_at(1)
+    } else {
+        return Err(format!(
+            "invalid element spec '{spec}': expected n<id>, w<id>, r<id>, \
+             node/<id>, way/<id>, or relation/<id>"
+        )
+        .into());
+    };
+
+    let id: i64 = id_str
+        .parse()
+        .map_err(|_| format!("invalid ID in '{spec}': '{id_str}' is not an integer"))?;
+
+    let elem_type = match type_str {
+        "n" => ShowElementType::Node,
+        "w" => ShowElementType::Way,
+        "r" => ShowElementType::Relation,
+        _ => unreachable!(),
+    };
+
+    Ok((elem_type, id))
 }
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]

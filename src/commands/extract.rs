@@ -1108,8 +1108,8 @@ fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
 ///
 /// The closure captures the caller's ID sets and clean reference.
 /// Blob descriptor for pread schedule.
+#[derive(Clone, Copy)]
 struct BlobDesc {
-    seq: usize,
     /// Byte offset of the 4-byte frame length prefix (start of the entire blob frame).
     frame_offset: u64,
     /// Total size of the blob frame (4-byte len + header + blob body).
@@ -1143,7 +1143,6 @@ fn build_blob_schedule_with_passthrough(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut schedule = Vec::new();
-    let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -1163,8 +1162,7 @@ fn build_blob_schedule_with_passthrough(
 
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (data_offset - frame_offset) as usize + data_size;
-        schedule.push(BlobDesc { seq, frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, count, raw_passthrough });
-        seq += 1;
+        schedule.push(BlobDesc { frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, count, raw_passthrough });
     }
     Ok(schedule)
 }
@@ -1226,7 +1224,6 @@ where
         });
 
         // Workers: pread → decompress → PrimitiveBlock → extract → OwnedBlocks.
-        // For raw_passthrough blobs: pread → decompress → frame_raw_block (no PrimitiveBlock).
         for _ in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
             let tx = result_tx.clone();
@@ -1781,9 +1778,7 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_NODE_CLASSIFY_END");
     // bbox_node_ids frozen. Write matching nodes via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_NODE_WRITE_START");
-    let node_descs: Vec<BlobDesc> = node_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: d.raw_passthrough, frame_offset: d.frame_offset, frame_size: d.frame_size })
-        .collect();
+    let node_descs: Vec<BlobDesc> = node_schedule.iter().map(|d| **d).collect();
     {
         let ids = ExtractPass2IdSets {
             bbox_node_ids: &bbox_node_ids,
@@ -1883,8 +1878,8 @@ fn extract_simple_single_pass(
     crate::debug::emit_marker("SIMPLE_WAY_CLASSIFY_END");
     // matched_way_ids frozen. Write matching ways via pread-from-workers.
     crate::debug::emit_marker("SIMPLE_WAY_WRITE_START");
-    let way_descs: Vec<BlobDesc> = way_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+    let way_descs: Vec<BlobDesc> = way_schedule.iter()
+        .map(|d| BlobDesc { raw_passthrough: false, ..**d })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -1931,8 +1926,8 @@ fn extract_simple_single_pass(
     }
     crate::debug::emit_marker("SIMPLE_REL_CLASSIFY_END");
     crate::debug::emit_marker("SIMPLE_REL_WRITE_START");
-    let rel_descs: Vec<BlobDesc> = relation_schedule.iter().enumerate()
-        .map(|(i, d)| BlobDesc { seq: i, offset: d.offset, size: d.size, kind: d.kind, bbox: d.bbox, count: d.count, raw_passthrough: false, frame_offset: d.frame_offset, frame_size: d.frame_size })
+    let rel_descs: Vec<BlobDesc> = relation_schedule.iter()
+        .map(|d| BlobDesc { raw_passthrough: false, ..**d })
         .collect();
     {
         let ids = ExtractPass2IdSets {
@@ -2662,32 +2657,6 @@ fn extract_block_pass3(
         }
     }
     Ok(stats)
-}
-
-/// Process a batch of blocks in parallel for Pass 3 of smart extraction.
-fn process_extract_pass3_batch(
-    batch: &[PrimitiveBlock],
-    ids: &ExtractPass3IdSets<'_>,
-    clean: &CleanAttrs,
-    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
-    stats: &mut ExtractStats,
-) -> Result<()> {
-    type BatchResult = std::result::Result<(Vec<OwnedBlock>, ExtractStats), String>;
-    let results: Vec<BatchResult> = batch
-        .par_iter()
-        .map_init(
-            BlockBuilder::new,
-            |bb, block| {
-                let mut output: Vec<OwnedBlock> = Vec::new();
-                let block_stats = extract_block_pass3(block, ids, clean, bb, &mut output)?;
-                flush_local(bb, &mut output)?;
-                Ok((output, block_stats))
-            },
-        )
-        .collect();
-
-    drain_batch_results(results, writer, |s| merge_extract_stats(stats, &s))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

@@ -484,32 +484,8 @@ impl Blob {
             .and_then(|d| crate::blob_index::TagIndex::deserialize(d))
     }
 
-    /// Like [`to_primitiveblock`](Self::to_primitiveblock), but reuses decompression buffers
-    /// from a [`DecompressPool`]. Used by the pipeline for buffer reuse.
-    pub(crate) fn to_primitiveblock_pooled(
-        &self,
-        pool: &Arc<DecompressPool>,
-    ) -> Result<PrimitiveBlock> {
-        decompress_blob(&self.blob, Some(pool)).and_then(PrimitiveBlock::new)
-    }
-
-    /// Decompress and construct PrimitiveBlock with inline string table entries.
-    ///
-    /// Eliminates cross-thread `Box<[(u32, u32)]>` allocations by appending the
-    /// entry table directly into the decompressed buffer. Uses pool for buffer
-    /// recycling — prevents both Box retention AND decompressed Vec retention.
-    pub(crate) fn to_primitiveblock_inline(
-        &self,
-        pool: &Arc<DecompressPool>,
-    ) -> Result<PrimitiveBlock> {
-        #[allow(clippy::cast_sign_loss)]
-        let capacity = self.blob.raw_size.unwrap_or(0).max(0) as usize;
-        let mut buf = pool_get(Some(pool), capacity);
-        decompress_parsed_blob_into(&self.blob, &mut buf)?;
-        PrimitiveBlock::from_vec_pooled(buf, pool)
-    }
-
-    /// Like [`to_primitiveblock_inline`] but reuses caller-provided scratch buffers
+    /// Decompress and construct PrimitiveBlock with inline string table entries,
+    /// reusing caller-provided scratch buffers
     /// for `parse_and_inline`. Used by the pipelined reader with thread-local scratch
     /// to avoid per-blob `Vec<(u32, u32)>` allocations in rayon decode tasks.
     pub(crate) fn to_primitiveblock_inline_with_scratch(
@@ -1228,23 +1204,8 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
 
 /// Parse already-decompressed bytes into a [`PrimitiveBlock`].
 ///
-/// This variant accepts `&[u8]` for convenience but must copy the bytes
-/// internally. If you already have a `Vec<u8>` or `Bytes`, prefer
-/// [`parse_primitive_block_from_bytes_owned`] to avoid the copy.
-pub(crate) fn parse_primitive_block_from_bytes(raw: &[u8]) -> Result<crate::PrimitiveBlock> {
-    crate::PrimitiveBlock::new(Bytes::copy_from_slice(raw))
-}
-
-/// Zero-copy variant of [`parse_primitive_block_from_bytes`].
-///
-/// Accepts a `Bytes` value directly, avoiding the copy that the `&[u8]`
-/// variant must perform. Use `Bytes::from(vec)` to wrap a `Vec<u8>` in
-/// O(1).
-///
-/// Named `_owned` rather than `_from_bytes` to avoid confusion with the
-/// existing `parse_primitive_block_from_bytes` which already has
-/// `from_bytes` in its name. The `_owned` suffix signals that this
-/// variant takes ownership of the buffer.
+/// Accepts a `Bytes` value directly. Use `Bytes::from(vec)` to wrap a
+/// `Vec<u8>` in O(1).
 pub(crate) fn parse_primitive_block_from_bytes_owned(raw: &Bytes) -> Result<crate::PrimitiveBlock> {
     crate::PrimitiveBlock::new(raw.clone())
 }

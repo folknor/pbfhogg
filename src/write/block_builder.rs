@@ -1242,7 +1242,6 @@ fn encode_way<'t>(
 /// Uses three packed buffers in a single zip loop for refs/lat/lon to avoid
 /// iterating the data three separate times.
 #[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
 fn encode_way_with_locations<'t>(
     string_table: &mut StringTable,
     group_buf: &mut Vec<u8>,

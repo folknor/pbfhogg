@@ -7,7 +7,7 @@
 //! can operate on directly, enabling autovectorization and better cache
 //! utilization vs element-by-element iteration.
 
-use super::wire::{Cursor, PackedSint64Iter, WireDenseNodes};
+use super::wire::{PackedSint64Iter, WireDenseNodes};
 
 /// Decoded dense node columns — contiguous arrays of IDs and coordinates.
 ///

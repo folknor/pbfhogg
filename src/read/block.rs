@@ -436,18 +436,6 @@ impl PrimitiveBlock {
     }
 
     /// Like [`from_vec`] but wraps the buffer with pool recycling.
-    /// On drop, the Vec returns to the DecompressPool instead of being freed.
-    /// This eliminates cross-thread Vec retention in the pipelined reader.
-    pub(crate) fn from_vec_pooled(
-        mut buffer: Vec<u8>,
-        pool: &std::sync::Arc<crate::blob::DecompressPool>,
-    ) -> Result<PrimitiveBlock> {
-        let mut st_scratch = Vec::new();
-        let mut gr_scratch = Vec::new();
-        Self::from_vec_pooled_with_scratch(buffer, pool, &mut st_scratch, &mut gr_scratch)
-    }
-
-    /// Like [`from_vec_pooled`] but reuses caller-provided scratch buffers
     /// for `parse_and_inline`. Workers in `parallel_classify_phase` call this
     /// with loop-local scratch to avoid per-block allocation.
     pub(crate) fn from_vec_pooled_with_scratch(
@@ -522,28 +510,6 @@ impl PrimitiveBlock {
     /// coordinates, refs, and tags.
     pub fn elements_skip_metadata(&self) -> BlockElementsIter<'_> {
         BlockElementsIter::new_skip_metadata(&self.block)
-    }
-
-    /// Returns the raw protobuf bytes of a PrimitiveGroup by index.
-    /// Used by raw group passthrough to copy all-match groups without re-encoding.
-    pub(crate) fn raw_group_bytes(&self, index: usize) -> &[u8] {
-        self.block.group(index)
-    }
-
-    /// Returns the number of PrimitiveGroups in this block.
-    pub(crate) fn group_count(&self) -> usize {
-        self.block.group_count()
-    }
-
-    /// Returns the raw StringTable protobuf bytes (field 1 of PrimitiveBlock).
-    /// Used by raw group passthrough to copy the string table into output blocks.
-    pub(crate) fn raw_stringtable_bytes(&self) -> &[u8] {
-        self.block.raw_stringtable()
-    }
-
-    /// Returns the scalar fields needed to reconstruct a PrimitiveBlock frame.
-    pub(crate) fn block_scalars(&self) -> (i32, i64, i64, i32) {
-        (self.block.granularity, self.block.lat_offset, self.block.lon_offset, self.block.date_granularity)
     }
 
     /// Returns the number of entries in this block's string table.

@@ -251,12 +251,10 @@ from simple extract applies to any sequential collection pass:
   extract. Callers with custom filtering (spatial, tagdata) keep their
   own schedule builders. Flagged by 1/10 reviewers.
 
-- [ ] **tags-filter pass 1 not exploiting blob-level tag index** — the
-  schedule builder only uses `idx.kind` for type domination
-  (`tags_filter.rs` ~line 588-603). It doesn't apply `tagdata` filtering,
-  even though `blob_filter_from_expressions()` already computes
-  key/prefix filters. Blobs that provably lack required tag keys could
-  be skipped without decompression. Flagged by 2/10 reviewers.
+- [x] **tags-filter pass 1 blob-level tag index** — done in commit
+  `b7ef585`. Pass 1 schedule builder uses `tagdata` filtering to skip
+  blobs whose tag index provably lacks required tag keys. Flagged by
+  2/10 reviewers.
 
 - [x] **`collect_relation_member_closure` early return on empty set** —
   call site guarded by `has_included_relation` check. Skips schedule
@@ -416,6 +414,17 @@ hardware-level tuning. Investigate allocators and columnar together as
 Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
 
 **Milestone A: data layout + allocation (investigate together)**
+
+- [ ] **Global allocator investigation** — jemalloc and mimalloc were
+  previously benchmarked at <1% wall time difference on Denmark (483 MB)
+  and removed as CLI features (they broke `--all-features` builds due to
+  duplicate `#[global_allocator]` definitions). Re-investigate at planet
+  scale where allocator behavior under cross-thread free patterns and
+  high churn may differ. Meta/Facebook has restarted active jemalloc
+  development — revisit `tikv-jemallocator` and `mimalloc` when the
+  arena/scratch work is complete and the remaining alloc profile is
+  clearer. Measure RSS and wall time on planet add-locations-to-ways,
+  merge, and build-geocode-index.
 
 - [ ] **1. Custom allocators (per-block arena)** — 4/6 reviewers ranked 1st.
   See [notes/arena-allocator-research.md](notes/arena-allocator-research.md)

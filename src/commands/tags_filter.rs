@@ -756,10 +756,10 @@ fn tags_filter_two_pass(
     };
 
     // pread-from-workers: parallel decode + filter + write with reorder buffer.
-    // No raw passthrough — tag-based all-match detection requires per-element
-    // ID verification (count_in_range is unsound due to extraneous IDs from
-    // other blobs inflating the count). Pread workers are kept for planet
-    // safety (no cross-thread PrimitiveBlock retention).
+    // No raw passthrough — tag-based all-match detection requires a per-blob
+    // wire-format ID scanner (see TODO.md "Tags-filter raw passthrough via
+    // lightweight ID scanner"). Pread workers are kept for planet safety
+    // (no cross-thread PrimitiveBlock retention).
     {
     use std::os::unix::fs::FileExt as _;
 

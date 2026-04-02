@@ -66,11 +66,13 @@ decode them to check coordinates. If way blobs also had spatial
 bboxes (computed from their node coordinates during ALTW), a spatial
 index over way blobs would enable direct spatial queries for ways.
 
-This is more impactful: way classification currently requires
-decoding all way blobs to check if any refs are in the node ID set.
-With spatial bboxes on way blobs, we could skip way blobs whose
-bbox doesn't intersect the query region — potentially skipping
-50-80% of way blobs for small extract regions.
+However, way IDs are chronological (not geographic), so way blob
+bboxes would be large — recent-ID blobs span most of the mapped world.
+Estimated skip rates: ~30% for Denmark, ~45% for Copenhagen, not the
+50-80% one might hope for. Geography-sorted way blobs (Hilbert curve)
+would give 90%+ skip but breaks Sort.Type_then_ID ordering. See
+[way-blob-bbox-speculation.md](way-blob-bbox-speculation.md) for the
+full analysis.
 
 ### 4. Multi-region classification
 
@@ -237,10 +239,10 @@ entirely for blobs outside the extract region — no decompression needed.
 | Extract Copenhagen from planet | 0.5s scan + 100s decode | 0.001s lookup + 100s decode | 0.5% |
 | 1000 small extracts from planet | 500s scan + 100Ks decode | 1s lookup + 100Ks decode | marginal |
 | Multi-extract 100 regions | 0.5s scan × 100 | 0.1s total | 99.8% scan reduction |
-| Way spatial skip (with way bboxes) | decode all way blobs | skip 50-80% | 50-80% decode reduction |
+| Way spatial skip (with way bboxes) | decode all way blobs | skip ~30% (Denmark) | ~30% decode reduction |
 
-**The big win is way blob spatial skip**, not the node blob lookup.
-Node blob spatial skip is already fast via sequential header scan.
-Way blobs currently have no spatial information — adding bboxes to
-way blobs (during ALTW or cat) and including them in the spatial
-index would be the transformative change.
+Way blob spatial skip is limited by chronological ID ordering — see
+[way-blob-bbox-speculation.md](way-blob-bbox-speculation.md). The
+transformative change would be geography-sorted way blobs (90%+ skip)
+but that breaks Sort.Type_then_ID. Multi-extract benefits most
+(per-region selectivity compounds across many regions).

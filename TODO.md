@@ -638,10 +638,11 @@ per-iteration allocations remain across the codebase, ordered by impact:
 - [ ] Spatial indexing in PBF format (R-tree over blob offsets for
   O(log N) spatial queries on planet files).
   See [notes/spatial-index-in-pbf.md](notes/spatial-index-in-pbf.md)
-  for analysis. Key finding: node blob header scan is already fast
-  (~0.5s planet). The real win is **way blob spatial bboxes** — with
-  bboxes on way blobs (from ALTW), 50-80% of way blobs could be
-  skipped without decompression during extract.
+  and [notes/way-blob-bbox-speculation.md](notes/way-blob-bbox-speculation.md).
+  Node blob header scan is already fast (~0.5s planet). Way blob spatial
+  bboxes are limited by chronological ID ordering (~30% skip for Denmark,
+  not 50-80%). Geography-sorted way blobs (Hilbert curve) would give
+  90%+ skip but breaks Sort.Type_then_ID. Multi-extract benefits most.
 - [ ] Streaming pipeline composition (pipe commands without intermediate
   PBF encode/decode — library-level iterator API).
   See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md)

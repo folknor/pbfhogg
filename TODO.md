@@ -631,10 +631,24 @@ per-iteration allocations remain across the codebase, ordered by impact:
   rebuild (better query perf, proportional to diff size).
 - [ ] Incremental extract update (`extract --apply-changes` — base extract + OSC +
   region → updated extract without re-reading planet).
+  See [notes/incremental-extract.md](notes/incremental-extract.md)
+  for 4 approaches. Recommended: apply-changes on region extract +
+  re-extract to filter (approach 3). ~10s vs 862s. Needs
+  `--allow-missing` flag for apply-changes.
 - [ ] Spatial indexing in PBF format (R-tree over blob offsets for
   O(log N) spatial queries on planet files).
+  See [notes/spatial-index-in-pbf.md](notes/spatial-index-in-pbf.md)
+  for analysis. Key finding: node blob header scan is already fast
+  (~0.5s planet). The real win is **way blob spatial bboxes** — with
+  bboxes on way blobs (from ALTW), 50-80% of way blobs could be
+  skipped without decompression during extract.
 - [ ] Streaming pipeline composition (pipe commands without intermediate
   PBF encode/decode — library-level iterator API).
+  See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md)
+  for analysis. Key finding: the codebase already does the most valuable
+  composition (inline indexdata in all write paths). Multi-pass commands
+  (ALTW, extract, geocode) can't consume streams. Limited practical
+  benefit beyond what exists.
 - [ ] Zstd as default compression for internal pipelines (3-5x faster
   decompress than zlib at equivalent ratios).
 - [ ] Dense ALTW compact rank-indexed array (same pattern as geocode builder —

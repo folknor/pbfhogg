@@ -23,13 +23,13 @@ fn write_minimal_pbf(path: &Path) {
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
-    bb.add_node(1, 100_000_000, 200_000_000, &[("name", "test")], None);
-    bb.add_node(2, 110_000_000, 210_000_000, &[], None);
+    bb.add_node(1, 100_000_000, 200_000_000, [("name", "test")], None);
+    bb.add_node(2, 110_000_000, 210_000_000, std::iter::empty(), None);
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
-    bb.add_way(10, &[("highway", "path")], &[1, 2], None);
+    bb.add_way(10, [("highway", "path")], &[1, 2], None);
     if let Some(bytes) = bb.take().expect("take") {
         writer.write_primitive_block(bytes).expect("write block");
     }

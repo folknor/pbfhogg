@@ -78,7 +78,7 @@ fn parse_way_refs(
 
     while let Some((field, wire_type)) = cursor.read_tag()? {
         match (field, wire_type) {
-            (1, WIRE_VARINT) => { way_id = cursor.read_varint()? as i64; }
+            (1, WIRE_VARINT) => { way_id = cursor.read_varint_i64()?; }
             (8, WIRE_LEN) => { refs_data = Some(cursor.read_len_delimited()?); }
             _ => { cursor.skip_field(wire_type)?; }
         }

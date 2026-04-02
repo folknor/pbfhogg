@@ -252,10 +252,9 @@ from simple extract applies to any sequential collection pass:
   call site guarded by `has_included_relation` check. Skips schedule
   building + file open when no relations matched. Flagged by 1/10.
 
-- [ ] **`way_scanner` way_id parsing inconsistency** — line 80 uses
-  `read_varint()? as i64` while canonical WireWay uses
-  `read_varint_i64()`. Identical for positive IDs (all real OSM data)
-  but inconsistent. Flagged by 1/10 reviewers.
+- [x] **`way_scanner` way_id parsing inconsistency** — fixed: uses
+  `read_varint_i64()` consistent with canonical WireWay. Flagged by
+  1/10 reviewers.
 
 - [ ] **Simple extract node_scanner skips non-dense Node messages** —
   `node_scanner.rs` only parses DenseNodes (line 15, 43). On legacy
@@ -263,8 +262,8 @@ from simple extract applies to any sequential collection pass:
   cascading into missing ways and relations. Not reachable in practice
   (all modern PBFs use DenseNodes). Flagged by 1/10 reviewers.
 
-- [ ] **Duplicate comment in extract.rs** — lines 2091-2092 have
-  "--- Pass 3: Write matching elements..." twice. Flagged by 1/10.
+- [x] **Duplicate comment in extract.rs** — removed duplicate Pass 3
+  comment. Flagged by 1/10.
 
 ### Smaller items
 
@@ -630,7 +629,8 @@ FxHash, pass fusion, clone/alloc cleanup) to other commands.
   no cloning. Batch slot dispatch is enum-based. Already well optimized.
 
 **inspect** (verified — already optimized):
-- [ ] `elements_skip_metadata()` in `--locations` without `--extended`: minor, deferred.
+- [x] `elements_skip_metadata()` in `--locations` without `--extended`: done.
+  Also converted `scan_data_blob` to `new_with_scratch` for scratch buffer reuse.
   Index-only fast path already skips decompression for the common case.
 - [x] Audit: `inspect tags` uses FxHashMap for counting (tags_count.rs). No std hash
   in hot paths.

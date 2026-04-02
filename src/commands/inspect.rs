@@ -5,7 +5,7 @@ use std::path::Path;
 
 use super::{read_blob_header_only, read_raw_frame};
 use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data_into, parse_primitive_block_from_bytes,
+    decode_blob_to_headerblock, decompress_blob_data_into,
     BlobKind,
 };
 use crate::blob_index::ElemKind;
@@ -662,6 +662,8 @@ fn full_decode_scan(
     let mut accum = BlockAccum::new(show_blocks);
     let mut block_number = 0u32;
     let mut state = ScanState::new(show_id_ranges, show_locations, extended);
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     while let Some(frame) = read_raw_frame(&mut reader, &mut offset)? {
         match frame.blob_type {
@@ -675,7 +677,7 @@ fn full_decode_scan(
                     indexed_blobs += 1;
                 }
                 block_number += 1;
-                scan_data_blob(&frame, &mut decompress_buf, &mut state, block_number, &mut accum)?;
+                scan_data_blob(&frame, &mut decompress_buf, &mut st_scratch, &mut gr_scratch, &mut state, block_number, &mut accum)?;
             }
             BlobKind::Unknown(_) => {}
         }
@@ -716,6 +718,8 @@ fn full_decode_scan(
 fn scan_data_blob(
     frame: &super::RawBlobFrame,
     decompress_buf: &mut Vec<u8>,
+    st_scratch: &mut Vec<(u32, u32)>,
+    gr_scratch: &mut Vec<(u32, u32)>,
     state: &mut ScanState,
     block_number: u32,
     accum: &mut BlockAccum,
@@ -725,21 +729,36 @@ fn scan_data_blob(
 
     decompress_blob_data_into(frame.blob_bytes(), decompress_buf)?;
     let raw_size = decompress_buf.len();
-    let block = parse_primitive_block_from_bytes(decompress_buf)?;
+    let block = crate::block::PrimitiveBlock::new_with_scratch(
+        bytes::Bytes::copy_from_slice(decompress_buf),
+        st_scratch,
+        gr_scratch,
+    )?;
 
     let mut has_nodes = false;
     let mut has_ways = false;
     let mut has_relations = false;
     let mut block_elements = 0u64;
 
-    for element in block.elements() {
-        block_elements += 1;
-        let (n, w, r) = state.process_element(&element);
-        has_nodes |= n;
-        has_ways |= w;
-        has_relations |= r;
-        if let Some(ref mut ext) = state.extended {
-            update_extended_for_element(ext, &element);
+    let need_metadata = state.extended.is_some();
+    if need_metadata {
+        for element in block.elements() {
+            block_elements += 1;
+            let (n, w, r) = state.process_element(&element);
+            has_nodes |= n;
+            has_ways |= w;
+            has_relations |= r;
+            if let Some(ref mut ext) = state.extended {
+                update_extended_for_element(ext, &element);
+            }
+        }
+    } else {
+        for element in block.elements_skip_metadata() {
+            block_elements += 1;
+            let (n, w, r) = state.process_element(&element);
+            has_nodes |= n;
+            has_ways |= w;
+            has_relations |= r;
         }
     }
 

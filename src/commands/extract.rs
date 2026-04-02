@@ -2520,7 +2520,6 @@ fn extract_smart(
 
     crate::debug::emit_marker("EXTRACT_PASS2_END");
 
-    // --- Pass 3: Write matching elements in file order ---
     // --- Pass 3: Write matching elements via pread-from-workers ---
     crate::debug::emit_marker("EXTRACT_PASS3_START");
 

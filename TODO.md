@@ -125,6 +125,16 @@ For renumber/time-filter: every element is modified, so raw passthrough
 does not apply — the win here is write-path throughput instead.
 See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
 
+Four per-group raw passthrough primitives are committed as scaffolding
+for partial-match blobs (e.g., extract boundary blobs where some groups
+match and some don't). Currently unused — blob-level passthrough handles
+the common case. See `notes/raw-group-passthrough.md` "Infrastructure":
+- `PrimitiveBlock::raw_group_bytes(index)` — raw PrimitiveGroup bytes
+- `PrimitiveBlock::raw_stringtable_bytes()` — raw StringTable bytes
+- `PrimitiveBlock::block_scalars()` — granularity, lat/lon offset
+- `frame_raw_block()` in `src/write/raw_passthrough.rs` — assemble
+  PrimitiveBlock from raw components
+
 ### Write-path throughput
 
 After raw group passthrough, `BlockBuilder` (`src/write/block_builder.rs`)

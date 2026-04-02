@@ -512,6 +512,36 @@ impl PrimitiveBlock {
         BlockElementsIter::new_skip_metadata(&self.block)
     }
 
+    /// Returns the raw protobuf bytes of a PrimitiveGroup by index.
+    /// Scaffolding for future per-group raw passthrough — see
+    /// `notes/raw-group-passthrough.md` and `frame_raw_block` in
+    /// `src/write/raw_passthrough.rs`.
+    #[allow(dead_code)]
+    pub(crate) fn raw_group_bytes(&self, index: usize) -> &[u8] {
+        self.block.group(index)
+    }
+
+    /// Returns the number of PrimitiveGroups in this block.
+    /// Scaffolding for future per-group raw passthrough.
+    #[allow(dead_code)]
+    pub(crate) fn group_count(&self) -> usize {
+        self.block.group_count()
+    }
+
+    /// Returns the raw StringTable protobuf bytes (field 1 of PrimitiveBlock).
+    /// Scaffolding for future per-group raw passthrough.
+    #[allow(dead_code)]
+    pub(crate) fn raw_stringtable_bytes(&self) -> &[u8] {
+        self.block.raw_stringtable()
+    }
+
+    /// Returns the scalar fields needed to reconstruct a PrimitiveBlock frame.
+    /// Scaffolding for future per-group raw passthrough.
+    #[allow(dead_code)]
+    pub(crate) fn block_scalars(&self) -> (i32, i64, i64, i32) {
+        (self.block.granularity, self.block.lat_offset, self.block.lon_offset, self.block.date_granularity)
+    }
+
     /// Returns the number of entries in this block's string table.
     pub fn string_table_len(&self) -> usize {
         self.block.stringtable.len()

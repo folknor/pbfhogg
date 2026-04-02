@@ -67,6 +67,9 @@ is the predicted next victim (16 GB DenseMmapIndex + 25 GB retention = OOM).
 See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
+See [notes/pipelined-reader-retention.md](notes/pipelined-reader-retention.md)
+for the April 2026 audit: 6 remaining paths, renumber and cat --type are
+the production-relevant ones still using `into_blocks_pipelined`.
 
 ## ALTW external join — COMPLETE
 
@@ -141,10 +144,20 @@ After raw group passthrough, `BlockBuilder` (`src/write/block_builder.rs`)
 and `PbfWriter` (`src/write/writer.rs`) are the next bottleneck for commands
 that must re-encode partial-match groups. Opportunities: SIMD varint encoding
 in `src/write/wire.rs` (the write-side protobuf primitives), zlib compression
-level tuning (currently hardcoded level 6), and reducing per-element overhead
-in `BlockBuilder::add_node/add_way/add_relation` (string table construction
+level tuning, and reducing per-element overhead in
+`BlockBuilder::add_node/add_way/add_relation` (string table construction
 is the hot path — FxHashMap lookup + Rc<str> alloc per unique string).
 See [notes/SIMD.md](notes/SIMD.md) for the varint research.
+
+**Zlib level tuning:** default is level 6 (matches osmium). Code audit
+confirms the write path is well-optimized — BlockBuilder uses direct
+wire-format encoding with scratch buffers, dual-buffer single-pass tag
+encoding. The remaining CPU goes to zlib compression in rayon workers.
+Level 1-3 could save 30-60% compression CPU for pipeline-internal PBFs.
+zstd level 3 is strictly better for internal pipelines (3-5x faster
+decompress). See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md)
+for the analysis. Benchmark needed: `brokkr cat --compression zlib:1`
+vs `zlib:6` vs `zstd:3` on Denmark/Europe.
 
 ### Published benchmark matrix
 
@@ -344,6 +357,8 @@ input or --clean. Verified via `brokkr verify multi-extract`.
   not a pbfhogg bug. Pre-existing since multi-extract shipped.
 
 **v2 improvements:**
+See [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
+for full analysis of 6 optimization opportunities.
 
 - [ ] **Parallel decode** — convert sequential BlobReader to
   pread-from-workers within each phase. Workers classify against N
@@ -352,6 +367,9 @@ input or --clean. Verified via `brokkr verify multi-extract`.
   at small scale (Japan 34.9s vs 5 × 4.4s = 22s sequential) because
   sequential gets parallel decode per-region. At planet scale with
   10+ regions, the I/O savings (1× vs 10×) dominate.
+  See [notes/multi-extract-parallel-write-plan.md](notes/multi-extract-parallel-write-plan.md)
+  for the 5-step implementation plan: extract write loop, build schedule,
+  pread-from-workers, raw passthrough, sync vs pipelined writers.
 - [ ] **Spatial index** — grid or R-tree over regions for O(1)
   per-element lookup instead of O(N). Required for 200+ regions where
   linear scan becomes the bottleneck. Simple grid (3600×1800 cells of
@@ -378,14 +396,16 @@ The export command would iterate elements, resolve geometry (points for
 nodes, linestrings for ways, polygons for multipolygon relations), and
 write GeoJSON features to stdout or a file. Tag mapping (which tags
 become GeoJSON properties) needs a configuration model.
+See [notes/geojson-export-design.md](notes/geojson-export-design.md)
+for the v1 design: GeoJSONSeq from ALTW-enriched PBFs, streaming
+single-pass, tag expression and bbox filtering.
 
 ### Command surface
 
-- [ ] `inspect --show <id>` — display a single element by ID with all
-  metadata, tags, refs, members. Fits naturally alongside existing
-  `--nodes`, `--indexed`, `--locations` flags rather than a separate
-  `show` command. Needs indexed lookup via `IndexedReader` or sequential
-  scan with early exit.
+- [x] `inspect --show <id>` — display a single element by ID with all
+  metadata, tags, refs, members. Uses blob-level indexdata to skip
+  non-matching blobs, early exit on sorted PBFs. Accepts n<id>, w<id>,
+  r<id>, or node/<id>, way/<id>, relation/<id>.
 - [ ] Resolve or document known semantic differences in verify output.
   Three commands have known diffs: extract (relation inclusion criteria),
   diff (14-element version comparison), check-refs (occurrences vs unique).
@@ -397,6 +417,10 @@ become GeoJSON properties) needs a configuration model.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `notes/osmium-parity.md`.
+- [ ] Document `renumber` planet-scale limitation — the `FxHashMap<i64, i64>`
+  for node ID mapping requires ~250 GB for 10.4B nodes (24 bytes/entry).
+  Infeasible without a different data structure (e.g., dense array for
+  sequential-assign renumbering, or external sort + streaming rewrite).
 
 ### Ecosystem
 
@@ -453,10 +477,36 @@ per-iteration allocations remain across the codebase, ordered by impact:
   copy tags into `OwnedNode.tags: Vec<(String, String)>`. Measured:
   `fill_buffer` = 80.7 GB cumulative alloc on Japan for diff (commit
   `bb15e66`). The iterator API eliminated the downstream Vec but the
-  upstream String allocation dominates. Fix requires eliminating owned
-  element construction in the sort/merge sweep — fundamentally different
-  architecture (e.g., direct wire-format merge without materializing
-  elements, or arena-backed owned elements).
+  upstream String allocation dominates.
+  See [notes/fill-buffer-optimization.md](notes/fill-buffer-optimization.md)
+  for full analysis. Key finding: 98.8% of elements are unchanged
+  (Equal) in a typical daily diff — materializing and comparing full
+  owned elements for them is pure waste. Best approach: **block-pair
+  merge-join** using indexdata min/max IDs to skip non-overlapping
+  blocks entirely (zero decode), with borrowed elements for overlapping
+  blocks. Complementary: raw blob byte comparison as fast path for
+  identical blobs. Three-step rollout plan: v1 blob-level equal skip,
+  v2 borrowed element merge, v3 non-overlapping block skip.
+  See [notes/block-pair-merge-join-plan.md](notes/block-pair-merge-join-plan.md)
+  for the detailed implementation plan.
+
+- [ ] **`stream_merge` metadata allocation waste** — `convert_node`,
+  `convert_way`, `convert_relation` in `stream_merge.rs` allocate
+  `OwnedMetadata` for every element, but the equality checks
+  (`nodes_equal`, `ways_equal`, `relations_equal`) don't compare
+  metadata — only tags, coords, refs, members. Metadata is only used
+  by `version()` for diff output formatting. For the 98.8% Equal
+  path, metadata allocation is pure waste. Fix: defer metadata to
+  `version_only` (already done in stream_merge, but `sort.rs`
+  `read_dense_node`/`read_way`/`read_relation` still allocate full
+  `OwnedMetadata` with timestamp/changeset/uid/user String).
+
+- [ ] **`diff` redundant header reads** — `diff()` opens two
+  `ElementReader`s to check sorted headers (lines 138-143), then
+  immediately drops them and opens two `StreamingBlocks` (which read
+  the headers again). Four file opens and four header reads for two
+  files. Fix: check sorted flag inside `StreamingBlocks::new_sequential`
+  or return the header from it.
 
 - [x] **Pipelined reader `from_vec_pooled`** — converted to
   `from_vec_pooled_with_scratch` via `thread_local!` storage in
@@ -466,6 +516,11 @@ per-iteration allocations remain across the codebase, ordered by impact:
   to `new_with_scratch` in commit `ea1ab6e`: check_refs, ALTW,
   stream_merge, geocode pass 2, cat fallback, getid workers.
   `new_with_scratch`. Mechanical.
+  **Stale note:** `parse_primitive_block_from_bytes_owned` (used by
+  merge classify workers at `merge.rs` ~line 1176 and ALTW fallback)
+  still calls `PrimitiveBlock::new()` internally. These are rayon
+  closures — would need `thread_local!` scratch. Low frequency
+  (merge: only for diff-overlapping blobs, ALTW: `--force` only).
 
 - [x] **cat/getid per-blob allocations inside loop** — hoisted
   decompress_buf, BlockBuilder, and output_blocks outside the per-blob
@@ -506,6 +561,11 @@ per-iteration allocations remain across the codebase, ordered by impact:
   coordinate processing in extract bbox classification, ALTW node scans.
   The tag path is harder (variable-length strings) but tag key indices
   could be columnar. Planetiler uses this approach.
+  See [notes/columnar-integration.md](notes/columnar-integration.md)
+  for integration analysis: multi-extract (N-region classification),
+  ALTW node scan, geocode builder pass 2, external join stage 2.
+  Columnar is primarily valuable for dense nodes (fixed-width parallel
+  arrays); ways/relations are better served by wire-format scanners.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 
@@ -565,6 +625,10 @@ per-iteration allocations remain across the codebase, ordered by impact:
 ### Research / stretch ideas
 
 - [ ] Incremental geocode index update (daily diff → index patch, no full rebuild).
+  See [notes/incremental-geocode-index.md](notes/incremental-geocode-index.md)
+  for 4 approaches analyzed. Recommended: v1 append-only delta index with
+  query-time merge (simplest, no format changes), v2 S2 cell-level partial
+  rebuild (better query perf, proportional to diff size).
 - [ ] Incremental extract update (`extract --apply-changes` — base extract + OSC +
   region → updated extract without re-reading planet).
 - [ ] Spatial indexing in PBF format (R-tree over blob offsets for

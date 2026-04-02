@@ -777,6 +777,8 @@ fn try_extract_multi_single_pass(
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let decompress_pool = crate::blob::DecompressPool::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -785,7 +787,7 @@ fn try_extract_multi_single_pass(
                 if !spatial_filter.wants_index(&idx) { continue; }
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
+            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
             for element in block.elements() {
                 match &element {
                     Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
@@ -857,6 +859,8 @@ fn try_extract_multi_single_pass(
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let decompress_pool = crate::blob::DecompressPool::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -864,7 +868,7 @@ fn try_extract_multi_single_pass(
                 if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
+            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
             let mut refs_buf: Vec<i64> = Vec::new();
             for element in block.elements() {
                 if let Element::Way(w) = &element {
@@ -922,6 +926,8 @@ fn try_extract_multi_single_pass(
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         let decompress_pool = crate::blob::DecompressPool::new();
+        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         for blob_result in &mut blob_reader {
             let blob = blob_result?;
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -929,7 +935,7 @@ fn try_extract_multi_single_pass(
                 if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
             }
             let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
+            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
             let mut members_buf: Vec<MemberData<'_>> = Vec::new();
             for element in block.elements() {
                 if let Element::Relation(r) = &element {

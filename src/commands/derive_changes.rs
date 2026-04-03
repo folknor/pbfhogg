@@ -14,8 +14,12 @@ use quick_xml::Writer;
 use super::elements_xml::{
     from_decimicro, format_coord, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
 };
-use super::stream_merge::{merge_join_phase, MergeJoinAction, StreamingBlocks};
-use super::{require_sorted, Result};
+use super::stream_merge::{
+    block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
+    MergeJoinAction, StreamingBlocks,
+};
+use super::{has_indexdata, require_sorted, Result};
+use crate::blob_index::ElemKind;
 use crate::{ElementReader, MemberType};
 
 // ---------------------------------------------------------------------------
@@ -70,42 +74,16 @@ pub fn derive_changes(
         require_sorted(new_reader.header(), new_path, "New PBF")?;
     }
 
-    // Sequential readers to avoid 2× PrimitiveBlock cross-thread retention.
+    let both_indexed =
+        has_indexdata(old_path, direct_io)? && has_indexdata(new_path, direct_io)?;
+
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
-    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
-    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
-    // Collect changes by action type.
-    let mut creates = Changes::new();
-    let mut modifies = Changes::new();
-    let mut deletes = Changes::new();
-
-    // Phase 1: Nodes
-    {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut creates.nodes, &mut modifies.nodes, &mut deletes.nodes,
-        )?;
-    }
-
-    // Phase 2: Ways
-    {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut creates.ways, &mut modifies.ways, &mut deletes.ways,
-        )?;
-    }
-
-    // Phase 3: Relations
-    {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src, &mut ob, &mut new_src, &mut nb,
-            &mut creates.relations, &mut modifies.relations, &mut deletes.relations,
-        )?;
-    }
+    let (creates, modifies, deletes) = if both_indexed {
+        derive_changes_block_pair(old_path, new_path, direct_io)?
+    } else {
+        derive_changes_element_stream(old_path, new_path, direct_io)?
+    };
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
 
@@ -176,6 +154,149 @@ fn collect_changes_phase<T: super::stream_merge::MergeJoinElement + Clone>(
         }
         Ok(())
     })
+}
+
+// ---------------------------------------------------------------------------
+// Optimized block-pair path (borrowed elements, zero-alloc for Equal)
+// ---------------------------------------------------------------------------
+
+/// Collect changes using block-pair merge with borrowed elements.
+/// Only changed elements (~1.2% of typical daily diff) are materialized as owned.
+fn derive_changes_block_pair(
+    old_path: &Path,
+    new_path: &Path,
+    direct_io: bool,
+) -> Result<(Changes, Changes, Changes)> {
+    let mut old_reader = crate::blob::BlobReader::open(old_path, direct_io)?;
+    old_reader.set_parse_indexdata(true);
+    let mut new_reader = crate::blob::BlobReader::open(new_path, direct_io)?;
+    new_reader.set_parse_indexdata(true);
+
+    let mut merge = BlockPairMergeState::new(old_reader, new_reader);
+
+    let mut creates = Changes::new();
+    let mut modifies = Changes::new();
+    let mut deletes = Changes::new();
+
+    collect_phase_block_pair(&mut merge, ElemKind::Node, &mut creates, &mut modifies, &mut deletes)?;
+    collect_phase_block_pair(&mut merge, ElemKind::Way, &mut creates, &mut modifies, &mut deletes)?;
+    collect_phase_block_pair(&mut merge, ElemKind::Relation, &mut creates, &mut modifies, &mut deletes)?;
+
+    Ok((creates, modifies, deletes))
+}
+
+/// Run one type phase of block-pair merge, collecting changed elements as owned.
+fn collect_phase_block_pair(
+    merge: &mut BlockPairMergeState,
+    kind: ElemKind,
+    creates: &mut Changes,
+    modifies: &mut Changes,
+    deletes: &mut Changes,
+) -> Result<()> {
+    block_pair_merge_phase(merge, kind, &mut |action| {
+        match action {
+            BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
+            BlockMergeAction::BlobOldOnly { block, skip, .. } => {
+                for elem in block.elements().skip(skip) {
+                    push_converted(&elem, kind, deletes);
+                }
+            }
+            BlockMergeAction::BlobNewOnly { block, skip, .. } => {
+                for elem in block.elements().skip(skip) {
+                    push_converted(&elem, kind, creates);
+                }
+            }
+            BlockMergeAction::ElementModified { new, .. } => {
+                push_converted(new, kind, modifies);
+            }
+            BlockMergeAction::ElementOldOnly(o) => {
+                push_converted(o, kind, deletes);
+            }
+            BlockMergeAction::ElementNewOnly(n) => {
+                push_converted(n, kind, creates);
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Convert a borrowed Element to the appropriate owned type and push to Changes.
+fn push_converted(elem: &crate::Element<'_>, kind: ElemKind, target: &mut Changes) {
+    use super::stream_merge::{convert_node, convert_relation, convert_way};
+
+    match kind {
+        ElemKind::Node => {
+            if let Some(owned) = convert_node(elem) {
+                target.nodes.push(owned);
+            }
+        }
+        ElemKind::Way => {
+            if let Some(owned) = convert_way(elem) {
+                target.ways.push(owned);
+            }
+        }
+        ElemKind::Relation => {
+            if let Some(owned) = convert_relation(elem) {
+                target.relations.push(owned);
+            }
+        }
+    }
+}
+
+/// Fallback path using element-level merge-join with owned elements.
+fn derive_changes_element_stream(
+    old_path: &Path,
+    new_path: &Path,
+    direct_io: bool,
+) -> Result<(Changes, Changes, Changes)> {
+    let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
+    let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
+
+    let mut creates = Changes::new();
+    let mut modifies = Changes::new();
+    let mut deletes = Changes::new();
+
+    // Phase 1: Nodes
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        collect_changes_phase(
+            &mut old_src,
+            &mut ob,
+            &mut new_src,
+            &mut nb,
+            &mut creates.nodes,
+            &mut modifies.nodes,
+            &mut deletes.nodes,
+        )?;
+    }
+    // Phase 2: Ways
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        collect_changes_phase(
+            &mut old_src,
+            &mut ob,
+            &mut new_src,
+            &mut nb,
+            &mut creates.ways,
+            &mut modifies.ways,
+            &mut deletes.ways,
+        )?;
+    }
+    // Phase 3: Relations
+    {
+        let (mut ob, mut nb) = (Vec::new(), Vec::new());
+        collect_changes_phase(
+            &mut old_src,
+            &mut ob,
+            &mut new_src,
+            &mut nb,
+            &mut creates.relations,
+            &mut modifies.relations,
+            &mut deletes.relations,
+        )?;
+    }
+
+    Ok((creates, modifies, deletes))
 }
 
 // ---------------------------------------------------------------------------

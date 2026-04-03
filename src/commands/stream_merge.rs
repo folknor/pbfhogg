@@ -5,6 +5,10 @@
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
 
+use std::sync::Arc;
+
+use crate::blob::DecompressPool;
+use crate::blob_index::ElemKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
 use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay};
@@ -341,3 +345,486 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Borrowed element equality — zero-alloc comparison via iterators
+// ---------------------------------------------------------------------------
+
+/// Extract ID from any Element variant.
+pub(crate) fn element_id(e: &Element<'_>) -> i64 {
+    match e {
+        Element::DenseNode(dn) => dn.id(),
+        Element::Node(n) => n.id(),
+        Element::Way(w) => w.id(),
+        Element::Relation(r) => r.id(),
+    }
+}
+
+/// Extract version from any Element variant.
+pub(crate) fn element_version(e: &Element<'_>) -> Option<i32> {
+    match e {
+        Element::DenseNode(dn) => dn.info().map(crate::DenseNodeInfo::version),
+        Element::Node(n) => n.info().version(),
+        Element::Way(w) => w.info().version(),
+        Element::Relation(r) => r.info().version(),
+    }
+}
+
+/// Compare two node elements (DenseNode or Node) by coords + tags.
+/// Handles all 4 cross-match combinations. Matches `nodes_equal` semantics:
+/// compares decimicro_lat, decimicro_lon, tags — NOT id or metadata.
+fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
+    let (a_lat, a_lon) = match a {
+        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
+        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+        _ => return false,
+    };
+    let (b_lat, b_lon) = match b {
+        Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
+        Element::Node(n) => (n.decimicro_lat(), n.decimicro_lon()),
+        _ => return false,
+    };
+    if a_lat != b_lat || a_lon != b_lon {
+        return false;
+    }
+    // Tag comparison: DenseTagIter and TagIter are different types but both
+    // yield (&str, &str). Handle all 4 cross-match combinations explicitly.
+    match (a, b) {
+        (Element::DenseNode(da), Element::DenseNode(db)) => da.tags().eq(db.tags()),
+        (Element::DenseNode(da), Element::Node(nb)) => {
+            iter_tags_equal(da.tags(), nb.tags())
+        }
+        (Element::Node(na), Element::DenseNode(db)) => {
+            iter_tags_equal(na.tags(), db.tags())
+        }
+        (Element::Node(na), Element::Node(nb)) => na.tags().eq(nb.tags()),
+        _ => false,
+    }
+}
+
+/// Compare two tag iterators of different concrete types.
+/// Both must yield `(&str, &str)`.
+fn iter_tags_equal<'a>(
+    a: impl Iterator<Item = (&'a str, &'a str)>,
+    b: impl Iterator<Item = (&'a str, &'a str)>,
+) -> bool {
+    a.eq(b)
+}
+
+/// Compare two Way elements by refs + tags. Matches `ways_equal` semantics.
+fn borrowed_ways_equal(a: &crate::Way<'_>, b: &crate::Way<'_>) -> bool {
+    a.refs().eq(b.refs()) && a.tags().eq(b.tags())
+}
+
+/// Compare two Relation elements by tags + members. Matches `relations_equal` semantics.
+fn borrowed_relations_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
+    if !a.tags().eq(b.tags()) {
+        return false;
+    }
+    borrowed_members_equal(a, b)
+}
+
+/// Compare relation members by (MemberId, role). Matches `members_equal` semantics.
+/// Role uses `unwrap_or("")` matching the owned conversion path.
+fn borrowed_members_equal(a: &crate::Relation<'_>, b: &crate::Relation<'_>) -> bool {
+    let mut a_iter = a.members();
+    let mut b_iter = b.members();
+    loop {
+        match (a_iter.next(), b_iter.next()) {
+            (None, None) => return true,
+            (Some(am), Some(bm)) => {
+                if am.id != bm.id {
+                    return false;
+                }
+                let a_role = am.role().unwrap_or("");
+                let b_role = bm.role().unwrap_or("");
+                if a_role != b_role {
+                    return false;
+                }
+            }
+            _ => return false, // different lengths
+        }
+    }
+}
+
+/// Compare two elements of the same type. Dispatches to type-specific comparison.
+fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
+    match (a, b) {
+        // Node phase: any combination of DenseNode/Node
+        (Element::DenseNode(_) | Element::Node(_), Element::DenseNode(_) | Element::Node(_)) => {
+            borrowed_nodes_equal(a, b)
+        }
+        // Way phase
+        (Element::Way(wa), Element::Way(wb)) => borrowed_ways_equal(wa, wb),
+        // Relation phase
+        (Element::Relation(ra), Element::Relation(rb)) => borrowed_relations_equal(ra, rb),
+        // Different types with same ID = Modified
+        _ => false,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Block-pair merge engine — blob-level comparison with borrowed elements
+// ---------------------------------------------------------------------------
+
+/// Actions emitted by the block-pair merge engine.
+pub(crate) enum BlockMergeAction<'a> {
+    /// All elements in this blob are unchanged (count from indexdata).
+    /// Not emitted by v2 (reserved for v1 compressed-byte comparison).
+    #[allow(dead_code)]
+    BlobEqual(u64),
+    /// All elements in this blob exist only in old.
+    BlobOldOnly {
+        block: &'a PrimitiveBlock,
+        count: u64,
+        /// Number of elements to skip from the start of the block (for residuals).
+        skip: usize,
+    },
+    /// All elements in this blob exist only in new.
+    BlobNewOnly {
+        block: &'a PrimitiveBlock,
+        count: u64,
+        /// Number of elements to skip from the start of the block (for residuals).
+        skip: usize,
+    },
+    /// Single element unchanged. Carries extracted id/version/type_char
+    /// so the caller doesn't need to hold the Element borrow.
+    ElementEqual {
+        id: i64,
+        version: Option<i32>,
+        type_char: char,
+    },
+    /// Single element modified (different content, same ID).
+    ElementModified {
+        old: &'a Element<'a>,
+        new: &'a Element<'a>,
+    },
+    /// Single element only in old.
+    ElementOldOnly(&'a Element<'a>),
+    /// Single element only in new.
+    ElementNewOnly(&'a Element<'a>),
+}
+
+/// State for one side of the block-pair merge.
+struct BlockState {
+    block: PrimitiveBlock,
+    skip_count: usize,
+    index: crate::blob_index::BlobIndex,
+}
+
+/// Advance a BlobReader to the next OsmData blob matching `kind`.
+/// Returns None at EOF or when the next blob's type doesn't match `kind`
+/// (which means we've moved past this type phase in a sorted PBF).
+///
+/// **Important:** In a sorted PBF, element types appear in order:
+/// nodes → ways → relations. Once we encounter a blob of a different
+/// (later) kind, this phase is done. We must NOT consume that blob
+/// because the next phase needs it. We store it in `stash` for the
+/// next phase to pick up.
+fn next_block_for_kind(
+    reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
+    pool: &Arc<DecompressPool>,
+    st_scratch: &mut Vec<(u32, u32)>,
+    gr_scratch: &mut Vec<(u32, u32)>,
+    kind: ElemKind,
+    stash: &mut Option<crate::blob::Blob>,
+) -> Result<Option<BlockState>> {
+    loop {
+        // Check the stash first (blob consumed but not processed by prior phase).
+        let blob = if let Some(stashed) = stash.take() {
+            stashed
+        } else {
+            match reader.next() {
+                Some(result) => result?,
+                None => return Ok(None),
+            }
+        };
+
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        let index = match blob.index() {
+            Some(idx) => idx,
+            None => {
+                return Err("block-pair merge requires indexdata but blob has none".into());
+            }
+        };
+        if index.kind != kind {
+            // In sorted PBFs, element types appear in order: nodes → ways → relations.
+            // If this blob is for a later kind, stash it and stop.
+            // If it's for an earlier kind, discard it and keep looking.
+            if kind_order(index.kind) > kind_order(kind) {
+                *stash = Some(blob);
+                return Ok(None);
+            }
+            // Earlier kind — skip it.
+            continue;
+        }
+        let decompressed = blob.decompress_pooled(pool)?;
+        let block = PrimitiveBlock::new_with_scratch(decompressed, st_scratch, gr_scratch)?;
+        return Ok(Some(BlockState {
+            block,
+            skip_count: 0,
+            index,
+        }));
+    }
+}
+
+/// Canonical order: nodes (0) → ways (1) → relations (2).
+fn kind_order(kind: ElemKind) -> u8 {
+    match kind {
+        ElemKind::Node => 0,
+        ElemKind::Way => 1,
+        ElemKind::Relation => 2,
+    }
+}
+
+/// Type char for an ElemKind.
+pub(crate) fn kind_type_char(kind: ElemKind) -> char {
+    match kind {
+        ElemKind::Node => 'n',
+        ElemKind::Way => 'w',
+        ElemKind::Relation => 'r',
+    }
+}
+
+/// State for the block-pair merge engine (one per diff/derive_changes call).
+pub(crate) struct BlockPairMergeState {
+    pub old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    pub new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    pub old_pool: Arc<DecompressPool>,
+    pub new_pool: Arc<DecompressPool>,
+    pub old_st: Vec<(u32, u32)>,
+    pub old_gr: Vec<(u32, u32)>,
+    pub new_st: Vec<(u32, u32)>,
+    pub new_gr: Vec<(u32, u32)>,
+    /// Stashed blob from a prior phase (consumed but belongs to a later kind).
+    old_stash: Option<crate::blob::Blob>,
+    new_stash: Option<crate::blob::Blob>,
+}
+
+impl BlockPairMergeState {
+    pub(crate) fn new(
+        old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+        new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
+    ) -> Self {
+        Self {
+            old_reader,
+            new_reader,
+            old_pool: DecompressPool::new(),
+            new_pool: DecompressPool::new(),
+            old_st: Vec::new(),
+            old_gr: Vec::new(),
+            new_st: Vec::new(),
+            new_gr: Vec::new(),
+            old_stash: None,
+            new_stash: None,
+        }
+    }
+}
+
+/// Run one type phase of the block-pair merge.
+///
+/// Requires both readers to have `set_parse_indexdata(true)` and both inputs
+/// to be sorted. Falls through to element-level comparison for overlapping
+/// blocks.
+pub(crate) fn block_pair_merge_phase(
+    state: &mut BlockPairMergeState,
+    kind: ElemKind,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
+    let type_char = kind_type_char(kind);
+    let mut old_state: Option<BlockState> = None;
+    let mut new_state: Option<BlockState> = None;
+
+    loop {
+        // Ensure both sides have a block (or are exhausted).
+        if old_state.is_none() {
+            old_state = next_block_for_kind(
+                &mut state.old_reader,
+                &state.old_pool,
+                &mut state.old_st,
+                &mut state.old_gr,
+                kind,
+                &mut state.old_stash,
+            )?;
+        }
+        if new_state.is_none() {
+            new_state = next_block_for_kind(
+                &mut state.new_reader,
+                &state.new_pool,
+                &mut state.new_st,
+                &mut state.new_gr,
+                kind,
+                &mut state.new_stash,
+            )?;
+        }
+
+        match (&old_state, &new_state) {
+            (None, None) => break,
+
+            (Some(_), None) => {
+                let os = old_state.take().expect("checked Some");
+                let remaining = os.index.count.saturating_sub(os.skip_count as u64);
+                on_action(BlockMergeAction::BlobOldOnly {
+                    block: &os.block,
+                    count: remaining,
+                    skip: os.skip_count,
+                })?;
+            }
+
+            (None, Some(_)) => {
+                let ns = new_state.take().expect("checked Some");
+                let remaining = ns.index.count.saturating_sub(ns.skip_count as u64);
+                on_action(BlockMergeAction::BlobNewOnly {
+                    block: &ns.block,
+                    count: remaining,
+                    skip: ns.skip_count,
+                })?;
+            }
+
+            (Some(os), Some(ns)) => {
+                // Non-overlapping: old entirely before new.
+                if os.index.max_id < ns.index.min_id {
+                    let os = old_state.take().expect("checked Some");
+                    let remaining = os.index.count.saturating_sub(os.skip_count as u64);
+                    on_action(BlockMergeAction::BlobOldOnly {
+                        block: &os.block,
+                        count: remaining,
+                        skip: os.skip_count,
+                    })?;
+                    continue;
+                }
+                // Non-overlapping: new entirely before old.
+                if ns.index.max_id < os.index.min_id {
+                    let ns = new_state.take().expect("checked Some");
+                    let remaining = ns.index.count.saturating_sub(ns.skip_count as u64);
+                    on_action(BlockMergeAction::BlobNewOnly {
+                        block: &ns.block,
+                        count: remaining,
+                        skip: ns.skip_count,
+                    })?;
+                    continue;
+                }
+
+                // Overlapping: decode both and element-merge.
+                let mut os = old_state.take().expect("checked Some");
+                let mut ns = new_state.take().expect("checked Some");
+
+                let merge_up_to = os.index.max_id.min(ns.index.max_id);
+                element_merge_pair(
+                    &os.block,
+                    os.skip_count,
+                    &ns.block,
+                    ns.skip_count,
+                    merge_up_to,
+                    type_char,
+                    on_action,
+                )?;
+
+                // Determine residuals: which side has unconsumed elements?
+                if os.index.max_id > merge_up_to {
+                    // Old block has elements past merge_up_to — keep as residual.
+                    // Count how many elements were consumed.
+                    let consumed = count_elements_up_to(&os.block, os.skip_count, merge_up_to);
+                    os.skip_count += consumed;
+                    old_state = Some(os);
+                }
+                if ns.index.max_id > merge_up_to {
+                    let consumed = count_elements_up_to(&ns.block, ns.skip_count, merge_up_to);
+                    ns.skip_count += consumed;
+                    new_state = Some(ns);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Count how many elements in `block` (starting from `skip`) have id <= `up_to`.
+fn count_elements_up_to(block: &PrimitiveBlock, skip: usize, up_to: i64) -> usize {
+    let mut count = 0;
+    for elem in block.elements().skip(skip) {
+        if element_id(&elem) > up_to {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+/// Two-pointer element merge over a pair of decoded blocks.
+///
+/// Processes elements up to `merge_up_to` ID (inclusive). Elements beyond that
+/// boundary in either block are left unconsumed for the caller to handle.
+///
+/// Uses `osm_id_cmp` for element ordering (positive IDs in practice).
+fn element_merge_pair(
+    old_block: &PrimitiveBlock,
+    old_skip: usize,
+    new_block: &PrimitiveBlock,
+    new_skip: usize,
+    merge_up_to: i64,
+    type_char: char,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut old_iter = old_block.elements().skip(old_skip).peekable();
+    let mut new_iter = new_block.elements().skip(new_skip).peekable();
+
+    loop {
+        // Check if both sides are within range.
+        let old_in_range = old_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
+        let new_in_range = new_iter
+            .peek()
+            .is_some_and(|e| element_id(e) <= merge_up_to);
+
+        match (old_in_range, new_in_range) {
+            (false, false) => break,
+            (true, false) => {
+                let o = old_iter.next().expect("checked peek");
+                on_action(BlockMergeAction::ElementOldOnly(&o))?;
+            }
+            (false, true) => {
+                let n = new_iter.next().expect("checked peek");
+                on_action(BlockMergeAction::ElementNewOnly(&n))?;
+            }
+            (true, true) => {
+                let o_id = element_id(old_iter.peek().expect("checked"));
+                let n_id = element_id(new_iter.peek().expect("checked"));
+
+                match super::osm_id_cmp(o_id, n_id) {
+                    std::cmp::Ordering::Less => {
+                        let o = old_iter.next().expect("checked");
+                        on_action(BlockMergeAction::ElementOldOnly(&o))?;
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let n = new_iter.next().expect("checked");
+                        on_action(BlockMergeAction::ElementNewOnly(&n))?;
+                    }
+                    std::cmp::Ordering::Equal => {
+                        let o = old_iter.next().expect("checked");
+                        let n = new_iter.next().expect("checked");
+                        if borrowed_elements_equal(&o, &n) {
+                            on_action(BlockMergeAction::ElementEqual {
+                                id: o_id,
+                                version: element_version(&o),
+                                type_char,
+                            })?;
+                        } else {
+                            on_action(BlockMergeAction::ElementModified {
+                                old: &o,
+                                new: &n,
+                            })?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+

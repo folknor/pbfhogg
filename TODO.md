@@ -472,25 +472,24 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Dual-buffer single-pass encoding for way/relation tag fields.
   See [notes/blockbuilder-iterator-api.md](notes/blockbuilder-iterator-api.md).
 
-- [ ] **`fill_buffer` owned element allocation (sort/merge sweep)** —
-  `read_dense_node`/`read_way`/`read_relation` in `elements_pbf.rs`
-  copy tags into `OwnedNode.tags: Vec<(String, String)>`. Measured:
-  `fill_buffer` = 80.7 GB cumulative alloc on Japan for diff (commit
-  `bb15e66`). The iterator API eliminated the downstream Vec but the
-  upstream String allocation dominates.
+- [x] **Block-pair merge-join v2 (borrowed element merge)** —
+  Japan diff: 86.4s → 52.9s (39% faster), 80.7 GB → 40.6 GB cumulative
+  alloc (50% less). Commit `66990c3`, plantasjen. Borrowed element
+  comparison via `&str` iterators from PrimitiveBlock string table —
+  zero String allocation for the 98.8% Equal path. Remaining 24.1 GB
+  is protobuf parsing overhead (`parse_and_inline_with_scratch`).
   See [notes/fill-buffer-optimization.md](notes/fill-buffer-optimization.md)
-  for full analysis. Key finding: 98.8% of elements are unchanged
-  (Equal) in a typical daily diff — materializing and comparing full
-  owned elements for them is pure waste. Best approach: **block-pair
-  merge-join** using indexdata min/max IDs to skip non-overlapping
-  blocks entirely (zero decode), with borrowed elements for overlapping
-  blocks. Complementary: raw blob byte comparison as fast path for
-  identical blobs. Three-step rollout plan: v1 blob-level equal skip,
-  v2 borrowed element merge, v3 non-overlapping block skip.
-  See [notes/block-pair-merge-join-plan.md](notes/block-pair-merge-join-plan.md)
-  for the detailed implementation plan.
-
-- [ ] **`stream_merge` metadata allocation waste** — `convert_node`,
+  and [notes/block-pair-merge-join-plan.md](notes/block-pair-merge-join-plan.md).
+- [ ] **Block-pair merge-join v1 (compressed byte comparison)** —
+  skip decode entirely for matching blobs by comparing compressed bytes.
+  Would eliminate the 24.1 GB protobuf parsing overhead for unchanged
+  blocks. Most effective for way/relation blobs where modifications
+  are sparser. Complementary to v2.
+- [x] **`stream_merge` metadata allocation waste** — resolved by v2.
+  The block-pair path uses `element_version()` on borrowed elements,
+  avoiding OwnedMetadata construction for the Equal path. Only changed
+  elements (~1.2%) are materialized via `convert_node`/`convert_way`/
+  `convert_relation`. Previous description: `convert_node`,
   `convert_way`, `convert_relation` in `stream_merge.rs` allocate
   `OwnedMetadata` for every element, but the equality checks
   (`nodes_equal`, `ways_equal`, `relations_equal`) don't compare

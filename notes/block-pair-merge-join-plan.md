@@ -9,8 +9,11 @@ Replace the element-level `fill_buffer` → `next_element` → `merge_join_phase
 architecture with a block-pair merge-join that operates at blob level first,
 falling through to element level only for overlapping blocks.
 
-**Impact:** 80.7 GB → ~1 GB cumulative alloc (Japan diff), 98.8% of elements
-skip decode entirely.
+**Impact:** v2 shipped (commit `66990c3`). Japan diff: 86.4s → 52.9s (39%
+faster), 80.7 GB → 40.6 GB cumulative alloc (50% less). 98.8% of elements
+use the zero-String-allocation borrowed comparison path. Remaining 24.1 GB
+is protobuf parsing overhead (v1 byte comparison would skip decode for
+matching blocks).
 
 ## Current architecture
 

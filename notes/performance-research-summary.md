@@ -5,16 +5,18 @@ detailed analysis documents where available.
 
 ## Tier 1: High impact, ready to implement
 
-### Block-pair merge-join for diff/derive_changes
+### Block-pair merge-join for diff/derive_changes — SHIPPED
 
-**Impact:** 80.7 GB → ~1 GB cumulative alloc (Japan), 98.8% elements skipped.
+**Result:** Japan diff: 86.4s → 52.9s (39% faster), 80.7 GB → 40.6 GB
+cumulative alloc (50% less). Commit `66990c3`.
 **Document:** [fill-buffer-optimization.md](fill-buffer-optimization.md)
-**What:** Replace element-level merge-join with block-level comparison.
-Non-overlapping blocks (by indexdata min/max ID) skip decode entirely.
-Overlapping blocks use borrowed elements (no String allocation).
+**What:** Replaced element-level merge-join with block-level comparison.
+Non-overlapping blocks skip via indexdata min/max ID ranges.
+Overlapping blocks use borrowed elements (no String allocation for the
+98.8% Equal path). Falls back to existing `fill_buffer` path for
+non-indexed PBFs. Remaining 24.1 GB alloc is protobuf parsing — v1
+compressed byte comparison would skip decode for matching blocks.
 **Affects:** `diff`, `derive_changes` (both use `stream_merge.rs`)
-**Risk:** Medium — changes the merge-join architecture but correctness
-is verifiable via `brokkr verify diff`.
 
 ### Multi-extract parallel decode
 

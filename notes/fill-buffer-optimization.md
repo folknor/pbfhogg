@@ -184,9 +184,31 @@ the hash/byte comparison is cheap and catches the common case.
 
 Approach 3 is the fallback for elements that must be materialized.
 
-## Impact estimate
+## Results — v2 shipped (commit `66990c3`)
 
-- Japan diff: 80.7 GB → ~1 GB (98.8% elements unchanged, skip decode)
+Japan diff (2.4 GB, 344M elements, daily diff):
+
+| Metric | Baseline (`bb15e66`) | v2 (`66990c3`) | Improvement |
+|--------|---------------------|----------------|-------------|
+| Wall time | 86.4s | 52.9s | **39% faster** |
+| Cumulative alloc | 80.7 GB | 40.6 GB | **50% less** |
+| Net RSS | — | 9.4 MB | negligible |
+
+The initial estimate of 80.7 GB → ~1 GB was too optimistic. v2 eliminates
+String allocation for the Equal path (98.8% of elements), but protobuf
+parsing (`parse_and_inline_with_scratch`) still contributes 24.1 GB of
+cumulative allocation (59% of total). This is inherent to decoding
+PrimitiveBlocks — v1 compressed byte comparison would skip decode for
+matching blocks and reduce this further.
+
+The 39% wall time improvement is significant. The remaining time is
+dominated by sequential decompression + protobuf parsing of two full
+PBFs. Further gains require either v1 (skip decode for matching blocks)
+or parallelism.
+
+## Original impact estimate
+
+- Japan diff: 80.7 GB → ~1 GB (predicted, actual: 40.6 GB)
 - Planet diff: more nuanced than initially estimated. ~99.7% of elements
   are unchanged, but ~86% of node blobs contain at least one change.
   Blob-level byte comparison (approach 2) only skips ~14% of node blobs.

@@ -171,20 +171,14 @@ fn count_block_tags(
     expressions: &Option<Vec<Expression>>,
 ) {
     for element in block.elements_skip_metadata() {
-        let dominated = match &element {
-            Element::DenseNode(_) | Element::Node(_) => filter_node,
-            Element::Way(_) => filter_way,
-            Element::Relation(_) => filter_relation,
+        let (dominated, is_node, is_way, is_relation) = match &element {
+            Element::DenseNode(_) | Element::Node(_) => (filter_node, true, false, false),
+            Element::Way(_) => (filter_way, false, true, false),
+            Element::Relation(_) => (filter_relation, false, false, true),
         };
         if !dominated {
             continue;
         }
-
-        let (is_node, is_way, is_relation) = match &element {
-            Element::DenseNode(_) | Element::Node(_) => (true, false, false),
-            Element::Way(_) => (false, true, false),
-            Element::Relation(_) => (false, false, true),
-        };
 
         match &element {
             Element::DenseNode(dn) => {

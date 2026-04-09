@@ -53,9 +53,11 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
+    let need_nodes = opts.add_self && !ids.node_ids.is_empty();
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
+    let reader = reader.with_blob_filter(crate::BlobFilter::new(need_nodes, true, true));
     let mut stats = GetparentsStats {
         nodes_written: 0,
         ways_written: 0,

@@ -1220,6 +1220,7 @@ fn bucketed_cell_assignment(
                 if let Some(rec) = rec {
                     let nc = rec.node_count as usize;
                     if nc >= 2 {
+                        out.reserve(nc * 2);
                         for seg_idx in 0..nc - 1 {
                             let off1 = rec.node_offset as usize + seg_idx * NODE_COORD_SIZE;
                             let off2 = off1 + NODE_COORD_SIZE;

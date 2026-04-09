@@ -466,12 +466,12 @@ pub(crate) fn build_classify_schedule(
 /// file order. All current callers use order-independent merge operations
 /// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
+pub(crate) fn parallel_classify_phase<S: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
     worker_init: impl Fn() -> S + Send + Sync,
-    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
-    mut merge: impl FnMut(R),
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) + Send + Sync,
+    mut merge: impl FnMut(S),
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -483,7 +483,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<crate::error::Result<S>>(decode_threads);
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
@@ -503,18 +503,18 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
                 let worker_pool = crate::blob::DecompressPool::new();
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-                let mut worker_state = worker_init_ref();
+                let mut state = worker_init_ref();
 
-                loop {
-                    let (s, data_offset, data_size) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
+                let result: crate::error::Result<()> = (|| {
+                    loop {
+                        let (_s, data_offset, data_size) = {
+                            let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match guard.recv() {
+                                Ok(d) => d,
+                                Err(_) => return Ok(()),
+                            }
+                        };
 
-                    let r: crate::error::Result<R> = (|| {
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
@@ -523,19 +523,22 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
-                        let result = classify_ref(&block, &mut worker_state);
-                        Ok(result)
-                    })();
-                    if tx.send((s, r)).is_err() { break; }
+                        classify_ref(&block, &mut state);
+                    }
+                })();
+
+                match result {
+                    Ok(()) => { tx.send(Ok(state)).ok(); }
+                    Err(e) => { tx.send(Err(e)).ok(); }
                 }
             });
         }
         drop(desc_rx);
         drop(result_tx);
 
-        for (_seq, result) in result_rx {
-            let r = result?;
-            merge(r);
+        for result in result_rx {
+            let state = result?;
+            merge(state);
         }
         Ok(())
     })?;

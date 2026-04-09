@@ -596,13 +596,12 @@ fn tags_filter_two_pass(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        || (),
-        |block, _s| {
-            let mut result = ClassifyResult {
-                matched_nodes: Vec::new(),
-                matched_ways: Vec::new(),
-                matched_relations: Vec::new(),
-            };
+        || ClassifyResult {
+            matched_nodes: Vec::new(),
+            matched_ways: Vec::new(),
+            matched_relations: Vec::new(),
+        },
+        |block, result| {
             let mut tags_buf: Vec<(&str, &str)> = Vec::new();
             for element in block.elements_skip_metadata() {
                 match &element {
@@ -637,7 +636,6 @@ fn tags_filter_two_pass(
                     }
                 }
             }
-            result
         },
         |cr| {
             for id in cr.matched_nodes {
@@ -931,13 +929,12 @@ fn collect_relation_member_closure(
         super::parallel_classify_phase(
             &shared_file,
             &schedule,
-            || (),
-            |block, _s| {
-                let mut result = ClosureResult {
-                    node_ids: Vec::new(),
-                    way_ids: Vec::new(),
-                    relation_ids: Vec::new(),
-                };
+            || ClosureResult {
+                node_ids: Vec::new(),
+                way_ids: Vec::new(),
+                relation_ids: Vec::new(),
+            },
+            |block, result| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element {
                         if !included_relation_ids.get(r.id()) {
@@ -953,7 +950,6 @@ fn collect_relation_member_closure(
                         }
                     }
                 }
-                result
             },
             |cr| results.push(cr),
         )?;
@@ -1002,9 +998,8 @@ fn collect_way_node_dependencies(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        || (),
-        |block, _s| {
-            let mut node_ids = Vec::new();
+        Vec::<i64>::new,
+        |block, node_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
                     && included_way_ids.get(w.id())
@@ -1017,7 +1012,6 @@ fn collect_way_node_dependencies(
                     node_ids.extend(w.refs());
                 }
             }
-            node_ids
         },
         |node_ids| {
             for id in node_ids {

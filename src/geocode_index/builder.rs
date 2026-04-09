@@ -294,9 +294,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         crate::commands::parallel_classify_phase(
             &shared_file,
             &schedule,
-            || (),
-            |block, _s| {
-                let mut node_ids = Vec::new();
+            Vec::<i64>::new,
+            |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(way) = element {
                         let mut highway = false;
@@ -330,7 +329,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                         }
                     }
                 }
-                node_ids
             },
             |node_ids| {
                 for id in node_ids {

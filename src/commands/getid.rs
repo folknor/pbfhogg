@@ -147,13 +147,8 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        || (),
-        |block, _s| {
-            let mut batch = IdBatch {
-                node_ids: Vec::new(),
-                way_ids: Vec::new(),
-                relation_ids: Vec::new(),
-            };
+        || IdBatch { node_ids: Vec::new(), way_ids: Vec::new(), relation_ids: Vec::new() },
+        |block, batch| {
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn) => batch.node_ids.push(dn.id()),
@@ -162,7 +157,6 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
                     Element::Relation(r) => batch.relation_ids.push(r.id()),
                 }
             }
-            batch
         },
         |batch| {
             set.node_ids.extend(batch.node_ids);
@@ -515,9 +509,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         super::parallel_classify_phase(
             &shared_file,
             &schedule,
-            || (),
-            |block, _s| {
-                let mut node_ids = Vec::new();
+            Vec::<i64>::new,
+            |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element
                         && ids.way_ids.contains(&w.id())
@@ -525,7 +518,6 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
                         node_ids.extend(w.refs());
                     }
                 }
-                node_ids
             },
             |node_ids| {
                 for id in node_ids {

@@ -762,13 +762,11 @@ fn try_extract_multi_single_pass(
             &shared_file,
             &node_schedule,
             || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
-            |block, (columns, scratch)| {
+            |block, (columns, region_ids)| {
                 block.decode_dense_columns(columns);
-                for v in scratch.iter_mut() { v.clear(); }
-                columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
-                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
+                columns.collect_matching_ids_multi_bbox(&bboxes, region_ids);
             },
-            |region_ids: Vec<Vec<i64>>| {
+            |(_, region_ids)| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids {
                         bbox_node_ids[i].set(id);
@@ -782,7 +780,6 @@ fn try_extract_multi_single_pass(
             &node_schedule,
             || vec![Vec::<i64>::new(); n],
             |block, region_ids| {
-                for v in region_ids.iter_mut() { v.clear(); }
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn) => {
@@ -806,9 +803,8 @@ fn try_extract_multi_single_pass(
                         _ => {}
                     }
                 }
-                region_ids.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
             },
-            |region_ids: Vec<Vec<i64>>| {
+            |region_ids| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids {
                         bbox_node_ids[i].set(id);
@@ -867,9 +863,8 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (),
-        |block, _s| {
-            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+        || vec![Vec::<i64>::new(); n],
+        |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
@@ -879,7 +874,6 @@ fn try_extract_multi_single_pass(
                     }
                 }
             }
-            region_ids
         },
         |region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
@@ -928,9 +922,8 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        || (),
-        |block, _s| {
-            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+        || vec![Vec::<i64>::new(); n],
+        |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     for i in 0..n {
@@ -940,7 +933,6 @@ fn try_extract_multi_single_pass(
                     }
                 }
             }
-            region_ids
         },
         |region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
@@ -2264,9 +2256,8 @@ fn extract_simple_single_pass(
         parallel_classify_phase(
             &rel_classify_file,
             &rel_classify_schedule,
-            || (),
-            |block, _s| {
-                let mut ids = Vec::new();
+            Vec::<i64>::new,
+            |block, ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element {
                         if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
@@ -2274,7 +2265,6 @@ fn extract_simple_single_pass(
                         }
                     }
                 }
-                ids
             },
             |ids| {
                 for id in ids {
@@ -2573,7 +2563,6 @@ fn collect_pass1_generic<H: RelationHandler>(
         &node_schedule,
         || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
         |block, (columns, ids)| {
-            ids.clear();
             if use_columnar {
                 block.decode_dense_columns(columns);
                 columns.collect_matching_ids_bbox(
@@ -2598,9 +2587,8 @@ fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
-            ids.drain(..).collect::<Vec<i64>>()
         },
-        |ids: Vec<i64>| {
+        |(_, ids)| {
             for id in ids {
                 bbox_node_ids.set(id);
             }
@@ -2611,10 +2599,8 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (),
-        |block, _s| {
-            let mut way_ids = Vec::new();
-            let mut node_ids = Vec::new();
+        || (Vec::<i64>::new(), Vec::<i64>::new()),
+        |block, (way_ids, node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     if w.refs().any(|r| bbox_node_ids.get(r)) {
@@ -2623,7 +2609,6 @@ fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
-            (way_ids, node_ids)
         },
         |(way_ids, node_ids)| {
             for id in way_ids {
@@ -2640,11 +2625,8 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        || (),
-        |block, _s| {
-            let mut rel_ids = Vec::new();
-            let mut extra_way_ids: Vec<i64> = Vec::new();
-            let mut extra_node_ids: Vec<i64> = Vec::new();
+        || (Vec::<i64>::new(), Vec::<i64>::new(), Vec::<i64>::new()),
+        |block, (rel_ids, extra_way_ids, extra_node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
@@ -2661,7 +2643,6 @@ fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
-            (rel_ids, extra_way_ids, extra_node_ids)
         },
         |(rel_ids, extra_way_ids, extra_node_ids)| {
             for id in rel_ids {
@@ -2843,9 +2824,8 @@ fn extract_smart(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (),
-        |block, _s| {
-            let mut node_ids = Vec::new();
+        Vec::<i64>::new,
+        |block, node_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
@@ -2854,7 +2834,6 @@ fn extract_smart(
                     }
                 }
             }
-            node_ids
         },
         |node_ids| {
             for id in node_ids {

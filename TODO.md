@@ -807,6 +807,32 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 - [x] Add LICENSE-APACHE copyright header — addressed by dual MIT/Apache-2.0 licensing
 - [x] Add a CHANGELOG.md before first tagged release
+## Post-v0.1 review: deferred optimizations
+
+- [ ] **getparents: use IdSetDense instead of BTreeSet for node ID lookups** —
+  `getparents` checks every way's refs against `BTreeSet<i64>` (O(log n) per lookup).
+  `IdSetDense` gives O(1). The complication is that `IdSet` (in `getid.rs`) uses
+  `BTreeSet<i64>` for all three element types and is shared across getid/getparents.
+  Changing it requires either converting at the getparents boundary or reworking
+  `IdSet` globally. Only matters when `--id-osm-file` provides millions of IDs.
+
+- [ ] **merge --locations-on-ways: avoid cloning the location HashMap per batch** —
+  `Arc::new(idx.locations.clone())` at `merge.rs:1495` copies the entire
+  `FxHashMap<i64, (i32, i32)>` for each batch of rewrite jobs that contains way blobs.
+  At planet scale with ~160M node locations this is a significant per-batch allocation.
+  The map only grows (never shrinks or mutates existing entries), so an immutable
+  snapshot without full clone should be possible — e.g. a shared `Arc` that's only
+  replaced when new entries are added, or a read-handle from a concurrent map.
+
+- [ ] **derive_changes: stream changes instead of buffering all in memory** —
+  `derive_changes.rs:78-93` collects all creates, modifies, and deletes into three
+  `Changes` structs before writing the OSC output. For large diffs (e.g. planet-scale
+  weekly diffs with millions of changes) this buffers everything in memory. A streaming
+  approach that writes each change as it's detected would reduce peak memory. Requires
+  restructuring the two-phase scan (detect changes → write OSC) into a single-pass
+  pipeline, which is a significant refactor since the OSC format groups changes by
+  action type (all creates, then all modifies, then all deletes).
+
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)

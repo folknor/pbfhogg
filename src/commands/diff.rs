@@ -572,57 +572,25 @@ fn write_tag_diff(
     old_tags: &[(String, String)],
     new_tags: &[(String, String)],
 ) -> Result<()> {
-    let old_map: HashMap<&str, &str> = old_tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    let new_map: HashMap<&str, &str> = new_tags
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
-    write_removed_tags(output, old_tags, &new_map)?;
-    write_added_tags(output, new_tags, &old_map)?;
-    write_changed_tags(output, new_tags, &old_map)?;
-    Ok(())
-}
-
-fn write_removed_tags(
-    output: &mut dyn Write,
-    old_tags: &[(String, String)],
-    new_map: &HashMap<&str, &str>,
-) -> Result<()> {
+    // Linear scan — elements typically have 2-5 tags, faster than HashMap.
+    // Removed: in old but not in new
     for (k, v) in old_tags {
-        if !new_map.contains_key(k.as_str()) {
+        if !new_tags.iter().any(|(nk, _)| nk == k) {
             writeln!(output, "  -{k}={v}")?;
         }
     }
-    Ok(())
-}
-
-fn write_added_tags(
-    output: &mut dyn Write,
-    new_tags: &[(String, String)],
-    old_map: &HashMap<&str, &str>,
-) -> Result<()> {
+    // Added: in new but not in old
     for (k, v) in new_tags {
-        if !old_map.contains_key(k.as_str()) {
+        if !old_tags.iter().any(|(ok, _)| ok == k) {
             writeln!(output, "  +{k}={v}")?;
         }
     }
-    Ok(())
-}
-
-fn write_changed_tags(
-    output: &mut dyn Write,
-    new_tags: &[(String, String)],
-    old_map: &HashMap<&str, &str>,
-) -> Result<()> {
-    for (k, new_v) in new_tags {
-        if let Some(old_v) = old_map.get(k.as_str())
-            && *old_v != new_v.as_str()
-        {
-            writeln!(output, "  ~{k}: {old_v} -> {new_v}")?;
+    // Changed: same key, different value
+    for (k, v) in new_tags {
+        if let Some((_, old_v)) = old_tags.iter().find(|(ok, _)| ok == k) {
+            if old_v != v {
+                writeln!(output, "  ~{k}: {old_v} -> {v}")?;
+            }
         }
     }
     Ok(())

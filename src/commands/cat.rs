@@ -217,6 +217,7 @@ fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compressio
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
 
     for file in files {
         let mut reader = FileReader::open(file, direct_io)?;
@@ -241,7 +242,7 @@ fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compressio
                             &mut st_scratch, &mut gr_scratch,
                         )?;
                         output_blocks.clear();
-                        let count = process_block(&block, &mut bb, &mut output_blocks, &tf, &clean)?;
+                        let count = process_block(&block, &mut bb, &mut output_blocks, &tf, &clean, &mut refs_buf)?;
                         flush_local(&mut bb, &mut output_blocks)
                             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                         for (block_bytes, index, tagdata) in output_blocks.drain(..) {
@@ -279,13 +280,10 @@ fn process_block(
     output: &mut Vec<OwnedBlock>,
     tf: &TypeFilter,
     clean: &CleanAttrs,
+    refs_buf: &mut Vec<i64>,
 ) -> std::result::Result<u64, String> {
     let (filter_node, filter_way, filter_relation) = (tf.nodes, tf.ways, tf.relations);
     let mut count: u64 = 0;
-
-    // Reusable buffers — same hoisting strategy as the old sequential path.
-    // Grow to max element size in the block then stabilize.
-    let mut refs_buf: Vec<i64> = Vec::new();
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
     for element in block.elements() {
@@ -319,7 +317,7 @@ fn process_block(
                 refs_buf.clear();
                 refs_buf.extend(w.refs());
                 let meta = clean_metadata(element_metadata(&w.info()), clean);
-                bb.add_way(w.id(), w.tags(), &refs_buf, meta.as_ref());
+                bb.add_way(w.id(), w.tags(), refs_buf, meta.as_ref());
                 count += 1;
             }
             Element::Relation(r) if filter_relation => {
@@ -426,11 +424,11 @@ fn process_batch(
     let results: Vec<BatchResult> = batch
         .par_iter()
         .map_init(
-            BlockBuilder::new,
-            |bb, block| {
+            || (BlockBuilder::new(), Vec::<i64>::new()),
+            |(bb, refs_buf), block| {
                 let mut output: Vec<OwnedBlock> = Vec::new();
                 let count = process_block(
-                    block, bb, &mut output, tf, clean,
+                    block, bb, &mut output, tf, clean, refs_buf,
                 )?;
                 flush_local(bb, &mut output)?;
 

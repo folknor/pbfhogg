@@ -366,8 +366,6 @@ fn build_node_index_sparse(
     scratch_dir: &Path,
     referenced: &IdSetDense,
 ) -> Result<SparseArrayIndex> {
-    // Pre-size for planet-scale: max node ID ~12.5B → ~49M chunks.
-    let initial_chunks = 50_000_000;
     let mut offsets: Vec<u64> = Vec::new();
     let mut start_pad: Vec<u8> = Vec::new();
 
@@ -390,9 +388,7 @@ fn build_node_index_sparse(
     let mut byte_pos: u64 = 0;
     let mut prev_id: i64 = -1;
 
-    // Reserve space for chunk arrays.
-    offsets.reserve(initial_chunks);
-    start_pad.reserve(initial_chunks);
+    // Grow on demand — avoids 450 MB upfront allocation for small datasets.
 
     // Node-only sequential scanner: bypasses PrimitiveBlock construction to avoid
     // cross-thread alloc/free retention (25+ GB at Europe/planet scale).

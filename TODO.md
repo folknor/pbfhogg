@@ -360,16 +360,13 @@ input or --clean. Verified via `brokkr verify multi-extract`.
 See [notes/multi-extract-optimization.md](notes/multi-extract-optimization.md)
 for full analysis of 6 optimization opportunities.
 
-- [ ] **Parallel decode** — convert sequential BlobReader to
-  pread-from-workers within each phase. Workers classify against N
-  regions simultaneously, consumer routes to N writers. Currently
-  single-threaded decode makes multi-extract slower than sequential
-  at small scale (Japan 34.9s vs 5 × 4.4s = 22s sequential) because
-  sequential gets parallel decode per-region. At planet scale with
-  10+ regions, the I/O savings (1× vs 10×) dominate.
-  See [notes/multi-extract-parallel-write-plan.md](notes/multi-extract-parallel-write-plan.md)
-  for the 5-step implementation plan: extract write loop, build schedule,
-  pread-from-workers, raw passthrough, sync vs pipelined writers.
+- [x] **Parallel decode** — write phases converted from sequential
+  BlobReader to pread-from-workers via `multi_extract_pread_write`.
+  Workers decode blobs in parallel, classify against N regions, produce
+  N × Vec<OwnedBlock>. Consumer routes to N sync-mode writers via
+  ReorderBuffer. Denmark 5-region: 6.7s → 2.0s (3.4x). Japan 5-region:
+  32.5s → 8.1s (4.0x). Single-pass now 2.7x faster than 5 sequential
+  extracts at Japan scale (8.1s vs 22s).
 - [ ] **Spatial index** — grid or R-tree over regions for O(1)
   per-element lookup instead of O(N). Required for 200+ regions where
   linear scan becomes the bottleneck. Simple grid (3600×1800 cells of

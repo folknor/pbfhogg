@@ -690,11 +690,6 @@ fn try_extract_multi_single_pass(
         strategy: "simple",
     }).collect();
 
-    // Per-region BlockBuilders (one per element type per region).
-    let mut node_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
-    let mut way_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
-    let mut rel_bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
-
     // Build schedules by element type for parallel classification.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -770,24 +765,13 @@ fn try_extract_multi_single_pass(
         },
     )?;
 
-    // Phase 1 write: sequential decode, write matching nodes to N writers.
-    {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
-                if !spatial_filter.wants_index(&idx) { continue; }
-            }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+    // Phase 1 write: parallel decode, write matching nodes to N writers.
+    multi_extract_pread_write(
+        &shared_file,
+        &node_schedule,
+        n,
+        |block, bbs, output| {
+            let mut counts = vec![0u64; n];
             for element in block.elements() {
                 match &element {
                     Element::DenseNode(dn) if bbox_node_ids.iter().any(|s| s.get(dn.id())) => {
@@ -795,13 +779,9 @@ fn try_extract_multi_single_pass(
                         let meta = dense_node_metadata(dn);
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
-                                if !node_bbs[i].can_add_node() {
-                                    if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
-                                        writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                    }
-                                }
-                                node_bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
-                                stats[i].nodes_in_bbox += 1;
+                                ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
+                                bbs[i].add_node(id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                                counts[i] += 1;
                             }
                         }
                     }
@@ -810,21 +790,21 @@ fn try_extract_multi_single_pass(
                         let meta = element_metadata(&nd.info());
                         for i in 0..n {
                             if bbox_node_ids[i].get(id) {
-                                if !node_bbs[i].can_add_node() {
-                                    if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
-                                        writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                    }
-                                }
-                                node_bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), nd.tags(), meta.as_ref());
-                                stats[i].nodes_in_bbox += 1;
+                                ensure_node_capacity_local(&mut bbs[i], &mut output[i])?;
+                                bbs[i].add_node(id, nd.decimicro_lat(), nd.decimicro_lon(), nd.tags(), meta.as_ref());
+                                counts[i] += 1;
                             }
                         }
                     }
                     _ => {}
                 }
             }
-        }
-    }
+            Ok(counts)
+        },
+        &mut writers,
+        &mut stats,
+        |s| &mut s.nodes_in_bbox,
+    )?;
 
     // Phase 2: Parallel way classification → N matched_way_ids.
     parallel_classify_phase(
@@ -852,23 +832,13 @@ fn try_extract_multi_single_pass(
         },
     )?;
 
-    // Phase 2 write: sequential decode, write matching ways to N writers.
-    {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
-            }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+    // Phase 2 write: parallel decode, write matching ways to N writers.
+    multi_extract_pread_write(
+        &shared_file,
+        &way_schedule,
+        n,
+        |block, bbs, output| {
+            let mut counts = vec![0u64; n];
             let mut refs_buf: Vec<i64> = Vec::new();
             for element in block.elements() {
                 if let Element::Way(w) = &element {
@@ -879,19 +849,19 @@ fn try_extract_multi_single_pass(
                     let meta = element_metadata(&w.info());
                     for i in 0..n {
                         if matched_way_ids[i].get(wid) {
-                            if !way_bbs[i].can_add_way() {
-                                if let Some((bytes, index, tagdata)) = way_bbs[i].take_owned()? {
-                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                }
-                            }
-                            way_bbs[i].add_way(wid, w.tags(), &refs_buf, meta.as_ref());
-                            stats[i].ways_written += 1;
+                            ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
+                            bbs[i].add_way(wid, w.tags(), &refs_buf, meta.as_ref());
+                            counts[i] += 1;
                         }
                     }
                 }
             }
-        }
-    }
+            Ok(counts)
+        },
+        &mut writers,
+        &mut stats,
+        |s| &mut s.ways_written,
+    )?;
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
     parallel_classify_phase(
@@ -919,23 +889,13 @@ fn try_extract_multi_single_pass(
         },
     )?;
 
-    // Phase 3 write: sequential decode, write matching relations to N writers.
-    {
-        let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-        blob_reader.set_parse_indexdata(true);
-        blob_reader.next()
-            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
-        let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-        let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-        for blob_result in &mut blob_reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-            if let Some(idx) = blob.index() {
-                if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
-            }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+    // Phase 3 write: parallel decode, write matching relations to N writers.
+    multi_extract_pread_write(
+        &shared_file,
+        &relation_schedule,
+        n,
+        |block, bbs, output| {
+            let mut counts = vec![0u64; n];
             let mut members_buf: Vec<MemberData<'_>> = Vec::new();
             for element in block.elements() {
                 if let Element::Relation(r) = &element {
@@ -949,33 +909,24 @@ fn try_extract_multi_single_pass(
                     let meta = element_metadata(&r.info());
                     for i in 0..n {
                         if matched_relation_ids[i].get(rid) {
-                            if !rel_bbs[i].can_add_relation() {
-                                if let Some((bytes, index, tagdata)) = rel_bbs[i].take_owned()? {
-                                    writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-                                }
-                            }
-                            rel_bbs[i].add_relation(rid, r.tags(), &members_buf, meta.as_ref());
-                            stats[i].relations_written += 1;
+                            ensure_relation_capacity_local(&mut bbs[i], &mut output[i])?;
+                            bbs[i].add_relation(rid, r.tags(), &members_buf, meta.as_ref());
+                            counts[i] += 1;
                         }
                     }
                 }
             }
-        }
-    }
+            Ok(counts)
+        },
+        &mut writers,
+        &mut stats,
+        |s| &mut s.relations_written,
+    )?;
 
-    // Flush all remaining BlockBuilders.
-    for i in 0..n {
-        if let Some((bytes, index, tagdata)) = node_bbs[i].take_owned()? {
-            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-        }
-        if let Some((bytes, index, tagdata)) = way_bbs[i].take_owned()? {
-            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-        }
-        if let Some((bytes, index, tagdata)) = rel_bbs[i].take_owned()? {
-            writers[i].write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
-        }
+    // Flush all writers (workers already flushed their BlockBuilders per blob).
+    for (i, slot) in slots.iter().enumerate() {
         writers[i].flush()
-            .map_err(|e| format!("failed to flush {}: {e}", slots[i].output.display()))?;
+            .map_err(|e| format!("failed to flush {}: {e}", slot.output.display()))?;
     }
 
     // Print per-region stats.
@@ -1096,6 +1047,138 @@ pub fn extract(
 // Parallel batch infrastructure
 // ---------------------------------------------------------------------------
 
+/// Multi-region pread-from-workers write pass.
+///
+/// Workers pread blob data, decompress, parse into PrimitiveBlock, then call
+/// the provided closure to classify elements against N regions and produce
+/// N × Vec<OwnedBlock>. The consumer writes each region's blocks to its
+/// writer in sequence order.
+#[allow(clippy::too_many_lines)]
+fn multi_extract_pread_write<F>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    n: usize,
+    block_fn: F,
+    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
+    stats: &mut [ExtractStats],
+    stat_field: fn(&mut ExtractStats) -> &mut u64,
+) -> Result<()>
+where
+    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>)
+        -> std::result::Result<Vec<u64>, String> + Send + Sync,
+{
+    use std::os::unix::fs::FileExt as _;
+
+    if schedule.is_empty() { return Ok(()); }
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|t| t.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    // Worker result: per-region OwnedBlocks + per-region counts.
+    type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
+
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, WorkerResult)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule items to workers with local sequence index.
+        scope.spawn(move || {
+            for (local_seq, &(_global_seq, data_offset, data_size)) in schedule.iter().enumerate() {
+                if desc_tx.send((local_seq, data_offset, data_size)).is_err() { break; }
+            }
+        });
+
+        // Workers: pread → decompress → PrimitiveBlock → classify N regions → N × OwnedBlocks.
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let block_fn_ref = &block_fn;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+                let mut output: Vec<Vec<OwnedBlock>> = (0..n).map(|_| Vec::new()).collect();
+                let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: WorkerResult = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                        )?;
+                        for v in &mut output { v.clear(); }
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            ))?;
+                        // Flush remaining elements in each BlockBuilder.
+                        for i in 0..n {
+                            flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
+                                crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
+                                )
+                            })?;
+                        }
+                        let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
+                            .map(std::mem::take)
+                            .collect();
+                        Ok((taken, counts))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        // Consumer: receive N-region results in order, write to N writers.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<WorkerResult> =
+            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+
+            while let Some(result) = reorder.pop_ready() {
+                let (region_blocks, counts) = result?;
+                for (i, blocks) in region_blocks.into_iter().enumerate() {
+                    *stat_field(&mut stats[i]) += counts[i];
+                    for (block_bytes, index, tagdata) in blocks {
+                        writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                    }
+                }
+            }
+        }
+        // Drain remaining.
+        while let Some(result) = reorder.pop_ready() {
+            let (region_blocks, counts) = result?;
+            for (i, blocks) in region_blocks.into_iter().enumerate() {
+                *stat_field(&mut stats[i]) += counts[i];
+                for (block_bytes, index, tagdata) in blocks {
+                    writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
 
 fn merge_extract_stats(target: &mut ExtractStats, source: &ExtractStats) {
     target.nodes_in_bbox += source.nodes_in_bbox;

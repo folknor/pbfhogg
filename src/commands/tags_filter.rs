@@ -121,10 +121,10 @@ impl TagsFilterStats {
             self.nodes_matched,
             self.nodes_from_ways,
             self.nodes_from_relations,
-            self.ways_matched,
+            self.ways_matched + self.ways_from_relations,
             self.ways_matched,
             self.ways_from_relations,
-            self.relations_matched,
+            self.relations_matched + self.relations_from_relations,
             self.relations_matched,
             self.relations_from_relations,
         );

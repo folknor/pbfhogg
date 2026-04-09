@@ -53,40 +53,54 @@ pub(crate) enum OwnedElement {
 }
 
 // ---------------------------------------------------------------------------
-// Ord impls — compare by ID only via osm_id_cmp
+// Ord impls — compare by ID via osm_id_cmp, then version ascending as tiebreaker
 // ---------------------------------------------------------------------------
 
+/// Extract version from optional metadata (0 if absent).
+fn version_of(meta: &Option<OwnedMetadata>) -> i32 {
+    meta.as_ref().map_or(0, |m| m.version)
+}
+
 impl PartialEq for OwnedNode {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
 }
 impl Eq for OwnedNode {}
 impl PartialOrd for OwnedNode {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedNode {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+            .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
+    }
 }
 
 impl PartialEq for OwnedWay {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
 }
 impl Eq for OwnedWay {}
 impl PartialOrd for OwnedWay {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedWay {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+            .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
+    }
 }
 
 impl PartialEq for OwnedRelation {
-    fn eq(&self, other: &Self) -> bool { self.id == other.id }
+    fn eq(&self, other: &Self) -> bool { self.id == other.id && version_of(&self.metadata) == version_of(&other.metadata) }
 }
 impl Eq for OwnedRelation {}
 impl PartialOrd for OwnedRelation {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
 }
 impl Ord for OwnedRelation {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering { super::osm_id_cmp(self.id, other.id) }
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        super::osm_id_cmp(self.id, other.id)
+            .then_with(|| version_of(&self.metadata).cmp(&version_of(&other.metadata)))
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -1069,7 +1069,7 @@ fn cover_segment(
     // Walk intermediate points. Step size < half cell edge to catch crossings.
     let dlat = lat2 - lat1;
     let dlon = lon2 - lon1;
-    let seg_len_deg = ((dlat * 1e-7).powi(2) + (dlon * 1e-7).powi(2)).sqrt();
+    let seg_len_deg = (dlat.powi(2) + dlon.powi(2)).sqrt();
 
     let step_deg = match level {
         17 => 0.0003,
@@ -1306,7 +1306,7 @@ fn bucketed_cell_assignment(
     let mut interp_out = BufWriter::new(std::fs::File::create(output_dir.join(interp_entries_file))?);
 
     let mut street_byte_offset: u64 = 0;
-    let mut addr_byte_offset: u32 = 0;
+    let mut addr_byte_offset: u64 = 0;
     let mut interp_byte_offset: u64 = 0;
     let mut total_cells: u32 = 0;
     let mut prev_cell_id: u64 = 0;
@@ -1391,11 +1391,8 @@ fn bucketed_cell_assignment(
             let gc = GeoCell {
                 cell_id,
                 street_offset: if has_streets { street_byte_offset } else { NO_DATA_U64 },
-                addr_offset: if has_addrs { addr_byte_offset } else { NO_DATA_U32 },
-                interp_offset: if has_interps {
-                    #[allow(clippy::cast_possible_truncation)]
-                    { interp_byte_offset as u32 }
-                } else { NO_DATA_U32 },
+                addr_offset: if has_addrs { addr_byte_offset } else { NO_DATA_U64 },
+                interp_offset: if has_interps { interp_byte_offset } else { NO_DATA_U64 },
             };
             cells_out.write_all(&gc.to_bytes())?;
             debug_assert!(
@@ -1412,7 +1409,7 @@ fn bucketed_cell_assignment(
             }
             if has_addrs {
                 let count = addrs.len().min(u16::MAX as usize);
-                addr_byte_offset += 2 + (count * 4) as u32;
+                addr_byte_offset += 2 + (count * 4) as u64;
             }
             if has_interps {
                 let count = interps.len().min(u16::MAX as usize);

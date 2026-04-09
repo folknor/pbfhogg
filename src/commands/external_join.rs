@@ -422,8 +422,11 @@ fn stage2_node_join(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
 
+    let io_error: std::sync::Mutex<Option<crate::error::Error>> = std::sync::Mutex::new(None);
+
     std::thread::scope(|scope| -> Result<()> {
         // IO thread: read headers only, filter to node blobs, send descriptors.
+        let io_error_ref = &io_error;
         scope.spawn(move || {
             let mut seq: usize = 0;
             while let Some(result) = blob_reader.next_header_with_data_offset() {
@@ -442,7 +445,12 @@ fn stage2_node_join(
                         }
                         seq += 1;
                     }
-                    Err(_) => break,
+                    Err(e) => {
+                        if let Ok(mut guard) = io_error_ref.lock() {
+                            *guard = Some(e);
+                        }
+                        break;
+                    }
                 }
             }
         });
@@ -568,6 +576,10 @@ fn stage2_node_join(
 
         Ok(())
     })?;
+
+    if let Some(e) = io_error.into_inner().unwrap_or(None) {
+        return Err(Box::new(e));
+    }
 
     Ok(resolved_count)
 }

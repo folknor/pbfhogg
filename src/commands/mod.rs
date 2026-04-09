@@ -885,7 +885,7 @@ pub(crate) fn require_indexdata(
         return Err(format!(
             "{reason}\n\n\
              Generate an indexed PBF first:\n\n\
-             \x20 pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf\n\n\
+             \x20 pbfhogg cat input.osm.pbf -o indexed.osm.pbf\n\n\
              Or pass --force to proceed anyway."
         )
         .into());

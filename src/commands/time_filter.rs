@@ -78,8 +78,12 @@ pub fn time_filter(
         dropped_no_snapshot_version: 0,
     };
     let mut pending: Option<PendingGroup> = None;
+    let mut flush_error: Result<()> = Ok(());
 
     reader.for_each(|element| {
+        if flush_error.is_err() {
+            return;
+        }
         let (kind, id, timestamp) = element_identity_and_timestamp(&element);
         stats.versions_seen += 1;
 
@@ -87,7 +91,10 @@ pub fn time_filter(
             .as_ref()
             .is_some_and(|g| g.kind != kind || g.id != id);
         if group_changed && let Some(group) = pending.take() {
-            flush_group(group, &mut bb, &mut writer, &mut stats).expect("flush pending group");
+            if let Err(e) = flush_group(group, &mut bb, &mut writer, &mut stats) {
+                flush_error = Err(e);
+                return;
+            }
         }
 
         if pending.is_none() {
@@ -105,6 +112,7 @@ pub fn time_filter(
             }
         }
     })?;
+    flush_error?;
 
     if let Some(group) = pending.take() {
         flush_group(group, &mut bb, &mut writer, &mut stats)?;

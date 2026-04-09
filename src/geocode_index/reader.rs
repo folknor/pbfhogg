@@ -470,7 +470,8 @@ struct U32EntryIter<'a> {
 }
 
 impl<'a> U32EntryIter<'a> {
-    fn new(mmap: &'a [u8], offset: u32) -> Self {
+    #[allow(clippy::cast_possible_truncation)] // u64→usize: Linux 64-bit only
+    fn new(mmap: &'a [u8], offset: u64) -> Self {
         let off = offset as usize;
         if off + 2 > mmap.len() {
             return Self { data: mmap, pos: 0, remaining: 0 };
@@ -522,9 +523,6 @@ impl<'a> SegmentEntryIter<'a> {
         Self { data: mmap, pos: off + 2, remaining: count }
     }
 
-    fn from_u32(mmap: &'a [u8], offset: u32) -> Self {
-        Self::new(mmap, offset as u64)
-    }
 }
 
 impl Iterator for SegmentEntryIter<'_> {
@@ -637,7 +635,7 @@ impl Reader {
             };
 
             // Address points
-            if gc.addr_offset != format::NO_DATA_U32 {
+            if gc.addr_offset != format::NO_DATA_U64 {
                 for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
                     let pt = self.read_addr_point(idx);
                     let dist_sq = geo::approx_distance_sq(
@@ -667,8 +665,8 @@ impl Reader {
             }
 
             // Interpolation segments
-            if gc.interp_offset != format::NO_DATA_U32 {
-                for seg_ref in SegmentEntryIter::from_u32(interp_entries_mmap, gc.interp_offset) {
+            if gc.interp_offset != format::NO_DATA_U64 {
+                for seg_ref in SegmentEntryIter::new(interp_entries_mmap, gc.interp_offset) {
                     let (snap_lat, snap_lon, dist_sq) =
                         self.interp_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq
@@ -705,7 +703,7 @@ impl Reader {
                 continue;
             };
 
-            if gc.addr_offset != format::NO_DATA_U32 {
+            if gc.addr_offset != format::NO_DATA_U64 {
                 for idx in U32EntryIter::new(addr_entries_mmap, gc.addr_offset) {
                     let pt = self.read_addr_point(idx);
                     let dist_sq = geo::approx_distance_sq(
@@ -742,8 +740,8 @@ impl Reader {
                 }
             }
 
-            if gc.interp_offset != format::NO_DATA_U32 {
-                for seg_ref in SegmentEntryIter::from_u32(interp_entries_mmap, gc.interp_offset) {
+            if gc.interp_offset != format::NO_DATA_U64 {
+                for seg_ref in SegmentEntryIter::new(interp_entries_mmap, gc.interp_offset) {
                     let (snap_lat, snap_lon, dist_sq) =
                         self.interp_segment_distance(ctx, &seg_ref);
                     if dist_sq < max_dist_sq {

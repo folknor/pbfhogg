@@ -36,7 +36,7 @@ struct StringInterner {
     /// Flat buffer holding all interned string bytes, concatenated.
     data: Vec<u8>,
     /// Maps intern_id -> (offset, len) into `data`.
-    table: Vec<(u32, u16)>,
+    table: Vec<(u32, u32)>,
     /// Maps string content -> intern_id for dedup lookup.
     lookup: FxHashMap<String, u32>,
 }
@@ -62,7 +62,7 @@ impl StringInterner {
             return id;
         }
         let offset = self.data.len() as u32;
-        let len = s.len() as u16;
+        let len = s.len() as u32;
         self.data.extend_from_slice(s.as_bytes());
         let id = self.table.len() as u32;
         self.table.push((offset, len));
@@ -73,14 +73,14 @@ impl StringInterner {
     /// Resolve an intern ID back to the original string.
     fn resolve(&self, id: u32) -> &str {
         let (offset, len) = self.table[id as usize];
-        let bytes = &self.data[offset as usize..offset as usize + len as usize];
+        let bytes = &self.data[offset as usize..(offset + len) as usize];
         std::str::from_utf8(bytes).unwrap_or("")
     }
 
     /// Estimate the heap memory used by this interner in bytes.
     fn heap_size_estimate(&self) -> usize {
         let mut total = self.data.capacity();
-        total += self.table.capacity() * std::mem::size_of::<(u32, u16)>();
+        total += self.table.capacity() * std::mem::size_of::<(u32, u32)>();
         // FxHashMap overhead: each bucket is (String, u32) + 1 control byte.
         total += self.lookup.capacity()
             * (std::mem::size_of::<String>() + std::mem::size_of::<u32>() + 1);
@@ -133,12 +133,6 @@ fn read_u32_le(data: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes(bytes)
 }
 
-#[inline]
-fn read_u16_le(data: &[u8], offset: usize) -> u16 {
-    let bytes: [u8; 2] = [data[offset], data[offset + 1]];
-    u16::from_le_bytes(bytes)
-}
-
 // ---------------------------------------------------------------------------
 // MemberType <-> byte conversion
 // ---------------------------------------------------------------------------
@@ -168,8 +162,8 @@ fn byte_to_member_type(b: u8) -> MemberType {
 
 /// Append a node to the arena in packed binary layout.
 ///
-/// Layout: `[id:i64 LE][lat:i32 LE][lon:i32 LE][tag_count:u16 LE]`
-/// then per tag: `[key_intern_id:u32 LE][value_len:u16 LE][value_bytes]`
+/// Layout: `[id:i64 LE][lat:i32 LE][lon:i32 LE][tag_count:u32 LE]`
+/// then per tag: `[key_intern_id:u32 LE][value_len:u32 LE][value_bytes]`
 ///
 /// Returns the byte offset where this node starts in the arena.
 #[allow(clippy::cast_possible_truncation)]
@@ -178,11 +172,11 @@ fn arena_append_node(arena: &mut Vec<u8>, id: i64, lat: i32, lon: i32, tags: &[(
     arena.extend_from_slice(&id.to_le_bytes());
     arena.extend_from_slice(&lat.to_le_bytes());
     arena.extend_from_slice(&lon.to_le_bytes());
-    let tag_count = tags.len() as u16;
+    let tag_count = tags.len() as u32;
     arena.extend_from_slice(&tag_count.to_le_bytes());
     for &(key_id, value) in tags {
         arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u16;
+        let value_len = value.len() as u32;
         arena.extend_from_slice(&value_len.to_le_bytes());
         arena.extend_from_slice(value.as_bytes());
     }
@@ -191,7 +185,7 @@ fn arena_append_node(arena: &mut Vec<u8>, id: i64, lat: i32, lon: i32, tags: &[(
 
 /// Append a way to the arena in packed binary layout.
 ///
-/// Layout: `[id:i64 LE][ref_count:u32 LE][tag_count:u16 LE][pad:u16=0]`
+/// Layout: `[id:i64 LE][ref_count:u32 LE][tag_count:u32 LE]`
 /// then `ref_count` x `[ref_id:i64 LE]`, then tags (same format as nodes).
 ///
 /// Returns the byte offset where this way starts in the arena.
@@ -201,15 +195,14 @@ fn arena_append_way(arena: &mut Vec<u8>, id: i64, refs: &[i64], tags: &[(u32, &s
     arena.extend_from_slice(&id.to_le_bytes());
     let ref_count = refs.len() as u32;
     arena.extend_from_slice(&ref_count.to_le_bytes());
-    let tag_count = tags.len() as u16;
+    let tag_count = tags.len() as u32;
     arena.extend_from_slice(&tag_count.to_le_bytes());
-    arena.extend_from_slice(&0u16.to_le_bytes()); // padding
     for &r in refs {
         arena.extend_from_slice(&r.to_le_bytes());
     }
     for &(key_id, value) in tags {
         arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u16;
+        let value_len = value.len() as u32;
         arena.extend_from_slice(&value_len.to_le_bytes());
         arena.extend_from_slice(value.as_bytes());
     }
@@ -218,7 +211,7 @@ fn arena_append_way(arena: &mut Vec<u8>, id: i64, refs: &[i64], tags: &[(u32, &s
 
 /// Append a relation to the arena in packed binary layout.
 ///
-/// Layout: `[id:i64 LE][member_count:u32 LE][tag_count:u16 LE][pad:u16=0]`
+/// Layout: `[id:i64 LE][member_count:u32 LE][tag_count:u32 LE]`
 /// then per member: `[ref_id:i64 LE][type:u8][role_intern_id:u32 LE]` (13 bytes each),
 /// then tags (same format as nodes).
 ///
@@ -234,9 +227,8 @@ fn arena_append_relation(
     arena.extend_from_slice(&id.to_le_bytes());
     let member_count = members.len() as u32;
     arena.extend_from_slice(&member_count.to_le_bytes());
-    let tag_count = tags.len() as u16;
+    let tag_count = tags.len() as u32;
     arena.extend_from_slice(&tag_count.to_le_bytes());
-    arena.extend_from_slice(&0u16.to_le_bytes()); // padding
     for &(ref_id, type_byte, role_id) in members {
         arena.extend_from_slice(&ref_id.to_le_bytes());
         arena.push(type_byte);
@@ -244,7 +236,7 @@ fn arena_append_relation(
     }
     for &(key_id, value) in tags {
         arena.extend_from_slice(&key_id.to_le_bytes());
-        let value_len = value.len() as u16;
+        let value_len = value.len() as u32;
         arena.extend_from_slice(&value_len.to_le_bytes());
         arena.extend_from_slice(value.as_bytes());
     }
@@ -257,7 +249,7 @@ fn arena_append_relation(
 
 /// Iterator over tags in arena-packed binary layout.
 ///
-/// Each tag is stored as `[key_intern_id:u32 LE][value_len:u16 LE][value_bytes]`.
+/// Each tag is stored as `[key_intern_id:u32 LE][value_len:u32 LE][value_bytes]`.
 /// Yields `(&str, &str)` pairs of (key, value).
 pub struct CompactTagIter<'a> {
     data: &'a [u8],
@@ -276,8 +268,8 @@ impl<'a> Iterator for CompactTagIter<'a> {
         self.remaining -= 1;
         let key_id = read_u32_le(self.data, self.offset);
         self.offset += 4;
-        let value_len = read_u16_le(self.data, self.offset) as usize;
-        self.offset += 2;
+        let value_len = read_u32_le(self.data, self.offset) as usize;
+        self.offset += 4;
         let value_bytes = &self.data[self.offset..self.offset + value_len];
         self.offset += value_len;
         let key = self.interner.resolve(key_id);
@@ -364,15 +356,15 @@ impl ExactSizeIterator for CompactMemberIter<'_> {}
 
 /// Zero-copy accessor for a node stored in the arena.
 ///
-/// Layout: `[id:i64][lat:i32][lon:i32][tag_count:u16]` then tags.
+/// Layout: `[id:i64][lat:i32][lon:i32][tag_count:u32]` then tags.
 pub struct CompactNodeRef<'a> {
     data: &'a [u8],
     interner: &'a StringInterner,
 }
 
 impl<'a> CompactNodeRef<'a> {
-    /// Header size: 8 (id) + 4 (lat) + 4 (lon) + 2 (tag_count) = 18 bytes.
-    const HEADER_LEN: usize = 18;
+    /// Header size: 8 (id) + 4 (lat) + 4 (lon) + 4 (tag_count) = 20 bytes.
+    const HEADER_LEN: usize = 20;
 
     /// Returns the node ID.
     pub fn id(&self) -> i64 {
@@ -391,7 +383,7 @@ impl<'a> CompactNodeRef<'a> {
 
     /// Returns the number of tags.
     pub fn tag_count(&self) -> usize {
-        read_u16_le(self.data, 16) as usize
+        read_u32_le(self.data, 16) as usize
     }
 
     /// Returns an iterator over the tags as `(&str, &str)` pairs.
@@ -407,14 +399,14 @@ impl<'a> CompactNodeRef<'a> {
 
 /// Zero-copy accessor for a way stored in the arena.
 ///
-/// Layout: `[id:i64][ref_count:u32][tag_count:u16][pad:u16]` then refs, then tags.
+/// Layout: `[id:i64][ref_count:u32][tag_count:u32]` then refs, then tags.
 pub struct CompactWayRef<'a> {
     data: &'a [u8],
     interner: &'a StringInterner,
 }
 
 impl<'a> CompactWayRef<'a> {
-    /// Header size: 8 (id) + 4 (ref_count) + 2 (tag_count) + 2 (pad) = 16 bytes.
+    /// Header size: 8 (id) + 4 (ref_count) + 4 (tag_count) = 16 bytes.
     const HEADER_LEN: usize = 16;
 
     /// Returns the way ID.
@@ -429,7 +421,7 @@ impl<'a> CompactWayRef<'a> {
 
     /// Returns the number of tags.
     pub fn tag_count(&self) -> usize {
-        read_u16_le(self.data, 12) as usize
+        read_u32_le(self.data, 12) as usize
     }
 
     /// Returns an iterator over the node references.
@@ -455,14 +447,14 @@ impl<'a> CompactWayRef<'a> {
 
 /// Zero-copy accessor for a relation stored in the arena.
 ///
-/// Layout: `[id:i64][member_count:u32][tag_count:u16][pad:u16]` then members, then tags.
+/// Layout: `[id:i64][member_count:u32][tag_count:u32]` then members, then tags.
 pub struct CompactRelationRef<'a> {
     data: &'a [u8],
     interner: &'a StringInterner,
 }
 
 impl<'a> CompactRelationRef<'a> {
-    /// Header size: 8 (id) + 4 (member_count) + 2 (tag_count) + 2 (pad) = 16 bytes.
+    /// Header size: 8 (id) + 4 (member_count) + 4 (tag_count) = 16 bytes.
     const HEADER_LEN: usize = 16;
 
     /// Per-member size: 8 (ref_id) + 1 (type) + 4 (role_intern_id) = 13 bytes.
@@ -480,7 +472,7 @@ impl<'a> CompactRelationRef<'a> {
 
     /// Returns the number of tags.
     pub fn tag_count(&self) -> usize {
-        read_u16_le(self.data, 12) as usize
+        read_u32_le(self.data, 12) as usize
     }
 
     /// Returns an iterator over the members as `(MemberType, i64, &str)` tuples.

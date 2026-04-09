@@ -145,9 +145,9 @@ struct FrameScratch {
     /// Intermediate compression output (zlib/zstd only).
     compress_buf: Vec<u8>,
     /// Reusable zlib compressor (lazy-initialized on first zlib blob).
-    zlib_compressor: Option<Compress>,
+    zlib_compressor: Option<(u32, Compress)>,
     /// Reusable zstd compressor (lazy-initialized on first zstd blob).
-    zstd_compressor: Option<zstd::bulk::Compressor<'static>>,
+    zstd_compressor: Option<(i32, zstd::bulk::Compressor<'static>)>,
 }
 
 impl FrameScratch {
@@ -890,14 +890,16 @@ fn encode_blob_body(
             compress_zlib(uncompressed, *level, scratch)?;
         }
         Compression::Zstd(level) => {
-            if scratch.zstd_compressor.is_none() {
-                scratch.zstd_compressor = Some(
-                    zstd::bulk::Compressor::new(*level).map_err(io::Error::other)?,
-                );
+            match &scratch.zstd_compressor {
+                Some((cached_level, _)) if *cached_level == *level => {}
+                _ => {
+                    scratch.zstd_compressor = Some((
+                        *level,
+                        zstd::bulk::Compressor::new(*level).map_err(io::Error::other)?,
+                    ));
+                }
             }
-            let Some(compressor) = scratch.zstd_compressor.as_mut() else {
-                unreachable!()
-            };
+            let (_, compressor) = scratch.zstd_compressor.as_mut().expect("just initialized");
             scratch.compress_buf = compressor.compress(uncompressed).map_err(io::Error::other)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
@@ -917,9 +919,14 @@ fn compress_zlib(
     level: u32,
     scratch: &mut FrameScratch,
 ) -> io::Result<()> {
-    let compressor = scratch.zlib_compressor.get_or_insert_with(|| {
-        Compress::new(FlateCompression::new(level), true)
-    });
+    let needs_new = match &scratch.zlib_compressor {
+        Some((cached_level, _)) => *cached_level != level,
+        None => true,
+    };
+    if needs_new {
+        scratch.zlib_compressor = Some((level, Compress::new(FlateCompression::new(level), true)));
+    }
+    let (_, compressor) = scratch.zlib_compressor.as_mut().expect("just initialized");
     scratch.compress_buf.clear();
     // Zlib worst-case bound: input + ~0.1% + header/trailer.
     scratch.compress_buf.reserve(uncompressed.len() + (uncompressed.len() >> 10) + 64);

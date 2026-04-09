@@ -13,8 +13,6 @@ pub const HEADER_MAGIC: [u8; 4] = *b"GIDX";
 pub const FORMAT_VERSION: u32 = 1;
 
 /// Sentinel value for "no data" in u32 offset fields.
-pub const NO_DATA_U32: u32 = 0xFFFF_FFFF;
-
 /// Sentinel value for "no data" in u64 offset fields.
 pub const NO_DATA_U64: u64 = u64::MAX;
 
@@ -114,17 +112,17 @@ impl Header {
 // ---------------------------------------------------------------------------
 
 /// Merged street-level cell index entry.
-pub const GEO_CELL_SIZE: usize = 24;
+pub const GEO_CELL_SIZE: usize = 32;
 
 #[derive(Debug, Clone, Copy)]
 pub struct GeoCell {
     pub cell_id: u64,
-    /// Byte offset into street_entries.bin (u64, can exceed 4 GB).
+    /// Byte offset into street_entries.bin.
     pub street_offset: u64,
-    /// Byte offset into addr_entries.bin (u32).
-    pub addr_offset: u32,
-    /// Byte offset into interp_entries.bin (u32).
-    pub interp_offset: u32,
+    /// Byte offset into addr_entries.bin.
+    pub addr_offset: u64,
+    /// Byte offset into interp_entries.bin.
+    pub interp_offset: u64,
 }
 
 impl GeoCell {
@@ -132,8 +130,8 @@ impl GeoCell {
         let mut buf = [0u8; GEO_CELL_SIZE];
         buf[0..8].copy_from_slice(&self.cell_id.to_le_bytes());
         buf[8..16].copy_from_slice(&self.street_offset.to_le_bytes());
-        buf[16..20].copy_from_slice(&self.addr_offset.to_le_bytes());
-        buf[20..24].copy_from_slice(&self.interp_offset.to_le_bytes());
+        buf[16..24].copy_from_slice(&self.addr_offset.to_le_bytes());
+        buf[24..32].copy_from_slice(&self.interp_offset.to_le_bytes());
         buf
     }
 
@@ -141,8 +139,8 @@ impl GeoCell {
         Self {
             cell_id: u64::from_le_bytes([buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7]]),
             street_offset: u64::from_le_bytes([buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]]),
-            addr_offset: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
-            interp_offset: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            addr_offset: u64::from_le_bytes([buf[16], buf[17], buf[18], buf[19], buf[20], buf[21], buf[22], buf[23]]),
+            interp_offset: u64::from_le_bytes([buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31]]),
         }
     }
 }
@@ -517,15 +515,15 @@ mod tests {
         let cell = GeoCell {
             cell_id: 0x1234_5678_9ABC_DEF0,
             street_offset: 0xAAAA_BBBB_CCCC_DDDD,
-            addr_offset: 0x1111_2222,
-            interp_offset: NO_DATA_U32,
+            addr_offset: 0x1111_2222_3333_4444,
+            interp_offset: NO_DATA_U64,
         };
         let bytes = cell.to_bytes();
         let parsed = GeoCell::from_bytes(&bytes);
         assert_eq!(parsed.cell_id, cell.cell_id);
         assert_eq!(parsed.street_offset, cell.street_offset);
         assert_eq!(parsed.addr_offset, cell.addr_offset);
-        assert_eq!(parsed.interp_offset, NO_DATA_U32);
+        assert_eq!(parsed.interp_offset, NO_DATA_U64);
     }
 
     #[test]

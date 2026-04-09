@@ -141,6 +141,65 @@ impl DenseNodeColumns {
         }
     }
 
+    /// Classify nodes against N bounding boxes in a single pass, setting
+    /// matching IDs directly into per-region `IdSetDense` instances.
+    ///
+    /// Same as `collect_matching_ids_multi_bbox` but avoids intermediate
+    /// Vec allocation by writing directly to the bitmap.
+    #[inline]
+    pub fn set_matching_ids_multi_bbox(
+        &self,
+        bboxes: &[(i32, i32, i32, i32)],
+        out: &mut [crate::commands::id_set_dense::IdSetDense],
+    ) {
+        let n = self.len();
+        let lats = &self.lats;
+        let lons = &self.lons;
+        let ids = &self.ids;
+
+        for i in 0..n {
+            let lat = lats[i];
+            let lon = lons[i];
+            let id = ids[i];
+            for (j, &(min_lat, max_lat, min_lon, max_lon)) in bboxes.iter().enumerate() {
+                let hit = (lat >= min_lat) as u8
+                        & (lat <= max_lat) as u8
+                        & (lon >= min_lon) as u8
+                        & (lon <= max_lon) as u8;
+                if hit != 0 {
+                    out[j].set(id);
+                }
+            }
+        }
+    }
+
+    /// Classify nodes against a bounding box, setting matching IDs
+    /// directly into an `IdSetDense`.
+    #[inline]
+    pub fn set_matching_ids_bbox(
+        &self,
+        min_lat: i32,
+        max_lat: i32,
+        min_lon: i32,
+        max_lon: i32,
+        out: &mut crate::commands::id_set_dense::IdSetDense,
+    ) {
+        let n = self.len();
+        let lats = &self.lats;
+        let lons = &self.lons;
+        let ids = &self.ids;
+
+        for i in 0..n {
+            let hit = (lats[i] >= min_lat) as u8
+                    & (lats[i] <= max_lat) as u8
+                    & (lons[i] >= min_lon) as u8
+                    & (lons[i] <= max_lon) as u8;
+            if hit != 0 {
+                out.set(ids[i]);
+            }
+        }
+    }
+
     /// Classify nodes against a bounding box, collecting matching IDs
     /// into a caller-provided Vec (scratch reuse).
     ///

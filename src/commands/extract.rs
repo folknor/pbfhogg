@@ -761,16 +761,14 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
+            || (crate::read::columnar::DenseNodeColumns::new(), (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>()),
             |block, (columns, region_ids)| {
                 block.decode_dense_columns(columns);
-                columns.collect_matching_ids_multi_bbox(&bboxes, region_ids);
+                columns.set_matching_ids_multi_bbox(&bboxes, region_ids);
             },
             |(_, region_ids)| {
-                for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids {
-                        bbox_node_ids[i].set(id);
-                    }
+                for (i, worker_set) in region_ids.into_iter().enumerate() {
+                    bbox_node_ids[i].merge(worker_set);
                 }
             },
         )?;
@@ -778,7 +776,7 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            || vec![Vec::<i64>::new(); n],
+            || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
             |block, region_ids| {
                 for element in block.elements_skip_metadata() {
                     match &element {
@@ -787,7 +785,7 @@ fn try_extract_multi_single_pass(
                             let lon = dn.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(dn.id());
+                                    region_ids[i].set(dn.id());
                                 }
                             }
                         }
@@ -796,7 +794,7 @@ fn try_extract_multi_single_pass(
                             let lon = nd.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(nd.id());
+                                    region_ids[i].set(nd.id());
                                 }
                             }
                         }
@@ -805,10 +803,8 @@ fn try_extract_multi_single_pass(
                 }
             },
             |region_ids| {
-                for (i, ids) in region_ids.into_iter().enumerate() {
-                    for id in ids {
-                        bbox_node_ids[i].set(id);
-                    }
+                for (i, worker_set) in region_ids.into_iter().enumerate() {
+                    bbox_node_ids[i].merge(worker_set);
                 }
             },
         )?;
@@ -863,23 +859,21 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || vec![Vec::<i64>::new(); n],
+        || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
         |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
                         if w.refs().any(|r| bbox_node_ids[i].get(r)) {
-                            region_ids[i].push(w.id());
+                            region_ids[i].set(w.id());
                         }
                     }
                 }
             }
         },
         |region_ids| {
-            for (i, ids) in region_ids.into_iter().enumerate() {
-                for id in ids {
-                    matched_way_ids[i].set(id);
-                }
+            for (i, worker_set) in region_ids.into_iter().enumerate() {
+                matched_way_ids[i].merge(worker_set);
             }
         },
     )?;
@@ -922,23 +916,21 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        || vec![Vec::<i64>::new(); n],
+        || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
         |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     for i in 0..n {
                         if relation_has_matched_member(r, &bbox_node_ids[i], &matched_way_ids[i]) {
-                            region_ids[i].push(r.id());
+                            region_ids[i].set(r.id());
                         }
                     }
                 }
             }
         },
         |region_ids| {
-            for (i, ids) in region_ids.into_iter().enumerate() {
-                for id in ids {
-                    matched_relation_ids[i].set(id);
-                }
+            for (i, worker_set) in region_ids.into_iter().enumerate() {
+                matched_relation_ids[i].merge(worker_set);
             }
         },
     )?;
@@ -2256,20 +2248,18 @@ fn extract_simple_single_pass(
         parallel_classify_phase(
             &rel_classify_file,
             &rel_classify_schedule,
-            Vec::<i64>::new,
+            IdSetDense::new,
             |block, ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element {
                         if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                            ids.push(r.id());
+                            ids.set(r.id());
                         }
                     }
                 }
             },
-            |ids| {
-                for id in ids {
-                    matched_relation_ids.set(id);
-                }
+            |worker_ids| {
+                matched_relation_ids.merge(worker_ids);
             },
         )?;
     }
@@ -2387,7 +2377,7 @@ trait RelationHandler {
     fn handle_relation(&mut self, r: &crate::Relation);
 
     /// Merge extra way/node IDs from parallel workers (sorted path phase 3).
-    fn merge_worker_extras(&mut self, extra_way_ids: Vec<i64>, extra_node_ids: Vec<i64>);
+    fn merge_worker_extras(&mut self, extra_way_ids: IdSetDense, extra_node_ids: IdSetDense);
 }
 
 struct CompleteRelationHandler;
@@ -2397,7 +2387,7 @@ impl RelationHandler for CompleteRelationHandler {
 
     fn handle_relation(&mut self, _r: &crate::Relation) {}
 
-    fn merge_worker_extras(&mut self, _extra_way_ids: Vec<i64>, _extra_node_ids: Vec<i64>) {}
+    fn merge_worker_extras(&mut self, _extra_way_ids: IdSetDense, _extra_node_ids: IdSetDense) {}
 }
 
 struct SmartRelationHandler {
@@ -2429,13 +2419,9 @@ impl RelationHandler for SmartRelationHandler {
         }
     }
 
-    fn merge_worker_extras(&mut self, extra_way_ids: Vec<i64>, extra_node_ids: Vec<i64>) {
-        for id in extra_way_ids {
-            self.extra_way_ids.set(id);
-        }
-        for id in extra_node_ids {
-            self.extra_node_ids.set(id);
-        }
+    fn merge_worker_extras(&mut self, extra_way_ids: IdSetDense, extra_node_ids: IdSetDense) {
+        self.extra_way_ids.merge(extra_way_ids);
+        self.extra_node_ids.merge(extra_node_ids);
     }
 }
 
@@ -2561,11 +2547,11 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &node_schedule,
-        || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
+        || (crate::read::columnar::DenseNodeColumns::new(), IdSetDense::new()),
         |block, (columns, ids)| {
             if use_columnar {
                 block.decode_dense_columns(columns);
-                columns.collect_matching_ids_bbox(
+                columns.set_matching_ids_bbox(
                     bbox_int.min_lat, bbox_int.max_lat,
                     bbox_int.min_lon, bbox_int.max_lon,
                     ids,
@@ -2576,22 +2562,20 @@ fn collect_pass1_generic<H: RelationHandler>(
                         Element::DenseNode(dn)
                             if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
                         {
-                            ids.push(dn.id());
+                            ids.set(dn.id());
                         }
                         Element::Node(n)
                             if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
                         {
-                            ids.push(n.id());
+                            ids.set(n.id());
                         }
                         _ => {}
                     }
                 }
             }
         },
-        |(_, ids)| {
-            for id in ids {
-                bbox_node_ids.set(id);
-            }
+        |(_, worker_ids)| {
+            bbox_node_ids.merge(worker_ids);
         },
     )?;
 
@@ -2599,24 +2583,20 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (Vec::<i64>::new(), Vec::<i64>::new()),
+        || (IdSetDense::new(), IdSetDense::new()),
         |block, (way_ids, node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     if w.refs().any(|r| bbox_node_ids.get(r)) {
-                        way_ids.push(w.id());
-                        node_ids.extend(w.refs());
+                        way_ids.set(w.id());
+                        for r in w.refs() { node_ids.set(r); }
                     }
                 }
             }
         },
-        |(way_ids, node_ids)| {
-            for id in way_ids {
-                matched_way_ids.set(id);
-            }
-            for id in node_ids {
-                all_way_node_ids.set(id);
-            }
+        |(worker_way_ids, worker_node_ids)| {
+            matched_way_ids.merge(worker_way_ids);
+            all_way_node_ids.merge(worker_node_ids);
         },
     )?;
 
@@ -2625,17 +2605,17 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        || (Vec::<i64>::new(), Vec::<i64>::new(), Vec::<i64>::new()),
+        || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
         |block, (rel_ids, extra_way_ids, extra_node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
                     if relation_has_matched_member(r, &bbox_node_ids, &matched_way_ids) {
-                        rel_ids.push(r.id());
+                        rel_ids.set(r.id());
                         if collect_member_ids && is_smart_relation(r) {
                             for m in r.members() {
                                 match m.id {
-                                    MemberId::Way(id) => extra_way_ids.push(id),
-                                    MemberId::Node(id) => extra_node_ids.push(id),
+                                    MemberId::Way(id) => extra_way_ids.set(id),
+                                    MemberId::Node(id) => extra_node_ids.set(id),
                                     MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
                                 }
                             }
@@ -2644,11 +2624,9 @@ fn collect_pass1_generic<H: RelationHandler>(
                 }
             }
         },
-        |(rel_ids, extra_way_ids, extra_node_ids)| {
-            for id in rel_ids {
-                matched_relation_ids.set(id);
-            }
-            handler.merge_worker_extras(extra_way_ids, extra_node_ids);
+        |(worker_rel_ids, worker_extra_way_ids, worker_extra_node_ids)| {
+            matched_relation_ids.merge(worker_rel_ids);
+            handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
         },
     )?;
 
@@ -2824,21 +2802,19 @@ fn extract_smart(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        Vec::<i64>::new,
+        IdSetDense::new,
         |block, node_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
                     if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
-                        node_ids.extend(w.refs());
+                        for r in w.refs() { node_ids.set(r); }
                     }
                 }
             }
         },
-        |node_ids| {
-            for id in node_ids {
-                extra_node_ids.set(id);
-            }
+        |worker_node_ids| {
+            extra_node_ids.merge(worker_node_ids);
         },
     )?;
     }

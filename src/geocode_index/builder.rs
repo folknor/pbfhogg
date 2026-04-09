@@ -294,7 +294,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         crate::commands::parallel_classify_phase(
             &shared_file,
             &schedule,
-            Vec::<i64>::new,
+            crate::commands::id_set_dense::IdSetDense::new,
             |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(way) = element {
@@ -325,15 +325,13 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                         let is_admin = needed_admin_ways.get(way.id());
 
                         if is_street || is_building_addr || is_interp || is_admin {
-                            node_ids.extend(way.refs());
+                            for r in way.refs() { node_ids.set(r); }
                         }
                     }
                 }
             },
-            |node_ids| {
-                for id in node_ids {
-                    referenced_nodes.set(id);
-                }
+            |worker_node_ids| {
+                referenced_nodes.merge(worker_node_ids);
             },
         )?;
     }

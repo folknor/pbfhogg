@@ -998,7 +998,7 @@ fn collect_way_node_dependencies(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        Vec::<i64>::new,
+        IdSetDense::new,
         |block, node_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element
@@ -1009,14 +1009,12 @@ fn collect_way_node_dependencies(
                             continue;
                         }
                     }
-                    node_ids.extend(w.refs());
+                    for r in w.refs() { node_ids.set(r); }
                 }
             }
         },
-        |node_ids| {
-            for id in node_ids {
-                relation_dep_node_ids.set(id);
-            }
+        |worker_node_ids| {
+            relation_dep_node_ids.merge(worker_node_ids);
         },
     )?;
 

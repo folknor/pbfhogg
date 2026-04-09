@@ -30,6 +30,11 @@ impl IdSetDense {
         Self { chunks: Vec::new(), rank_chunk_prefix: None, rank_block_prefix: None }
     }
 
+    /// Returns `true` if any chunk has been allocated (at least one `set` call).
+    pub fn has_any(&self) -> bool {
+        self.chunks.iter().any(std::option::Option::is_some)
+    }
+
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
         let id = id as u64;
@@ -202,7 +207,6 @@ impl IdSetDense {
     /// For non-overlapping chunks (common in sorted PBFs where each rayon thread
     /// processes a contiguous ID range), chunks are moved with zero copying.
     /// For overlapping chunks, byte-level OR is applied.
-    #[allow(dead_code)]
     pub fn merge(&mut self, other: Self) {
         if other.chunks.len() > self.chunks.len() {
             self.chunks.resize_with(other.chunks.len(), || None);

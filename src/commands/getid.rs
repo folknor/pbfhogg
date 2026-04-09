@@ -509,21 +509,19 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         super::parallel_classify_phase(
             &shared_file,
             &schedule,
-            Vec::<i64>::new,
+            super::id_set_dense::IdSetDense::new,
             |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element
                         && ids.way_ids.contains(&w.id())
                     {
-                        node_ids.extend(w.refs());
+                        for r in w.refs() { node_ids.set(r); }
                     }
                 }
             },
-            |node_ids| {
-                for id in node_ids {
-                    dep_node_ids.set(id);
-                    has_dep_nodes = true;
-                }
+            |worker_node_ids| {
+                if worker_node_ids.has_any() { has_dep_nodes = true; }
+                dep_node_ids.merge(worker_node_ids);
             },
         )?;
     }

@@ -917,6 +917,23 @@ pub(crate) fn require_sorted(
     Ok(())
 }
 
+/// Unconditionally return the "not sorted" error for a given path.
+///
+/// Used when the sorted flag has already been checked separately (e.g. via
+/// `check_sorted_and_indexed`) and we just need to emit the error.
+pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
+    Err(format!(
+        "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
+         File: {}\n\n\
+         Sort the input file first:\n\n\
+         \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
+         Streaming diff requires sorted inputs to operate in constant memory.",
+        path.display(),
+        path.display(),
+    )
+    .into())
+}
+
 // ---------------------------------------------------------------------------
 // OSM ID ordering — canonical sort order matching libosmium
 // ---------------------------------------------------------------------------

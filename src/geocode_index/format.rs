@@ -396,6 +396,69 @@ impl NodeCoord {
 }
 
 // ---------------------------------------------------------------------------
+// Ring parsing
+// ---------------------------------------------------------------------------
+
+/// Parse a sequence of [`NodeCoord`] values into rings of `(lon, lat)` f64 pairs,
+/// split by [`RING_SENTINEL`]. Rings with fewer than 3 vertices are dropped.
+///
+/// Returns all rings (exterior first, then holes) as a flat `Vec<Vec<(f64, f64)>>`.
+pub fn parse_rings(coords: impl Iterator<Item = NodeCoord>) -> Vec<Vec<(f64, f64)>> {
+    let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut current: Vec<(f64, f64)> = Vec::new();
+    for nc in coords {
+        if nc == RING_SENTINEL {
+            if current.len() >= 3 {
+                rings.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        } else {
+            current.push((nc.lon_e7 as f64 * 1e-7, nc.lat_e7 as f64 * 1e-7));
+        }
+    }
+    if current.len() >= 3 {
+        rings.push(current);
+    }
+    rings
+}
+
+/// Parse rings and split into exterior + hole rings.
+///
+/// Convenience wrapper around [`parse_rings`] that returns the first ring as the
+/// exterior and the rest as holes.
+#[allow(clippy::type_complexity)]
+pub fn parse_polygon_rings(coords: impl Iterator<Item = NodeCoord>) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
+    let mut rings = parse_rings(coords);
+    if rings.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let exterior = rings.remove(0);
+    (exterior, rings)
+}
+
+// ---------------------------------------------------------------------------
+// Null-terminated string reading
+// ---------------------------------------------------------------------------
+
+/// Read a null-terminated UTF-8 string from a byte slice at the given offset.
+///
+/// Returns an empty string for offset 0 or out-of-bounds offsets. If the bytes
+/// are not valid UTF-8, returns an empty string.
+pub fn read_nul_string(data: &[u8], offset: u32) -> &str {
+    if offset == 0 {
+        return "";
+    }
+    let start = offset as usize;
+    if start >= data.len() {
+        return "";
+    }
+    let remaining = &data[start..];
+    let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
+    std::str::from_utf8(&remaining[..end]).unwrap_or("")
+}
+
+// ---------------------------------------------------------------------------
 // File names
 // ---------------------------------------------------------------------------
 

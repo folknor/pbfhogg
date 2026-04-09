@@ -669,6 +669,18 @@ pub struct Stats {
 }
 
 impl Stats {
+    /// Accumulate stats from another `Stats` instance into this one.
+    pub fn merge(&mut self, src: &Stats) {
+        self.nodes_read += src.nodes_read;
+        self.nodes_written += src.nodes_written;
+        self.nodes_dropped += src.nodes_dropped;
+        self.ways_written += src.ways_written;
+        self.relations_written += src.relations_written;
+        self.missing_locations += src.missing_locations;
+        self.blobs_passthrough += src.blobs_passthrough;
+        self.blobs_decoded += src.blobs_decoded;
+    }
+
     /// Print a summary of the operation to stderr.
     pub fn print_summary(&self) {
         eprintln!(
@@ -1068,7 +1080,7 @@ fn write_output_decode_all(
                 keep_untagged_nodes,
                 relation_member_node_ids,
             )?;
-            merge_stats(&mut stats, &batch_stats);
+            stats.merge(&batch_stats);
             batch.clear();
         }
     }
@@ -1081,7 +1093,7 @@ fn write_output_decode_all(
             keep_untagged_nodes,
             relation_member_node_ids,
         )?;
-        merge_stats(&mut stats, &batch_stats);
+        stats.merge(&batch_stats);
     }
 
     writer.flush()?;
@@ -1094,16 +1106,6 @@ fn write_output_decode_all(
 
 use super::{dense_node_metadata, element_metadata, flush_local};
 
-fn merge_stats(dst: &mut Stats, src: &Stats) {
-    dst.nodes_read += src.nodes_read;
-    dst.nodes_written += src.nodes_written;
-    dst.nodes_dropped += src.nodes_dropped;
-    dst.ways_written += src.ways_written;
-    dst.relations_written += src.relations_written;
-    dst.missing_locations += src.missing_locations;
-    dst.blobs_passthrough += src.blobs_passthrough;
-    dst.blobs_decoded += src.blobs_decoded;
-}
 
 // ---------------------------------------------------------------------------
 // Batched sorted lookups for sparse index
@@ -1332,7 +1334,7 @@ fn process_batch(
         blobs_decoded: 0,
     };
 
-    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
+    drain_batch_results(results, writer, |s| total.merge(&s))?;
 
     Ok(total)
 }
@@ -1486,7 +1488,7 @@ fn write_output_passthrough(
                     keep_untagged_nodes,
                     relation_member_node_ids,
                 )?;
-                merge_stats(&mut stats, &batch_stats);
+                stats.merge(&batch_stats);
                 batch.clear();
                 batch_bytes = 0;
             }
@@ -1555,7 +1557,7 @@ fn write_output_passthrough(
                 keep_untagged_nodes,
                 relation_member_node_ids,
             )?;
-            merge_stats(&mut stats, &batch_stats);
+            stats.merge(&batch_stats);
             batch.clear();
             batch_bytes = 0;
         }
@@ -1570,7 +1572,7 @@ fn write_output_passthrough(
             keep_untagged_nodes,
             relation_member_node_ids,
         )?;
-        merge_stats(&mut stats, &batch_stats);
+        stats.merge(&batch_stats);
     }
     #[cfg(feature = "linux-direct-io")]
     copy_range.flush(&mut writer)?;
@@ -1654,7 +1656,7 @@ fn process_slot_batch(
         ways_written: 0, relations_written: 0, missing_locations: 0,
         blobs_passthrough: 0, blobs_decoded: 0,
     };
-    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
+    drain_batch_results(results, writer, |s| total.merge(&s))?;
     Ok(total)
 }
 
@@ -1708,6 +1710,6 @@ fn process_slot_batch_dense(
         ways_written: 0, relations_written: 0, missing_locations: 0,
         blobs_passthrough: 0, blobs_decoded: 0,
     };
-    drain_batch_results(results, writer, |s| merge_stats(&mut total, &s))?;
+    drain_batch_results(results, writer, |s| total.merge(&s))?;
     Ok(total)
 }

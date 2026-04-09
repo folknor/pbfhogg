@@ -69,8 +69,8 @@ pub fn derive_changes(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = super::diff::check_sorted_and_indexed(old_path, direct_io)?;
     let (new_sorted, new_indexed) = super::diff::check_sorted_and_indexed(new_path, direct_io)?;
-    if !old_sorted { super::diff::require_sorted_err(old_path, "Old PBF")?; }
-    if !new_sorted { super::diff::require_sorted_err(new_path, "New PBF")?; }
+    if !old_sorted { super::require_sorted_err(old_path, "Old PBF")?; }
+    if !new_sorted { super::require_sorted_err(new_path, "New PBF")?; }
     let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");

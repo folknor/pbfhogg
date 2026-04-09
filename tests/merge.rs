@@ -1286,36 +1286,6 @@ fn merge_cross_validate_osmium() {
 }
 
 // ---------------------------------------------------------------------------
-// O_DIRECT / io_uring helpers
-// ---------------------------------------------------------------------------
-
-/// Check if an error is EINVAL (O_DIRECT not supported on this filesystem).
-#[cfg(feature = "linux-direct-io")]
-fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-        return io_err.raw_os_error() == Some(libc::EINVAL);
-    }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
-        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
-            return io_err.raw_os_error() == Some(libc::EINVAL);
-        }
-    }
-    false
-}
-
-/// Check if an error is due to io_uring unavailability.
-#[cfg(feature = "linux-io-uring")]
-fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
-    if err.downcast_ref::<std::io::Error>().is_some() {
-        return true;
-    }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
-        return matches!(pbf_err.kind(), pbfhogg::ErrorKind::Io(_));
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
 // O_DIRECT variant
 // ---------------------------------------------------------------------------
 
@@ -1416,7 +1386,7 @@ fn merge_basic_create_modify_delete_direct_io() {
             // Stats
             assert_eq!(stats.deleted, 1);
         }
-        Err(e) if is_einval(&*e) => {
+        Err(e) if common::is_einval(&*e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
             return;
         }
@@ -1525,7 +1495,7 @@ fn merge_basic_create_modify_delete_uring() {
             // Stats
             assert_eq!(stats.deleted, 1);
         }
-        Err(e) if is_uring_unavailable(&*e) => {
+        Err(e) if common::is_uring_unavailable(&*e) => {
             eprintln!("io_uring not available, skipping test");
             return;
         }

@@ -71,19 +71,24 @@ pub struct TestMember {
 /// builder is flushed between element types and whenever a block reaches its
 /// capacity limit (8000 entities).
 ///
+/// When `sorted` is true, the header declares `Sort.Type_then_ID`.
+///
 /// This is the canonical test PBF writer shared across most integration tests.
 /// The `add_locations_to_ways` tests use a local variant because their
 /// `TestRelation` type uses a different member representation.
-pub fn write_test_pbf(
+pub fn write_test_pbf_impl(
     path: &Path,
     nodes: &[TestNode],
     ways: &[TestWay],
     relations: &[TestRelation],
+    sorted: bool,
 ) {
     let file = std::fs::File::create(path).expect("create file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
     let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().build().expect("build header");
+    let mut hb = block_builder::HeaderBuilder::new();
+    if sorted { hb = hb.sorted(); }
+    let header = hb.build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -144,78 +149,24 @@ pub fn write_test_pbf(
     writer.flush().expect("flush");
 }
 
-/// Same as [`write_test_pbf`] but with the `Sort.Type_then_ID` header flag set.
-///
-/// Used by diff tests (and later derive_changes tests) which require sorted
-/// inputs for streaming merge-join.
+/// Write a test PBF without the sorted header flag. See [`write_test_pbf_impl`].
+pub fn write_test_pbf(
+    path: &Path,
+    nodes: &[TestNode],
+    ways: &[TestWay],
+    relations: &[TestRelation],
+) {
+    write_test_pbf_impl(path, nodes, ways, relations, false);
+}
+
+/// Write a test PBF with `Sort.Type_then_ID` header flag. See [`write_test_pbf_impl`].
 pub fn write_test_pbf_sorted(
     path: &Path,
     nodes: &[TestNode],
     ways: &[TestWay],
     relations: &[TestRelation],
 ) {
-    let file = std::fs::File::create(path).expect("create file");
-    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-    let mut writer = PbfWriter::new(buf, Compression::default());
-    let header = block_builder::HeaderBuilder::new().sorted().build().expect("build header");
-    writer.write_header(&header).expect("write header");
-
-    let mut bb = BlockBuilder::new();
-
-    // Nodes
-    for n in nodes {
-        if !bb.can_add_node()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        bb.add_node(n.id, n.lat, n.lon, n.tags.iter().copied(), None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    // Ways
-    for w in ways {
-        if !bb.can_add_way()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        bb.add_way(w.id, w.tags.iter().copied(), &w.refs, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    // Relations
-    for r in relations {
-        if !bb.can_add_relation()
-            && let Some(bytes) = bb.take().expect("take")
-        {
-            writer.write_primitive_block(bytes).expect("write block");
-        }
-        let members: Vec<MemberData<'_>> = r
-            .members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: m.role,
-            })
-            .collect();
-        bb.add_relation(r.id, r.tags.iter().copied(), &members, None);
-    }
-    if !bb.is_empty()
-        && let Some(bytes) = bb.take().expect("take")
-    {
-        writer.write_primitive_block(bytes).expect("write block");
-    }
-
-    writer.flush().expect("flush");
+    write_test_pbf_impl(path, nodes, ways, relations, true);
 }
 
 // ---------------------------------------------------------------------------
@@ -417,4 +368,34 @@ pub fn way_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
 /// Extract just the relation IDs from a [`PbfContentsIdOnly`].
 pub fn relation_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
     c.relations.iter().map(|(id, _)| *id).collect()
+}
+
+// ---------------------------------------------------------------------------
+// Error helpers for platform-specific I/O tests
+// ---------------------------------------------------------------------------
+
+/// Check if an error is EINVAL (used to skip O_DIRECT tests on unsupported filesystems).
+#[cfg(feature = "linux-direct-io")]
+pub fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
+    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+        return io_err.raw_os_error() == Some(libc::EINVAL);
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
+            return io_err.raw_os_error() == Some(libc::EINVAL);
+        }
+    }
+    false
+}
+
+/// Check if an error indicates io_uring is unavailable.
+#[cfg(feature = "linux-io-uring")]
+pub fn is_uring_unavailable(err: &(dyn std::error::Error + 'static)) -> bool {
+    if err.downcast_ref::<std::io::Error>().is_some() {
+        return true;
+    }
+    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
+        return matches!(pbf_err.kind(), pbfhogg::ErrorKind::Io(_));
+    }
+    false
 }

@@ -80,19 +80,7 @@ pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(
     Ok((sorted, indexed))
 }
 
-/// Error for unsorted PBF input (same message as `require_sorted`).
-pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
-    Err(format!(
-        "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
-         File: {}\n\n\
-         Sort the input file first:\n\n\
-         \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
-         Streaming diff requires sorted inputs to operate in constant memory.",
-        path.display(),
-        path.display(),
-    )
-    .into())
-}
+// `require_sorted_err` is defined in `super::mod` and re-used here.
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -200,8 +188,8 @@ pub fn diff(
     // Single-pass: check sorted headers + indexdata from one file open each.
     let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io)?;
     let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io)?;
-    if !old_sorted { require_sorted_err(old_path, "Old PBF")?; }
-    if !new_sorted { require_sorted_err(new_path, "New PBF")?; }
+    if !old_sorted { super::require_sorted_err(old_path, "Old PBF")?; }
+    if !new_sorted { super::require_sorted_err(new_path, "New PBF")?; }
     let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DIFF_SCAN_START");

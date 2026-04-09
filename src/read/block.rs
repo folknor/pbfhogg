@@ -3,7 +3,8 @@
 use super::dense::DenseNodeIter;
 use super::elements::{Element, Node, Relation, Way};
 use super::wire::{
-    WireBlock, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation, WireWay,
+    WireBlock, WireBlockMeta, WireDenseNodes, WireGroup, WireMessageIter, WireNode, WireRelation,
+    WireWay,
 };
 use crate::error::{new_error, new_wire_error, ErrorKind, Result};
 use bytes::Bytes;
@@ -376,49 +377,14 @@ impl PrimitiveBlock {
         Self::from_vec(buffer.to_vec())
     }
 
-    /// Like [`new`] but reuses caller-provided scratch buffers for
-    /// `parse_and_inline`. Sequential loops call this with loop-local
-    /// scratch to avoid per-block allocation.
-    #[allow(clippy::needless_pass_by_value)]
-    pub(crate) fn new_with_scratch(
-        buffer: Bytes,
-        st_scratch: &mut Vec<(u32, u32)>,
-        gr_scratch: &mut Vec<(u32, u32)>,
-    ) -> Result<PrimitiveBlock> {
-        let mut buf = buffer.to_vec();
-        let meta = WireBlock::parse_and_inline_with_scratch(&mut buf, st_scratch, gr_scratch)?;
-        let bytes = Bytes::from(buf);
-        let data: &[u8] = &bytes;
-        let block = WireBlock::from_inline(data, &meta);
-
-        for index in 0..block.stringtable.len() {
-            if let Some(raw) = block.stringtable.get(index) {
-                std::str::from_utf8(raw)
-                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
-            }
-        }
-
-        #[allow(clippy::transmute_undefined_repr)]
-        let block =
-            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
-
-        Ok(PrimitiveBlock { buffer: bytes, block })
-    }
-
-    /// Parse from a mutable Vec, inlining string table entries and group ranges
-    /// into the buffer itself. Zero separate heap allocations beyond the buffer.
+    /// Validate stringtable entries and construct a `PrimitiveBlock` from already-inlined data.
     ///
-    /// This eliminates the cross-thread `Box<[(u32, u32)]>` retention that caused
-    /// 25+ GB OOM at Europe scale (520K blocks) with the pipelined reader.
-    /// The temp Vecs during parsing are allocated and freed on the calling thread.
-    ///
-    /// The buffer is extended with inline entry data. After conversion to `Bytes`,
-    /// the block references both the protobuf data and the appended entries.
-    pub(crate) fn from_vec(mut buffer: Vec<u8>) -> Result<PrimitiveBlock> {
-        let meta = WireBlock::parse_and_inline(&mut buffer)?;
-        let bytes = Bytes::from(buffer);
+    /// Shared finishing step for all constructors: builds the `WireBlock` from
+    /// inline metadata, validates UTF-8, and transmutes the lifetime to `'static`
+    /// (safe because `bytes` owns the backing data).
+    fn finish(bytes: Bytes, meta: &WireBlockMeta) -> Result<PrimitiveBlock> {
         let data: &[u8] = &bytes;
-        let block = WireBlock::from_inline(data, &meta);
+        let block = WireBlock::from_inline(data, meta);
 
         // Validate every stringtable entry once at construction time.
         for index in 0..block.stringtable.len() {
@@ -435,6 +401,34 @@ impl PrimitiveBlock {
         Ok(PrimitiveBlock { buffer: bytes, block })
     }
 
+    /// Like [`new`] but reuses caller-provided scratch buffers for
+    /// `parse_and_inline`. Sequential loops call this with loop-local
+    /// scratch to avoid per-block allocation.
+    #[allow(clippy::needless_pass_by_value)]
+    pub(crate) fn new_with_scratch(
+        buffer: Bytes,
+        st_scratch: &mut Vec<(u32, u32)>,
+        gr_scratch: &mut Vec<(u32, u32)>,
+    ) -> Result<PrimitiveBlock> {
+        let mut buf = buffer.to_vec();
+        let meta = WireBlock::parse_and_inline_with_scratch(&mut buf, st_scratch, gr_scratch)?;
+        Self::finish(Bytes::from(buf), &meta)
+    }
+
+    /// Parse from a mutable Vec, inlining string table entries and group ranges
+    /// into the buffer itself. Zero separate heap allocations beyond the buffer.
+    ///
+    /// This eliminates the cross-thread `Box<[(u32, u32)]>` retention that caused
+    /// 25+ GB OOM at Europe scale (520K blocks) with the pipelined reader.
+    /// The temp Vecs during parsing are allocated and freed on the calling thread.
+    ///
+    /// The buffer is extended with inline entry data. After conversion to `Bytes`,
+    /// the block references both the protobuf data and the appended entries.
+    pub(crate) fn from_vec(mut buffer: Vec<u8>) -> Result<PrimitiveBlock> {
+        let meta = WireBlock::parse_and_inline(&mut buffer)?;
+        Self::finish(Bytes::from(buffer), &meta)
+    }
+
     /// Like [`from_vec`] but wraps the buffer with pool recycling.
     /// for `parse_and_inline`. Workers in `parallel_classify_phase` call this
     /// with loop-local scratch to avoid per-block allocation.
@@ -445,22 +439,7 @@ impl PrimitiveBlock {
         gr_scratch: &mut Vec<(u32, u32)>,
     ) -> Result<PrimitiveBlock> {
         let meta = WireBlock::parse_and_inline_with_scratch(&mut buffer, st_scratch, gr_scratch)?;
-        let bytes = crate::blob::pool_wrap(buffer, Some(pool));
-        let data: &[u8] = &bytes;
-        let block = WireBlock::from_inline(data, &meta);
-
-        for index in 0..block.stringtable.len() {
-            if let Some(raw) = block.stringtable.get(index) {
-                std::str::from_utf8(raw)
-                    .map_err(|err| new_error(ErrorKind::StringtableUtf8 { err, index }))?;
-            }
-        }
-
-        #[allow(clippy::transmute_undefined_repr)]
-        let block =
-            unsafe { std::mem::transmute::<WireBlock<'_>, WireBlock<'static>>(block) };
-
-        Ok(PrimitiveBlock { buffer: bytes, block })
+        Self::finish(crate::blob::pool_wrap(buffer, Some(pool)), &meta)
     }
 
     /// Returns the size of the decompressed protobuf payload in bytes.

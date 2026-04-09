@@ -1185,6 +1185,32 @@ fn encode_info_to(
     }
 }
 
+/// Encode tag key/value pairs into packed fields 2 (keys) and 3 (vals) on `elem`.
+///
+/// Uses two scratch buffers (`keys_buf` and `vals_buf`) for single-pass dual-buffer
+/// encoding. Each tag key index is also inserted into `tag_key_indices`.
+fn encode_tags<'t>(
+    string_table: &mut StringTable,
+    elem: &mut Vec<u8>,
+    keys_buf: &mut Vec<u8>,
+    vals_buf: &mut Vec<u8>,
+    tag_key_indices: &mut FxHashSet<u32>,
+    tags: impl IntoIterator<Item = (&'t str, &'t str)>,
+) {
+    keys_buf.clear();
+    vals_buf.clear();
+    for (key, val) in tags {
+        let key_idx = string_table.add(key);
+        tag_key_indices.insert(key_idx);
+        encode_varint(keys_buf, u64::from(key_idx));
+        encode_varint(vals_buf, u64::from(string_table.add(val)));
+    }
+    if !keys_buf.is_empty() {
+        encode_bytes_field(elem, 2, keys_buf);
+        encode_bytes_field(elem, 3, vals_buf);
+    }
+}
+
 /// Encode a Way and append it as `PrimitiveGroup.ways` (field 3) to `group_buf`.
 #[allow(clippy::too_many_arguments)]
 fn encode_way<'t>(
@@ -1205,19 +1231,8 @@ fn encode_way<'t>(
     // Field 1: id (int64)
     encode_int64_field(elem, 1, id);
 
-    // Fields 2+3: keys/vals (packed uint32) — single-pass dual-buffer
-    packed_keys.clear();
-    packed_vals.clear();
-    for (key, val) in tags {
-        let key_idx = string_table.add(key);
-        tag_key_indices.insert(key_idx);
-        encode_varint(packed_keys, u64::from(key_idx));
-        encode_varint(packed_vals, u64::from(string_table.add(val)));
-    }
-    if !packed_keys.is_empty() {
-        encode_bytes_field(elem, 2, packed_keys);
-        encode_bytes_field(elem, 3, packed_vals);
-    }
+    // Fields 2+3: keys/vals
+    encode_tags(string_table, elem, packed_keys, packed_vals, tag_key_indices, tags);
 
     // Field 4: info (submessage)
     if let Some(meta) = metadata {
@@ -1264,19 +1279,8 @@ fn encode_way_with_locations<'t>(
     elem.clear();
     encode_int64_field(elem, 1, id);
 
-    // Fields 2+3: keys/vals — single-pass dual-buffer
-    packed_refs.clear();
-    packed_vals.clear();
-    for (key, val) in tags {
-        let key_idx = string_table.add(key);
-        tag_key_indices.insert(key_idx);
-        encode_varint(packed_refs, u64::from(key_idx));
-        encode_varint(packed_vals, u64::from(string_table.add(val)));
-    }
-    if !packed_refs.is_empty() {
-        encode_bytes_field(elem, 2, packed_refs);
-        encode_bytes_field(elem, 3, packed_vals);
-    }
+    // Fields 2+3: keys/vals
+    encode_tags(string_table, elem, packed_refs, packed_vals, tag_key_indices, tags);
 
     if let Some(meta) = metadata {
         encode_info_to(info_buf, string_table, meta);
@@ -1386,19 +1390,8 @@ fn encode_relation<'t>(
     elem.clear();
     encode_int64_field(elem, 1, id);
 
-    // Fields 2+3: keys/vals — single-pass dual-buffer
-    packed.clear();
-    packed_vals.clear();
-    for (key, val) in tags {
-        let key_idx = string_table.add(key);
-        tag_key_indices.insert(key_idx);
-        encode_varint(packed, u64::from(key_idx));
-        encode_varint(packed_vals, u64::from(string_table.add(val)));
-    }
-    if !packed.is_empty() {
-        encode_bytes_field(elem, 2, packed);
-        encode_bytes_field(elem, 3, packed_vals);
-    }
+    // Fields 2+3: keys/vals
+    encode_tags(string_table, elem, packed, packed_vals, tag_key_indices, tags);
 
     if let Some(meta) = metadata {
         encode_info_to(info_buf, string_table, meta);

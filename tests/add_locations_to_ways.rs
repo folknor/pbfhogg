@@ -606,24 +606,6 @@ fn passthrough_drop_untagged_keeps_relation_member_nodes() {
 }
 
 // ---------------------------------------------------------------------------
-// O_DIRECT helper
-// ---------------------------------------------------------------------------
-
-/// Check if an error is EINVAL (O_DIRECT not supported on this filesystem).
-#[cfg(feature = "linux-direct-io")]
-fn is_einval(err: &(dyn std::error::Error + 'static)) -> bool {
-    if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-        return io_err.raw_os_error() == Some(libc::EINVAL);
-    }
-    if let Some(pbf_err) = err.downcast_ref::<pbfhogg::Error>() {
-        if let pbfhogg::ErrorKind::Io(io_err) = pbf_err.kind() {
-            return io_err.raw_os_error() == Some(libc::EINVAL);
-        }
-    }
-    false
-}
-
-// ---------------------------------------------------------------------------
 // O_DIRECT variant
 // ---------------------------------------------------------------------------
 
@@ -680,7 +662,7 @@ fn basic_locations_added_direct_io() {
             }
             assert!(found_way, "way not found in output");
         }
-        Err(e) if is_einval(&*e) => {
+        Err(e) if common::is_einval(&*e) => {
             eprintln!("O_DIRECT not supported on this filesystem, skipping test");
             return;
         }

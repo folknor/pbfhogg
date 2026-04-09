@@ -331,6 +331,13 @@ impl WireBlob {
         let bytes = Bytes::copy_from_slice(data);
         Self::parse(&bytes)
     }
+
+    /// Returns the declared `raw_size` as a `usize` capacity hint for buffer
+    /// pre-allocation, or 0 if absent or negative.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn estimated_capacity(&self) -> usize {
+        self.raw_size.unwrap_or(0).max(0) as usize
+    }
 }
 
 /// Maximum allowed [`BlobHeader`] size in bytes.
@@ -508,9 +515,7 @@ impl Blob {
         st_scratch: &mut Vec<(u32, u32)>,
         gr_scratch: &mut Vec<(u32, u32)>,
     ) -> Result<PrimitiveBlock> {
-        #[allow(clippy::cast_sign_loss)]
-        let capacity = self.blob.raw_size.unwrap_or(0).max(0) as usize;
-        let mut buf = pool_get(Some(pool), capacity);
+        let mut buf = pool_get(Some(pool), self.blob.estimated_capacity());
         decompress_parsed_blob_into(&self.blob, &mut buf)?;
         PrimitiveBlock::from_vec_pooled_with_scratch(buf, pool, st_scratch, gr_scratch)
     }
@@ -1128,16 +1133,16 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
             }
         }
         Some(BlobData::Zlib(bytes)) => {
-            if blob.raw_size.unwrap_or(0) > 0 {
-                let capacity = blob.raw_size.unwrap_or(0) as usize;
-                buf.reserve(capacity.saturating_sub(buf.capacity()));
+            let cap = blob.estimated_capacity();
+            if cap > 0 {
+                buf.reserve(cap.saturating_sub(buf.capacity()));
             }
             zlib_decompress_into(bytes, buf)
         }
         Some(BlobData::Zstd(bytes)) => {
-            if blob.raw_size.unwrap_or(0) > 0 {
-                let capacity = blob.raw_size.unwrap_or(0) as usize;
-                buf.reserve(capacity.saturating_sub(buf.capacity()));
+            let cap = blob.estimated_capacity();
+            if cap > 0 {
+                buf.reserve(cap.saturating_sub(buf.capacity()));
             }
             zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
             let size = buf.len() as u64;
@@ -1258,23 +1263,15 @@ pub(crate) fn decompress_blob(
             }
         }
         Some(BlobData::Zlib(bytes)) => {
-            #[allow(clippy::cast_sign_loss)]
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
+            let est = blob.estimated_capacity();
+            let capacity = if est > 0 { est } else { bytes.len() * 4 };
             let mut decoded_bytes = pool_get(pool, capacity);
             zlib_decompress_into(bytes, &mut decoded_bytes)?;
             Ok(pool_wrap(decoded_bytes, pool))
         }
         Some(BlobData::Zstd(bytes)) => {
-            #[allow(clippy::cast_sign_loss)]
-            let capacity = if blob.raw_size.unwrap_or(0) > 0 {
-                blob.raw_size.unwrap_or(0) as usize
-            } else {
-                bytes.len() * 4
-            };
+            let est = blob.estimated_capacity();
+            let capacity = if est > 0 { est } else { bytes.len() * 4 };
             let mut decoded_bytes = pool_get(pool, capacity);
             zstd::stream::copy_decode(Cursor::new(&**bytes), &mut decoded_bytes)?;
             let size = decoded_bytes.len() as u64;

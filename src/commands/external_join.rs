@@ -1040,7 +1040,7 @@ fn stage4_assembly(
 
             while let Some(result) = reorder.pop_ready() {
                 let (blocks, block_stats) = result?;
-                merge_stats(&mut total_stats, &block_stats);
+                total_stats.merge(&block_stats);
 
                 for (block_bytes, index, tagdata) in blocks {
                     writer.write_primitive_block_owned(
@@ -1059,16 +1059,6 @@ fn stage4_assembly(
     Ok(total_stats)
 }
 
-fn merge_stats(dst: &mut Stats, src: &Stats) {
-    dst.nodes_read += src.nodes_read;
-    dst.nodes_written += src.nodes_written;
-    dst.nodes_dropped += src.nodes_dropped;
-    dst.ways_written += src.ways_written;
-    dst.relations_written += src.relations_written;
-    dst.missing_locations += src.missing_locations;
-    dst.blobs_passthrough += src.blobs_passthrough;
-    dst.blobs_decoded += src.blobs_decoded;
-}
 
 /// Process a single block for assembly.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]

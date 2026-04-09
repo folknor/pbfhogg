@@ -1003,12 +1003,7 @@ fn find_endpoint_house_number_mmap(
 
 /// Read a null-terminated string from the pool by offset.
 fn read_string_from_pool(pool: &StringPool, offset: u32) -> &str {
-    if offset == 0 { return ""; }
-    let start = offset as usize;
-    if start >= pool.data.len() { return ""; }
-    let remaining = &pool.data[start..];
-    let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
-    std::str::from_utf8(&remaining[..end]).unwrap_or("")
+    super::format::read_nul_string(&pool.data, offset)
 }
 
 fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
@@ -1504,25 +1499,7 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
 /// Parse polygon vertices (with sentinel separators) into exterior + hole rings as f64.
 #[allow(clippy::type_complexity)]
 fn parse_polygon_rings(vertices: &[NodeCoord]) -> (Vec<(f64, f64)>, Vec<Vec<(f64, f64)>>) {
-    let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut current: Vec<(f64, f64)> = Vec::new();
-    for v in vertices {
-        if *v == RING_SENTINEL {
-            if current.len() >= 3 {
-                rings.push(std::mem::take(&mut current));
-            } else {
-                current.clear();
-            }
-        } else {
-            current.push((v.lon_e7 as f64 * 1e-7, v.lat_e7 as f64 * 1e-7));
-        }
-    }
-    if current.len() >= 3 {
-        rings.push(current);
-    }
-    let exterior = rings.first().cloned().unwrap_or_default();
-    let holes = if rings.len() > 1 { rings[1..].to_vec() } else { Vec::new() };
-    (exterior, holes)
+    super::format::parse_polygon_rings(vertices.iter().copied())
 }
 
 // ---------------------------------------------------------------------------

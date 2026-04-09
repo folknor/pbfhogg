@@ -838,28 +838,12 @@ impl Reader {
         }
 
         // Parse vertices into rings separated by sentinel
-        let mut rings: Vec<Vec<(f64, f64)>> = Vec::new();
-        let mut current: Vec<(f64, f64)> = Vec::new();
-
-        for i in 0..count {
+        let coords = (0..count).map_while(|i| {
             let offset = start + i * NODE_COORD_SIZE;
-            let Some(rec) = read_record::<NODE_COORD_SIZE>(&self.admin_vertices, offset) else {
-                break;
-            };
-            let nc = NodeCoord::from_bytes(rec);
-            if nc == format::RING_SENTINEL {
-                if current.len() >= 3 {
-                    rings.push(std::mem::take(&mut current));
-                } else {
-                    current.clear();
-                }
-            } else {
-                current.push((nc.lon_e7 as f64 * 1e-7, nc.lat_e7 as f64 * 1e-7));
-            }
-        }
-        if current.len() >= 3 {
-            rings.push(current);
-        }
+            let rec = read_record::<NODE_COORD_SIZE>(&self.admin_vertices, offset)?;
+            Some(NodeCoord::from_bytes(rec))
+        });
+        let rings = format::parse_rings(coords);
         if rings.is_empty() {
             return false;
         }
@@ -935,16 +919,7 @@ impl Reader {
     }
 
     fn read_string(&self, offset: u32) -> &str {
-        if offset == 0 {
-            return "";
-        }
-        let start = offset as usize;
-        if start >= self.strings.len() {
-            return "";
-        }
-        let remaining = &self.strings[start..];
-        let end = remaining.iter().position(|&b| b == 0).unwrap_or(remaining.len());
-        std::str::from_utf8(&remaining[..end]).unwrap_or("")
+        format::read_nul_string(&self.strings, offset)
     }
 
     // -- Interpolation helpers -----------------------------------------------

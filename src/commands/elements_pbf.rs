@@ -201,6 +201,10 @@ pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
             .tags()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
+        // Dense nodes use -1 as "no metadata" sentinel (Osmosis convention).
+        // Non-dense elements normalize this at parse time in WireInfo::parse;
+        // dense nodes check it here to avoid adding branches to the hot
+        // DenseNodeIter path. See CORRECTNESS.md "Osmosis -1 sentinel".
         metadata: dn.info().and_then(|info| {
             if info.version() == -1 {
                 return None;

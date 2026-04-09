@@ -1329,6 +1329,12 @@ fn encode_way_raw_bytes(
     refs_data: &[u8],
     info_data: Option<&[u8]>,
 ) {
+    debug_assert!(
+        keys_data.is_empty() == vals_data.is_empty(),
+        "keys/vals must be paired: keys={} vals={} bytes",
+        keys_data.len(),
+        vals_data.len(),
+    );
     elem.clear();
     encode_int64_field(elem, 1, id);
     encode_bytes_field(elem, 2, keys_data);

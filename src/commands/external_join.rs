@@ -937,11 +937,7 @@ fn stage4_assembly(
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
-    let mut total_stats = Stats {
-        nodes_read: 0, nodes_written: 0, nodes_dropped: 0,
-        ways_written: 0, relations_written: 0, missing_locations: 0,
-        blobs_passthrough: 0, blobs_decoded: 0,
-    };
+    let mut total_stats = Stats::default();
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule into descriptor channel.
@@ -1074,16 +1070,7 @@ fn assemble_block(
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
-    let mut stats = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    let mut stats = Stats::default();
 
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 

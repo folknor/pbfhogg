@@ -83,6 +83,7 @@ pub fn renumber(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
+    crate::debug::emit_marker("RENUMBER_START");
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -146,5 +147,6 @@ pub fn renumber(
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
+    crate::debug::emit_marker("RENUMBER_END");
     Ok(stats)
 }

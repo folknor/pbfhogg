@@ -92,6 +92,7 @@ pub fn tags_count(
     let mut counts: CountMap = FxHashMap::default();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    crate::debug::emit_marker("TAGSCOUNT_START");
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -142,6 +143,7 @@ pub fn tags_count(
             .then_with(|| b.count.cmp(&a.count)),
     });
 
+    crate::debug::emit_marker("TAGSCOUNT_END");
     Ok(results)
 }
 

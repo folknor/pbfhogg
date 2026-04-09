@@ -146,8 +146,10 @@ pub fn tags_filter_osc(
     expression_strs: &[String],
 ) -> Result<TagsFilterOscStats> {
     let expressions = parse_expressions(expression_strs)?;
+    crate::debug::emit_marker("TAGSFILTEROSC_START");
     let (filtered, stats) = parse_and_filter_osc(input, &expressions)?;
     write_filtered_osc(output, &filtered)?;
+    crate::debug::emit_marker("TAGSFILTEROSC_END");
     Ok(stats)
 }
 

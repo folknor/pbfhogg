@@ -169,13 +169,7 @@ impl FrameScratch {
 
 thread_local! {
     /// Per-rayon-thread scratch buffers for pipelined blob framing.
-    static PIPELINE_SCRATCH: RefCell<FrameScratch> = const { RefCell::new(FrameScratch {
-        blob_buf: Vec::new(),
-        header_buf: Vec::new(),
-        compress_buf: Vec::new(),
-        zlib_compressor: None,
-        zstd_compressor: None,
-    }) };
+    static PIPELINE_SCRATCH: RefCell<FrameScratch> = const { RefCell::new(FrameScratch::new()) };
 }
 
 /// Writes PBF files as a sequence of framed, compressed blobs.

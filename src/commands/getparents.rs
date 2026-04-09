@@ -62,6 +62,7 @@ pub fn getparents(
         relations_written: 0,
     };
 
+    crate::debug::emit_marker("GETPARENTS_START");
     for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
         let (nodes, ways, relations) = process_batch(
             batch, &mut writer, ids, opts.add_self,
@@ -73,6 +74,7 @@ pub fn getparents(
     })?;
 
     writer.flush()?;
+    crate::debug::emit_marker("GETPARENTS_END");
     Ok(stats)
 }
 

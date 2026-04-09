@@ -657,6 +657,7 @@ impl BatchSlot {
 // ---------------------------------------------------------------------------
 
 /// Statistics from the add-locations-to-ways operation.
+#[derive(Default)]
 pub struct Stats {
     pub nodes_read: u64,
     pub nodes_written: u64,
@@ -1044,16 +1045,7 @@ fn write_output_decode_all(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    let mut stats = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    let mut stats = Stats::default();
 
     let reader = ElementReader::open(input, direct_io)?;
     let mut writer = writer_from_header(
@@ -1199,16 +1191,7 @@ fn process_block(
     refs_buf: &mut Vec<i64>,
     locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
-    let mut stats = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    let mut stats = Stats::default();
 
     let mut members_buf: Vec<MemberData<'_>> = Vec::new();
 
@@ -1323,16 +1306,7 @@ fn process_batch(
         )
         .collect();
 
-    let mut total = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    let mut total = Stats::default();
 
     drain_batch_results(results, writer, |s| total.merge(&s))?;
 
@@ -1428,16 +1402,7 @@ fn write_output_passthrough(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    let mut stats = Stats {
-        nodes_read: 0,
-        nodes_written: 0,
-        nodes_dropped: 0,
-        ways_written: 0,
-        relations_written: 0,
-        missing_locations: 0,
-        blobs_passthrough: 0,
-        blobs_decoded: 0,
-    };
+    let mut stats = Stats::default();
 
     let mut reader = FileReader::open(input, direct_io)?;
     let mut file_offset: u64 = 0;

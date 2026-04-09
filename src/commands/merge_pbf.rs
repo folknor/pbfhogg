@@ -148,6 +148,7 @@ pub fn merge_pbf(
         )?;
     }
 
+    crate::debug::emit_marker("MERGEPBF_START");
     // Pass 1: Build blob index from all files
     eprintln!("Pass 1: indexing blobs...");
     let (header, mut entries) = build_blob_index(inputs, opts.direct_io)?;
@@ -233,6 +234,7 @@ pub fn merge_pbf(
 
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
+    crate::debug::emit_marker("MERGEPBF_END");
     Ok(stats)
 }
 

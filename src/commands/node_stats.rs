@@ -66,6 +66,7 @@ impl CoordStats {
         }
         // max >= min guaranteed, and both are i32, so difference is in [0, u32::MAX].
         // i32::MAX - i32::MIN = 4_294_967_295 = u32::MAX, so this always succeeds.
+        debug_assert!(max >= min, "CoordStats: max ({max}) < min ({min})");
         let diff = u64::try_from(i64::from(max) - i64::from(min)).unwrap_or(0);
         let range = u32::try_from(diff).unwrap_or(u32::MAX);
         let bits = bits_needed(range);
@@ -159,6 +160,7 @@ fn print_histogram(label: &str, stats: &CoordStats) {
 ///
 /// Streams through all nodes, collecting coordinate ranges and FOR block
 /// bit-width distributions. Runs in constant memory.
+#[hotpath::measure]
 pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStatsReport> {
     require_indexdata(path, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
@@ -187,6 +189,7 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
+    crate::debug::emit_marker("NODESTATS_START");
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -234,6 +237,7 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
         max_lon = 0;
     }
 
+    crate::debug::emit_marker("NODESTATS_END");
     Ok(NodeStatsReport {
         node_count,
         min_lat,

@@ -164,6 +164,7 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
         return Err("at least one input OSC file is required".into());
     }
 
+    crate::debug::emit_marker("MERGECHANGES_START");
     if simplify {
         let mut stream = ChangeStream::default();
         for path in inputs {
@@ -171,6 +172,7 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
         }
         let changes_in = stream.changes.len() as u64;
         let changes_out = write_simplified(output, stream)? as u64;
+        crate::debug::emit_marker("MERGECHANGES_END");
         Ok(MergeChangesStats {
             files: inputs.len(),
             changes_in,
@@ -179,6 +181,7 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
         })
     } else {
         let changes_out = write_streaming(inputs, output)?;
+        crate::debug::emit_marker("MERGECHANGES_END");
         Ok(MergeChangesStats {
             files: inputs.len(),
             changes_in: changes_out,

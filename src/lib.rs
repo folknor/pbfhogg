@@ -164,6 +164,7 @@ pub use write::{block_builder, writer};
 pub(crate) use write::file_writer;
 #[doc(hidden)]
 pub use commands::has_indexdata;
+#[doc(hidden)]
 pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{

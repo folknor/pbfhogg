@@ -80,6 +80,7 @@ pub fn time_filter(
     let mut pending: Option<PendingGroup> = None;
     let mut flush_error: Result<()> = Ok(());
 
+    crate::debug::emit_marker("TIMEFILTER_START");
     reader.for_each(|element| {
         if flush_error.is_err() {
             return;
@@ -121,6 +122,7 @@ pub fn time_filter(
         writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
     }
     writer.flush()?;
+    crate::debug::emit_marker("TIMEFILTER_END");
     Ok(stats)
 }
 

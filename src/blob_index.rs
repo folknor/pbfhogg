@@ -670,13 +670,14 @@ impl TagIndex {
 
     /// Returns `true` if any of the given keys is present in this tag index.
     pub fn has_any_key(&self, required: &[Box<[u8]>]) -> bool {
-        required.iter().any(|rk| self.keys.iter().any(|k| k == rk))
+        required.iter().any(|rk| self.keys.binary_search(rk).is_ok())
     }
 
     /// Returns `true` if any key in this tag index starts with any of the given prefixes.
     pub fn has_any_prefix(&self, prefixes: &[Box<[u8]>]) -> bool {
         prefixes.iter().any(|prefix| {
-            self.keys.iter().any(|k| k.starts_with(prefix))
+            let idx = self.keys.partition_point(|k| k.as_ref() < prefix.as_ref());
+            idx < self.keys.len() && self.keys[idx].starts_with(prefix)
         })
     }
 }

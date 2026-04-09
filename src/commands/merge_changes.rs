@@ -170,7 +170,7 @@ pub fn merge_changes(inputs: &[&Path], output: &Path, simplify: bool) -> Result<
             parse_osc_into(path, &mut stream)?;
         }
         let changes_in = stream.changes.len() as u64;
-        let changes_out = write_simplified(output, &stream)? as u64;
+        let changes_out = write_simplified(output, stream)? as u64;
         Ok(MergeChangesStats {
             files: inputs.len(),
             changes_in,
@@ -634,10 +634,10 @@ fn emit_change(
     write_change_to(writer, change)
 }
 
-fn write_simplified(output: &Path, stream: &ChangeStream) -> Result<usize> {
+fn write_simplified(output: &Path, stream: ChangeStream) -> Result<usize> {
     let mut last_by_object: BTreeMap<(u8, i64), Change> = BTreeMap::new();
-    for change in &stream.changes {
-        last_by_object.insert(change.element.key(), change.clone());
+    for change in stream.changes {
+        last_by_object.insert(change.element.key(), change);
     }
 
     let mut creates = Vec::new();

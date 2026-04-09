@@ -227,15 +227,48 @@ pub fn simplify_ring(ring: &[(f64, f64)], max_vertices: usize) -> Vec<(f64, f64)
         .collect()
 }
 
-/// Count how many vertices would be kept at a given epsilon.
+/// Count how many vertices would be kept at a given epsilon (allocation-free).
 fn dp_count(ring: &[(f64, f64)], epsilon: f64) -> usize {
-    let mut keep = vec![false; ring.len()];
-    keep[0] = true;
-    if let Some(last) = ring.len().checked_sub(1) {
-        keep[last] = true;
+    if ring.len() <= 2 {
+        return ring.len();
     }
-    dp_mark(ring, 0, ring.len() - 1, epsilon, &mut keep);
-    keep.iter().filter(|&&k| k).count()
+    // 2 for first and last, plus recursive count of interior kept vertices
+    2 + dp_count_range(ring, 0, ring.len() - 1, epsilon)
+}
+
+/// Count vertices kept by Douglas-Peucker in the open range (start, end).
+fn dp_count_range(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64) -> usize {
+    if end <= start + 1 {
+        return 0;
+    }
+    let (ax, ay) = pts[start];
+    let (bx, by) = pts[end];
+    let dx = bx - ax;
+    let dy = by - ay;
+    let len_sq = dx * dx + dy * dy;
+
+    let mut max_dist = 0.0_f64;
+    let mut max_idx = start + 1;
+    for (i, &(px, py)) in pts.iter().enumerate().skip(start + 1).take(end - start - 1) {
+        let dist = if len_sq < 1e-30 {
+            let ex = px - ax;
+            let ey = py - ay;
+            ex * ex + ey * ey
+        } else {
+            let cross = (px - ax) * dy - (py - ay) * dx;
+            (cross * cross) / len_sq
+        };
+        if dist > max_dist {
+            max_dist = dist;
+            max_idx = i;
+        }
+    }
+    if max_dist > epsilon * epsilon {
+        1 + dp_count_range(pts, start, max_idx, epsilon)
+            + dp_count_range(pts, max_idx, end, epsilon)
+    } else {
+        0
+    }
 }
 
 /// Mark vertices to keep using Douglas-Peucker recursion.

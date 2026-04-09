@@ -905,7 +905,10 @@ fn encode_blob_body(
                 }
             }
             let (_, compressor) = scratch.zstd_compressor.as_mut().expect("just initialized");
-            scratch.compress_buf = compressor.compress(uncompressed).map_err(io::Error::other)?;
+            let bound = zstd::zstd_safe::compress_bound(uncompressed.len());
+            scratch.compress_buf.clear();
+            scratch.compress_buf.reserve(bound);
+            compressor.compress_to_buffer(uncompressed, &mut scratch.compress_buf).map_err(io::Error::other)?;
             let raw_size = i32::try_from(uncompressed.len()).map_err(|_| {
                 io::Error::other(format!("blob raw_size overflow: {} bytes", uncompressed.len()))
             })?;
@@ -996,18 +999,28 @@ pub(crate) fn reframe_raw_with_index(
     indexdata: &[u8],
     tagdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
+    let mut header_buf = Vec::new();
+    reframe_raw_with_index_scratch(blob_bytes, indexdata, tagdata, &mut header_buf)
+}
+
+pub(crate) fn reframe_raw_with_index_scratch(
+    blob_bytes: &[u8],
+    indexdata: &[u8],
+    tagdata: Option<&[u8]>,
+    header_buf: &mut Vec<u8>,
+) -> io::Result<Vec<u8>> {
     let datasize = i32::try_from(blob_bytes.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", blob_bytes.len()))
     })?;
-    let mut header_buf = Vec::new();
-    encode_blob_header_into("OSMData", datasize, Some(indexdata), tagdata, &mut header_buf);
+    header_buf.clear();
+    encode_blob_header_into("OSMData", datasize, Some(indexdata), tagdata, header_buf);
 
     let header_len = u32::try_from(header_buf.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", header_buf.len())))?;
     let total_len = 4 + header_buf.len() + blob_bytes.len();
     let mut out = Vec::with_capacity(total_len);
     out.extend_from_slice(&header_len.to_be_bytes());
-    out.extend_from_slice(&header_buf);
+    out.extend_from_slice(header_buf);
     out.extend_from_slice(blob_bytes);
 
     Ok(out)

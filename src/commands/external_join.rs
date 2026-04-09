@@ -255,6 +255,8 @@ fn stage1_way_pass(
     let decompress_pool = crate::blob::DecompressPool::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     // P2c sidecar: per-way-blob ref counts for stage 4 slot_pos pre-computation.
     // Stage 1 and stage 4 must see way blobs in the same file order (both filter
@@ -278,21 +280,26 @@ fn stage1_way_pass(
         }
 
         let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
         let blob_start_pos = slot_pos;
-        for element in block.elements_skip_metadata() {
-            if let Element::Way(w) = element {
-                for node_id in w.refs() {
-                    let pair = CooPair { node_id, slot_pos };
-                    let bucket = pair.node_bucket();
-                    pair.write_to(&mut pair_buf);
-                    if let Some(writer) = node_buckets.writers[bucket].as_mut() {
-                        writer.write_all(&pair_buf)?;
+        let mut write_err: Option<std::io::Error> = None;
+        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, &mut group_starts, |_way_id, refs| {
+            if write_err.is_some() { return; }
+            for &node_id in refs {
+                let pair = CooPair { node_id, slot_pos };
+                let bucket = pair.node_bucket();
+                pair.write_to(&mut pair_buf);
+                if let Some(writer) = node_buckets.writers[bucket].as_mut() {
+                    if let Err(e) = writer.write_all(&pair_buf) {
+                        write_err = Some(e);
+                        return;
                     }
-                    node_buckets.entry_counts[bucket] += 1;
-                    slot_pos += 1;
                 }
+                node_buckets.entry_counts[bucket] += 1;
+                slot_pos += 1;
             }
+        })?;
+        if let Some(e) = write_err {
+            return Err(e.into());
         }
         // Write per-blob ref count to sidecar.
         let blob_ref_count = slot_pos - blob_start_pos;

@@ -68,15 +68,18 @@ const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 struct StringTable {
     strings: Vec<Rc<str>>,
     index: FxHashMap<Rc<str>, u32>,
+    empty: Rc<str>,
 }
 
 impl StringTable {
     fn new() -> Self {
+        let empty: Rc<str> = Rc::from("");
         let mut st = StringTable {
             strings: Vec::with_capacity(256),
             index: FxHashMap::with_capacity_and_hasher(256, Default::default()),
+            empty: Rc::clone(&empty),
         };
-        st.strings.push(Rc::from("")); // index 0 = empty string
+        st.strings.push(empty); // index 0 = empty string
         st
     }
 
@@ -125,7 +128,7 @@ impl StringTable {
     fn clear(&mut self) {
         self.strings.clear();
         self.index.clear();
-        self.strings.push(Rc::from(""));
+        self.strings.push(Rc::clone(&self.empty));
     }
 
     /// Encode the string table directly to wire format bytes.

@@ -237,6 +237,7 @@ fn dp_count(ring: &[(f64, f64)], epsilon: f64) -> usize {
 }
 
 /// Count vertices kept by Douglas-Peucker in the open range (start, end).
+/// Uses the same clamped segment-distance metric as `dp_mark`.
 fn dp_count_range(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64) -> usize {
     if end <= start + 1 {
         return 0;
@@ -250,13 +251,15 @@ fn dp_count_range(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64) ->
     let mut max_dist = 0.0_f64;
     let mut max_idx = start + 1;
     for (i, &(px, py)) in pts.iter().enumerate().skip(start + 1).take(end - start - 1) {
+        let rx = px - ax;
+        let ry = py - ay;
         let dist = if len_sq < 1e-30 {
-            let ex = px - ax;
-            let ey = py - ay;
-            ex * ex + ey * ey
+            rx * rx + ry * ry
         } else {
-            let cross = (px - ax) * dy - (py - ay) * dx;
-            (cross * cross) / len_sq
+            let t = ((rx * dx + ry * dy) / len_sq).clamp(0.0, 1.0);
+            let proj_x = t * dx - rx;
+            let proj_y = t * dy - ry;
+            proj_x * proj_x + proj_y * proj_y
         };
         if dist > max_dist {
             max_dist = dist;

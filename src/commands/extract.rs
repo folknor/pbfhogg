@@ -761,14 +761,14 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            || (crate::read::columnar::DenseNodeColumns::new(), (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>()),
+            || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
             |block, (columns, region_ids)| {
                 block.decode_dense_columns(columns);
-                columns.set_matching_ids_multi_bbox(&bboxes, region_ids);
+                columns.collect_matching_ids_multi_bbox(&bboxes, region_ids);
             },
             |(_, region_ids)| {
-                for (i, worker_set) in region_ids.into_iter().enumerate() {
-                    bbox_node_ids[i].merge(worker_set);
+                for (i, ids) in region_ids.into_iter().enumerate() {
+                    for id in ids { bbox_node_ids[i].set(id); }
                 }
             },
         )?;
@@ -776,7 +776,7 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
+            || vec![Vec::<i64>::new(); n],
             |block, region_ids| {
                 for element in block.elements_skip_metadata() {
                     match &element {
@@ -785,7 +785,7 @@ fn try_extract_multi_single_pass(
                             let lon = dn.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].set(dn.id());
+                                    region_ids[i].push(dn.id());
                                 }
                             }
                         }
@@ -794,7 +794,7 @@ fn try_extract_multi_single_pass(
                             let lon = nd.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].set(nd.id());
+                                    region_ids[i].push(nd.id());
                                 }
                             }
                         }
@@ -803,8 +803,8 @@ fn try_extract_multi_single_pass(
                 }
             },
             |region_ids| {
-                for (i, worker_set) in region_ids.into_iter().enumerate() {
-                    bbox_node_ids[i].merge(worker_set);
+                for (i, ids) in region_ids.into_iter().enumerate() {
+                    for id in ids { bbox_node_ids[i].set(id); }
                 }
             },
         )?;
@@ -859,21 +859,21 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
+        || vec![Vec::<i64>::new(); n],
         |block, region_ids| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
                         if w.refs().any(|r| bbox_node_ids[i].get(r)) {
-                            region_ids[i].set(w.id());
+                            region_ids[i].push(w.id());
                         }
                     }
                 }
             }
         },
         |region_ids| {
-            for (i, worker_set) in region_ids.into_iter().enumerate() {
-                matched_way_ids[i].merge(worker_set);
+            for (i, ids) in region_ids.into_iter().enumerate() {
+                for id in ids { matched_way_ids[i].set(id); }
             }
         },
     )?;
@@ -2547,11 +2547,11 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &node_schedule,
-        || (crate::read::columnar::DenseNodeColumns::new(), IdSetDense::new()),
+        || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
         |block, (columns, ids)| {
             if use_columnar {
                 block.decode_dense_columns(columns);
-                columns.set_matching_ids_bbox(
+                columns.collect_matching_ids_bbox(
                     bbox_int.min_lat, bbox_int.max_lat,
                     bbox_int.min_lon, bbox_int.max_lon,
                     ids,
@@ -2562,20 +2562,20 @@ fn collect_pass1_generic<H: RelationHandler>(
                         Element::DenseNode(dn)
                             if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
                         {
-                            ids.set(dn.id());
+                            ids.push(dn.id());
                         }
                         Element::Node(n)
                             if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
                         {
-                            ids.set(n.id());
+                            ids.push(n.id());
                         }
                         _ => {}
                     }
                 }
             }
         },
-        |(_, worker_ids)| {
-            bbox_node_ids.merge(worker_ids);
+        |(_, ids)| {
+            for id in ids { bbox_node_ids.set(id); }
         },
     )?;
 
@@ -2583,20 +2583,20 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (IdSetDense::new(), IdSetDense::new()),
+        || (Vec::<i64>::new(), Vec::<i64>::new()),
         |block, (way_ids, node_ids)| {
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     if w.refs().any(|r| bbox_node_ids.get(r)) {
-                        way_ids.set(w.id());
-                        for r in w.refs() { node_ids.set(r); }
+                        way_ids.push(w.id());
+                        node_ids.extend(w.refs());
                     }
                 }
             }
         },
-        |(worker_way_ids, worker_node_ids)| {
-            matched_way_ids.merge(worker_way_ids);
-            all_way_node_ids.merge(worker_node_ids);
+        |(way_ids, node_ids)| {
+            for id in way_ids { matched_way_ids.set(id); }
+            for id in node_ids { all_way_node_ids.set(id); }
         },
     )?;
 

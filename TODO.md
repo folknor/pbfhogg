@@ -601,16 +601,19 @@ per-iteration allocations remain across the codebase, ordered by impact:
 - [x] **2. Columnar batch processing** — shipped for extract node
   classification. `DenseNodeColumns` decodes IDs/lats/lons into
   contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass
-  N-region bbox test. Used in multi-extract (commit `d9a81ea`) and
-  single-extract (commit `e0b0780`). Thread-local scratch reuse for
-  all four classify paths (commit `9197763`).
+  N-region bbox test. Used in multi-extract and single-extract.
+  `parallel_classify_phase` refactored to per-worker accumulation:
+  workers own persistent state S, classify mutates S without per-blob
+  return, merge receives S once per worker at scope exit. Hot paths
+  (node/way) use Vec accumulation (cache-friendly push). Sparse paths
+  (relation, way deps, geocode) use direct IdSetDense::set + merge.
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
-  Remaining integration targets (ALTW, external join, geocode) are not
-  good fits — they use wire-format scanners or tag-based filtering.
-  See [notes/columnar-integration.md](notes/columnar-integration.md).
-  Remaining alloc opportunity: `parallel_classify_phase` in-place merge
-  to eliminate `drain(..).collect()` destination allocation (~8.7 GB
-  Japan, ~38 GB estimated planet).
+  Single-extract Japan alloc 6.4 GB → 2.0 GB (-69%).
+  Direct IdSetDense::set() in tight loops caused 29x regression —
+  reverted for hot paths, kept for sparse. See
+  [notes/columnar-integration.md](notes/columnar-integration.md).
+  Remaining alloc: multi-extract 8.7 GB from per-worker Vec growth.
+  Next step: contiguous worker sharding for non-overlapping IdSetDense.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

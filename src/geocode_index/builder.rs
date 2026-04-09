@@ -294,7 +294,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         crate::commands::parallel_classify_phase(
             &shared_file,
             &schedule,
-            |block| {
+            || (),
+            |block, _s| {
                 let mut node_ids = Vec::new();
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(way) = element {

@@ -596,7 +596,8 @@ fn tags_filter_two_pass(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut result = ClassifyResult {
                 matched_nodes: Vec::new(),
                 matched_ways: Vec::new(),
@@ -930,7 +931,8 @@ fn collect_relation_member_closure(
         super::parallel_classify_phase(
             &shared_file,
             &schedule,
-            |block| {
+            || (),
+            |block, _s| {
                 let mut result = ClosureResult {
                     node_ids: Vec::new(),
                     way_ids: Vec::new(),
@@ -1000,7 +1002,8 @@ fn collect_way_node_dependencies(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut node_ids = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element

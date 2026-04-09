@@ -761,23 +761,12 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            |block| {
-                use std::cell::RefCell;
-                thread_local! {
-                    static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
-                        RefCell::new(crate::read::columnar::DenseNodeColumns::new());
-                    static REGION_IDS: RefCell<Vec<Vec<i64>>> = RefCell::new(Vec::new());
-                }
-                COLUMNS.with_borrow_mut(|columns| {
-                    block.decode_dense_columns(columns);
-                    REGION_IDS.with_borrow_mut(|scratch| {
-                        // Ensure scratch has N entries, preserving capacity from prior blobs.
-                        scratch.resize_with(bboxes.len(), Vec::new);
-                        for v in scratch.iter_mut() { v.clear(); }
-                        columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
-                        scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
-                    })
-                })
+            || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
+            |block, (columns, scratch)| {
+                block.decode_dense_columns(columns);
+                for v in scratch.iter_mut() { v.clear(); }
+                columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
+                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
             },
             |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
@@ -791,39 +780,33 @@ fn try_extract_multi_single_pass(
         parallel_classify_phase(
             &shared_file,
             &node_schedule,
-            |block| {
-                use std::cell::RefCell;
-                thread_local! {
-                    static REGION_IDS: RefCell<Vec<Vec<i64>>> = RefCell::new(Vec::new());
-                }
-                REGION_IDS.with_borrow_mut(|region_ids| {
-                    region_ids.resize_with(n, Vec::new);
-                    for v in region_ids.iter_mut() { v.clear(); }
-                    for element in block.elements_skip_metadata() {
-                        match &element {
-                            Element::DenseNode(dn) => {
-                                let lat = dn.decimicro_lat();
-                                let lon = dn.decimicro_lon();
-                                for i in 0..n {
-                                    if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                        region_ids[i].push(dn.id());
-                                    }
+            || vec![Vec::<i64>::new(); n],
+            |block, region_ids| {
+                for v in region_ids.iter_mut() { v.clear(); }
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn) => {
+                            let lat = dn.decimicro_lat();
+                            let lon = dn.decimicro_lon();
+                            for i in 0..n {
+                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                    region_ids[i].push(dn.id());
                                 }
                             }
-                            Element::Node(nd) => {
-                                let lat = nd.decimicro_lat();
-                                let lon = nd.decimicro_lon();
-                                for i in 0..n {
-                                    if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                        region_ids[i].push(nd.id());
-                                    }
-                                }
-                            }
-                            _ => {}
                         }
+                        Element::Node(nd) => {
+                            let lat = nd.decimicro_lat();
+                            let lon = nd.decimicro_lon();
+                            for i in 0..n {
+                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                    region_ids[i].push(nd.id());
+                                }
+                            }
+                        }
+                        _ => {}
                     }
-                    region_ids.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
-                })
+                }
+                region_ids.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
             },
             |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
@@ -884,7 +867,8 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
@@ -944,7 +928,8 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
             for element in block.elements_skip_metadata() {
                 if let Element::Relation(r) = &element {
@@ -2279,7 +2264,8 @@ fn extract_simple_single_pass(
         parallel_classify_phase(
             &rel_classify_file,
             &rel_classify_schedule,
-            |block| {
+            || (),
+            |block, _s| {
                 let mut ids = Vec::new();
                 for element in block.elements_skip_metadata() {
                     if let Element::Relation(r) = &element {
@@ -2585,56 +2571,34 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &node_schedule,
-        |block| {
+        || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
+        |block, (columns, ids)| {
+            ids.clear();
             if use_columnar {
-                // Columnar path: batch decode + branchless bbox check.
-                // Worker-local scratch reused across blobs via thread_local.
-                use std::cell::RefCell;
-                thread_local! {
-                    static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
-                        RefCell::new(crate::read::columnar::DenseNodeColumns::new());
-                }
-                COLUMNS.with_borrow_mut(|columns| {
-                    block.decode_dense_columns(columns);
-                    thread_local! {
-                        static IDS_SCRATCH: RefCell<Vec<i64>> = RefCell::new(Vec::new());
-                    }
-                    IDS_SCRATCH.with_borrow_mut(|ids| {
-                        ids.clear();
-                        columns.collect_matching_ids_bbox(
-                            bbox_int.min_lat, bbox_int.max_lat,
-                            bbox_int.min_lon, bbox_int.max_lon,
-                            ids,
-                        );
-                        ids.drain(..).collect::<Vec<i64>>()
-                    })
-                })
+                block.decode_dense_columns(columns);
+                columns.collect_matching_ids_bbox(
+                    bbox_int.min_lat, bbox_int.max_lat,
+                    bbox_int.min_lon, bbox_int.max_lon,
+                    ids,
+                );
             } else {
-                // Polygon path: element-by-element with point-in-polygon check.
-                use std::cell::RefCell;
-                thread_local! {
-                    static IDS_POLY: RefCell<Vec<i64>> = RefCell::new(Vec::new());
-                }
-                IDS_POLY.with_borrow_mut(|ids| {
-                    ids.clear();
-                    for element in block.elements_skip_metadata() {
-                        match &element {
-                            Element::DenseNode(dn)
-                                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                            {
-                                ids.push(dn.id());
-                            }
-                            Element::Node(n)
-                                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                            {
-                                ids.push(n.id());
-                            }
-                            _ => {}
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn)
+                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                        {
+                            ids.push(dn.id());
                         }
+                        Element::Node(n)
+                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                        {
+                            ids.push(n.id());
+                        }
+                        _ => {}
                     }
-                    ids.drain(..).collect::<Vec<i64>>()
-                })
+                }
             }
+            ids.drain(..).collect::<Vec<i64>>()
         },
         |ids: Vec<i64>| {
             for id in ids {
@@ -2647,7 +2611,8 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut way_ids = Vec::new();
             let mut node_ids = Vec::new();
             for element in block.elements_skip_metadata() {
@@ -2675,7 +2640,8 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut rel_ids = Vec::new();
             let mut extra_way_ids: Vec<i64> = Vec::new();
             let mut extra_node_ids: Vec<i64> = Vec::new();
@@ -2877,7 +2843,8 @@ fn extract_smart(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut node_ids = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {

@@ -466,10 +466,11 @@ pub(crate) fn build_classify_schedule(
 /// file order. All current callers use order-independent merge operations
 /// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn parallel_classify_phase<R: Send>(
+pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
-    classify: impl Fn(&crate::PrimitiveBlock) -> R + Send + Sync,
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
     mut merge: impl FnMut(R),
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
@@ -496,11 +497,13 @@ pub(crate) fn parallel_classify_phase<R: Send>(
             let tx = result_tx.clone();
             let file = std::sync::Arc::clone(shared_file);
             let classify_ref = &classify;
+            let worker_init_ref = &worker_init;
             scope.spawn(move || {
                 let mut read_buf: Vec<u8> = Vec::new();
                 let worker_pool = crate::blob::DecompressPool::new();
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut worker_state = worker_init_ref();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -520,7 +523,7 @@ pub(crate) fn parallel_classify_phase<R: Send>(
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
-                        let result = classify_ref(&block);
+                        let result = classify_ref(&block, &mut worker_state);
                         Ok(result)
                     })();
                     if tx.send((s, r)).is_err() { break; }

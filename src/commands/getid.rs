@@ -147,7 +147,8 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        |block| {
+        || (),
+        |block, _s| {
             let mut batch = IdBatch {
                 node_ids: Vec::new(),
                 way_ids: Vec::new(),
@@ -514,7 +515,8 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         super::parallel_classify_phase(
             &shared_file,
             &schedule,
-            |block| {
+            || (),
+            |block, _s| {
                 let mut node_ids = Vec::new();
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element

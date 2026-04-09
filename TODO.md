@@ -598,36 +598,32 @@ per-iteration allocations remain across the codebase, ordered by impact:
   parallel iterator ownership semantics. `SmallVec` could avoid heap
   allocation for ways with few segments. Low priority.
 
-- [ ] **2. Columnar batch processing** — 2/6 reviewers ranked 1st, all
-  ranked top 2. Decode PrimitiveBlock fields into contiguous arrays (all
-  IDs, then all lats, then all lons) instead of element-by-element. Cuts
-  classify memory bandwidth from ~1.5 MB/block to ~100-200 KB/block.
-  Enables autovectorization for bbox checks, ID lookups, coordinate math.
-  Arena allocation (item 1) provides the natural home for column arrays.
-  Primary candidates: dense node decoding in `src/read/block.rs`,
-  coordinate processing in extract bbox classification, ALTW node scans.
-  The tag path is harder (variable-length strings) but tag key indices
-  could be columnar. Planetiler uses this approach.
-  See [notes/columnar-integration.md](notes/columnar-integration.md)
-  for integration analysis: multi-extract (N-region classification),
-  ALTW node scan, geocode builder pass 2, external join stage 2.
-  Columnar is primarily valuable for dense nodes (fixed-width parallel
-  arrays); ways/relations are better served by wire-format scanners.
+- [x] **2. Columnar batch processing** — shipped for extract node
+  classification. `DenseNodeColumns` decodes IDs/lats/lons into
+  contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass
+  N-region bbox test. Used in multi-extract (commit `d9a81ea`) and
+  single-extract (commit `e0b0780`). Thread-local scratch reuse for
+  all four classify paths (commit `9197763`).
+  Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
+  Remaining integration targets (ALTW, external join, geocode) are not
+  good fits — they use wire-format scanners or tag-based filtering.
+  See [notes/columnar-integration.md](notes/columnar-integration.md).
+  Remaining alloc opportunity: `parallel_classify_phase` in-place merge
+  to eliminate `drain(..).collect()` destination allocation (~8.7 GB
+  Japan, ~38 GB estimated planet).
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 
 - [ ] **3. SIMD** — universal agreement: comes after columnar. Columnar
-  prototype shipped (commit `e0b0780`). ASM inspection confirms LLVM
-  does NOT autovectorize the bbox classify loop — even with branchless
-  `&` pattern, LLVM optimizes back to conditional jumps. The `push()`
-  side effect prevents vectorization entirely.
+  now shipped for extract (single + multi-region). ASM inspection
+  confirms LLVM does NOT autovectorize the bbox classify loop — the
+  `push()` side effect prevents vectorization entirely.
 
   **Codegen finding:** explicit AVX2 intrinsics are the only path.
-  However, the bbox classify loop is only ~6.5s at Europe scale
-  (500K blobs × 8000 nodes × ~5 cycles). SIMD 8-wide would save ~5s
-  — **2.8% of total Europe extract time**. Not worth the complexity
-  (unsafe intrinsics, target_feature gates, non-AVX2 fallback) for
-  this specific loop alone.
+  The multi-bbox loop is a better SIMD target than single-bbox: N
+  region tests per node amortizes setup (N=5 with AVX2 8-wide ≈ 1.6
+  nodes of all 5 tests per vector op). Single-bbox is only 2.8% of
+  total Europe extract time — not worth it alone.
 
   SIMD becomes worthwhile when:
   - The classify loop is a larger fraction of runtime (after write-path

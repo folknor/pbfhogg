@@ -4,110 +4,80 @@
 
 Prototype shipped (commit `e0b0780`). `DenseNodeColumns` in
 `src/read/columnar.rs` batch-decodes IDs, lats, lons into contiguous
-arrays. `collect_matching_ids_bbox` does branchless bbox classification.
-Used only in extract's node classification for bbox regions
-(`src/commands/extract.rs` line 2216).
+arrays. Two classification methods:
+- `collect_matching_ids_bbox` — single-region branchless bbox check
+- `collect_matching_ids_multi_bbox` — single-pass N-region bbox check
+  (commit `d9a81ea`)
+
+Used in:
+- Single-extract node classification for bbox regions
+- Multi-extract node classification for all-bbox regions (commit `d9a81ea`)
+
+All four node classify paths (multi-extract columnar + polygon fallback,
+single-extract columnar + polygon fallback) use thread-local scratch
+Vecs for output, preserving capacity across blobs (commit `9197763`).
 
 ASM inspection confirms LLVM does NOT autovectorize the bbox loop —
 the `push()` side effect prevents it. Explicit AVX2 intrinsics are
 the only path, but the theoretical max gain is 2.8% of total extract
-time (not worth the complexity yet).
+time (not worth the complexity yet). The multi-bbox loop is a better
+SIMD target: N region tests per node amortizes setup cost.
+
+## Measured results (commit `9197763`, plantasjen)
+
+### Multi-extract Japan 5-region node classify phase
+
+| Metric | Baseline (element-by-element) | +columnar | +scratch reuse |
+|--------|------------------------------|-----------|----------------|
+| Node classify | 1081ms | 748ms (-31%) | ~748ms |
+| Total | 8.1s | 7.3s | 7.3s |
+| `parallel_classify_phase` time | 2.03s | 1.72s | 1.68s |
+
+Alloc churn: 8.7 GB in `parallel_classify_phase` — unchanged by
+columnar or scratch reuse because `drain(..).collect()` still
+allocates fresh destination Vecs for the return channel. The
+thread-local scratch preserves source Vec capacity (less allocator
+pressure, Dealloc 721→655 MB) but the alloc counter tracks both.
+
+To eliminate the 8.7 GB, `parallel_classify_phase` would need an
+in-place merge interface (worker accumulates into thread-local state,
+merge callback drains it directly) instead of the current
+closure-returns-owned-R pattern. Bigger refactor.
 
 ## Integration opportunities
 
-### 1. Multi-extract node classification (high value)
+### 1. Multi-extract node classification — DONE (commit `d9a81ea`)
 
-Multi-extract (line 738) uses element-by-element iteration with an
-O(N) inner loop per node (N = number of regions). With columnar decode:
+`collect_matching_ids_multi_bbox` tests each node against all N
+bboxes in one pass over contiguous i32 lat/lon arrays. Thread-local
+`DenseNodeColumns` + `Vec<Vec<i64>>` scratch reused across blobs.
+Polygon regions fall back to element-by-element with thread-local
+scratch.
 
-```
-columns.decode_dense_columns(block);
-for i in 0..n {
-    columns.collect_matching_ids_bbox(
-        bbox_ints[i].min_lat, bbox_ints[i].max_lat,
-        bbox_ints[i].min_lon, bbox_ints[i].max_lon,
-        &mut region_ids[i],
-    );
-}
-```
+### 2. ALTW node scan — NOT A GOOD TARGET
 
-This is N passes over contiguous i32 arrays vs N × 8000 element
-iterations with method calls through the `DenseNode` abstraction.
-Cache-friendlier and eliminates the element dispatch overhead.
+`add_locations_to_ways` external join uses wire-format scanners
+(`node_scanner.rs`) which operate at wire level without PrimitiveBlock
+construction. Columnar decode would be a different (and slower)
+approach. The wire-format scanner is already optimal. Alloc profiling
+confirms: `stage2_node_join` is 655 MB (0.87%), not a bottleneck.
 
-**Alternative: single-pass multi-region classification**
+### 3. External join stage 2 — NOT A GOOD TARGET
 
-A new `collect_matching_ids_multi_bbox` method that tests each node
-against all N regions in one pass:
+Same as ALTW: wire-format scanner already operates below PrimitiveBlock
+level. Columnar would add overhead, not remove it.
 
-```rust
-pub fn collect_matching_ids_multi_bbox(
-    &self,
-    bboxes: &[BboxInt],
-    out: &mut [Vec<i64>],  // one Vec per region
-) {
-    for i in 0..self.len() {
-        let lat = self.lats[i];
-        let lon = self.lons[i];
-        for (j, bbox) in bboxes.iter().enumerate() {
-            if lat >= bbox.min_lat && lat <= bbox.max_lat
-               && lon >= bbox.min_lon && lon <= bbox.max_lon {
-                out[j].push(self.ids[i]);
-            }
-        }
-    }
-}
-```
+### 4. Geocode builder pass 2 — NOT A GOOD TARGET
 
-Single pass over lat/lon arrays, N bbox tests per node. For N=5,
-this is 5 comparisons per element vs 5 separate array passes.
-
-### 2. ALTW node scan (medium value)
-
-`add_locations_to_ways` pass 0 filters node IDs by blob-level bbox
-(already done via indexdata). The actual node coordinate extraction
-in pass 2 reads node IDs + lats + lons — exactly what columnar
-provides. Currently uses `extract_node_tuples` which does
-element-by-element parsing.
-
-### 3. External join stage 2 (medium value)
-
-Stage 2 of the external join scans node blobs for IDs + coordinates
-using a wire-format scanner (`node_scanner.rs`). The scanner already
-operates at wire level (no PrimitiveBlock), so columnar decode would
-be a different approach — decode into arrays first, then filter. The
-wire-format scanner may already be optimal here since it avoids the
-PrimitiveBlock overhead entirely.
-
-### 4. Geocode builder pass 2 (medium value)
-
-Pass 2 scans nodes for coordinates, matching against admin boundary
-polygons. Currently uses `elements_skip_metadata()`. Columnar would
-give contiguous lat/lon arrays for point-in-polygon batch testing.
-This is the prerequisite for GPU-accelerated PIP (TODO.md stretch).
+Pass 2 scans for nodes with specific tags (addresses, POIs) and ways
+with specific tags (streets). The primary filter is tag-based, not
+coordinate-based. Columnar provides coordinates, not tags. The 12.1 GB
+alloc in pass 2 is `parse_and_inline_with_scratch` (protobuf parsing),
+not coordinate classification.
 
 ### 5. Node stats (low value)
 
-`node_stats.rs` collects coordinate statistics. Already converted to
-sequential BlobReader. Columnar would give contiguous arrays for
-min/max/histogram computation. Low priority — diagnostic command.
-
-## Scratch buffer reuse for output Vec
-
-The extract columnar path (line 2226) allocates a fresh `Vec<i64>`
-per block for the bbox match results. This should use thread-local
-scratch, same as the `COLUMNS` struct:
-
-```rust
-thread_local! {
-    static COLUMNS: RefCell<DenseNodeColumns> = ...;
-    static IDS_SCRATCH: RefCell<Vec<i64>> = RefCell::new(Vec::new());
-}
-```
-
-Workers clear and reuse the Vec across blocks. Currently a minor
-allocation (~64 KB per block at 8000 nodes) but adds up at planet
-scale (600K blocks × 64 KB = 38 GB cumulative churn).
+Diagnostic command. Not worth the complexity.
 
 ## Columnar for ways and relations
 
@@ -134,9 +104,18 @@ the bbox classify loop is only 2.8% of extract time — not worth
 explicit AVX2 intrinsics for this loop alone.
 
 SIMD becomes worthwhile when:
-- Multi-region classification (N bbox tests per node, amortized)
+- Multi-region classification (N bbox tests per node, amortized) — NOW IN PLACE
 - Polygon PIP (expensive per-node computation)
 - Batch varint decode in protohoggr (different target, broader impact)
 
 The columnar infrastructure is the right foundation — the SIMD payoff
 comes from the consumers, not the bbox check itself.
+
+## Next steps
+
+The remaining alloc reduction opportunity is changing
+`parallel_classify_phase` to support in-place worker accumulation
+instead of returning owned results per blob. This would eliminate the
+`drain(..).collect()` destination allocation (~8.7 GB at Japan scale,
+~38 GB estimated at planet scale). This is a worker infrastructure
+refactor, not a columnar change.

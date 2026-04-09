@@ -480,11 +480,13 @@ per-iteration allocations remain across the codebase, ordered by impact:
   is protobuf parsing overhead (`parse_and_inline_with_scratch`).
   See [notes/fill-buffer-optimization.md](notes/fill-buffer-optimization.md)
   and [notes/block-pair-merge-join-plan.md](notes/block-pair-merge-join-plan.md).
-- [ ] **Block-pair merge-join v1 (compressed byte comparison)** —
+- [x] **Block-pair merge-join v1 (compressed byte comparison)** —
   skip decode entirely for matching blobs by comparing compressed bytes.
-  Would eliminate the 24.1 GB protobuf parsing overhead for unchanged
-  blocks. Most effective for way/relation blobs where modifications
-  are sparser. Complementary to v2.
+  Overlapping blob pairs with identical min_id/max_id/count AND
+  compressed bytes emit `BlobEqual(count)` without decompression.
+  Denmark diff: 20s → 10s (2x). Enabled for `diff --suppress-common`
+  and `derive_changes` (always). Diff without `--suppress-common`
+  falls through to element-level (needs per-element IDs for output).
 - [x] **`stream_merge` metadata allocation waste** — resolved by v2.
   The block-pair path uses `element_version()` on borrowed elements,
   avoiding OwnedMetadata construction for the Equal path. Only changed

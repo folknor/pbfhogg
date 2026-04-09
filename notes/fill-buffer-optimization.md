@@ -206,6 +206,23 @@ dominated by sequential decompression + protobuf parsing of two full
 PBFs. Further gains require either v1 (skip decode for matching blocks)
 or parallelism.
 
+## Results — v1 shipped (compressed byte comparison)
+
+Denmark diff (464 MB, 59M elements, daily diff, `--suppress-common`):
+
+| Metric | v2 only | v2 + v1 | Improvement |
+|--------|---------|---------|-------------|
+| Wall time | ~20s | ~10s | **2x faster** |
+
+v1 compares compressed bytes for overlapping blob pairs with matching
+indexdata (min_id, max_id, count). If bytes are identical, all elements
+are unchanged — skip decode entirely. The apply-changes merge preserves
+passthrough blobs byte-for-byte, so the majority of blob pairs match.
+
+Only active when `skip_equal_blobs=true`: `diff --suppress-common` and
+`derive_changes`. Without `--suppress-common`, diff needs per-element
+IDs for the unchanged-element output lines.
+
 ## Original impact estimate
 
 - Japan diff: 80.7 GB → ~1 GB (predicted, actual: 40.6 GB)

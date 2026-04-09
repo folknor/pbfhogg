@@ -473,6 +473,19 @@ impl Blob {
             .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
     }
 
+    /// Returns the compressed payload bytes for blob equality comparison.
+    ///
+    /// Two blobs with identical compressed bytes are guaranteed to contain
+    /// identical elements (same compressed bytes → same decompressed bytes →
+    /// same protobuf → same elements). Returns `None` only if the blob has
+    /// no data payload.
+    pub(crate) fn compressed_bytes(&self) -> Option<&[u8]> {
+        match &self.blob.data {
+            Some(BlobData::Raw(b) | BlobData::Zlib(b) | BlobData::Zstd(b)) => Some(b),
+            None => None,
+        }
+    }
+
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs

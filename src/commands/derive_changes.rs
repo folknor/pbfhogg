@@ -193,7 +193,7 @@ fn collect_phase_block_pair(
     modifies: &mut Changes,
     deletes: &mut Changes,
 ) -> Result<()> {
-    block_pair_merge_phase(merge, kind, &mut |action| {
+    block_pair_merge_phase(merge, kind, true, &mut |action| {
         match action {
             BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
             BlockMergeAction::BlobOldOnly { block, skip, .. } => {

@@ -206,12 +206,10 @@ fn diff_block_pair(
         block_pair_merge_phase(
             &mut merge,
             kind,
+            options.suppress_common,
             &mut |action| {
                 match action {
                     BlockMergeAction::BlobEqual(count) => {
-                        // v2 doesn't emit BlobEqual yet (reserved for v1 byte comparison).
-                        // When it does, we'd need to iterate for per-element output if
-                        // !suppress_common. For now, just count.
                         stats.common += count;
                     }
                     BlockMergeAction::BlobOldOnly {

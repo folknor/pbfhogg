@@ -470,8 +470,8 @@ fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
 /// Actions emitted by the block-pair merge engine.
 pub(crate) enum BlockMergeAction<'a> {
     /// All elements in this blob are unchanged (count from indexdata).
-    /// Not emitted by v2 (reserved for v1 compressed-byte comparison).
-    #[allow(dead_code)]
+    /// Emitted by v1 compressed-byte comparison when `skip_equal_blobs` is true
+    /// and the old/new blobs have identical compressed bytes.
     BlobEqual(u64),
     /// All elements in this blob exist only in old.
     BlobOldOnly {
@@ -512,7 +512,15 @@ struct BlockState {
     index: crate::blob_index::BlobIndex,
 }
 
-/// Advance a BlobReader to the next OsmData blob matching `kind`.
+/// Undecoded blob with its index — held between blob read and decompress.
+/// Used by v1 compressed-byte comparison: we read the blob, check its index,
+/// and optionally compare compressed bytes before deciding whether to decode.
+struct PendingBlob {
+    blob: crate::blob::Blob,
+    index: crate::blob_index::BlobIndex,
+}
+
+/// Read the next OsmData blob matching `kind` without decompressing it.
 /// Returns None at EOF or when the next blob's type doesn't match `kind`
 /// (which means we've moved past this type phase in a sorted PBF).
 ///
@@ -521,16 +529,12 @@ struct BlockState {
 /// (later) kind, this phase is done. We must NOT consume that blob
 /// because the next phase needs it. We store it in `stash` for the
 /// next phase to pick up.
-fn next_block_for_kind(
+fn next_blob_for_kind(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
-    pool: &Arc<DecompressPool>,
-    st_scratch: &mut Vec<(u32, u32)>,
-    gr_scratch: &mut Vec<(u32, u32)>,
     kind: ElemKind,
     stash: &mut Option<crate::blob::Blob>,
-) -> Result<Option<BlockState>> {
+) -> Result<Option<PendingBlob>> {
     loop {
-        // Check the stash first (blob consumed but not processed by prior phase).
         let blob = if let Some(stashed) = stash.take() {
             stashed
         } else {
@@ -550,24 +554,31 @@ fn next_block_for_kind(
             }
         };
         if index.kind != kind {
-            // In sorted PBFs, element types appear in order: nodes → ways → relations.
-            // If this blob is for a later kind, stash it and stop.
-            // If it's for an earlier kind, discard it and keep looking.
             if kind_order(index.kind) > kind_order(kind) {
                 *stash = Some(blob);
                 return Ok(None);
             }
-            // Earlier kind — skip it.
             continue;
         }
-        let decompressed = blob.decompress_pooled(pool)?;
-        let block = PrimitiveBlock::new_with_scratch(decompressed, st_scratch, gr_scratch)?;
-        return Ok(Some(BlockState {
-            block,
-            skip_count: 0,
-            index,
-        }));
+        return Ok(Some(PendingBlob { blob, index }));
     }
+}
+
+/// Decompress a pending blob into a decoded BlockState.
+#[allow(clippy::needless_pass_by_value)] // consumes blob to drop compressed bytes after decode
+fn decode_pending(
+    pending: PendingBlob,
+    pool: &Arc<DecompressPool>,
+    st_scratch: &mut Vec<(u32, u32)>,
+    gr_scratch: &mut Vec<(u32, u32)>,
+) -> Result<BlockState> {
+    let decompressed = pending.blob.decompress_pooled(pool)?;
+    let block = PrimitiveBlock::new_with_scratch(decompressed, st_scratch, gr_scratch)?;
+    Ok(BlockState {
+        block,
+        skip_count: 0,
+        index: pending.index,
+    })
 }
 
 /// Canonical order: nodes (0) → ways (1) → relations (2).
@@ -623,123 +634,207 @@ impl BlockPairMergeState {
     }
 }
 
+/// Decode the next blob from a reader into a BlockState, or return None at EOF.
+fn next_decoded_block(
+    reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
+    pool: &Arc<DecompressPool>,
+    st: &mut Vec<(u32, u32)>,
+    gr: &mut Vec<(u32, u32)>,
+    kind: ElemKind,
+    stash: &mut Option<crate::blob::Blob>,
+) -> Result<Option<BlockState>> {
+    match next_blob_for_kind(reader, kind, stash)? {
+        Some(p) => Ok(Some(decode_pending(p, pool, st, gr)?)),
+        None => Ok(None),
+    }
+}
+
+/// Drain all remaining blobs of `kind` from one side of a merge.
+fn drain_remaining(
+    state: &mut BlockPairMergeState,
+    kind: ElemKind,
+    is_old: bool,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
+    let (reader, pool, st, gr, stash) = if is_old {
+        (&mut state.old_reader, &state.old_pool, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
+    } else {
+        (&mut state.new_reader, &state.new_pool, &mut state.new_st, &mut state.new_gr, &mut state.new_stash)
+    };
+    while let Some(p) = next_blob_for_kind(reader, kind, stash)? {
+        let bs = decode_pending(p, pool, st, gr)?;
+        emit_block(&bs, is_old, on_action)?;
+    }
+    Ok(())
+}
+
+/// Emit a decoded block as BlobOldOnly or BlobNewOnly, accounting for skip.
+fn emit_block(
+    bs: &BlockState,
+    is_old: bool,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
+    let remaining = bs.index.count.saturating_sub(bs.skip_count as u64);
+    if is_old {
+        on_action(BlockMergeAction::BlobOldOnly {
+            block: &bs.block,
+            count: remaining,
+            skip: bs.skip_count,
+        })
+    } else {
+        on_action(BlockMergeAction::BlobNewOnly {
+            block: &bs.block,
+            count: remaining,
+            skip: bs.skip_count,
+        })
+    }
+}
+
+/// Merge a pair of decoded overlapping blocks, tracking residuals.
+fn merge_decoded_pair(
+    old_decoded: &mut Option<BlockState>,
+    new_decoded: &mut Option<BlockState>,
+    type_char: char,
+    on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
+) -> Result<()> {
+    let mut os = old_decoded.take().expect("checked Some");
+    let mut ns = new_decoded.take().expect("checked Some");
+
+    let merge_up_to = os.index.max_id.min(ns.index.max_id);
+    element_merge_pair(
+        &os.block,
+        os.skip_count,
+        &ns.block,
+        ns.skip_count,
+        merge_up_to,
+        type_char,
+        on_action,
+    )?;
+
+    if os.index.max_id > merge_up_to {
+        let consumed = count_elements_up_to(&os.block, os.skip_count, merge_up_to);
+        os.skip_count += consumed;
+        *old_decoded = Some(os);
+    }
+    if ns.index.max_id > merge_up_to {
+        let consumed = count_elements_up_to(&ns.block, ns.skip_count, merge_up_to);
+        ns.skip_count += consumed;
+        *new_decoded = Some(ns);
+    }
+    Ok(())
+}
+
 /// Run one type phase of the block-pair merge.
 ///
 /// Requires both readers to have `set_parse_indexdata(true)` and both inputs
 /// to be sorted. Falls through to element-level comparison for overlapping
 /// blocks.
+///
+/// When `skip_equal_blobs` is true, overlapping blobs with identical compressed
+/// bytes emit `BlobEqual(count)` without decompression (v1 optimization).
+/// Callers that need per-element output for unchanged elements (e.g., diff with
+/// `!suppress_common`) should pass `false`.
 pub(crate) fn block_pair_merge_phase(
     state: &mut BlockPairMergeState,
     kind: ElemKind,
+    skip_equal_blobs: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
 ) -> Result<()> {
     let type_char = kind_type_char(kind);
-    let mut old_state: Option<BlockState> = None;
-    let mut new_state: Option<BlockState> = None;
+    let mut old_decoded: Option<BlockState> = None;
+    let mut new_decoded: Option<BlockState> = None;
 
     loop {
-        // Ensure both sides have a block (or are exhausted).
-        if old_state.is_none() {
-            old_state = next_block_for_kind(
-                &mut state.old_reader,
-                &state.old_pool,
-                &mut state.old_st,
-                &mut state.old_gr,
-                kind,
-                &mut state.old_stash,
-            )?;
-        }
-        if new_state.is_none() {
-            new_state = next_block_for_kind(
-                &mut state.new_reader,
-                &state.new_pool,
-                &mut state.new_st,
-                &mut state.new_gr,
-                kind,
-                &mut state.new_stash,
-            )?;
+        // Fast path: both sides need fresh blobs (no residuals).
+        // Read without decompressing so we can compare compressed bytes.
+        if old_decoded.is_none() && new_decoded.is_none() {
+            let op = next_blob_for_kind(&mut state.old_reader, kind, &mut state.old_stash)?;
+            let np = next_blob_for_kind(&mut state.new_reader, kind, &mut state.new_stash)?;
+
+            match (op, np) {
+                (None, None) => break,
+                (Some(op), None) => {
+                    let os = decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?;
+                    emit_block(&os, true, on_action)?;
+                    drain_remaining(state, kind, true, on_action)?;
+                    break;
+                }
+                (None, Some(np)) => {
+                    let ns = decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?;
+                    emit_block(&ns, false, on_action)?;
+                    drain_remaining(state, kind, false, on_action)?;
+                    break;
+                }
+                (Some(op), Some(np)) => {
+                    if op.index.max_id < np.index.min_id {
+                        let os = decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?;
+                        emit_block(&os, true, on_action)?;
+                        new_decoded = Some(decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?);
+                        continue;
+                    }
+                    if np.index.max_id < op.index.min_id {
+                        let ns = decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?;
+                        emit_block(&ns, false, on_action)?;
+                        old_decoded = Some(decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?);
+                        continue;
+                    }
+                    // Overlapping — try compressed byte comparison (v1).
+                    if skip_equal_blobs && blobs_byte_equal(&op, &np) {
+                        on_action(BlockMergeAction::BlobEqual(op.index.count))?;
+                        continue;
+                    }
+                    old_decoded = Some(decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?);
+                    new_decoded = Some(decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?);
+                }
+            }
         }
 
-        match (&old_state, &new_state) {
+        // Slow path: at least one side has a decoded residual block.
+        if old_decoded.is_none() {
+            old_decoded = next_decoded_block(&mut state.old_reader, &state.old_pool, &mut state.old_st, &mut state.old_gr, kind, &mut state.old_stash)?;
+        }
+        if new_decoded.is_none() {
+            new_decoded = next_decoded_block(&mut state.new_reader, &state.new_pool, &mut state.new_st, &mut state.new_gr, kind, &mut state.new_stash)?;
+        }
+
+        match (&old_decoded, &new_decoded) {
             (None, None) => break,
-
             (Some(_), None) => {
-                let os = old_state.take().expect("checked Some");
-                let remaining = os.index.count.saturating_sub(os.skip_count as u64);
-                on_action(BlockMergeAction::BlobOldOnly {
-                    block: &os.block,
-                    count: remaining,
-                    skip: os.skip_count,
-                })?;
+                let os = old_decoded.take().expect("checked");
+                emit_block(&os, true, on_action)?;
             }
-
             (None, Some(_)) => {
-                let ns = new_state.take().expect("checked Some");
-                let remaining = ns.index.count.saturating_sub(ns.skip_count as u64);
-                on_action(BlockMergeAction::BlobNewOnly {
-                    block: &ns.block,
-                    count: remaining,
-                    skip: ns.skip_count,
-                })?;
+                let ns = new_decoded.take().expect("checked");
+                emit_block(&ns, false, on_action)?;
             }
-
             (Some(os), Some(ns)) => {
-                // Non-overlapping: old entirely before new.
                 if os.index.max_id < ns.index.min_id {
-                    let os = old_state.take().expect("checked Some");
-                    let remaining = os.index.count.saturating_sub(os.skip_count as u64);
-                    on_action(BlockMergeAction::BlobOldOnly {
-                        block: &os.block,
-                        count: remaining,
-                        skip: os.skip_count,
-                    })?;
+                    let os = old_decoded.take().expect("checked");
+                    emit_block(&os, true, on_action)?;
                     continue;
                 }
-                // Non-overlapping: new entirely before old.
                 if ns.index.max_id < os.index.min_id {
-                    let ns = new_state.take().expect("checked Some");
-                    let remaining = ns.index.count.saturating_sub(ns.skip_count as u64);
-                    on_action(BlockMergeAction::BlobNewOnly {
-                        block: &ns.block,
-                        count: remaining,
-                        skip: ns.skip_count,
-                    })?;
+                    let ns = new_decoded.take().expect("checked");
+                    emit_block(&ns, false, on_action)?;
                     continue;
                 }
-
-                // Overlapping: decode both and element-merge.
-                let mut os = old_state.take().expect("checked Some");
-                let mut ns = new_state.take().expect("checked Some");
-
-                let merge_up_to = os.index.max_id.min(ns.index.max_id);
-                element_merge_pair(
-                    &os.block,
-                    os.skip_count,
-                    &ns.block,
-                    ns.skip_count,
-                    merge_up_to,
-                    type_char,
-                    on_action,
-                )?;
-
-                // Determine residuals: which side has unconsumed elements?
-                if os.index.max_id > merge_up_to {
-                    // Old block has elements past merge_up_to — keep as residual.
-                    // Count how many elements were consumed.
-                    let consumed = count_elements_up_to(&os.block, os.skip_count, merge_up_to);
-                    os.skip_count += consumed;
-                    old_state = Some(os);
-                }
-                if ns.index.max_id > merge_up_to {
-                    let consumed = count_elements_up_to(&ns.block, ns.skip_count, merge_up_to);
-                    ns.skip_count += consumed;
-                    new_state = Some(ns);
-                }
+                merge_decoded_pair(&mut old_decoded, &mut new_decoded, type_char, on_action)?;
             }
         }
     }
 
     Ok(())
+}
+
+/// Check if two pending blobs have identical index metadata and compressed bytes.
+fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
+    a.index.min_id == b.index.min_id
+        && a.index.max_id == b.index.max_id
+        && a.index.count == b.index.count
+        && match (a.blob.compressed_bytes(), b.blob.compressed_bytes()) {
+            (Some(ab), Some(bb)) => ab == bb,
+            _ => false,
+        }
 }
 
 /// Count how many elements in `block` (starting from `skip`) have id <= `up_to`.

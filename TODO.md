@@ -382,6 +382,26 @@ for full analysis of 6 optimization opportunities.
   strips needs hybrid decode+raw consumer path — decode once, write
   raw to contained regions, route elements to non-contained regions.
 
+**Reviewer findings (2026-04-09, 6 reviewers across 3 archetypes):**
+
+- [ ] **`std::mem::take` on worker output Vecs defeats capacity reuse** —
+  `output.iter_mut().map(std::mem::take)` replaces each per-region
+  `Vec<OwnedBlock>` with a fresh empty Vec, losing accumulated capacity.
+  Re-grows on the next blob. Fix: swap with pre-allocated Vecs or
+  drain into a taken Vec and restore capacity. Flagged by 4/6 reviewers.
+- [ ] **Passthrough `frame_buf.clone()` for each of N writers** —
+  N-1 unnecessary copies of ~200-500 KB raw frames. Last writer could
+  take ownership via `std::mem::take`. Flagged by 3/6 reviewers.
+- [ ] **Per-closure `refs_buf`/`members_buf` allocation** — way and
+  relation write closures create fresh `Vec` per blob invocation
+  (~16 KB ways, ~480 bytes relations). Could be added to worker
+  persistent state but would change the `block_fn` signature.
+  Flagged by 2/6 reviewers.
+- [ ] **O(workers × regions) scaling for large N** — each worker
+  allocates N BlockBuilders (~500 KB each). At N=50, ~200 MB across
+  8 workers. At N=100+, ~400 MB. Monitor but acceptable for typical
+  use (5-20 regions). Flagged by 2/6 reviewers.
+
 ### Export (GeoJSON/GeoPackage)
 
 The bridge to the GIS ecosystem. Streaming PBF → GeoJSON/GeoJSONSeq

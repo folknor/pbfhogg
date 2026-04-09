@@ -709,12 +709,17 @@ fn try_extract_multi_single_pass(
             if !spatial_filter.wants_index(&idx) { continue; }
             match idx.kind {
                 crate::blob_index::ElemKind::Node => {
+                    // Raw passthrough is only sound for bbox regions — polygon
+                    // regions can exclude nodes inside the bbox but outside the
+                    // polygon boundary or inside holes.
                     let mut contained_in: Vec<usize> = Vec::new();
                     if let Some(ref blob_bbox) = idx.bbox {
-                        for (i, bi) in bbox_ints.iter().enumerate() {
-                            let region_bbox = crate::BlobBbox::new(bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon);
-                            if region_bbox.contains(blob_bbox) {
-                                contained_in.push(i);
+                        for (i, (bi, slot)) in bbox_ints.iter().zip(slots.iter()).enumerate() {
+                            if matches!(slot.region, Region::Bbox(_)) {
+                                let region_bbox = crate::BlobBbox::new(bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon);
+                                if region_bbox.contains(blob_bbox) {
+                                    contained_in.push(i);
+                                }
                             }
                         }
                     }

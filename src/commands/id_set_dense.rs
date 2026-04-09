@@ -227,3 +227,116 @@ impl IdSetDense {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_get_basic_ids() {
+        let mut s = IdSetDense::new();
+        s.set(1);
+        s.set(100);
+        s.set(1_000_000);
+        assert!(s.get(1));
+        assert!(s.get(100));
+        assert!(s.get(1_000_000));
+    }
+
+    #[test]
+    fn get_returns_false_for_unset_ids() {
+        let mut s = IdSetDense::new();
+        s.set(5);
+        assert!(!s.get(0));
+        assert!(!s.get(4));
+        assert!(!s.get(6));
+        assert!(!s.get(999_999));
+    }
+
+    #[test]
+    fn chunk_boundary_ids() {
+        let mut s = IdSetDense::new();
+        // Chunk size is 1 << 22 bytes = 4MB = 33_554_432 bits.
+        // IDs at and around the boundary cross chunks.
+        let boundary: i64 = 33_554_432;
+        s.set(0);
+        s.set(boundary - 1);
+        s.set(boundary);
+        s.set(boundary + 1);
+
+        assert!(s.get(0));
+        assert!(s.get(boundary - 1));
+        assert!(s.get(boundary));
+        assert!(s.get(boundary + 1));
+        assert!(!s.get(boundary - 2));
+        assert!(!s.get(boundary + 2));
+    }
+
+    #[test]
+    fn any_in_range_hit_and_miss() {
+        let mut s = IdSetDense::new();
+        s.set(50);
+        s.set(200);
+
+        // Range that contains a set ID
+        assert!(s.any_in_range(40, 60));
+        assert!(s.any_in_range(50, 50));
+        assert!(s.any_in_range(190, 210));
+
+        // Range that does not contain any set ID
+        // Note: any_in_range uses byte-level granularity, so we need ranges
+        // that don't share a byte with any set ID. ID 50 is in byte 6 (bits 48-55),
+        // ID 200 is in byte 25 (bits 200-207).
+        assert!(!s.any_in_range(56, 199));
+        assert!(!s.any_in_range(0, 47));
+        assert!(!s.any_in_range(208, 300));
+
+        // Inverted range returns false
+        assert!(!s.any_in_range(100, 10));
+    }
+
+    #[test]
+    fn merge_two_sets() {
+        let mut a = IdSetDense::new();
+        a.set(10);
+        a.set(20);
+
+        let mut b = IdSetDense::new();
+        b.set(20);
+        b.set(30);
+
+        a.merge(b);
+
+        assert!(a.get(10));
+        assert!(a.get(20));
+        assert!(a.get(30));
+        assert!(!a.get(15));
+    }
+
+    #[test]
+    fn rank_and_total_count() {
+        let mut s = IdSetDense::new();
+        s.set(5);
+        s.set(10);
+        s.set(15);
+        s.set(20);
+        s.build_rank_index();
+
+        assert_eq!(s.total_count(), 4);
+        // rank(id) = number of set bits before id
+        assert_eq!(s.rank(5), 0);
+        assert_eq!(s.rank(10), 1);
+        assert_eq!(s.rank(15), 2);
+        assert_eq!(s.rank(20), 3);
+    }
+
+    #[test]
+    fn has_any_empty_vs_nonempty() {
+        let empty = IdSetDense::new();
+        assert!(!empty.has_any());
+
+        let mut s = IdSetDense::new();
+        s.set(42);
+        assert!(s.has_any());
+    }
+}

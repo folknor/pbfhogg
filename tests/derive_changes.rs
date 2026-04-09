@@ -449,3 +449,35 @@ fn no_increment_version_preserves_delete_versions() {
     // Node 2 should have version="5" (unchanged)
     assert!(xml.contains(r#"version="5""#), "node 2 version should be 5, got:\n{xml}");
 }
+
+#[test]
+fn increment_version_and_update_timestamp_combined() {
+    let dir = TempDir::new().expect("tempdir");
+    let old = dir.path().join("old.osm.pbf");
+    let new = dir.path().join("new.osm.pbf");
+    let osc = dir.path().join("changes.osc.gz");
+
+    // Old has node 1 (v2) and way 10 (v4).
+    // New has neither — both are deleted.
+    write_versioned_pbf(&old, &[
+        (1, 100_000_000, 200_000_000, 2),
+    ], &[
+        (10, vec![1], 4),
+    ]);
+    write_versioned_pbf(&new, &[], &[]);
+
+    // Both increment_version=true and update_timestamp=true
+    let stats = derive_changes(&old, &new, &osc, false, true, true).expect("derive");
+    assert_eq!(stats.deletes, 2); // node 1 + way 10
+
+    let xml = read_osc(&osc);
+
+    // Versions should be bumped
+    assert!(xml.contains(r#"version="3""#), "node 1 version should be 3 (was 2), got:\n{xml}");
+    assert!(xml.contains(r#"version="5""#), "way 10 version should be 5 (was 4), got:\n{xml}");
+
+    // Timestamps should be present and recent (the code uses current time)
+    assert!(xml.contains("timestamp="), "delete elements should have a timestamp, got:\n{xml}");
+    // Verify the timestamp looks like a valid ISO 8601 date (20xx-)
+    assert!(xml.contains("timestamp=\"20"), "timestamp should be a recent ISO date, got:\n{xml}");
+}

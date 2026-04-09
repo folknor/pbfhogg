@@ -690,4 +690,77 @@ mod tests {
         let parsed = NodeCoord::from_bytes(&bytes);
         assert_eq!(parsed, RING_SENTINEL);
     }
+
+    // -----------------------------------------------------------------------
+    // parse_polygon_rings tests
+    // -----------------------------------------------------------------------
+
+    fn nc(lat: i32, lon: i32) -> NodeCoord {
+        NodeCoord { lat_e7: lat, lon_e7: lon }
+    }
+
+    #[test]
+    fn parse_polygon_rings_single_ring() {
+        // Three vertices, no sentinel → exterior only, no holes
+        let coords = vec![nc(10, 20), nc(30, 40), nc(50, 60)];
+        let (exterior, holes) = parse_polygon_rings(coords.into_iter());
+        assert_eq!(exterior.len(), 3);
+        assert!(holes.is_empty());
+    }
+
+    #[test]
+    fn parse_polygon_rings_exterior_plus_hole() {
+        // Exterior ring, then RING_SENTINEL, then hole ring
+        let coords = vec![
+            nc(10, 20), nc(30, 40), nc(50, 60),
+            RING_SENTINEL,
+            nc(15, 25), nc(35, 45), nc(55, 65),
+        ];
+        let (exterior, holes) = parse_polygon_rings(coords.into_iter());
+        assert_eq!(exterior.len(), 3);
+        assert_eq!(holes.len(), 1);
+        assert_eq!(holes[0].len(), 3);
+    }
+
+    #[test]
+    fn parse_polygon_rings_short_ring_dropped() {
+        // A ring with fewer than 3 vertices gets dropped
+        let coords = vec![
+            nc(10, 20), nc(30, 40), // 2 vertices — too short
+        ];
+        let (exterior, holes) = parse_polygon_rings(coords.into_iter());
+        assert!(exterior.is_empty());
+        assert!(holes.is_empty());
+    }
+
+    #[test]
+    fn parse_polygon_rings_empty_input() {
+        let coords: Vec<NodeCoord> = vec![];
+        let (exterior, holes) = parse_polygon_rings(coords.into_iter());
+        assert!(exterior.is_empty());
+        assert!(holes.is_empty());
+    }
+
+    #[test]
+    fn parse_polygon_rings_consecutive_sentinels_no_empty_rings() {
+        // Multiple sentinels in a row should not produce empty rings
+        let coords = vec![
+            nc(10, 20), nc(30, 40), nc(50, 60),
+            RING_SENTINEL,
+            RING_SENTINEL,
+            RING_SENTINEL,
+            nc(15, 25), nc(35, 45), nc(55, 65),
+        ];
+        let (exterior, holes) = parse_polygon_rings(coords.into_iter());
+        assert_eq!(exterior.len(), 3);
+        assert_eq!(holes.len(), 1, "consecutive sentinels should not create empty rings");
+        assert_eq!(holes[0].len(), 3);
+    }
+
+    #[test]
+    fn ring_sentinel_values() {
+        // Verify RING_SENTINEL uses i32::MIN, not (0, 0)
+        assert_eq!(RING_SENTINEL.lat_e7, i32::MIN);
+        assert_eq!(RING_SENTINEL.lon_e7, i32::MIN);
+    }
 }

@@ -280,3 +280,48 @@ fn empty_osc_produces_empty_output() {
     assert!(!xml.contains("<modify>"));
     assert!(!xml.contains("<delete>"));
 }
+
+#[test]
+fn simplify_create_then_delete_yields_only_delete() {
+    let dir = TempDir::new().expect("tempdir");
+    let in1 = dir.path().join("001.osc.gz");
+    let in2 = dir.path().join("002.osc.gz");
+    let out = dir.path().join("out.osc.gz");
+
+    // First OSC: create a node
+    write_osc_gz(
+        &in1,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="42" lat="1.0" lon="2.0" version="1"/>
+  </create>
+</osmChange>"#,
+    );
+
+    // Second OSC: delete that same node
+    write_osc_gz(
+        &in2,
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <delete>
+    <node id="42" version="2"/>
+  </delete>
+</osmChange>"#,
+    );
+
+    let stats = merge_changes(&[&in1, &in2], &out, true).expect("merge simplify create-then-delete");
+    assert_eq!(stats.files, 2);
+    assert_eq!(stats.changes_in, 2);
+    // The simplified output should contain only the delete (last action wins)
+    assert_eq!(stats.changes_out, 1);
+    assert!(stats.simplified);
+
+    let xml = read_osc_gz(&out);
+    // Should contain the delete
+    assert!(xml.contains("<delete>"), "output should contain a delete section");
+    assert!(xml.contains(r#"id="42""#), "output should contain node id=42");
+    assert!(xml.contains(r#"version="2""#), "output should have version 2 from the delete");
+    // Should NOT contain a create
+    assert!(!xml.contains("<create>"), "simplified output should not contain create for a deleted element");
+}

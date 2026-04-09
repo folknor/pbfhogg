@@ -44,3 +44,71 @@ impl<T> ReorderBuffer<T> {
         item
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn in_order_push() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+        rb.push(0, "a");
+        rb.push(1, "b");
+        rb.push(2, "c");
+        assert_eq!(rb.pop_ready(), Some("a"));
+        assert_eq!(rb.pop_ready(), Some("b"));
+        assert_eq!(rb.pop_ready(), Some("c"));
+        assert_eq!(rb.pop_ready(), None);
+    }
+
+    #[test]
+    fn out_of_order_push() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+
+        // Push 1 first — can't pop yet (0 missing)
+        rb.push(1, "b");
+        assert_eq!(rb.pop_ready(), None);
+
+        // Push 0 — now 0 and 1 are contiguous
+        rb.push(0, "a");
+        assert_eq!(rb.pop_ready(), Some("a"));
+        assert_eq!(rb.pop_ready(), Some("b"));
+
+        // Push 2 — immediately ready
+        rb.push(2, "c");
+        assert_eq!(rb.pop_ready(), Some("c"));
+        assert_eq!(rb.pop_ready(), None);
+    }
+
+    #[test]
+    fn empty_buffer() {
+        let mut rb: ReorderBuffer<i32> = ReorderBuffer::with_capacity(4);
+        assert_eq!(rb.pop_ready(), None);
+    }
+
+    #[test]
+    fn single_item() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+        rb.push(0, 42);
+        assert_eq!(rb.pop_ready(), Some(42));
+        assert_eq!(rb.pop_ready(), None);
+    }
+
+    #[test]
+    fn gap_blocks_then_fills() {
+        let mut rb = ReorderBuffer::with_capacity(4);
+
+        rb.push(0, "x");
+        rb.push(2, "z");
+
+        // 0 is ready, but 1 is missing so 2 is blocked
+        assert_eq!(rb.pop_ready(), Some("x"));
+        assert_eq!(rb.pop_ready(), None);
+
+        // Fill the gap
+        rb.push(1, "y");
+        assert_eq!(rb.pop_ready(), Some("y"));
+        assert_eq!(rb.pop_ready(), Some("z"));
+        assert_eq!(rb.pop_ready(), None);
+    }
+}

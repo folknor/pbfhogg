@@ -1539,3 +1539,55 @@ fn write_admin_index(dir: &Path, entries: &mut [AdminCellEntry]) -> Result<u32> 
     entries_out.flush()?;
     Ok(cell_ids.len() as u32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_segment_same_cell() {
+        // Two very close points in Copenhagen — should be in the same S2 cell at level 17.
+        let lat1 = 556_762_000; // 55.6762
+        let lon1 = 125_683_000; // 12.5683
+        let lat2 = 556_762_100; // 55.67621 — ~0.1m away
+        let lon2 = 125_683_100;
+
+        let mut cells = Vec::new();
+        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+
+        assert_eq!(cells.len(), 1, "very close points should produce exactly 1 cell");
+    }
+
+    #[test]
+    fn cover_segment_cross_cell() {
+        // Two points about 1km apart — should cross multiple S2 cells at level 17.
+        // Level 17 cells are roughly 150m on a side.
+        let lat1 = 556_700_000; // 55.6700
+        let lon1 = 125_600_000; // 12.5600
+        let lat2 = 556_800_000; // 55.6800 — ~1.1km north
+        let lon2 = 125_700_000; // 12.5700
+
+        let mut cells = Vec::new();
+        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+
+        assert!(cells.len() >= 2, "points ~1km apart should cross at least 2 level-17 cells, got {}", cells.len());
+    }
+
+    #[test]
+    fn cover_segment_endpoints_included() {
+        // Verify both endpoint cells are always in the output.
+        let lat1 = 556_700_000;
+        let lon1 = 125_600_000;
+        let lat2 = 556_800_000;
+        let lon2 = 125_700_000;
+
+        let c1 = CellID::from(LatLng::from_degrees(55.6700, 12.5600)).parent(17).0;
+        let c2 = CellID::from(LatLng::from_degrees(55.6800, 12.5700)).parent(17).0;
+
+        let mut cells = Vec::new();
+        cover_segment(lat1, lon1, lat2, lon2, 17, |c| cells.push(c));
+
+        assert!(cells.contains(&c1), "first endpoint cell must be included");
+        assert!(cells.contains(&c2), "second endpoint cell must be included");
+    }
+}

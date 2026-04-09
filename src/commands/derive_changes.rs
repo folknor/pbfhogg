@@ -18,9 +18,9 @@ use super::stream_merge::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, StreamingBlocks,
 };
-use super::{has_indexdata, require_sorted, Result};
+use super::Result;
 use crate::blob_index::ElemKind;
-use crate::{ElementReader, MemberType};
+use crate::MemberType;
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -66,16 +66,12 @@ pub fn derive_changes(
     increment_version: bool,
     update_timestamp: bool,
 ) -> Result<DeriveChangesStats> {
-    // Check sorted headers before opening sequential readers.
-    {
-        let old_reader = ElementReader::open(old_path, direct_io)?;
-        let new_reader = ElementReader::open(new_path, direct_io)?;
-        require_sorted(old_reader.header(), old_path, "Old PBF")?;
-        require_sorted(new_reader.header(), new_path, "New PBF")?;
-    }
-
-    let both_indexed =
-        has_indexdata(old_path, direct_io)? && has_indexdata(new_path, direct_io)?;
+    // Single-pass: check sorted headers + indexdata from one file open each.
+    let (old_sorted, old_indexed) = super::diff::check_sorted_and_indexed(old_path, direct_io)?;
+    let (new_sorted, new_indexed) = super::diff::check_sorted_and_indexed(new_path, direct_io)?;
+    if !old_sorted { super::diff::require_sorted_err(old_path, "Old PBF")?; }
+    if !new_sorted { super::diff::require_sorted_err(new_path, "New PBF")?; }
+    let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 

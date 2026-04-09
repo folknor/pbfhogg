@@ -517,12 +517,9 @@ per-iteration allocations remain across the codebase, ordered by impact:
   or fall back gracefully when a blob lacks indexdata. Pre-existing
   issue, not introduced by v1. Flagged by 2/8 reviewers.
 
-- [ ] **`diff` redundant header reads** — `diff()` opens two
-  `ElementReader`s to check sorted headers (lines 138-143), then
-  immediately drops them and opens two `StreamingBlocks` (which read
-  the headers again). Four file opens and four header reads for two
-  files. Fix: check sorted flag inside `StreamingBlocks::new_sequential`
-  or return the header from it.
+- [x] **`diff` redundant header reads** — `check_sorted_and_indexed`
+  reads sorted flag + indexdata from a single file open per input.
+  Replaced 6 file opens with 2 in both `diff()` and `derive_changes()`.
 
 - [x] **Pipelined reader `from_vec_pooled`** — converted to
   `from_vec_pooled_with_scratch` via `thread_local!` storage in

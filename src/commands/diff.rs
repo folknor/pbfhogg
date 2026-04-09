@@ -21,9 +21,51 @@ use super::stream_merge::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
     MergeJoinAction, MergeJoinElement, StreamingBlocks,
 };
-use super::{has_indexdata, require_sorted, Result, TypeFilter};
+use super::{Result, TypeFilter};
 use crate::blob_index::ElemKind;
 use crate::{Element, ElementReader, MemberType};
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Check if a PBF is sorted and has indexdata in a single file open.
+/// Returns `(is_sorted, has_indexdata)`.
+pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(bool, bool)> {
+    let mut reader = crate::blob::BlobReader::open(path, direct_io)?;
+    reader.set_parse_indexdata(true);
+    let mut sorted = false;
+    let mut indexed = false;
+    for blob_result in &mut reader {
+        let blob = blob_result?;
+        match blob.get_type() {
+            crate::blob::BlobType::OsmHeader => {
+                let header = blob.to_headerblock()?;
+                sorted = header.is_sorted();
+            }
+            crate::blob::BlobType::OsmData => {
+                indexed = blob.index().is_some();
+                break; // Only need the first data blob.
+            }
+            _ => {}
+        }
+    }
+    Ok((sorted, indexed))
+}
+
+/// Error for unsorted PBF input (same message as `require_sorted`).
+pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
+    Err(format!(
+        "{context} is not sorted (missing Sort.Type_then_ID optional feature).\n\
+         File: {}\n\n\
+         Sort the input file first:\n\n\
+         \x20 pbfhogg sort {} -o sorted.osm.pbf\n\n\
+         Streaming diff requires sorted inputs to operate in constant memory.",
+        path.display(),
+        path.display(),
+    )
+    .into())
+}
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -135,17 +177,12 @@ pub fn diff(
         None => TypeFilter::all(),
     };
 
-    // Check sorted headers before opening sequential readers.
-    {
-        let old_reader = ElementReader::open(old_path, direct_io)?;
-        let new_reader = ElementReader::open(new_path, direct_io)?;
-        require_sorted(old_reader.header(), old_path, "Old PBF")?;
-        require_sorted(new_reader.header(), new_path, "New PBF")?;
-    }
-
-    // Check if both files have indexdata for the optimized block-pair path.
-    let both_indexed =
-        has_indexdata(old_path, direct_io)? && has_indexdata(new_path, direct_io)?;
+    // Single-pass: check sorted headers + indexdata from one file open each.
+    let (old_sorted, old_indexed) = check_sorted_and_indexed(old_path, direct_io)?;
+    let (new_sorted, new_indexed) = check_sorted_and_indexed(new_path, direct_io)?;
+    if !old_sorted { require_sorted_err(old_path, "Old PBF")?; }
+    if !new_sorted { require_sorted_err(new_path, "New PBF")?; }
+    let both_indexed = old_indexed && new_indexed;
 
     crate::debug::emit_marker("DIFF_SCAN_START");
 

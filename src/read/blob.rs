@@ -1170,7 +1170,7 @@ pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<
                 // raw (uncompressed): bytes
                 let slice = cursor.read_len_delimited()?;
                 let size = slice.len() as u64;
-                if size >= MAX_BLOB_MESSAGE_SIZE {
+                if size > MAX_BLOB_MESSAGE_SIZE {
                     return Err(new_blob_error(BlobError::MessageTooBig { size }));
                 }
                 buf.extend_from_slice(slice);

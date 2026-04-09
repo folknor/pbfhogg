@@ -749,45 +749,79 @@ fn try_extract_multi_single_pass(
     );
 
     // Phase 1: Parallel node classification → N bbox_node_ids.
+    // For all-bbox regions, use columnar decode (batch IDs/lats/lons into
+    // contiguous arrays) with single-pass multi-region classification.
+    // Polygon regions fall back to element-by-element iteration.
+    let all_bbox = slots.iter().all(|s| matches!(s.region, Region::Bbox(_)));
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
-    parallel_classify_phase(
-        &shared_file,
-        &node_schedule,
-        |block| {
-            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
-            for element in block.elements_skip_metadata() {
-                match &element {
-                    Element::DenseNode(dn) => {
-                        let lat = dn.decimicro_lat();
-                        let lon = dn.decimicro_lon();
-                        for i in 0..n {
-                            if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                region_ids[i].push(dn.id());
+    if all_bbox {
+        let bboxes: Vec<(i32, i32, i32, i32)> = bbox_ints.iter()
+            .map(|bi| (bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon))
+            .collect();
+        parallel_classify_phase(
+            &shared_file,
+            &node_schedule,
+            |block| {
+                use std::cell::RefCell;
+                thread_local! {
+                    static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
+                        RefCell::new(crate::read::columnar::DenseNodeColumns::new());
+                }
+                COLUMNS.with_borrow_mut(|columns| {
+                    block.decode_dense_columns(columns);
+                    let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); bboxes.len()];
+                    columns.collect_matching_ids_multi_bbox(&bboxes, &mut region_ids);
+                    region_ids
+                })
+            },
+            |region_ids| {
+                for (i, ids) in region_ids.into_iter().enumerate() {
+                    for id in ids {
+                        bbox_node_ids[i].set(id);
+                    }
+                }
+            },
+        )?;
+    } else {
+        parallel_classify_phase(
+            &shared_file,
+            &node_schedule,
+            |block| {
+                let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+                for element in block.elements_skip_metadata() {
+                    match &element {
+                        Element::DenseNode(dn) => {
+                            let lat = dn.decimicro_lat();
+                            let lon = dn.decimicro_lon();
+                            for i in 0..n {
+                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                    region_ids[i].push(dn.id());
+                                }
                             }
                         }
-                    }
-                    Element::Node(nd) => {
-                        let lat = nd.decimicro_lat();
-                        let lon = nd.decimicro_lon();
-                        for i in 0..n {
-                            if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                region_ids[i].push(nd.id());
+                        Element::Node(nd) => {
+                            let lat = nd.decimicro_lat();
+                            let lon = nd.decimicro_lon();
+                            for i in 0..n {
+                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                    region_ids[i].push(nd.id());
+                                }
                             }
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-            }
-            region_ids
-        },
-        |region_ids| {
-            for (i, ids) in region_ids.into_iter().enumerate() {
-                for id in ids {
-                    bbox_node_ids[i].set(id);
+                region_ids
+            },
+            |region_ids| {
+                for (i, ids) in region_ids.into_iter().enumerate() {
+                    for id in ids {
+                        bbox_node_ids[i].set(id);
+                    }
                 }
-            }
-        },
-    )?;
+            },
+        )?;
+    }
     crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
 
     // Phase 1 write: parallel decode with raw passthrough for fully-contained node blobs.

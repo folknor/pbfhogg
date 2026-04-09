@@ -108,6 +108,39 @@ impl DenseNodeColumns {
         }
     }
 
+    /// Classify nodes against N bounding boxes in a single pass, collecting
+    /// matching IDs into per-region output Vecs.
+    ///
+    /// Each bbox is `(min_lat, max_lat, min_lon, max_lon)` in decimicrodegrees.
+    /// `out` must have length >= `bboxes.len()`. Single pass over the lat/lon
+    /// arrays with N bbox tests per node.
+    #[inline]
+    pub fn collect_matching_ids_multi_bbox(
+        &self,
+        bboxes: &[(i32, i32, i32, i32)],
+        out: &mut [Vec<i64>],
+    ) {
+        let n = self.len();
+        let lats = &self.lats;
+        let lons = &self.lons;
+        let ids = &self.ids;
+
+        for i in 0..n {
+            let lat = lats[i];
+            let lon = lons[i];
+            let id = ids[i];
+            for (j, &(min_lat, max_lat, min_lon, max_lon)) in bboxes.iter().enumerate() {
+                let hit = (lat >= min_lat) as u8
+                        & (lat <= max_lat) as u8
+                        & (lon >= min_lon) as u8
+                        & (lon <= max_lon) as u8;
+                if hit != 0 {
+                    out[j].push(id);
+                }
+            }
+        }
+    }
+
     /// Classify nodes against a bounding box, collecting matching IDs
     /// into a caller-provided Vec (scratch reuse).
     ///

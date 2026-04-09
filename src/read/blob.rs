@@ -1251,10 +1251,10 @@ pub(crate) fn decompress_blob(
     match &blob.data {
         Some(BlobData::Raw(bytes)) => {
             let size = bytes.len() as u64;
-            if size < MAX_BLOB_MESSAGE_SIZE {
-                Ok(bytes.clone())
-            } else {
+            if size > MAX_BLOB_MESSAGE_SIZE {
                 Err(new_blob_error(BlobError::MessageTooBig { size }))
+            } else {
+                Ok(bytes.clone())
             }
         }
         Some(BlobData::Zlib(bytes)) => {

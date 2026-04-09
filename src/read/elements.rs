@@ -511,8 +511,9 @@ impl<'a> RelMember<'a> {
     #[allow(clippy::cast_sign_loss)]
     pub fn role(&self) -> Result<&'a str> {
         if self.role_sid < 0 {
+            #[allow(clippy::cast_sign_loss)]
             return Err(crate::error::new_error(
-                crate::error::ErrorKind::StringtableIndexOutOfBounds { index: 0 },
+                crate::error::ErrorKind::StringtableIndexOutOfBounds { index: self.role_sid as usize },
             ));
         }
         str_from_stringtable(self.block, self.role_sid as usize)

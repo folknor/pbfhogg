@@ -26,9 +26,6 @@ fn default_options() -> DiffOptions {
         verbose: false,
         summary: false,
         type_filter: None,
-        ignore_changeset: false,
-        ignore_uid: false,
-        ignore_user: false,
     }
 }
 

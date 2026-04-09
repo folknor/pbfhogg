@@ -93,12 +93,15 @@ non-standard encoding.
 **Context:** `DenseMmapIndex` (used by `add-locations-to-ways`) stores node coordinates
 as `(lat: i32, lon: i32)` pairs in a direct-addressed array, using `(0, 0)` as the
 "unset" sentinel. This means a node at exactly `0.0000000, 0.0000000` (Null Island)
-is treated as missing.
+is treated as missing. The same pattern appears in the geocode index builder
+(`src/geocode_index/builder.rs:502`), where the compact rank-indexed coordinate array
+is zero-initialized and `(0, 0)` is filtered as unpopulated.
 
 **Impact:** Ways referencing nodes at exactly `(0, 0)` — decimicrodegree precision,
 so within ~11mm of the intersection of the prime meridian and equator — will not
-have locations added. This affects zero real-world nodes. The nearest land is ~570 km
-away (Gulf of Guinea).
+have locations added. In the geocode builder, streets or address ways with a node at
+exactly `(0, 0)` will have that coordinate silently dropped from their geometry. This
+affects zero real-world nodes. The nearest land is ~570 km away (Gulf of Guinea).
 
 **Why not fix:** Fixing requires either a separate occupancy bitmap (1 bit per node,
 ~550 MB at planet scale) or reserving an impossible sentinel with explicit valid-bit

@@ -92,6 +92,11 @@ impl FromStr for Compression {
                 let level: i32 = s[5..]
                     .parse()
                     .map_err(|_| ParseCompressionError(format!("invalid zstd level: {s}")))?;
+                if !(-7..=22).contains(&level) {
+                    return Err(ParseCompressionError(format!(
+                        "zstd level must be -7..22, got {level}"
+                    )));
+                }
                 Ok(Self::Zstd(level))
             }
             _ => Err(ParseCompressionError(format!(

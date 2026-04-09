@@ -227,6 +227,13 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
         lon_stats.record_block(&lon_block);
     }
 
+    if node_count == 0 {
+        min_lat = 0;
+        max_lat = 0;
+        min_lon = 0;
+        max_lon = 0;
+    }
+
     Ok(NodeStatsReport {
         node_count,
         min_lat,

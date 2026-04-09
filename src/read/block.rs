@@ -32,11 +32,11 @@ impl WireHeaderBBox {
         let mut bottom: i64 = 0;
 
         while let Some((field, wire_type)) = cursor.read_tag()? {
-            match field {
-                1 => left = cursor.read_sint64()?,
-                2 => right = cursor.read_sint64()?,
-                3 => top = cursor.read_sint64()?,
-                4 => bottom = cursor.read_sint64()?,
+            match (field, wire_type) {
+                (1, 0) => left = cursor.read_sint64()?,
+                (2, 0) => right = cursor.read_sint64()?,
+                (3, 0) => top = cursor.read_sint64()?,
+                (4, 0) => bottom = cursor.read_sint64()?,
                 _ => cursor.skip_field(wire_type)?,
             }
         }

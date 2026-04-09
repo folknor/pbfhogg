@@ -108,12 +108,6 @@ pub struct DiffOptions {
     pub summary: bool,
     /// Comma-separated type filter (e.g. "node,way").
     pub type_filter: Option<String>,
-    /// Ignore changeset metadata when comparing.
-    pub ignore_changeset: bool,
-    /// Ignore uid metadata when comparing.
-    pub ignore_uid: bool,
-    /// Ignore user metadata when comparing.
-    pub ignore_user: bool,
 }
 
 /// Statistics from a diff operation.
@@ -198,7 +192,6 @@ pub fn diff(
     options: &DiffOptions,
     direct_io: bool,
 ) -> Result<DiffStats> {
-    let _ = (options.ignore_changeset, options.ignore_uid, options.ignore_user);
     let filter = match options.type_filter.as_deref() {
         Some(s) => TypeFilter::parse(s),
         None => TypeFilter::all(),

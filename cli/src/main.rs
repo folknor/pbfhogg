@@ -209,15 +209,6 @@ enum Command {
         /// Filter by element type (comma-separated: node, way, relation)
         #[arg(short = 't', long = "type")]
         type_filter: Option<String>,
-        /// Ignore changeset metadata when diffing (already ignored by content-equality mode)
-        #[arg(long)]
-        ignore_changeset: bool,
-        /// Ignore uid metadata when diffing (already ignored by content-equality mode)
-        #[arg(long)]
-        ignore_uid: bool,
-        /// Ignore user metadata when diffing (already ignored by content-equality mode)
-        #[arg(long)]
-        ignore_user: bool,
         /// Output format: text (default) or osc
         #[arg(long, default_value = "text")]
         format: DiffFormat,
@@ -785,9 +776,6 @@ fn main() {
             quiet,
             output,
             type_filter,
-            ignore_changeset,
-            ignore_uid,
-            ignore_user,
             format,
             increment_version,
             update_timestamp,
@@ -828,9 +816,6 @@ fn main() {
                     quiet,
                     output.as_deref(),
                     type_filter.as_deref(),
-                    ignore_changeset,
-                    ignore_uid,
-                    ignore_user,
                     io.direct_io,
                 )
             }
@@ -852,6 +837,9 @@ fn main() {
             header,
         } => {
             if invert {
+                if force.force {
+                    eprintln!("Warning: --force has no effect with --invert (removeid does not use indexdata)");
+                }
                 run_removeid(
                     &file,
                     &output.output,
@@ -1618,9 +1606,6 @@ fn run_diff(
     quiet: bool,
     output_path: Option<&std::path::Path>,
     type_filter: Option<&str>,
-    ignore_changeset: bool,
-    ignore_uid: bool,
-    ignore_user: bool,
     direct_io: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::io::Write;
@@ -1630,9 +1615,6 @@ fn run_diff(
         verbose,
         summary,
         type_filter: type_filter.map(String::from),
-        ignore_changeset,
-        ignore_uid,
-        ignore_user,
     };
     let stats = if quiet {
         let mut sink = std::io::sink();

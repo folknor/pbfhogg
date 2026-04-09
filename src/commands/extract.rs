@@ -766,15 +766,20 @@ fn try_extract_multi_single_pass(
                 thread_local! {
                     static COLUMNS: RefCell<crate::read::columnar::DenseNodeColumns> =
                         RefCell::new(crate::read::columnar::DenseNodeColumns::new());
+                    static REGION_IDS: RefCell<Vec<Vec<i64>>> = RefCell::new(Vec::new());
                 }
                 COLUMNS.with_borrow_mut(|columns| {
                     block.decode_dense_columns(columns);
-                    let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); bboxes.len()];
-                    columns.collect_matching_ids_multi_bbox(&bboxes, &mut region_ids);
-                    region_ids
+                    REGION_IDS.with_borrow_mut(|scratch| {
+                        // Ensure scratch has N entries, preserving capacity from prior blobs.
+                        scratch.resize_with(bboxes.len(), Vec::new);
+                        for v in scratch.iter_mut() { v.clear(); }
+                        columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
+                        scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
+                    })
                 })
             },
-            |region_ids| {
+            |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids {
                         bbox_node_ids[i].set(id);
@@ -787,33 +792,40 @@ fn try_extract_multi_single_pass(
             &shared_file,
             &node_schedule,
             |block| {
-                let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn) => {
-                            let lat = dn.decimicro_lat();
-                            let lon = dn.decimicro_lon();
-                            for i in 0..n {
-                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(dn.id());
-                                }
-                            }
-                        }
-                        Element::Node(nd) => {
-                            let lat = nd.decimicro_lat();
-                            let lon = nd.decimicro_lon();
-                            for i in 0..n {
-                                if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(nd.id());
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                use std::cell::RefCell;
+                thread_local! {
+                    static REGION_IDS: RefCell<Vec<Vec<i64>>> = RefCell::new(Vec::new());
                 }
-                region_ids
+                REGION_IDS.with_borrow_mut(|region_ids| {
+                    region_ids.resize_with(n, Vec::new);
+                    for v in region_ids.iter_mut() { v.clear(); }
+                    for element in block.elements_skip_metadata() {
+                        match &element {
+                            Element::DenseNode(dn) => {
+                                let lat = dn.decimicro_lat();
+                                let lon = dn.decimicro_lon();
+                                for i in 0..n {
+                                    if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                        region_ids[i].push(dn.id());
+                                    }
+                                }
+                            }
+                            Element::Node(nd) => {
+                                let lat = nd.decimicro_lat();
+                                let lon = nd.decimicro_lon();
+                                for i in 0..n {
+                                    if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
+                                        region_ids[i].push(nd.id());
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    region_ids.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect()
+                })
             },
-            |region_ids| {
+            |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids {
                         bbox_node_ids[i].set(id);
@@ -2584,36 +2596,47 @@ fn collect_pass1_generic<H: RelationHandler>(
                 }
                 COLUMNS.with_borrow_mut(|columns| {
                     block.decode_dense_columns(columns);
-                    let mut ids = Vec::new();
-                    columns.collect_matching_ids_bbox(
-                        bbox_int.min_lat, bbox_int.max_lat,
-                        bbox_int.min_lon, bbox_int.max_lon,
-                        &mut ids,
-                    );
-                    ids
+                    thread_local! {
+                        static IDS_SCRATCH: RefCell<Vec<i64>> = RefCell::new(Vec::new());
+                    }
+                    IDS_SCRATCH.with_borrow_mut(|ids| {
+                        ids.clear();
+                        columns.collect_matching_ids_bbox(
+                            bbox_int.min_lat, bbox_int.max_lat,
+                            bbox_int.min_lon, bbox_int.max_lon,
+                            ids,
+                        );
+                        ids.drain(..).collect::<Vec<i64>>()
+                    })
                 })
             } else {
                 // Polygon path: element-by-element with point-in-polygon check.
-                let mut ids = Vec::new();
-                for element in block.elements_skip_metadata() {
-                    match &element {
-                        Element::DenseNode(dn)
-                            if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
-                        {
-                            ids.push(dn.id());
-                        }
-                        Element::Node(n)
-                            if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
-                        {
-                            ids.push(n.id());
-                        }
-                        _ => {}
-                    }
+                use std::cell::RefCell;
+                thread_local! {
+                    static IDS_POLY: RefCell<Vec<i64>> = RefCell::new(Vec::new());
                 }
-                ids
+                IDS_POLY.with_borrow_mut(|ids| {
+                    ids.clear();
+                    for element in block.elements_skip_metadata() {
+                        match &element {
+                            Element::DenseNode(dn)
+                                if region.contains_decimicro(bbox_int, dn.decimicro_lat(), dn.decimicro_lon()) =>
+                            {
+                                ids.push(dn.id());
+                            }
+                            Element::Node(n)
+                                if region.contains_decimicro(bbox_int, n.decimicro_lat(), n.decimicro_lon()) =>
+                            {
+                                ids.push(n.id());
+                            }
+                            _ => {}
+                        }
+                    }
+                    ids.drain(..).collect::<Vec<i64>>()
+                })
             }
         },
-        |ids| {
+        |ids: Vec<i64>| {
             for id in ids {
                 bbox_node_ids.set(id);
             }

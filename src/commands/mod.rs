@@ -465,8 +465,100 @@ pub(crate) fn build_classify_schedule(
 /// **Note:** `merge` is called in arbitrary worker-completion order, not blob
 /// file order. All current callers use order-independent merge operations
 /// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
+/// Per-blob streaming classify: workers send `R` per blob, keep `S` for scratch.
+///
+/// Use for dense/hot paths (node classify, way classify) where per-worker
+/// accumulation would be unbounded at planet scale. Each per-blob `R` is
+/// bounded by blob size (~8000 elements). `S` persists across blobs for
+/// scratch reuse (DenseNodeColumns, decompress buffers, etc.).
+///
+/// For sparse paths that want per-worker accumulation, use
+/// [`parallel_classify_accumulate`].
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-pub(crate) fn parallel_classify_phase<S: Send>(
+pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    worker_init: impl Fn() -> S + Send + Sync,
+    classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
+    mut merge: impl FnMut(R),
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    if schedule.is_empty() { return Ok(()); }
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, crate::error::Result<R>)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for &item in schedule {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let classify_ref = &classify;
+            let worker_init_ref = &worker_init;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut state = worker_init_ref();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: crate::error::Result<R> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                        )?;
+                        Ok(classify_ref(&block, &mut state))
+                    })();
+                    if tx.send((s, r)).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        for (_seq, result) in result_rx {
+            merge(result?);
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Per-worker accumulation classify: workers accumulate into `S` across
+/// all blobs, send `S` once at completion.
+///
+/// Use ONLY for sparse paths where per-worker `S` is bounded at planet
+/// scale (relation classify: ~68 MB per worker; relation closure members:
+/// ~13 MB per worker). NOT safe for dense paths — per-worker Vec or
+/// IdSetDense accumulation is unbounded for node/way classify.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn parallel_classify_accumulate<S: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
     worker_init: impl Fn() -> S + Send + Sync,
@@ -537,8 +629,7 @@ pub(crate) fn parallel_classify_phase<S: Send>(
         drop(result_tx);
 
         for result in result_rx {
-            let state = result?;
-            merge(state);
+            merge(result?);
         }
         Ok(())
     })?;

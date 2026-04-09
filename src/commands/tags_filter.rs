@@ -596,12 +596,13 @@ fn tags_filter_two_pass(
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        || ClassifyResult {
-            matched_nodes: Vec::new(),
-            matched_ways: Vec::new(),
-            matched_relations: Vec::new(),
-        },
-        |block, result| {
+        || (),
+        |block, _s| {
+            let mut result = ClassifyResult {
+                matched_nodes: Vec::new(),
+                matched_ways: Vec::new(),
+                matched_relations: Vec::new(),
+            };
             let mut tags_buf: Vec<(&str, &str)> = Vec::new();
             for element in block.elements_skip_metadata() {
                 match &element {
@@ -636,6 +637,7 @@ fn tags_filter_two_pass(
                     }
                 }
             }
+            result
         },
         |cr| {
             for id in cr.matched_nodes {
@@ -926,7 +928,7 @@ fn collect_relation_member_closure(
         // Classify phase: workers read included_relation_ids (immutable).
         // Results collected into a Vec — merge phase runs after with mutable access.
         let mut results: Vec<ClosureResult> = Vec::new();
-        super::parallel_classify_phase(
+        super::parallel_classify_accumulate(
             &shared_file,
             &schedule,
             || ClosureResult {
@@ -995,7 +997,7 @@ fn collect_way_node_dependencies(
         input, Some(crate::blob_index::ElemKind::Way),
     )?;
 
-    super::parallel_classify_phase(
+    super::parallel_classify_accumulate(
         &shared_file,
         &schedule,
         IdSetDense::new,

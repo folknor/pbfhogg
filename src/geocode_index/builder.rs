@@ -291,7 +291,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             &config.input_path, Some(crate::blob_index::ElemKind::Way),
         )?;
 
-        crate::commands::parallel_classify_phase(
+        crate::commands::parallel_classify_accumulate(
             &shared_file,
             &schedule,
             crate::commands::id_set_dense::IdSetDense::new,

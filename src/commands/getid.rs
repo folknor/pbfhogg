@@ -147,8 +147,13 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     super::parallel_classify_phase(
         &shared_file,
         &schedule,
-        || IdBatch { node_ids: Vec::new(), way_ids: Vec::new(), relation_ids: Vec::new() },
-        |block, batch| {
+        || (),
+        |block, _s| {
+            let mut batch = IdBatch {
+                node_ids: Vec::new(),
+                way_ids: Vec::new(),
+                relation_ids: Vec::new(),
+            };
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn) => batch.node_ids.push(dn.id()),
@@ -157,6 +162,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
                     Element::Relation(r) => batch.relation_ids.push(r.id()),
                 }
             }
+            batch
         },
         |batch| {
             set.node_ids.extend(batch.node_ids);
@@ -506,7 +512,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
             input, Some(crate::blob_index::ElemKind::Way),
         )?;
 
-        super::parallel_classify_phase(
+        super::parallel_classify_accumulate(
             &shared_file,
             &schedule,
             super::id_set_dense::IdSetDense::new,

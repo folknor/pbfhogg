@@ -762,11 +762,13 @@ fn try_extract_multi_single_pass(
             &shared_file,
             &node_schedule,
             || (crate::read::columnar::DenseNodeColumns::new(), vec![Vec::<i64>::new(); n]),
-            |block, (columns, region_ids)| {
+            |block, (columns, scratch)| {
                 block.decode_dense_columns(columns);
-                columns.collect_matching_ids_multi_bbox(&bboxes, region_ids);
+                for v in scratch.iter_mut() { v.clear(); }
+                columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
+                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
             },
-            |(_, region_ids)| {
+            |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids { bbox_node_ids[i].set(id); }
                 }
@@ -777,7 +779,8 @@ fn try_extract_multi_single_pass(
             &shared_file,
             &node_schedule,
             || vec![Vec::<i64>::new(); n],
-            |block, region_ids| {
+            |block, scratch| {
+                for v in scratch.iter_mut() { v.clear(); }
                 for element in block.elements_skip_metadata() {
                     match &element {
                         Element::DenseNode(dn) => {
@@ -785,7 +788,7 @@ fn try_extract_multi_single_pass(
                             let lon = dn.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(dn.id());
+                                    scratch[i].push(dn.id());
                                 }
                             }
                         }
@@ -794,15 +797,16 @@ fn try_extract_multi_single_pass(
                             let lon = nd.decimicro_lon();
                             for i in 0..n {
                                 if slots[i].region.contains_decimicro(&bbox_ints[i], lat, lon) {
-                                    region_ids[i].push(nd.id());
+                                    scratch[i].push(nd.id());
                                 }
                             }
                         }
                         _ => {}
                     }
                 }
+                scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
             },
-            |region_ids| {
+            |region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids { bbox_node_ids[i].set(id); }
                 }
@@ -859,8 +863,9 @@ fn try_extract_multi_single_pass(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || vec![Vec::<i64>::new(); n],
-        |block, region_ids| {
+        || (),
+        |block, _s| {
+            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
@@ -870,6 +875,7 @@ fn try_extract_multi_single_pass(
                     }
                 }
             }
+            region_ids
         },
         |region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
@@ -913,7 +919,7 @@ fn try_extract_multi_single_pass(
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
     crate::debug::emit_marker("MULTI_REL_CLASSIFY_START");
-    parallel_classify_phase(
+    parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
         || (0..n).map(|_| IdSetDense::new()).collect::<Vec<_>>(),
@@ -2245,7 +2251,7 @@ fn extract_simple_single_pass(
         let (rel_classify_schedule, rel_classify_file) = super::build_classify_schedule(
             input, Some(crate::blob_index::ElemKind::Relation),
         )?;
-        parallel_classify_phase(
+        parallel_classify_accumulate(
             &rel_classify_file,
             &rel_classify_schedule,
             IdSetDense::new,
@@ -2346,7 +2352,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     Ok(stats)
 }
 
-use super::parallel_classify_phase;
+use super::{parallel_classify_phase, parallel_classify_accumulate};
 
 // ---------------------------------------------------------------------------
 // Pass 1: Generic ID collection with pluggable relation handling
@@ -2549,6 +2555,7 @@ fn collect_pass1_generic<H: RelationHandler>(
         &node_schedule,
         || (crate::read::columnar::DenseNodeColumns::new(), Vec::<i64>::new()),
         |block, (columns, ids)| {
+            ids.clear();
             if use_columnar {
                 block.decode_dense_columns(columns);
                 columns.collect_matching_ids_bbox(
@@ -2573,8 +2580,9 @@ fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
+            ids.drain(..).collect::<Vec<i64>>()
         },
-        |(_, ids)| {
+        |ids| {
             for id in ids { bbox_node_ids.set(id); }
         },
     )?;
@@ -2583,8 +2591,10 @@ fn collect_pass1_generic<H: RelationHandler>(
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (Vec::<i64>::new(), Vec::<i64>::new()),
-        |block, (way_ids, node_ids)| {
+        || (),
+        |block, _s| {
+            let mut way_ids = Vec::new();
+            let mut node_ids = Vec::new();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     if w.refs().any(|r| bbox_node_ids.get(r)) {
@@ -2593,6 +2603,7 @@ fn collect_pass1_generic<H: RelationHandler>(
                     }
                 }
             }
+            (way_ids, node_ids)
         },
         |(way_ids, node_ids)| {
             for id in way_ids { matched_way_ids.set(id); }
@@ -2602,7 +2613,7 @@ fn collect_pass1_generic<H: RelationHandler>(
 
     // Phase 3: Classify relations by member intersection.
     let collect_member_ids = H::COLLECT_MEMBER_IDS;
-    parallel_classify_phase(
+    parallel_classify_accumulate(
         &shared_file,
         &relation_schedule,
         || (IdSetDense::new(), IdSetDense::new(), IdSetDense::new()),
@@ -2799,7 +2810,7 @@ fn extract_smart(
 
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;
-    parallel_classify_phase(
+    parallel_classify_accumulate(
         &shared_file,
         &way_schedule,
         IdSetDense::new,

@@ -211,7 +211,7 @@ PrimitiveBlock construction path uses scratch.
 ### Columnar decode codegen analysis (commit e0b0780)
 
 Assembly inspection (`RUSTFLAGS="-C target-cpu=native" --emit=asm`)
-of `collect_matching_ids_bbox` confirms:
+of `collect_matching_ids_bbox` (on `DenseNodeColumns`) confirms:
 - **No autovectorization.** LLVM emits pure scalar: 4× `cmpl` + `jg`/`jl`
   conditional jumps per element. No `vpcmpgtd` or `vpand`.
 - **Branchless `&` trick undone by LLVM.** The `(cmp) as u8 & (cmp) as u8`
@@ -275,7 +275,7 @@ Fix options:
 ### Step 2: Remaining scratch opportunities
 
 See TODO.md "Scratch buffer reuse audit" for the full list:
-- Remaining `PrimitiveBlock::new()` call sites (mechanical, `new_with_scratch` exists)
+- ~~Remaining `PrimitiveBlock::new()` call sites~~ — DONE (commit `ea1ab6e`)
 - Geocode pass 3 bucket merge (3 Vecs × 20M iterations, ~1.4 GB)
 - `scan_block_ids`/`scan_block_tags` per-blob Vecs
 - Merge per-element Vecs (same lifetime issue as step 1b)

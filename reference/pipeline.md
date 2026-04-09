@@ -1,6 +1,210 @@
 # pbfhogg Pipeline Reference
 
-Rust library for reading, writing, and merging OpenStreetMap PBF files. The full planet PBF is ~80 GB compressed; a weekly refresh reads the entire file, applies 5-30 daily diffs (~15 MB each), and writes a new PBF. At this scale, per-blob allocations that are invisible on small extracts (Denmark 465 MB, ~7400 blobs) become dominant — the planet has ~600K blobs, so a 64 KB throwaway allocation per blob means 38 GB of allocator churn per run.
+This document has two parts:
+
+1. **Pipeline inventory** — all read, write, and command pipelines in the codebase, how they compose, and which commands use them.
+2. **Author's production pipeline** — the specific deployment that drives pbfhogg's development: planet-scale PBF refresh feeding tile generation and reverse geocoding.
+
+---
+
+## Core Infrastructure Pipelines
+
+### Pipelined Read
+
+**3-stage pipeline** — `src/read/pipeline.rs`, driven by `ElementReader`
+
+| Stage | Thread | Work | Buffer |
+|-------|--------|------|--------|
+| 1. I/O | Dedicated | Read raw compressed blobs sequentially via `BlobReader` | 16-blob read-ahead channel |
+| 2. Decode | Rayon pool (`nproc - 2` threads) | Decompress (thread-local `flate2::Decompress`) + parse `PrimitiveBlock` | `DecompressPool` recycles `Vec<u8>` buffers |
+| 3. Reorder | Caller's thread | `ReorderBuffer` restores file order, delivers blocks to consumer | 32-slot decode-ahead |
+
+Entry points:
+- `ElementReader::for_each_pipelined()` — element-level callback
+- `ElementReader::for_each_block_pipelined()` — owned `PrimitiveBlock` callback
+- `ElementReader::into_blocks_pipelined()` — returns `Iterator<Item = Result<PrimitiveBlock>>`
+
+Used by most commands. See Sequential Read below for exceptions.
+
+### Sequential Read
+
+Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling thread. ~6x slower than pipelined, but avoids cross-thread allocation/free churn.
+
+Used by:
+- `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) — two files read in lockstep
+- `tags-count` — avoids 25+ GB heap retention at planet scale
+
+### Blob Filtering (pre-decode)
+
+Skips entire blobs before decompression using metadata embedded in `BlobHeader`:
+
+| Filter | Source | Effect |
+|--------|--------|--------|
+| Element type | `BlobIndex::ElemKind` (indexdata) | Skip blobs with wrong type (~85% reduction for single-type queries) |
+| Tag key/prefix | Tagdata (BlobHeader field 4) | Skip blobs without required tag keys |
+| Spatial bbox | Coordinate bounds in indexdata | Skip blobs outside bounding box (nodes only) |
+
+Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-filter`, `extract`.
+
+### Pipelined Write
+
+**Parallel compression with sequential output** — `src/write/writer.rs`
+
+| Stage | Thread | Work |
+|-------|--------|------|
+| 1. Frame + compress | Rayon pool | Per-thread `FrameScratch` (reusable buffers + lazy-init compressors). Zlib/zstd/none. |
+| 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (32-slot write-ahead), writes to `FileWriter` |
+
+Output modes:
+- `PbfWriter::to_path()` — buffered I/O
+- `PbfWriter::to_path_direct()` — O_DIRECT (Linux, `linux-direct-io` feature)
+- `PbfWriter::to_path_uring()` — io_uring with registered buffers (Linux, `linux-io-uring` feature)
+
+Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chunks()` — zero decompression/recompression, uses `copy_file_range` on Linux.
+
+### io_uring Writer
+
+`src/write/uring_writer.rs` — replaces the buffered writer thread when `--io-uring` is set.
+
+64 × 256 KB page-aligned registered buffers. Accumulates data, submits `WriteFixed` SQEs when a buffer fills, reaps CQEs to recycle buffers. Supports `CopyRange` for passthrough blobs.
+
+Used by `sort`, `cat --dedupe`, `apply-changes`.
+
+### Block Builder
+
+`src/write/block_builder.rs` — accumulates elements into PBF blocks.
+
+- Max 8000 entities per block, one element type per block
+- `StringTable` with `FxHashMap<Rc<str>, u32>` dedup
+- Reusable wire scratch buffers (`wire.rs` encoding primitives)
+- Output: `OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>)` — serialized data + index + optional tagdata
+
+Used by all commands that produce PBF output.
+
+### Node-Only Wire Scanner
+
+`src/commands/node_scanner.rs` — parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
+
+Used internally by external join (stage 2), ALTW dense/sparse (pass 1), and merge `--locations-on-ways`.
+
+---
+
+## Command Pipelines
+
+### cat (passthrough)
+
+No `--type` filter: reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. Zero decompression.
+
+### cat --type / --clean
+
+Blob filter → pipelined decode → element-level type check → `BlockBuilder` → pipelined write. Batch processing (64 blocks or 32 MB budget).
+
+### cat --dedupe
+
+K-way sorted merge of multiple PBFs. Blob-level passthrough for non-overlapping ranges, decode + dedup for overlaps. All inputs must be sorted.
+
+### sort
+
+Two-pass blob-level permutation sort.
+1. Scan all blobs, build index of (element_type, min_id, max_id)
+2. Non-overlapping blobs: raw passthrough. Overlapping blobs: decode → binary heap merge → re-encode.
+
+### apply-changes (merge)
+
+Single-pass batch pipeline applying an OSC diff to a sorted PBF. OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index). `DiffRanges` enables O(log n) overlap checks.
+
+3 phases per batch:
+1. **Parallel classify** (rayon) — indexdata fast-path skips ~92% of blobs at Denmark scale
+2. **Sequential assign** — passthrough / false-positive / rewrite decision per blob
+3. **Streaming rewrite + output** — rayon tasks own their `PrimitiveBlock`, results reordered for sequential output. Gap creates interleaved at sorted positions.
+
+Optional `--locations-on-ways`: preserves/updates inline way-node coordinates through the merge.
+
+### diff / derive-changes
+
+Two-pointer merge-join over two sorted PBFs via `StreamingBlocks` (sequential readers). Three phases per element type (nodes, ways, relations). Each element compared by content equality (coordinates, tags, refs, members).
+
+- `diff` → text or summary output
+- `diff --format osc` (derive-changes) → OSC XML output
+
+### extract
+
+Geographic extraction with three strategies:
+- `--simple` — single pass, blob-filter by bbox, may leave dangling refs
+- Default (complete-ways) — two passes: pass 1 collects way-referenced node IDs, pass 2 emits all
+- `--smart` — three passes: also completes multipolygon/boundary relation members
+
+Multi-extract via `--config` JSON: single pass producing multiple output files.
+
+### tags-filter
+
+Tag expression matching with dependency expansion:
+1. Build `BlobFilter` from union of tag keys
+2. Blob filter → pipelined decode → element matching
+3. Default: matched relations pull in member ways/nodes transitively (multi-pass)
+4. With `-R`: single pass, direct matches only
+
+Also supports `--input-kind osc` for filtering OSC change files.
+
+### getid / getparents
+
+- `getid`: indexed seek (via `IndexedReader`) or full scan. Optional `--add-referenced` (two-pass) and `--invert` (removeid).
+- `getparents`: full scan, reverse-lookup of ways/relations referencing given IDs.
+
+### add-locations-to-ways
+
+Embeds node coordinates in ways. Three index strategies:
+
+**Dense** (default): file-backed mmap, direct addressing by node ID. Pass 0 builds `IdSetDense` of way-referenced nodes, pass 1 populates index via node-only scanner (lock-free parallel writes), pass 2 enriches ways.
+
+**Sparse**: chunk-indexed sparse array (~540 MB RAM). Batched sorted access converts random I/O to sequential scans.
+
+**External** (4-stage radix partition):
+1. Way pass → emit `(node_id, slot_pos)` COO pairs into 256 buckets
+2. Node join → merge-join with sorted COO buckets, emit resolved `(slot_pos, lat, lon)`
+3. Slot reorder → scatter buffer into final coord_slots file
+4. Assembly → pread-from-workers, enrich ways with coordinates
+
+Bounded memory (<2 GB), all sequential I/O, uses temp disk (~4 GB Denmark, ~112 GB Europe, ~300 GB planet).
+
+### renumber
+
+Single-pass sequential: 3 `FxHashMap` (node/way/relation) for old→new ID mapping. Remaps cross-references in way node refs and relation members.
+
+### time-filter
+
+Single-pass grouped snapshot: maintains `PendingGroup` per object, emits latest version with `timestamp <= cutoff`, skips deleted (`visible=false`).
+
+### inspect
+
+Header-only scan (fast path on indexed PBFs — reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
+
+### check
+
+- `--ids`: sequential scan checking ID uniqueness and ordering. Optional `--full` bitmap for duplicate detection.
+- `--refs`: referential integrity via `IdSetDense` (roaring bitmap). Optional `--check-relations`.
+
+### build-geocode-index
+
+4-pass build pipeline:
+1. Relations (admin boundaries)
+2. Referenced node collection (`IdSetDense`)
+3. Nodes + ways fused scan (compact rank-indexed coord array, streaming data files)
+4. Bucketed S2 cell assignment (256 temp-file buckets per level)
+
+Outputs 19 binary files. Self-contained module in `src/geocode_index/`.
+
+### merge-changes
+
+OSC-only: merges multiple OSC XML files into one. Optional `--simplify` keeps only the last change per object. No PBF I/O.
+
+---
+
+---
+
+## Author's Production Pipeline
+
+_The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation — it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
 
 **Production pipeline** (runs every planet refresh cycle):
 ```

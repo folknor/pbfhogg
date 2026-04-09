@@ -3,6 +3,11 @@
 Parent document: [reverse-geocoding.md](reverse-geocoding.md) (problem statement and
 design direction).
 
+**Note: implementation deviated from this spec.** Node coordinates use a compact
+rank-indexed array (via `IdSetDense` rank) instead of the spec's `DenseMmapIndex`.
+Pass 4 (S2 cell assignment) uses 256 temp-file buckets instead of external merge
+sort. Actual peak RSS is 17.8 GB (planet) vs the spec's ~14.5 GB budget.
+
 ## 1. Scope
 
 This spec covers two deliverables:

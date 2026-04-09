@@ -215,7 +215,7 @@ full investigation and memory optimization research log.
 
 Commit `aacbe80`, plantasjen. Best of 3 runs.
 
-### Denmark (487 MB indexed, 59M elements)
+### Denmark (487 MB indexed, 59M elements, commit `6fc1283`, plantasjen)
 
 | Command | Time |
 |---------|------|
@@ -245,37 +245,40 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | cat --dedupe | 22.4s |
 | renumber | 22.3s |
 
-### Japan (2.4 GB indexed, 344M elements)
+### Japan (2.4 GB indexed, 344M elements, plantasjen)
 
-| Command | Time |
-|---------|------|
-| inspect (indexdata) | 92 ms |
-| tags-filter-osc | 169 ms |
-| cat --type relation | 306 ms |
-| tags-filter highway=primary | 840 ms |
-| sort (sorted, indexdata) | 1.33s |
-| merge-changes | 1.62s |
-| getid | 1.94s |
-| getparents | 2.06s |
-| tags-filter amenity=* | 2.20s |
-| inspect-tags --type way | 2.43s |
-| apply-changes | 2.53s |
-| cat --type way | 0.7s |
-| inspect-tags | 4.82s |
-| getid --invert | 1.3s |
-| inspect-nodes | 9.14s |
-| extract --simple | 9.36s |
-| check --ids | 10.4s |
-| extract --complete | 4.4s |
-| extract --smart | 5.2s |
-| tags-filter two-pass | 13.7s |
-| check --refs | 38.7s |
-| time-filter | 43.8s |
-| add-locations-to-ways | 64.1s |
-| diff | 72.2s |
-| diff --format osc | 73.1s |
-| cat --dedupe | 102.2s |
-| renumber | 152.4s |
+Baseline commit `aacbe80`. Entries marked with † were improved by later
+optimizations and show the latest measured value.
+
+| Command | Time | Notes |
+|---------|------|-------|
+| inspect (indexdata) | 92 ms | |
+| tags-filter-osc | 169 ms | |
+| cat --type relation | 306 ms | |
+| cat --type way | 0.7s | † raw passthrough, `c33e8cc` |
+| tags-filter highway=primary | 840 ms | |
+| sort (sorted, indexdata) | 1.33s | |
+| getid --invert | 1.3s | † raw passthrough, `c33e8cc` |
+| merge-changes | 1.62s | |
+| getid | 1.94s | |
+| getparents | 2.06s | |
+| tags-filter amenity=* | 2.20s | |
+| inspect-tags --type way | 2.43s | |
+| apply-changes | 2.53s | |
+| extract --complete | 4.4s | † parallel classify |
+| inspect-tags | 4.82s | |
+| extract --smart | 5.2s | † parallel classify |
+| inspect-nodes | 9.14s | |
+| extract --simple | 9.36s | |
+| check --ids | 10.4s | |
+| tags-filter two-pass | 13.7s | |
+| check --refs | 38.7s | |
+| time-filter | 43.8s | |
+| add-locations-to-ways | 64.1s | |
+| diff | 72.2s | |
+| diff --format osc | 73.1s | |
+| cat --dedupe | 102.2s | |
+| renumber | 152.4s | |
 
 ### Germany (4.7 GB indexed, ~496M elements)
 
@@ -400,8 +403,8 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 
 | Dataset | PBF size | Time | Index size | Addr points | Streets | Admin | Commit |
 |---------|----------|------|------------|-------------|---------|-------|--------|
-| Denmark | 465 MB | **13.7s** | 172 MB | 2.6M | 314K | 2K | `5776b67` |
-| Japan | 2.4 GB | **57s** | — | — | — | — | `5776b67` (sidecar) |
+| Denmark | 465 MB | **7.1s** | 172 MB | 2.6M | 314K | 2K | `f42da6e` |
+| Japan | 2.4 GB | **26.7s** | — | — | — | — | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)

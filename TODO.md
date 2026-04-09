@@ -52,7 +52,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   Allocations: merge 293 MB net (17+ GB cumulative churn through rewrite pipeline).
   check-refs is single-threaded consumer bound (74s wall, 73s on one core).
   cat --type (zlib): 61.8s, 10.9 GB RSS, 240 GB cumulative alloc (175 MB net).
-  Full results in `notes/performance.md`.
+  Full results in `reference/performance.md`.
 
 ## ~~BlobReader fadvise: gate on `target_os = "linux"` instead of `linux-direct-io`~~ DONE
 
@@ -449,7 +449,7 @@ single-pass, tag expression and bbox filtering.
   batch size based on core count. Config or heuristic, not manual flags.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
-  `notes/osmium-parity.md`.
+  `reference/osmium-parity.md`.
 - [ ] Document `renumber` planet-scale limitation — the `FxHashMap<i64, i64>`
   for node ID mapping requires ~250 GB for 10.4B nodes (24 bytes/entry).
   Infeasible without a different data structure (e.g., dense array for
@@ -457,7 +457,7 @@ single-pass, tag expression and bbox filtering.
 
 ### Ecosystem
 
-- [ ] crates.io release (protohoggr + pbfhogg + pbfhogg-cli).
+- [x] crates.io release (protohoggr + pbfhogg + pbfhogg-cli).
 - [ ] CI with benchmark regression guard.
 - [ ] API documentation for library consumers.
 - [ ] PyO3 Python bindings (read/write API for the Python ecosystem).
@@ -717,7 +717,7 @@ per-iteration allocations remain across the codebase, ordered by impact:
 ### Testing
 
 See `notes/test-plan.md` for the full pre-release test matrix (feature permutations,
-I/O modes, CLI commands) and `notes/performance.md` for consolidated baselines.
+I/O modes, CLI commands) and `reference/performance.md` for consolidated baselines.
 
 ### Cross-validation known diffs
 

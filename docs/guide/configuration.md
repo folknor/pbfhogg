@@ -1,138 +1,94 @@
 # Configuration
 
-Nidhogg can be configured via command-line flags, a TOML configuration file, or environment variables. When multiple sources are present, the precedence order is: **CLI flags > environment variables > config file > defaults**.
+pbfhogg has no configuration file. All behavior is controlled via CLI flags.
 
-## Config File
+## Compression
 
-By default, Nidhogg looks for `nidhogg.toml` in the current directory. You can specify a different path with `--config`:
+Control output blob compression with `--compression`:
 
 ```sh
-nidhogg --config /etc/nidhogg/production.toml input.osm.pbf output.pmtiles
+pbfhogg sort input.osm.pbf -o sorted.osm.pbf --compression zstd
+pbfhogg cat input.osm.pbf -o output.osm.pbf --compression zlib:9
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf --compression none
 ```
 
-### Example Configuration
+The default is `zlib` (level 6), which produces standard PBF files compatible with all tools. Use `none` for intermediate files or when the filesystem handles compression (erofs). Use `zstd` for better compression ratio and faster decompression.
 
-```toml
-[input]
-ocean_shapefile = "/data/water-polygons-split-4326/water_polygons.shp"
-natural_earth   = "/data/natural_earth_vector.gpkg"
+## Index type for add-locations-to-ways
 
-[output]
-format       = "pmtiles"       # "pmtiles" | "mbtiles" | "directory"
-min_zoom     = 0
-max_zoom     = 14
-compression  = "zstd"          # "gzip" | "zstd" | "brotli" | "none"
-tile_size    = 4096
+Select the node coordinate index strategy with `--index-type`:
 
-[processing]
-threads      = 0               # 0 = auto-detect (number of CPUs)
-memory_limit = "4GB"           # max memory for sort buffers
-temp_dir     = "/tmp/nidhogg"  # scratch space for external sort
-batch_size   = 50000           # features per batch
-
-[layers]
-# Selectively enable or disable Shortbread layers.
-# All layers are enabled by default.
-include = ["transportation", "buildings", "water", "landuse", "pois"]
-# Or exclude specific layers:
-# exclude = ["boundary_labels"]
-
-[simplification]
-tolerance = 1.0                # Douglas-Peucker tolerance in tile units
-area_threshold = 4.0           # drop polygons smaller than this (tile units^2)
+```sh
+pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type auto
 ```
 
-::: tip
-Running without a config file? Nidhogg works out of the box with sensible defaults — you only need a config file when tuning performance or selecting specific layers.
-:::
+Options: `dense` (default), `sparse`, `external`, `auto`. See [Advanced Topics](./advanced#add-locations-to-ways-index-types) for details on each strategy and when to use them.
 
-::: danger
-Never point `temp_dir` at a tmpfs mount for planet-scale runs. External sort can write 80 GB+ of intermediate data and will exhaust RAM-backed filesystems.
-:::
+## Output header metadata
 
-## Environment Variables
+### Generator string
 
-All configuration options can be set via environment variables with the `NIDHOGG_` prefix. Nested keys use double underscores:
+Override the writing program name in the output header:
 
-| Variable | Config Equivalent | Example |
-|---|---|---|
-| `NIDHOGG_THREADS` | `processing.threads` | `8` |
-| `NIDHOGG_MEMORY_LIMIT` | `processing.memory_limit` | `8GB` |
-| `NIDHOGG_OUTPUT__FORMAT` | `output.format` | `mbtiles` |
-| `NIDHOGG_OUTPUT__COMPRESSION` | `output.compression` | `zstd` |
-| `NIDHOGG_OUTPUT__MIN_ZOOM` | `output.min_zoom` | `0` |
-| `NIDHOGG_OUTPUT__MAX_ZOOM` | `output.max_zoom` | `14` |
-
-## Output Formats
-
-### PMTiles <span class="badge badge-new">Recommended</span>
-
-The default and recommended format. Produces a single `.pmtiles` file that can be served directly from cloud storage (S3, GCS, R2) without a tile server.
-
-```toml
-[output]
-format = "pmtiles"
-compression = "zstd"
+```sh
+pbfhogg sort input.osm.pbf -o sorted.osm.pbf --generator "my-pipeline/1.0"
 ```
 
-### MBTiles <span class="badge badge-deprecated">Legacy</span>
+By default, the output header identifies `pbfhogg` as the writing program.
 
-SQLite-based format compatible with most tile servers (Martin, TileServer GL, etc.).
+### Replication metadata
 
-```toml
-[output]
-format = "mbtiles"
-compression = "gzip"
+Set replication metadata fields in the output header with `--output-header`:
+
+```sh
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o updated.osm.pbf \
+  --output-header osmosis_replication_timestamp=2026-04-09T00:00:00Z \
+  --output-header osmosis_replication_sequence_number=4706 \
+  --output-header osmosis_replication_base_url=https://download.geofabrik.de/europe/denmark-updates
 ```
 
-### Directory <span class="badge badge-beta">Beta</span>
+Supported keys: `osmosis_replication_timestamp`, `osmosis_replication_sequence_number`, `osmosis_replication_base_url`.
 
-Writes individual `.mvt` files to a directory tree. Useful for debugging or serving from a static file server.
+## I/O mode flags
 
-```toml
-[output]
-format = "directory"
-compression = "none"
+### O_DIRECT
+
+Bypass the page cache for reads and writes. Useful at planet scale to prevent cache pollution:
+
+```sh
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io
 ```
 
-The directory structure follows the `{z}/{x}/{y}.mvt` convention.
+Requires the `linux-direct-io` feature at compile time and a real filesystem (not tmpfs).
 
-## Zoom Levels
+### io_uring
 
-Control which zoom levels are generated:
+Use io_uring for output writes with pre-registered buffers:
 
-```toml
-[output]
-min_zoom = 0    # coarsest level (whole world in one tile)
-max_zoom = 14   # most detailed level
+```sh
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 ```
 
-Higher max zoom values produce significantly more tiles. As a rough guide:
+Requires the `linux-io-uring` feature at compile time, Linux 5.1+, and sufficient `RLIMIT_MEMLOCK`.
 
-| Max Zoom | Approx. Tiles (planet) | Typical Use |
-|---|---|---|
-| 10 | ~1M | Country-level overview |
-| 12 | ~17M | City-level detail |
-| 14 | ~270M | Street-level detail |
-| 16 | ~4.3B | Building-level detail |
+## RLIMIT_MEMLOCK for io_uring
 
-## Tile Size
+io_uring with registered buffers needs to pin memory pages. The default 64-buffer pool requires about 16 MB of locked memory. If the limit is too low, pbfhogg will print an error suggesting the fix:
 
-The `tile_size` option controls the extent of the vector tile coordinate space. The default is `4096`, which is the standard for Mapbox Vector Tiles.
+```sh
+ulimit -l unlimited
+```
 
-::: warning
-Changing the tile size from the default `4096` may cause rendering issues with some map renderers. Only change this if you know what you're doing.
-:::
+For a permanent change, add to `/etc/security/limits.conf`:
 
-## Validating Your Configuration
+```
+your-user  soft  memlock  unlimited
+your-user  hard  memlock  unlimited
+```
 
-Use the `check` subcommand to validate your config without running a full pipeline:
+Or set a specific value (in KB):
 
-<div class="terminal">
-$ nidhogg check --config production.toml<br>
-✓ Config file valid<br>
-✓ Ocean shapefile found (2.1 GB)<br>
-✓ Output directory writable<br>
-✓ 14 zoom levels, estimated ~270M tiles<br>
-⚠ memory_limit (4GB) may be low for planet-scale — consider 16GB+
-</div>
+```
+your-user  soft  memlock  65536
+your-user  hard  memlock  65536
+```

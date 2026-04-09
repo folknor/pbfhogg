@@ -8,7 +8,7 @@ Fast command-line toolkit for OpenStreetMap PBF files. Built on the [pbfhogg](ht
 cargo install pbfhogg-cli
 ```
 
-Requires Rust 1.85+. The binary is called `pbfhogg`.
+Requires Rust 1.87+. The binary is called `pbfhogg`.
 
 ## Commands
 
@@ -46,7 +46,7 @@ Most write commands accept:
 pbfhogg embeds blob-level index metadata (element type, ID range, spatial bbox, tag keys) in BlobHeader fields. Commands like `apply-changes`, `sort`, `tags-filter`, and `extract` use this to skip decompression of irrelevant blobs. Generate an indexed PBF with:
 
 ```
-pbfhogg cat input.osm.pbf --type node,way,relation -o indexed.osm.pbf
+pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
 Commands that benefit from indexdata will error if it's missing. Pass `--force` to proceed anyway.
@@ -67,4 +67,4 @@ At North America scale (18.8 GB, 645K-change daily diff), `apply-changes` runs i
 
 ## License
 
-Apache-2.0
+Licensed under either of [Apache License, Version 2.0](../LICENSE-APACHE) or [MIT License](../LICENSE-MIT) at your option.

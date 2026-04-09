@@ -73,7 +73,7 @@ let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::defa
 
 // Add elements via BlockBuilder
 let mut bb = BlockBuilder::new();
-bb.add_node(1, 556_761_000, 125_683_000, &[("name", "Copenhagen")], None);
+bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], None);
 if let Some(bytes) = bb.take()? {
     writer.write_primitive_block(bytes)?;
 }

@@ -80,7 +80,7 @@ let header_bytes = HeaderBuilder::new()
 let mut writer = PbfWriter::to_path("output.osm.pbf".as_ref(), Compression::default(), &header_bytes)?;
 
 let mut bb = BlockBuilder::new();
-bb.add_node(1, 556_761_000, 125_683_000, &[("name", "Copenhagen")], None);
+bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], None);
 if let Some(bytes) = bb.take()? {
     writer.write_primitive_block(bytes)?;
 }
@@ -127,7 +127,8 @@ writer.flush()?;
 
 | Feature | Description |
 |---------|-------------|
-| `commands` (default) | Enables `check_refs`, `extract`, and their deps (`roaring`, `serde_json`) |
+| `commands` (default) | Enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`) |
+| `geocode-reader` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`). Included by `commands`. |
 | `linux-direct-io` | O_DIRECT read/write paths — bypasses page cache for planet-scale I/O |
 | `linux-io-uring` | io_uring writer with registered buffers — 20% faster writes above ~4 GB |
 
@@ -160,4 +161,9 @@ pbfhogg started as a fork of [osmpbf](https://github.com/b-r-u/osmpbf/) by Thoma
 
 ## License
 
-Licensed under the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.

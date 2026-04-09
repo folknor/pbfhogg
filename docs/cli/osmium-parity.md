@@ -188,7 +188,7 @@ These osmium flags have no pbfhogg equivalent:
 | `--fsync` | Always enabled (no flag needed) |
 | `-H, --with-history` | Current-snapshot tool, no history file support |
 | `--buffer-data` | Pipelined writer handles buffering internally |
-| ~~`-i, --index-type`~~ | ~~`add-locations-to-ways` uses DenseMmapIndex only~~ — **Now supported:** `--index-type dense\|sparse\|external` |
+| `--index-type` | `dense` (default), `sparse`, `external` (bounded memory, 3.9x faster than dense at planet), `auto` (external if sorted+indexed). Different valid values from osmium's `-i, --index-type`. |
 
 ### Flags only pbfhogg has
 
@@ -201,15 +201,16 @@ These osmium flags have no pbfhogg equivalent:
 | `--generator` | Most write commands | Set writing program name in output header |
 | `--output-header` | Most write commands | Set replication header fields |
 | `--json` | inspect, check | Machine-readable output |
+| `--index-type` | add-locations-to-ways | `dense`, `sparse`, `external`, `auto` (different values from osmium's `-i`) |
 
 ## Commands pbfhogg doesn't have
 
 | osmium command | Status |
 |----------------|--------|
-| `export` | Not planned. GeoJSON/PG export is outside pbfhogg's scope. |
+| `export` | Planned (GeoJSON export design exists, not yet implemented) |
 | `changeset-filter` | Not planned. Changeset processing is a niche use case. |
 | `create-locations-index` / `query-locations-index` | Not needed. pbfhogg builds indexes in-memory via anonymous mmap. |
-| `show` | Not planned. `inspect` covers metadata; element-level display not implemented. |
+| `show` | Implemented via `inspect --show <TYPE_ID>` |
 
 ## Indexdata
 

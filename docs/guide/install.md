@@ -1,121 +1,81 @@
 # Installation
 
-## Pre-built Binaries
+## CLI
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/user/nidhogg/releases):
-
-| Platform | Architecture | Download |
-|---|---|---|
-| Linux | x86_64 | `nidhogg-x86_64-unknown-linux-gnu.tar.gz` |
-| Linux | aarch64 | `nidhogg-aarch64-unknown-linux-gnu.tar.gz` |
-| macOS | Apple Silicon | `nidhogg-aarch64-apple-darwin.tar.gz` |
-| macOS | Intel | `nidhogg-x86_64-apple-darwin.tar.gz` |
-| Windows | x86_64 | `nidhogg-x86_64-pc-windows-msvc.zip` |
+Install the `pbfhogg` binary from crates.io:
 
 ```sh
-# Example: Linux x86_64
-curl -LO https://github.com/user/nidhogg/releases/latest/download/nidhogg-x86_64-unknown-linux-gnu.tar.gz
-tar xzf nidhogg-x86_64-unknown-linux-gnu.tar.gz
-sudo mv nidhogg /usr/local/bin/
+cargo install pbfhogg-cli
 ```
 
-## From Crates.io
+This builds from source with fat LTO. The binary is called `pbfhogg`. Requires Rust 1.87+.
 
-If you have Rust installed:
+## Library
 
-```sh
-cargo install nidhogg
+Add the library to your `Cargo.toml`:
+
+```toml
+[dependencies]
+pbfhogg = "0.2"
 ```
 
-This builds from source with all optimizations. Requires Rust 1.75+.
+This enables the default `commands` feature. If you only need read/write (no extract, check-refs, or geocode index), disable it to skip `serde_json`, `roaring`, and `s2` dependencies:
 
-## From Source
-
-```sh
-git clone https://github.com/user/nidhogg
-cd nidhogg
-cargo build --release
+```toml
+[dependencies]
+pbfhogg = { version = "0.2", default-features = false }
 ```
 
-The binary will be at `target/release/nidhogg`. Copy it somewhere on your `$PATH`:
-
-```sh
-sudo cp target/release/nidhogg /usr/local/bin/
-```
-
-### Build Features
-
-Nidhogg has optional compile-time features:
+### Feature flags
 
 | Feature | Default | Description |
-|---|---|---|
-| `zstd` | yes | Zstandard compression support |
-| `brotli` | yes | Brotli compression support |
-| `lua` | no | Lua plugin support for custom layers |
-| `simd` | no | SIMD-accelerated geometry operations |
+|---------|---------|-------------|
+| `commands` | yes | Enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`) |
+| `geocode-reader` | included by `commands` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`) |
+| `linux-direct-io` | no | O_DIRECT read/write paths — bypasses page cache for planet-scale I/O (Linux only) |
+| `linux-io-uring` | no | io_uring writer with registered buffers — faster writes above ~4 GB (Linux only, requires kernel 5.1+) |
 
-To build with Lua plugin support:
+For reverse geocoding queries without the full `commands` feature:
+
+```toml
+[dependencies]
+pbfhogg = { version = "0.2", default-features = false, features = ["geocode-reader"] }
+```
+
+## Building from source
 
 ```sh
-cargo build --release --features lua
+git clone https://github.com/folknor/pbfhogg
+cd pbfhogg
+cargo install --path cli
 ```
 
-To build a minimal binary (gzip only, no plugins):
+To enable O_DIRECT and io_uring support:
 
 ```sh
-cargo build --release --no-default-features
+cargo install --path cli --features linux-direct-io,linux-io-uring
 ```
 
-## Docker
+### Build requirements
 
-A Docker image is available for convenience, though the native binary is recommended for production builds:
+- Rust 1.87 or later
+- No C compiler required — all protobuf encoding is hand-rolled wire format, and zlib uses `zlib-rs` (pure Rust)
+- No `protoc` or Protocol Buffers toolchain needed
+
+## Platform
+
+pbfhogg is developed on Linux and untested elsewhere. The core read/write functionality has no platform-specific code, but the production-relevant features (`linux-direct-io`, `linux-io-uring`) are Linux-only. O_DIRECT requires a real filesystem (not tmpfs). io_uring requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK`.
+
+## Verifying the installation
 
 ```sh
-docker pull ghcr.io/user/nidhogg:latest
+pbfhogg --version
 
-# Mount your data directory and run
-docker run --rm -v /data:/data ghcr.io/user/nidhogg:latest \
-    --ocean /data/water_polygons.shp \
-    /data/input.osm.pbf /data/output.pmtiles
+pbfhogg --help
 ```
 
-## Requirements
-
-### Runtime
-
-- No runtime dependencies for the default build
-- An ocean shapefile is optional but recommended (see [Getting Started](./))
-- Disk space: 2x input file size for temporary sort files
-
-### Building from Source
-
-- Rust 1.75 or later
-- A C compiler (for native dependencies)
-- `protoc` (Protocol Buffers compiler) — usually available via your package manager:
-
-::: code-group
-```sh [Ubuntu/Debian]
-sudo apt install protobuf-compiler
-```
-```sh [macOS]
-brew install protobuf
-```
-```sh [Arch]
-sudo pacman -S protobuf
-```
-```sh [Fedora]
-sudo dnf install protobuf-compiler
-```
-:::
-
-## Verifying the Installation
-
-After installing, verify everything works:
+To check that a PBF file can be read:
 
 ```sh
-nidhogg --version
-# nidhogg 0.4.2
-
-nidhogg --help
-# Prints the full CLI reference
+pbfhogg inspect denmark.osm.pbf
 ```

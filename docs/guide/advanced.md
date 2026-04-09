@@ -1,162 +1,125 @@
 # Advanced Topics
 
-## Performance Tuning
+## Indexdata
 
-### Thread Count
+pbfhogg embeds additional metadata in BlobHeader fields: element type, ID range, spatial bounding box, and tag key sets. Standard PBF readers silently skip these fields per protobuf wire format rules.
 
-By default, Nidhogg uses all available CPU cores. On shared machines, you may want to limit this:
+This metadata enables commands to skip decompression of irrelevant blobs entirely. For example, `apply-changes` classifies blobs in O(1) without decompressing them, passing through ~92% of blobs as raw bytes. `tags-filter` skips blobs that provably lack required tag keys.
 
-```sh
-nidhogg --threads 8 input.osm.pbf output.pmtiles
-```
-
-The processing pipeline has three parallelizable stages:
-
-1. **PBF decoding** — decompresses and parses OSM data blocks
-2. **Feature extraction** — matches tags against Shortbread layer rules
-3. **Tile encoding** — clips, simplifies, and encodes MVT tiles
-
-Each stage scales near-linearly up to about 16 threads, after which contention on the sort buffer starts to dominate.
-
-### Memory Management
-
-The `--memory-limit` flag controls how much RAM the external merge sort can use for in-memory buffers. Larger buffers mean fewer disk passes:
+Generate an indexed PBF:
 
 ```sh
-# Use up to 32 GB for sort buffers
-nidhogg --memory-limit 32GB input.osm.pbf output.pmtiles
+pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 ```
 
-| Memory Limit | Planet Build Time | Sort Passes |
-|---|---|---|
-| 2 GB | ~6 hours | 12 |
-| 4 GB | ~4 hours | 6 |
-| 8 GB | ~3 hours | 3 |
-| 16 GB | ~2.5 hours | 2 |
-| 32 GB | ~2 hours | 1 |
+Without a `--type` flag, `cat` adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal. Planet (87 GB) completes in ~8 minutes with under 0.5% file size overhead.
 
-::: tip
-If you have enough RAM to keep the entire sort in memory (typically 24-32 GB for a planet build), the sort completes in a single pass with no temporary files written to disk.
-:::
+Commands that benefit from indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, and `build-geocode-index`.
 
-### Temporary Storage
+## O_DIRECT for planet-scale I/O
 
-The external merge sort writes intermediate files to `--temp-dir`. For best performance:
-
-- Point this at your fastest disk (NVMe > SATA SSD > HDD)
-- Ensure at least 2x the input file size in free space
-- Avoid network-mounted filesystems
+Planet-scale operations read and write 80 GB+, polluting the entire page cache and evicting useful data from co-resident processes. The `linux-direct-io` feature bypasses the page cache entirely.
 
 ```sh
-nidhogg --temp-dir /mnt/nvme/scratch input.osm.pbf output.pmtiles
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io
 ```
 
-## Custom Layer Selection
+O_DIRECT requires a real filesystem (not tmpfs). Wall time is typically unchanged at country scale (CPU-bound) — the benefit is cache hygiene at planet scale. For sequential single-file passthrough (`cat`), buffered I/O is actually faster because the page cache prefetch helps. `--direct-io` wins for concurrent read/write patterns like merge.
 
-### Include Only Specific Layers
+## io_uring writes
+
+The `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and pre-registered page-aligned buffers. Requires Linux 5.1+ and sufficient `RLIMIT_MEMLOCK` (16 MB for the default 64-buffer pool).
 
 ```sh
-# Only generate transportation and water layers
-nidhogg --layers transportation,water,waterways \
-        input.osm.pbf transport-water.pmtiles
+pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 ```
 
-### Exclude Layers
+At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up — io_uring overhead dominates when the page cache absorbs everything.
+
+## Compression modes
+
+All write commands accept `--compression`:
+
+| Value | Description |
+|-------|-------------|
+| `none` | No compression. Fastest writes, largest files. Ideal for intermediate files or erofs storage. |
+| `zlib` | Zlib level 6 (default). Standard PBF compression, compatible with all tools. |
+| `zlib:LEVEL` | Zlib with explicit level (0-9). Higher = smaller + slower. |
+| `zstd` | Zstandard level 3. Better ratio and faster decompression than zlib. |
+| `zstd:LEVEL` | Zstandard with explicit level. |
+
+With pipelined writes (the production path), compression is dispatched to rayon and all modes converge to the decode + serialization floor. The choice mainly affects file size and downstream read speed.
+
+Zlib uses `zlib-rs` (pure Rust). No C compiler needed.
+
+## Add-locations-to-ways index types
+
+`add-locations-to-ways` embeds node coordinates in ways. It supports four index strategies via `--index-type`:
 
 ```sh
-# Everything except POIs and address labels
-nidhogg --exclude pois,addresses \
-        input.osm.pbf no-pois.pmtiles
+pbfhogg add-locations-to-ways input.osm.pbf -o output.osm.pbf --index-type external
 ```
 
-### Available Shortbread Layers
+| Type | Memory | Disk | Sorted required | Best for |
+|------|--------|------|-----------------|----------|
+| `dense` | 8 bytes/node slot (mmap) | none | no | Country-scale where working set fits in RAM |
+| `sparse` | ~540 MB fixed | ~16 GB values file | no | Memory-constrained hosts, no temp disk |
+| `external` | ~17 GB peak (planet) | ~300 GB temp (planet) | yes + indexdata | Planet-scale, 3.9x faster than dense |
+| `auto` | varies | varies | external if sorted+indexed, else dense | Recommended default |
 
-The full Shortbread spec defines 26 layers:
+**dense** is a direct-mapped mmap array indexed by node ID. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires 30+ GB free memory to avoid page cache thrashing.
 
-| Layer | Description | Min Zoom |
-|---|---|---|
-| `ocean` | Ocean fill polygons | 0 |
-| `water` | Inland water bodies | 4 |
-| `waterways` | Rivers, streams, canals | 9 |
-| `landuse` | Parks, forests, residential areas | 4 |
-| `landcover` | Natural land cover (grass, sand, etc.) | 7 |
-| `transportation` | Roads, railways, paths | 4 |
-| `transportation_labels` | Road names and route numbers | 10 |
-| `buildings` | Building footprints | 13 |
-| `pois` | Points of interest | 14 |
-| `places` | City, town, village labels | 2 |
-| `boundaries` | Country and state borders | 0 |
-| `boundary_labels` | Border crossing names | 10 |
-| `addresses` | House numbers | 14 |
-| `sites` | Industrial/commercial/retail areas | 14 |
-| `aerialways` | Ski lifts, cable cars | 12 |
-| `ferries` | Ferry routes | 8 |
+**sparse** uses a Planetiler-inspired chunk-indexed array. Way lookups are batched and sorted by file offset, converting random I/O into sequential scans. About 1.85x slower than dense when everything fits in RAM (pure CPU overhead).
 
-<small>See the [Shortbread schema specification](https://shortbread-tiles.org/) for the complete list and tag mapping rules.</small>
+**external** uses a double radix permutation with bounded memory and all sequential I/O. Requires sorted input with indexdata. Planet (87 GB): 24 minutes, 17 GB peak memory, 3.9x faster than dense (which takes 96 minutes due to thrashing). Needs ~300 GB temp disk at planet scale.
 
-## Simplification
+## Multi-extract
 
-Nidhogg applies Douglas-Peucker simplification to geometry at each zoom level. You can tune the aggressiveness:
+Extract multiple regions in a single pass using a JSON config file:
+
+```sh
+pbfhogg extract input.osm.pbf -c regions.json
+```
+
+The config file defines multiple extract regions, each with a name, output path, and bounding box or polygon. All regions are extracted in one pass over the input, which is much faster than running separate extracts.
+
+Use `-d` to override the output directory for all extracts:
+
+```sh
+pbfhogg extract input.osm.pbf -c regions.json -d /data/extracts/
+```
+
+## Tags-filter with and without -R
+
+Without `-R` (default mode), `tags-filter` resolves matched relation members transitively: member ways, member nodes, nested member relations are included, and node refs of included ways are pulled in. This requires multiple passes but gives complete, usable output.
+
+With `-R` (omit-referenced), only directly matched elements are emitted. This is a single pass and significantly faster, but the output may have dangling references.
+
+```sh
+# Full resolution (default) — complete output
+pbfhogg tags-filter denmark.osm.pbf -o highways.osm.pbf "highway=primary"
+
+# Direct matches only — faster but may have dangling refs
+pbfhogg tags-filter denmark.osm.pbf -o highways.osm.pbf -R "highway=primary"
+```
+
+Tags-filter also supports OSC input (autodetected from extension, or override with `--input-kind osc`). In OSC mode, delete directives are always preserved.
+
+## Build-geocode-index
+
+Build a reverse geocoding index from a PBF file:
+
+```sh
+pbfhogg build-geocode-index denmark.osm.pbf --output-dir geocode-index/
+```
+
+This runs a 4-pass pipeline: admin boundary relations, referenced node collection, node+way fused scan, and bucketed S2 cell assignment. The output is a set of 19 memory-mappable binary files for fast reverse geocoding queries.
+
+Europe: ~10 minutes, 7.5 GB RSS. Planet: ~22 minutes, 18 GB RSS.
+
+The index can be queried from Rust using the `geocode-reader` feature:
 
 ```toml
-[simplification]
-tolerance = 1.0        # units: tile coordinate space (0-4096)
-area_threshold = 4.0   # drop polygons smaller than this
+[dependencies]
+pbfhogg = { version = "0.2", default-features = false, features = ["geocode-reader"] }
 ```
-
-Lower tolerance values preserve more detail but produce larger tiles. The default of `1.0` is a good balance for most use cases.
-
-### Per-Layer Overrides
-
-```toml
-[simplification.overrides.buildings]
-tolerance = 0.5        # keep building shapes crisp
-area_threshold = 1.0
-
-[simplification.overrides.landcover]
-tolerance = 2.0        # landcover can be more aggressive
-area_threshold = 16.0
-```
-
-## Coordinate Reference System
-
-Nidhogg outputs tiles in Web Mercator (EPSG:3857), which is the standard for vector tile renderers. Input data is expected in WGS 84 (EPSG:4326) — the native CRS of OpenStreetMap.
-
-The ocean shapefile must also be in EPSG:4326. The recommended source is the [osmdata.openstreetmap.de water polygons](https://osmdata.openstreetmap.de/data/water-polygons.html), specifically the "WGS84, split" variant.
-
-## Extending with Plugins
-
-::: warning Experimental
-The plugin system is under active development. The API may change between minor versions.
-:::
-
-Nidhogg supports Lua plugins for custom tag-to-layer mapping:
-
-```lua
--- custom_layers.lua
-function process_node(tags, layer_builder)
-  if tags["amenity"] == "charging_station" then
-    layer_builder:add("ev_chargers", {
-      operator = tags["operator"] or "unknown",
-      capacity = tonumber(tags["capacity"]) or 1,
-    })
-  end
-end
-
-function process_way(tags, layer_builder)
-  if tags["highway"] == "cycleway" or tags["cycleway"] then
-    layer_builder:add("cycling", {
-      surface = tags["surface"] or "unknown",
-      lit = tags["lit"] == "yes",
-    })
-  end
-end
-```
-
-Load a plugin with:
-
-```sh
-nidhogg --plugin custom_layers.lua input.osm.pbf output.pmtiles
-```
-
-The custom layers appear alongside the standard Shortbread layers in the output.

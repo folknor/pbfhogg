@@ -45,6 +45,7 @@ pbfhogg inspect tags [OPTIONS] <FILE> [EXPRESSIONS]...
 | `-e, --extended` | Extended scan: timestamp range, data bbox, metadata coverage, ordering |
 | `-g, --get <KEY>` | Get a single value by key path (e.g. `header.bbox`, `data.timestamp.first`) |
 | `--json` | Machine-readable JSON output |
+| `--show <TYPE_ID>` | Display a single element by ID (e.g. `n123`, `w456`, `r789`). Uses indexdata to skip non-matching blobs, early exit on sorted PBFs |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 | `--force` | Proceed even if input lacks indexdata (for `--nodes`) |
 
@@ -59,6 +60,8 @@ Count tag key=value frequencies (subcommand of `inspect`).
 | `-s, --sort <ORDER>` | Sort order: count-desc (default), count-asc, name-asc, name-desc |
 | `-e, --expressions <FILE>` | Read tag expressions from file (one per line, # comments) |
 | `-t, --type <TYPE>` | Filter by element type: node, way, or relation |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
+| `--force` | Proceed even if input lacks indexdata (slower fallback path) |
 
 ### check
 
@@ -79,11 +82,11 @@ pbfhogg check [OPTIONS] <FILE>
 | `--max-errors <N>` | Stop after N violations (0 = unlimited) [default: 100] |
 | `--check-relations` | Also check relation member references (applies to ref check) |
 | `--show-ids` | Show IDs of missing objects, format: `n123 in w456` (applies to ref check) |
+| `--json` | Machine-readable JSON output |
+| `--quiet` | Exit-code only, no output |
+| `--direct-io` | Use O_DIRECT to bypass page cache |
 
 For missing relation-to-relation members, reports unique missing IDs with occurrence count when they differ: `Missing relation members: 706 (777 references)`.
-| `--json` | Machine-readable JSON output |
-| `-q, --quiet` | Exit-code only, no output |
-| `--direct-io` | Use O_DIRECT to bypass page cache |
 
 ---
 
@@ -221,12 +224,12 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `-t, --type <TYPE>` | Filter by element type (text only) |
 | `--increment-version` | Bump version of deleted elements by 1 (osc only) |
 | `--update-timestamp` | Set delete timestamp to current time (osc only) |
-
-With `--format osc`, produces a lossless roundtrip — applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
 | `--ignore-changeset` | Compatibility flag (already ignored by content-equality mode) |
 | `--ignore-uid` | Compatibility flag (already ignored by content-equality mode) |
 | `--ignore-user` | Compatibility flag (already ignored by content-equality mode) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
+
+With `--format osc`, produces a lossless roundtrip — applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](/cli/deviations#derive-changes-lossless-delete-roundtrip)).
 
 ### getid
 
@@ -280,7 +283,7 @@ Embed node coordinates in ways. Three index strategies:
 
 - **dense** (default) — Direct-mapped mmap array. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires ~30+ GB free memory to avoid page cache thrashing.
 - **sparse** — Planetiler-inspired chunk-indexed sparse array. Bounded memory (~540 MB). Slower than dense at all scales. No temp disk needed. Works on any PBF.
-- **external** — Double radix permutation via 4-stage pipeline. Bounded memory (~1.6 GB). 2.8x faster than dense at Europe scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~224 GB at planet.
+- **external** — Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). 3.9x faster than dense at planet scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~300 GB at planet.
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -291,7 +294,7 @@ pbfhogg add-locations-to-ways [OPTIONS] --output <OUTPUT> <FILE>
 | Flag | Description |
 |------|-------------|
 | `-o, --output <FILE>` | Output file |
-| `--index-type <TYPE>` | Node index type: `dense` (default), `sparse`, or `external` |
+| `--index-type <TYPE>` | Node index type: `dense` (default), `sparse`, `external`, or `auto` (external if sorted+indexed, dense otherwise) |
 | `--keep-untagged-nodes` | Keep all untagged nodes in output |
 | `--compression` | Blob compression [default: zlib] |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
@@ -372,4 +375,4 @@ pbfhogg build-geocode-index [OPTIONS] --output-dir <DIR> <FILE>
 | `--coarse-search-radius <M>` | Coarse-level max search distance in meters [default: 1000] |
 | `--force` | Proceed without indexdata / overwrite existing index |
 
-Outputs 19 binary files. Denmark (465 MB PBF): ~21s, 172 MB index. Germany (4.5 GB PBF): ~30 min, ~1.8 GB index.
+Outputs 19 binary files. Denmark (465 MB PBF): ~7s, 172 MB index. Europe (32.4 GB): 524s (8.7 min), 7.5 GB RSS. Planet (87 GB): 1,346s (22.4 min), 17.8 GB RSS.

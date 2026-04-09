@@ -69,3 +69,33 @@ the derived OSC to the old PBF reproduces the new PBF exactly.
 **Rationale:** Not a design choice — osmium simply cannot represent certain deletes
 when the deleted element is absent from both input files. pbfhogg's content-equality
 diff captures all three change types (create, modify, delete) correctly.
+
+## extract: relation inclusion criteria differences
+
+**osmium behavior:** In complete-ways and smart strategies, osmium applies its own
+heuristics for which relations to include and which additional nodes/ways to pull
+in for relation completeness.
+
+**pbfhogg behavior:** extract has expected differences in relation inclusion criteria
+across all three strategies. Cross-validation shows 99.99% node/way match. In smart
+mode, pbfhogg includes more way-referenced nodes while osmium includes more relations.
+
+**Impact:** For the vast majority of use cases the output is equivalent. Edge cases
+near extract boundaries may see slightly different relation membership. The node/way
+coverage is effectively identical.
+
+## check-refs: occurrence-counting vs unique-counting for missing references
+
+**osmium behavior:** For missing relation-to-relation members, osmium reports the
+total number of broken references (occurrences).
+
+**pbfhogg behavior:** Reports unique missing IDs as the primary count, with the
+occurrence count in parentheses when it differs from the unique count:
+`Missing relation members: 706 (777 references)`. Also reports
+`missing_relation_member_occurrences` in JSON output.
+
+**Impact:** Both tools find the same set of missing IDs. The difference is
+presentational — pbfhogg distinguishes "how many distinct IDs are missing" from
+"how many references point to missing IDs." Users comparing numeric output between
+the two tools should be aware that osmium's count corresponds to pbfhogg's
+occurrence (parenthesized) count, not the primary count.

@@ -4,20 +4,19 @@
 
 Prototype shipped (commit `e0b0780`). `DenseNodeColumns` in
 `src/read/columnar.rs` batch-decodes IDs, lats, lons into contiguous
-arrays. Four classification methods:
+arrays. Two classification methods:
 - `collect_matching_ids_bbox` — single-region bbox, output to Vec
 - `collect_matching_ids_multi_bbox` — N-region bbox, output to Vec
-- `set_matching_ids_bbox` — single-region bbox, output to IdSetDense
-- `set_matching_ids_multi_bbox` — N-region bbox, output to IdSetDense
 
 Used in:
 - Single-extract node classification for bbox regions (Vec path)
 - Multi-extract node classification for all-bbox regions (Vec path)
 
-The IdSetDense output methods exist but are NOT used in production —
-direct IdSetDense::set() in tight loops causes 29x regression vs
-Vec::push() due to random chunk access. See "IdSetDense accumulation
-findings" below.
+The IdSetDense output methods (`set_matching_ids_bbox`,
+`set_matching_ids_multi_bbox`) were removed in commit `c4c7b9e` after
+confirming they were unused in production. Direct IdSetDense::set() in
+tight loops caused 29x regression vs Vec::push() due to random chunk
+access. See "IdSetDense accumulation findings" below.
 
 ASM inspection confirms LLVM does NOT autovectorize the bbox loop —
 the `push()` side effect prevents it. Explicit AVX2 intrinsics are

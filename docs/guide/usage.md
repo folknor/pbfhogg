@@ -1,141 +1,135 @@
-# Usage
+# Basic Usage
 
-## Basic Usage
+## Inspecting a PBF file
 
-The simplest invocation takes an OpenStreetMap PBF extract and produces a PMTiles archive:
-
-```sh
-nidhogg input.osm.pbf output.pmtiles
-```
-
-For proper ocean and coastline rendering, pass an ocean shapefile:
+Get an overview of any PBF file — block breakdown, element counts, ordering analysis:
 
 ```sh
-nidhogg --ocean water-polygons-split-4326/water_polygons.shp \
-        input.osm.pbf output.pmtiles
+pbfhogg inspect denmark.osm.pbf
 ```
 
-## Common Workflows
-
-### Regional Extract
-
-Process a single country or region. Downloads are available from [Geofabrik](https://download.geofabrik.de/):
+Check if a PBF has blob-level indexdata (exit code 0 = indexed, 1 = not):
 
 ```sh
-# Download the extract
-wget https://download.geofabrik.de/europe/germany-latest.osm.pbf
-
-# Generate tiles for zoom 0-14
-nidhogg --min-zoom 0 --max-zoom 14 \
-        --ocean /data/water_polygons.shp \
-        germany-latest.osm.pbf germany.pmtiles
+pbfhogg inspect --indexed denmark.osm.pbf
 ```
 
-### Planet Build
-
-Processing the full planet extract (~75 GB) requires adequate disk space for temporary sort files. Expect 2-4 hours on a modern machine with 16+ cores:
+Count tag key=value frequencies:
 
 ```sh
-nidhogg --threads 16 \
-        --memory-limit 32GB \
-        --temp-dir /fast-ssd/tmp \
-        --ocean /data/water_polygons.shp \
-        planet-latest.osm.pbf planet.pmtiles
+pbfhogg inspect tags denmark.osm.pbf
 ```
 
-::: tip
-Use `--temp-dir` to point at your fastest storage. The external merge sort is I/O-bound, so an NVMe drive makes a significant difference.
-:::
-
-### Custom Zoom Range
-
-Generate tiles for a specific zoom range only:
+For extended analysis (timestamp range, data bbox, metadata coverage):
 
 ```sh
-# Only street-level tiles
-nidhogg --min-zoom 12 --max-zoom 14 input.osm.pbf streets.pmtiles
-
-# Only overview tiles
-nidhogg --min-zoom 0 --max-zoom 8 input.osm.pbf overview.pmtiles
+pbfhogg inspect --extended denmark.osm.pbf
 ```
 
-### Output to MBTiles
+## Generating indexdata
 
-If your tile server requires MBTiles format:
+Many commands are faster with blob-level indexdata. Generate an indexed PBF with `cat`:
 
 ```sh
-nidhogg --format mbtiles \
-        --compression gzip \
-        input.osm.pbf output.mbtiles
+pbfhogg cat denmark-raw.osm.pbf -o denmark.osm.pbf
 ```
 
-### Debug: Single Tile
+This passthrough path adds indexdata without re-compressing blobs — minimal memory, suitable for planet-scale files (87 GB planet in ~8 minutes). No `--type` flag means passthrough; adding `-t` does full decode and re-encode.
 
-Extract a single tile for inspection:
+## Extracting a region
+
+Extract by bounding box:
 
 ```sh
-nidhogg --tile 14/8691/5677 input.osm.pbf tile.mvt
-
-# Inspect with tippecanoe's tile-join or vt-cli
-vt info tile.mvt
+pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8
 ```
 
-## CLI Reference
-
-```
-nidhogg [OPTIONS] <INPUT> <OUTPUT>
-
-Arguments:
-  <INPUT>   Path to .osm.pbf input file
-  <OUTPUT>  Path to output file (.pmtiles, .mbtiles, or directory)
-
-Options:
-      --ocean <PATH>        Ocean polygon shapefile for coastline fill
-      --natural-earth <PATH> Natural Earth vectors for low-zoom features
-      --config <PATH>       Path to nidhogg.toml config file
-      --format <FORMAT>     Output format: pmtiles, mbtiles, directory
-                            [default: pmtiles]
-      --compression <ALG>   Compression: zstd, gzip, brotli, none
-                            [default: zstd]
-      --min-zoom <N>        Minimum zoom level [default: 0]
-      --max-zoom <N>        Maximum zoom level [default: 14]
-      --threads <N>         Worker threads (0 = auto) [default: 0]
-      --memory-limit <SIZE> Max memory for sort buffers [default: 4GB]
-      --temp-dir <PATH>     Directory for temporary sort files
-      --tile <Z/X/Y>        Generate a single tile (debug mode)
-      --layers <LIST>       Comma-separated list of layers to include
-      --exclude <LIST>      Comma-separated list of layers to exclude
-  -v, --verbose             Increase log verbosity (-vv for debug)
-  -q, --quiet               Suppress all output except errors
-  -h, --help                Print help
-  -V, --version             Print version
-```
-
-## Logging
-
-Nidhogg uses the `RUST_LOG` environment variable for fine-grained log control:
+The default strategy is complete-ways (two passes, all way nodes included). For faster extraction with possible dangling refs:
 
 ```sh
-# Show progress bars and summary (default)
-nidhogg input.osm.pbf output.pmtiles
-
-# Verbose: show per-layer statistics
-nidhogg -v input.osm.pbf output.pmtiles
-
-# Debug: show individual tile processing
-RUST_LOG=nidhogg=debug nidhogg input.osm.pbf output.pmtiles
-
-# Trace: show everything including sort internals
-RUST_LOG=nidhogg=trace nidhogg input.osm.pbf output.pmtiles
+pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8 --simple
 ```
 
-## Exit Codes
+For complete multipolygon and boundary relations:
 
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | General error (invalid input, I/O failure) |
-| `2` | Invalid command-line arguments |
-| `3` | Input file not found or unreadable |
-| `4` | Output write failure (disk full, permissions) |
-| `5` | Out of memory |
+```sh
+pbfhogg extract denmark.osm.pbf -o copenhagen.osm.pbf -b 12.4,55.6,12.7,55.8 --smart
+```
+
+Extract by GeoJSON polygon:
+
+```sh
+pbfhogg extract denmark.osm.pbf -o region.osm.pbf -p boundary.geojson
+```
+
+## Applying a daily diff
+
+Apply an OSC change file to a sorted PBF:
+
+```sh
+pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf
+```
+
+To preserve and update inline way-node coordinates through the merge (avoids re-running `add-locations-to-ways` after each update):
+
+```sh
+pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf --locations-on-ways
+```
+
+## Filtering by tags
+
+Filter elements by tag expressions:
+
+```sh
+pbfhogg tags-filter denmark.osm.pbf -o highways.osm.pbf "highway=primary" "highway=secondary"
+```
+
+By default, matched relations pull in their member ways, nodes, and nested relations transitively. For direct matches only (faster, single pass):
+
+```sh
+pbfhogg tags-filter denmark.osm.pbf -o restaurants.osm.pbf -R "amenity=restaurant"
+```
+
+## Sorting
+
+Sort a PBF into standard order (nodes, ways, relations by ID):
+
+```sh
+pbfhogg sort unsorted.osm.pbf -o sorted.osm.pbf
+```
+
+## Extracting elements by ID
+
+```sh
+pbfhogg getid denmark.osm.pbf -o subset.osm.pbf n123 w456 r789
+```
+
+Remove specific elements (keep everything else):
+
+```sh
+pbfhogg getid denmark.osm.pbf -o filtered.osm.pbf --invert n123 w456
+```
+
+## The --force flag
+
+Commands that benefit from indexdata (`apply-changes`, `sort`, `extract`, `tags-filter`, `getid`, `add-locations-to-ways`, and others) will error if the input PBF lacks it. Pass `--force` to proceed without indexdata — the command will work but use slower fallback paths:
+
+```sh
+pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
+```
+
+The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
+
+## Common flags
+
+Most write commands accept these flags:
+
+| Flag | Description |
+|------|-------------|
+| `-o, --output <FILE>` | Output file path |
+| `--compression <SPEC>` | Compression: `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`) |
+| `--direct-io` | Bypass page cache via O_DIRECT (Linux, requires `linux-direct-io` feature) |
+| `--io-uring` | Use io_uring for output writes (Linux, requires `linux-io-uring` feature) |
+| `--force` | Proceed without indexdata (slower fallback path) |
+| `--generator <NAME>` | Override the writing program name in the output header |
+| `--output-header <K=V>` | Set replication metadata fields in the output header |

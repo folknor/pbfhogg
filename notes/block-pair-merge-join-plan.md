@@ -287,20 +287,18 @@ all node blobs.
 
 Recommended order: **v2 first, then v1, then v3.**
 
-1. **v2: Borrowed element merge** (highest impact) — Replace
-   OwnedNode/Way/Relation with borrowed element iterators for the
-   decoded-block path. Both old and new blocks are alive simultaneously,
-   so elements can borrow from their respective blocks. Tags compared
-   via `&str` iterators, refs via `Iterator::eq()`, members via
-   iterator comparison. Zero String allocation.
-   More invasive — changes `MergeJoinElement` trait and all consumers.
-   But correctness is verifiable via `brokkr verify diff`.
+1. **v2: Borrowed element merge** (highest impact) — **SHIPPED** (commit
+   `66990c3`). Replaced OwnedNode/Way/Relation with borrowed element
+   iterators for the decoded-block path. Tags compared via `&str`
+   iterators, refs via `Iterator::eq()`, members via iterator comparison.
+   Zero String allocation. Japan diff: 86.4s -> 52.9s (39% faster),
+   80.7 GB -> 40.6 GB cumulative alloc (50% less).
 
-2. **v1: Blob-level equal skip** — Compare compressed bytes for
-   matching blocks. Skip decode for identical blobs. Falls through
-   to v2's borrowed element merge for differing blobs. Most effective
-   for way/relation blobs (sparser modifications). ~14% of node blobs
-   skip at planet scale, but way/relation blob skip rate is much higher.
+2. **v1: Blob-level equal skip** — **SHIPPED**. Compare compressed
+   bytes for matching blobs. Skip decode for identical blobs. Falls
+   through to v2's borrowed element merge for differing blobs.
+   Denmark diff: 20s -> 10s (2x). Enabled for `diff --suppress-common`
+   and `derive_changes` (always). See TODO.md for details.
 
 3. **v3: Non-overlapping block skip** — Use indexdata min/max ID
    to skip decode for blocks that are entirely OldOnly or NewOnly

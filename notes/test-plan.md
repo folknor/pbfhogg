@@ -131,7 +131,7 @@ Sparse index: Denmark buffered tested (identical output, 15.5s vs dense 8.4s).
 | Germany | 4.5 GB | merge buffered + direct-io | [x] Both pass |
 | North America | 18.8 GB | merge buffered + io-uring | [x] Both pass, identical element counts |
 | Planet | 87 GB | cat passthrough | [x] Pass (50816 blobs) |
-| Planet | 87 GB | cat --type | **OOM** (SIGKILL on 30 GB host, known issue) |
+| Planet | 87 GB | cat --type | [x] Pass — 43.7s via raw frame passthrough (commit `573ef71`) |
 | Planet | 87 GB | merge | Skipped (no planet OSC diff available) |
 | Planet | 87 GB | add-locations-to-ways --index-type sparse | [ ] Pending — key validation for memory-bounded path |
 | Europe | 33.6 GB | add-locations-to-ways --index-type sparse | [ ] Pending — intermediate scale validation |

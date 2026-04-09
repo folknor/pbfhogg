@@ -199,7 +199,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 **Geocode index:** `geocode_index/` module
 - `format.rs`: on-disk binary format (19 files, header/cells/entries/data/strings). Manual byte-level serialization, no `#[repr(C)]`.
 - `reader.rs`: mmap reader with two-layer API. `query()` (allocation-free, nearest-of-each-type) and `candidates()` (Vec-backed, all matches). S2 cell neighborhood lookup, binary search on sorted cell arrays, segment-level distance scoring.
-- `builder.rs`: 4-pass build pipeline. Pass 1: relations (admin boundaries). Pass 1.5: referenced node collection (IdSetDense). Pass 2: nodes + ways fused scan (compact rank-indexed coord array via IdSetDense rank, streaming data files to disk). Pass 3: bucketed S2 cell assignment (256 temp-file buckets per level). Interpolation endpoint resolution via spatial join against address points. Europe: 568s (9.5 min), 7.5 GB RSS. Planet: 1,346s (22.4 min), 17.8 GB RSS.
+- `builder.rs`: 4-pass build pipeline. Pass 1: relations (admin boundaries). Pass 1.5: referenced node collection (IdSetDense). Pass 2: nodes + ways fused scan (compact rank-indexed coord array via IdSetDense rank, streaming data files to disk). Pass 3: bucketed S2 cell assignment (256 temp-file buckets per level). Interpolation endpoint resolution via spatial join against address points. Europe: 524s (8.7 min), 7.5 GB RSS (commit `dad0dbd`). Planet: 1,346s (22.4 min), 17.8 GB RSS.
 
 **Geometry:** `geo.rs` — shared primitives (point-in-ring, antimeridian handling, point-in-polygon with holes, Douglas-Peucker simplification, ring assembly, cos-projection distance).
 
@@ -209,7 +209,7 @@ Library users who only need read/write can depend on `pbfhogg` with `default-fea
 - Strict clippy lints enforced (see `[workspace.lints.clippy]` in Cargo.toml) -- notably `unwrap_used = "deny"` and `cognitive_complexity = "deny"`
 - Coordinates use decimicrodegrees (10^-7 degrees) for node I/O in BlockBuilder
 - Error types in `error.rs` follow the `csv` crate pattern (boxed ErrorKind). `MissingHeader` error if a PBF doesn't start with an OsmHeader blob.
-- Tests live in `tests/` (roundtrip.rs, roundtrip_real.rs) and inline in blob.rs/indexed.rs
+- Tests live in `tests/` (21 test files covering all commands, roundtrip, read paths, corrupt input) and `cli/tests/cli.rs` (CLI integration tests), plus inline unit tests in source files
 
 ## Features (library crate)
 

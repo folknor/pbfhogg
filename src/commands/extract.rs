@@ -609,6 +609,7 @@ pub fn extract_multi(
 /// Simple strategy only (no per-region way/relation ID tracking beyond what
 /// fits in memory). Uses sync-mode PbfWriters (no per-writer thread).
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn try_extract_multi_single_pass(
     input: &Path,
     slots: &[ExtractSlot],
@@ -748,6 +749,7 @@ fn try_extract_multi_single_pass(
     );
 
     // Phase 1: Parallel node classification → N bbox_node_ids.
+    crate::debug::emit_marker("MULTI_NODE_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &node_schedule,
@@ -786,8 +788,10 @@ fn try_extract_multi_single_pass(
             }
         },
     )?;
+    crate::debug::emit_marker("MULTI_NODE_CLASSIFY_END");
 
     // Phase 1 write: parallel decode with raw passthrough for fully-contained node blobs.
+    crate::debug::emit_marker("MULTI_NODE_WRITE_START");
     multi_extract_pread_write_nodes(
         &shared_file,
         &node_schedule,
@@ -827,8 +831,10 @@ fn try_extract_multi_single_pass(
         &mut writers,
         &mut stats,
     )?;
+    crate::debug::emit_marker("MULTI_NODE_WRITE_END");
 
     // Phase 2: Parallel way classification → N matched_way_ids.
+    crate::debug::emit_marker("MULTI_WAY_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
@@ -853,8 +859,10 @@ fn try_extract_multi_single_pass(
             }
         },
     )?;
+    crate::debug::emit_marker("MULTI_WAY_CLASSIFY_END");
 
     // Phase 2 write: parallel decode, write matching ways to N writers.
+    crate::debug::emit_marker("MULTI_WAY_WRITE_START");
     multi_extract_pread_write(
         &shared_file,
         &way_schedule,
@@ -883,8 +891,10 @@ fn try_extract_multi_single_pass(
         &mut stats,
         |s| &mut s.ways_written,
     )?;
+    crate::debug::emit_marker("MULTI_WAY_WRITE_END");
 
     // Phase 3: Parallel relation classification → N matched_relation_ids.
+    crate::debug::emit_marker("MULTI_REL_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &relation_schedule,
@@ -909,8 +919,10 @@ fn try_extract_multi_single_pass(
             }
         },
     )?;
+    crate::debug::emit_marker("MULTI_REL_CLASSIFY_END");
 
     // Phase 3 write: parallel decode, write matching relations to N writers.
+    crate::debug::emit_marker("MULTI_REL_WRITE_START");
     multi_extract_pread_write(
         &shared_file,
         &relation_schedule,
@@ -943,6 +955,7 @@ fn try_extract_multi_single_pass(
         &mut stats,
         |s| &mut s.relations_written,
     )?;
+    crate::debug::emit_marker("MULTI_REL_WRITE_END");
 
     // Flush all writers (workers already flushed their BlockBuilders per blob).
     for (i, slot) in slots.iter().enumerate() {
@@ -1083,6 +1096,7 @@ struct NodeBlobInfo {
 }
 
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn multi_extract_pread_write_nodes<F>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],
@@ -1276,6 +1290,7 @@ enum MultiNodeCI {
 /// N × Vec<OwnedBlock>. The consumer writes each region's blocks to its
 /// writer in sequence order.
 #[allow(clippy::too_many_lines)]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn multi_extract_pread_write<F>(
     shared_file: &std::sync::Arc<std::fs::File>,
     schedule: &[(usize, u64, usize)],

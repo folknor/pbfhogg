@@ -61,6 +61,7 @@ Utility commands (unchanged):
   Planet uses planet.openstreetmap.org replication; everything else uses Geofabrik.
   Short aliases (denmark, europe, japan) or full paths (europe/france, asia/japan/kanto).
   Re-running is safe (only writes entries that don't already exist in brokkr.toml).
+- `brokkr lock` — check if a brokkr command is currently running (PID, duration, I/O stats). Use this to poll long-running benchmarks instead of reading output files. Never compile or run CPU-intensive work while a bench holds the lock.
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history.
 - `brokkr verify <command> [--dataset name]` — cross-validate against reference tools.

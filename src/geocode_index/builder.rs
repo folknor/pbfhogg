@@ -1079,7 +1079,7 @@ fn cover_segment(
     };
 
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
-    let steps = ((seg_len_deg / step_deg).ceil() as usize).max(2);
+    let steps = ((seg_len_deg / step_deg).ceil() as usize).clamp(2, 256);
 
     // Stack-based dedup for the common case (1–8 cells per segment)
     let mut seen = [0u64; 8];

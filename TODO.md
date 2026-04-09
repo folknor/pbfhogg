@@ -502,6 +502,22 @@ per-iteration allocations remain across the codebase, ordered by impact:
   `read_dense_node`/`read_way`/`read_relation` still allocate full
   `OwnedMetadata` with timestamp/changeset/uid/user String).
 
+- [ ] **`element_merge_pair` return consumed counts** —
+  `merge_decoded_pair` calls `count_elements_up_to` to re-iterate
+  already-merged elements just to count how many were consumed.
+  `element_merge_pair` could return the consumed count from each side
+  directly, eliminating the redundant re-scan (~8000 elements per
+  block for misaligned residuals). Flagged by 4/8 reviewers.
+
+- [ ] **`has_indexdata()` only checks first blob** — `diff()` and
+  `derive_changes()` select the block-pair path based on
+  `has_indexdata()`, which only checks the first OsmData blob. If a
+  partially-indexed PBF starts indexed but has later unindexed blobs,
+  `next_blob_for_kind` hard-errors mid-run instead of falling back
+  to the element-stream path. Fix: either check all blobs upfront,
+  or fall back gracefully when a blob lacks indexdata. Pre-existing
+  issue, not introduced by v1. Flagged by 2/8 reviewers.
+
 - [ ] **`diff` redundant header reads** — `diff()` opens two
   `ElementReader`s to check sorted headers (lines 138-143), then
   immediately drops them and opens two `StreamingBlocks` (which read

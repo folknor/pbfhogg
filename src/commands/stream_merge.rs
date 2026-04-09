@@ -769,13 +769,15 @@ pub(crate) fn block_pair_merge_phase(
                     if op.index.max_id < np.index.min_id {
                         let os = decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?;
                         emit_block(&os, true, on_action)?;
-                        new_decoded = Some(decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?);
+                        // Stash new blob undecoded — next iteration can try v1 byte comparison.
+                        state.new_stash = Some(np.blob);
                         continue;
                     }
                     if np.index.max_id < op.index.min_id {
                         let ns = decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?;
                         emit_block(&ns, false, on_action)?;
-                        old_decoded = Some(decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?);
+                        // Stash old blob undecoded — next iteration can try v1 byte comparison.
+                        state.old_stash = Some(op.blob);
                         continue;
                     }
                     // Overlapping — try compressed byte comparison (v1).
@@ -826,13 +828,14 @@ pub(crate) fn block_pair_merge_phase(
     Ok(())
 }
 
-/// Check if two pending blobs have identical index metadata and compressed bytes.
+/// Check if two pending blobs have identical index metadata, compression kind,
+/// and compressed bytes.
 fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
     a.index.min_id == b.index.min_id
         && a.index.max_id == b.index.max_id
         && a.index.count == b.index.count
-        && match (a.blob.compressed_bytes(), b.blob.compressed_bytes()) {
-            (Some(ab), Some(bb)) => ab == bb,
+        && match (a.blob.compressed_data(), b.blob.compressed_data()) {
+            (Some((ak, ab)), Some((bk, bb))) => ak == bk && ab == bb,
             _ => false,
         }
 }

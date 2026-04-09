@@ -473,15 +473,16 @@ impl Blob {
             .and_then(|d| crate::blob_index::BlobIndex::deserialize(d))
     }
 
-    /// Returns the compressed payload bytes for blob equality comparison.
+    /// Returns the compression kind and payload bytes for blob equality comparison.
     ///
-    /// Two blobs with identical compressed bytes are guaranteed to contain
-    /// identical elements (same compressed bytes → same decompressed bytes →
-    /// same protobuf → same elements). Returns `None` only if the blob has
+    /// Two blobs with the same compression kind and identical payload bytes are
+    /// guaranteed to contain identical elements. Returns `None` if the blob has
     /// no data payload.
-    pub(crate) fn compressed_bytes(&self) -> Option<&[u8]> {
+    pub(crate) fn compressed_data(&self) -> Option<(u8, &[u8])> {
         match &self.blob.data {
-            Some(BlobData::Raw(b) | BlobData::Zlib(b) | BlobData::Zstd(b)) => Some(b),
+            Some(BlobData::Raw(b)) => Some((0, b)),
+            Some(BlobData::Zlib(b)) => Some((1, b)),
+            Some(BlobData::Zstd(b)) => Some((2, b)),
             None => None,
         }
     }

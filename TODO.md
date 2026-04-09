@@ -384,19 +384,32 @@ for full analysis of 6 optimization opportunities.
 
 **Reviewer findings (2026-04-09, 6 reviewers across 3 archetypes):**
 
-- [ ] **`std::mem::take` on worker output Vecs defeats capacity reuse** —
-  `output.iter_mut().map(std::mem::take)` replaces each per-region
-  `Vec<OwnedBlock>` with a fresh empty Vec, losing accumulated capacity.
-  Re-grows on the next blob. Fix: swap with pre-allocated Vecs or
-  drain into a taken Vec and restore capacity. Flagged by 4/6 reviewers.
-- [ ] **Passthrough `frame_buf.clone()` for each of N writers** —
-  N-1 unnecessary copies of ~200-500 KB raw frames. Last writer could
-  take ownership via `std::mem::take`. Flagged by 3/6 reviewers.
-- [ ] **Per-closure `refs_buf`/`members_buf` allocation** — way and
-  relation write closures create fresh `Vec` per blob invocation
-  (~16 KB ways, ~480 bytes relations). Could be added to worker
-  persistent state but would change the `block_fn` signature.
-  Flagged by 2/6 reviewers.
+- [x] **`std::mem::take` on worker output Vecs defeats capacity reuse** —
+  fixed: `drain(..).collect()` preserves inner Vec capacity across
+  worker loop iterations. Both `multi_extract_pread_write` and
+  `multi_extract_pread_write_nodes`. Flagged by 4/6 reviewers.
+  Sweep review note: `drain(..).collect()` still allocates a fresh
+  destination Vec per handoff — a swap/pool approach would eliminate
+  that too. Not worth it unless profiling shows handoff churn.
+- [x] **Passthrough `frame_buf.clone()` for each of N writers** —
+  fixed: `write_raw(&frame_buf)` borrows instead of cloning. Sync-mode
+  writers just call `write_all` — zero heap copies. Both passthrough-only
+  path and `write_consumer_item`. Flagged by 3/6 reviewers.
+  Sweep review note: depends on sync-writer invariant — if multi-extract
+  ever switches to pipelined `to_path` writers, `write_raw` falls back
+  to `to_vec()` copy per writer (performance regression, not correctness).
+- [x] **Per-closure `refs_buf` allocation** — fixed: `block_fn` signature
+  extended with `&mut Vec<i64>` scratch parameter, allocated once per
+  worker thread and reused across blobs. Way closure uses it for refs.
+  `members_buf` in relation closure cannot be hoisted due to
+  `MemberData<'a>` lifetime tied to PrimitiveBlock — remains per-blob
+  (small: ~480 bytes). Flagged by 2/6 reviewers.
+- [ ] **Raw passthrough unsafe for polygon regions** — `contained_in`
+  is computed from each slot's bbox, not polygon geometry. For polygon
+  or multipolygon extracts, "blob bbox contained in region bbox" does
+  not prove every node is inside the polygon — can raw-copy
+  out-of-polygon nodes. Pre-existing issue, not introduced by the
+  allocation fixes. Flagged by sweep review (bugs/codex).
 - [ ] **O(workers × regions) scaling for large N** — each worker
   allocates N BlockBuilders (~500 KB each). At N=50, ~200 MB across
   8 workers. At N=100+, ~400 MB. Monitor but acceptable for typical
@@ -528,14 +541,15 @@ per-iteration allocations remain across the codebase, ordered by impact:
   `merge_decoded_pair` uses these directly instead of re-scanning
   via `count_elements_up_to` (removed). Flagged by 4/8 reviewers.
 
-- [ ] **`has_indexdata()` only checks first blob** — `diff()` and
-  `derive_changes()` select the block-pair path based on
-  `has_indexdata()`, which only checks the first OsmData blob. If a
-  partially-indexed PBF starts indexed but has later unindexed blobs,
-  `next_blob_for_kind` hard-errors mid-run instead of falling back
-  to the element-stream path. Fix: either check all blobs upfront,
-  or fall back gracefully when a blob lacks indexdata. Pre-existing
-  issue, not introduced by v1. Flagged by 2/8 reviewers.
+- [x] **`has_indexdata()` only checks first blob** — fixed: both
+  `has_indexdata()` (mod.rs) and `check_sorted_and_indexed()` (diff.rs)
+  now scan ALL data blob headers. Uses header-only reads with seeks
+  (no decompression, no blob data I/O). Returns false if any data blob
+  lacks indexdata, correctly falling back to the element-stream path
+  for diff/derive_changes. Flagged by 2/8 reviewers.
+  Sweep review note: `check_sorted_and_indexed` duplicates the
+  index-scan logic from `has_indexdata` — mild maintenance drift risk.
+  Could extract a shared helper if more callers appear.
 
 - [x] **`diff` redundant header reads** — `check_sorted_and_indexed`
   reads sorted flag + indexdata from a single file open per input.

@@ -23,33 +23,60 @@ use super::stream_merge::{
 };
 use super::{Result, TypeFilter};
 use crate::blob_index::ElemKind;
-use crate::{Element, ElementReader, MemberType};
+use crate::{Element, MemberType};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Check if a PBF is sorted and has indexdata in a single file open.
+/// Check if a PBF is sorted and has indexdata.
 /// Returns `(is_sorted, has_indexdata)`.
+///
+/// The sorted flag comes from the OsmHeader blob (first blob, needs full
+/// read + decompress). Indexdata is verified on ALL data blobs via a
+/// header-only scan (no decompression, just blob header reads + seeks).
 pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(bool, bool)> {
-    let mut reader = crate::blob::BlobReader::open(path, direct_io)?;
-    reader.set_parse_indexdata(true);
-    let mut sorted = false;
-    let mut indexed = false;
-    for blob_result in &mut reader {
-        let blob = blob_result?;
-        match blob.get_type() {
-            crate::blob::BlobType::OsmHeader => {
-                let header = blob.to_headerblock()?;
-                sorted = header.is_sorted();
+    use crate::blob::BlobKind;
+
+    // Pass 1: read sorted flag from OsmHeader via BlobReader (reads ~1 blob).
+    let sorted = {
+        let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
+        let mut s = false;
+        for blob_result in &mut blob_reader {
+            let blob = blob_result?;
+            match blob.get_type() {
+                crate::blob::BlobType::OsmHeader => {
+                    let header = blob.to_headerblock()?;
+                    s = header.is_sorted();
+                }
+                _ => break,
             }
-            crate::blob::BlobType::OsmData => {
-                indexed = blob.index().is_some();
-                break; // Only need the first data blob.
-            }
-            _ => {}
         }
+        s
+    };
+
+    // Pass 2: header-only scan of all blobs to verify every OsmData blob
+    // has indexdata. Reads only blob headers (~100 bytes each), seeks past
+    // blob data. Planet-scale cost: sequential seek through file, no I/O
+    // on blob payloads.
+    let mut reader = crate::file_reader::FileReader::open(path, direct_io)?;
+    let mut offset = 0u64;
+    let mut indexed = true;
+    let mut saw_data = false;
+
+    while let Some(info) = super::read_blob_header_only(&mut reader, &mut offset)? {
+        if matches!(info.blob_type, BlobKind::OsmData) {
+            saw_data = true;
+            if info.index.is_none() {
+                indexed = false;
+                break;
+            }
+        }
+        reader.skip(info.data_size as u64)?;
+        offset += info.data_size as u64;
     }
+
+    if !saw_data { indexed = false; }
     Ok((sorted, indexed))
 }
 

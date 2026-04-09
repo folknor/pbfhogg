@@ -793,7 +793,7 @@ fn try_extract_multi_single_pass(
         &node_schedule,
         &node_blob_info,
         n,
-        |block, bbs, output| {
+        |block, bbs, output, _scratch| {
             let mut counts = vec![0u64; n];
             for element in block.elements() {
                 match &element {
@@ -859,20 +859,19 @@ fn try_extract_multi_single_pass(
         &shared_file,
         &way_schedule,
         n,
-        |block, bbs, output| {
+        |block, bbs, output, scratch| {
             let mut counts = vec![0u64; n];
-            let mut refs_buf: Vec<i64> = Vec::new();
             for element in block.elements() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
                     if !matched_way_ids.iter().any(|s| s.get(wid)) { continue; }
-                    refs_buf.clear();
-                    refs_buf.extend(w.refs());
+                    scratch.clear();
+                    scratch.extend(w.refs());
                     let meta = element_metadata(&w.info());
                     for i in 0..n {
                         if matched_way_ids[i].get(wid) {
                             ensure_way_capacity_local(&mut bbs[i], &mut output[i])?;
-                            bbs[i].add_way(wid, w.tags(), &refs_buf, meta.as_ref());
+                            bbs[i].add_way(wid, w.tags(), scratch, meta.as_ref());
                             counts[i] += 1;
                         }
                     }
@@ -916,7 +915,7 @@ fn try_extract_multi_single_pass(
         &shared_file,
         &relation_schedule,
         n,
-        |block, bbs, output| {
+        |block, bbs, output, _scratch| {
             let mut counts = vec![0u64; n];
             let mut members_buf: Vec<MemberData<'_>> = Vec::new();
             for element in block.elements() {
@@ -1094,7 +1093,7 @@ fn multi_extract_pread_write_nodes<F>(
     stats: &mut [ExtractStats],
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>)
+    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>, &mut Vec<i64>)
         -> std::result::Result<Vec<u64>, String> + Send + Sync,
 {
     use std::os::unix::fs::FileExt as _;
@@ -1129,7 +1128,7 @@ where
             shared_file.read_exact_at(&mut frame_buf, frame_offset)
                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
             for i in 0..n {
-                writers[i].write_raw_owned(frame_buf.clone())?;
+                writers[i].write_raw(&frame_buf)?;
                 stats[i].nodes_in_bbox += count;
             }
         }
@@ -1165,6 +1164,7 @@ where
                 let worker_pool = crate::blob::DecompressPool::new();
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut i64_scratch: Vec<i64> = Vec::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -1185,7 +1185,7 @@ where
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
                         for v in &mut output { v.clear(); }
-                        let counts = block_fn_ref(&block, &mut bbs, &mut output)
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
                             ))?;
@@ -1197,7 +1197,7 @@ where
                             })?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(std::mem::take)
+                            .map(|v| v.drain(..).collect())
                             .collect();
                         Ok((taken, counts))
                     })();
@@ -1256,7 +1256,7 @@ fn write_consumer_item(
             shared_file.read_exact_at(frame_buf, frame_offset)
                 .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
             for i in 0..n {
-                writers[i].write_raw_owned(frame_buf.clone())?;
+                writers[i].write_raw(frame_buf)?;
                 stats[i].nodes_in_bbox += count;
             }
         }
@@ -1286,7 +1286,7 @@ fn multi_extract_pread_write<F>(
     stat_field: fn(&mut ExtractStats) -> &mut u64,
 ) -> Result<()>
 where
-    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>)
+    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>, &mut Vec<i64>)
         -> std::result::Result<Vec<u64>, String> + Send + Sync,
 {
     use std::os::unix::fs::FileExt as _;
@@ -1325,6 +1325,7 @@ where
                 let worker_pool = crate::blob::DecompressPool::new();
                 let mut st_scratch: Vec<(u32, u32)> = Vec::new();
                 let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut i64_scratch: Vec<i64> = Vec::new();
 
                 loop {
                     let (s, data_offset, data_size) = {
@@ -1345,7 +1346,7 @@ where
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
                         for v in &mut output { v.clear(); }
-                        let counts = block_fn_ref(&block, &mut bbs, &mut output)
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output, &mut i64_scratch)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
                             ))?;
@@ -1358,7 +1359,7 @@ where
                             })?;
                         }
                         let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
-                            .map(std::mem::take)
+                            .map(|v| v.drain(..).collect())
                             .collect();
                         Ok((taken, counts))
                     })();

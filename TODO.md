@@ -602,18 +602,24 @@ per-iteration allocations remain across the codebase, ordered by impact:
   classification. `DenseNodeColumns` decodes IDs/lats/lons into
   contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass
   N-region bbox test. Used in multi-extract and single-extract.
-  `parallel_classify_phase` refactored to per-worker accumulation:
-  workers own persistent state S, classify mutates S without per-blob
-  return, merge receives S once per worker at scope exit. Hot paths
-  (node/way) use Vec accumulation (cache-friendly push). Sparse paths
-  (relation, way deps, geocode) use direct IdSetDense::set + merge.
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
-  Single-extract Japan alloc 6.4 GB → 2.0 GB (-69%).
-  Direct IdSetDense::set() in tight loops caused 29x regression —
-  reverted for hot paths, kept for sparse. See
-  [notes/columnar-integration.md](notes/columnar-integration.md).
-  Remaining alloc: multi-extract 8.7 GB from per-worker Vec growth.
-  Next step: contiguous worker sharding for non-overlapping IdSetDense.
+  See [notes/columnar-integration.md](notes/columnar-integration.md).
+
+- [ ] **`parallel_classify_phase` planet safety** — per-worker Vec
+  accumulation is NOT planet-safe for dense paths. Node classify
+  multi-extract: 48 GB worst case. Way classify single-extract:
+  ~11 GB. tags_filter pass 1 ClassifyResult: 2.9 GB per worker.
+  **Fix:** restore two-parameter `<S, R>` signature — `S` for
+  persistent scratch (DenseNodeColumns), `R` for per-blob results
+  sent through channel. Keep per-worker accumulation only for
+  relation classify (~68 MB per worker, bounded).
+  Design review (10 reviewers, 5 archetypes, 2026-04-09): unanimous
+  that per-blob send is the correct permanent solution. Consumer
+  throughput is not a bottleneck for realistic workloads.
+  Way dep IdSetDense accumulation (tags-filter, smart extract,
+  geocode) is disputed — 9 GB total at planet, tight but possibly
+  feasible. Needs measurement or revert to per-blob send.
+  See [notes/columnar-integration.md](notes/columnar-integration.md).
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

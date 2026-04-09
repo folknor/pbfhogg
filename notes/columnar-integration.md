@@ -108,17 +108,57 @@ SIMD becomes worthwhile when:
 - Polygon PIP (expensive per-node computation)
 - Batch varint decode in protohoggr (different target, broader impact)
 
-## Next steps
+## Next steps: planet-safe parallel_classify_phase
 
-The remaining alloc opportunity for multi-extract is the per-worker
-Vec growth (8.7 GB at Japan scale). Options:
-1. **Contiguous worker sharding** — assign each worker a contiguous
-   schedule slice instead of shared work queue. Per-worker IdSetDense
-   chunks would be non-overlapping, making merge zero-copy. Eliminates
-   Vec intermediary entirely without the random-access penalty (each
-   worker's IDs fall in a narrow chunk range).
-2. **Batch set_sorted_batch()** — amortize chunk lookup for runs of
-   IDs in the same chunk. Less effective than #1 but simpler.
-3. **Accept the Vec pattern** — 8.7 GB at Japan is bounded and
-   proportional to input size. The per-worker accumulation already
-   eliminated per-blob channel alloc.
+Full design review (10 reviewers, 5 archetypes, 2026-04-09) concluded
+that per-worker Vec accumulation is NOT planet-safe for dense paths.
+The per-blob send pattern (v1) is the correct permanent solution.
+
+### Consensus findings
+
+**Per-blob send is planet-safe.** Each per-blob Vec bounded by blob
+size (~64 KB per region). Consumer throughput is not a bottleneck for
+realistic workloads (continental extract: ~26s consumer vs ~33s decode
+at planet scale). Only pathological for whole-planet identity extract.
+
+**API: restore two-type-parameter signature.** `S` for persistent
+scratch (DenseNodeColumns, etc.), `R` for per-blob results (Vec<i64>).
+Workers send `R` per blob, keep `S` across blobs. Two functions:
+- `parallel_classify_phase<S, R>` — per-blob sends with scratch
+- `parallel_classify_accumulate<S>` — per-worker accumulation (current)
+
+### Per-path planet memory analysis
+
+| Path | State | Planet per-worker | Planet-safe? | Action |
+|------|-------|-------------------|-------------|--------|
+| Node classify (multi, 5 regions) | Vec<Vec<i64>> | 3.5 GB | **No** | Per-blob send |
+| Node classify (single) | Vec<i64> | 700 MB | Marginal | Per-blob send |
+| Way classify (single) | (Vec<i64>, Vec<i64>) | 1.6 GB way + 9.5 GB refs | **No** | Per-blob send |
+| Way classify (multi, 5 regions) | Vec<Vec<i64>> | 8 GB | **No** | Per-blob send |
+| tags_filter pass 1 ClassifyResult | Vec<(i64, Vec<i64>)> | 2.9 GB | **No** | Per-blob send |
+| Relation classify | (IdSetDense×3) | 68 MB | **Yes** | Keep accumulate |
+| tags_filter relation closure | Vec<i64> members | 13 MB | **Yes** | Keep accumulate |
+| Way dep node refs (tags_filter) | IdSetDense | 1.5 GB | Disputed | See below |
+| Way dep node refs (smart extract) | IdSetDense | 1.5 GB | Disputed | See below |
+| Geocode referenced nodes | IdSetDense | 1.5 GB | Disputed | See below |
+
+### Disputed: way dep IdSetDense accumulation
+
+Split opinion on per-worker IdSetDense for way dep node refs:
+- **Keep (correctness/claude):** 6 workers × 1.5 GB = 9 GB, feasible
+  on 30 GB host. Merge frees 5 copies → 1.5 GB final.
+- **Not safe (perf/codex, arch/codex, planet):** IdSetDense memory
+  is driven by chunk spread, not count. Shared work queue means each
+  worker touches the full node ID range → each allocates ~387 chunks
+  = ~1.5 GB. 6 × 1.5 GB = 9 GB is tight alongside other allocations.
+
+Decision pending. If we keep it, need planet-scale measurement to
+confirm 9 GB fits. If not, revert to per-blob send (each blob
+produces ~64K refs, bounded).
+
+### Future optimization (not needed now)
+
+Contiguous worker sharding and batch set_sorted_batch remain viable
+for future optimization if consumer throughput becomes a bottleneck.
+Both reviewers agree: do not build these yet. Address only if
+profiling shows consumer merge is the dominant cost.

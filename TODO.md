@@ -223,12 +223,15 @@ from simple extract applies to any sequential collection pass:
 
 **Do later:**
 
-- [ ] **Hybrid batching for pread workers** — workers accumulate N
-  decode items (e.g., 8-16) from the descriptor channel before
-  processing, reducing mutex contention and channel send/recv overhead.
-  Could recover the ~8s tags-filter pass 2 regression from pipelined
-  reader → pread workers conversion. Applies to `parallel_classify_phase`
-  and tags-filter pass 2 workers. Flagged by 4/6 reviewers.
+- [x] **Hybrid batching for pread workers** — CLOSED, not worth it.
+  The ~8s regression claim was a stale estimate from pipelined reader
+  vs pread worker comparison, not a measured mutex cost. Actual mutex
+  overhead: ~50ms for 500K blobs (6 workers, ~100ns uncontended futex).
+  Batch drain would save <1s on a 37s pass — not justified for the
+  added complexity. crossbeam channels would be simpler but also
+  no measurable benefit at current contention levels (~0.15% of CPU).
+  Perf review (2 reviewers, 2026-04-09): unanimous close.
+  See [notes/hybrid-batching-research.md](notes/hybrid-batching-research.md).
 
 - [ ] **Tags-filter raw passthrough via lightweight ID scanner** — the
   `count_in_range >= blob_count` check was unsound (extraneous IDs from

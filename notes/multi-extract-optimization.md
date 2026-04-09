@@ -137,9 +137,13 @@ to at least one region in a typical multi-extract configuration.
 
 ## Priority order
 
-1. **Scratch buffer reuse** (mechanical, immediate)
+1. ~~**Scratch buffer reuse**~~ — DONE (commit `19f8bc9`). `new_with_scratch`
+   in all 3 write phases.
 2. **Raw passthrough for contained blobs** (high impact, moderate effort)
-3. **Parallel decode in write phase** (Option A, high impact, moderate effort)
+3. ~~**Parallel decode in write phase**~~ — DONE (commit `9f72bcf`).
+   `multi_extract_pread_write` replaces sequential BlobReader in all 3
+   write phases. Denmark 5-region: 6.7s → 2.1s (3.2x). Japan 5-region:
+   32.5s → 8.1s (4.0x).
 4. **Columnar node classification** (moderate impact, low effort)
 5. **Thread-local region_ids** (low impact, mechanical)
 6. **Spatial index** (only for N > 50, future)

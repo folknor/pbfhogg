@@ -74,9 +74,20 @@ for (i, blocks) in result.region_blocks.iter().enumerate() {
 }
 ```
 
+## Status — DONE (commit `9f72bcf`)
+
+Steps 1-3 shipped. `multi_extract_pread_write` in `src/commands/extract.rs`
+replaces all three sequential write phases. Denmark 5-region: 6.7s → 2.1s
+(3.2x). Japan 5-region: 32.5s → 8.1s (4.0x). Verified via
+`brokkr verify multi-extract --regions 3` (PASS) and `--regions 5`
+(strip-4 known rounding issue, pre-existing).
+
+Step 4 (raw passthrough) and step 5 (pipelined writers) remain as
+future optimizations.
+
 ## Implementation steps
 
-### Step 1: Extract multi-extract write loop into a function
+### Step 1: Extract multi-extract write loop into a function — DONE
 
 Currently, each write phase (nodes/ways/relations) has an inline
 BlobReader loop. Extract into a shared function:
@@ -96,7 +107,7 @@ fn multi_extract_write_phase(
 ) -> Result<()>;
 ```
 
-### Step 2: Build schedule from indexdata
+### Step 2: Build schedule from indexdata — DONE
 
 The schedule is the same as what `build_classify_schedule` produces.
 Multi-extract already builds node/way/relation schedules for the
@@ -119,7 +130,7 @@ So the schedule for the write phase is the same as the classification
 schedule. We can reuse the `node_schedule`, `way_schedule`,
 `relation_schedule` vectors.
 
-### Step 3: Convert to pread-from-workers
+### Step 3: Convert to pread-from-workers — DONE
 
 Replace the sequential BlobReader loop with the pread pattern:
 

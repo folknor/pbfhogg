@@ -699,19 +699,36 @@ fn try_extract_multi_single_pass(
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut relation_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    // Per-node-blob passthrough metadata.
+    let mut node_blob_info: Vec<NodeBlobInfo> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        let (hdr, frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(idx) = hdr.index() {
             if !spatial_filter.wants_index(&idx) { continue; }
             match idx.kind {
-                crate::blob_index::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
+                crate::blob_index::ElemKind::Node => {
+                    let mut contained_in: Vec<usize> = Vec::new();
+                    if let Some(ref blob_bbox) = idx.bbox {
+                        for (i, bi) in bbox_ints.iter().enumerate() {
+                            let region_bbox = crate::BlobBbox::new(bi.min_lat, bi.max_lat, bi.min_lon, bi.max_lon);
+                            if region_bbox.contains(blob_bbox) {
+                                contained_in.push(i);
+                            }
+                        }
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    let frame_size = (data_offset - frame_offset) as usize + data_size;
+                    node_blob_info.push(NodeBlobInfo { contained_in, frame_offset, frame_size, count: idx.count });
+                    node_schedule.push((seq, data_offset, data_size));
+                }
                 crate::blob_index::ElemKind::Way => way_schedule.push((seq, data_offset, data_size)),
                 crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
             }
         } else {
             // No indexdata — include in all schedules (conservative).
+            node_blob_info.push(NodeBlobInfo { contained_in: Vec::new(), frame_offset, frame_size: 0, count: 0 });
             node_schedule.push((seq, data_offset, data_size));
             way_schedule.push((seq, data_offset, data_size));
             relation_schedule.push((seq, data_offset, data_size));
@@ -765,10 +782,11 @@ fn try_extract_multi_single_pass(
         },
     )?;
 
-    // Phase 1 write: parallel decode, write matching nodes to N writers.
-    multi_extract_pread_write(
+    // Phase 1 write: parallel decode with raw passthrough for fully-contained node blobs.
+    multi_extract_pread_write_nodes(
         &shared_file,
         &node_schedule,
+        &node_blob_info,
         n,
         |block, bbs, output| {
             let mut counts = vec![0u64; n];
@@ -803,7 +821,6 @@ fn try_extract_multi_single_pass(
         },
         &mut writers,
         &mut stats,
-        |s| &mut s.nodes_in_bbox,
     )?;
 
     // Phase 2: Parallel way classification → N matched_way_ids.
@@ -1046,6 +1063,206 @@ pub fn extract(
 // ---------------------------------------------------------------------------
 // Parallel batch infrastructure
 // ---------------------------------------------------------------------------
+
+/// Node write phase with raw passthrough for fully-contained blobs.
+///
+/// Blobs fully contained in ALL N regions are written as raw frames to all
+/// N writers without decode. Other blobs go through parallel decode workers.
+/// Both streams are interleaved in sequence order via ReorderBuffer.
+#[allow(clippy::too_many_lines)]
+/// Per-node-blob passthrough metadata: (contained_regions, frame_offset, frame_size, count).
+struct NodeBlobInfo {
+    contained_in: Vec<usize>,
+    frame_offset: u64,
+    frame_size: usize,
+    count: u64,
+}
+
+#[allow(clippy::too_many_lines)]
+fn multi_extract_pread_write_nodes<F>(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    blob_info: &[NodeBlobInfo],
+    n: usize,
+    block_fn: F,
+    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
+    stats: &mut [ExtractStats],
+) -> Result<()>
+where
+    F: Fn(&PrimitiveBlock, &mut Vec<BlockBuilder>, &mut Vec<Vec<OwnedBlock>>)
+        -> std::result::Result<Vec<u64>, String> + Send + Sync,
+{
+    use std::os::unix::fs::FileExt as _;
+
+    if schedule.is_empty() { return Ok(()); }
+
+    // Blobs fully contained in ALL N regions skip decode entirely — write raw
+    // frame to all N writers. Other blobs go through parallel decode workers.
+    let mut decode_items: Vec<(usize, u64, usize)> = Vec::new();
+    let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
+    for (local_seq, ((_global_seq, data_offset, data_size), info)) in
+        schedule.iter().zip(blob_info.iter()).enumerate()
+    {
+        if info.contained_in.len() == n {
+            passthrough_items.push((local_seq, info.frame_offset, info.frame_size, info.count));
+        } else {
+            decode_items.push((local_seq, *data_offset, *data_size));
+        }
+    }
+
+    if !passthrough_items.is_empty() {
+        let pt = passthrough_items.len();
+        let dc = decode_items.len();
+        eprintln!("  node blobs: {pt} passthrough, {dc} decoded");
+    }
+
+    // If everything is passthrough, skip the thread scope entirely.
+    if decode_items.is_empty() {
+        let mut frame_buf: Vec<u8> = Vec::new();
+        for &(_, frame_offset, frame_size, count) in &passthrough_items {
+            frame_buf.resize(frame_size, 0);
+            shared_file.read_exact_at(&mut frame_buf, frame_offset)
+                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+            for i in 0..n {
+                writers[i].write_raw_owned(frame_buf.clone())?;
+                stats[i].nodes_in_bbox += count;
+            }
+        }
+        return Ok(());
+    }
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|t| t.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    type WorkerResult = crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>;
+
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<(usize, MultiNodeCI)>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        scope.spawn(move || {
+            for item in decode_items {
+                if desc_tx.send(item).is_err() { break; }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = result_tx.clone();
+            let file = std::sync::Arc::clone(shared_file);
+            let block_fn_ref = &block_fn;
+            scope.spawn(move || {
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut bbs: Vec<BlockBuilder> = (0..n).map(|_| BlockBuilder::new()).collect();
+                let mut output: Vec<Vec<OwnedBlock>> = (0..n).map(|_| Vec::new()).collect();
+                let worker_pool = crate::blob::DecompressPool::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+                loop {
+                    let (s, data_offset, data_size) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let r: WorkerResult = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+                        let mut buf = crate::blob::pool_get_pub(&worker_pool, data_size * 4);
+                        crate::blob::decompress_blob_raw(&read_buf, &mut buf)?;
+                        let block = PrimitiveBlock::from_vec_pooled_with_scratch(
+                            buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
+                        )?;
+                        for v in &mut output { v.clear(); }
+                        let counts = block_fn_ref(&block, &mut bbs, &mut output)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            ))?;
+                        for i in 0..n {
+                            flush_local(&mut bbs[i], &mut output[i]).map_err(|e| {
+                                crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
+                                )
+                            })?;
+                        }
+                        let taken: Vec<Vec<OwnedBlock>> = output.iter_mut()
+                            .map(std::mem::take)
+                            .collect();
+                        Ok((taken, counts))
+                    })();
+                    if tx.send((s, MultiNodeCI::Decoded(r))).is_err() { break; }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(result_tx);
+
+        // Pre-insert passthrough items into the reorder buffer.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<MultiNodeCI> =
+            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+        for &(local_seq, frame_offset, frame_size, count) in &passthrough_items {
+            reorder.push(local_seq, MultiNodeCI::Passthrough(frame_offset, frame_size, count));
+        }
+
+        let mut frame_buf: Vec<u8> = Vec::new();
+        for (s, item) in result_rx {
+            reorder.push(s, item);
+            while let Some(ci) = reorder.pop_ready() {
+                write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
+            }
+        }
+        while let Some(ci) = reorder.pop_ready() {
+            write_consumer_item(ci, n, shared_file, &mut frame_buf, writers, stats)?;
+        }
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Write one consumer item (decoded or passthrough) to N writers.
+fn write_consumer_item(
+    item: MultiNodeCI,
+    n: usize,
+    shared_file: &std::sync::Arc<std::fs::File>,
+    frame_buf: &mut Vec<u8>,
+    writers: &mut [PbfWriter<std::io::BufWriter<std::fs::File>>],
+    stats: &mut [ExtractStats],
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+    match item {
+        MultiNodeCI::Decoded(r) => {
+            let (region_blocks, counts) = r?;
+            for (i, blocks) in region_blocks.into_iter().enumerate() {
+                stats[i].nodes_in_bbox += counts[i];
+                for (block_bytes, index, tagdata) in blocks {
+                    writers[i].write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
+                }
+            }
+        }
+        MultiNodeCI::Passthrough(frame_offset, frame_size, count) => {
+            frame_buf.resize(frame_size, 0);
+            shared_file.read_exact_at(frame_buf, frame_offset)
+                .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
+            for i in 0..n {
+                writers[i].write_raw_owned(frame_buf.clone())?;
+                stats[i].nodes_in_bbox += count;
+            }
+        }
+    }
+    Ok(())
+}
+
+enum MultiNodeCI {
+    Decoded(crate::error::Result<(Vec<Vec<OwnedBlock>>, Vec<u64>)>),
+    Passthrough(u64, usize, u64),
+}
 
 /// Multi-region pread-from-workers write pass.
 ///

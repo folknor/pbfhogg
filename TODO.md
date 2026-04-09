@@ -374,9 +374,13 @@ for full analysis of 6 optimization opportunities.
 - [ ] **Complete/smart strategies** — per-region way/relation ID
   tracking. Memory: N × ~3 GB (bbox_node_ids + all_way_node_ids per
   region). Feasible for ~10 regions on 30 GB host, ~40 on 128 GB.
-- [ ] **Raw passthrough** — node blobs fully contained in a region's
-  bbox passed through raw to that region's writer. Per-blob per-region
-  passthrough decisions (blob bbox contained in region bbox).
+- [ ] **Raw passthrough** — infrastructure in place: `NodeBlobInfo`
+  tracks per-region containment, `multi_extract_pread_write_nodes`
+  handles passthrough via ReorderBuffer interleaving. Currently only
+  fires when a blob is contained in ALL N regions (useful for N=1 or
+  fully-overlapping regions). Per-region passthrough for disjoint
+  strips needs hybrid decode+raw consumer path — decode once, write
+  raw to contained regions, route elements to non-contained regions.
 
 ### Export (GeoJSON/GeoPackage)
 

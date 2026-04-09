@@ -149,15 +149,11 @@ level tuning, and reducing per-element overhead in
 is the hot path — FxHashMap lookup + Rc<str> alloc per unique string).
 See [notes/SIMD.md](notes/SIMD.md) for the varint research.
 
-**Zlib level tuning:** default is level 6 (matches osmium). Code audit
-confirms the write path is well-optimized — BlockBuilder uses direct
-wire-format encoding with scratch buffers, dual-buffer single-pass tag
-encoding. The remaining CPU goes to zlib compression in rayon workers.
-Level 1-3 could save 30-60% compression CPU for pipeline-internal PBFs.
-zstd level 3 is strictly better for internal pipelines (3-5x faster
-decompress). See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md)
-for the analysis. Benchmark needed: `brokkr cat --compression zlib:1`
-vs `zlib:6` vs `zstd:3` on Denmark/Europe.
+**Zlib level tuning:** extremely low priority. Investigated multiple
+times in the project's history with no actionable outcome. Default
+level 6 matches osmium and is the right choice for interop. zstd is
+better for internal pipelines but the production pipeline already
+works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
 
 ### Published benchmark matrix
 
@@ -698,15 +694,12 @@ per-iteration allocations remain across the codebase, ordered by impact:
   bboxes are limited by chronological ID ordering (~30% skip for Denmark,
   not 50-80%). Geography-sorted way blobs (Hilbert curve) would give
   90%+ skip but breaks Sort.Type_then_ID. Multi-extract benefits most.
-- [ ] Streaming pipeline composition (pipe commands without intermediate
-  PBF encode/decode — library-level iterator API).
-  See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md)
-  for analysis. Key finding: the codebase already does the most valuable
-  composition (inline indexdata in all write paths). Multi-pass commands
-  (ALTW, extract, geocode) can't consume streams. Limited practical
-  benefit beyond what exists.
-- [ ] Zstd as default compression for internal pipelines (3-5x faster
-  decompress than zlib at equivalent ratios).
+- [x] Streaming pipeline composition — CLOSED, limited benefit.
+  The codebase already does the most valuable composition (inline
+  indexdata in all write paths). Multi-pass commands can't consume
+  streams. See [notes/streaming-pipeline-composition.md](notes/streaming-pipeline-composition.md).
+- [ ] Zstd as default compression for internal pipelines — extremely
+  low priority. Investigated multiple times, production pipeline works.
 - [ ] Dense ALTW compact rank-indexed array (same pattern as geocode builder —
   better locality on hosts where dense currently works, reviewers split 1/8).
 - [ ] Verify GeoJSON polygon format coverage for extract (does `--polygon`

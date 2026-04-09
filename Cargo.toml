@@ -6,7 +6,8 @@ dependencies = {}
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
-license = "Apache-2.0"
+license = "MIT OR Apache-2.0"
+authors = ["folknor <folk@folk.wtf>"]
 repository = "https://github.com/folknor/pbfhogg"
 
 [workspace.lints.clippy]
@@ -46,6 +47,7 @@ too_many_lines = "deny"
 [package]
 name = "pbfhogg"
 version.workspace = true
+authors.workspace = true
 description = "Fast OpenStreetMap PBF reader and writer for Rust. Read, write, and merge .osm.pbf files with pipelined parallel decoding."
 license.workspace = true
 edition.workspace = true
@@ -65,7 +67,7 @@ linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
 
 [dependencies]
-protohoggr = { path = "../protohoggr" }
+protohoggr = { version = "0.2.1", path = "../protohoggr" }
 bytes = "1"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9"

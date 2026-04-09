@@ -710,9 +710,9 @@ per-iteration allocations remain across the codebase, ordered by impact:
 
 ### crates.io blockers
 
-- [ ] **Publish `protohoggr` first** — currently `path = "../protohoggr"` only. Add `version = "0.2"` alongside the path dep so crates.io resolves it. Publish protohoggr before pbfhogg.
-- [ ] **Add `version` to CLI path dep** — `cli/Cargo.toml` needs `version = "0.2"` on the `pbfhogg` dep if we publish pbfhogg-cli too (or skip publishing the CLI crate).
-- [ ] **Clarify license** — README mentions MIT but only Apache-2.0 is declared. Pick one story.
+- [x] **Publish `protohoggr` first** — published as 0.2.0. `version = "0.2"` added alongside path dep.
+- [x] **Add `version` to CLI path dep** — `cli/Cargo.toml` has `version = "0.2"` on pbfhogg dep.
+- [x] **Clarify license** — dual MIT/Apache-2.0. Cargo.toml, README, and LICENSE-MIT updated.
 
 ### Testing
 
@@ -805,8 +805,8 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 ### Other
 
-- [ ] Add LICENSE-APACHE copyright header (currently has upstream b-r-u only)
-- [ ] Add a CHANGELOG.md before first tagged release
+- [x] Add LICENSE-APACHE copyright header — addressed by dual MIT/Apache-2.0 licensing
+- [x] Add a CHANGELOG.md before first tagged release
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release
 - [ ] Write a small 1-page project website (what it does, benchmarks, usage, link to repo)

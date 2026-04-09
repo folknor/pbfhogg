@@ -7,6 +7,9 @@ repository.workspace = true
 description = "Command-line OpenStreetMap PBF toolkit"
 readme = "README.md"
 rust-version = "1.87"
+authors = ["folknor <folk@folk.wtf>"]
+keywords = ["osm", "openstreetmap", "pbf", "cli", "gis"]
+categories = ["command-line-utilities", "science::geo"]
 
 [[bin]]
 name = "pbfhogg"
@@ -20,7 +23,7 @@ linux-direct-io = ["pbfhogg/linux-direct-io"]
 linux-io-uring = ["pbfhogg/linux-io-uring"]
 
 [dependencies]
-pbfhogg = { path = "..", default-features = false, features = ["commands"] }
+pbfhogg = { version = "0.2", path = "..", default-features = false, features = ["commands"] }
 clap = { version = "4.6.0", features = ["derive"] }
 serde_json = "1"
 hotpath = "0.14"

@@ -499,12 +499,10 @@ per-iteration allocations remain across the codebase, ordered by impact:
   `read_dense_node`/`read_way`/`read_relation` still allocate full
   `OwnedMetadata` with timestamp/changeset/uid/user String).
 
-- [ ] **`element_merge_pair` return consumed counts** —
-  `merge_decoded_pair` calls `count_elements_up_to` to re-iterate
-  already-merged elements just to count how many were consumed.
-  `element_merge_pair` could return the consumed count from each side
-  directly, eliminating the redundant re-scan (~8000 elements per
-  block for misaligned residuals). Flagged by 4/8 reviewers.
+- [x] **`element_merge_pair` return consumed counts** —
+  `element_merge_pair` now returns `(old_consumed, new_consumed)`.
+  `merge_decoded_pair` uses these directly instead of re-scanning
+  via `count_elements_up_to` (removed). Flagged by 4/8 reviewers.
 
 - [ ] **`has_indexdata()` only checks first blob** — `diff()` and
   `derive_changes()` select the block-pair path based on

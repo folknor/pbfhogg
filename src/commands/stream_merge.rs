@@ -701,7 +701,7 @@ fn merge_decoded_pair(
     let mut ns = new_decoded.take().expect("checked Some");
 
     let merge_up_to = os.index.max_id.min(ns.index.max_id);
-    element_merge_pair(
+    let (old_consumed, new_consumed) = element_merge_pair(
         &os.block,
         os.skip_count,
         &ns.block,
@@ -712,13 +712,11 @@ fn merge_decoded_pair(
     )?;
 
     if os.index.max_id > merge_up_to {
-        let consumed = count_elements_up_to(&os.block, os.skip_count, merge_up_to);
-        os.skip_count += consumed;
+        os.skip_count += old_consumed;
         *old_decoded = Some(os);
     }
     if ns.index.max_id > merge_up_to {
-        let consumed = count_elements_up_to(&ns.block, ns.skip_count, merge_up_to);
-        ns.skip_count += consumed;
+        ns.skip_count += new_consumed;
         *new_decoded = Some(ns);
     }
     Ok(())
@@ -840,24 +838,13 @@ fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
         }
 }
 
-/// Count how many elements in `block` (starting from `skip`) have id <= `up_to`.
-fn count_elements_up_to(block: &PrimitiveBlock, skip: usize, up_to: i64) -> usize {
-    let mut count = 0;
-    for elem in block.elements().skip(skip) {
-        if element_id(&elem) > up_to {
-            break;
-        }
-        count += 1;
-    }
-    count
-}
-
 /// Two-pointer element merge over a pair of decoded blocks.
 ///
 /// Processes elements up to `merge_up_to` ID (inclusive). Elements beyond that
 /// boundary in either block are left unconsumed for the caller to handle.
 ///
-/// Uses `osm_id_cmp` for element ordering (positive IDs in practice).
+/// Returns `(old_consumed, new_consumed)` — the number of elements consumed
+/// from each side, so the caller can update skip counts without re-scanning.
 fn element_merge_pair(
     old_block: &PrimitiveBlock,
     old_skip: usize,
@@ -866,12 +853,13 @@ fn element_merge_pair(
     merge_up_to: i64,
     type_char: char,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
-) -> Result<()> {
+) -> Result<(usize, usize)> {
     let mut old_iter = old_block.elements().skip(old_skip).peekable();
     let mut new_iter = new_block.elements().skip(new_skip).peekable();
+    let mut old_consumed: usize = 0;
+    let mut new_consumed: usize = 0;
 
     loop {
-        // Check if both sides are within range.
         let old_in_range = old_iter
             .peek()
             .is_some_and(|e| element_id(e) <= merge_up_to);
@@ -884,10 +872,12 @@ fn element_merge_pair(
             (true, false) => {
                 let o = old_iter.next().expect("checked peek");
                 on_action(BlockMergeAction::ElementOldOnly(&o))?;
+                old_consumed += 1;
             }
             (false, true) => {
                 let n = new_iter.next().expect("checked peek");
                 on_action(BlockMergeAction::ElementNewOnly(&n))?;
+                new_consumed += 1;
             }
             (true, true) => {
                 let o_id = element_id(old_iter.peek().expect("checked"));
@@ -897,14 +887,18 @@ fn element_merge_pair(
                     std::cmp::Ordering::Less => {
                         let o = old_iter.next().expect("checked");
                         on_action(BlockMergeAction::ElementOldOnly(&o))?;
+                        old_consumed += 1;
                     }
                     std::cmp::Ordering::Greater => {
                         let n = new_iter.next().expect("checked");
                         on_action(BlockMergeAction::ElementNewOnly(&n))?;
+                        new_consumed += 1;
                     }
                     std::cmp::Ordering::Equal => {
                         let o = old_iter.next().expect("checked");
                         let n = new_iter.next().expect("checked");
+                        old_consumed += 1;
+                        new_consumed += 1;
                         if borrowed_elements_equal(&o, &n) {
                             on_action(BlockMergeAction::ElementEqual {
                                 id: o_id,
@@ -923,6 +917,6 @@ fn element_merge_pair(
         }
     }
 
-    Ok(())
+    Ok((old_consumed, new_consumed))
 }
 

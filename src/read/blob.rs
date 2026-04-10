@@ -469,6 +469,15 @@ impl Blob {
         decompress_blob(&self.blob, Some(pool))
     }
 
+    /// Decompress into a caller-owned buffer, avoiding the Bytes→Vec copy.
+    ///
+    /// The buffer is cleared and refilled. Its backing allocation is retained
+    /// across calls, so sequential loops avoid per-blob heap allocation.
+    /// Use with `PrimitiveBlock::from_vec_with_scratch` on the taken buffer.
+    pub(crate) fn decompress_into(&self, buf: &mut Vec<u8>) -> Result<()> {
+        decompress_wire_blob_into(&self.blob, buf)
+    }
+
     /// Returns the blob-level index from the header's `indexdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs
@@ -1282,6 +1291,40 @@ pub(crate) fn decompress_blob(
         }
         None => Err(new_blob_error(BlobError::Empty)),
     }
+}
+
+/// Decompress a WireBlob into a caller-owned buffer.
+///
+/// Avoids the Bytes→Vec round-trip of `decompress_blob()` → `.to_vec()`.
+/// The buffer is cleared and refilled; its backing allocation is retained
+/// across calls for sequential decode loops.
+fn decompress_wire_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()> {
+    buf.clear();
+    match &blob.data {
+        Some(BlobData::Raw(bytes)) => {
+            let size = bytes.len() as u64;
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                return Err(new_blob_error(BlobError::MessageTooBig { size }));
+            }
+            buf.extend_from_slice(bytes);
+        }
+        Some(BlobData::Zlib(bytes)) => {
+            let est = blob.estimated_capacity();
+            if est > 0 { buf.reserve(est); }
+            zlib_decompress_into(bytes, buf)?;
+        }
+        Some(BlobData::Zstd(bytes)) => {
+            let est = blob.estimated_capacity();
+            if est > 0 { buf.reserve(est); }
+            zstd::stream::copy_decode(Cursor::new(&**bytes), &mut *buf)?;
+            let size = buf.len() as u64;
+            if size > MAX_BLOB_MESSAGE_SIZE {
+                return Err(new_blob_error(BlobError::MessageTooBig { size }));
+            }
+        }
+        None => return Err(new_blob_error(BlobError::Empty)),
+    }
+    Ok(())
 }
 
 /// Decompress and parse a blob's data as a HeaderBlock.

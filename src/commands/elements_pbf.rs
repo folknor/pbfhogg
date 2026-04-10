@@ -140,47 +140,6 @@ impl OwnedElement {
 }
 
 // ---------------------------------------------------------------------------
-// Tags/members helper methods
-// ---------------------------------------------------------------------------
-
-impl OwnedNode {
-    pub(crate) fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-}
-
-impl OwnedWay {
-    pub(crate) fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-}
-
-impl OwnedRelation {
-    pub(crate) fn tags_as_pairs(&self) -> Vec<(&str, &str)> {
-        self.tags
-            .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
-            .collect()
-    }
-
-    pub(crate) fn members_as_data(&self) -> Vec<MemberData<'_>> {
-        self.members
-            .iter()
-            .map(|m| MemberData {
-                id: m.id,
-                role: &m.role,
-            })
-            .collect()
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Shared helper
 // ---------------------------------------------------------------------------
 

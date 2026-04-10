@@ -816,20 +816,24 @@ Prioritized by planet-scale value/effort ratio (4 reviewers: perf+planet,
 
 Planet reviewers rank #1: broadest cross-command impact, hits hot write/rewrite
 paths in sort, merge, diff, derive_changes, cat --type, extract, tags-filter.
-~80+ GB cumulative alloc at Japan scale from `tags_as_pairs()`,
-`members_as_data()`, and tag Vec construction in every `write_single_*` call.
 
-- `PrimitiveBlock::new` always copies `Bytes` to `Vec` via `to_vec()`.
-  Could try `Bytes::try_into_mut()` first to avoid the copy when refcount
-  is 1, but `parse_and_inline` needs `&mut Vec<u8>` so this requires
-  reworking the wire parser to accept `&mut BytesMut` or a similar type.
-- `tags_as_pairs()` and `members_as_data()` in `elements_pbf.rs` allocate
-  a `Vec` per call. The `add_node`/`add_way`/`add_relation` methods accept
-  iterators, so callers could pass iterators directly — but `MemberData`
-  borrows from the block, creating lifetime issues when the buffer outlives
-  the block (same reason `members_buf` can't be hoisted out of the per-blob
-  loop in `renumber.rs`). Fix requires either owned member data or
-  restructuring the encode API.
+**Phase A (tags_as_pairs): DONE.** `write_single_node/way/relation` already
+pass iterators (commit `bb15e66`). `time_filter.rs` was the last caller of
+`tags_as_pairs()` and `members_as_data()` — converted to pass iterators.
+Both helper methods removed.
+
+**Phase B (Bytes→Vec copy elimination): IN PROGRESS.** `decompress_pooled()` →
+`new_with_scratch(Bytes)` copies 1.5 MB per blob via `.to_vec()`. Replaced
+with `decompress_into(&mut Vec)` → `from_vec_with_scratch(take(&mut buf))`
+in sequential callers, avoiding the copy entirely. New infrastructure:
+`Blob::decompress_into()`, `PrimitiveBlock::from_vec_with_scratch()`.
+Converted: tags_count, node_stats, check_refs, renumber.
+Remaining: add_locations_to_ways (4 sites), external_join (1),
+inspect (1), extract (3), stream_merge (2), geocode builder (1).
+
+**Phase C (members_scratch): SKIPPED.** Per planet/claude review: 14M
+relations × ~10 members × 24 bytes = 3.4 GB cumulative at planet. All
+allocator fast-path, no RSS impact. Not worth the API complexity.
 
 ### Priority 2: IdSet — migrate from BTreeSet to IdSetDense
 

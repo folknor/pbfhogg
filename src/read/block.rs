@@ -429,8 +429,19 @@ impl PrimitiveBlock {
         Self::finish(Bytes::from(buffer), &meta)
     }
 
+    /// Like [`from_vec`] but reuses caller-provided scratch buffers.
+    /// Sequential loops call this to avoid per-block scratch allocation.
+    pub(crate) fn from_vec_with_scratch(
+        mut buffer: Vec<u8>,
+        st_scratch: &mut Vec<(u32, u32)>,
+        gr_scratch: &mut Vec<(u32, u32)>,
+    ) -> Result<PrimitiveBlock> {
+        let meta = WireBlock::parse_and_inline_with_scratch(&mut buffer, st_scratch, gr_scratch)?;
+        Self::finish(Bytes::from(buffer), &meta)
+    }
+
     /// Like [`from_vec`] but wraps the buffer with pool recycling.
-    /// for `parse_and_inline`. Workers in `parallel_classify_phase` call this
+    /// Workers in `parallel_classify_phase` call this
     /// with loop-local scratch to avoid per-block allocation.
     pub(crate) fn from_vec_pooled_with_scratch(
         mut buffer: Vec<u8>,

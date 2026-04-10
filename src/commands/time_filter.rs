@@ -9,7 +9,7 @@ use super::elements_pbf::{
     OwnedElement, owned_to_metadata, read_dense_node, read_node, read_way, read_relation,
 };
 use super::{HeaderOverrides, Result, require_sorted, warn_locations_on_ways_loss, writer_from_header};
-use crate::block_builder::BlockBuilder;
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::Compression;
 use crate::{DenseNode, Element, ElementReader, Node, Relation, Way};
 
@@ -160,7 +160,7 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(n.metadata.as_ref());
-            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, n.tags_as_pairs(), meta.as_ref());
+            bb.add_node(n.id, n.decimicro_lat, n.decimicro_lon, n.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), meta.as_ref());
         }
         OwnedElement::Way(w) => {
             if !bb.can_add_way()
@@ -169,7 +169,7 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(w.metadata.as_ref());
-            bb.add_way(w.id, w.tags_as_pairs(), &w.refs, meta.as_ref());
+            bb.add_way(w.id, w.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), &w.refs, meta.as_ref());
         }
         OwnedElement::Relation(r) => {
             if !bb.can_add_relation()
@@ -178,8 +178,8 @@ fn write_owned_element(
                 writer.write_primitive_block_owned(bytes, index, tagdata.as_deref())?;
             }
             let meta = owned_to_metadata(r.metadata.as_ref());
-            let members = r.members_as_data();
-            bb.add_relation(r.id, r.tags_as_pairs(), &members, meta.as_ref());
+            let members: Vec<MemberData<'_>> = r.members.iter().map(|m| MemberData { id: m.id, role: &m.role }).collect();
+            bb.add_relation(r.id, r.tags.iter().map(|(k, v)| (k.as_str(), v.as_str())), &members, meta.as_ref());
         }
     }
     Ok(())

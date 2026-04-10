@@ -87,9 +87,8 @@ pub fn tags_count(
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
-
     let mut counts: CountMap = FxHashMap::default();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     crate::debug::emit_marker("TAGSCOUNT_START");
@@ -101,8 +100,10 @@ pub fn tags_count(
                 if !filter.wants_index(&idx) { continue; }
             }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
         count_block_tags(&mut counts, &block, tf.nodes, tf.ways, tf.relations, &expressions);
     }
 

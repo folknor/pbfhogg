@@ -173,7 +173,7 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
     let mut node_count: u64 = 0;
     let mut min_lat = i32::MAX;
@@ -196,8 +196,10 @@ pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStats
         if let Some(idx) = blob.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
         for element in block.elements_skip_metadata() {
             let (lat_e7, lon_e7) = match &element {
                 Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),

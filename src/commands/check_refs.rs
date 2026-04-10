@@ -113,7 +113,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
     let mut node_ids = RoaringTreemap::new();
     let mut way_ids = RoaringTreemap::new();
@@ -161,8 +161,10 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 }
             }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
         for element in block.elements_skip_metadata() {
         match element {
             Element::DenseNode(dn) => {

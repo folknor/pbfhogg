@@ -9,7 +9,6 @@ use super::{
     dense_node_metadata, element_metadata, ensure_node_capacity, ensure_relation_capacity,
     ensure_way_capacity, flush_block, require_sorted, writer_from_header, HeaderOverrides, Result,
 };
-use crate::blob::DecompressPool;
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::Compression;
 use crate::{Element, MemberId};
@@ -79,7 +78,7 @@ pub fn renumber(
     };
 
     let mut refs_buf: Vec<i64> = Vec::new();
-    let decompress_pool = DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -87,8 +86,10 @@ pub fn renumber(
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
         let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {

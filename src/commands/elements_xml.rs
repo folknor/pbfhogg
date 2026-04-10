@@ -256,3 +256,165 @@ pub(crate) fn write_tags_xml<W: std::io::Write>(
     }
     Ok(())
 }
+
+fn write_borrowed_tags_xml<'a, W: std::io::Write>(
+    writer: &mut Writer<W>,
+    tags: impl Iterator<Item = (&'a str, &'a str)>,
+) -> super::Result<()> {
+    for (k, v) in tags {
+        let mut tag = BytesStart::new("tag");
+        tag.push_attribute(("k", k));
+        tag.push_attribute(("v", v));
+        writer.write_event(Event::Empty(tag))?;
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Borrowed element XML writing — zero-clone path for derive_changes
+// ---------------------------------------------------------------------------
+
+/// Write a borrowed `Element` as XML. Avoids the owned conversion path
+/// (no tag/ref/member String cloning). Used by derive_changes for the
+/// create/modify paths.
+pub(crate) fn write_element_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    elem: &crate::Element<'_>,
+    coord_buf: &mut String,
+) -> super::Result<()> {
+    match elem {
+        crate::Element::DenseNode(dn) => write_dense_node_xml(writer, dn, coord_buf),
+        crate::Element::Node(n) => write_borrowed_node_xml(writer, n, coord_buf),
+        crate::Element::Way(w) => write_borrowed_way_xml(writer, w),
+        crate::Element::Relation(r) => write_borrowed_relation_xml(writer, r),
+    }
+}
+
+fn write_dense_node_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    node: &crate::dense::DenseNode<'_>,
+    coord_buf: &mut String,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("node");
+    let id_str = node.id().to_string();
+    format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
+    let lat_str = coord_buf.clone();
+    format_coord(coord_buf, from_decimicro(node.decimicro_lon()));
+    elem.push_attribute(("id", id_str.as_str()));
+    elem.push_attribute(("lat", lat_str.as_str()));
+    elem.push_attribute(("lon", coord_buf.as_str()));
+    if let Some(info) = node.info() {
+        let v = info.version();
+        if v != -1 {
+            let v_str = v.to_string();
+            elem.push_attribute(("version", v_str.as_str()));
+        }
+    }
+
+    let mut tags = node.tags().peekable();
+    if tags.peek().is_none() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        write_borrowed_tags_xml(writer, tags)?;
+        writer.write_event(Event::End(BytesEnd::new("node")))?;
+    }
+    Ok(())
+}
+
+fn write_borrowed_node_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    node: &crate::elements::Node<'_>,
+    coord_buf: &mut String,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("node");
+    let id_str = node.id().to_string();
+    format_coord(coord_buf, from_decimicro(node.decimicro_lat()));
+    let lat_str = coord_buf.clone();
+    format_coord(coord_buf, from_decimicro(node.decimicro_lon()));
+    elem.push_attribute(("id", id_str.as_str()));
+    elem.push_attribute(("lat", lat_str.as_str()));
+    elem.push_attribute(("lon", coord_buf.as_str()));
+    if let Some(v) = node.info().version() {
+        let v_str = v.to_string();
+        elem.push_attribute(("version", v_str.as_str()));
+    }
+
+    let mut tags = node.tags().peekable();
+    if tags.peek().is_none() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        write_borrowed_tags_xml(writer, tags)?;
+        writer.write_event(Event::End(BytesEnd::new("node")))?;
+    }
+    Ok(())
+}
+
+fn write_borrowed_way_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    way: &crate::elements::Way<'_>,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("way");
+    let id_str = way.id().to_string();
+    elem.push_attribute(("id", id_str.as_str()));
+    if let Some(v) = way.info().version() {
+        let v_str = v.to_string();
+        elem.push_attribute(("version", v_str.as_str()));
+    }
+
+    let refs: Vec<i64> = way.refs().collect();
+    let mut tags = way.tags().peekable();
+    if refs.is_empty() && tags.peek().is_none() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        for r in &refs {
+            let mut nd = BytesStart::new("nd");
+            let r_str = r.to_string();
+            nd.push_attribute(("ref", r_str.as_str()));
+            writer.write_event(Event::Empty(nd))?;
+        }
+        write_borrowed_tags_xml(writer, tags)?;
+        writer.write_event(Event::End(BytesEnd::new("way")))?;
+    }
+    Ok(())
+}
+
+fn write_borrowed_relation_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    rel: &crate::elements::Relation<'_>,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("relation");
+    let id_str = rel.id().to_string();
+    elem.push_attribute(("id", id_str.as_str()));
+    if let Some(v) = rel.info().version() {
+        let v_str = v.to_string();
+        elem.push_attribute(("version", v_str.as_str()));
+    }
+
+    let members: Vec<_> = rel.members().collect();
+    let mut tags = rel.tags().peekable();
+    if members.is_empty() && tags.peek().is_none() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        for m in &members {
+            let mut member = BytesStart::new("member");
+            let type_str = match m.id {
+                crate::MemberId::Node(_) => "node",
+                crate::MemberId::Way(_) => "way",
+                crate::MemberId::Relation(_) => "relation",
+                crate::MemberId::Unknown(_, _) => "node",
+            };
+            let member_id = m.id.id().to_string();
+            member.push_attribute(("type", type_str));
+            member.push_attribute(("ref", member_id.as_str()));
+            member.push_attribute(("role", m.role().unwrap_or("")));
+            writer.write_event(Event::Empty(member))?;
+        }
+        write_borrowed_tags_xml(writer, tags)?;
+        writer.write_event(Event::End(BytesEnd::new("relation")))?;
+    }
+    Ok(())
+}

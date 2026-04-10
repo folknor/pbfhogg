@@ -853,19 +853,23 @@ Both block_pair (indexed) and element_stream (fallback) paths converted.
 Temp files include PID for concurrent safety, cleaned up on all exit paths.
 Delete path extracts id+metadata directly (zero tag clone).
 
-**Follow-up: borrowed element XML writers.** `write_create`/`write_modify`
-still clone elements to owned via `convert_node/convert_way/convert_relation`
-before writing XML. Add `write_*_xml` variants that accept `&DenseNode`,
-`&Way`, `&Relation` directly — avoids ~100-500 MB tag String allocation at
-planet scale for the create/modify path. The delete path already avoids
-the clone via `extract_delete_info`.
+**Follow-up: borrowed element XML writers — DONE.** `write_element_xml`
+in `elements_xml.rs` writes XML directly from borrowed `&Element<'_>`
+(DenseNode, Node, Way, Relation) without cloning to owned types.
+`ChangeSink::write_create`/`write_modify` use this zero-clone path.
+Removed `OwnedXml` enum and `convert_to_xml_node` from derive_changes.
+The element_stream fallback path retains owned writers (already has
+owned elements from `merge_join_phase`).
 
-### Priority 4: Split merge.rs into submodules
+### Priority 4: Split merge.rs into submodules — DONE
 
-1857 lines, 5 interleaved concerns. Highest-risk file for introducing bugs
-during future merge optimizations (daily production pipeline). Mechanical
-split: `merge/stats.rs`, `merge/node_locations.rs`, `merge/diff_ranges.rs`,
-`merge/classify.rs`, `merge/rewrite.rs`. No runtime impact.
+1857-line `merge.rs` split into 5 submodules: `merge/stats.rs` (MergeStats,
+percentiles, PhaseTimers, PhaseRss), `merge/node_locations.rs`
+(NodeLocationIndex), `merge/diff_ranges.rs` (DiffRanges, UpsertCursors),
+`merge/classify.rs` (ClassifyResult, BatchSlot, classify_only,
+block_overlaps_diff), `merge/rewrite.rs` (all write functions, header
+handling, reader thread, rewrite logic, main `merge()`). `merge/mod.rs`
+re-exports `merge`, `MergeOptions`, `MergeStats`. Public API unchanged.
 
 ### Priority 5: Reduce build_geocode_index cognitive complexity
 

@@ -15,6 +15,7 @@ use quick_xml::Writer;
 
 use super::elements_xml::{
     OwnedMetadata,
+    write_element_xml,
     write_node_xml, write_way_xml, write_relation_xml,
 };
 use super::stream_merge::{
@@ -128,6 +129,7 @@ struct ChangeSink {
     delete_count: u64,
     increment_version: bool,
     update_timestamp: bool,
+    coord_buf: String,
 }
 
 impl ChangeSink {
@@ -152,22 +154,19 @@ impl ChangeSink {
             delete_count: 0,
             increment_version,
             update_timestamp,
+            coord_buf: String::new(),
         })
     }
 
-    fn write_create(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
-        if let Some(owned) = convert_to_xml_node(elem, kind) {
-            write_owned_element(&mut self.creates, &owned)?;
-            self.create_count += 1;
-        }
+    fn write_create(&mut self, elem: &crate::Element<'_>, _kind: ElemKind) -> Result<()> {
+        write_element_xml(&mut self.creates, elem, &mut self.coord_buf)?;
+        self.create_count += 1;
         Ok(())
     }
 
-    fn write_modify(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
-        if let Some(owned) = convert_to_xml_node(elem, kind) {
-            write_owned_element(&mut self.modifies, &owned)?;
-            self.modify_count += 1;
-        }
+    fn write_modify(&mut self, elem: &crate::Element<'_>, _kind: ElemKind) -> Result<()> {
+        write_element_xml(&mut self.modifies, elem, &mut self.coord_buf)?;
+        self.modify_count += 1;
         Ok(())
     }
 
@@ -201,30 +200,6 @@ impl ChangeSink {
             modifies: self.modify_count,
             deletes: self.delete_count,
         }
-    }
-}
-
-/// Convert a borrowed element to an owned XML-writable form and write it.
-fn write_owned_element<W: Write>(writer: &mut Writer<W>, owned: &OwnedXml) -> Result<()> {
-    match owned {
-        OwnedXml::Node(n) => write_node_xml(writer, n),
-        OwnedXml::Way(w) => write_way_xml(writer, w),
-        OwnedXml::Relation(r) => write_relation_xml(writer, r),
-    }
-}
-
-enum OwnedXml {
-    Node(super::elements_xml::OwnedNode),
-    Way(super::elements_xml::OwnedWay),
-    Relation(super::elements_xml::OwnedRelation),
-}
-
-fn convert_to_xml_node(elem: &crate::Element<'_>, kind: ElemKind) -> Option<OwnedXml> {
-    use super::stream_merge::{convert_node, convert_way, convert_relation};
-    match kind {
-        ElemKind::Node => convert_node(elem).map(OwnedXml::Node),
-        ElemKind::Way => convert_way(elem).map(OwnedXml::Way),
-        ElemKind::Relation => convert_relation(elem).map(OwnedXml::Relation),
     }
 }
 

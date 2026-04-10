@@ -1,28 +1,14 @@
-//! PBF merge: apply an OSC diff overlay to a base PBF, producing an updated PBF.
-//!
-//! Single-pass streaming batch pipeline:
-//!   Phase 1: Parallel classify              [rayon pool]
-//!   Phase 2: Sequential inline assign       [main thread, O(log n) per blob]
-//!   Phase 3+4: Parallel rewrite + streaming output [rayon pool + main thread]
-//!
-//! Key insight: we pass ALL upsert IDs in a blob's range to the rewrite function.
-//! IDs that match base elements are modifications (handled by normal element processing);
-//! IDs that don't match are creates (emitted by the cursor). This eliminates the need
-//! for a separate pass to collect modification IDs and compute create lists.
+//! Element rewriting, output streaming, and merge orchestration.
 
 use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 
 use rayon::prelude::*;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
-use crate::blob::{
-    decode_blob_to_headerblock, decompress_blob_data_into,
-    parse_primitive_block_from_bytes_owned, BlobKind,
-};
-use crate::blob_index::{self, BlobIndex, ElemKind};
-use bytes::Bytes;
+use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
+use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
 use crate::file_writer::FileWriter;
@@ -30,550 +16,27 @@ use crate::osc::{parse_osc_file, CompactDiffOverlay};
 use crate::writer::{Compression, PbfWriter};
 use crate::{Element, PrimitiveBlock};
 
-use super::{
-    build_output_header, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, flush_passthrough_buf, read_raw_frame,
+use crate::commands::{
+    build_output_header, dense_node_raw_metadata, element_raw_metadata,
+    ensure_node_capacity, ensure_node_capacity_local, ensure_relation_capacity,
+    ensure_relation_capacity_local, ensure_way_capacity, ensure_way_capacity_local,
+    flush_block, flush_local, flush_passthrough_buf, read_raw_frame,
     require_indexdata, writer_from_header_bytes, HeaderOverrides, RawBlobFrame,
+    BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
 };
 
-use super::{Result, BATCH_BYTE_BUDGET, BATCH_MIN_BLOBS, BATCH_MAX_BLOBS};
+use super::classify::{
+    classify_only, BatchSlot, ClassifyResult, RewriteJob,
+};
+use super::diff_ranges::{DiffRanges, UpsertCursors};
+use super::node_locations::NodeLocationIndex;
+use super::stats::MergeStats;
+#[cfg(feature = "hotpath")]
+use super::stats::{PhaseRss, PhaseTimers, read_rss_kb};
+
+use super::Result;
 
 const READER_CHANNEL_SIZE: usize = 128;
-
-// ---------------------------------------------------------------------------
-// Progress counters
-// ---------------------------------------------------------------------------
-
-/// Statistics from a merge operation.
-pub struct MergeStats {
-    pub base_nodes: u64,
-    pub base_ways: u64,
-    pub base_relations: u64,
-    pub diff_nodes: u64,
-    pub diff_ways: u64,
-    pub diff_relations: u64,
-    pub deleted: u64,
-    pub blobs_passthrough: u64,
-    pub blobs_rewritten: u64,
-    pub blobs_skip_decompress: u64,
-    pub blobs_scan_only: u64,
-    pub blobs_index_hit: u64,
-    /// Bytes of raw passthrough frames (wire size including framing).
-    pub bytes_passthrough: u64,
-    /// Bytes of rewritten blocks (pre-compression protobuf size).
-    pub bytes_rewritten: u64,
-    /// Heap bytes used by the CompactDiffOverlay after OSC parsing.
-    pub diff_heap_bytes: u64,
-    /// Per-blob frame sizes in bytes for percentile computation.
-    blob_sizes: Vec<u32>,
-    // -- locations-on-ways stats (only populated when flag is on) --
-    /// Total node IDs needed for OSC ways.
-    pub loc_nodes_needed: u64,
-    /// Node coordinates found in OSC (pre-seeded).
-    pub loc_nodes_from_diff: u64,
-    /// Node coordinates found in base PBF during merge.
-    pub loc_nodes_from_base: u64,
-    /// Node coordinates not found anywhere (0,0 fallback).
-    pub loc_missing: u64,
-    /// Passthrough node blobs decompressed for coordinate extraction.
-    pub loc_node_blobs_scanned: u64,
-}
-
-impl MergeStats {
-    fn new() -> Self {
-        Self {
-            base_nodes: 0,
-            base_ways: 0,
-            base_relations: 0,
-            diff_nodes: 0,
-            diff_ways: 0,
-            diff_relations: 0,
-            deleted: 0,
-            blobs_passthrough: 0,
-            blobs_rewritten: 0,
-            blobs_skip_decompress: 0,
-            blobs_scan_only: 0,
-            blobs_index_hit: 0,
-            bytes_passthrough: 0,
-            bytes_rewritten: 0,
-            diff_heap_bytes: 0,
-            blob_sizes: Vec::new(),
-            loc_nodes_needed: 0,
-            loc_nodes_from_diff: 0,
-            loc_nodes_from_base: 0,
-            loc_missing: 0,
-            loc_node_blobs_scanned: 0,
-        }
-    }
-
-    pub fn total_elements(&self) -> u64 {
-        self.base_nodes
-            + self.base_ways
-            + self.base_relations
-            + self.diff_nodes
-            + self.diff_ways
-            + self.diff_relations
-    }
-
-    fn merge_from(&mut self, other: &MergeStats) {
-        self.base_nodes += other.base_nodes;
-        self.base_ways += other.base_ways;
-        self.base_relations += other.base_relations;
-        self.diff_nodes += other.diff_nodes;
-        self.diff_ways += other.diff_ways;
-        self.diff_relations += other.diff_relations;
-        self.deleted += other.deleted;
-        self.bytes_passthrough += other.bytes_passthrough;
-        self.bytes_rewritten += other.bytes_rewritten;
-    }
-
-    pub fn print_summary(&self) {
-        let total_blobs =
-            self.blobs_passthrough + self.blobs_rewritten + self.blobs_skip_decompress;
-        eprintln!("Merge complete: {} elements written", self.total_elements());
-        eprintln!(
-            "  Base: {} nodes, {} ways, {} relations",
-            self.base_nodes, self.base_ways, self.base_relations,
-        );
-        eprintln!(
-            "  Diff: {} nodes, {} ways, {} relations",
-            self.diff_nodes, self.diff_ways, self.diff_relations,
-        );
-        eprintln!("  Deleted: {}", self.deleted);
-        eprintln!(
-            "  Blobs: {} passthrough ({} index-hit, {} scan-only, {} skip-decompress), {} rewritten (of {total_blobs} total)",
-            self.blobs_passthrough + self.blobs_skip_decompress,
-            self.blobs_index_hit,
-            self.blobs_scan_only,
-            self.blobs_skip_decompress,
-            self.blobs_rewritten,
-        );
-        let total_bytes = self.bytes_passthrough + self.bytes_rewritten;
-        if total_bytes > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let rewrite_pct = (self.bytes_rewritten as f64 / total_bytes as f64) * 100.0;
-            eprintln!(
-                "  Bytes: {} passthrough, {} rewritten ({rewrite_pct:.1}% rewrite ratio)",
-                self.bytes_passthrough, self.bytes_rewritten,
-            );
-        }
-        if !self.blob_sizes.is_empty() {
-            let mut sizes = self.blob_sizes.clone();
-            let (p50, p95, p99) = percentiles_u32(&mut sizes);
-            eprintln!("  Blob sizes: p50={p50}, p95={p95}, p99={p99} bytes");
-        }
-        if self.diff_heap_bytes > 0 {
-            #[allow(clippy::cast_precision_loss)]
-            let mb = self.diff_heap_bytes as f64 / (1024.0 * 1024.0);
-            eprintln!("  CompactDiffOverlay heap: {mb:.1} MB");
-        }
-        if self.loc_nodes_needed > 0 {
-            eprintln!(
-                "  Locations-on-ways: {} nodes needed, {} from diff, {} from base, {} missing, {} node blobs scanned",
-                self.loc_nodes_needed, self.loc_nodes_from_diff,
-                self.loc_nodes_from_base, self.loc_missing,
-                self.loc_node_blobs_scanned,
-            );
-        }
-    }
-}
-
-/// Compute p50, p95, p99 from a mutable slice. Returns `(0, 0, 0)` if empty.
-fn percentiles_u32(data: &mut [u32]) -> (u32, u32, u32) {
-    if data.is_empty() {
-        return (0, 0, 0);
-    }
-    data.sort_unstable();
-    let len = data.len();
-    (data[len / 2], data[len * 95 / 100], data[len * 99 / 100])
-}
-
-/// Per-phase wall time accumulation across all batches.
-#[cfg(feature = "hotpath")]
-struct PhaseTimers {
-    osc_parse: std::time::Duration,
-    classify_total: std::time::Duration,
-    rewrite_total: std::time::Duration,
-    output_total: std::time::Duration,
-    trailing_creates: std::time::Duration,
-}
-
-#[cfg(feature = "hotpath")]
-impl PhaseTimers {
-    fn new() -> Self {
-        Self {
-            osc_parse: std::time::Duration::ZERO,
-            classify_total: std::time::Duration::ZERO,
-            rewrite_total: std::time::Duration::ZERO,
-            output_total: std::time::Duration::ZERO,
-            trailing_creates: std::time::Duration::ZERO,
-        }
-    }
-}
-
-/// Read current RSS in kilobytes from `/proc/self/statm`.
-/// Returns 0 on failure (non-Linux, read error, parse error).
-#[cfg(feature = "hotpath")]
-fn read_rss_kb() -> u64 {
-    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
-        return 0;
-    };
-    let Some(resident_str) = statm.split_whitespace().nth(1) else {
-        return 0;
-    };
-    let Ok(pages) = resident_str.parse::<u64>() else {
-        return 0;
-    };
-    pages * 4 // pages × 4096 / 1024 = pages × 4
-}
-
-/// Per-phase RSS tracking (rolling max across batches, in KB).
-#[cfg(feature = "hotpath")]
-struct PhaseRss {
-    after_osc_parse: u64,
-    classify_max: u64,
-    rewrite_max: u64,
-    output_max: u64,
-    after_flush: u64,
-}
-
-#[cfg(feature = "hotpath")]
-impl PhaseRss {
-    fn new() -> Self {
-        Self {
-            after_osc_parse: 0,
-            classify_max: 0,
-            rewrite_max: 0,
-            output_max: 0,
-            after_flush: 0,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sparse node location index for --locations-on-ways
-// ---------------------------------------------------------------------------
-
-/// Sparse node coordinate index for maintaining LocationsOnWays through merges.
-///
-/// Only contains coordinates for nodes referenced by OSC ways. Populated in two
-/// stages: (1) pre-seeded from OSC node creates/modifications, (2) filled from
-/// base PBF during the merge pass for nodes not in the OSC.
-struct NodeLocationIndex {
-    /// Coordinates indexed by node ID (decimicrodegrees).
-    locations: FxHashMap<i64, (i32, i32)>,
-    /// Node IDs still needed from the base PBF (not found in OSC).
-    /// Sorted for range overlap checks against BlobIndex.
-    needed_sorted: Vec<i64>,
-    /// Same IDs as `needed_sorted` but as a set for O(1) membership tests.
-    needed_set: FxHashSet<i64>,
-}
-
-impl NodeLocationIndex {
-    /// Build the index from an already-parsed OSC diff.
-    ///
-    /// 1. Collects all node IDs referenced by OSC ways
-    /// 2. Seeds coordinates from OSC nodes (creates/modifications)
-    /// 3. Remaining needed IDs stored for base PBF extraction
-    fn build_from_diff(diff: &CompactDiffOverlay) -> Self {
-        // Collect all node IDs referenced by OSC ways
-        let mut all_needed: FxHashSet<i64> = FxHashSet::default();
-        for &way_id in diff.way_ids() {
-            if let Some(way) = diff.get_way(way_id) {
-                for node_id in way.refs() {
-                    all_needed.insert(node_id);
-                }
-            }
-        }
-
-        // Seed from OSC nodes
-        let mut locations: FxHashMap<i64, (i32, i32)> =
-            FxHashMap::with_capacity_and_hasher(all_needed.len(), Default::default());
-        let mut still_needed: FxHashSet<i64> = FxHashSet::default();
-
-        for &node_id in &all_needed {
-            if let Some(node) = diff.get_node(node_id) {
-                locations.insert(node_id, (node.decimicro_lat(), node.decimicro_lon()));
-            } else {
-                still_needed.insert(node_id);
-            }
-        }
-
-        let mut needed_sorted: Vec<i64> = still_needed.iter().copied().collect();
-        needed_sorted.sort_unstable();
-
-        let seeded = locations.len() as u64;
-        let remaining = still_needed.len() as u64;
-        let total = all_needed.len() as u64;
-        eprintln!(
-            "Locations-on-ways: {total} node IDs needed, {seeded} from diff, {remaining} from base"
-        );
-
-        Self {
-            locations,
-            needed_sorted,
-            needed_set: still_needed,
-        }
-    }
-
-    /// Check if a blob's ID range overlaps any still-needed node IDs.
-    fn overlaps_needed(&self, min_id: i64, max_id: i64) -> bool {
-        if self.needed_sorted.is_empty() {
-            return false;
-        }
-        // Find the first needed ID >= min_id
-        let start = self.needed_sorted.partition_point(|&id| id < min_id);
-        // If that ID is <= max_id, there's overlap
-        start < self.needed_sorted.len() && self.needed_sorted[start] <= max_id
-    }
-
-    /// Extract needed coordinates from a decoded PrimitiveBlock.
-    fn extract_from_block(&mut self, block: &PrimitiveBlock) -> u64 {
-        let mut found: u64 = 0;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    if self.needed_set.contains(&dn.id()) {
-                        self.locations
-                            .insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
-                        self.needed_set.remove(&dn.id());
-                        found += 1;
-                    }
-                }
-                Element::Node(n) => {
-                    if self.needed_set.contains(&n.id()) {
-                        self.locations
-                            .insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
-                        self.needed_set.remove(&n.id());
-                        found += 1;
-                    }
-                }
-                Element::Way(_) | Element::Relation(_) => {}
-            }
-        }
-        found
-    }
-
-    /// Check if all needed nodes have been found.
-    fn all_found(&self) -> bool {
-        self.needed_set.is_empty()
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Diff ID ranges for fast overlap checking
-// ---------------------------------------------------------------------------
-
-/// Pre-computed sorted ID vectors from the diff, for fast overlap checks.
-///
-/// `node_ids`/`way_ids`/`rel_ids` include both upserts and deletes — used
-/// for range overlap checks. `node_upserts`/`way_upserts`/`rel_upserts`
-/// contain only create/modify IDs (no deletes) — used for inline assignment
-/// and gap create tracking.
-struct DiffRanges {
-    /// Sorted node IDs affected by the diff (upserts + deletes).
-    node_ids: Vec<i64>,
-    /// Sorted way IDs affected by the diff (upserts + deletes).
-    way_ids: Vec<i64>,
-    /// Sorted relation IDs affected by the diff (upserts + deletes).
-    rel_ids: Vec<i64>,
-    /// Sorted create/modify node IDs (no deletes). For inline assignment + gap creates.
-    node_upserts: Vec<i64>,
-    /// Sorted create/modify way IDs (no deletes).
-    way_upserts: Vec<i64>,
-    /// Sorted create/modify relation IDs (no deletes).
-    rel_upserts: Vec<i64>,
-}
-
-impl DiffRanges {
-    fn from_diff(diff: &CompactDiffOverlay) -> Self {
-        let mut node_ids: Vec<i64> = diff
-            .node_ids()
-            .chain(diff.deleted_nodes.iter())
-            .copied()
-            .collect();
-        node_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        node_ids.dedup();
-
-        let mut way_ids: Vec<i64> = diff
-            .way_ids()
-            .chain(diff.deleted_ways.iter())
-            .copied()
-            .collect();
-        way_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        way_ids.dedup();
-
-        let mut rel_ids: Vec<i64> = diff
-            .relation_ids()
-            .chain(diff.deleted_relations.iter())
-            .copied()
-            .collect();
-        rel_ids.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        rel_ids.dedup();
-
-        let mut node_upserts: Vec<i64> = diff.node_ids().copied().collect();
-        node_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        node_upserts.dedup();
-
-        let mut way_upserts: Vec<i64> = diff.way_ids().copied().collect();
-        way_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        way_upserts.dedup();
-
-        let mut rel_upserts: Vec<i64> = diff.relation_ids().copied().collect();
-        rel_upserts.sort_unstable_by(|a, b| super::osm_id_cmp(*a, *b));
-        rel_upserts.dedup();
-
-        Self {
-            node_ids,
-            way_ids,
-            rel_ids,
-            node_upserts,
-            way_upserts,
-            rel_upserts,
-        }
-    }
-
-    /// Check if any affected ID of the given type falls within [min_id, max_id].
-    ///
-    /// This is a coarse range check used during blob classification. A true
-    /// result means the blob *might* need rewriting — it still gets a secondary
-    /// check via `block_overlaps_diff` after full parsing. A false result means
-    /// the blob is safe for raw passthrough (no diff IDs in its range at all).
-    fn range_overlaps(&self, kind: ElemKind, min_id: i64, max_id: i64) -> bool {
-        let ids = match kind {
-            ElemKind::Node => &self.node_ids,
-            ElemKind::Way => &self.way_ids,
-            ElemKind::Relation => &self.rel_ids,
-        };
-        if ids.is_empty() {
-            return false;
-        }
-        // Binary search for the first ID >= blob's OSM-first in OSM order
-        let first = super::blob_osm_first_key(min_id, max_id);
-        let last = super::blob_osm_last_key(min_id, max_id);
-        let pos = ids.partition_point(|&id| super::osm_id_key(id) < first);
-        pos < ids.len() && super::osm_id_key(ids[pos]) <= last
-    }
-
-    /// Return the sorted upsert (create/modify) IDs for a given element kind.
-    fn upserts(&self, kind: ElemKind) -> &[i64] {
-        match kind {
-            ElemKind::Node => &self.node_upserts,
-            ElemKind::Way => &self.way_upserts,
-            ElemKind::Relation => &self.rel_upserts,
-        }
-    }
-
-
-}
-
-// osc_member_type_to_member_type removed: OscRelMember.member_type is now
-// a MemberType enum directly (see osc.rs), so no string→enum conversion needed.
-
-// ---------------------------------------------------------------------------
-// Per-type upsert cursor tracking
-// ---------------------------------------------------------------------------
-
-/// Grouped per-type cursors tracking how far through each upsert vector
-/// we have emitted creates. Replaces three bare `usize` variables.
-struct UpsertCursors {
-    node: usize,
-    way: usize,
-    rel: usize,
-}
-
-impl UpsertCursors {
-    fn new() -> Self {
-        Self { node: 0, way: 0, rel: 0 }
-    }
-
-    /// Mutable cursor + upsert slice for the given element kind.
-    fn get_mut<'a>(&mut self, kind: ElemKind, ranges: &'a DiffRanges) -> (&mut usize, &'a [i64]) {
-        match kind {
-            ElemKind::Node => (&mut self.node, ranges.upserts(ElemKind::Node)),
-            ElemKind::Way => (&mut self.way, ranges.upserts(ElemKind::Way)),
-            ElemKind::Relation => (&mut self.rel, ranges.upserts(ElemKind::Relation)),
-        }
-    }
-
-    /// Immutable cursor value + upsert slice for the given element kind.
-    fn get<'a>(&self, kind: ElemKind, ranges: &'a DiffRanges) -> (usize, &'a [i64]) {
-        match kind {
-            ElemKind::Node => (self.node, ranges.upserts(ElemKind::Node)),
-            ElemKind::Way => (self.way, ranges.upserts(ElemKind::Way)),
-            ElemKind::Relation => (self.rel, ranges.upserts(ElemKind::Relation)),
-        }
-    }
-}
-
-/// Estimate a blob's in-flight memory cost for byte-budgeted batch sizing.
-///
-/// For indexed blobs whose ID range doesn't overlap the diff, returns just
-/// the raw frame size (pure passthrough — no decompression needed).
-/// For potential rewrite blobs, returns raw_size × 21 (raw + ~16× decompressed
-/// + ~5× rewrite output estimate).
-fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> usize {
-    let raw = frame.frame_bytes.len();
-    if let Some(ref idx) = frame.index
-        && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
-    {
-        return raw;
-    }
-    raw * 21
-}
-
-// ---------------------------------------------------------------------------
-// Quick-scan: check if a block has any IDs that overlap the diff
-// ---------------------------------------------------------------------------
-
-/// Check if any element *actually in the block* has a matching ID in the diff.
-/// Returns true if the block needs re-encoding, false for safe passthrough.
-///
-/// This is the secondary, precise overlap check. It runs after `classify_blob`
-/// returned `MayOverlap` (the coarse range check found diff IDs within the
-/// blob's [min_id, max_id]). This function iterates actual element IDs in the
-/// parsed block and checks them against the diff's HashMap/HashSet.
-///
-/// **Key distinction from `range_overlaps`**: a diff with only pure creates
-/// (new IDs not present in the base PBF) can cause `range_overlaps` to return
-/// true (the create IDs fall within the blob's range), but this function
-/// returns false (no element in the block has a matching diff ID). In that
-/// case the blob is passed through raw, and the creates are emitted afterward
-/// by the gap-create logic, which means they may appear out of strict ID order
-/// relative to the passthrough block. This is intentional — rewriting an
-/// otherwise unaffected block just to interleave pure creates would be wasted
-/// work. OSM consumers handle non-strictly-sorted IDs across block boundaries.
-fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> bool {
-    for element in block.elements_skip_metadata() {
-        let dominated = match &element {
-            Element::DenseNode(dn) => {
-                let id = dn.id();
-                diff.deleted_nodes.contains(&id) || diff.has_node(id)
-            }
-            Element::Node(n) => {
-                let id = n.id();
-                diff.deleted_nodes.contains(&id) || diff.has_node(id)
-            }
-            Element::Way(w) => {
-                let id = w.id();
-                diff.deleted_ways.contains(&id) || diff.has_way(id)
-            }
-            Element::Relation(r) => {
-                let id = r.id();
-                diff.deleted_relations.contains(&id) || diff.has_relation(id)
-            }
-        };
-        if dominated {
-            return true;
-        }
-    }
-    false
-}
-
-use super::{
-    dense_node_raw_metadata, element_raw_metadata, ensure_node_capacity, ensure_relation_capacity,
-    ensure_way_capacity, flush_block,
-};
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, no metadata)
@@ -799,7 +262,7 @@ fn build_header_bytes(
             hb.sorted().optional_feature("LocationsOnWays")
         })
     } else {
-        super::warn_locations_on_ways_loss(header);
+        crate::commands::warn_locations_on_ways_loss(header);
         build_output_header(header, false, overrides, |hb| hb.sorted())
     }
 }
@@ -867,6 +330,7 @@ fn collect_batch(
     ranges: &DiffRanges,
     batch: &mut Vec<RawBlobFrame>,
 ) -> usize {
+    use super::classify::estimate_blob_cost;
     batch.clear();
     let mut batch_bytes: usize = 0;
     while batch.len() < BATCH_MAX_BLOBS {
@@ -898,25 +362,13 @@ fn collect_batch(
 }
 
 // ---------------------------------------------------------------------------
-// Process an affected data block (has diff overlap — re-encode)
-// ---------------------------------------------------------------------------
-
-fn element_kind(element: &Element<'_>) -> ElemKind {
-    match element {
-        Element::DenseNode(_) | Element::Node(_) => ElemKind::Node,
-        Element::Way(_) => ElemKind::Way,
-        Element::Relation(_) => ElemKind::Relation,
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Parallel rewrite: rewrite a block without PbfWriter or CreateEmitter
+// Parallel rewrite
 // ---------------------------------------------------------------------------
 
 /// Output from `rewrite_block_parallel`: serialized blocks + local stats.
-struct RewriteOutput {
-    blocks: Vec<OwnedBlock>,
-    stats: MergeStats,
+pub(super) struct RewriteOutput {
+    pub(super) blocks: Vec<OwnedBlock>,
+    pub(super) stats: MergeStats,
 }
 
 /// Emit a single create element into the local BlockBuilder.
@@ -992,7 +444,7 @@ fn rewrite_block_parallel(
         };
 
         // Emit creates (upsert IDs not in base block) before this element
-        while upsert_cursor < inline_upserts.len() && super::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
+        while upsert_cursor < inline_upserts.len() && crate::commands::osm_id_cmp(inline_upserts[upsert_cursor], elem_id).is_lt() {
             let cid = inline_upserts[upsert_cursor];
             upsert_cursor += 1;
             emit_create_local(cid, kind, diff, bb, &mut output, &mut stats, loc_map)?;
@@ -1088,103 +540,6 @@ fn rewrite_block_parallel(
 }
 
 // ---------------------------------------------------------------------------
-// Single-pass classification types
-// ---------------------------------------------------------------------------
-
-/// Classification result from Phase 1 parallel classify.
-enum ClassifyResult {
-    /// No diff overlap — raw passthrough.
-    Passthrough(BlobIndex, bool),
-    /// Range overlapped but no element affected — raw passthrough.
-    FalsePositive(BlobIndex, bool),
-    /// At least one element affected — needs rewrite.
-    NeedsRewrite(PrimitiveBlock, BlobIndex),
-}
-
-/// Per-blob slot in the batch pipeline.
-enum BatchSlot {
-    Passthrough { index: BlobIndex, has_indexdata: bool },
-    FalsePositive { index: BlobIndex, has_indexdata: bool },
-    Rewrite { job_index: usize, index: BlobIndex },
-}
-
-/// A rewrite job for Phase 3 parallel processing.
-struct RewriteJob {
-    block: PrimitiveBlock,
-    kind: ElemKind,
-    upsert_range: (usize, usize),
-}
-
-// ---------------------------------------------------------------------------
-// Phase 1: classify_only
-// ---------------------------------------------------------------------------
-
-/// Fallback BlobIndex when scan_block_ids didn't produce one (shouldn't
-/// happen in practice, but handles edge cases like empty blocks).
-fn fallback_index(block: &PrimitiveBlock) -> BlobIndex {
-    match block.elements().next() {
-        Some(ref elem) => BlobIndex {
-            kind: element_kind(elem),
-            min_id: 0,
-            max_id: 0,
-            count: 0,
-            bbox: None,
-        },
-        None => BlobIndex {
-            kind: ElemKind::Node,
-            min_id: 0,
-            max_id: 0,
-            count: 0,
-            bbox: None,
-        },
-    }
-}
-
-/// Classify a blob for single-pass merge. Returns whether the blob can be
-/// passed through raw or needs rewriting.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn classify_only(
-    frame: &RawBlobFrame,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
-    buf: &mut Vec<u8>,
-) -> std::result::Result<ClassifyResult, String> {
-    let has_indexdata = frame.index.is_some();
-
-    // Fast path: use inline index from BlobHeader indexdata (no decompression).
-    if let Some(ref idx) = frame.index
-        && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
-    {
-        return Ok(ClassifyResult::Passthrough(*idx, has_indexdata));
-    }
-
-    // Slow path: decompress + lightweight scan.
-    decompress_blob_data_into(frame.blob_bytes(), buf).map_err(|e| e.to_string())?;
-
-    let scan = if let Some(scan) = blob_index::scan_block_ids(buf) {
-        if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
-            return Ok(ClassifyResult::Passthrough(scan, has_indexdata));
-        }
-        Some(scan)
-    } else {
-        None
-    };
-
-    // Range overlaps — full parse + precise check.
-    let raw = std::mem::take(buf);
-    let block =
-        parse_primitive_block_from_bytes_owned(&Bytes::from(raw)).map_err(|e| e.to_string())?;
-
-    let index = scan.unwrap_or_else(|| fallback_index(&block));
-
-    if !block_overlaps_diff(&block, diff) {
-        return Ok(ClassifyResult::FalsePositive(index, has_indexdata));
-    }
-
-    Ok(ClassifyResult::NeedsRewrite(block, index))
-}
-
-// ---------------------------------------------------------------------------
 // Gap-create emitter for Phase 4 sequential output
 // ---------------------------------------------------------------------------
 
@@ -1223,10 +578,109 @@ fn emit_create_for_output(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
+/// Flush remaining upserts for the previous element type during a type
+/// transition. Also handles skipped types (e.g., Node -> Relation flushes
+/// all Way upserts).
+#[allow(clippy::too_many_arguments)]
+fn flush_remaining_upserts(
+    prev: ElemKind,
+    next: ElemKind,
+    ranges: &DiffRanges,
+    diff: &CompactDiffOverlay,
+    cursors: &mut UpsertCursors,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+) -> Result<()> {
+    // Flush remaining creates of the previous type
+    let (cursor, upserts) = cursors.get_mut(prev, ranges);
+    while *cursor < upserts.len() {
+        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc_map)?;
+        *cursor += 1;
+    }
+    flush_block(bb, writer)?;
+
+    // Handle skipped type: Node -> Relation (flush all Way upserts)
+    if prev == ElemKind::Node && next == ElemKind::Relation {
+        let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
+        while *cursor < upserts.len() {
+            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats, loc_map)?;
+            *cursor += 1;
+        }
+        flush_block(bb, writer)?;
+    }
+
+    Ok(())
+}
+
+/// Emit gap creates: upsert IDs of the current type that fall before a blob's min_id.
+#[allow(clippy::too_many_arguments)]
+fn emit_gap_creates(
+    blob_kind: ElemKind,
+    min_id: i64,
+    ranges: &DiffRanges,
+    diff: &CompactDiffOverlay,
+    cursors: &mut UpsertCursors,
+    bb: &mut BlockBuilder,
+    writer: &mut PbfWriter<FileWriter>,
+    stats: &mut MergeStats,
+    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
+) -> Result<()> {
+    let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
+    while *cursor < upserts.len() && crate::commands::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
+        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
+        *cursor += 1;
+    }
+    Ok(())
+}
+
+/// Append a passthrough blob's raw bytes to the coalescing buffer.
+/// For indexed blobs, moves frame_bytes via std::mem::take (zero copy).
+/// For non-indexed blobs, reframes with indexdata first.
+fn coalesce_passthrough(
+    frame: &mut RawBlobFrame,
+    index: &BlobIndex,
+    has_indexdata: bool,
+    chunks: &mut Vec<Vec<u8>>,
+) -> Result<()> {
+    if has_indexdata {
+        chunks.push(std::mem::take(&mut frame.frame_bytes));
+    } else {
+        let indexdata = index.serialize();
+        let reframed = crate::write::writer::reframe_raw_with_index(
+            frame.blob_bytes(),
+            &indexdata,
+            frame.tagdata.as_deref(),
+        )?;
+        chunks.push(reframed);
+    }
+    Ok(())
+}
+
+/// Check whether there are gap creates to emit before min_id (without mutating cursors).
+fn has_gap_creates(
+    blob_kind: ElemKind,
+    min_id: i64,
+    ranges: &DiffRanges,
+    cursors: &UpsertCursors,
+) -> bool {
+    let (cursor, upserts) = cursors.get(blob_kind, ranges);
+    cursor < upserts.len() && crate::commands::osm_id_cmp(upserts[cursor], min_id).is_lt()
+}
+
 // ---------------------------------------------------------------------------
 // Public merge function
 // ---------------------------------------------------------------------------
+
+/// Options controlling merge I/O and compression behavior.
+pub struct MergeOptions {
+    pub compression: Compression,
+    pub direct_io: bool,
+    pub io_uring: bool,
+    pub force: bool,
+    pub locations_on_ways: bool,
+}
 
 /// Apply an OSC diff to a base PBF file, producing an updated sorted PBF.
 ///
@@ -1239,15 +693,6 @@ fn emit_create_for_output(
 ///
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
-/// Options controlling merge I/O and compression behavior.
-pub struct MergeOptions {
-    pub compression: Compression,
-    pub direct_io: bool,
-    pub io_uring: bool,
-    pub force: bool,
-    pub locations_on_ways: bool,
-}
-
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
 #[hotpath::measure]
 pub fn merge(
@@ -1392,10 +837,10 @@ pub fn merge(
                 ClassifyResult::NeedsRewrite(block, index) => {
                     // Binary search for inline upserts in blob's OSM-order range
                     let upserts = ranges.upserts(index.kind);
-                    let first = super::blob_osm_first_key(index.min_id, index.max_id);
-                    let last = super::blob_osm_last_key(index.min_id, index.max_id);
-                    let start = upserts.partition_point(|&id| super::osm_id_key(id) < first);
-                    let end = upserts[start..].partition_point(|&id| super::osm_id_key(id) <= last) + start;
+                    let first = crate::commands::blob_osm_first_key(index.min_id, index.max_id);
+                    let last = crate::commands::blob_osm_last_key(index.min_id, index.max_id);
+                    let start = upserts.partition_point(|&id| crate::commands::osm_id_key(id) < first);
+                    let end = upserts[start..].partition_point(|&id| crate::commands::osm_id_key(id) <= last) + start;
 
                     let job_idx = rewrite_jobs.len();
                     rewrite_jobs.push(RewriteJob {
@@ -1462,7 +907,7 @@ pub fn merge(
                             }
                             let mut tuples = Vec::new();
                             let mut group_starts = Vec::new();
-                            if super::node_scanner::extract_node_tuples(&buf, &mut tuples, &mut group_starts).is_err()
+                            if crate::commands::node_scanner::extract_node_tuples(&buf, &mut tuples, &mut group_starts).is_err()
                             {
                                 return None;
                             }
@@ -1566,7 +1011,7 @@ pub fn merge(
             last_type = Some(blob_kind);
 
             // Gap creates: emit upserts before this blob in OSM order
-            let osm_first = super::blob_osm_first_id(min_id, max_id);
+            let osm_first = crate::commands::blob_osm_first_id(min_id, max_id);
             let has_gap = has_gap_creates(blob_kind, osm_first, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
@@ -1650,9 +1095,9 @@ pub fn merge(
                     // output dropped here — RewriteOutput freed immediately
 
                     // Advance cursor past blob's OSM-last (inline upserts handled by rewrite)
-                    let last = super::blob_osm_last_key(min_id, max_id);
+                    let last = crate::commands::blob_osm_last_key(min_id, max_id);
                     let (cursor, upserts) = cursors.get_mut(blob_kind, &ranges);
-                    while *cursor < upserts.len() && super::osm_id_key(upserts[*cursor]) <= last {
+                    while *cursor < upserts.len() && crate::commands::osm_id_key(upserts[*cursor]) <= last {
                         *cursor += 1;
                     }
                 }
@@ -1758,99 +1203,4 @@ pub fn merge(
     }
 
     Ok(stats)
-}
-
-// ---------------------------------------------------------------------------
-// Helpers extracted from merge() to keep cognitive complexity down
-// ---------------------------------------------------------------------------
-
-/// Flush remaining upserts for the previous element type during a type
-/// transition. Also handles skipped types (e.g., Node -> Relation flushes
-/// all Way upserts).
-#[allow(clippy::too_many_arguments)]
-fn flush_remaining_upserts(
-    prev: ElemKind,
-    next: ElemKind,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
-    cursors: &mut UpsertCursors,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-) -> Result<()> {
-    // Flush remaining creates of the previous type
-    let (cursor, upserts) = cursors.get_mut(prev, ranges);
-    while *cursor < upserts.len() {
-        emit_create_for_output(upserts[*cursor], prev, diff, bb, writer, stats, loc_map)?;
-        *cursor += 1;
-    }
-    flush_block(bb, writer)?;
-
-    // Handle skipped type: Node -> Relation (flush all Way upserts)
-    if prev == ElemKind::Node && next == ElemKind::Relation {
-        let (cursor, upserts) = cursors.get_mut(ElemKind::Way, ranges);
-        while *cursor < upserts.len() {
-            emit_create_for_output(upserts[*cursor], ElemKind::Way, diff, bb, writer, stats, loc_map)?;
-            *cursor += 1;
-        }
-        flush_block(bb, writer)?;
-    }
-
-    Ok(())
-}
-
-/// Emit gap creates: upsert IDs of the current type that fall before a blob's min_id.
-#[allow(clippy::too_many_arguments)]
-fn emit_gap_creates(
-    blob_kind: ElemKind,
-    min_id: i64,
-    ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
-    cursors: &mut UpsertCursors,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergeStats,
-    loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-) -> Result<()> {
-    let (cursor, upserts) = cursors.get_mut(blob_kind, ranges);
-    while *cursor < upserts.len() && super::osm_id_cmp(upserts[*cursor], min_id).is_lt() {
-        emit_create_for_output(upserts[*cursor], blob_kind, diff, bb, writer, stats, loc_map)?;
-        *cursor += 1;
-    }
-    Ok(())
-}
-
-/// Append a passthrough blob's raw bytes to the coalescing buffer.
-/// For indexed blobs, moves frame_bytes via std::mem::take (zero copy).
-/// For non-indexed blobs, reframes with indexdata first.
-fn coalesce_passthrough(
-    frame: &mut RawBlobFrame,
-    index: &BlobIndex,
-    has_indexdata: bool,
-    chunks: &mut Vec<Vec<u8>>,
-) -> Result<()> {
-    if has_indexdata {
-        chunks.push(std::mem::take(&mut frame.frame_bytes));
-    } else {
-        let indexdata = index.serialize();
-        let reframed = crate::write::writer::reframe_raw_with_index(
-            frame.blob_bytes(),
-            &indexdata,
-            frame.tagdata.as_deref(),
-        )?;
-        chunks.push(reframed);
-    }
-    Ok(())
-}
-
-/// Check whether there are gap creates to emit before min_id (without mutating cursors).
-fn has_gap_creates(
-    blob_kind: ElemKind,
-    min_id: i64,
-    ranges: &DiffRanges,
-    cursors: &UpsertCursors,
-) -> bool {
-    let (cursor, upserts) = cursors.get(blob_kind, ranges);
-    cursor < upserts.len() && super::osm_id_cmp(upserts[cursor], min_id).is_lt()
 }

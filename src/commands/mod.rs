@@ -428,11 +428,14 @@ pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_index::ElemKind>,
 ) -> Result<(Vec<(usize, u64, usize)>, std::sync::Arc<std::fs::File>)> {
+    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
 
+    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
     let mut schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
@@ -446,11 +449,15 @@ pub(crate) fn build_classify_schedule(
         schedule.push((seq, data_offset, data_size));
         seq += 1;
     }
+    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
 
+    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
+    drop(scanner);
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?
     );
+    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
     Ok((schedule, shared_file))
 }

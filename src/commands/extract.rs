@@ -1710,9 +1710,15 @@ fn pread_write_pass<F>(
 where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
 {
+    crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
     let schedule = build_blob_schedule(input)?;
+    crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
+    crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
     pread_execute(input, &schedule, writer, stats, block_fn)?;
+    crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
+    crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");
     writer.flush()?;
+    crate::debug::emit_marker("PREAD_WRITE_FLUSH_END");
     Ok(())
 }
 
@@ -2371,6 +2377,12 @@ struct Pass1Result {
     matched_way_ids: IdSetDense,
     all_way_node_ids: IdSetDense,
     matched_relation_ids: IdSetDense,
+    /// Unfiltered way blob schedule built during PASS1's manual scan, plumbed
+    /// out so smart PASS2 can reuse it instead of calling
+    /// `build_classify_schedule` again. Saves ~16% wall on Europe by avoiding
+    /// a second 19-second header scan. Empty for the unsorted-fallback path
+    /// (smart PASS2 falls back to `build_classify_schedule` in that case).
+    way_schedule: Vec<(usize, u64, usize)>,
 }
 
 /// Strategy-specific relation handling for pass 1.
@@ -2512,6 +2524,7 @@ fn collect_pass1_generic<H: RelationHandler>(
         }
         return Ok(Pass1Result {
             bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+            way_schedule: Vec::new(),
         });
     }
 
@@ -2531,11 +2544,21 @@ fn collect_pass1_generic<H: RelationHandler>(
     let mut node_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut way_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut relation_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    // Unfiltered way schedule (no spatial filter): used by smart PASS2 to
+    // find ways referenced by relations regardless of spatial location.
+    // Returned via Pass1Result so smart PASS2 can skip its own
+    // build_classify_schedule call entirely, saving ~16% wall on Europe
+    // (one fewer 19-second header scan after PASS1's parallel work).
+    let mut full_way_schedule: Vec<(usize, u64, usize)> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
         if let Some(idx) = hdr.index() {
+            // Build full_way_schedule unconditionally for way blobs.
+            if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                full_way_schedule.push((seq, data_offset, data_size));
+            }
             if !filter.wants_index(&idx) { continue; }
             match idx.kind {
                 crate::blob_index::ElemKind::Node => node_schedule.push((seq, data_offset, data_size)),
@@ -2656,6 +2679,7 @@ fn collect_pass1_generic<H: RelationHandler>(
 
     Ok(Pass1Result {
         bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
+        way_schedule: full_way_schedule,
     })
 }
 
@@ -2807,7 +2831,7 @@ fn extract_smart(
     crate::debug::emit_marker("SMART_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
-    let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    let mut result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     let mut extra_node_ids = handler.extra_node_ids;
     crate::debug::emit_marker("SMART_PASS1_END");
 
@@ -2815,21 +2839,35 @@ fn extract_smart(
     crate::debug::emit_marker("SMART_PASS2_START");
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
-    // Only way blobs are needed here — skip node and relation blobs via index.
+    // Reuses PASS1's full_way_schedule (built during the manual header scan
+    // in collect_pass1_generic) to avoid a second 19-second
+    // build_classify_schedule call after PASS1's parallel work. Saves ~16%
+    // wall on Europe extract-smart. Falls back to build_classify_schedule
+    // for the unsorted-fallback path where PASS1 doesn't build a schedule.
     {
     crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
-    let (way_schedule, shared_file) = super::build_classify_schedule(
-        input, Some(crate::blob_index::ElemKind::Way),
-    )?;
+    let pass1_way_schedule = std::mem::take(&mut result.way_schedule);
+    let (way_schedule, shared_file) = if pass1_way_schedule.is_empty() {
+        super::build_classify_schedule(input, Some(crate::blob_index::ElemKind::Way))?
+    } else {
+        let shared_file = std::sync::Arc::new(
+            std::fs::File::open(input)
+                .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+        );
+        (pass1_way_schedule, shared_file)
+    };
     crate::debug::emit_marker("SMART_PASS2_SCHEDULE_END");
 
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;
     // Per-blob send (not accumulate): extra_way_ids is relation-driven and
-    // can be wide + globally dispersed. Per-worker IdSetDense accumulate
-    // here blew up to 10.7 GB on Europe (commit 5ca2df9, sidecar 01de22bb).
-    // See notes/columnar-integration.md "Resolved: way dep IdSetDense
-    // accumulation" for the workload-selectivity rationale.
+    // can be wide + globally dispersed. Per-worker IdSetDense accumulate over
+    // an unbounded node-ID set is the unsafe shape the helper doc warns
+    // against, regardless of whether this specific workload triggers the
+    // worst case. The fix improves PASS2 wall by ~23%; the planet-scale
+    // memory peak it was originally framed as fixing turned out to be
+    // elsewhere (still under investigation, see
+    // notes/parallel-classify-regression-2026-04-11-followup.md).
     crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,

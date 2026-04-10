@@ -37,6 +37,7 @@ impl IdSetDense {
 
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
+        if id < 0 { return; } // Negative IDs are not valid OSM element IDs
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
         if cid >= self.chunks.len() {

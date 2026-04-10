@@ -81,26 +81,26 @@ pub fn derive_changes(
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
-    let scan_result = if both_indexed {
-        derive_changes_block_pair(old_path, new_path, direct_io, &mut sink)
-    } else {
-        derive_changes_element_stream(old_path, new_path, direct_io, &mut sink)
-    };
-    // Clean up temp files on error
-    if let Err(e) = scan_result {
-        sink.cleanup();
-        return Err(e);
-    }
-    sink.flush()?;
+    let result = (|| -> Result<DeriveChangesStats> {
+        if both_indexed {
+            derive_changes_block_pair(old_path, new_path, direct_io, &mut sink)?;
+        } else {
+            derive_changes_element_stream(old_path, new_path, direct_io, &mut sink)?;
+        }
+        sink.flush()?;
 
-    crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
+        crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
 
-    let stats = sink.stats();
+        let stats = sink.stats();
 
-    crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
-    assemble_osc(output, &sink)?;
+        crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
+        assemble_osc(output, &sink)?;
+        crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
+        Ok(stats)
+    })();
+    // Always clean up temp files, even on error
     sink.cleanup();
-    crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
+    let stats = result?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -136,9 +136,10 @@ impl ChangeSink {
         increment_version: bool,
         update_timestamp: bool,
     ) -> io::Result<Self> {
-        let cp = scratch_dir.join("derive-creates.xml.tmp");
-        let mp = scratch_dir.join("derive-modifies.xml.tmp");
-        let dp = scratch_dir.join("derive-deletes.xml.tmp");
+        let pid = std::process::id();
+        let cp = scratch_dir.join(format!("derive-creates-{pid}.xml.tmp"));
+        let mp = scratch_dir.join(format!("derive-modifies-{pid}.xml.tmp"));
+        let dp = scratch_dir.join(format!("derive-deletes-{pid}.xml.tmp"));
         Ok(Self {
             creates: Writer::new(io::BufWriter::new(File::create(&cp)?)),
             modifies: Writer::new(io::BufWriter::new(File::create(&mp)?)),
@@ -227,12 +228,19 @@ fn convert_to_xml_node(elem: &crate::Element<'_>, kind: ElemKind) -> Option<Owne
     }
 }
 
+/// Extract just id + metadata from a borrowed element for delete output.
+/// Avoids full owned conversion (no tag/ref cloning — deletes only need id + version).
 fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
-    use super::stream_merge::{convert_node, convert_way, convert_relation};
-    match kind {
-        ElemKind::Node => convert_node(elem).map(|n| ("node", n.id, n.metadata)),
-        ElemKind::Way => convert_way(elem).map(|w| ("way", w.id, w.metadata)),
-        ElemKind::Relation => convert_relation(elem).map(|r| ("relation", r.id, r.metadata)),
+    match (kind, elem) {
+        (ElemKind::Node, crate::Element::DenseNode(dn)) => Some(("node", dn.id(),
+            dn.info().map(crate::dense::DenseNodeInfo::version).filter(|&v| v != -1).map(OwnedMetadata::version_only))),
+        (ElemKind::Node, crate::Element::Node(n)) => Some(("node", n.id(),
+            n.info().version().map(OwnedMetadata::version_only))),
+        (ElemKind::Way, crate::Element::Way(w)) => Some(("way", w.id(),
+            w.info().version().map(OwnedMetadata::version_only))),
+        (ElemKind::Relation, crate::Element::Relation(r)) => Some(("relation", r.id(),
+            r.info().version().map(OwnedMetadata::version_only))),
+        _ => None,
     }
 }
 

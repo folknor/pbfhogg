@@ -501,3 +501,123 @@ fn omit_referenced_does_not_expand_relation_members() {
     assert!(node_ids(&c).is_empty());
     assert_eq!(stats.relations_matched, 1);
 }
+
+// ---------------------------------------------------------------------------
+// F49: --invert-match
+// ---------------------------------------------------------------------------
+
+fn run_filter_opts(
+    input: &std::path::Path,
+    output: &std::path::Path,
+    expression_strs: &[String],
+    omit_referenced: bool,
+    invert: bool,
+    remove_tags: bool,
+) -> pbfhogg::tags_filter::TagsFilterStats {
+    let opts = TagsFilterOptions {
+        expression_strs,
+        omit_referenced,
+        invert,
+        remove_tags,
+        compression: Compression::default(),
+        direct_io: false,
+        force: true,
+    };
+    tags_filter(input, output, &opts, &pbfhogg::HeaderOverrides::default()).expect("filter")
+}
+
+#[test]
+fn invert_match_excludes_matching_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("amenity", "bench")] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "foo")] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[],
+        &[],
+    );
+
+    // Invert: output nodes that do NOT match "amenity"
+    let stats = run_filter_opts(&input, &output, &exprs(&["amenity"]), true, true, false);
+    let c = read_all_elements(&output);
+
+    // Node 1 has amenity → excluded. Nodes 2 and 3 → included.
+    assert_eq!(node_ids(&c), vec![2, 3]);
+    assert_eq!(stats.nodes_matched, 2);
+}
+
+#[test]
+fn invert_match_excludes_matching_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "primary")] },
+            TestWay { id: 11, refs: vec![1, 2], tags: vec![("highway", "secondary")] },
+            TestWay { id: 12, refs: vec![1, 2], tags: vec![("building", "yes")] },
+        ],
+        &[],
+    );
+
+    // Invert: output ways that do NOT match "highway"
+    let _stats = run_filter_opts(&input, &output, &exprs(&["highway"]), true, true, false);
+    let c = read_all_elements(&output);
+
+    // Ways 10, 11 have highway → excluded. Way 12 → included.
+    assert_eq!(way_ids(&c), vec![12]);
+}
+
+// ---------------------------------------------------------------------------
+// F50: --remove-tags
+// ---------------------------------------------------------------------------
+
+#[test]
+fn remove_tags_strips_tags_from_referenced_nodes() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("shop", "bakery")] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "corner")] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![("highway", "residential")] },
+        ],
+        &[],
+    );
+
+    // Two-pass (omit_referenced=false) with remove_tags: way 10 matches
+    // "highway", its referenced nodes 1,2 are pulled in but with tags stripped.
+    let _stats = run_filter_opts(&input, &output, &exprs(&["highway"]), false, false, true);
+    let c = read_all_elements(&output);
+
+    // Way 10 should keep its tags (directly matched)
+    assert_eq!(way_ids(&c), vec![10]);
+    let way_tags: Vec<_> = c.ways.iter()
+        .find(|(id, _, _)| *id == 10)
+        .map(|(_, _, tags)| tags.clone())
+        .unwrap_or_default();
+    assert!(!way_tags.is_empty(), "directly matched way should keep tags");
+
+    // Nodes 1,2 should be present but with empty tags (referenced only)
+    assert_eq!(node_ids(&c), vec![1, 2]);
+    for (id, tags) in &c.nodes {
+        assert!(tags.is_empty(), "node {id} should have tags stripped (referenced only)");
+    }
+}

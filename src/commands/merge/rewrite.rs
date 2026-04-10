@@ -57,7 +57,7 @@ fn write_osc_way(
     writer: &mut PbfWriter<FileWriter>,
     way: &crate::osc::CompactWayRef<'_>,
     loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-    stats: &mut MergeStats,
+    _stats: &mut MergeStats,
 ) -> Result<()> {
     ensure_way_capacity(bb, writer)?;
     let refs: Vec<i64> = way.refs().collect();
@@ -194,7 +194,7 @@ fn write_osc_way_local(
     output: &mut Vec<OwnedBlock>,
     way: &crate::osc::CompactWayRef<'_>,
     loc_map: Option<&FxHashMap<i64, (i32, i32)>>,
-    stats: &mut MergeStats,
+    _stats: &mut MergeStats,
 ) -> Result<()> {
     ensure_way_capacity_local(bb, output)?;
     let refs: Vec<i64> = way.refs().collect();

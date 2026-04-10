@@ -1440,4 +1440,67 @@ mod tests {
         let tag_vec: Vec<(&str, &str)> = rel.tags().collect();
         assert_eq!(tag_vec[0], ("type", "multipolygon"));
     }
+
+    /// F57: End-to-end test parsing an OSC file with way `<nd>` children
+    /// and relation `<member>` children through `parse_osc_file`.
+    #[test]
+    fn test_parse_osc_way_and_relation_children() -> ParseResult<()> {
+        let dir = make_test_dir("way_relation_children");
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <way id="100" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <nd ref="3"/>
+      <tag k="highway" v="residential"/>
+      <tag k="name" v="Main Street"/>
+    </way>
+    <relation id="200" version="1">
+      <member type="way" ref="100" role="outer"/>
+      <member type="way" ref="101" role="inner"/>
+      <member type="node" ref="1" role="label"/>
+      <tag k="type" v="multipolygon"/>
+    </relation>
+  </create>
+  <modify>
+    <way id="300" version="5">
+      <nd ref="10"/>
+      <nd ref="11"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </modify>
+</osmChange>"#;
+
+        write_osc_gz(&dir, "children.osc.gz", xml);
+        let overlay = parse_osc_file(&dir.join("children.osc.gz"))?;
+
+        // Way 100: 3 refs, 2 tags
+        let way100 = overlay.get_way(100).ok_or("way 100 should exist")?;
+        let refs: Vec<i64> = way100.refs().collect();
+        assert_eq!(refs, vec![1, 2, 3]);
+        let tags: Vec<(&str, &str)> = way100.tags().collect();
+        assert_eq!(tags, vec![("highway", "residential"), ("name", "Main Street")]);
+
+        // Way 300: 2 refs, 1 tag (modify)
+        let way300 = overlay.get_way(300).ok_or("way 300 should exist")?;
+        let refs: Vec<i64> = way300.refs().collect();
+        assert_eq!(refs, vec![10, 11]);
+        let tags: Vec<(&str, &str)> = way300.tags().collect();
+        assert_eq!(tags, vec![("highway", "primary")]);
+
+        // Relation 200: 3 members, 1 tag
+        let rel = overlay.get_relation(200).ok_or("relation 200 should exist")?;
+        let members: Vec<(MemberType, i64, &str)> = rel.members().collect();
+        assert_eq!(members.len(), 3);
+        assert_eq!(members[0], (MemberType::Way, 100, "outer"));
+        assert_eq!(members[1], (MemberType::Way, 101, "inner"));
+        assert_eq!(members[2], (MemberType::Node, 1, "label"));
+        let tags: Vec<(&str, &str)> = rel.tags().collect();
+        assert_eq!(tags, vec![("type", "multipolygon")]);
+
+        drop(std::fs::remove_dir_all(&dir));
+        Ok(())
+    }
 }

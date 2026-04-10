@@ -597,6 +597,17 @@ per-iteration allocations remain across the codebase, ordered by impact:
   parallel iterator ownership semantics. `SmallVec` could avoid heap
   allocation for ways with few segments. Low priority.
 
+- [ ] **Per-relation members_scratch** — 14M relations × ~10 members ×
+  24 bytes = 3.4 GB cumulative at planet. All allocator fast-path, no
+  RSS impact. Skipped during v0.1 review (4 planet reviewers: not worth
+  the API complexity). Revisit only if allocator profiling shows it
+  matters after arena/columnar work.
+
+- [ ] **Borrowed XML writer Vec elimination** — `write_borrowed_way_xml`
+  and `write_borrowed_relation_xml` in `elements_xml.rs` still collect
+  refs and members into `Vec`s. Could use `.peekable()` like tags to
+  iterate directly. Low priority (~8 refs/way, ~10 members/relation).
+
 - [x] **2. Columnar batch processing** — shipped for extract node
   classification. `DenseNodeColumns` decodes IDs/lats/lons into
   contiguous arrays. `collect_matching_ids_multi_bbox` does single-pass
@@ -719,6 +730,27 @@ per-iteration allocations remain across the codebase, ordered by impact:
 See `notes/test-plan.md` for the full pre-release test matrix (feature permutations,
 I/O modes, CLI commands) and `reference/performance.md` for consolidated baselines.
 
+- [ ] **Diff element_stream fallback path untested** — all test PBFs are
+  indexed because `PbfWriter::write_primitive_block` unconditionally adds
+  indexdata. The `diff_element_stream` fallback (non-indexed inputs) has
+  no direct coverage. Needs a `write_test_pbf_non_indexed` helper that
+  either strips indexdata post-write or uses `write_blob` directly.
+
+- [ ] **Test fixture infrastructure** — current `write_test_pbf` /
+  `write_test_pbf_sorted` helpers create minimal PBFs (1-3 elements per
+  type, single block). Needed: (1) a sorted+indexed fixture generator
+  for commands that require indexdata (merge, extract, diff, ALTW),
+  (2) larger multi-block fixtures (~100 elements, 3-5 blocks) to exercise
+  batch boundaries, blob classification, and passthrough coalescing,
+  (3) a fixture with metadata (version, changeset, timestamp, uid, user)
+  for CleanAttrs / time_filter / diff verbose testing.
+
+- [ ] **Fuzz testing** — PBF parsing (`PrimitiveBlock::from_vec`), OSC
+  parsing (`parse_osc_file`), and wire-format decoders (`Cursor`,
+  `WireBlock`, `WireInfo`) accept untrusted input. `cargo-fuzz` targets
+  for these entry points would catch panics, OOM, and logic errors on
+  malformed data. Also fuzz the roundtrip path (write → read → compare).
+
 ### Cross-validation known diffs
 
 Three `brokkr verify` commands show known differences vs osmium. These are semantic
@@ -807,123 +839,11 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 - [x] Add LICENSE-APACHE copyright header — addressed by dual MIT/Apache-2.0 licensing
 - [x] Add a CHANGELOG.md before first tagged release
-## Post-v0.1 review: remaining work
+## Post-v0.1 review — COMPLETE
 
-Prioritized by planet-scale value/effort ratio (4 reviewers: perf+planet,
-2026-04-10). Items 5-8 are low-priority — skip unless blocking other work.
-
-### Priority 1: Per-element Vec allocations in decode→re-encode paths
-
-Planet reviewers rank #1: broadest cross-command impact, hits hot write/rewrite
-paths in sort, merge, diff, derive_changes, cat --type, extract, tags-filter.
-
-**Phase A (tags_as_pairs): DONE.** `write_single_node/way/relation` already
-pass iterators (commit `bb15e66`). `time_filter.rs` was the last caller of
-`tags_as_pairs()` and `members_as_data()` — converted to pass iterators.
-Both helper methods removed.
-
-**Phase B (Bytes→Vec copy elimination): DONE.** All 16 sequential callers
-of `decompress_pooled()` → `new_with_scratch(Bytes)` converted to
-`decompress_into(&mut Vec)` → `from_vec_with_scratch(take(&mut buf))`.
-Eliminates 1.5 MB Bytes→Vec copy per blob. At planet scale (600K blobs
-for stream_merge): old path 1032 GB cumulative alloc, new path 132 GB
-(7.8x reduction). Scanner sites (ALTW, external_join) use buffer reuse
-(no take, true retained allocation). `decompress_pooled` method retained
-for pipelined reader paths (parallel workers with pool recycling).
-
-**Phase C (members_scratch): SKIPPED.** Per planet/claude review: 14M
-relations × ~10 members × 24 bytes = 3.4 GB cumulative at planet. All
-allocator fast-path, no RSS impact. Not worth the API complexity.
-
-### Priority 2: IdSet — migrate from BTreeSet to IdSetDense — DONE
-
-`IdSet` fields changed from `BTreeSet<i64>` to `IdSetDense`. O(log n) → O(1)
-per element lookup. Blob-skip optimization preserved via `any_in_range()`.
-Added `IdSetDense::merge_from()` for union, `iter()` for diagnostic output.
-`ids_intersect_range` removed. CLI updated for `has_any()`/`iter()` API.
-Also fixed redundant closures in sweep_merge call sites (clippy).
-
-### Priority 3: derive_changes — stream instead of buffering — DONE
-
-`ChangeSink` writes element XML directly to 3 temp files during the scan
-pass. Final `.osc.gz` assembled by copying raw temp bytes through GzEncoder
-(single gzip member, per reviewer consensus). Memory bounded by one element
-at a time instead of all changes. Planet daily diff: ~1-6 GB peak → ~24 KB.
-Both block_pair (indexed) and element_stream (fallback) paths converted.
-Temp files include PID for concurrent safety, cleaned up on all exit paths.
-Delete path extracts id+metadata directly (zero tag clone).
-
-**Follow-up: borrowed element XML writers — DONE.** `write_element_xml`
-in `elements_xml.rs` writes XML directly from borrowed `&Element<'_>`
-(DenseNode, Node, Way, Relation) without cloning to owned types.
-`ChangeSink::write_create`/`write_modify` use this zero-clone path.
-Removed `OwnedXml` enum and `convert_to_xml_node` from derive_changes.
-The element_stream fallback path retains owned writers (already has
-owned elements from `merge_join_phase`). Borrowed way/relation writers
-still collect refs and members into `Vec`s (not fully allocation-free) —
-could use `.peekable()` like tags to avoid. Low priority.
-
-### Priority 4: Split merge.rs into submodules — DONE
-
-1857-line `merge.rs` split into 5 submodules: `merge/stats.rs` (MergeStats,
-percentiles, PhaseTimers, PhaseRss), `merge/node_locations.rs`
-(NodeLocationIndex), `merge/diff_ranges.rs` (DiffRanges, UpsertCursors),
-`merge/classify.rs` (ClassifyResult, BatchSlot, classify_only,
-block_overlaps_diff), `merge/rewrite.rs` (all write functions, header
-handling, reader thread, rewrite logic, main `merge()`). `merge/mod.rs`
-re-exports `merge`, `MergeOptions`, `MergeStats`. Public API unchanged.
-
-### Priority 5: Reduce build_geocode_index cognitive complexity — DONE
-
-Pass 2 node+way loop extracted into `Pass2State` struct with
-`process_dense_node()` and `process_way()` methods. All mutable
-state (writers, counters, coord_mmap, way_geom, strings, interp_ways)
-is grouped in the struct. The main loop body is now 5 lines.
-
-### Priority 6: merge --locations-on-ways — avoid cloning location HashMap — DONE
-
-`NodeLocationIndex::prefill_from_base()` pre-scans the base PBF before
-the merge loop to fill all remaining needed node coordinates. Uses
-indexdata to skip non-node blobs, breaks at first non-node blob (sorted
-PBF), and exits early once all IDs are found. Locations wrapped in
-`Arc` once and shared read-only across all rewrite tasks — no per-batch
-`HashMap::clone()`. Phase 2.5 (in-loop extraction) removed entirely.
-`LocStats` struct carries pre-scan statistics to final summary.
-
-### Priority 7: pread-from-workers boilerplate dedup (SKIP)
-
-~100 lines duplicated between extract.rs and tags_filter.rs. Reviewers
-(4/4) recommend skipping: different payloads, consumer logic, and stats
-types make the generic helper harder to read than the duplication. Only
-do this after the pread API shape stabilizes.
-
-### Priority 8: Unify assemble_block (SKIP)
-
-Reviewers (4/4) unanimously rank last. ~10 lines of shared logic behind
-8+ parameter functions. The abstraction would be harder to read than the
-duplication and risks codegen regression in a performance-critical path.
-
-### Completed
-
-- [x] **OSC XML element writing shared** — `write_node_xml` etc. in
-  `elements_xml.rs`. Both derive_changes and merge_changes now call shared
-  functions. Node attribute order unified to id, lat, lon, version.
-- [x] **sweep_merge generics** — sort.rs `sweep_merge<T>`, merge_pbf.rs
-  `sweep_merge_dedup<T>`. Closures for extract and write_elem.
-- [x] **Unify getid filter_by_id / filter_by_id_invert** — single function
-  with `include: bool`. ~230 lines → ~130.
-- [x] **Page-aligned allocation shared** — `alloc_page_aligned()` in
-  `write/mod.rs`. Both `AlignedBuffer::new` and `AlignedBufferPool::new`.
-- [x] **bucketed_cell_assignment params** — `CellAssignmentParams` struct.
-- [x] **load_next_bucket params** — `BucketState` struct. Reviewed by
-  perf+planet: no codegen concern at planet scale.
-- [x] **osc.rs byte helpers** — `try_into()` slice conversion.
-
-### Investigated, not worth doing
-
-- **DenseNodeIter batch kv_pos** — regressed inspect-nodes +8.7%.
-  Confirmed by 4 reviewers: original per-iteration pattern is already
-  optimal, don't retry.
+All 8 priorities resolved (2026-04-10). Priorities 1-6 done, 7-8 skipped
+by reviewer consensus. Remaining low-priority items (members_scratch,
+borrowed XML writer Vec elimination) moved to scratch buffer audit above.
 
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release

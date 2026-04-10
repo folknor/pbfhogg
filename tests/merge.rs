@@ -1502,3 +1502,147 @@ fn merge_basic_create_modify_delete_uring() {
         Err(e) => panic!("unexpected error: {e}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// F47: Gap creates — verify creates with IDs between base blob ranges
+// ---------------------------------------------------------------------------
+
+/// F47: Create elements with IDs that fall in gaps between base blobs.
+/// Verifies gap create detection and cursor advancement across blob boundaries.
+#[test]
+fn merge_gap_creates_between_blobs() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Base: nodes 10, 20, 30 and ways 100, 200
+    write_test_pbf(
+        &base,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")] },
+            TestWay { id: 200, refs: vec![20, 30], tags: vec![("highway", "path")] },
+        ],
+        &[],
+    );
+
+    // Diff: creates in gaps — node 5 before base, node 15 between 10-20,
+    // node 35 after base. Way 50 before base, way 150 between 100-200.
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <node id="5" lat="50.0" lon="10.0" version="1"/>
+    <node id="15" lat="51.0" lon="11.0" version="1"/>
+    <node id="35" lat="52.0" lon="12.0" version="1"/>
+    <way id="50" version="1">
+      <nd ref="10"/>
+      <nd ref="20"/>
+    </way>
+    <way id="150" version="1">
+      <nd ref="20"/>
+      <nd ref="30"/>
+    </way>
+  </create>
+</osmChange>"#);
+
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }, &pbfhogg::HeaderOverrides::default()).expect("merge");
+    let c = read_all_elements(&output);
+
+    // All nodes present. Gap create 5 emitted before base blob.
+    // Creates 15 and 35 fall within/after the passthrough blob range
+    // and are emitted after the passthrough blob (intentional — the merge
+    // optimizes for throughput by passing through unaffected blobs raw).
+    let nids = node_ids(&c);
+    assert_eq!(nids.len(), 6);
+    assert!(nids.contains(&5));
+    assert!(nids.contains(&10));
+    assert!(nids.contains(&15));
+    assert!(nids.contains(&20));
+    assert!(nids.contains(&30));
+    assert!(nids.contains(&35));
+
+    // All ways present: gap create + base + gap create
+    let wids = way_ids(&c);
+    assert_eq!(wids.len(), 4);
+    assert!(wids.contains(&50));
+    assert!(wids.contains(&100));
+    assert!(wids.contains(&150));
+    assert!(wids.contains(&200));
+
+    // Stats: 3 base nodes, 3 diff nodes, 2 base ways, 2 diff ways
+    assert_eq!(stats.base_nodes, 3);
+    assert_eq!(stats.diff_nodes, 3);
+    assert_eq!(stats.base_ways, 2);
+    assert_eq!(stats.diff_ways, 2);
+}
+
+// ---------------------------------------------------------------------------
+// F48: Type transitions — Node→Relation with no Ways in base
+// ---------------------------------------------------------------------------
+
+/// F48: Base has only nodes and relations (no ways). Diff creates ways.
+/// Verifies that the Node→Relation type transition flushes all pending
+/// way upserts before processing the relation blob.
+#[test]
+fn merge_type_transition_node_to_relation_skipping_ways() {
+    let dir = TempDir::new().expect("tempdir");
+    let base = dir.path().join("base.osm.pbf");
+    let osc = dir.path().join("diff.osc.gz");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Base: nodes + relations, NO ways
+    write_test_pbf(
+        &base,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![TestMember { id: MemberId::Node(1), role: "label" }],
+                tags: vec![("type", "boundary")],
+            },
+        ],
+    );
+
+    // Diff: create ways (entirely new type in base)
+    write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
+<osmChange version="0.6">
+  <create>
+    <way id="50" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="residential"/>
+    </way>
+    <way id="51" version="1">
+      <nd ref="1"/>
+      <nd ref="2"/>
+      <tag k="highway" v="primary"/>
+    </way>
+  </create>
+</osmChange>"#);
+
+    let stats = merge(&base, &osc, &output, &MergeOptions { compression: Compression::default(), direct_io: false, io_uring: false, force: true, locations_on_ways: false }, &pbfhogg::HeaderOverrides::default()).expect("merge");
+    let c = read_all_elements(&output);
+
+    // All nodes from base
+    assert_eq!(node_ids(&c), vec![1, 2]);
+
+    // Ways from diff — must be present (flushed during type transition)
+    assert_eq!(way_ids(&c), vec![50, 51]);
+
+    // Relation from base
+    assert_eq!(relation_ids(&c), vec![100]);
+
+    // Output ordering: nodes before ways before relations
+    assert_eq!(stats.base_nodes, 2);
+    assert_eq!(stats.diff_ways, 2);
+    assert_eq!(stats.base_relations, 1);
+}

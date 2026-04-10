@@ -4,6 +4,7 @@ mod common;
 
 use common::{
     read_all_elements_id_only as read_all_elements,
+    read_all_elements_with_coords,
     node_ids_id_only as node_ids, way_ids_id_only as way_ids,
     relation_ids_id_only as relation_ids,
     write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
@@ -178,4 +179,142 @@ fn empty_input() {
     assert_eq!(stats.nodes_written, 0);
     assert_eq!(stats.ways_written, 0);
     assert_eq!(stats.relations_written, 0);
+}
+
+// ---------------------------------------------------------------------------
+// F54: Verify way refs and relation member IDs are actually remapped
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renumber_way_refs_actually_remapped() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10, 20, 30], tags: vec![("highway", "primary")] },
+        ],
+        &[],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    let c = read_all_elements_with_coords(&output);
+
+    // Nodes renumbered: 10→1, 20→2, 30→3
+    assert_eq!(c.nodes.len(), 3);
+    assert_eq!(c.nodes[0].0, 1);
+    assert_eq!(c.nodes[1].0, 2);
+    assert_eq!(c.nodes[2].0, 3);
+
+    // Way refs must reference the NEW node IDs, not the old ones
+    assert_eq!(c.ways.len(), 1);
+    assert_eq!(c.ways[0].0, 1); // way 100→1
+    assert_eq!(c.ways[0].1, vec![1, 2, 3], "way refs should be remapped to new node IDs");
+}
+
+#[test]
+fn renumber_relation_member_ids_actually_remapped() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 50, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 80, refs: vec![50], tags: vec![] },
+        ],
+        &[
+            TestRelation {
+                id: 200,
+                members: vec![
+                    TestMember { id: MemberId::Node(50), role: "stop" },
+                    TestMember { id: MemberId::Way(80), role: "outer" },
+                ],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    let c = read_all_elements_with_coords(&output);
+
+    // Node 50→1, Way 80→1, Relation 200→1
+    assert_eq!(c.relations.len(), 1);
+    let members = &c.relations[0].1;
+    assert_eq!(members.len(), 2);
+    // Member node ref should be remapped: 50→1
+    assert_eq!(members[0].0, 1, "node member ref should be remapped");
+    assert_eq!(members[0].1, "node");
+    assert_eq!(members[0].2, "stop");
+    // Member way ref should be remapped: 80→1
+    assert_eq!(members[1].0, 1, "way member ref should be remapped");
+    assert_eq!(members[1].1, "way");
+    assert_eq!(members[1].2, "outer");
+}
+
+// ---------------------------------------------------------------------------
+// F55: Relation referencing relation
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renumber_relation_referencing_relation() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+        ],
+        &[],
+        &[
+            TestRelation {
+                id: 500,
+                members: vec![
+                    TestMember { id: MemberId::Node(10), role: "label" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+            TestRelation {
+                id: 600,
+                members: vec![
+                    TestMember { id: MemberId::Relation(500), role: "subarea" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+        ],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    let c = read_all_elements_with_coords(&output);
+
+    // Node 10→1, Relation 500→1, Relation 600→2
+    assert_eq!(c.nodes[0].0, 1);
+    assert_eq!(c.relations.len(), 2);
+    assert_eq!(c.relations[0].0, 1); // rel 500→1
+    assert_eq!(c.relations[1].0, 2); // rel 600→2
+
+    // Relation 600's member should reference remapped relation 500→1
+    let members = &c.relations[1].1;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].0, 1, "relation member ref should be remapped: 500→1");
+    assert_eq!(members[0].1, "relation");
+    assert_eq!(members[0].2, "subarea");
 }

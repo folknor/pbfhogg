@@ -227,3 +227,57 @@ fn merge_empty_files() {
     assert_eq!(stats.relations, 0);
     assert_eq!(stats.duplicates_removed, 0);
 }
+
+/// F60: Three files with overlapping ID ranges — exercises 3-way heap merge.
+#[test]
+fn merge_three_files_overlapping_ids() {
+    let dir = TempDir::new().expect("tempdir");
+    let a = dir.path().join("a.osm.pbf");
+    let b = dir.path().join("b.osm.pbf");
+    let c_file = dir.path().join("c.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    // Three files with overlapping node ID ranges:
+    // A: 1, 3, 5    B: 2, 3, 4    C: 3, 5, 6
+    // Node 3 appears in all three, node 5 in A+C — tests 3-way dedup
+    write_test_pbf_sorted(
+        &a,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("src", "a")] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "a")] },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "a")] },
+        ],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &b,
+        &[
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![("src", "b")] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "b")] },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![("src", "b")] },
+        ],
+        &[],
+        &[],
+    );
+    write_test_pbf_sorted(
+        &c_file,
+        &[
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("src", "c")] },
+            TestNode { id: 5, lat: 140_000_000, lon: 240_000_000, tags: vec![("src", "c")] },
+            TestNode { id: 6, lat: 150_000_000, lon: 250_000_000, tags: vec![("src", "c")] },
+        ],
+        &[],
+        &[],
+    );
+
+    let inputs: Vec<&std::path::Path> = vec![a.as_path(), b.as_path(), c_file.as_path()];
+    let stats = merge_pbf(&inputs, &output, &default_opts(), &pbfhogg::HeaderOverrides::default()).expect("merge_pbf");
+    let c = read_all_elements(&output);
+
+    // Output should contain exactly 6 unique nodes (1-6), sorted
+    assert_eq!(node_ids(&c), vec![1, 2, 3, 4, 5, 6]);
+    assert_eq!(stats.nodes, 6);
+    // Node 3 appears in 3 files (2 duplicates), node 5 in 2 files (1 duplicate)
+    assert_eq!(stats.duplicates_removed, 3, "3 duplicates: node 3 ×2 + node 5 ×1");
+}

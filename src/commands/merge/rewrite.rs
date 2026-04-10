@@ -66,10 +66,7 @@ fn write_osc_way(
         for &node_id in &refs {
             match locs.get(&node_id) {
                 Some(&loc) => locations.push(loc),
-                None => {
-                    stats.loc_missing += 1;
-                    locations.push((0, 0));
-                }
+                None => locations.push((0, 0)),
             }
         }
         bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);
@@ -207,10 +204,7 @@ fn write_osc_way_local(
         for &node_id in &refs {
             match locs.get(&node_id) {
                 Some(&loc) => locations.push(loc),
-                None => {
-                    stats.loc_missing += 1;
-                    locations.push((0, 0));
-                }
+                None => locations.push((0, 0)),
             }
         }
         bb.add_way_with_locations(way.id(), way.tags(), &refs, &locations, None);

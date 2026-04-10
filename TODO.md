@@ -615,21 +615,45 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
-- [ ] **`parallel_classify_phase` planet safety** — per-worker Vec
-  accumulation is NOT planet-safe for dense paths. Node classify
-  multi-extract: 48 GB worst case. Way classify single-extract:
-  ~11 GB. tags_filter pass 1 ClassifyResult: 2.9 GB per worker.
-  **Fix:** restore two-parameter `<S, R>` signature — `S` for
-  persistent scratch (DenseNodeColumns), `R` for per-blob results
-  sent through channel. Keep per-worker accumulation only for
-  relation classify (~68 MB per worker, bounded).
-  Design review (10 reviewers, 5 archetypes, 2026-04-09): unanimous
-  that per-blob send is the correct permanent solution. Consumer
-  throughput is not a bottleneck for realistic workloads.
-  Way dep IdSetDense accumulation (tags-filter, smart extract,
-  geocode) is disputed — 9 GB total at planet, tight but possibly
-  feasible. Needs measurement or revert to per-blob send.
-  See [notes/columnar-integration.md](notes/columnar-integration.md).
+- [ ] **`parallel_classify_phase` planet safety** — two-parameter
+  `<S, R>` signature is already implemented in `src/commands/mod.rs`
+  alongside the single-parameter `parallel_classify_accumulate<S>`.
+  The remaining work is per-call-site audit and conversion. Most
+  hot/dense paths already use `_phase`; relation classify call sites
+  correctly use `accumulate` (bounded). The 2026-04-09 design review
+  flagged three "disputed" way-dep IdSetDense accumulation paths
+  (tags-filter, smart extract, geocode). 2026-04-10 measurement
+  resolved them per-call-site:
+  - **`extract.rs:2813` (smart PASS2 way deps): per-blob send.**
+    Measured Europe peak anon 4.12 GB → 10.72 GB (+160%) and PASS2
+    wall +64% post-refactor. Pro-rated to planet ~28 GB. Confirmed
+    planet blocker. **TODO: convert to `parallel_classify_phase<(),
+    Vec<i64>>`.**
+  - **`tags_filter.rs:1000` (way deps): keep accumulate.** Measured
+    Europe peak essentially flat (~200 MB per-worker contribution
+    on top of persistent state). Tag-selective `included_way_ids`
+    is narrow and clustered, not relation-driven. Pro-rated to
+    planet ~5.5 GB. Safe. Add a comment at the call site.
+  - **Geocode referenced nodes: not yet measured.** Path is in
+    `geocode_index/builder.rs` Pass 1.5. Has both selective and
+    dispersed characteristics. Measure on Europe before deciding.
+  See [notes/columnar-integration.md](notes/columnar-integration.md)
+  (resolved section), [notes/parallel-classify-regression-2026-04-10.md](notes/parallel-classify-regression-2026-04-10.md)
+  and [notes/parallel-classify-regression-2026-04-10-reviews.md](notes/parallel-classify-regression-2026-04-10-reviews.md).
+
+- [ ] **Cross-command wall regression (separate issue, defer)** —
+  2026-04-10 measurement showed +22-24% wall-time regression on both
+  extract-smart and tags-filter-twopass at Europe scale, post the
+  parallel_classify_phase refactor. NOT explained by memory:
+  tags-filter has flat memory and PASS1 (the +32% outlier) already
+  uses `parallel_classify_phase`, not accumulate. Likely multiple
+  causes: phase split in tags-filter (PASS1 → CLOSURE → WAYDEPS
+  re-reads way blobs), possibly columnar scratch in PASS1 even
+  where unused, lost producer/consumer overlap from accumulate's
+  merge barrier in extract-smart, plus cross-day measurement noise
+  from `--bench 1`. Investigate AFTER `extract.rs:2813` fix lands.
+  Approach: `--bench 3` baselines on the same day, then per-call-site
+  A/B toggles. Do NOT start with flamegraphs.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

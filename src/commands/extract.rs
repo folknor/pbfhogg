@@ -2810,22 +2810,29 @@ fn extract_smart(
 
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;
-    parallel_classify_accumulate(
+    // Per-blob send (not accumulate): extra_way_ids is relation-driven and
+    // can be wide + globally dispersed. Per-worker IdSetDense accumulate
+    // here blew up to 10.7 GB on Europe (commit 5ca2df9, sidecar 01de22bb).
+    // See notes/columnar-integration.md "Resolved: way dep IdSetDense
+    // accumulation" for the workload-selectivity rationale.
+    parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        IdSetDense::new,
-        |block, node_ids| {
+        Vec::<i64>::new,
+        |block, scratch| {
+            scratch.clear();
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     let wid = w.id();
                     if extra_way_ids_ref.get(wid) && !matched_way_ids_ref.get(wid) {
-                        for r in w.refs() { node_ids.set(r); }
+                        for r in w.refs() { scratch.push(r); }
                     }
                 }
             }
+            scratch.drain(..).collect::<Vec<i64>>()
         },
-        |worker_node_ids| {
-            extra_node_ids.merge(worker_node_ids);
+        |refs| {
+            for id in refs { extra_node_ids.set(id); }
         },
     )?;
     }

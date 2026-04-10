@@ -137,23 +137,100 @@ Workers send `R` per blob, keep `S` across blobs. Two functions:
 | tags_filter pass 1 ClassifyResult | Vec<(i64, Vec<i64>)> | 2.9 GB | **No** | Per-blob send |
 | Relation classify | (IdSetDense×3) | 68 MB | **Yes** | Keep accumulate |
 | tags_filter relation closure | Vec<i64> members | 13 MB | **Yes** | Keep accumulate |
-| Way dep node refs (tags_filter) | IdSetDense | 1.5 GB | Disputed | See below |
-| Way dep node refs (smart extract) | IdSetDense | 1.5 GB | Disputed | See below |
-| Geocode referenced nodes | IdSetDense | 1.5 GB | Disputed | See below |
+| Way dep node refs (tags_filter, `tags_filter.rs:1000`) | IdSetDense | ~200 MB (measured at Europe, see below) | **Yes** (workload-selective) | Keep accumulate |
+| Way dep node refs (smart extract, `extract.rs:2813`) | IdSetDense | 1.5 GB+ (measured at Europe, see below) | **No** | Per-blob send |
+| Geocode referenced nodes | IdSetDense | 1.5 GB (estimated, not measured) | Likely No, untested | Measure before deciding |
 
-### Disputed: way dep IdSetDense accumulation
+### Resolved: way dep IdSetDense accumulation (2026-04-10 measurement)
 
-Split opinion on per-worker IdSetDense for way dep node refs:
-- **Keep (correctness/claude):** 6 workers × 1.5 GB = 9 GB, feasible
-  on 30 GB host. Merge frees 5 copies → 1.5 GB final.
-- **Not safe (perf/codex, arch/codex, planet):** IdSetDense memory
-  is driven by chunk spread, not count. Shared work queue means each
-  worker touches the full node ID range → each allocates ~387 chunks
-  = ~1.5 GB. 6 × 1.5 GB = 9 GB is tight alongside other allocations.
+The "disputed" framing from the 2026-04-09 design review was based on a
+**worst-case** chunk-spread model (6 workers × full node ID range = 9 GB
+per-worker). Measurement at Europe scale on 2026-04-10 (commit `5ca2df9`,
+plantasjen, sidecar profiler) showed the model is correct for the worst
+case but **too pessimistic for selective workloads**. The decision is
+not all-or-nothing — it's per-call-site, driven by what produces the
+input way ID set.
 
-Decision pending. If we keep it, need planet-scale measurement to
-confirm 9 GB fits. If not, revert to per-blob send (each blob
-produces ~64K refs, bounded).
+**Measured:**
+- `extract --strategy smart` Europe: EXTRACT_PASS2 peak anon **10.72 GB**
+  (UUID `01de22bb`). Pre-refactor `fc17b51` was 4.12 GB. The +6.6 GB
+  matches 6 workers × ~1.1 GB per-worker IdSetDense exactly. Pro-rated
+  to planet (~2.6×): ~28 GB. Does NOT fit on 30 GB host. **Confirmed
+  planet blocker.**
+- `tags-filter-twopass` Europe: TAGSFILTER_WAYDEPS peak anon **1.89 GB**
+  (UUID `c1672f04`), but ~1.7 GB of that is the persistent IdSetDense
+  state from prior phases (`included_way_ids`, `included_node_ids`,
+  etc.). Per-worker contribution is ~200 MB total. Pro-rated to planet:
+  ~5.5 GB. **Comfortably fits 30 GB host.**
+
+**Why the difference?** The two call sites are byte-identical at the API
+level but **not workload-equivalent**:
+- `tags_filter.rs:1000` `collect_way_node_dependencies` filters on
+  `included_way_ids` — a **tag-selective** subset (e.g. `highway=primary`
+  ≈ 0.1% of all ways). Tag selectivity correlates with geography
+  (highways cluster along road networks), so per-worker chunk spread is
+  narrow (~50–200 chunks per worker, ~200–800 MB).
+- `extract.rs:2813` smart PASS2 filters on `extra_way_ids` — a
+  **relation-driven** subset of ways pulled in via relation member
+  expansion (coastlines, admin boundaries, multipolygons). Relations
+  span continents, so the extra-way set is wide and globally dispersed.
+  Per-worker chunk spread approaches the worst case (~500 chunks,
+  ~1.5+ GB).
+
+**The chunk-spread model is workload-dependent, not a uniform property
+of `parallel_classify_accumulate`.** The same helper, the same data
+structure, applied to two filtered subsets of the same way blob set,
+produces 5× different per-worker memory. The model is correct as a
+worst-case prediction; it's wrong as a uniform prediction across all
+"way deps" call sites.
+
+**Per-call-site decisions:**
+- `extract.rs:2813` (smart PASS2 way deps): **Per-blob send**.
+  Convert to `parallel_classify_phase<(), Vec<i64>>`. The relation-driven
+  workload genuinely hits the worst case the model predicted.
+- `tags_filter.rs:1000` (tag-selective way deps): **Keep accumulate**.
+  Add a comment at the call site documenting that this is safe ONLY
+  because `included_way_ids` is tag-selective (narrow + clustered).
+  Future maintainers should NOT copy this pattern for relation-driven
+  filters.
+- Geocode referenced nodes: **Not yet measured**. The path is
+  `geocode_index/builder.rs` Pass 1.5 (referenced node collection),
+  built from relation members + way refs. Has both selective and
+  dispersed characteristics depending on which relation/way categories
+  it includes. Measure on Europe before deciding.
+
+**Defensive guard (suggested by planet/claude):** consider adding a
+runtime heuristic that falls back to per-blob send if the input
+filter set has high chunk spread (e.g. `extra_way_ids.chunk_count() >
+threshold`). This future-proofs against new callers hitting the same
+trap as smart PASS2. Not yet implemented; revisit after the
+extract.rs:2813 fix lands.
+
+### Open: cross-command wall regression (separate issue)
+
+The 2026-04-10 measurement also showed a **+22-24% wall-time regression**
+on both `extract --strategy smart` (208s → 254s) and `tags-filter-twopass`
+(105s → 130.5s) at Europe scale. This is **not** explained by the memory
+issue above:
+- Tags-filter has flat memory and still regressed +24% wall.
+- Tags-filter PASS1 — the phase with the largest wall regression
+  (+32%) — already uses `parallel_classify_phase`, NOT
+  `parallel_classify_accumulate`. So accumulate-mode semantics cannot
+  fully explain the tags-filter wall regression.
+
+Multiple causes likely mixed:
+- Phase split in tags-filter (PASS1 → CLOSURE → WAYDEPS) means way
+  blobs are read twice. ~8-10 seconds at Europe scale.
+- Possibly columnar scratch allocation in PASS1 even where unused.
+- Lost producer/consumer overlap from accumulate's all-finish-then-merge
+  barrier in extract-smart PASS2.
+- Cross-day measurement noise on `--bench 1` runs from different
+  commits.
+
+**Investigation deferred** until after the extract.rs:2813 fix lands.
+The fastest isolation path is `--bench 3` baselines on the same day
+followed by per-call-site A/B toggles on HEAD. Do not start with
+flamegraphs.
 
 ### Future optimization (not needed now)
 

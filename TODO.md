@@ -615,31 +615,42 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
-- [ ] **`parallel_classify_phase` planet safety** — two-parameter
-  `<S, R>` signature is already implemented in `src/commands/mod.rs`
-  alongside the single-parameter `parallel_classify_accumulate<S>`.
-  The remaining work is per-call-site audit and conversion. Most
-  hot/dense paths already use `_phase`; relation classify call sites
-  correctly use `accumulate` (bounded). The 2026-04-09 design review
-  flagged three "disputed" way-dep IdSetDense accumulation paths
-  (tags-filter, smart extract, geocode). 2026-04-10 measurement
-  resolved them per-call-site:
-  - **`extract.rs:2813` (smart PASS2 way deps): per-blob send.**
-    Measured Europe peak anon 4.12 GB → 10.72 GB (+160%) and PASS2
-    wall +64% post-refactor. Pro-rated to planet ~28 GB. Confirmed
-    planet blocker. **TODO: convert to `parallel_classify_phase<(),
-    Vec<i64>>`.**
-  - **`tags_filter.rs:1000` (way deps): keep accumulate.** Measured
-    Europe peak essentially flat (~200 MB per-worker contribution
-    on top of persistent state). Tag-selective `included_way_ids`
-    is narrow and clustered, not relation-driven. Pro-rated to
-    planet ~5.5 GB. Safe. Add a comment at the call site.
-  - **Geocode referenced nodes: not yet measured.** Path is in
-    `geocode_index/builder.rs` Pass 1.5. Has both selective and
-    dispersed characteristics. Measure on Europe before deciding.
-  See [notes/columnar-integration.md](notes/columnar-integration.md)
-  (resolved section), [notes/parallel-classify-regression-2026-04-10.md](notes/parallel-classify-regression-2026-04-10.md)
-  and [notes/parallel-classify-regression-2026-04-10-reviews.md](notes/parallel-classify-regression-2026-04-10-reviews.md).
+- [ ] **Smart-extract planet memory blocker — STILL OPEN**, root cause not
+  the one we thought. Original framing: `extract.rs:2813`'s
+  `parallel_classify_accumulate(IdSetDense)` over way-dep refs. Fix
+  shipped in commit `cc19d26` (per-blob send via
+  `parallel_classify_phase<(), Vec<i64>>`). Re-measurement at `--bench 3`
+  on Europe showed peak anon barely moved (10.72 → 10.09 GB, −6%, three
+  runs cluster tightly). PASS2 wall improved 23% which is real — keep
+  the fix shipped (architecturally correct) but don't credit it for
+  fixing the planet blocker.
+
+  Sub-phase markers + hotpath annotations added (commit `51f820d`), and
+  re-bench on Europe (UUID `8ac56b15`) localized the burst to
+  **`SMART_PASS2_SCHEDULE`** (the wrapper around `build_classify_schedule`),
+  NOT `SMART_PASS2_CLASSIFY`. The 6.33 GB transient is somewhere inside
+  `build_classify_schedule`'s call path (`BlobReader::seekable_from_path`,
+  `next_header_with_data_offset`, or the indexdata parser at
+  `src/read/blob.rs`). Function body itself can't account for it (small
+  loop pushing 24-byte triples into a Vec).
+
+  Puzzle: `collect_pass1_generic` runs nearly identical scan code at
+  PASS1 start. Same code, same file, but PASS1 overall peak is 3.73 GB
+  with no 6 GB transient. Why does the same scan have different memory
+  behavior in two contexts?
+
+  Sent to reviewers for round 2 — see
+  [notes/parallel-classify-regression-2026-04-11-followup.md](notes/parallel-classify-regression-2026-04-11-followup.md)
+  for the brief and the four open questions. Awaiting their analysis
+  before next implementation step.
+
+  Other paths from the previous round, status unchanged:
+  - **`tags_filter.rs:1000`**: keep accumulate, tag-selective workload
+    is fine (~200 MB peak per-worker contribution at Europe, pro-rated
+    ~5.5 GB at planet). Safe.
+  - **Geocode referenced nodes**: not measured. Probably moot now since
+    the smart-extract diagnosis was wrong — likely the same kind of
+    structural issue elsewhere, not a parallel_classify problem.
 
 - [ ] **Cross-command wall regression (separate issue, defer)** —
   2026-04-10 measurement showed +22-24% wall-time regression on both

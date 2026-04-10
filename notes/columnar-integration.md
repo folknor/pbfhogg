@@ -141,7 +141,40 @@ Workers send `R` per blob, keep `S` across blobs. Two functions:
 | Way dep node refs (smart extract, `extract.rs:2813`) | IdSetDense | 1.5 GB+ (measured at Europe, see below) | **No** | Per-blob send |
 | Geocode referenced nodes | IdSetDense | 1.5 GB (estimated, not measured) | Likely No, untested | Measure before deciding |
 
-### Resolved: way dep IdSetDense accumulation (2026-04-10 measurement)
+### UPDATE 2026-04-11: the resolved section below was wrong
+
+The `extract.rs:2813` fix (commit `cc19d26`) was shipped and re-measured at
+`--bench 3`. **Peak anon barely moved (10.72 → 10.09 GB, −6%).** The
+chunk-spread diagnosis was wrong even for the workload it was supposed to
+fit. After adding sub-phase markers (commit `51f820d`) and re-measuring on
+Europe (UUID `8ac56b15`), the burst is **inside `SMART_PASS2_SCHEDULE`**,
+not in `SMART_PASS2_CLASSIFY`:
+
+```
+SMART_PASS2_SCHEDULE  19307ms  10.06 GB peak anon  ← here
+SMART_PASS2_CLASSIFY   4977ms   6.24 GB peak anon  ← already dropped 3.8 GB
+```
+
+`SMART_PASS2_SCHEDULE` wraps `build_classify_schedule(input, Some(Way))`.
+That function's body is small and obviously doesn't allocate 6 GB — the
+6.33 GB transient must be in `BlobReader::seekable_from_path` or
+`next_header_with_data_offset` or the indexdata parser. We have not yet
+identified the exact source.
+
+**The puzzle:** `collect_pass1_generic` runs nearly identical scan code
+at PASS1 start, but PASS1 overall peak is only 3.73 GB (no 6 GB transient
+visible). Same code, different memory behavior. Sent to reviewers — see
+[`notes/parallel-classify-regression-2026-04-11-followup.md`](parallel-classify-regression-2026-04-11-followup.md).
+
+The "Resolved" section below remains as the historical record of the
+2026-04-10 reasoning, but **its conclusion is wrong** — the fix did not
+address the planet blocker. Keep the fix shipped (architectural rationale
+holds, +23% PASS2 wall improvement is real) but treat the planet-scale
+memory issue as still open.
+
+---
+
+### Resolved: way dep IdSetDense accumulation (2026-04-10 measurement) — SUPERSEDED, see UPDATE 2026-04-11 above
 
 The "disputed" framing from the 2026-04-09 design review was based on a
 **worst-case** chunk-spread model (6 workers × full node ID range = 9 GB

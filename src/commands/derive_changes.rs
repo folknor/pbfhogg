@@ -12,7 +12,8 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use super::elements_xml::{
-    from_decimicro, format_coord, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
+    OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
+    write_node_xml, write_way_xml, write_relation_xml,
 };
 use super::stream_merge::{
     block_pair_merge_phase, merge_join_phase, BlockMergeAction, BlockPairMergeState,
@@ -20,7 +21,6 @@ use super::stream_merge::{
 };
 use super::Result;
 use crate::blob_index::ElemKind;
-use crate::MemberType;
 
 // ---------------------------------------------------------------------------
 // Stats
@@ -324,13 +324,13 @@ fn write_osc(
     if !creates.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("create")))?;
         for node in &creates.nodes {
-            write_node(&mut writer, node)?;
+            write_node_xml(&mut writer, node)?;
         }
         for way in &creates.ways {
-            write_way(&mut writer, way)?;
+            write_way_xml(&mut writer, way)?;
         }
         for rel in &creates.relations {
-            write_relation(&mut writer, rel)?;
+            write_relation_xml(&mut writer, rel)?;
         }
         writer.write_event(Event::End(BytesEnd::new("create")))?;
     }
@@ -339,13 +339,13 @@ fn write_osc(
     if !modifies.is_empty() {
         writer.write_event(Event::Start(BytesStart::new("modify")))?;
         for node in &modifies.nodes {
-            write_node(&mut writer, node)?;
+            write_node_xml(&mut writer, node)?;
         }
         for way in &modifies.ways {
-            write_way(&mut writer, way)?;
+            write_way_xml(&mut writer, way)?;
         }
         for rel in &modifies.relations {
-            write_relation(&mut writer, rel)?;
+            write_relation_xml(&mut writer, rel)?;
         }
         writer.write_event(Event::End(BytesEnd::new("modify")))?;
     }
@@ -370,89 +370,6 @@ fn write_osc(
 
     let gz = writer.into_inner();
     gz.finish()?;
-    Ok(())
-}
-
-fn write_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode) -> Result<()> {
-    let mut elem = BytesStart::new("node");
-    let id_str = node.id.to_string();
-    let mut coord_buf = String::new();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
-    let lat_str = coord_buf.clone();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
-    elem.push_attribute(("id", id_str.as_str()));
-    elem.push_attribute(("lat", lat_str.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
-    if let Some(meta) = &node.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if node.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        write_tags(writer, &node.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
-    }
-    Ok(())
-}
-
-fn write_way<W: Write>(writer: &mut Writer<W>, way: &OwnedWay) -> Result<()> {
-    let mut elem = BytesStart::new("way");
-    let id_str = way.id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    if let Some(meta) = &way.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if way.refs.is_empty() && way.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for r in &way.refs {
-            let mut nd = BytesStart::new("nd");
-            let r_str = r.to_string();
-            nd.push_attribute(("ref", r_str.as_str()));
-            writer.write_event(Event::Empty(nd))?;
-        }
-        write_tags(writer, &way.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("way")))?;
-    }
-    Ok(())
-}
-
-fn write_relation<W: Write>(writer: &mut Writer<W>, rel: &OwnedRelation) -> Result<()> {
-    let mut elem = BytesStart::new("relation");
-    let id_str = rel.id.to_string();
-    elem.push_attribute(("id", id_str.as_str()));
-    if let Some(meta) = &rel.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if rel.members.is_empty() && rel.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for m in &rel.members {
-            let mut member = BytesStart::new("member");
-            let type_str = match m.id.member_type() {
-                MemberType::Node => "node",
-                MemberType::Way => "way",
-                MemberType::Relation => "relation",
-                // Unknown member types from newer PBF producers — write as "node"
-                // since OSC XML has no "unknown" type value. The protobuf enum
-                // only defines NODE/WAY/RELATION and has never been extended.
-                MemberType::Unknown(_) => "node",
-            };
-            let id_str = m.id.id().to_string();
-            member.push_attribute(("type", type_str));
-            member.push_attribute(("ref", id_str.as_str()));
-            member.push_attribute(("role", m.role.as_str()));
-            writer.write_event(Event::Empty(member))?;
-        }
-        write_tags(writer, &rel.tags)?;
-        writer.write_event(Event::End(BytesEnd::new("relation")))?;
-    }
     Ok(())
 }
 
@@ -487,12 +404,3 @@ fn write_delete_element<W: Write>(
     Ok(())
 }
 
-fn write_tags<W: Write>(writer: &mut Writer<W>, tags: &[(String, String)]) -> Result<()> {
-    for (k, v) in tags {
-        let mut tag = BytesStart::new("tag");
-        tag.push_attribute(("k", k.as_str()));
-        tag.push_attribute(("v", v.as_str()));
-        writer.write_event(Event::Empty(tag))?;
-    }
-    Ok(())
-}

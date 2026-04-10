@@ -257,7 +257,9 @@ pub fn removeid(input: &Path, output: &Path, ids: &IdSet, compression: Compressi
 }
 
 // ---------------------------------------------------------------------------
-// Single-pass filter (shared by getid without refs and removeid)
+// Single-pass filter (shared by getid without refs and removeid).
+// Include mode: skip non-matching blobs by type and ID range.
+// Invert mode: raw passthrough for non-matching blobs.
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -271,10 +273,6 @@ fn filter_by_id(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetidStats> {
-    if !include {
-        return filter_by_id_invert(input, output, ids, compression, direct_io, overrides);
-    }
-
     use crate::blob::{decode_blob_to_headerblock, BlobKind};
     use crate::file_reader::FileReader;
     use super::read_raw_frame;
@@ -307,118 +305,7 @@ fn filter_by_id(
         !ids.way_ids.is_empty(),
         !ids.relation_ids.is_empty(),
     );
-
-    let mut reader = FileReader::open(input, direct_io)?;
-    let mut file_offset: u64 = 0;
     let mut blobs_skipped: u64 = 0;
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut bb = BlockBuilder::new();
-    let mut output_blocks: Vec<crate::block_builder::OwnedBlock> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-    while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-        match &frame.blob_type {
-            BlobKind::OsmHeader => {}
-            BlobKind::OsmData => {
-                if let Some(ref idx) = frame.index {
-                    // Skip blob types with no matching IDs.
-                    if !blob_filter.wants_index(idx) {
-                        blobs_skipped += 1;
-                        continue;
-                    }
-                    // Skip blobs whose ID range has no intersection with requested IDs.
-                    let has_match = match idx.kind {
-                        crate::blob_index::ElemKind::Node =>
-                            ids_intersect_range(&ids.node_ids, idx.min_id, idx.max_id),
-                        crate::blob_index::ElemKind::Way =>
-                            ids_intersect_range(&ids.way_ids, idx.min_id, idx.max_id),
-                        crate::blob_index::ElemKind::Relation =>
-                            ids_intersect_range(&ids.relation_ids, idx.min_id, idx.max_id),
-                    };
-                    if !has_match {
-                        blobs_skipped += 1;
-                        continue;
-                    }
-                }
-                // Blob might contain matching IDs: decode and filter.
-                let blob_bytes = frame.blob_bytes();
-                decompress_buf.clear();
-                crate::blob::decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
-                let block = PrimitiveBlock::new_with_scratch(
-                    std::mem::take(&mut decompress_buf).into(),
-                    &mut st_scratch, &mut gr_scratch,
-                )?;
-                output_blocks.clear();
-                let (nodes, ways, relations) = process_block(
-                    &block, &mut bb, &mut output_blocks, ids, true, None, false,
-                ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                flush_local(&mut bb, &mut output_blocks)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                for (block_bytes, index, tagdata) in output_blocks.drain(..) {
-                    writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
-                }
-                stats.nodes_written += nodes;
-                stats.ways_written += ways;
-                stats.relations_written += relations;
-            }
-            _ => {}
-        }
-    }
-
-    if blobs_skipped > 0 {
-        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
-    }
-    writer.flush()?;
-    crate::debug::emit_marker("GETID_SCAN_END");
-    Ok(stats)
-}
-
-/// Check whether any ID in the BTreeSet falls within the blob's [min_id, max_id] range.
-fn ids_intersect_range(ids: &BTreeSet<i64>, min_id: i64, max_id: i64) -> bool {
-    use std::ops::RangeInclusive;
-    ids.range(RangeInclusive::new(min_id, max_id)).next().is_some()
-}
-
-/// Inverted filter (removeid): raw frame passthrough for blobs whose ID range
-/// has no intersection with the requested IDs. Only blobs that could contain
-/// matching elements are decoded and filtered.
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn filter_by_id_invert(
-    input: &Path,
-    output: &Path,
-    ids: &IdSet,
-    compression: Compression,
-    direct_io: bool,
-    overrides: &HeaderOverrides,
-) -> Result<GetidStats> {
-    use crate::blob::{decode_blob_to_headerblock, BlobKind};
-    use crate::file_reader::FileReader;
-    use super::read_raw_frame;
-
-    crate::debug::emit_marker("GETID_SCAN_START");
-
-    let header_bytes = {
-        let mut reader = FileReader::open(input, direct_io)?;
-        let mut file_offset: u64 = 0;
-        let mut hdr_bytes = None;
-        while let Some(frame) = read_raw_frame(&mut reader, &mut file_offset)? {
-            if frame.blob_type == BlobKind::OsmHeader {
-                let header = decode_blob_to_headerblock(frame.blob_bytes())?;
-                super::warn_locations_on_ways_loss(&header);
-                hdr_bytes = Some(super::build_output_header(&header, true, overrides, |hb| hb)?);
-                break;
-            }
-        }
-        hdr_bytes.ok_or("no OSMHeader blob found")?
-    };
-
-    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
-    let mut stats = GetidStats {
-        nodes_written: 0,
-        ways_written: 0,
-        relations_written: 0,
-    };
     let mut blobs_passthrough: u64 = 0;
 
     let mut reader = FileReader::open(input, direct_io)?;
@@ -434,7 +321,6 @@ fn filter_by_id_invert(
             BlobKind::OsmHeader => {}
             BlobKind::OsmData => {
                 if let Some(ref idx) = frame.index {
-                    // Check if any requested ID falls in this blob's range.
                     let has_match = match idx.kind {
                         crate::blob_index::ElemKind::Node =>
                             ids_intersect_range(&ids.node_ids, idx.min_id, idx.max_id),
@@ -443,8 +329,14 @@ fn filter_by_id_invert(
                         crate::blob_index::ElemKind::Relation =>
                             ids_intersect_range(&ids.relation_ids, idx.min_id, idx.max_id),
                     };
-                    if !has_match {
-                        // No matching IDs in range: all elements are kept, raw passthrough.
+                    if include {
+                        // Include mode: skip blob types with no matching IDs.
+                        if !blob_filter.wants_index(idx) || !has_match {
+                            blobs_skipped += 1;
+                            continue;
+                        }
+                    } else if !has_match {
+                        // Invert mode: no matching IDs → raw passthrough.
                         match idx.kind {
                             crate::blob_index::ElemKind::Node => stats.nodes_written += idx.count,
                             crate::blob_index::ElemKind::Way => stats.ways_written += idx.count,
@@ -465,7 +357,7 @@ fn filter_by_id_invert(
                 )?;
                 output_blocks.clear();
                 let (nodes, ways, relations) = process_block(
-                    &block, &mut bb, &mut output_blocks, ids, false, None, false,
+                    &block, &mut bb, &mut output_blocks, ids, include, None, false,
                 ).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 flush_local(&mut bb, &mut output_blocks)
                     .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -480,12 +372,21 @@ fn filter_by_id_invert(
         }
     }
 
+    if blobs_skipped > 0 {
+        eprintln!("[getid] {blobs_skipped} blobs skipped by ID range filter");
+    }
     if blobs_passthrough > 0 {
         eprintln!("[getid --invert] {blobs_passthrough} blobs passed through raw");
     }
     writer.flush()?;
     crate::debug::emit_marker("GETID_SCAN_END");
     Ok(stats)
+}
+
+/// Check whether any ID in the BTreeSet falls within the blob's [min_id, max_id] range.
+fn ids_intersect_range(ids: &BTreeSet<i64>, min_id: i64, max_id: i64) -> bool {
+    use std::ops::RangeInclusive;
+    ids.range(RangeInclusive::new(min_id, max_id)).next().is_some()
 }
 
 // ---------------------------------------------------------------------------

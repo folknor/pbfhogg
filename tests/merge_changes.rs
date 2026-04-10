@@ -222,9 +222,9 @@ fn simplify_multiple_same_type_different_ids() {
 
     let xml = read_osc_gz(&out);
     // node 1 simplified to modify (last action)
-    assert!(xml.contains(r#"<node id="1" version="2""#));
+    assert!(xml.contains(r#"<node id="1" lat="1.1" lon="2.1" version="2""#));
     // node 2 stays as create
-    assert!(xml.contains(r#"<node id="2" version="1""#));
+    assert!(xml.contains(r#"<node id="2" lat="3" lon="4" version="1""#));
 }
 
 #[test]

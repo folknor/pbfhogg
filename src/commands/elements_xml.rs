@@ -3,6 +3,9 @@
 //! Metadata fields are String-typed for direct XML attribute output.
 //! See `elements_pbf` for the PBF-oriented variant with native types.
 
+use quick_xml::events::{BytesEnd, BytesStart, Event};
+use quick_xml::Writer;
+
 use crate::MemberId;
 
 // ---------------------------------------------------------------------------
@@ -129,4 +132,127 @@ pub(crate) fn format_coord(buf: &mut String, deg: f64) {
     write!(buf, "{deg:.7}").ok();
     let trimmed = buf.trim_end_matches('0').trim_end_matches('.');
     buf.truncate(trimmed.len());
+}
+
+// ---------------------------------------------------------------------------
+// OSC XML element writing (shared by derive_changes and merge_changes)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn write_node_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    node: &OwnedNode,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("node");
+    let id_str = node.id.to_string();
+    let mut coord_buf = String::new();
+    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
+    let lat_str = coord_buf.clone();
+    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
+    elem.push_attribute(("id", id_str.as_str()));
+    elem.push_attribute(("lat", lat_str.as_str()));
+    elem.push_attribute(("lon", coord_buf.as_str()));
+    if let Some(meta) = &node.metadata {
+        meta.push_attrs(&mut elem);
+    }
+
+    if node.tags.is_empty() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        write_tags_xml(writer, &node.tags)?;
+        writer.write_event(Event::End(BytesEnd::new("node")))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_way_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    way: &OwnedWay,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("way");
+    let id_str = way.id.to_string();
+    elem.push_attribute(("id", id_str.as_str()));
+    if let Some(meta) = &way.metadata {
+        meta.push_attrs(&mut elem);
+    }
+
+    if way.refs.is_empty() && way.tags.is_empty() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        for r in &way.refs {
+            let mut nd = BytesStart::new("nd");
+            let r_str = r.to_string();
+            nd.push_attribute(("ref", r_str.as_str()));
+            writer.write_event(Event::Empty(nd))?;
+        }
+        write_tags_xml(writer, &way.tags)?;
+        writer.write_event(Event::End(BytesEnd::new("way")))?;
+    }
+    Ok(())
+}
+
+pub(crate) fn write_relation_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    rel: &OwnedRelation,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new("relation");
+    let id_str = rel.id.to_string();
+    elem.push_attribute(("id", id_str.as_str()));
+    if let Some(meta) = &rel.metadata {
+        meta.push_attrs(&mut elem);
+    }
+
+    if rel.members.is_empty() && rel.tags.is_empty() {
+        writer.write_event(Event::Empty(elem))?;
+    } else {
+        writer.write_event(Event::Start(elem))?;
+        for m in &rel.members {
+            let mut member = BytesStart::new("member");
+            let type_str = match m.id {
+                MemberId::Node(_) => "node",
+                MemberId::Way(_) => "way",
+                MemberId::Relation(_) => "relation",
+                MemberId::Unknown(_, _) => "node",
+            };
+            let member_id = m.id.id().to_string();
+            member.push_attribute(("type", type_str));
+            member.push_attribute(("ref", member_id.as_str()));
+            member.push_attribute(("role", m.role.as_str()));
+            writer.write_event(Event::Empty(member))?;
+        }
+        write_tags_xml(writer, &rel.tags)?;
+        writer.write_event(Event::End(BytesEnd::new("relation")))?;
+    }
+    Ok(())
+}
+
+/// Write an element as a delete entry (id + metadata only, no content).
+pub(crate) fn write_delete_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    tag_name: &str,
+    id: i64,
+    metadata: Option<&OwnedMetadata>,
+) -> super::Result<()> {
+    let mut elem = BytesStart::new(tag_name);
+    let id_str = id.to_string();
+    elem.push_attribute(("id", id_str.as_str()));
+    if let Some(meta) = metadata {
+        meta.push_attrs(&mut elem);
+    }
+    writer.write_event(Event::Empty(elem))?;
+    Ok(())
+}
+
+pub(crate) fn write_tags_xml<W: std::io::Write>(
+    writer: &mut Writer<W>,
+    tags: &[(String, String)],
+) -> super::Result<()> {
+    for (k, v) in tags {
+        let mut tag = BytesStart::new("tag");
+        tag.push_attribute(("k", k.as_str()));
+        tag.push_attribute(("v", v.as_str()));
+        writer.write_event(Event::Empty(tag))?;
+    }
+    Ok(())
 }

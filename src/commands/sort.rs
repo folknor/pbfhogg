@@ -417,10 +417,29 @@ fn write_overlap_run(
     // type_order first, and detect_overlaps only marks adjacent same-type).
     let kind = entries[0].index.kind;
     match kind {
-        ElemKind::Node => sweep_merge_nodes(entries, input_file, bb, writer, stats),
-        ElemKind::Way => sweep_merge_ways(entries, input_file, bb, writer, stats),
-        ElemKind::Relation => sweep_merge_rels(entries, input_file, bb, writer, stats),
-    }?;
+        ElemKind::Node => {
+            stats.nodes += sweep_merge(entries, input_file, bb, writer,
+                |e, heap| match e {
+                    Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
+                    Element::Node(n) => heap.push(Reverse(read_node(n))),
+                    _ => {}
+                },
+                |node, bb, w| write_single_node(node, bb, w),
+            )?;
+        }
+        ElemKind::Way => {
+            stats.ways += sweep_merge(entries, input_file, bb, writer,
+                |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
+                |way, bb, w| write_single_way(way, bb, w),
+            )?;
+        }
+        ElemKind::Relation => {
+            stats.relations += sweep_merge(entries, input_file, bb, writer,
+                |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
+                |rel, bb, w| write_single_relation(rel, bb, w),
+            )?;
+        }
+    };
     stats.blobs_rewritten += entries.len() as u64;
     Ok(())
 }
@@ -429,21 +448,22 @@ fn write_overlap_run(
 // Sweep merge per element type
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn sweep_merge_nodes(
+fn sweep_merge<T: Ord + HasId>(
     entries: &[BlobEntry],
     input_file: &mut File,
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    stats: &mut SortStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedNode>> = BinaryHeap::new();
+    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
+    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
+) -> Result<u64> {
+    let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
+    let mut count: u64 = 0;
 
     for entry in entries {
-        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |node| {
-            write_single_node(&node, bb, writer)?;
-            stats.nodes += 1;
+        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |elem| {
+            write_elem(&elem, bb, writer)?;
+            count += 1;
             Ok(())
         })?;
 
@@ -451,89 +471,16 @@ fn sweep_merge_nodes(
         let blob_bytes = extract_blob_bytes(&frame_buf)?;
         let block = decode_blob_to_primitiveblock(blob_bytes)?;
         for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
-                Element::Node(n) => heap.push(Reverse(read_node(n))),
-                _ => {}
-            }
+            extract(&element, &mut heap);
         }
     }
 
-    while let Some(Reverse(node)) = heap.pop() {
-        write_single_node(&node, bb, writer)?;
-        stats.nodes += 1;
+    while let Some(Reverse(elem)) = heap.pop() {
+        write_elem(&elem, bb, writer)?;
+        count += 1;
     }
-    flush_block(bb, writer)
-}
-
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn sweep_merge_ways(
-    entries: &[BlobEntry],
-    input_file: &mut File,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut SortStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedWay>> = BinaryHeap::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
-
-    for entry in entries {
-        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |way| {
-            write_single_way(&way, bb, writer)?;
-            stats.ways += 1;
-            Ok(())
-        })?;
-
-        read_frame_into(input_file, entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
-        for element in block.elements() {
-            if let Element::Way(w) = &element {
-                heap.push(Reverse(read_way(w)));
-            }
-        }
-    }
-
-    while let Some(Reverse(way)) = heap.pop() {
-        write_single_way(&way, bb, writer)?;
-        stats.ways += 1;
-    }
-    flush_block(bb, writer)
-}
-
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn sweep_merge_rels(
-    entries: &[BlobEntry],
-    input_file: &mut File,
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut SortStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedRelation>> = BinaryHeap::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
-
-    for entry in entries {
-        flush_heap_below(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), |rel| {
-            write_single_relation(&rel, bb, writer)?;
-            stats.relations += 1;
-            Ok(())
-        })?;
-
-        read_frame_into(input_file, entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
-        for element in block.elements() {
-            if let Element::Relation(r) = &element {
-                heap.push(Reverse(read_relation(r)));
-            }
-        }
-    }
-
-    while let Some(Reverse(rel)) = heap.pop() {
-        write_single_relation(&rel, bb, writer)?;
-        stats.relations += 1;
-    }
-    flush_block(bb, writer)
+    flush_block(bb, writer)?;
+    Ok(count)
 }
 
 /// Flush all elements from the min-heap whose ID is below `below`.

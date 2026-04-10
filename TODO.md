@@ -852,25 +852,29 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 ## Post-v0.1 review: deferred deduplication
 
-- [ ] **OSC XML element writing shared between derive_changes and merge_changes** —
-  Both files implement `write_node`, `write_way`, `write_relation`, `write_tags` with
-  nearly identical logic. Minor differences in attribute ordering and a `delete_only`
-  flag. Should share a single writer module (e.g. `elements_xml.rs` or `osc_writer.rs`).
+- [x] **OSC XML element writing shared between derive_changes and merge_changes** —
+  `write_node_xml`, `write_way_xml`, `write_relation_xml`, `write_delete_xml`,
+  `write_tags_xml` added to `elements_xml.rs`. Both `derive_changes.rs` and
+  `merge_changes.rs` now call the shared functions. `merge_changes` delete path
+  uses `write_delete_xml` (id+metadata only). Node attribute order unified to
+  id, lat, lon, version (derive_changes order, matches osmium). One test updated
+  for the attribute order change.
 
-- [ ] **sweep_merge generics for sort.rs and merge_pbf.rs** —
-  `sweep_merge_nodes/ways/rels` are near-identical in both files (~70-145 lines of
-  identical heap+flush+decode structure per element type). A generic function
-  parameterized on element type via a `HasId` trait would eliminate most of this.
-  Same pattern applies to `emit_create_local`/`emit_create_for_output` in merge.rs.
+- [x] **sweep_merge generics for sort.rs and merge_pbf.rs** —
+  sort.rs: `sweep_merge<T>` with closures for extract and write_elem. Returns
+  element count; callers assign to the correct stats field. 3 × ~35 lines → 1 × 30 lines + 3 × 5-line call sites.
+  merge_pbf.rs: `sweep_merge_dedup<T>` with same pattern plus dedup drain.
+  Returns (count, deduped). 3 × ~50 lines → 1 × 40 lines + 3 × 8-line call sites.
 
 - [ ] **Unify assemble_block between external join and ALTW** —
   `external_join.rs:assemble_block` and `add_locations_to_ways.rs:process_block` are
   ~80 lines of duplicated node/relation handling, differing only in way-coordinate
   resolution. Could be unified with a trait or closure for the way path.
 
-- [ ] **Unify getid filter_by_id and filter_by_id_invert** —
-  Same header-reading prologue, per-blob decode loop, and process_block call. Differ
-  in BlobFilter usage and raw passthrough. Could unify with a flag parameter.
+- [x] **Unify getid filter_by_id and filter_by_id_invert** —
+  Merged into single `filter_by_id` with `include: bool` parameter. Include mode
+  uses `BlobFilter` + skip; invert mode uses raw passthrough. Shared header
+  reading, reader setup, decompress/decode/process_block loop. ~230 lines → ~130.
 
 - [ ] **pread-from-workers boilerplate in extract and tags_filter** —
   ~80-100 lines each of nearly identical channel setup, worker loop, and consumer
@@ -913,7 +917,11 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 - [x] **load_next_bucket takes 7 mutable references** —
   `BucketState` struct encapsulates `idx`, `sorted_pairs`, `data_buf`,
   `pair_cursor`, `max_id`. `load_next` is now a method. Consumer loop
-  uses `bstate.` field access.
+  uses `bstate.` field access. Reviewed by perf+planet (4 reviewers,
+  2026-04-10): no codegen concern at planet scale — LLVM promotes struct
+  fields to registers in the hot inner loop. If a Europe-scale stage 2
+  regression ever appears, add local aliases in the hot loop:
+  `let pairs = &bstate.sorted_pairs; let cursor = &mut bstate.pair_cursor;`
 
 - [x] **osc.rs byte-reading helpers: use try_from pattern** —
   `read_i64_le`, `read_i32_le`, `read_u32_le` now use

@@ -15,7 +15,8 @@ use quick_xml::name::QName;
 use quick_xml::{Reader, Writer};
 
 use super::elements_xml::{
-    format_coord, from_decimicro, OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
+    OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
+    write_node_xml, write_way_xml, write_relation_xml, write_delete_xml,
 };
 use super::Result;
 use crate::MemberId;
@@ -701,119 +702,30 @@ fn action_tag(action: Action) -> &'static str {
 
 fn write_change_to(writer: &mut OscWriter, change: &Change) -> Result<()> {
     let delete = change.action == Action::Delete;
-    match (&change.element, writer) {
-        (ChangeElement::Node(node), OscWriter::Gz(w)) => write_node(w, node, delete),
-        (ChangeElement::Node(node), OscWriter::Plain(w)) => write_node(w, node, delete),
-        (ChangeElement::Way(way), OscWriter::Gz(w)) => write_way(w, way, delete),
-        (ChangeElement::Way(way), OscWriter::Plain(w)) => write_way(w, way, delete),
-        (ChangeElement::Relation(rel), OscWriter::Gz(w)) => write_relation(w, rel, delete),
-        (ChangeElement::Relation(rel), OscWriter::Plain(w)) => write_relation(w, rel, delete),
+    match writer {
+        OscWriter::Gz(w) => write_change_element(w, &change.element, delete),
+        OscWriter::Plain(w) => write_change_element(w, &change.element, delete),
     }
 }
 
-fn write_node<W: Write>(writer: &mut Writer<W>, node: &OwnedNode, delete_only: bool) -> Result<()> {
-    let mut elem = BytesStart::new("node");
-    let id = node.id.to_string();
-    elem.push_attribute(("id", id.as_str()));
-    if let Some(meta) = &node.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if delete_only {
-        writer.write_event(Event::Empty(elem))?;
-        return Ok(());
-    }
-
-    let mut coord_buf = String::new();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lat));
-    let lat = coord_buf.clone();
-    format_coord(&mut coord_buf, from_decimicro(node.decimicro_lon));
-    elem.push_attribute(("lat", lat.as_str()));
-    elem.push_attribute(("lon", coord_buf.as_str()));
-
-    if node.tags.is_empty() {
-        writer.write_event(Event::Empty(elem))?;
-    } else {
-        writer.write_event(Event::Start(elem))?;
-        for (k, v) in &node.tags {
-            let mut tag = BytesStart::new("tag");
-            tag.push_attribute(("k", k.as_str()));
-            tag.push_attribute(("v", v.as_str()));
-            writer.write_event(Event::Empty(tag))?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("node")))?;
-    }
-    Ok(())
-}
-
-fn write_way<W: Write>(writer: &mut Writer<W>, way: &OwnedWay, delete_only: bool) -> Result<()> {
-    let mut elem = BytesStart::new("way");
-    let id = way.id.to_string();
-    elem.push_attribute(("id", id.as_str()));
-    if let Some(meta) = &way.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if delete_only || (way.refs.is_empty() && way.tags.is_empty()) {
-        writer.write_event(Event::Empty(elem))?;
-        return Ok(());
-    }
-
-    writer.write_event(Event::Start(elem))?;
-    for rf in &way.refs {
-        let mut nd = BytesStart::new("nd");
-        let rf = rf.to_string();
-        nd.push_attribute(("ref", rf.as_str()));
-        writer.write_event(Event::Empty(nd))?;
-    }
-    for (k, v) in &way.tags {
-        let mut tag = BytesStart::new("tag");
-        tag.push_attribute(("k", k.as_str()));
-        tag.push_attribute(("v", v.as_str()));
-        writer.write_event(Event::Empty(tag))?;
-    }
-    writer.write_event(Event::End(BytesEnd::new("way")))?;
-    Ok(())
-}
-
-fn write_relation<W: Write>(
+fn write_change_element<W: Write>(
     writer: &mut Writer<W>,
-    relation: &OwnedRelation,
-    delete_only: bool,
+    element: &ChangeElement,
+    delete: bool,
 ) -> Result<()> {
-    let mut elem = BytesStart::new("relation");
-    let id = relation.id.to_string();
-    elem.push_attribute(("id", id.as_str()));
-    if let Some(meta) = &relation.metadata {
-        meta.push_attrs(&mut elem);
-    }
-
-    if delete_only || (relation.members.is_empty() && relation.tags.is_empty()) {
-        writer.write_event(Event::Empty(elem))?;
-        return Ok(());
-    }
-
-    writer.write_event(Event::Start(elem))?;
-    for member in &relation.members {
-        let mut m = BytesStart::new("member");
-        let type_str = match member.id {
-            MemberId::Node(_) => "node",
-            MemberId::Way(_) => "way",
-            MemberId::Relation(_) => "relation",
-            MemberId::Unknown(_, _) => "node",
+    if delete {
+        let (tag, id, meta) = match element {
+            ChangeElement::Node(n) => ("node", n.id, n.metadata.as_ref()),
+            ChangeElement::Way(w) => ("way", w.id, w.metadata.as_ref()),
+            ChangeElement::Relation(r) => ("relation", r.id, r.metadata.as_ref()),
         };
-        let member_id = member.id.id().to_string();
-        m.push_attribute(("type", type_str));
-        m.push_attribute(("ref", member_id.as_str()));
-        m.push_attribute(("role", member.role.as_str()));
-        writer.write_event(Event::Empty(m))?;
+        write_delete_xml(writer, tag, id, meta)
+    } else {
+        match element {
+            ChangeElement::Node(node) => write_node_xml(writer, node),
+            ChangeElement::Way(way) => write_way_xml(writer, way),
+            ChangeElement::Relation(rel) => write_relation_xml(writer, rel),
+        }
     }
-    for (k, v) in &relation.tags {
-        let mut tag = BytesStart::new("tag");
-        tag.push_attribute(("k", k.as_str()));
-        tag.push_attribute(("v", v.as_str()));
-        writer.write_event(Event::Empty(tag))?;
-    }
-    writer.write_event(Event::End(BytesEnd::new("relation")))?;
-    Ok(())
 }
+

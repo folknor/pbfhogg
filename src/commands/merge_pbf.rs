@@ -429,10 +429,35 @@ fn write_overlap_run(
 ) -> Result<()> {
     let kind = entries[0].index.kind;
     match kind {
-        ElemKind::Node => sweep_merge_nodes(entries, files, bb, writer, stats),
-        ElemKind::Way => sweep_merge_ways(entries, files, bb, writer, stats),
-        ElemKind::Relation => sweep_merge_rels(entries, files, bb, writer, stats),
-    }?;
+        ElemKind::Node => {
+            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
+                |e, heap| match e {
+                    Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
+                    Element::Node(n) => heap.push(Reverse(read_node(n))),
+                    _ => {}
+                },
+                |node, bb, w| write_single_node(node, bb, w),
+            )?;
+            stats.nodes += c;
+            stats.duplicates_removed += d;
+        }
+        ElemKind::Way => {
+            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
+                |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
+                |way, bb, w| write_single_way(way, bb, w),
+            )?;
+            stats.ways += c;
+            stats.duplicates_removed += d;
+        }
+        ElemKind::Relation => {
+            let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
+                |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
+                |rel, bb, w| write_single_relation(rel, bb, w),
+            )?;
+            stats.relations += c;
+            stats.duplicates_removed += d;
+        }
+    };
     stats.blobs_rewritten += entries.len() as u64;
     Ok(())
 }
@@ -441,151 +466,53 @@ fn write_overlap_run(
 // Sweep merge per element type — with dedup
 // ---------------------------------------------------------------------------
 
-fn sweep_merge_nodes(
+/// Generic sweep merge: heap-based merge of overlapping blob entries with
+/// dedup (skip elements with same id + version as the just-emitted element).
+/// Returns (elements_written, duplicates_removed).
+fn sweep_merge_dedup<T: Ord + HasId>(
     entries: &[BlobEntry],
     files: &mut [File],
     bb: &mut BlockBuilder,
     writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergePbfStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedNode>> = BinaryHeap::new();
+    mut extract: impl FnMut(&Element<'_>, &mut BinaryHeap<Reverse<T>>),
+    mut write_elem: impl FnMut(&T, &mut BlockBuilder, &mut PbfWriter<FileWriter>) -> Result<()>,
+) -> Result<(u64, u64)> {
+    let mut heap: BinaryHeap<Reverse<T>> = BinaryHeap::new();
     let mut frame_buf: Vec<u8> = Vec::new();
+    let mut count: u64 = 0;
+    let mut deduped: u64 = 0;
 
     for entry in entries {
-        flush_heap_below_dedup(
-            &mut heap,
-            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
-            &mut stats.duplicates_removed,
-            |node| {
-                write_single_node(&node, bb, writer)?;
-                stats.nodes += 1;
-                Ok(())
-            },
-        )?;
+        flush_heap_below_dedup(&mut heap, super::blob_osm_first_id(entry.index.min_id, entry.index.max_id), &mut deduped, |elem| {
+            write_elem(&elem, bb, writer)?;
+            count += 1;
+            Ok(())
+        })?;
 
         read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
         let blob_bytes = extract_blob_bytes(&frame_buf)?;
         let block = decode_blob_to_primitiveblock(blob_bytes)?;
         for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => heap.push(Reverse(read_dense_node(dn))),
-                Element::Node(n) => heap.push(Reverse(read_node(n))),
-                _ => {}
-            }
+            extract(&element, &mut heap);
         }
     }
 
     // Drain remaining with dedup
-    while let Some(Reverse(node)) = heap.pop() {
-        let eid = node.id;
-        let ever = node.version();
-        write_single_node(&node, bb, writer)?;
-        stats.nodes += 1;
+    while let Some(Reverse(elem)) = heap.pop() {
+        let eid = elem.id();
+        let ever = elem.version();
+        write_elem(&elem, bb, writer)?;
+        count += 1;
         while heap
             .peek()
-            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
+            .is_some_and(|Reverse(e)| e.id() == eid && e.version() == ever)
         {
             heap.pop();
-            stats.duplicates_removed += 1;
+            deduped += 1;
         }
     }
-    flush_block(bb, writer)
-}
-
-fn sweep_merge_ways(
-    entries: &[BlobEntry],
-    files: &mut [File],
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergePbfStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedWay>> = BinaryHeap::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
-
-    for entry in entries {
-        flush_heap_below_dedup(
-            &mut heap,
-            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
-            &mut stats.duplicates_removed,
-            |way| {
-                write_single_way(&way, bb, writer)?;
-                stats.ways += 1;
-                Ok(())
-            },
-        )?;
-
-        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
-        for element in block.elements() {
-            if let Element::Way(w) = &element {
-                heap.push(Reverse(read_way(w)));
-            }
-        }
-    }
-
-    while let Some(Reverse(way)) = heap.pop() {
-        let eid = way.id;
-        let ever = way.version();
-        write_single_way(&way, bb, writer)?;
-        stats.ways += 1;
-        while heap
-            .peek()
-            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
-        {
-            heap.pop();
-            stats.duplicates_removed += 1;
-        }
-    }
-    flush_block(bb, writer)
-}
-
-fn sweep_merge_rels(
-    entries: &[BlobEntry],
-    files: &mut [File],
-    bb: &mut BlockBuilder,
-    writer: &mut PbfWriter<FileWriter>,
-    stats: &mut MergePbfStats,
-) -> Result<()> {
-    let mut heap: BinaryHeap<Reverse<OwnedRelation>> = BinaryHeap::new();
-    let mut frame_buf: Vec<u8> = Vec::new();
-
-    for entry in entries {
-        flush_heap_below_dedup(
-            &mut heap,
-            super::blob_osm_first_id(entry.index.min_id, entry.index.max_id),
-            &mut stats.duplicates_removed,
-            |rel| {
-                write_single_relation(&rel, bb, writer)?;
-                stats.relations += 1;
-                Ok(())
-            },
-        )?;
-
-        read_frame_into(&mut files[entry.file_index], entry, &mut frame_buf)?;
-        let blob_bytes = extract_blob_bytes(&frame_buf)?;
-        let block = decode_blob_to_primitiveblock(blob_bytes)?;
-        for element in block.elements() {
-            if let Element::Relation(r) = &element {
-                heap.push(Reverse(read_relation(r)));
-            }
-        }
-    }
-
-    while let Some(Reverse(rel)) = heap.pop() {
-        let eid = rel.id;
-        let ever = rel.version();
-        write_single_relation(&rel, bb, writer)?;
-        stats.relations += 1;
-        while heap
-            .peek()
-            .is_some_and(|Reverse(e)| e.id == eid && e.version() == ever)
-        {
-            heap.pop();
-            stats.duplicates_removed += 1;
-        }
-    }
-    flush_block(bb, writer)
+    flush_block(bb, writer)?;
+    Ok((count, deduped))
 }
 
 /// Flush elements from the min-heap whose ID is below `below`, with dedup.

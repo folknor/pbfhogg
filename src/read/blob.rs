@@ -464,18 +464,13 @@ impl Blob {
         decompress_blob(&self.blob, None).and_then(PrimitiveBlock::new)
     }
 
-    /// Decompress with buffer pool reuse, without constructing a `PrimitiveBlock`.
-    pub(crate) fn decompress_pooled(&self, pool: &Arc<DecompressPool>) -> Result<Bytes> {
-        decompress_blob(&self.blob, Some(pool))
-    }
-
     /// Decompress into a caller-owned buffer, avoiding the Bytes→Vec copy.
     ///
     /// The buffer is cleared and refilled. Callers typically pass ownership
     /// to `PrimitiveBlock::from_vec_with_scratch(std::mem::take(&mut buf))`
     /// which leaves `buf` empty — the next call will re-allocate. This trades
     /// per-blob allocation (~220 KB) for eliminating the 1.5 MB Bytes→Vec copy
-    /// that `decompress_pooled()` + `new_with_scratch()` would incur.
+    /// that the old `decompress_pooled()` + `new_with_scratch()` path incurred.
     pub(crate) fn decompress_into(&self, buf: &mut Vec<u8>) -> Result<()> {
         decompress_wire_blob_into(&self.blob, buf)
     }

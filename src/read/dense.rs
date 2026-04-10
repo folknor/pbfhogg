@@ -179,27 +179,37 @@ impl<'a> Iterator for DenseNodeIter<'a> {
                 //   terminated by a single 0 varint delimiter.
                 let tag_start = self.kv_pos;
                 let mut cursor = Cursor::new(&self.kv_data[self.kv_pos..]);
-                let initial_remaining = cursor.remaining();
-                let mut found_delimiter = false;
 
                 // Scan forward, decoding varints until we hit a 0 key.
-                // kv_pos is updated once after the loop to avoid per-iteration
-                // struct field writes (lets the compiler keep cursor in registers).
                 while !cursor.is_empty() {
+                    let before = cursor.remaining();
                     match cursor.read_varint() {
-                        Ok(0) => { found_delimiter = true; break; }
+                        Ok(0) => {
+                            // 0 delimiter found. Record position past the delimiter.
+                            let consumed = before - cursor.remaining();
+                            self.kv_pos += consumed;
+                            break;
+                        }
                         Ok(_key) => {
-                            if cursor.read_varint().is_err() { break; }
+                            // Skip the corresponding value varint
+                            if cursor.read_varint().is_err() {
+                                break;
+                            }
+                            let consumed = before - cursor.remaining();
+                            self.kv_pos += consumed;
                         }
                         Err(_) => break,
                     }
                 }
 
-                // Batch update: advance kv_pos by the total bytes consumed.
-                self.kv_pos += initial_remaining - cursor.remaining();
-
                 // tag_bytes covers the key-value pairs for this node (before the 0 delimiter).
-                let tag_end = if found_delimiter { self.kv_pos - 1 } else { self.kv_pos };
+                // The kv_pos now points past the 0 delimiter for the next node.
+                let tag_end = self.kv_pos.saturating_sub(if tag_start < self.kv_pos {
+                    // Subtract the size of the 0 delimiter varint (always 1 byte: 0x00)
+                    1
+                } else {
+                    0
+                });
                 let tag_bytes = &self.kv_data[tag_start..tag_end.min(self.kv_data.len())];
 
                 Some(DenseNode {

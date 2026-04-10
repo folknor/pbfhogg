@@ -878,11 +878,13 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 ## Post-v0.1 review: remaining code quality
 
-- [x] **DenseNodeIter::next tag scanning: batch kv_pos update** —
-  `kv_pos` now updated once after the scan loop instead of per key-value
-  pair. Cursor position tracked via `initial_remaining - cursor.remaining()`.
-  Eliminates per-iteration struct field write, letting the compiler keep
-  cursor state in registers.
+- [ ] **DenseNodeIter::next tag scanning: batch kv_pos update** —
+  Attempted: batch update with `found_delimiter` bool + single `kv_pos +=`.
+  Reverted: inspect-nodes regressed 2300ms → 2500ms (+8.7%). The original
+  per-iteration `kv_pos += consumed` pattern generates better code — likely
+  because the compiler keeps `kv_pos` in a register anyway (it's a local
+  struct field in a tight loop), and the `found_delimiter` bool introduced
+  an extra branch. Leave as-is unless SIMD varint decode changes the picture.
 
 - [x] **Page-aligned allocation shared between direct_writer and uring_writer** —
   `alloc_page_aligned()` helper in `src/write/mod.rs` centralizes the

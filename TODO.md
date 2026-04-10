@@ -843,14 +843,14 @@ Added `IdSetDense::merge_from()` for union, `iter()` for diagnostic output.
 `ids_intersect_range` removed. CLI updated for `has_any()`/`iter()` API.
 Also fixed redundant closures in sweep_merge call sites (clippy).
 
-### Priority 3: derive_changes — stream instead of buffering
+### Priority 3: derive_changes — stream instead of buffering — DONE
 
-Buffers all creates/modifies/deletes in memory before writing OSC. Planet
-daily diff: ~5-30M changes × ~200 bytes = 1-6 GB of owned elements.
-**Approach (planet/claude):** write creates, modifies, deletes to three
-separate temp gzip streams. Concatenate into final .osc.gz — gzip supports
-concatenation (multiple gzip members in one file are valid and decompress
-as the concatenation of their contents). No algorithmic restructuring needed.
+`ChangeSink` writes element XML directly to 3 temp files during the scan
+pass. Final `.osc.gz` assembled by copying raw temp bytes through GzEncoder
+(single gzip member, per reviewer consensus). Memory bounded by one element
+at a time instead of all changes. Planet daily diff: ~1-6 GB peak → ~24 KB.
+Both block_pair (indexed) and element_stream (fallback) paths converted.
+Temp files cleaned up after assembly (or on error).
 
 ### Priority 4: Split merge.rs into submodules
 

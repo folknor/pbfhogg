@@ -1,6 +1,8 @@
 //! Generate an OSC diff from two PBF snapshots. Equivalent to `osmium derive-changes`.
 //!
-//! Streams through both files in constant memory using [`StreamingBlocks`] cursors.
+//! Streams through both files writing changes directly to temp files,
+//! then assembles the final `.osc.gz` in a single pass. Memory is bounded
+//! by one element at a time, not total change count.
 //! Requires both inputs to declare `Sort.Type_then_ID`.
 
 use std::fs::File;
@@ -12,7 +14,7 @@ use quick_xml::events::{BytesDecl, BytesEnd, BytesStart, BytesText, Event};
 use quick_xml::Writer;
 
 use super::elements_xml::{
-    OwnedMetadata, OwnedNode, OwnedRelation, OwnedWay,
+    OwnedMetadata,
     write_node_xml, write_way_xml, write_relation_xml,
 };
 use super::stream_merge::{
@@ -73,24 +75,31 @@ pub fn derive_changes(
     if !new_sorted { super::require_sorted_err(new_path, "New PBF")?; }
     let both_indexed = old_indexed && new_indexed;
 
+    // Scratch directory for temp files (same as brokkr scratch).
+    let scratch_dir = output.parent().unwrap_or(Path::new("."));
+    let mut sink = ChangeSink::new(scratch_dir, increment_version, update_timestamp)?;
+
     crate::debug::emit_marker("DERIVECHANGES_SCAN_START");
 
-    let (creates, modifies, deletes) = if both_indexed {
-        derive_changes_block_pair(old_path, new_path, direct_io)?
+    let scan_result = if both_indexed {
+        derive_changes_block_pair(old_path, new_path, direct_io, &mut sink)
     } else {
-        derive_changes_element_stream(old_path, new_path, direct_io)?
+        derive_changes_element_stream(old_path, new_path, direct_io, &mut sink)
     };
+    // Clean up temp files on error
+    if let Err(e) = scan_result {
+        sink.cleanup();
+        return Err(e);
+    }
+    sink.flush()?;
 
     crate::debug::emit_marker("DERIVECHANGES_SCAN_END");
 
-    let stats = DeriveChangesStats {
-        creates: (creates.nodes.len() + creates.ways.len() + creates.relations.len()) as u64,
-        modifies: (modifies.nodes.len() + modifies.ways.len() + modifies.relations.len()) as u64,
-        deletes: (deletes.nodes.len() + deletes.ways.len() + deletes.relations.len()) as u64,
-    };
+    let stats = sink.stats();
 
     crate::debug::emit_marker("DERIVECHANGES_WRITE_START");
-    write_osc(output, &creates, &modifies, &deletes, increment_version, update_timestamp)?;
+    assemble_osc(output, &sink)?;
+    sink.cleanup();
     crate::debug::emit_marker("DERIVECHANGES_WRITE_END");
 
     #[allow(clippy::cast_possible_wrap)]
@@ -104,26 +113,126 @@ pub fn derive_changes(
 }
 
 // ---------------------------------------------------------------------------
-// Change collection
+// Streaming change sink — writes element XML directly to temp files
 // ---------------------------------------------------------------------------
 
-struct Changes {
-    nodes: Vec<OwnedNode>,
-    ways: Vec<OwnedWay>,
-    relations: Vec<OwnedRelation>,
+struct ChangeSink {
+    creates: Writer<io::BufWriter<File>>,
+    modifies: Writer<io::BufWriter<File>>,
+    deletes: Writer<io::BufWriter<File>>,
+    creates_path: std::path::PathBuf,
+    modifies_path: std::path::PathBuf,
+    deletes_path: std::path::PathBuf,
+    create_count: u64,
+    modify_count: u64,
+    delete_count: u64,
+    increment_version: bool,
+    update_timestamp: bool,
 }
 
-impl Changes {
-    fn new() -> Self {
-        Self {
-            nodes: Vec::new(),
-            ways: Vec::new(),
-            relations: Vec::new(),
-        }
+impl ChangeSink {
+    fn new(
+        scratch_dir: &Path,
+        increment_version: bool,
+        update_timestamp: bool,
+    ) -> io::Result<Self> {
+        let cp = scratch_dir.join("derive-creates.xml.tmp");
+        let mp = scratch_dir.join("derive-modifies.xml.tmp");
+        let dp = scratch_dir.join("derive-deletes.xml.tmp");
+        Ok(Self {
+            creates: Writer::new(io::BufWriter::new(File::create(&cp)?)),
+            modifies: Writer::new(io::BufWriter::new(File::create(&mp)?)),
+            deletes: Writer::new(io::BufWriter::new(File::create(&dp)?)),
+            creates_path: cp,
+            modifies_path: mp,
+            deletes_path: dp,
+            create_count: 0,
+            modify_count: 0,
+            delete_count: 0,
+            increment_version,
+            update_timestamp,
+        })
     }
 
-    fn is_empty(&self) -> bool {
-        self.nodes.is_empty() && self.ways.is_empty() && self.relations.is_empty()
+    fn write_create(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
+        if let Some(owned) = convert_to_xml_node(elem, kind) {
+            write_owned_element(&mut self.creates, &owned)?;
+            self.create_count += 1;
+        }
+        Ok(())
+    }
+
+    fn write_modify(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
+        if let Some(owned) = convert_to_xml_node(elem, kind) {
+            write_owned_element(&mut self.modifies, &owned)?;
+            self.modify_count += 1;
+        }
+        Ok(())
+    }
+
+    fn write_delete(&mut self, elem: &crate::Element<'_>, kind: ElemKind) -> Result<()> {
+        if let Some((tag, id, meta)) = extract_delete_info(elem, kind) {
+            write_delete_element(
+                &mut self.deletes, tag, id, meta.as_ref(),
+                self.increment_version, self.update_timestamp,
+            )?;
+            self.delete_count += 1;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.creates.get_mut().flush()?;
+        self.modifies.get_mut().flush()?;
+        self.deletes.get_mut().flush()?;
+        Ok(())
+    }
+
+    fn cleanup(&self) {
+        drop(std::fs::remove_file(&self.creates_path));
+        drop(std::fs::remove_file(&self.modifies_path));
+        drop(std::fs::remove_file(&self.deletes_path));
+    }
+
+    fn stats(&self) -> DeriveChangesStats {
+        DeriveChangesStats {
+            creates: self.create_count,
+            modifies: self.modify_count,
+            deletes: self.delete_count,
+        }
+    }
+}
+
+/// Convert a borrowed element to an owned XML-writable form and write it.
+fn write_owned_element<W: Write>(writer: &mut Writer<W>, owned: &OwnedXml) -> Result<()> {
+    match owned {
+        OwnedXml::Node(n) => write_node_xml(writer, n),
+        OwnedXml::Way(w) => write_way_xml(writer, w),
+        OwnedXml::Relation(r) => write_relation_xml(writer, r),
+    }
+}
+
+enum OwnedXml {
+    Node(super::elements_xml::OwnedNode),
+    Way(super::elements_xml::OwnedWay),
+    Relation(super::elements_xml::OwnedRelation),
+}
+
+fn convert_to_xml_node(elem: &crate::Element<'_>, kind: ElemKind) -> Option<OwnedXml> {
+    use super::stream_merge::{convert_node, convert_way, convert_relation};
+    match kind {
+        ElemKind::Node => convert_node(elem).map(OwnedXml::Node),
+        ElemKind::Way => convert_way(elem).map(OwnedXml::Way),
+        ElemKind::Relation => convert_relation(elem).map(OwnedXml::Relation),
+    }
+}
+
+fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
+    use super::stream_merge::{convert_node, convert_way, convert_relation};
+    match kind {
+        ElemKind::Node => convert_node(elem).map(|n| ("node", n.id, n.metadata)),
+        ElemKind::Way => convert_way(elem).map(|w| ("way", w.id, w.metadata)),
+        ElemKind::Relation => convert_relation(elem).map(|r| ("relation", r.id, r.metadata)),
     }
 }
 
@@ -131,38 +240,20 @@ impl Changes {
 // Change collection via shared merge-join
 // ---------------------------------------------------------------------------
 
-/// Run one type phase, collecting creates/modifies/deletes into Vecs.
-fn collect_changes_phase<T: super::stream_merge::MergeJoinElement + Clone>(
-    old_src: &mut StreamingBlocks,
-    old_buf: &mut Vec<T>,
-    new_src: &mut StreamingBlocks,
-    new_buf: &mut Vec<T>,
-    creates: &mut Vec<T>,
-    modifies: &mut Vec<T>,
-    deletes: &mut Vec<T>,
-) -> Result<()> {
-    merge_join_phase(old_src, old_buf, new_src, new_buf, |action| {
-        match action {
-            MergeJoinAction::OldOnly(o) => deletes.push(o.clone()),
-            MergeJoinAction::NewOnly(n) => creates.push(n.clone()),
-            MergeJoinAction::Modified(_o, n) => modifies.push(n.clone()),
-            MergeJoinAction::Equal(_) => {}
-        }
-        Ok(())
-    })
-}
 
 // ---------------------------------------------------------------------------
 // Optimized block-pair path (borrowed elements, zero-alloc for Equal)
 // ---------------------------------------------------------------------------
 
-/// Collect changes using block-pair merge with borrowed elements.
-/// Only changed elements (~1.2% of typical daily diff) are materialized as owned.
+/// Stream changes using block-pair merge with borrowed elements.
+/// Only changed elements (~1.2% of typical daily diff) are materialized as owned,
+/// written to temp files immediately, then dropped.
 fn derive_changes_block_pair(
     old_path: &Path,
     new_path: &Path,
     direct_io: bool,
-) -> Result<(Changes, Changes, Changes)> {
+    sink: &mut ChangeSink,
+) -> Result<()> {
     let mut old_reader = crate::blob::BlobReader::open(old_path, direct_io)?;
     old_reader.set_parse_indexdata(true);
     let mut new_reader = crate::blob::BlobReader::open(new_path, direct_io)?;
@@ -170,143 +261,122 @@ fn derive_changes_block_pair(
 
     let mut merge = BlockPairMergeState::new(old_reader, new_reader);
 
-    let mut creates = Changes::new();
-    let mut modifies = Changes::new();
-    let mut deletes = Changes::new();
+    collect_phase_block_pair(&mut merge, ElemKind::Node, sink)?;
+    collect_phase_block_pair(&mut merge, ElemKind::Way, sink)?;
+    collect_phase_block_pair(&mut merge, ElemKind::Relation, sink)?;
 
-    collect_phase_block_pair(&mut merge, ElemKind::Node, &mut creates, &mut modifies, &mut deletes)?;
-    collect_phase_block_pair(&mut merge, ElemKind::Way, &mut creates, &mut modifies, &mut deletes)?;
-    collect_phase_block_pair(&mut merge, ElemKind::Relation, &mut creates, &mut modifies, &mut deletes)?;
-
-    Ok((creates, modifies, deletes))
+    Ok(())
 }
 
-/// Run one type phase of block-pair merge, collecting changed elements as owned.
+/// Run one type phase of block-pair merge, streaming changed elements to temp files.
 fn collect_phase_block_pair(
     merge: &mut BlockPairMergeState,
     kind: ElemKind,
-    creates: &mut Changes,
-    modifies: &mut Changes,
-    deletes: &mut Changes,
+    sink: &mut ChangeSink,
 ) -> Result<()> {
     block_pair_merge_phase(merge, kind, true, &mut |action| {
         match action {
             BlockMergeAction::BlobEqual(_) | BlockMergeAction::ElementEqual { .. } => {}
             BlockMergeAction::BlobOldOnly { block, skip, .. } => {
                 for elem in block.elements().skip(skip) {
-                    push_converted(&elem, kind, deletes);
+                    sink.write_delete(&elem, kind)?;
                 }
             }
             BlockMergeAction::BlobNewOnly { block, skip, .. } => {
                 for elem in block.elements().skip(skip) {
-                    push_converted(&elem, kind, creates);
+                    sink.write_create(&elem, kind)?;
                 }
             }
             BlockMergeAction::ElementModified { new, .. } => {
-                push_converted(new, kind, modifies);
+                sink.write_modify(new, kind)?;
             }
             BlockMergeAction::ElementOldOnly(o) => {
-                push_converted(o, kind, deletes);
+                sink.write_delete(o, kind)?;
             }
             BlockMergeAction::ElementNewOnly(n) => {
-                push_converted(n, kind, creates);
+                sink.write_create(n, kind)?;
             }
         }
         Ok(())
     })
 }
 
-/// Convert a borrowed Element to the appropriate owned type and push to Changes.
-fn push_converted(elem: &crate::Element<'_>, kind: ElemKind, target: &mut Changes) {
-    use super::stream_merge::{convert_node, convert_relation, convert_way};
-
-    match kind {
-        ElemKind::Node => {
-            if let Some(owned) = convert_node(elem) {
-                target.nodes.push(owned);
-            }
-        }
-        ElemKind::Way => {
-            if let Some(owned) = convert_way(elem) {
-                target.ways.push(owned);
-            }
-        }
-        ElemKind::Relation => {
-            if let Some(owned) = convert_relation(elem) {
-                target.relations.push(owned);
-            }
-        }
-    }
-}
-
 /// Fallback path using element-level merge-join with owned elements.
+/// Streams changes directly to temp files via `ChangeSink`.
 fn derive_changes_element_stream(
     old_path: &Path,
     new_path: &Path,
     direct_io: bool,
-) -> Result<(Changes, Changes, Changes)> {
+    sink: &mut ChangeSink,
+) -> Result<()> {
+    use super::elements_xml::{OwnedNode, OwnedWay, OwnedRelation};
+
     let mut old_src = StreamingBlocks::new_sequential(old_path, direct_io)?;
     let mut new_src = StreamingBlocks::new_sequential(new_path, direct_io)?;
 
-    let mut creates = Changes::new();
-    let mut modifies = Changes::new();
-    let mut deletes = Changes::new();
+    let iv = sink.increment_version;
+    let ut = sink.update_timestamp;
 
     // Phase 1: Nodes
     {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut creates.nodes,
-            &mut modifies.nodes,
-            &mut deletes.nodes,
-        )?;
+        let (mut ob, mut nb): (Vec<OwnedNode>, Vec<OwnedNode>) = (Vec::new(), Vec::new());
+        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
+            match action {
+                MergeJoinAction::OldOnly(n) => {
+                    write_delete_element(&mut sink.deletes, "node", n.id, n.metadata.as_ref(), iv, ut)?;
+                    sink.delete_count += 1;
+                }
+                MergeJoinAction::NewOnly(n) => { write_node_xml(&mut sink.creates, n)?; sink.create_count += 1; }
+                MergeJoinAction::Modified(_, n) => { write_node_xml(&mut sink.modifies, n)?; sink.modify_count += 1; }
+                MergeJoinAction::Equal(_) => {}
+            }
+            Ok(())
+        })?;
     }
     // Phase 2: Ways
     {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut creates.ways,
-            &mut modifies.ways,
-            &mut deletes.ways,
-        )?;
+        let (mut ob, mut nb): (Vec<OwnedWay>, Vec<OwnedWay>) = (Vec::new(), Vec::new());
+        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
+            match action {
+                MergeJoinAction::OldOnly(w) => {
+                    write_delete_element(&mut sink.deletes, "way", w.id, w.metadata.as_ref(), iv, ut)?;
+                    sink.delete_count += 1;
+                }
+                MergeJoinAction::NewOnly(w) => { write_way_xml(&mut sink.creates, w)?; sink.create_count += 1; }
+                MergeJoinAction::Modified(_, w) => { write_way_xml(&mut sink.modifies, w)?; sink.modify_count += 1; }
+                MergeJoinAction::Equal(_) => {}
+            }
+            Ok(())
+        })?;
     }
     // Phase 3: Relations
     {
-        let (mut ob, mut nb) = (Vec::new(), Vec::new());
-        collect_changes_phase(
-            &mut old_src,
-            &mut ob,
-            &mut new_src,
-            &mut nb,
-            &mut creates.relations,
-            &mut modifies.relations,
-            &mut deletes.relations,
-        )?;
+        let (mut ob, mut nb): (Vec<OwnedRelation>, Vec<OwnedRelation>) = (Vec::new(), Vec::new());
+        merge_join_phase(&mut old_src, &mut ob, &mut new_src, &mut nb, |action| {
+            match action {
+                MergeJoinAction::OldOnly(r) => {
+                    write_delete_element(&mut sink.deletes, "relation", r.id, r.metadata.as_ref(), iv, ut)?;
+                    sink.delete_count += 1;
+                }
+                MergeJoinAction::NewOnly(r) => { write_relation_xml(&mut sink.creates, r)?; sink.create_count += 1; }
+                MergeJoinAction::Modified(_, r) => { write_relation_xml(&mut sink.modifies, r)?; sink.modify_count += 1; }
+                MergeJoinAction::Equal(_) => {}
+            }
+            Ok(())
+        })?;
     }
 
-    Ok((creates, modifies, deletes))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // OSC XML writer
 // ---------------------------------------------------------------------------
 
-fn write_osc(
-    output: &Path,
-    creates: &Changes,
-    modifies: &Changes,
-    deletes: &Changes,
-    increment_version: bool,
-    update_timestamp: bool,
-) -> Result<()> {
+/// Assemble the final `.osc.gz` from temp file fragments.
+/// Writes XML structure via quick_xml Writer, copies raw fragment bytes
+/// directly to the underlying GzEncoder (not through the XML writer).
+fn assemble_osc(output: &Path, sink: &ChangeSink) -> Result<()> {
     let file = File::create(output)?;
     let gz = GzEncoder::new(io::BufWriter::new(file), flate2::Compression::fast());
     let mut writer = Writer::new_with_indent(gz, b' ', 2);
@@ -320,56 +390,38 @@ fn write_osc(
     root.push_attribute(("version", "0.6"));
     writer.write_event(Event::Start(root))?;
 
-    // <create>
-    if !creates.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("create")))?;
-        for node in &creates.nodes {
-            write_node_xml(&mut writer, node)?;
-        }
-        for way in &creates.ways {
-            write_way_xml(&mut writer, way)?;
-        }
-        for rel in &creates.relations {
-            write_relation_xml(&mut writer, rel)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("create")))?;
-    }
-
-    // <modify>
-    if !modifies.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("modify")))?;
-        for node in &modifies.nodes {
-            write_node_xml(&mut writer, node)?;
-        }
-        for way in &modifies.ways {
-            write_way_xml(&mut writer, way)?;
-        }
-        for rel in &modifies.relations {
-            write_relation_xml(&mut writer, rel)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("modify")))?;
-    }
-
-    // <delete>
-    if !deletes.is_empty() {
-        writer.write_event(Event::Start(BytesStart::new("delete")))?;
-        for node in &deletes.nodes {
-            write_delete_element(&mut writer, "node", node.id, node.metadata.as_ref(), increment_version, update_timestamp)?;
-        }
-        for way in &deletes.ways {
-            write_delete_element(&mut writer, "way", way.id, way.metadata.as_ref(), increment_version, update_timestamp)?;
-        }
-        for rel in &deletes.relations {
-            write_delete_element(&mut writer, "relation", rel.id, rel.metadata.as_ref(), increment_version, update_timestamp)?;
-        }
-        writer.write_event(Event::End(BytesEnd::new("delete")))?;
-    }
+    // Copy each non-empty temp file as a section
+    copy_section(&mut writer, "create", &sink.creates_path, sink.create_count)?;
+    copy_section(&mut writer, "modify", &sink.modifies_path, sink.modify_count)?;
+    copy_section(&mut writer, "delete", &sink.deletes_path, sink.delete_count)?;
 
     // </osmChange>
     writer.write_event(Event::End(BytesEnd::new("osmChange")))?;
 
     let gz = writer.into_inner();
     gz.finish()?;
+    Ok(())
+}
+
+/// Copy a temp file's raw XML bytes into an action section.
+/// Flushes the XML writer before copying raw bytes to the underlying writer,
+/// then resumes structured writing for the closing tag.
+fn copy_section<W: Write>(
+    writer: &mut Writer<W>,
+    tag: &str,
+    path: &Path,
+    count: u64,
+) -> Result<()> {
+    if count == 0 {
+        return Ok(());
+    }
+    writer.write_event(Event::Start(BytesStart::new(tag)))?;
+    // Flush the XML writer's internal buffer before raw byte copy
+    writer.get_mut().flush()?;
+    // Copy raw XML fragment bytes directly to the underlying writer
+    let mut tmp = io::BufReader::new(File::open(path)?);
+    io::copy(&mut tmp, writer.get_mut())?;
+    writer.write_event(Event::End(BytesEnd::new(tag)))?;
     Ok(())
 }
 

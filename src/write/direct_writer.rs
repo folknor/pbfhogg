@@ -14,8 +14,7 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::ptr::NonNull;
 
-/// Page size for alignment. 4096 is universally safe across Linux filesystems.
-const PAGE_SIZE: usize = 4096;
+use super::{PAGE_SIZE, alloc_page_aligned};
 
 /// Internal buffer capacity. Matches the 256 KB `BufWriter` capacity used
 /// elsewhere. Must be a multiple of `PAGE_SIZE`.
@@ -39,12 +38,7 @@ unsafe impl Send for AlignedBuffer {}
 impl AlignedBuffer {
     /// Allocate a new buffer of `capacity` bytes aligned to `PAGE_SIZE`.
     fn new(capacity: usize) -> io::Result<Self> {
-        let layout = Layout::from_size_align(capacity, PAGE_SIZE)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // Safety: layout has non-zero size (BUF_CAPACITY > 0).
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let ptr = NonNull::new(ptr)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
+        let (ptr, layout) = alloc_page_aligned(capacity)?;
         Ok(Self { ptr, layout, len: 0 })
     }
 

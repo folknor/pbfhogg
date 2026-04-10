@@ -878,18 +878,17 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 
 ## Post-v0.1 review: remaining code quality
 
-- [ ] **DenseNodeIter::next tag scanning: batch kv_pos update** —
-  `src/read/dense.rs:180-203` updates `kv_pos` per key-value pair inside the tag
-  scanning loop. Could compute the final position once at the end. This is the
-  hottest loop in the library (~8 billion iterations for planet), so even small
-  changes are measurable — needs a benchmark before and after. The current code
-  is correct; this is purely a potential throughput improvement.
+- [x] **DenseNodeIter::next tag scanning: batch kv_pos update** —
+  `kv_pos` now updated once after the scan loop instead of per key-value
+  pair. Cursor position tracked via `initial_remaining - cursor.remaining()`.
+  Eliminates per-iteration struct field write, letting the compiler keep
+  cursor state in registers.
 
-- [ ] **Page-aligned allocation shared between direct_writer and uring_writer** —
-  Both `src/write/direct_writer.rs` and `src/write/uring_writer.rs` implement
-  page-aligned allocation via `alloc::alloc_zeroed` with identical `Layout`
-  construction and `Drop` deallocation logic. A shared `AlignedBuf` primitive
-  would eliminate the duplication and centralize the unsafe code.
+- [x] **Page-aligned allocation shared between direct_writer and uring_writer** —
+  `alloc_page_aligned()` helper in `src/write/mod.rs` centralizes the
+  `Layout::from_size_align` + `alloc_zeroed` + `NonNull` check pattern.
+  Both `AlignedBuffer::new` and `AlignedBufferPool::new` now call it.
+  Drop impls unchanged (each still owns its layout for dealloc).
 
 - [ ] **Split merge.rs into submodules** —
   `src/commands/merge.rs` is ~1857 lines with interleaved concerns: stats tracking,
@@ -904,20 +903,19 @@ prefetch helps sequential reads). Sidecar `6887288a`.
   nested loop with `#[allow(clippy::cognitive_complexity)]`. Extract helper
   functions per element type to make the pass structure readable.
 
-- [ ] **bucketed_cell_assignment takes 13 parameters** —
-  `src/geocode_index/builder.rs:1181` — a `CellAssignmentParams` struct would make
-  the call site and function signature readable. Currently the caller has to match
-  13 positional arguments.
+- [x] **bucketed_cell_assignment takes 13 parameters** —
+  `CellAssignmentParams` struct replaces 13 positional arguments. Call sites
+  use struct update syntax (`..shared`) for the 8 shared fields. Removed
+  `too_many_arguments` allow.
 
-- [ ] **load_next_bucket takes 7 mutable references** —
-  `src/commands/external_join.rs:348-379` — the inner function passes bucket state
-  through 7 separate `&mut` parameters. A small `BucketState` struct would make the
-  state transitions clearer and reduce the parameter count.
+- [x] **load_next_bucket takes 7 mutable references** —
+  `BucketState` struct encapsulates `idx`, `sorted_pairs`, `data_buf`,
+  `pair_cursor`, `max_id`. `load_next` is now a method. Consumer loop
+  uses `bstate.` field access.
 
-- [ ] **osc.rs byte-reading helpers: use try_from pattern** —
-  `src/osc.rs:100-140` has four `read_*_le` functions that manually construct byte
-  arrays element by element. Using `<[u8; N]>::try_from(&data[offset..offset+N])`
-  is shorter and generates identical code. Low priority but cleaner.
+- [x] **osc.rs byte-reading helpers: use try_from pattern** —
+  `read_i64_le`, `read_i32_le`, `read_u32_le` now use
+  `data[offset..offset+N].try_into()` instead of manual byte construction.
 
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release

@@ -684,23 +684,35 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_cell_entries = assign_admin_cells(&admin_polygons, config.admin_level);
 
     // Process fine and coarse levels via bucketed distribution
-    let fine_count = bucketed_cell_assignment(
-        &config.output_dir,
-        FILE_GEO_CELLS, FILE_STREET_ENTRIES, FILE_ADDR_ENTRIES, FILE_INTERP_ENTRIES,
-        &street_ways_mmap, &street_nodes_mmap, street_way_count,
-        &addr_points_mmap, addr_point_count,
-        &interp_ways, &interp_nodes_mmap,
-        sl,
-    )?;
-    let coarse_count = bucketed_cell_assignment(
-        &config.output_dir,
-        FILE_COARSE_GEO_CELLS, FILE_COARSE_STREET_ENTRIES,
-        FILE_COARSE_ADDR_ENTRIES, FILE_COARSE_INTERP_ENTRIES,
-        &street_ways_mmap, &street_nodes_mmap, street_way_count,
-        &addr_points_mmap, addr_point_count,
-        &interp_ways, &interp_nodes_mmap,
-        cl,
-    )?;
+    let shared = CellAssignmentParams {
+        output_dir: &config.output_dir,
+        street_ways_mmap: &street_ways_mmap,
+        street_nodes_mmap: &street_nodes_mmap,
+        street_way_count,
+        addr_points_mmap: &addr_points_mmap,
+        addr_point_count,
+        interp_ways: &interp_ways,
+        interp_nodes_mmap: &interp_nodes_mmap,
+        // Overridden per call:
+        cells_file: "", street_entries_file: "", addr_entries_file: "",
+        interp_entries_file: "", level: 0,
+    };
+    let fine_count = bucketed_cell_assignment(&CellAssignmentParams {
+        cells_file: FILE_GEO_CELLS,
+        street_entries_file: FILE_STREET_ENTRIES,
+        addr_entries_file: FILE_ADDR_ENTRIES,
+        interp_entries_file: FILE_INTERP_ENTRIES,
+        level: sl,
+        ..shared
+    })?;
+    let coarse_count = bucketed_cell_assignment(&CellAssignmentParams {
+        cells_file: FILE_COARSE_GEO_CELLS,
+        street_entries_file: FILE_COARSE_STREET_ENTRIES,
+        addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
+        interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
+        level: cl,
+        ..shared
+    })?;
     let admin_count = write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
 
     eprintln!("  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells");
@@ -1169,26 +1181,36 @@ fn parse_bucket_file(data: &[u8]) -> Vec<ParsedBucketEntry> {
     entries
 }
 
+/// Parameters for bucketed cell assignment at one S2 level.
+struct CellAssignmentParams<'a> {
+    output_dir: &'a Path,
+    cells_file: &'a str,
+    street_entries_file: &'a str,
+    addr_entries_file: &'a str,
+    interp_entries_file: &'a str,
+    street_ways_mmap: &'a [u8],
+    street_nodes_mmap: &'a [u8],
+    street_way_count: u32,
+    addr_points_mmap: &'a [u8],
+    addr_point_count: u32,
+    interp_ways: &'a [SlimInterpWay],
+    interp_nodes_mmap: &'a [u8],
+    level: u8,
+}
+
 /// Run bucketed cell assignment for one level (fine or coarse).
 /// Returns the number of unique cells written.
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
-fn bucketed_cell_assignment(
-    output_dir: &Path,
-    cells_file: &str,
-    street_entries_file: &str,
-    addr_entries_file: &str,
-    interp_entries_file: &str,
-    street_ways_mmap: &[u8],
-    street_nodes_mmap: &[u8],
-    street_way_count: u32,
-    addr_points_mmap: &[u8],
-    addr_point_count: u32,
-    interp_ways: &[SlimInterpWay],
-    interp_nodes_mmap: &[u8],
-    level: u8,
-) -> Result<u32> {
+fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
     use rayon::prelude::*;
+
+    let CellAssignmentParams {
+        output_dir, cells_file, street_entries_file, addr_entries_file,
+        interp_entries_file, street_ways_mmap, street_nodes_mmap, street_way_count,
+        addr_points_mmap, addr_point_count, interp_ways, interp_nodes_mmap, level,
+    } = p;
+    let (street_way_count, addr_point_count, level) = (*street_way_count, *addr_point_count, *level);
 
     // Create temp directory for bucket files (remove first to avoid stale files
     // from a failed prior run contaminating this build).

@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, SyncSender};
 
+use super::{PAGE_SIZE, alloc_page_aligned};
+
 /// Registered file descriptor index for the output file.
 const OUT_FD_IDX: u32 = 0;
 /// Registered file descriptor index for the input file (CopyRange passthrough).
@@ -50,9 +52,6 @@ const fn ud_expected_len(ud: u64) -> u32 {
 const fn ud_is_read(ud: u64) -> bool {
     ud & READ_FLAG != 0
 }
-
-/// Page size for O_DIRECT alignment.
-const PAGE_SIZE: usize = 4096;
 
 /// Size of each registered buffer (256 KB, matches DirectWriter / BufWriter).
 const BUF_SIZE: usize = 256 * 1024;
@@ -86,12 +85,7 @@ impl AlignedBufferPool {
     /// Allocate `count` page-aligned buffers of `buf_size` bytes each.
     fn new(count: u16, buf_size: usize) -> io::Result<Self> {
         let total = buf_size * count as usize;
-        let layout = Layout::from_size_align(total, PAGE_SIZE)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        // Safety: layout has non-zero size (BUF_SIZE > 0, NUM_BUFS > 0).
-        let ptr = unsafe { alloc::alloc_zeroed(layout) };
-        let base = NonNull::new(ptr)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::OutOfMemory, "aligned alloc failed"))?;
+        let (base, layout) = alloc_page_aligned(total)?;
         let mut free = VecDeque::with_capacity(count as usize);
         for i in 0..count {
             free.push_back(i);

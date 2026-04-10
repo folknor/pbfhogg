@@ -98,38 +98,19 @@ impl StringInterner {
 
 #[inline]
 fn read_i64_le(data: &[u8], offset: usize) -> i64 {
-    let bytes: [u8; 8] = [
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-        data[offset + 4],
-        data[offset + 5],
-        data[offset + 6],
-        data[offset + 7],
-    ];
+    let bytes: [u8; 8] = data[offset..offset + 8].try_into().expect("slice length");
     i64::from_le_bytes(bytes)
 }
 
 #[inline]
 fn read_i32_le(data: &[u8], offset: usize) -> i32 {
-    let bytes: [u8; 4] = [
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ];
+    let bytes: [u8; 4] = data[offset..offset + 4].try_into().expect("slice length");
     i32::from_le_bytes(bytes)
 }
 
 #[inline]
 fn read_u32_le(data: &[u8], offset: usize) -> u32 {
-    let bytes: [u8; 4] = [
-        data[offset],
-        data[offset + 1],
-        data[offset + 2],
-        data[offset + 3],
-    ];
+    let bytes: [u8; 4] = data[offset..offset + 4].try_into().expect("slice length");
     u32::from_le_bytes(bytes)
 }
 

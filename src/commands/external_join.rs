@@ -342,53 +342,54 @@ fn stage2_node_join(
 
     // Pre-load all non-empty buckets sorted by node_id.
     // We advance through them as the node stream progresses.
-    let mut bucket_idx: usize = 0;
-    let mut sorted_pairs: Vec<CooPair> = Vec::new();
-    let mut data_buf: Vec<u8> = Vec::new();
-    let mut pair_cursor: usize = 0;
-    let mut bucket_max_id: i64 = 0;
-
-    // Advance to first non-empty bucket. Reuses data_buf and sorted_pairs
-    // allocations across bucket loads to prevent heap accumulation — at Europe
-    // scale, 256 buckets × ~290 MB each would otherwise accumulate 27+ GB of
-    // unreturned heap memory from the allocator.
-    fn load_next_bucket(
-        bucket_idx: &mut usize,
-        sorted_pairs: &mut Vec<CooPair>,
-        data_buf: &mut Vec<u8>,
-        pair_cursor: &mut usize,
-        bucket_max_id: &mut i64,
-        node_buckets: &BucketWriters,
-        range_size: u64,
-    ) -> Result<bool> {
-        while *bucket_idx < NUM_BUCKETS {
-            if node_buckets.entry_counts[*bucket_idx] > 0 {
-                load_coo_bucket_into(
-                    &node_buckets.paths[*bucket_idx],
-                    data_buf,
-                    sorted_pairs,
-                )?;
-                sorted_pairs.sort_unstable_by_key(|p| p.node_id);
-                *pair_cursor = 0;
-                // Last bucket covers everything above its lower bound —
-                // prevents silent data loss if node IDs exceed MAX_NODE_ID.
-                *bucket_max_id = if *bucket_idx == NUM_BUCKETS - 1 {
-                    i64::MAX
-                } else {
-                    #[allow(clippy::cast_possible_truncation)]
-                    { ((*bucket_idx as u64 + 1) * range_size).cast_signed() }
-                };
-                return Ok(true);
-            }
-            *bucket_idx += 1;
-        }
-        Ok(false)
+    // Reuses data_buf and sorted_pairs allocations across bucket loads to
+    // prevent heap accumulation — at Europe scale, 256 buckets × ~290 MB
+    // each would otherwise accumulate 27+ GB of unreturned heap memory.
+    struct BucketState {
+        idx: usize,
+        sorted_pairs: Vec<CooPair>,
+        data_buf: Vec<u8>,
+        pair_cursor: usize,
+        max_id: i64,
     }
 
-    let has_bucket = load_next_bucket(
-        &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
-        &mut bucket_max_id, node_buckets, range_size,
-    )?;
+    impl BucketState {
+        fn new() -> Self {
+            Self { idx: 0, sorted_pairs: Vec::new(), data_buf: Vec::new(), pair_cursor: 0, max_id: 0 }
+        }
+
+        fn load_next(
+            &mut self,
+            node_buckets: &BucketWriters,
+            range_size: u64,
+        ) -> Result<bool> {
+            while self.idx < NUM_BUCKETS {
+                if node_buckets.entry_counts[self.idx] > 0 {
+                    load_coo_bucket_into(
+                        &node_buckets.paths[self.idx],
+                        &mut self.data_buf,
+                        &mut self.sorted_pairs,
+                    )?;
+                    self.sorted_pairs.sort_unstable_by_key(|p| p.node_id);
+                    self.pair_cursor = 0;
+                    // Last bucket covers everything above its lower bound —
+                    // prevents silent data loss if node IDs exceed MAX_NODE_ID.
+                    self.max_id = if self.idx == NUM_BUCKETS - 1 {
+                        i64::MAX
+                    } else {
+                        #[allow(clippy::cast_possible_truncation)]
+                        { ((self.idx as u64 + 1) * range_size).cast_signed() }
+                    };
+                    return Ok(true);
+                }
+                self.idx += 1;
+            }
+            Ok(false)
+        }
+    }
+
+    let mut bstate = BucketState::new();
+    let has_bucket = bstate.load_next(node_buckets, range_size)?;
 
     if !has_bucket {
         return Ok(0); // No COO pairs at all
@@ -541,28 +542,24 @@ fn stage2_node_join(
 
                 for &NodeTuple { id, lat, lon } in &tuples {
                     // Advance to the bucket that covers this node ID.
-                    while id >= bucket_max_id {
-                        bucket_idx += 1;
-                        let has = load_next_bucket(
-                            &mut bucket_idx, &mut sorted_pairs, &mut data_buf, &mut pair_cursor,
-                            &mut bucket_max_id, node_buckets, range_size,
-                        )?;
-                        if !has {
+                    while id >= bstate.max_id {
+                        bstate.idx += 1;
+                        if !bstate.load_next(node_buckets, range_size)? {
                             return Ok(());
                         }
                     }
 
-                    while pair_cursor < sorted_pairs.len()
-                        && sorted_pairs[pair_cursor].node_id < id
+                    while bstate.pair_cursor < bstate.sorted_pairs.len()
+                        && bstate.sorted_pairs[bstate.pair_cursor].node_id < id
                     {
-                        pair_cursor += 1;
+                        bstate.pair_cursor += 1;
                     }
 
-                    while pair_cursor < sorted_pairs.len()
-                        && sorted_pairs[pair_cursor].node_id == id
+                    while bstate.pair_cursor < bstate.sorted_pairs.len()
+                        && bstate.sorted_pairs[bstate.pair_cursor].node_id == id
                     {
                         let entry = ResolvedEntry {
-                            slot_pos: sorted_pairs[pair_cursor].slot_pos,
+                            slot_pos: bstate.sorted_pairs[bstate.pair_cursor].slot_pos,
                             lat,
                             lon,
                         };
@@ -573,7 +570,7 @@ fn stage2_node_join(
                         }
                         slot_buckets.entry_counts[bucket] += 1;
                         resolved_count += 1;
-                        pair_cursor += 1;
+                        bstate.pair_cursor += 1;
                     }
                 }
 

@@ -850,7 +850,15 @@ pass. Final `.osc.gz` assembled by copying raw temp bytes through GzEncoder
 (single gzip member, per reviewer consensus). Memory bounded by one element
 at a time instead of all changes. Planet daily diff: ~1-6 GB peak → ~24 KB.
 Both block_pair (indexed) and element_stream (fallback) paths converted.
-Temp files cleaned up after assembly (or on error).
+Temp files include PID for concurrent safety, cleaned up on all exit paths.
+Delete path extracts id+metadata directly (zero tag clone).
+
+**Follow-up: borrowed element XML writers.** `write_create`/`write_modify`
+still clone elements to owned via `convert_node/convert_way/convert_relation`
+before writing XML. Add `write_*_xml` variants that accept `&DenseNode`,
+`&Way`, `&Relation` directly — avoids ~100-500 MB tag String allocation at
+planet scale for the create/modify path. The delete path already avoids
+the clone via `extract_delete_info`.
 
 ### Priority 4: Split merge.rs into submodules
 

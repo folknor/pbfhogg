@@ -640,8 +640,8 @@ fn combine_expressions(
 #[allow(clippy::too_many_lines)]
 fn main() {
     let _guard = hotpath::HotpathGuardBuilder::new("pbfhogg::main")
-        .percentiles(&[50, 95, 99])
-        .with_functions_limit(0)
+        .percentiles(&[50.0, 95.0, 99.0])
+        .functions_limit(0)
         .build();
 
     let cli = Cli::parse();

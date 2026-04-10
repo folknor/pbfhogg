@@ -1,9 +1,11 @@
 //! Sparse node location index for `--locations-on-ways`.
 
+use std::path::Path;
+
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::blob_index::ElemKind;
 use crate::osc::CompactDiffOverlay;
-use crate::{Element, PrimitiveBlock};
 
 /// Sparse node coordinate index for maintaining LocationsOnWays through merges.
 ///
@@ -78,35 +80,69 @@ impl NodeLocationIndex {
         start < self.needed_sorted.len() && self.needed_sorted[start] <= max_id
     }
 
-    /// Extract needed coordinates from a decoded PrimitiveBlock.
-    pub(super) fn extract_from_block(&mut self, block: &PrimitiveBlock) -> u64 {
-        let mut found: u64 = 0;
-        for element in block.elements_skip_metadata() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    if self.needed_set.contains(&dn.id()) {
-                        self.locations
-                            .insert(dn.id(), (dn.decimicro_lat(), dn.decimicro_lon()));
-                        self.needed_set.remove(&dn.id());
-                        found += 1;
-                    }
-                }
-                Element::Node(n) => {
-                    if self.needed_set.contains(&n.id()) {
-                        self.locations
-                            .insert(n.id(), (n.decimicro_lat(), n.decimicro_lon()));
-                        self.needed_set.remove(&n.id());
-                        found += 1;
-                    }
-                }
-                Element::Way(_) | Element::Relation(_) => {}
-            }
-        }
-        found
-    }
-
     /// Check if all needed nodes have been found.
     pub(super) fn all_found(&self) -> bool {
         self.needed_set.is_empty()
+    }
+
+    /// Pre-scan the base PBF to fill all remaining needed node coordinates.
+    ///
+    /// Uses indexdata to skip non-node blobs and blobs whose ID ranges don't
+    /// overlap needed IDs. Matching blobs use the node scanner (no
+    /// PrimitiveBlock construction). Exits early once all needed IDs are found.
+    /// Returns `(nodes_found, blobs_scanned)`.
+    pub(super) fn prefill_from_base(
+        &mut self,
+        base_pbf: &Path,
+        direct_io: bool,
+    ) -> super::Result<(u64, u64)> {
+        if self.all_found() {
+            return Ok((0, 0));
+        }
+
+        let mut reader = crate::blob::BlobReader::open(base_pbf, direct_io)?;
+        reader.set_parse_indexdata(true);
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut tuples = Vec::new();
+        let mut group_starts = Vec::new();
+        let mut nodes_found: u64 = 0;
+        let mut blobs_scanned: u64 = 0;
+
+        for blob_result in &mut reader {
+            let blob = blob_result?;
+            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+                continue;
+            }
+            if let Some(idx) = blob.index() {
+                // Skip non-node blobs and node blobs outside needed range
+                if idx.kind != ElemKind::Node {
+                    // Sorted PBF: once past nodes, no more node blobs
+                    break;
+                }
+                if !self.overlaps_needed(idx.min_id, idx.max_id) {
+                    continue;
+                }
+            }
+            blob.decompress_into(&mut buf)?;
+            tuples.clear();
+            group_starts.clear();
+            if crate::commands::node_scanner::extract_node_tuples(
+                &buf, &mut tuples, &mut group_starts,
+            ).is_ok() {
+                for t in &tuples {
+                    if self.needed_set.remove(&t.id) {
+                        self.locations.insert(t.id, (t.lat, t.lon));
+                        nodes_found += 1;
+                    }
+                }
+            }
+            blobs_scanned += 1;
+            if self.all_found() {
+                break;
+            }
+        }
+
+        Ok((nodes_found, blobs_scanned))
     }
 }

@@ -859,7 +859,9 @@ in `elements_xml.rs` writes XML directly from borrowed `&Element<'_>`
 `ChangeSink::write_create`/`write_modify` use this zero-clone path.
 Removed `OwnedXml` enum and `convert_to_xml_node` from derive_changes.
 The element_stream fallback path retains owned writers (already has
-owned elements from `merge_join_phase`).
+owned elements from `merge_join_phase`). Borrowed way/relation writers
+still collect refs and members into `Vec`s (not fully allocation-free) —
+could use `.peekable()` like tags to avoid. Low priority.
 
 ### Priority 4: Split merge.rs into submodules — DONE
 
@@ -871,22 +873,22 @@ block_overlaps_diff), `merge/rewrite.rs` (all write functions, header
 handling, reader thread, rewrite logic, main `merge()`). `merge/mod.rs`
 re-exports `merge`, `MergeOptions`, `MergeStats`. Public API unchanged.
 
-### Priority 5: Reduce build_geocode_index cognitive complexity
+### Priority 5: Reduce build_geocode_index cognitive complexity — DONE
 
-Pass 2 body (~200 lines) handles nodes + ways in one deeply nested loop
-with 20+ mutable variables. Extract `process_node_element()` and
-`process_way_element()` helpers with a small params struct. Unlocks safe
-iteration on the geocode builder.
+Pass 2 node+way loop extracted into `Pass2State` struct with
+`process_dense_node()` and `process_way()` methods. All mutable
+state (writers, counters, coord_mmap, way_geom, strings, interp_ways)
+is grouped in the struct. The main loop body is now 5 lines.
 
-### Priority 6: merge --locations-on-ways — avoid cloning location HashMap
+### Priority 6: merge --locations-on-ways — avoid cloning location HashMap — DONE
 
-`Arc::new(idx.locations.clone())` at `merge.rs:1495`. Planet daily diff:
-~1M way-referenced nodes × 20 bytes = ~20 MB map, cloned 5-10 times per
-merge = 100-200 MB of copies. Measurable but not a bottleneck (merge is
-762s, dominated by zlib + I/O). **Approach (planet/claude):** restructure
-so all inserts happen before the batch loop (map is built from the OSC
-diff, which is finite and known upfront), then wrap in `Arc` for read-only
-sharing. No concurrent map needed.
+`NodeLocationIndex::prefill_from_base()` pre-scans the base PBF before
+the merge loop to fill all remaining needed node coordinates. Uses
+indexdata to skip non-node blobs, breaks at first non-node blob (sorted
+PBF), and exits early once all IDs are found. Locations wrapped in
+`Arc` once and shared read-only across all rewrite tasks — no per-batch
+`HashMap::clone()`. Phase 2.5 (in-loop extraction) removed entirely.
+`LocStats` struct carries pre-scan statistics to final summary.
 
 ### Priority 7: pread-from-workers boilerplate dedup (SKIP)
 

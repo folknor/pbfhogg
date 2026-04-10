@@ -144,6 +144,210 @@ struct AssembledPolygon {
 struct AdminCellEntry { cell_id: u64, poly_index: u32, is_interior: bool }
 
 // ---------------------------------------------------------------------------
+// Pass 2 helper state
+// ---------------------------------------------------------------------------
+
+/// Mutable state shared by node and way processing in pass 2.
+struct Pass2State<'a> {
+    coord_mmap: &'a mut memmap2::MmapMut,
+    referenced_nodes: &'a crate::commands::id_set_dense::IdSetDense,
+    needed_admin_ways: &'a crate::commands::id_set_dense::IdSetDense,
+    way_geom: &'a mut FxHashMap<i64, Vec<(i32, i32)>>,
+    strings: &'a mut StringPool,
+    interp_ways: &'a mut Vec<SlimInterpWay>,
+    // Output writers
+    street_ways_out: &'a mut BufWriter<std::fs::File>,
+    street_nodes_out: &'a mut BufWriter<std::fs::File>,
+    addr_points_out: &'a mut BufWriter<std::fs::File>,
+    interp_nodes_out: &'a mut BufWriter<std::fs::File>,
+    // Running counters
+    street_node_offset: u64,
+    interp_node_offset: u64,
+    addr_point_count: u32,
+    street_way_count: u32,
+    first_addr_lat_e7: i32,
+    first_addr_lon_e7: i32,
+}
+
+impl Pass2State<'_> {
+    /// Process a dense node: store coordinates for referenced nodes and
+    /// write address points for nodes with addr:housenumber + addr:street.
+    fn process_dense_node(&mut self, node: &crate::dense::DenseNode<'_>) -> Result<()> {
+        let lat_e7 = node.decimicro_lat();
+        let lon_e7 = node.decimicro_lon();
+        if self.referenced_nodes.get(node.id()) {
+            #[allow(clippy::cast_possible_truncation)]
+            let r = self.referenced_nodes.rank(node.id()) as usize;
+            let off = r * 8;
+            self.coord_mmap[off..off + 4].copy_from_slice(&lat_e7.to_le_bytes());
+            self.coord_mmap[off + 4..off + 8].copy_from_slice(&lon_e7.to_le_bytes());
+        }
+
+        let mut hn: Option<&str> = None;
+        let mut st: Option<&str> = None;
+        let mut pc: Option<&str> = None;
+        for (k, v) in node.tags() {
+            match k {
+                "addr:housenumber" => hn = Some(v),
+                "addr:street" => st = Some(v),
+                "addr:postcode" => pc = Some(v),
+                _ => {}
+            }
+        }
+        if let (Some(h), Some(s)) = (hn, st) {
+            let ap = AddrPoint {
+                lat_e7, lon_e7,
+                housenumber_offset: self.strings.intern(h),
+                street_offset: self.strings.intern(s),
+                postcode_offset: pc.map_or(0, |p| self.strings.intern(p)),
+            };
+            self.addr_points_out.write_all(&ap.to_bytes())?;
+            if self.addr_point_count == 0 {
+                self.first_addr_lat_e7 = lat_e7;
+                self.first_addr_lon_e7 = lon_e7;
+            }
+            self.addr_point_count += 1;
+        }
+        Ok(())
+    }
+
+    /// Process a way: classify by tags, resolve coordinates, and write to
+    /// the appropriate output (admin geometry, interpolation, building
+    /// address, or street).
+    #[allow(clippy::too_many_lines)]
+    fn process_way(&mut self, way: &crate::elements::Way<'_>) -> Result<()> {
+        let way_id = way.id();
+        let is_admin_way = self.needed_admin_ways.get(way_id);
+
+        // Tag-first classification: check tags before resolving
+        // coordinates. Skips node-index lookups for irrelevant ways.
+        let mut highway: Option<&str> = None;
+        let mut name: Option<&str> = None;
+        let mut hn: Option<&str> = None;
+        let mut addr_st: Option<&str> = None;
+        let mut pc: Option<&str> = None;
+        let mut building = false;
+        let mut interp: Option<&str> = None;
+
+        for (k, v) in way.tags() {
+            match k {
+                "highway" => highway = Some(v),
+                "name" => name = Some(v),
+                "addr:housenumber" => hn = Some(v),
+                "addr:street" => addr_st = Some(v),
+                "addr:postcode" => pc = Some(v),
+                "building" => building = true,
+                "addr:interpolation" => interp = Some(v),
+                _ => {}
+            }
+        }
+
+        let is_street = highway.is_some() && name.is_some()
+            && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
+        let is_building_addr = building && hn.is_some() && addr_st.is_some();
+        let is_interp = interp.is_some() && addr_st.is_some();
+
+        if !is_admin_way && !is_street && !is_building_addr && !is_interp {
+            return Ok(());
+        }
+
+        let coords: Vec<(i32, i32)> = way.refs()
+            .filter_map(|nid| {
+                if !self.referenced_nodes.get(nid) { return None; }
+                #[allow(clippy::cast_possible_truncation)]
+                let r = self.referenced_nodes.rank(nid) as usize;
+                let off = r * 8;
+                let lat = i32::from_le_bytes(self.coord_mmap[off..off+4].try_into().ok()?);
+                let lon = i32::from_le_bytes(self.coord_mmap[off+4..off+8].try_into().ok()?);
+                if lat == 0 && lon == 0 { None } else { Some((lat, lon)) }
+            })
+            .collect();
+        if coords.is_empty() { return Ok(()); }
+
+        // Admin way geometry — move coords if no other consumer needs them
+        if is_admin_way && !is_street && !is_building_addr && !is_interp {
+            self.way_geom.insert(way_id, coords);
+            return Ok(());
+        }
+        if is_admin_way {
+            self.way_geom.insert(way_id, coords.clone());
+        }
+
+        // Interpolation ways — write nodes to file, keep slim metadata
+        if is_interp {
+            if coords.len() >= 2 {
+                let itype = match interp.unwrap_or("") {
+                    "even" => 1u8, "odd" => 2, _ => 0,
+                };
+                #[allow(clippy::cast_possible_truncation)]
+                let nc = coords.len().min(u16::MAX as usize) as u16;
+                self.interp_ways.push(SlimInterpWay {
+                    street_offset: self.strings.intern(addr_st.unwrap_or("")),
+                    interpolation_type: itype,
+                    node_file_offset: self.interp_node_offset,
+                    node_count: nc,
+                    start_number: 0,
+                    end_number: 0,
+                });
+                for &(lat, lon) in &coords {
+                    self.interp_nodes_out.write_all(
+                        &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                    )?;
+                }
+                self.interp_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
+            }
+            return Ok(());
+        }
+
+        // Building addresses (centroid) — stream to addr_points.bin
+        if is_building_addr {
+            let (sum_lat, sum_lon) = coords.iter()
+                .fold((0i64, 0i64), |acc, &(lat, lon)| {
+                    (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
+                });
+            #[allow(clippy::cast_possible_wrap)]
+            let count = coords.len().max(1) as i64;
+            #[allow(clippy::cast_possible_truncation)]
+            let clat = (sum_lat / count) as i32;
+            #[allow(clippy::cast_possible_truncation)]
+            let clon = (sum_lon / count) as i32;
+            let ap = AddrPoint {
+                lat_e7: clat, lon_e7: clon,
+                housenumber_offset: self.strings.intern(hn.unwrap_or("")),
+                street_offset: self.strings.intern(addr_st.unwrap_or("")),
+                postcode_offset: pc.map_or(0, |p| self.strings.intern(p)),
+            };
+            self.addr_points_out.write_all(&ap.to_bytes())?;
+            if self.addr_point_count == 0 {
+                self.first_addr_lat_e7 = clat;
+                self.first_addr_lon_e7 = clon;
+            }
+            self.addr_point_count += 1;
+        }
+
+        // Streets — stream to street_ways.bin + street_nodes.bin
+        if is_street && coords.len() >= 2 {
+            #[allow(clippy::cast_possible_truncation)]
+            let nc = coords.len().min(u16::MAX as usize) as u16;
+            let sw = StreetWay {
+                node_offset: self.street_node_offset,
+                name_offset: self.strings.intern(name.unwrap_or("")),
+                node_count: nc,
+            };
+            self.street_ways_out.write_all(&sw.to_bytes())?;
+            for &(lat, lon) in &coords {
+                self.street_nodes_out.write_all(
+                    &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
+                )?;
+            }
+            self.street_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
+            self.street_way_count += 1;
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main build function
 // ---------------------------------------------------------------------------
 
@@ -379,13 +583,24 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         std::fs::File::create(config.output_dir.join(FILE_INTERP_NODES))?,
     );
 
-    let mut street_node_offset: u64 = 0;
-    let mut interp_node_offset: u64 = 0;
-    let mut addr_point_count: u32 = 0;
-    let mut street_way_count: u32 = 0;
-    // First address point lat/lon for the smoke test (since we won't have the Vec)
-    let mut first_addr_lat_e7: i32 = 0;
-    let mut first_addr_lon_e7: i32 = 0;
+    let mut state = Pass2State {
+        coord_mmap: &mut coord_mmap,
+        referenced_nodes: &referenced_nodes,
+        needed_admin_ways: &needed_admin_ways,
+        way_geom: &mut way_geom,
+        strings: &mut strings,
+        interp_ways: &mut interp_ways,
+        street_ways_out: &mut street_ways_out,
+        street_nodes_out: &mut street_nodes_out,
+        addr_points_out: &mut addr_points_out,
+        interp_nodes_out: &mut interp_nodes_out,
+        street_node_offset: 0,
+        interp_node_offset: 0,
+        addr_point_count: 0,
+        street_way_count: 0,
+        first_addr_lat_e7: 0,
+        first_addr_lon_e7: 0,
+    };
 
     {
         // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
@@ -418,179 +633,19 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             )?;
             for element in block.elements_skip_metadata() {
                 match element {
-                    Element::DenseNode(node) => {
-                        let lat_e7 = node.decimicro_lat();
-                        let lon_e7 = node.decimicro_lon();
-                        if referenced_nodes.get(node.id()) {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let r = referenced_nodes.rank(node.id()) as usize;
-                            let off = r * 8;
-                            coord_mmap[off..off + 4].copy_from_slice(&lat_e7.to_le_bytes());
-                            coord_mmap[off + 4..off + 8].copy_from_slice(&lon_e7.to_le_bytes());
-                        }
-
-                        let mut hn: Option<&str> = None;
-                        let mut st: Option<&str> = None;
-                        let mut pc: Option<&str> = None;
-                        for (k, v) in node.tags() {
-                            match k {
-                                "addr:housenumber" => hn = Some(v),
-                                "addr:street" => st = Some(v),
-                                "addr:postcode" => pc = Some(v),
-                                _ => {}
-                            }
-                        }
-                        if let (Some(h), Some(s)) = (hn, st) {
-                            // Stream directly to addr_points.bin
-                            let ap = AddrPoint {
-                                lat_e7, lon_e7,
-                                housenumber_offset: strings.intern(h),
-                                street_offset: strings.intern(s),
-                                postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                            };
-                            addr_points_out.write_all(&ap.to_bytes())?;
-                            if addr_point_count == 0 {
-                                first_addr_lat_e7 = lat_e7;
-                                first_addr_lon_e7 = lon_e7;
-                            }
-                            addr_point_count += 1;
-                        }
-                    }
-                    Element::Way(way) => {
-                        let way_id = way.id();
-                        let is_admin_way = needed_admin_ways.get(way_id);
-
-                        // Tag-first classification: check tags before resolving
-                        // coordinates. Skips node-index lookups for irrelevant ways.
-                        let mut highway: Option<&str> = None;
-                        let mut name: Option<&str> = None;
-                        let mut hn: Option<&str> = None;
-                        let mut addr_st: Option<&str> = None;
-                        let mut pc: Option<&str> = None;
-                        let mut building = false;
-                        let mut interp: Option<&str> = None;
-
-                        for (k, v) in way.tags() {
-                            match k {
-                                "highway" => highway = Some(v),
-                                "name" => name = Some(v),
-                                "addr:housenumber" => hn = Some(v),
-                                "addr:street" => addr_st = Some(v),
-                                "addr:postcode" => pc = Some(v),
-                                "building" => building = true,
-                                "addr:interpolation" => interp = Some(v),
-                                _ => {}
-                            }
-                        }
-
-                        // Skip coordinate resolution for irrelevant ways
-                        let is_street = highway.is_some() && name.is_some()
-                            && !EXCLUDED_HIGHWAYS.contains(&highway.unwrap_or(""));
-                        let is_building_addr = building && hn.is_some() && addr_st.is_some();
-                        let is_interp = interp.is_some() && addr_st.is_some();
-
-                        if !is_admin_way && !is_street && !is_building_addr && !is_interp {
-                            continue;
-                        }
-
-                        let coords: Vec<(i32, i32)> = way.refs()
-                            .filter_map(|nid| {
-                                if !referenced_nodes.get(nid) { return None; }
-                                #[allow(clippy::cast_possible_truncation)]
-                                let r = referenced_nodes.rank(nid) as usize;
-                                let off = r * 8;
-                                let lat = i32::from_le_bytes(coord_mmap[off..off+4].try_into().ok()?);
-                                let lon = i32::from_le_bytes(coord_mmap[off+4..off+8].try_into().ok()?);
-                                if lat == 0 && lon == 0 { None } else { Some((lat, lon)) }
-                            })
-                            .collect();
-                        if coords.is_empty() { continue; }
-
-                        // Admin way geometry — move coords if no other consumer needs them
-                        if is_admin_way && !is_street && !is_building_addr && !is_interp {
-                            way_geom.insert(way_id, coords);
-                            continue;
-                        }
-                        if is_admin_way {
-                            way_geom.insert(way_id, coords.clone());
-                        }
-
-                        // Interpolation ways — write nodes to file, keep slim metadata
-                        if is_interp {
-                            if coords.len() >= 2 {
-                                let itype = match interp.unwrap_or("") {
-                                    "even" => 1u8, "odd" => 2, _ => 0,
-                                };
-                                #[allow(clippy::cast_possible_truncation)]
-                                let nc = coords.len().min(u16::MAX as usize) as u16;
-                                interp_ways.push(SlimInterpWay {
-                                    street_offset: strings.intern(addr_st.unwrap_or("")),
-                                    interpolation_type: itype,
-                                    node_file_offset: interp_node_offset,
-                                    node_count: nc,
-                                    start_number: 0,
-                                    end_number: 0,
-                                });
-                                for &(lat, lon) in &coords {
-                                    interp_nodes_out.write_all(
-                                        &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
-                                    )?;
-                                }
-                                interp_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
-                            }
-                            continue;
-                        }
-
-                        // Building addresses (centroid) — stream to addr_points.bin
-                        if is_building_addr {
-                            let (sum_lat, sum_lon) = coords.iter()
-                                .fold((0i64, 0i64), |acc, &(lat, lon)| {
-                                    (acc.0 + i64::from(lat), acc.1 + i64::from(lon))
-                                });
-                            #[allow(clippy::cast_possible_wrap)]
-                            let count = coords.len().max(1) as i64;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let clat = (sum_lat / count) as i32;
-                            #[allow(clippy::cast_possible_truncation)]
-                            let clon = (sum_lon / count) as i32;
-                            let ap = AddrPoint {
-                                lat_e7: clat, lon_e7: clon,
-                                housenumber_offset: strings.intern(hn.unwrap_or("")),
-                                street_offset: strings.intern(addr_st.unwrap_or("")),
-                                postcode_offset: pc.map_or(0, |p| strings.intern(p)),
-                            };
-                            addr_points_out.write_all(&ap.to_bytes())?;
-                            if addr_point_count == 0 {
-                                first_addr_lat_e7 = clat;
-                                first_addr_lon_e7 = clon;
-                            }
-                            addr_point_count += 1;
-                        }
-
-                        // Streets — stream to street_ways.bin + street_nodes.bin
-                        if is_street && coords.len() >= 2 {
-                            #[allow(clippy::cast_possible_truncation)]
-                            let nc = coords.len().min(u16::MAX as usize) as u16;
-                            let sw = StreetWay {
-                                node_offset: street_node_offset,
-                                name_offset: strings.intern(name.unwrap_or("")),
-                                node_count: nc,
-                            };
-                            street_ways_out.write_all(&sw.to_bytes())?;
-                            for &(lat, lon) in &coords {
-                                street_nodes_out.write_all(
-                                    &NodeCoord { lat_e7: lat, lon_e7: lon }.to_bytes()
-                                )?;
-                            }
-                            street_node_offset += (coords.len() * NODE_COORD_SIZE) as u64;
-                            street_way_count += 1;
-                        }
-                    }
+                    Element::DenseNode(node) => state.process_dense_node(&node)?,
+                    Element::Way(way) => state.process_way(&way)?,
                     _ => {} // Node (non-dense) — rare, ignore
                 }
             }
         } // for blob_result
     }
+
+    let Pass2State {
+        addr_point_count, street_way_count,
+        first_addr_lat_e7, first_addr_lon_e7,
+        ..
+    } = state;
 
     // Flush and drop writers before mmap
     street_ways_out.flush()?;

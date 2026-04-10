@@ -7,7 +7,7 @@ use std::sync::Arc;
 use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
-use crate::blob::{decode_blob_to_headerblock, decompress_blob_data_into, BlobKind};
+use crate::blob::{decode_blob_to_headerblock, BlobKind};
 use crate::blob_index::{BlobIndex, ElemKind};
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::file_reader::FileReader;
@@ -37,6 +37,16 @@ use super::stats::{PhaseRss, PhaseTimers, read_rss_kb};
 use super::Result;
 
 const READER_CHANNEL_SIZE: usize = 128;
+
+/// Accumulated locations-on-ways statistics (populated during pre-scan).
+#[derive(Default)]
+struct LocStats {
+    needed: u64,
+    from_diff: u64,
+    from_base: u64,
+    missing: u64,
+    blobs_scanned: u64,
+}
 
 // ---------------------------------------------------------------------------
 // Writing OSC elements (from diff, no metadata)
@@ -746,11 +756,22 @@ pub fn merge(
     );
 
     // Step 2.5: Build sparse node location index for --locations-on-ways
-    let mut loc_index = if locations_on_ways {
-        let idx = NodeLocationIndex::build_from_diff(&diff);
-        Some(idx)
+    // Pre-scan base PBF to fill all needed node coordinates upfront, then
+    // wrap in Arc for read-only sharing across all rewrite tasks (no
+    // per-batch cloning).
+    let (loc_map, loc_stats) = if locations_on_ways {
+        let mut idx = NodeLocationIndex::build_from_diff(&diff);
+        let (from_base, blobs_scanned) = idx.prefill_from_base(base_pbf, direct_io)?;
+        let missing = idx.needed_set.len() as u64;
+        let total = idx.locations.len() as u64 + missing;
+        let from_diff = total - from_base - missing;
+        eprintln!(
+            "  {from_base} from base ({blobs_scanned} blobs), {missing} not found"
+        );
+        let stats = LocStats { needed: total, from_diff, from_base, missing, blobs_scanned };
+        (Some(Arc::new(idx.locations)), stats)
     } else {
-        None
+        (None, LocStats::default())
     };
 
     // Step 3: Read header from base PBF (for writer setup)
@@ -853,94 +874,7 @@ pub fn merge(
             }
         }
 
-        // Phase 2.5: Extract node coordinates for --locations-on-ways.
-        // Must complete BEFORE Phase 3 spawns way rewrites that read the index.
-        if let Some(ref mut idx) = loc_index
-            && !idx.all_found()
-        {
-                // First pass: extract from rewrite blobs (already parsed, cheap)
-                for slot in &slots {
-                    let blob_index = match slot {
-                        BatchSlot::Passthrough { index, .. }
-                        | BatchSlot::FalsePositive { index, .. }
-                        | BatchSlot::Rewrite { index, .. } => index,
-                    };
-                    if blob_index.kind != ElemKind::Node
-                        || !idx.overlaps_needed(blob_index.min_id, blob_index.max_id)
-                    {
-                        continue;
-                    }
-                    if let BatchSlot::Rewrite { job_index, .. } = slot {
-                        let found = idx.extract_from_block(&rewrite_jobs[*job_index].block);
-                        stats.loc_nodes_from_base += found;
-                    }
-                }
-
-                // Second pass: parallel decompress+extract from passthrough node blobs
-                let passthrough_scan: Vec<usize> = slots
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, slot)| {
-                        let blob_index = match slot {
-                            BatchSlot::Passthrough { index, .. }
-                            | BatchSlot::FalsePositive { index, .. }
-                            | BatchSlot::Rewrite { index, .. } => index,
-                        };
-                        blob_index.kind == ElemKind::Node
-                            && idx.overlaps_needed(blob_index.min_id, blob_index.max_id)
-                            && !matches!(slot, BatchSlot::Rewrite { .. })
-                    })
-                    .map(|(i, _)| i)
-                    .collect();
-
-                if !passthrough_scan.is_empty() {
-                    let needed_set = &idx.needed_set;
-                    // Node-only scanner: extract (id, lat, lon) without PrimitiveBlock
-                    // construction. Skips string table and group_ranges allocation.
-                    let extracted: Vec<Vec<(i64, (i32, i32))>> = passthrough_scan
-                        .par_iter()
-                        .filter_map(|&i| {
-                            let mut buf = Vec::new();
-                            if decompress_blob_data_into(batch[i].blob_bytes(), &mut buf).is_err()
-                            {
-                                return None;
-                            }
-                            let mut tuples = Vec::new();
-                            let mut group_starts = Vec::new();
-                            if crate::commands::node_scanner::extract_node_tuples(&buf, &mut tuples, &mut group_starts).is_err()
-                            {
-                                return None;
-                            }
-                            let found: Vec<(i64, (i32, i32))> = tuples
-                                .iter()
-                                .filter(|t| needed_set.contains(&t.id))
-                                .map(|t| (t.id, (t.lat, t.lon)))
-                                .collect();
-                            Some(found)
-                        })
-                        .collect();
-
-                    for coords in extracted {
-                        for (id, loc) in coords {
-                            idx.locations.insert(id, loc);
-                            idx.needed_set.remove(&id);
-                            stats.loc_nodes_from_base += 1;
-                        }
-                    }
-                    stats.loc_node_blobs_scanned += passthrough_scan.len() as u64;
-                }
-        }
-
-        // Snapshot the location index for rewrite tasks that need it (way blobs).
-        // Only clones when this batch has way rewrites and the flag is on.
-        let loc_snapshot: Option<Arc<FxHashMap<i64, (i32, i32)>>> =
-            if loc_index.is_some()
-                && rewrite_jobs.iter().any(|j| j.kind == ElemKind::Way)
-            {
-                loc_index.as_ref().map(|idx| Arc::new(idx.locations.clone()))
-            } else {
-                None
-            };
+        // Location index is pre-filled and immutable — just reference it.
 
         // Phase 3+4: Spawn parallel rewrites, then stream output in file order.
         // Each rayon task owns its RewriteJob (including PrimitiveBlock), freeing
@@ -960,7 +894,7 @@ pub fn merge(
             let tx = rewrite_tx.clone();
             let diff_clone = Arc::clone(&diff);
             let ranges_clone = Arc::clone(&ranges);
-            let loc_clone = if job.kind == ElemKind::Way { loc_snapshot.clone() } else { None };
+            let loc_clone = if job.kind == ElemKind::Way { loc_map.clone() } else { None };
             rayon::spawn(move || {
                 let mut task_bb = BlockBuilder::new();
                 let upserts = ranges_clone.upserts(job.kind);
@@ -1002,7 +936,7 @@ pub fn merge(
                 && prev != blob_kind
             {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
-                let lm = loc_index.as_ref().map(|idx| &idx.locations);
+                let lm = loc_map.as_deref();
                 flush_remaining_upserts(
                     prev, blob_kind, &ranges, &diff,
                     &mut cursors, &mut bb, &mut writer, &mut stats, lm,
@@ -1015,7 +949,7 @@ pub fn merge(
             let has_gap = has_gap_creates(blob_kind, osm_first, &ranges, &cursors);
             if has_gap {
                 flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
-                let lm = loc_index.as_ref().map(|idx| &idx.locations);
+                let lm = loc_map.as_deref();
                 emit_gap_creates(
                     blob_kind, osm_first, &ranges,
                     &diff, &mut cursors, &mut bb, &mut writer, &mut stats, lm,
@@ -1150,7 +1084,7 @@ pub fn merge(
     for &kind in types_to_flush {
         let (cursor, upserts) = cursors.get_mut(kind, &ranges);
         while *cursor < upserts.len() {
-            let lm = loc_index.as_ref().map(|idx| &idx.locations);
+            let lm = loc_map.as_deref();
             emit_create_for_output(upserts[*cursor], kind, &diff, &mut bb, &mut writer, &mut stats, lm)?;
             *cursor += 1;
         }
@@ -1169,10 +1103,12 @@ pub fn merge(
         phase_rss.after_flush = read_rss_kb();
     }
     // Populate location stats from the index (if active)
-    if let Some(ref idx) = loc_index {
-        stats.loc_nodes_needed = idx.locations.len() as u64 + idx.needed_set.len() as u64;
-        stats.loc_nodes_from_diff =
-            stats.loc_nodes_needed - stats.loc_nodes_from_base - idx.needed_set.len() as u64;
+    if loc_map.is_some() {
+        stats.loc_nodes_needed = loc_stats.needed;
+        stats.loc_nodes_from_diff = loc_stats.from_diff;
+        stats.loc_nodes_from_base = loc_stats.from_base;
+        stats.loc_missing = loc_stats.missing;
+        stats.loc_node_blobs_scanned = loc_stats.blobs_scanned;
     }
 
     stats.print_summary();

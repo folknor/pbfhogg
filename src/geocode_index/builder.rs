@@ -398,7 +398,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         blob_reader.set_parse_indexdata(true);
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let decompress_pool = crate::blob::DecompressPool::new();
+        let mut decompress_buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -412,8 +412,10 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                     continue;
                 }
             }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+            blob.decompress_into(&mut decompress_buf)?;
+            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+                std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+            )?;
             for element in block.elements_skip_metadata() {
                 match element {
                     Element::DenseNode(node) => {

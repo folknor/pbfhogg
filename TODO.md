@@ -822,14 +822,14 @@ pass iterators (commit `bb15e66`). `time_filter.rs` was the last caller of
 `tags_as_pairs()` and `members_as_data()` — converted to pass iterators.
 Both helper methods removed.
 
-**Phase B (Bytes→Vec copy elimination): IN PROGRESS.** `decompress_pooled()` →
-`new_with_scratch(Bytes)` copies 1.5 MB per blob via `.to_vec()`. Replaced
-with `decompress_into(&mut Vec)` → `from_vec_with_scratch(take(&mut buf))`
-in sequential callers, avoiding the copy entirely. New infrastructure:
-`Blob::decompress_into()`, `PrimitiveBlock::from_vec_with_scratch()`.
-Converted: tags_count, node_stats, check_refs, renumber.
-Remaining: add_locations_to_ways (4 sites), external_join (1),
-inspect (1), extract (3), stream_merge (2), geocode builder (1).
+**Phase B (Bytes→Vec copy elimination): DONE.** All 16 sequential callers
+of `decompress_pooled()` → `new_with_scratch(Bytes)` converted to
+`decompress_into(&mut Vec)` → `from_vec_with_scratch(take(&mut buf))`.
+Eliminates 1.5 MB Bytes→Vec copy per blob. At planet scale (600K blobs
+for stream_merge): old path 1032 GB cumulative alloc, new path 132 GB
+(7.8x reduction). Scanner sites (ALTW, external_join) use buffer reuse
+(no take, true retained allocation). `decompress_pooled` method retained
+for pipelined reader paths (parallel workers with pool recycling).
 
 **Phase C (members_scratch): SKIPPED.** Per planet/claude review: 14M
 relations × ~10 members × 24 bytes = 3.4 GB cumulative at planet. All

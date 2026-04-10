@@ -7,7 +7,7 @@ use std::path::Path;
 use super::{read_blob_header_only, read_raw_frame};
 use crate::blob::{
     decode_blob_to_headerblock, decompress_blob_data_into,
-    BlobKind, DecompressPool,
+    BlobKind,
 };
 use crate::blob_index::ElemKind;
 use crate::file_reader::FileReader;
@@ -1747,7 +1747,7 @@ pub fn show_element(
 ) -> Result<bool> {
     let mut reader = crate::blob::BlobReader::open(path, direct_io)?;
     reader.set_parse_indexdata(true);
-    let decompress_pool = DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -1779,9 +1779,9 @@ pub fn show_element(
             }
         }
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new_with_scratch(
-            decompressed,
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf),
             &mut st_scratch,
             &mut gr_scratch,
         )?;

@@ -252,7 +252,7 @@ fn stage1_way_pass(
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
     let mut refs_buf: Vec<i64> = Vec::new();
@@ -279,10 +279,10 @@ fn stage1_way_pass(
             }
         }
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        blob.decompress_into(&mut decompress_buf)?;
         let blob_start_pos = slot_pos;
         let mut write_err: Option<std::io::Error> = None;
-        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, &mut group_starts, |_way_id, refs| {
+        super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
             if write_err.is_some() { return; }
             for &node_id in refs {
                 let pair = CooPair { node_id, slot_pos };

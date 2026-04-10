@@ -398,7 +398,7 @@ fn build_node_index_sparse(
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
@@ -413,9 +413,9 @@ fn build_node_index_sparse(
             }
         }
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        blob.decompress_into(&mut decompress_buf)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples, &mut group_starts)?;
+        super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
 
         for &super::node_scanner::NodeTuple { id, lat, lon } in &tuples {
             if !referenced.get(id) {
@@ -881,7 +881,7 @@ fn build_node_index_dense(
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut tuples: Vec<super::node_scanner::NodeTuple> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
@@ -897,9 +897,9 @@ fn build_node_index_dense(
             }
         }
 
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
+        blob.decompress_into(&mut decompress_buf)?;
         tuples.clear();
-        super::node_scanner::extract_node_tuples(&decompressed, &mut tuples, &mut group_starts)?;
+        super::node_scanner::extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)?;
 
         // Insert into mmap index. SharedDenseWriter is safe for concurrent access
         // (direct mmap slot writes to disjoint positions).
@@ -927,7 +927,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut referenced = IdSetDense::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
@@ -938,8 +938,8 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
         if let Some(idx) = blob.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        super::way_scanner::scan_way_refs(&decompressed, &mut refs_buf, &mut group_starts, |_way_id, refs| {
+        blob.decompress_into(&mut decompress_buf)?;
+        super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
             for &node_id in refs {
                 if node_id >= 0 {
                     referenced.set(node_id);
@@ -959,7 +959,7 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut member_node_ids = IdSetDense::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -970,8 +970,10 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
         if let Some(idx) = blob.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = crate::block::PrimitiveBlock::new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
         for element in block.elements_skip_metadata() {
             if let Element::Relation(r) = element {
                 for member in r.members() {

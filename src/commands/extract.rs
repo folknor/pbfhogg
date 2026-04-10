@@ -1864,7 +1864,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     blob_reader.set_parse_indexdata(true);
     blob_reader.next()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -1872,8 +1872,8 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
         if let Some(idx) = blob.index() {
             if !spatial_filter.wants_index(&idx) { continue; }
         }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         classify_block_simple(
             &block, region, &bbox_int,
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
@@ -1906,13 +1906,13 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
         matched_relation_ids: &matched_relation_ids,
     };
 
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut batch: Vec<PrimitiveBlock> = Vec::with_capacity(BATCH_SIZE);
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        let decompressed = blob.decompress_pooled(&decompress_pool)?;
-        let block = PrimitiveBlock::new(decompressed)?;
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
         batch.push(block);
         if batch.len() >= BATCH_SIZE {
             process_extract_pass2_batch(&batch, &ids, clean, &mut writer, &mut stats)?;
@@ -2462,7 +2462,7 @@ fn collect_pass1_generic<H: RelationHandler>(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let is_sorted = header_blob.to_headerblock()?.is_sorted();
     let filter = spatial_blob_filter(bbox_int);
-    let decompress_pool = crate::blob::DecompressPool::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
 
     if !is_sorted {
         for blob_result in &mut blob_reader {
@@ -2471,8 +2471,8 @@ fn collect_pass1_generic<H: RelationHandler>(
             if let Some(idx) = blob.index() {
                 if !filter.wants_index(&idx) { continue; }
             }
-            let decompressed = blob.decompress_pooled(&decompress_pool)?;
-            let block = PrimitiveBlock::new(decompressed)?;
+            blob.decompress_into(&mut decompress_buf)?;
+            let block = PrimitiveBlock::from_vec(std::mem::take(&mut decompress_buf))?;
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
@@ -2513,7 +2513,7 @@ fn collect_pass1_generic<H: RelationHandler>(
     // Phase 2: ways (ref check against bbox_node_ids) → matched_way_ids + all_way_node_ids
     // Phase 3: relations (member check) → matched_relation_ids + handler extras
     drop(blob_reader);
-    drop(decompress_pool);
+    drop(decompress_buf);
 
     // Build per-type schedules from header-only scan.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;

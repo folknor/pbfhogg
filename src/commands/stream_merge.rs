@@ -5,9 +5,6 @@
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
 
-use std::sync::Arc;
-
-use crate::blob::DecompressPool;
 use crate::blob_index::ElemKind;
 use crate::{BlockType, Element, PrimitiveBlock};
 
@@ -39,7 +36,7 @@ impl StreamingBlocks {
         blob_reader.set_parse_indexdata(true);
         blob_reader.next()
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-        let pool = crate::blob::DecompressPool::new();
+        let mut decompress_buf: Vec<u8> = Vec::new();
         let mut st_scratch: Vec<(u32, u32)> = Vec::new();
         let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
         let iter = std::iter::from_fn(move || {
@@ -51,12 +48,11 @@ impl StreamingBlocks {
                 if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                     continue;
                 }
-                let decompressed = match blob.decompress_pooled(&pool) {
-                    Ok(d) => d,
-                    Err(e) => return Some(Err(e)),
-                };
-                return Some(crate::block::PrimitiveBlock::new_with_scratch(
-                    decompressed, &mut st_scratch, &mut gr_scratch,
+                if let Err(e) = blob.decompress_into(&mut decompress_buf) {
+                    return Some(Err(e));
+                }
+                return Some(crate::block::PrimitiveBlock::from_vec_with_scratch(
+                    std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
                 ));
             }
         });
@@ -568,12 +564,14 @@ fn next_blob_for_kind(
 #[allow(clippy::needless_pass_by_value)] // consumes blob to drop compressed bytes after decode
 fn decode_pending(
     pending: PendingBlob,
-    pool: &Arc<DecompressPool>,
+    buf: &mut Vec<u8>,
     st_scratch: &mut Vec<(u32, u32)>,
     gr_scratch: &mut Vec<(u32, u32)>,
 ) -> Result<BlockState> {
-    let decompressed = pending.blob.decompress_pooled(pool)?;
-    let block = PrimitiveBlock::new_with_scratch(decompressed, st_scratch, gr_scratch)?;
+    pending.blob.decompress_into(buf)?;
+    let block = PrimitiveBlock::from_vec_with_scratch(
+        std::mem::take(buf), st_scratch, gr_scratch,
+    )?;
     Ok(BlockState {
         block,
         skip_count: 0,
@@ -603,8 +601,8 @@ pub(crate) fn kind_type_char(kind: ElemKind) -> char {
 pub(crate) struct BlockPairMergeState {
     pub old_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
     pub new_reader: crate::blob::BlobReader<crate::file_reader::FileReader>,
-    pub old_pool: Arc<DecompressPool>,
-    pub new_pool: Arc<DecompressPool>,
+    pub old_buf: Vec<u8>,
+    pub new_buf: Vec<u8>,
     pub old_st: Vec<(u32, u32)>,
     pub old_gr: Vec<(u32, u32)>,
     pub new_st: Vec<(u32, u32)>,
@@ -622,8 +620,8 @@ impl BlockPairMergeState {
         Self {
             old_reader,
             new_reader,
-            old_pool: DecompressPool::new(),
-            new_pool: DecompressPool::new(),
+            old_buf: Vec::new(),
+            new_buf: Vec::new(),
             old_st: Vec::new(),
             old_gr: Vec::new(),
             new_st: Vec::new(),
@@ -637,14 +635,14 @@ impl BlockPairMergeState {
 /// Decode the next blob from a reader into a BlockState, or return None at EOF.
 fn next_decoded_block(
     reader: &mut crate::blob::BlobReader<crate::file_reader::FileReader>,
-    pool: &Arc<DecompressPool>,
+    buf: &mut Vec<u8>,
     st: &mut Vec<(u32, u32)>,
     gr: &mut Vec<(u32, u32)>,
     kind: ElemKind,
     stash: &mut Option<crate::blob::Blob>,
 ) -> Result<Option<BlockState>> {
     match next_blob_for_kind(reader, kind, stash)? {
-        Some(p) => Ok(Some(decode_pending(p, pool, st, gr)?)),
+        Some(p) => Ok(Some(decode_pending(p, buf, st, gr)?)),
         None => Ok(None),
     }
 }
@@ -656,13 +654,13 @@ fn drain_remaining(
     is_old: bool,
     on_action: &mut dyn FnMut(BlockMergeAction<'_>) -> Result<()>,
 ) -> Result<()> {
-    let (reader, pool, st, gr, stash) = if is_old {
-        (&mut state.old_reader, &state.old_pool, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
+    let (reader, buf, st, gr, stash) = if is_old {
+        (&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, &mut state.old_stash)
     } else {
-        (&mut state.new_reader, &state.new_pool, &mut state.new_st, &mut state.new_gr, &mut state.new_stash)
+        (&mut state.new_reader, &mut state.new_buf, &mut state.new_st, &mut state.new_gr, &mut state.new_stash)
     };
     while let Some(p) = next_blob_for_kind(reader, kind, stash)? {
-        let bs = decode_pending(p, pool, st, gr)?;
+        let bs = decode_pending(p, buf, st, gr)?;
         emit_block(&bs, is_old, on_action)?;
     }
     Ok(())
@@ -752,27 +750,27 @@ pub(crate) fn block_pair_merge_phase(
             match (op, np) {
                 (None, None) => break,
                 (Some(op), None) => {
-                    let os = decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?;
+                    let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
                     emit_block(&os, true, on_action)?;
                     drain_remaining(state, kind, true, on_action)?;
                     break;
                 }
                 (None, Some(np)) => {
-                    let ns = decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?;
+                    let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
                     emit_block(&ns, false, on_action)?;
                     drain_remaining(state, kind, false, on_action)?;
                     break;
                 }
                 (Some(op), Some(np)) => {
                     if op.index.max_id < np.index.min_id {
-                        let os = decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?;
+                        let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
                         emit_block(&os, true, on_action)?;
                         // Stash new blob undecoded — next iteration can try v1 byte comparison.
                         state.new_stash = Some(np.blob);
                         continue;
                     }
                     if np.index.max_id < op.index.min_id {
-                        let ns = decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?;
+                        let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
                         emit_block(&ns, false, on_action)?;
                         // Stash old blob undecoded — next iteration can try v1 byte comparison.
                         state.old_stash = Some(op.blob);
@@ -783,18 +781,18 @@ pub(crate) fn block_pair_merge_phase(
                         on_action(BlockMergeAction::BlobEqual(op.index.count))?;
                         continue;
                     }
-                    old_decoded = Some(decode_pending(op, &state.old_pool, &mut state.old_st, &mut state.old_gr)?);
-                    new_decoded = Some(decode_pending(np, &state.new_pool, &mut state.new_st, &mut state.new_gr)?);
+                    old_decoded = Some(decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?);
+                    new_decoded = Some(decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?);
                 }
             }
         }
 
         // Slow path: at least one side has a decoded residual block.
         if old_decoded.is_none() {
-            old_decoded = next_decoded_block(&mut state.old_reader, &state.old_pool, &mut state.old_st, &mut state.old_gr, kind, &mut state.old_stash)?;
+            old_decoded = next_decoded_block(&mut state.old_reader, &mut state.old_buf, &mut state.old_st, &mut state.old_gr, kind, &mut state.old_stash)?;
         }
         if new_decoded.is_none() {
-            new_decoded = next_decoded_block(&mut state.new_reader, &state.new_pool, &mut state.new_st, &mut state.new_gr, kind, &mut state.new_stash)?;
+            new_decoded = next_decoded_block(&mut state.new_reader, &mut state.new_buf, &mut state.new_st, &mut state.new_gr, kind, &mut state.new_stash)?;
         }
 
         match (&old_decoded, &new_decoded) {

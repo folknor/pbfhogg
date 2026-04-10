@@ -809,12 +809,14 @@ prefetch helps sequential reads). Sidecar `6887288a`.
 - [x] Add a CHANGELOG.md before first tagged release
 ## Post-v0.1 review: deferred optimizations
 
-- [ ] **getparents: use IdSetDense instead of BTreeSet for node ID lookups** —
-  `getparents` checks every way's refs against `BTreeSet<i64>` (O(log n) per lookup).
-  `IdSetDense` gives O(1). The complication is that `IdSet` (in `getid.rs`) uses
-  `BTreeSet<i64>` for all three element types and is shared across getid/getparents.
-  Changing it requires either converting at the getparents boundary or reworking
-  `IdSet` globally. Only matters when `--id-osm-file` provides millions of IDs.
+- [ ] **IdSet: migrate from BTreeSet to IdSetDense** —
+  `IdSet` (in `getid.rs`) uses `BTreeSet<i64>` for node/way/relation IDs. This
+  affects two paths: `getparents` checks every way's refs against the node set
+  (O(log n) per lookup, should be O(1) with IdSetDense), and `parse_ids_from_pbf`
+  (`--id-osm-file`) collects all element IDs from a PBF into BTreeSets when
+  IdSetDense would be more appropriate for planet-scale source files. The
+  complication is that `IdSet` is shared across getid/getparents/removeid, so
+  changing it requires reworking the type globally or converting at boundaries.
 
 - [ ] **merge --locations-on-ways: avoid cloning the location HashMap per batch** —
   `Arc::new(idx.locations.clone())` at `merge.rs:1495` copies the entire
@@ -832,6 +834,90 @@ prefetch helps sequential reads). Sidecar `6887288a`.
   restructuring the two-phase scan (detect changes → write OSC) into a single-pass
   pipeline, which is a significant refactor since the OSC format groups changes by
   action type (all creates, then all modifies, then all deletes).
+
+- [ ] **Avoid per-element Vec allocations in decode→re-encode paths** —
+  Several command paths allocate temporary Vecs per element that could be
+  avoided with API changes:
+  - `PrimitiveBlock::new` always copies `Bytes` to `Vec` via `to_vec()`.
+    Could try `Bytes::try_into_mut()` first to avoid the copy when refcount
+    is 1, but `parse_and_inline` needs `&mut Vec<u8>` so this requires
+    reworking the wire parser to accept `&mut BytesMut` or a similar type.
+  - `tags_as_pairs()` and `members_as_data()` in `elements_pbf.rs` allocate
+    a `Vec` per call. The `add_node`/`add_way`/`add_relation` methods accept
+    iterators, so callers could pass iterators directly — but `MemberData`
+    borrows from the block, creating lifetime issues when the buffer outlives
+    the block (same reason `members_buf` can't be hoisted out of the per-blob
+    loop in `renumber.rs`). Fix requires either owned member data or
+    restructuring the encode API.
+
+## Post-v0.1 review: deferred deduplication
+
+- [ ] **OSC XML element writing shared between derive_changes and merge_changes** —
+  Both files implement `write_node`, `write_way`, `write_relation`, `write_tags` with
+  nearly identical logic. Minor differences in attribute ordering and a `delete_only`
+  flag. Should share a single writer module (e.g. `elements_xml.rs` or `osc_writer.rs`).
+
+- [ ] **sweep_merge generics for sort.rs and merge_pbf.rs** —
+  `sweep_merge_nodes/ways/rels` are near-identical in both files (~70-145 lines of
+  identical heap+flush+decode structure per element type). A generic function
+  parameterized on element type via a `HasId` trait would eliminate most of this.
+  Same pattern applies to `emit_create_local`/`emit_create_for_output` in merge.rs.
+
+- [ ] **Unify assemble_block between external join and ALTW** —
+  `external_join.rs:assemble_block` and `add_locations_to_ways.rs:process_block` are
+  ~80 lines of duplicated node/relation handling, differing only in way-coordinate
+  resolution. Could be unified with a trait or closure for the way path.
+
+- [ ] **Unify getid filter_by_id and filter_by_id_invert** —
+  Same header-reading prologue, per-blob decode loop, and process_block call. Differ
+  in BlobFilter usage and raw passthrough. Could unify with a flag parameter.
+
+- [ ] **pread-from-workers boilerplate in extract and tags_filter** —
+  ~80-100 lines each of nearly identical channel setup, worker loop, and consumer
+  drain logic. A generic `pread_parallel_write` would eliminate hundreds of lines.
+
+## Post-v0.1 review: remaining code quality
+
+- [ ] **DenseNodeIter::next tag scanning: batch kv_pos update** —
+  `src/read/dense.rs:180-203` updates `kv_pos` per key-value pair inside the tag
+  scanning loop. Could compute the final position once at the end. This is the
+  hottest loop in the library (~8 billion iterations for planet), so even small
+  changes are measurable — needs a benchmark before and after. The current code
+  is correct; this is purely a potential throughput improvement.
+
+- [ ] **Page-aligned allocation shared between direct_writer and uring_writer** —
+  Both `src/write/direct_writer.rs` and `src/write/uring_writer.rs` implement
+  page-aligned allocation via `alloc::alloc_zeroed` with identical `Layout`
+  construction and `Drop` deallocation logic. A shared `AlignedBuf` primitive
+  would eliminate the duplication and centralize the unsafe code.
+
+- [ ] **Split merge.rs into submodules** —
+  `src/commands/merge.rs` is ~1857 lines with interleaved concerns: stats tracking,
+  node location index building, diff range classification, blob rewriting, and
+  output assembly. Could split into `merge/stats.rs`, `merge/node_locations.rs`,
+  `merge/diff_ranges.rs`, `merge/classify.rs`, `merge/rewrite.rs`. Large refactor
+  but the file is difficult to navigate.
+
+- [ ] **Reduce build_geocode_index cognitive complexity** —
+  `src/geocode_index/builder.rs` pass 2 body (lines ~390-591) does node processing,
+  way classification, coordinate resolution, and streaming output in one deeply
+  nested loop with `#[allow(clippy::cognitive_complexity)]`. Extract helper
+  functions per element type to make the pass structure readable.
+
+- [ ] **bucketed_cell_assignment takes 13 parameters** —
+  `src/geocode_index/builder.rs:1181` — a `CellAssignmentParams` struct would make
+  the call site and function signature readable. Currently the caller has to match
+  13 positional arguments.
+
+- [ ] **load_next_bucket takes 7 mutable references** —
+  `src/commands/external_join.rs:348-379` — the inner function passes bucket state
+  through 7 separate `&mut` parameters. A small `BucketState` struct would make the
+  state transitions clearer and reduce the parameter count.
+
+- [ ] **osc.rs byte-reading helpers: use try_from pattern** —
+  `src/osc.rs:100-140` has four `read_*_le` functions that manually construct byte
+  arrays element by element. Using `<[u8; N]>::try_from(&data[offset..offset+N])`
+  is shorter and generates identical code. Low priority but cleaner.
 
 - [ ] Add GitHub Actions CI — clippy, tests, rustfmt, doc build on Linux
 - [ ] Add GitHub Actions release pipeline — build binaries on tag push, attach to GitHub release

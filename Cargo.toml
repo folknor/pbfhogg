@@ -72,15 +72,15 @@ bytes = "1"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9"
 rayon = "1.5"
-rustc-hash = "2"
+rustc-hash = "2.1.2"
 zstd = "0.13"
-hotpath = "0.14"
+hotpath = "0.14.1"
 quick-xml = "0.39"
 serde_json = { version = "1", optional = true }
 roaring = { version = "0.11", optional = true }
 s2 = { version = "0.0.13", optional = true }
 io-uring = { version = "0.7", optional = true }
-libc = "0.2.183"
+libc = "0.2.184"
 
 
 [dev-dependencies]

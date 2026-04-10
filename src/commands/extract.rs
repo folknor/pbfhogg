@@ -1475,12 +1475,14 @@ struct BlobDesc {
 }
 
 /// Build a blob schedule from a header-only scan.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn build_blob_schedule(input: &Path) -> Result<Vec<BlobDesc>> {
     build_blob_schedule_with_passthrough(input, None)
 }
 
 /// Build a blob schedule, optionally tagging node blobs eligible for raw passthrough.
 /// A node blob is eligible if its bbox is fully contained in the extract bbox.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn build_blob_schedule_with_passthrough(
     input: &Path,
     extract_bbox: Option<&crate::BlobBbox>,
@@ -1698,6 +1700,7 @@ where
 /// Convenience: build schedule + execute + flush. Used by complete/smart write passes.
 /// Flushes the writer after execution (assumes single-use — don't call on a writer
 /// that will be reused for subsequent phases).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn pread_write_pass<F>(
     input: &Path,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -1842,7 +1845,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     }
 
     // --- Unsorted fallback: two passes (collect IDs, then write) ---
-    crate::debug::emit_marker("EXTRACT_PASS1_START");
+    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_START");
     let mut stats = ExtractStats {
         nodes_in_bbox: 0,
         nodes_from_ways: 0,
@@ -1879,9 +1882,9 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
             &mut bbox_node_ids, &mut matched_way_ids, &mut matched_relation_ids,
         );
     }
-    crate::debug::emit_marker("EXTRACT_PASS1_END");
+    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS1_END");
 
-    crate::debug::emit_marker("EXTRACT_PASS2_START");
+    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_START");
     let all_way_node_ids = IdSetDense::new();
 
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -1924,7 +1927,7 @@ fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool
     }
 
     writer.flush()?;
-    crate::debug::emit_marker("EXTRACT_PASS2_END");
+    crate::debug::emit_marker("SIMPLE_UNSORTED_PASS2_END");
     Ok(stats)
 }
 
@@ -2312,14 +2315,15 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     };
 
     // --- Pass 1: Collect matches ---
-    crate::debug::emit_marker("EXTRACT_PASS1_START");
+    crate::debug::emit_marker("COMPLETE_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
-    crate::debug::emit_marker("EXTRACT_PASS1_END");
+    crate::debug::emit_marker("COMPLETE_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
-    crate::debug::emit_marker("EXTRACT_PASS2_START");
+    crate::debug::emit_marker("COMPLETE_PASS2_START");
+    crate::debug::emit_marker("COMPLETE_PASS2_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
     let header_blob = header_reader.next()
@@ -2344,11 +2348,14 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
         matched_relation_ids: &result.matched_relation_ids,
     };
 
+    crate::debug::emit_marker("COMPLETE_PASS2_SETUP_END");
+    crate::debug::emit_marker("COMPLETE_PASS2_WRITE_START");
     pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
         extract_block_pass2(block, &ids, clean, bb, output_blocks)
     })?;
+    crate::debug::emit_marker("COMPLETE_PASS2_WRITE_END");
 
-    crate::debug::emit_marker("EXTRACT_PASS2_END");
+    crate::debug::emit_marker("COMPLETE_PASS2_END");
     Ok(stats)
 }
 
@@ -2549,6 +2556,7 @@ fn collect_pass1_generic<H: RelationHandler>(
     // For bbox-only regions, use columnar decode (batch IDs/lats/lons into
     // contiguous arrays) for cache-friendly classification. Polygon regions
     // fall back to element-by-element iteration.
+    crate::debug::emit_marker("PASS1_NODE_CLASSIFY_START");
     let use_columnar = matches!(region, Region::Bbox(_));
     parallel_classify_phase(
         &shared_file,
@@ -2586,8 +2594,10 @@ fn collect_pass1_generic<H: RelationHandler>(
             for id in ids { bbox_node_ids.set(id); }
         },
     )?;
+    crate::debug::emit_marker("PASS1_NODE_CLASSIFY_END");
 
     // Phase 2: Classify ways by ref intersection with bbox nodes.
+    crate::debug::emit_marker("PASS1_WAY_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
@@ -2610,8 +2620,10 @@ fn collect_pass1_generic<H: RelationHandler>(
             for id in node_ids { all_way_node_ids.set(id); }
         },
     )?;
+    crate::debug::emit_marker("PASS1_WAY_CLASSIFY_END");
 
     // Phase 3: Classify relations by member intersection.
+    crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_START");
     let collect_member_ids = H::COLLECT_MEMBER_IDS;
     parallel_classify_accumulate(
         &shared_file,
@@ -2640,6 +2652,7 @@ fn collect_pass1_generic<H: RelationHandler>(
             handler.merge_worker_extras(worker_extra_way_ids, worker_extra_node_ids);
         },
     )?;
+    crate::debug::emit_marker("PASS1_RELATION_CLASSIFY_END");
 
     Ok(Pass1Result {
         bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
@@ -2791,22 +2804,24 @@ fn extract_smart(
     };
 
     // --- Pass 1: Collect matches + smart relation deps ---
-    crate::debug::emit_marker("EXTRACT_PASS1_START");
+    crate::debug::emit_marker("SMART_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = SmartRelationHandler::new();
     let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     let mut extra_node_ids = handler.extra_node_ids;
-    crate::debug::emit_marker("EXTRACT_PASS1_END");
+    crate::debug::emit_marker("SMART_PASS1_END");
 
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---
-    crate::debug::emit_marker("EXTRACT_PASS2_START");
+    crate::debug::emit_marker("SMART_PASS2_START");
     // For each way in extra_way_ids not already in matched_way_ids,
     // collect all node refs into extra_node_ids.
     // Only way blobs are needed here — skip node and relation blobs via index.
     {
+    crate::debug::emit_marker("SMART_PASS2_SCHEDULE_START");
     let (way_schedule, shared_file) = super::build_classify_schedule(
         input, Some(crate::blob_index::ElemKind::Way),
     )?;
+    crate::debug::emit_marker("SMART_PASS2_SCHEDULE_END");
 
     let extra_way_ids_ref = &handler.extra_way_ids;
     let matched_way_ids_ref = &result.matched_way_ids;
@@ -2815,6 +2830,7 @@ fn extract_smart(
     // here blew up to 10.7 GB on Europe (commit 5ca2df9, sidecar 01de22bb).
     // See notes/columnar-integration.md "Resolved: way dep IdSetDense
     // accumulation" for the workload-selectivity rationale.
+    crate::debug::emit_marker("SMART_PASS2_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
@@ -2835,12 +2851,14 @@ fn extract_smart(
             for id in refs { extra_node_ids.set(id); }
         },
     )?;
+    crate::debug::emit_marker("SMART_PASS2_CLASSIFY_END");
     }
 
-    crate::debug::emit_marker("EXTRACT_PASS2_END");
+    crate::debug::emit_marker("SMART_PASS2_END");
 
     // --- Pass 3: Write matching elements via pread-from-workers ---
-    crate::debug::emit_marker("EXTRACT_PASS3_START");
+    crate::debug::emit_marker("SMART_PASS3_START");
+    crate::debug::emit_marker("SMART_PASS3_SETUP_START");
 
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
     let header_blob = header_reader.next()
@@ -2867,11 +2885,14 @@ fn extract_smart(
         matched_relation_ids: &result.matched_relation_ids,
     };
 
+    crate::debug::emit_marker("SMART_PASS3_SETUP_END");
+    crate::debug::emit_marker("SMART_PASS3_WRITE_START");
     pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
         extract_block_pass3(block, &ids, clean, bb, output_blocks)
     })?;
+    crate::debug::emit_marker("SMART_PASS3_WRITE_END");
 
-    crate::debug::emit_marker("EXTRACT_PASS3_END");
+    crate::debug::emit_marker("SMART_PASS3_END");
     Ok(stats)
 }
 

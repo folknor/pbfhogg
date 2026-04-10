@@ -423,6 +423,7 @@ pub(crate) fn ensure_relation_capacity_local(
 /// Each schedule entry is `(seq, data_offset, data_size)`. Only OsmData blobs
 /// are included. When `kind_filter` is `Some`, only blobs whose indexdata
 /// matches the given element type (plus blobs without indexdata) are included.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn build_classify_schedule(
     input: &std::path::Path,
     kind_filter: Option<crate::blob_index::ElemKind>,

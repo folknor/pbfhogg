@@ -53,7 +53,7 @@ pub fn getparents(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<GetparentsStats> {
-    let need_nodes = opts.add_self && !ids.node_ids.is_empty();
+    let need_nodes = opts.add_self && ids.node_ids.has_any();
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
@@ -102,7 +102,7 @@ fn process_block(
         match &element {
             Element::DenseNode(dn) => {
                 // Nodes are never parents. Include only if --add-self and ID matches.
-                if add_self && ids.node_ids.contains(&dn.id()) {
+                if add_self && ids.node_ids.get(dn.id()) {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = dense_node_metadata(dn);
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
@@ -110,7 +110,7 @@ fn process_block(
                 }
             }
             Element::Node(n) => {
-                if add_self && ids.node_ids.contains(&n.id()) {
+                if add_self && ids.node_ids.get(n.id()) {
                     ensure_node_capacity_local(bb, output)?;
                     let meta = element_metadata(&n.info());
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
@@ -119,8 +119,8 @@ fn process_block(
             }
             Element::Way(w) => {
                 // A way is a parent if it references any requested node ID.
-                let is_parent = w.refs().any(|r| ids.node_ids.contains(&r));
-                let is_self = add_self && ids.way_ids.contains(&w.id());
+                let is_parent = w.refs().any(|r| ids.node_ids.get(r));
+                let is_self = add_self && ids.way_ids.get(w.id());
                 if is_parent || is_self {
                     ensure_way_capacity_local(bb, output)?;
                     refs_buf.clear();
@@ -133,12 +133,12 @@ fn process_block(
             Element::Relation(r) => {
                 // A relation is a parent if any member matches a requested ID.
                 let is_parent = r.members().any(|m| match m.id {
-                    MemberId::Node(id) => ids.node_ids.contains(&id),
-                    MemberId::Way(id) => ids.way_ids.contains(&id),
-                    MemberId::Relation(id) => ids.relation_ids.contains(&id),
+                    MemberId::Node(id) => ids.node_ids.get(id),
+                    MemberId::Way(id) => ids.way_ids.get(id),
+                    MemberId::Relation(id) => ids.relation_ids.get(id),
                     MemberId::Unknown(..) => false,
                 });
-                let is_self = add_self && ids.relation_ids.contains(&r.id());
+                let is_self = add_self && ids.relation_ids.get(r.id());
                 if is_parent || is_self {
                     ensure_relation_capacity_local(bb, output)?;
                     members_buf.clear();

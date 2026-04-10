@@ -424,19 +424,19 @@ fn write_overlap_run(
                     Element::Node(n) => heap.push(Reverse(read_node(n))),
                     _ => {}
                 },
-                |node, bb, w| write_single_node(node, bb, w),
+                write_single_node,
             )?;
         }
         ElemKind::Way => {
             stats.ways += sweep_merge(entries, input_file, bb, writer,
                 |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
-                |way, bb, w| write_single_way(way, bb, w),
+                write_single_way,
             )?;
         }
         ElemKind::Relation => {
             stats.relations += sweep_merge(entries, input_file, bb, writer,
                 |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
-                |rel, bb, w| write_single_relation(rel, bb, w),
+                write_single_relation,
             )?;
         }
     };

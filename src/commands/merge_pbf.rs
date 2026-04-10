@@ -436,7 +436,7 @@ fn write_overlap_run(
                     Element::Node(n) => heap.push(Reverse(read_node(n))),
                     _ => {}
                 },
-                |node, bb, w| write_single_node(node, bb, w),
+                write_single_node,
             )?;
             stats.nodes += c;
             stats.duplicates_removed += d;
@@ -444,7 +444,7 @@ fn write_overlap_run(
         ElemKind::Way => {
             let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
                 |e, heap| { if let Element::Way(w) = e { heap.push(Reverse(read_way(w))); } },
-                |way, bb, w| write_single_way(way, bb, w),
+                write_single_way,
             )?;
             stats.ways += c;
             stats.duplicates_removed += d;
@@ -452,7 +452,7 @@ fn write_overlap_run(
         ElemKind::Relation => {
             let (c, d) = sweep_merge_dedup(entries, files, bb, writer,
                 |e, heap| { if let Element::Relation(r) = e { heap.push(Reverse(read_relation(r))); } },
-                |rel, bb, w| write_single_relation(rel, bb, w),
+                write_single_relation,
             )?;
             stats.relations += c;
             stats.duplicates_removed += d;

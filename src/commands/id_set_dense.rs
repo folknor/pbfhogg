@@ -12,7 +12,7 @@
 /// Memory: 1 bit per ID present in each allocated chunk, 4MB per chunk, zero
 /// for empty ranges. For Denmark's 52M nodes: 2 chunks = 8MB. For planet
 /// (12B node IDs): ~364 chunks = 1.5GB.
-pub(crate) struct IdSetDense {
+pub struct IdSetDense {
     chunks: Vec<Option<Box<[u8; CHUNK_SIZE]>>>,
     /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
     /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
@@ -99,6 +99,40 @@ impl IdSetDense {
             }
         }
         false
+    }
+
+    /// Iterate over all set IDs in ascending order.
+    pub fn iter(&self) -> impl Iterator<Item = i64> + '_ {
+        self.chunks.iter().enumerate().flat_map(|(cid, chunk)| {
+            let chunk_base = (cid as u64) << (CHUNK_BITS + 3);
+            chunk.iter().flat_map(move |data| {
+                data.iter().enumerate().flat_map(move |(byte_idx, &byte)| {
+                    (0..8u8).filter_map(move |bit| {
+                        if byte & (1 << bit) != 0 {
+                            #[allow(clippy::cast_possible_wrap)]
+                            Some((chunk_base + (byte_idx as u64) * 8 + u64::from(bit)) as i64)
+                        } else {
+                            None
+                        }
+                    })
+                })
+            })
+        })
+    }
+
+    /// Merge all set bits from `other` into `self` (union).
+    pub fn merge_from(&mut self, other: &IdSetDense) {
+        if other.chunks.len() > self.chunks.len() {
+            self.chunks.resize_with(other.chunks.len(), || None);
+        }
+        for (cid, src) in other.chunks.iter().enumerate() {
+            if let Some(src_chunk) = src {
+                let dst = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
+                for (d, s) in dst.iter_mut().zip(src_chunk.iter()) {
+                    *d |= *s;
+                }
+            }
+        }
     }
 
     /// Build the prefix-sum index for O(1) `rank()` queries.

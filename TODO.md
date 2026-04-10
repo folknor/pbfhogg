@@ -835,15 +835,13 @@ for pipelined reader paths (parallel workers with pool recycling).
 relations × ~10 members × 24 bytes = 3.4 GB cumulative at planet. All
 allocator fast-path, no RSS impact. Not worth the API complexity.
 
-### Priority 2: IdSet — migrate from BTreeSet to IdSetDense
+### Priority 2: IdSet — migrate from BTreeSet to IdSetDense — DONE
 
-Unanimous top-3 across reviewers. O(log n) → O(1) per element lookup.
-At planet scale with ~200K IDs: 500M elements × (18 comparisons vs 3 ops)
-≈ 42s savings. `ids_intersect_range` blob-skip optimization preserved via
-`IdSetDense::any_in_range(min_id, max_id)` — walk chunks from min to max,
-return true if any chunk has set bits (typically 1-3 chunks per blob range).
-Change `IdSet` fields from `BTreeSet<i64>` to `IdSetDense`, update
-`parse_ids_from_pbf` to use `set()`, replace `ids_intersect_range`.
+`IdSet` fields changed from `BTreeSet<i64>` to `IdSetDense`. O(log n) → O(1)
+per element lookup. Blob-skip optimization preserved via `any_in_range()`.
+Added `IdSetDense::merge_from()` for union, `iter()` for diagnostic output.
+`ids_intersect_range` removed. CLI updated for `has_any()`/`iter()` API.
+Also fixed redundant closures in sweep_merge call sites (clippy).
 
 ### Priority 3: derive_changes — stream instead of buffering
 

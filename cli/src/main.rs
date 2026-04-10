@@ -1528,14 +1528,14 @@ fn resolve_ids(
     // Merge IDs from text file
     if let Some(path) = id_file {
         let file_ids = pbfhogg::getid::parse_ids_from_file_with_default_type(path, default_type)?;
-        pbfhogg::getid::merge_id_sets(&mut id_set, file_ids);
+        pbfhogg::getid::merge_id_sets(&mut id_set, &file_ids);
     }
     // Merge IDs from OSM/PBF file
     if let Some(path) = id_osm_file {
         let pbf_ids = pbfhogg::getid::parse_ids_from_pbf(path, direct_io)?;
-        pbfhogg::getid::merge_id_sets(&mut id_set, pbf_ids);
+        pbfhogg::getid::merge_id_sets(&mut id_set, &pbf_ids);
     }
-    if id_set.node_ids.is_empty() && id_set.way_ids.is_empty() && id_set.relation_ids.is_empty() {
+    if !id_set.node_ids.has_any() && !id_set.way_ids.has_any() && !id_set.relation_ids.has_any() {
         return Err("no IDs specified (use positional args, -i FILE, or -I OSM-FILE)".into());
     }
     Ok(id_set)
@@ -1543,23 +1543,23 @@ fn resolve_ids(
 
 fn print_requested_ids(ids: &pbfhogg::getid::IdSet) {
     eprintln!("Requested IDs:");
-    if !ids.node_ids.is_empty() {
+    if ids.node_ids.has_any() {
         eprint!("  nodes:");
-        for id in &ids.node_ids {
+        for id in ids.node_ids.iter() {
             eprint!(" {id}");
         }
         eprintln!();
     }
-    if !ids.way_ids.is_empty() {
+    if ids.way_ids.has_any() {
         eprint!("  ways:");
-        for id in &ids.way_ids {
+        for id in ids.way_ids.iter() {
             eprint!(" {id}");
         }
         eprintln!();
     }
-    if !ids.relation_ids.is_empty() {
+    if ids.relation_ids.has_any() {
         eprint!("  relations:");
-        for id in &ids.relation_ids {
+        for id in ids.relation_ids.iter() {
             eprint!(" {id}");
         }
         eprintln!();
@@ -1574,9 +1574,9 @@ fn print_missing_ids(
     // Scan the output PBF to find which requested IDs are present.
     let found = pbfhogg::getid::parse_ids_from_pbf(output, direct_io)?;
 
-    let missing_nodes: Vec<_> = requested.node_ids.difference(&found.node_ids).collect();
-    let missing_ways: Vec<_> = requested.way_ids.difference(&found.way_ids).collect();
-    let missing_rels: Vec<_> = requested.relation_ids.difference(&found.relation_ids).collect();
+    let missing_nodes: Vec<_> = requested.node_ids.iter().filter(|&id| !found.node_ids.get(id)).collect();
+    let missing_ways: Vec<_> = requested.way_ids.iter().filter(|&id| !found.way_ids.get(id)).collect();
+    let missing_rels: Vec<_> = requested.relation_ids.iter().filter(|&id| !found.relation_ids.get(id)).collect();
 
     let total_missing = missing_nodes.len() + missing_ways.len() + missing_rels.len();
     if total_missing == 0 {

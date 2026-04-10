@@ -1,7 +1,8 @@
 //! Extract or remove elements by ID. Equivalent to `osmium getid` / `osmium removeid`.
 
-use std::collections::BTreeSet;
 use std::path::Path;
+
+use super::id_set_dense::IdSetDense;
 
 use rayon::prelude::*;
 
@@ -22,10 +23,11 @@ use super::{Result, BATCH_SIZE};
 // ---------------------------------------------------------------------------
 
 /// Parsed element IDs grouped by type.
+/// Uses `IdSetDense` for O(1) membership testing at all scales.
 pub struct IdSet {
-    pub node_ids: BTreeSet<i64>,
-    pub way_ids: BTreeSet<i64>,
-    pub relation_ids: BTreeSet<i64>,
+    pub node_ids: IdSetDense,
+    pub way_ids: IdSetDense,
+    pub relation_ids: IdSetDense,
 }
 
 /// Element type used as default when parsing bare numeric IDs.
@@ -88,18 +90,18 @@ pub fn parse_ids_with_default_type(
     default_type: Option<DefaultType>,
 ) -> Result<IdSet> {
     let mut set = IdSet {
-        node_ids: BTreeSet::new(),
-        way_ids: BTreeSet::new(),
-        relation_ids: BTreeSet::new(),
+        node_ids: IdSetDense::new(),
+        way_ids: IdSetDense::new(),
+        relation_ids: IdSetDense::new(),
     };
     for spec in specs {
         let (prefix, id) = parse_id_spec(spec, default_type)?;
         match prefix {
-            'n' => set.node_ids.insert(id),
-            'w' => set.way_ids.insert(id),
-            'r' => set.relation_ids.insert(id),
+            'n' => set.node_ids.set(id),
+            'w' => set.way_ids.set(id),
+            'r' => set.relation_ids.set(id),
             _ => unreachable!(),
-        };
+        }
     }
     Ok(set)
 }
@@ -131,9 +133,9 @@ pub fn parse_ids_from_file_with_default_type(
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
 pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     let mut set = IdSet {
-        node_ids: BTreeSet::new(),
-        way_ids: BTreeSet::new(),
-        relation_ids: BTreeSet::new(),
+        node_ids: IdSetDense::new(),
+        way_ids: IdSetDense::new(),
+        relation_ids: IdSetDense::new(),
     };
 
     let (schedule, shared_file) = super::build_classify_schedule(path, None)?;
@@ -165,9 +167,9 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
             batch
         },
         |batch| {
-            set.node_ids.extend(batch.node_ids);
-            set.way_ids.extend(batch.way_ids);
-            set.relation_ids.extend(batch.relation_ids);
+            for id in batch.node_ids { set.node_ids.set(id); }
+            for id in batch.way_ids { set.way_ids.set(id); }
+            for id in batch.relation_ids { set.relation_ids.set(id); }
         },
     )?;
 
@@ -175,10 +177,10 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
 }
 
 /// Merge two `IdSet`s together (union).
-pub fn merge_id_sets(a: &mut IdSet, b: IdSet) {
-    a.node_ids.extend(b.node_ids);
-    a.way_ids.extend(b.way_ids);
-    a.relation_ids.extend(b.relation_ids);
+pub fn merge_id_sets(a: &mut IdSet, b: &IdSet) {
+    a.node_ids.merge_from(&b.node_ids);
+    a.way_ids.merge_from(&b.way_ids);
+    a.relation_ids.merge_from(&b.relation_ids);
 }
 
 // ---------------------------------------------------------------------------
@@ -301,9 +303,9 @@ fn filter_by_id(
         relations_written: 0,
     };
     let blob_filter = BlobFilter::new(
-        !ids.node_ids.is_empty(),
-        !ids.way_ids.is_empty(),
-        !ids.relation_ids.is_empty(),
+        ids.node_ids.has_any(),
+        ids.way_ids.has_any(),
+        ids.relation_ids.has_any(),
     );
     let mut blobs_skipped: u64 = 0;
     let mut blobs_passthrough: u64 = 0;
@@ -323,11 +325,11 @@ fn filter_by_id(
                 if let Some(ref idx) = frame.index {
                     let has_match = match idx.kind {
                         crate::blob_index::ElemKind::Node =>
-                            ids_intersect_range(&ids.node_ids, idx.min_id, idx.max_id),
+                            ids.node_ids.any_in_range(idx.min_id, idx.max_id),
                         crate::blob_index::ElemKind::Way =>
-                            ids_intersect_range(&ids.way_ids, idx.min_id, idx.max_id),
+                            ids.way_ids.any_in_range(idx.min_id, idx.max_id),
                         crate::blob_index::ElemKind::Relation =>
-                            ids_intersect_range(&ids.relation_ids, idx.min_id, idx.max_id),
+                            ids.relation_ids.any_in_range(idx.min_id, idx.max_id),
                     };
                     if include {
                         // Include mode: skip blob types with no matching IDs.
@@ -383,11 +385,6 @@ fn filter_by_id(
     Ok(stats)
 }
 
-/// Check whether any ID in the BTreeSet falls within the blob's [min_id, max_id] range.
-fn ids_intersect_range(ids: &BTreeSet<i64>, min_id: i64, max_id: i64) -> bool {
-    use std::ops::RangeInclusive;
-    ids.range(RangeInclusive::new(min_id, max_id)).next().is_some()
-}
 
 // ---------------------------------------------------------------------------
 // Two-pass getid with --add-referenced
@@ -406,7 +403,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     let mut dep_node_ids = super::id_set_dense::IdSetDense::new();
     let mut has_dep_nodes = false;
 
-    if !ids.way_ids.is_empty() {
+    if ids.way_ids.has_any() {
         // Parallel classification: pread workers scan way blobs for matching
         // way IDs and collect their node refs.
         let (schedule, shared_file) = super::build_classify_schedule(
@@ -420,7 +417,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
             |block, node_ids| {
                 for element in block.elements_skip_metadata() {
                     if let Element::Way(w) = &element
-                        && ids.way_ids.contains(&w.id())
+                        && ids.way_ids.get(w.id())
                     {
                         for r in w.refs() { node_ids.set(r); }
                     }
@@ -433,7 +430,7 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
         )?;
     }
     // When --remove-tags is set, referenced-only nodes (not explicitly requested)
-    // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.contains(&id).
+    // get their tags stripped. Check at query time: dep_node_ids.get(id) && !ids.node_ids.get(id).
     let strip_tags = opts.remove_tags && has_dep_nodes;
     crate::debug::emit_marker("GETID_PASS1_END");
 
@@ -444,9 +441,9 @@ fn getid_with_refs(input: &Path, output: &Path, ids: &IdSet, opts: &GetidOptions
     // Skip blob types not needed: nodes if no node IDs and no dependent nodes,
     // ways always needed (add-referenced mode), relations if no relation IDs.
     let reader = reader.with_blob_filter(BlobFilter::new(
-        !ids.node_ids.is_empty() || has_dep_nodes,
+        ids.node_ids.has_any() || has_dep_nodes,
         true,
-        !ids.relation_ids.is_empty(),
+        ids.relation_ids.has_any(),
     ));
     let mut writer = writer_from_header(output, compression, reader.header(), true, overrides, |hb| hb, direct_io, false)?;
 
@@ -495,15 +492,15 @@ fn process_block(
     for element in block.elements() {
         let dominated = match &element {
             Element::DenseNode(dn) => {
-                ids.node_ids.contains(&dn.id())
+                ids.node_ids.get(dn.id())
                     || dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
             }
             Element::Node(n) => {
-                ids.node_ids.contains(&n.id())
+                ids.node_ids.get(n.id())
                     || dep_node_ids.is_some_and(|deps| deps.get(n.id()))
             }
-            Element::Way(w) => ids.way_ids.contains(&w.id()),
-            Element::Relation(r) => ids.relation_ids.contains(&r.id()),
+            Element::Way(w) => ids.way_ids.get(w.id()),
+            Element::Relation(r) => ids.relation_ids.get(r.id()),
         };
         let emit = if include { dominated } else { !dominated };
         if !emit {
@@ -516,7 +513,7 @@ fn process_block(
                 // Strip tags from referenced-only nodes (dep but not explicit)
                 let strip = strip_tags
                     && dep_node_ids.is_some_and(|deps| deps.get(dn.id()))
-                    && !ids.node_ids.contains(&dn.id());
+                    && !ids.node_ids.get(dn.id());
                 let meta = dense_node_metadata(dn);
                 if strip {
                     bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), std::iter::empty::<(&str, &str)>(), meta.as_ref());
@@ -529,7 +526,7 @@ fn process_block(
                 ensure_node_capacity_local(bb, output)?;
                 let strip = strip_tags
                     && dep_node_ids.is_some_and(|deps| deps.get(n.id()))
-                    && !ids.node_ids.contains(&n.id());
+                    && !ids.node_ids.get(n.id());
                 let meta = element_metadata(&n.info());
                 if strip {
                     bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), std::iter::empty::<(&str, &str)>(), meta.as_ref());
@@ -678,9 +675,11 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let set = parse_ids(&specs).unwrap();
-        assert_eq!(set.node_ids, BTreeSet::from([1, 2]));
-        assert_eq!(set.way_ids, BTreeSet::from([10]));
-        assert_eq!(set.relation_ids, BTreeSet::from([100]));
+        assert!(set.node_ids.get(1));
+        assert!(set.node_ids.get(2));
+        assert!(!set.node_ids.get(3));
+        assert!(set.way_ids.get(10));
+        assert!(set.relation_ids.get(100));
     }
 
     #[test]
@@ -697,9 +696,11 @@ mod tests {
             .map(ToString::to_string)
             .collect();
         let set = parse_ids_with_default_type(&specs, Some(DefaultType::Way)).unwrap();
-        assert_eq!(set.node_ids, BTreeSet::new());
-        assert_eq!(set.way_ids, BTreeSet::from([1, 2, 10]));
-        assert_eq!(set.relation_ids, BTreeSet::from([100]));
+        assert!(!set.node_ids.has_any());
+        assert!(set.way_ids.get(1));
+        assert!(set.way_ids.get(2));
+        assert!(set.way_ids.get(10));
+        assert!(set.relation_ids.get(100));
     }
 
     #[test]

@@ -448,6 +448,7 @@ fn write_overlap_run(
 // Sweep merge per element type
 // ---------------------------------------------------------------------------
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge<T: Ord + HasId>(
     entries: &[BlobEntry],
     input_file: &mut File,

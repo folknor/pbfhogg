@@ -469,6 +469,7 @@ fn write_overlap_run(
 /// Generic sweep merge: heap-based merge of overlapping blob entries with
 /// dedup (skip elements with same id + version as the just-emitted element).
 /// Returns (elements_written, duplicates_removed).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn sweep_merge_dedup<T: Ord + HasId>(
     entries: &[BlobEntry],
     files: &mut [File],

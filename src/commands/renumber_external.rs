@@ -248,13 +248,14 @@ pub fn renumber_external(
     overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
     // ---- Header validation + output writer setup ----
-    // Same pattern as the in-memory renumber. require_sorted ensures we
-    // read nodes in ascending old-id order, which makes the node_map
-    // bucket files internally sorted by old_id with no extra sort step.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    let header_blob = blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let header = header_blob.to_headerblock()?;
+    // Use the pipelined ElementReader for pass 1 — this parses the
+    // header eagerly at construction and enables `for_each_block_pipelined`
+    // which streams decoded blocks via a background I/O + decode pipeline.
+    // `require_sorted` ensures we read nodes in ascending old-id order,
+    // which makes the node_map bucket files internally sorted by old_id
+    // with no extra sort step.
+    let reader = crate::ElementReader::open(input, direct_io)?;
+    let header = reader.header().clone();
     require_sorted(&header, input, "Input PBF")?;
     super::warn_locations_on_ways_loss(&header);
 
@@ -282,81 +283,47 @@ pub fn renumber_external(
         relations_written: 0,
     };
 
-    // Decompression buffer recycling: buffers flow from the pool into
-    // each PrimitiveBlock via `from_vec_pooled_with_scratch` and return
-    // to the pool on block drop. Without the pool, `std::mem::take`
-    // would leave the caller's buf empty on every iteration, forcing a
-    // fresh allocation per blob — at planet scale, that's ~27 GB of
-    // cumulative alloc churn across pass 1 + stage 2a + stage 2d +
-    // R1 + R2a + R2d.
-    let pool = crate::blob::DecompressPool::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
 
-    // ---- Pass 1: node scan ----
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        // Fast-skip non-node blobs via blob_index (all brokkr datasets are
-        // indexed). Non-indexed PBFs fall through and decompress every
-        // blob, matching the pass-2 pattern in the in-memory renumber.
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                continue;
-            }
-        }
-        let mut decompress_buf = pool.get();
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
-        )?;
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    reject_negative_id(dn.id(), "node")?;
-                    ensure_node_capacity(&mut bb, &mut writer)?;
-                    let new_id = next_node_id;
-                    next_node_id += 1;
-                    let meta = dense_node_metadata(dn);
-                    bb.add_node(
-                        new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref(),
-                    );
-                    let old_id = dn.id();
-                    emit_old_id(
-                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
-                    )?;
-                    stats.nodes_written += 1;
-                }
-                Element::Node(n) => {
-                    reject_negative_id(n.id(), "node")?;
-                    ensure_node_capacity(&mut bb, &mut writer)?;
-                    let new_id = next_node_id;
-                    next_node_id += 1;
-                    let meta = element_metadata(&n.info());
-                    bb.add_node(
-                        new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref(),
-                    );
-                    let old_id = n.id();
-                    emit_old_id(
-                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
-                    )?;
-                    stats.nodes_written += 1;
-                }
-                // Ways and relations are deferred to pass 2 (task #3) and
-                // relation passes (task #4). Skipping them here is fine for
-                // the skeleton: the output PBF will contain only renumbered
-                // nodes until those tasks land.
-                _ => {}
-            }
-        }
-    }
+    // ---- Pass 1: node scan via pipelined reader ----
+    // `for_each_block_pipelined` runs a 3-stage pipeline: I/O thread
+    // reads blobs, decode thread pool decompresses + parses them into
+    // PrimitiveBlocks, reorder buffer delivers them to this closure in
+    // file order. Decouples disk I/O + zlib decompress from element
+    // iteration + BlockBuilder emit, bringing pass 1 from single-thread
+    // end-to-end (1,147 s at planet) toward the decoded-element rate.
+    //
+    // The closure captures `&mut bb`, `&mut writer`, `&mut node_map_buckets`,
+    // `&mut next_node_id`, `&mut stats`, `&mut id_buf`. All single-thread
+    // — FnMut guarantees one-thread-at-a-time invocation from the reorder
+    // buffer drain.
+    // Bridge the module Result<T, Box<dyn Error>> to the library
+    // crate::error::Result<T> expected by for_each_block_pipelined.
+    // Errors inside the closure (negative-id rejection, I/O failures
+    // on bucket writes, ensure_capacity's writer flush) are wrapped
+    // as io::Error::other() on the library side.
+    reader
+        .for_each_block_pipelined(|block: crate::PrimitiveBlock| -> crate::error::Result<()> {
+            pass1_process_block(
+                &block,
+                &mut bb,
+                &mut writer,
+                &mut node_map_buckets,
+                &mut id_buf,
+                &mut next_node_id,
+                &mut stats,
+            )
+            .map_err(|e| {
+                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })
+        })?;
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
-    drop(blob_reader);
 
     // Finalize the node_map bucket writers now that pass 1 is done emitting.
     // Files stay on disk until stage 2b consumes them (forthcoming); we just
@@ -585,6 +552,72 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_END");
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Pass 1 per-block helper
+// ---------------------------------------------------------------------------
+
+/// Process a single node blob block for pass 1: iterate nodes, assign
+/// new ids, write renumbered nodes to the output PBF via `BlockBuilder`,
+/// and emit the old ids into the `node_map` bucket files.
+///
+/// Called by `for_each_block_pipelined` on the main (consumer) thread
+/// via a bridge closure that converts the module `Result<_, Box<dyn
+/// Error>>` into the library `crate::error::Result<_>` expected by
+/// the pipelined reader API.
+///
+/// Non-node elements in the block are silently skipped. The `_ => {}`
+/// branches in the inner match handle the case where a blob contains
+/// mixed types (rare but legal per the PBF spec).
+#[allow(clippy::too_many_arguments)]
+fn pass1_process_block(
+    block: &crate::PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
+    node_map_buckets: &mut BucketWriters,
+    id_buf: &mut [u8; OLD_ID_SIZE],
+    next_node_id: &mut i64,
+    stats: &mut RenumberStats,
+) -> Result<()> {
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                reject_negative_id(dn.id(), "node")?;
+                ensure_node_capacity(bb, writer)?;
+                let new_id = *next_node_id;
+                *next_node_id += 1;
+                let meta = dense_node_metadata(dn);
+                bb.add_node(
+                    new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref(),
+                );
+                let old_id = dn.id();
+                emit_old_id(
+                    node_map_buckets, id_buf, old_id, node_id_bucket(old_id),
+                )?;
+                stats.nodes_written += 1;
+            }
+            Element::Node(n) => {
+                reject_negative_id(n.id(), "node")?;
+                ensure_node_capacity(bb, writer)?;
+                let new_id = *next_node_id;
+                *next_node_id += 1;
+                let meta = element_metadata(&n.info());
+                bb.add_node(
+                    new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref(),
+                );
+                let old_id = n.id();
+                emit_old_id(
+                    node_map_buckets, id_buf, old_id, node_id_bucket(old_id),
+                )?;
+                stats.nodes_written += 1;
+            }
+            // Ways and relations are handled in later stages (stage 2a,
+            // stage 2d, relation passes). Drop them here.
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

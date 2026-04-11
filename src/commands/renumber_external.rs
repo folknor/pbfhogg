@@ -1514,25 +1514,26 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
     Ok(slot_starts)
 }
 
-/// Re-scan way blobs via the pipelined reader, rewrite refs from the
-/// flat `new_refs` file using each blob's starting `slot_pos` from the
-/// ref-count sidecar, assign new sequential way ids, emit old_way_ids
-/// into `way_map` buckets, and write the renumbered ways to the output
-/// PBF.
+/// Re-scan way blobs, rewrite refs from the flat `new_refs` file using
+/// each blob's starting `slot_pos` from the ref-count sidecar, assign
+/// new sequential way ids, emit `(old_way_id, new_way_id)` pairs into
+/// `way_map` buckets, and write the renumbered ways to the output PBF.
 ///
-/// Uses `ElementReader::with_blob_filter(BlobFilter::only_ways())` +
-/// `for_each_block_pipelined` so disk I/O + zlib decompress overlap
-/// with the consumer-thread element walk. Same pattern as pass 1.
-///
-/// `scan_way_refs` in stage 2a and `block.elements()` here both
-/// iterate groups in top-level order and ways within a group in wire
-/// order, so slot_cursor aligns with the emitted (old_node_id,
-/// slot_pos) pairs.
+/// The second scan reuses the same blob filter as stage 2a (OsmData +
+/// `ElemKind::Way` when indexed) so the blob-index count matches the
+/// sidecar's entry count. Within each blob, ways are iterated via the
+/// full element path (`block.elements()` matched on `Element::Way`),
+/// which gives tags + metadata + refs — vs stage 2a's `scan_way_refs`
+/// which is a refs-only fast path.
 #[hotpath::measure]
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
 fn stage2d_way_assembly(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     bb: &mut BlockBuilder,
     way_map_buckets: &mut BucketWriters,
@@ -1545,7 +1546,10 @@ fn stage2d_way_assembly(
     // Load sidecar and compute per-blob starting slot positions.
     let blob_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
 
-    // mmap the flat new_refs file for zero-syscall slot lookups.
+    // mmap the flat new_refs file for zero-syscall slot lookups. Stage 2d
+    // accesses slots sequentially as it walks way refs in file order, so
+    // MADV_SEQUENTIAL gives the kernel a hint for readahead. Matches
+    // external_join::CoordSlots.
     let new_refs_file = std::fs::File::open(new_refs_path)
         .map_err(|e| format!("failed to open new_refs file: {e}"))?;
     let new_refs_len = new_refs_file
@@ -1559,6 +1563,9 @@ fn stage2d_way_assembly(
         )
         .into());
     }
+    // The zero-length case is legitimate: input had no way refs at all
+    // (e.g. an empty or nodes-only PBF). mmap rejects zero-length maps on
+    // some kernels; fall back to an anonymous empty mmap in that case.
     let new_refs_mmap: memmap2::Mmap = if new_refs_len == 0 {
         memmap2::MmapOptions::new().map_anon()?.make_read_only()?
     } else {
@@ -1569,65 +1576,105 @@ fn stage2d_way_assembly(
         mmap
     };
 
-    // Pipelined reader with blob filter for ways only. The background
-    // pipeline pre-fetches and decompresses blobs; the closure on this
-    // thread does the per-way ref lookup + BlockBuilder emission.
-    let reader = crate::ElementReader::open(input, direct_io)?
-        .with_blob_filter(crate::BlobFilter::only_ways());
+    // Second way scan via schedule + pread — same blob set and order
+    // as stage 2a so the per-blob ref-count sidecar aligns 1:1.
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
+    if schedule.len() != blob_slot_starts.len() {
+        return Err(format!(
+            "stage 2d: way blob schedule size {} != sidecar entries {}",
+            schedule.len(),
+            blob_slot_starts.len()
+        )
+        .into());
+    }
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
-    // State threaded through the closure via mutable references.
-    let mut id_buf = [0u8; OLD_ID_SIZE];
-    let mut refs_buf: Vec<i64> = Vec::new();
+    let pool = crate::blob::DecompressPool::new();
     let mut way_blob_idx: usize = 0;
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut id_buf = [0u8; OLD_ID_SIZE];
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    reader
-        .for_each_block_pipelined(|block: crate::PrimitiveBlock| -> crate::error::Result<()> {
-            let blob_start_cursor = blob_slot_starts
-                .get(way_blob_idx)
-                .copied()
-                .unwrap_or(total_slots);
-            let mut slot_cursor = blob_start_cursor;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        let mut slot_cursor = blob_slot_starts[way_blob_idx];
 
-            stage2d_process_block(
-                &block,
-                bb,
-                writer,
-                way_map_buckets,
-                &new_refs_mmap,
-                &mut refs_buf,
-                &mut id_buf,
-                &mut slot_cursor,
-                next_way_id,
-                stats,
-            )
-            .map_err(|e| {
-                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
+        )?;
 
-            // Per-blob cross-check: slot_cursor must equal the next
-            // blob's start (or total_slots for the last blob). Any
-            // drift means stage 2a and stage 2d disagreed on the way
-            // iteration order, which would silently misalign every
-            // subsequent blob's refs.
-            let expected_end = blob_slot_starts
-                .get(way_blob_idx + 1)
-                .copied()
-                .unwrap_or(total_slots);
-            if slot_cursor != expected_end {
-                return Err(crate::error::new_error(crate::error::ErrorKind::Io(
-                    std::io::Error::other(format!(
-                        "stage 2d slot cursor drift at way blob {way_blob_idx}: \
-                         cursor = {slot_cursor}, expected = {expected_end} \
-                         (blob start = {blob_start_cursor})"
-                    )),
-                )));
+        for element in block.elements() {
+            if let Element::Way(w) = &element {
+                ensure_way_capacity(bb, writer)?;
+                let new_id = *next_way_id;
+                *next_way_id += 1;
+
+                // Read ref_count consecutive new_node_ids from the flat file.
+                refs_buf.clear();
+                // Walk in file order. scan_way_refs in stage 2a and
+                // block.elements() here both iterate groups in top-
+                // level order and ways within a group in wire order,
+                // so slot_cursor aligns with the emitted (old, slot)
+                // pairs. The old ref ids themselves are discarded —
+                // we only use the count to advance the cursor.
+                for _ in w.refs() {
+                    let offset = slot_cursor as usize * NEW_REF_SIZE;
+                    let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap
+                        [offset..offset + NEW_REF_SIZE]
+                        .try_into()
+                        .map_err(|_| "stage 2d new_refs slice")?;
+                    let new_node_id = i64::from_le_bytes(bytes);
+                    refs_buf.push(new_node_id);
+                    slot_cursor += 1;
+                }
+
+                let meta = element_metadata(&w.info());
+                bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
+
+                // Emit the old_way_id into the way_map bucket. The
+                // corresponding new_way_id is reconstructed at R2B
+                // read time from `start_way_id + bucket_way_id_start
+                // [bucket] + position_within_bucket`.
+                let old_way_id = w.id();
+                emit_old_id(
+                    way_map_buckets, &mut id_buf, old_way_id, way_id_bucket(old_way_id),
+                )?;
+
+                stats.ways_written += 1;
             }
+        }
 
-            way_blob_idx += 1;
-            Ok(())
-        })?;
+        // Per-blob cross-check: slot_cursor must have advanced to exactly
+        // the next blob's start (or total_slots for the last blob). Any
+        // drift here indicates stage 2a and stage 2d disagreed on the way
+        // iteration order, which would silently misalign every subsequent
+        // blob's refs. This check catches the drift as soon as it happens
+        // rather than after the whole file is written.
+        let expected_end = blob_slot_starts
+            .get(way_blob_idx + 1)
+            .copied()
+            .unwrap_or(total_slots);
+        if slot_cursor != expected_end {
+            return Err(format!(
+                "stage 2d slot cursor drift at way blob {way_blob_idx}: \
+                 cursor = {slot_cursor}, expected = {expected_end} \
+                 (blob start = {})",
+                blob_slot_starts[way_blob_idx]
+            )
+            .into());
+        }
+
+        way_blob_idx += 1;
+    }
 
     if way_blob_idx != blob_slot_starts.len() {
         return Err(format!(
@@ -1637,56 +1684,6 @@ fn stage2d_way_assembly(
         .into());
     }
 
-    Ok(())
-}
-
-/// Process a single way blob block for stage 2d. Iterates ways in the
-/// block, looks up their refs via `new_refs_mmap[slot_cursor..]`,
-/// assigns new way ids, writes renumbered ways to the output PBF via
-/// `BlockBuilder`, and emits old_way_ids into `way_map_buckets`.
-///
-/// `slot_cursor` is advanced by one per way-ref walked. Callers
-/// verify post-block that the cursor landed at the expected next-blob
-/// offset (drift detection).
-#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-fn stage2d_process_block(
-    block: &crate::PrimitiveBlock,
-    bb: &mut BlockBuilder,
-    writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    way_map_buckets: &mut BucketWriters,
-    new_refs_mmap: &memmap2::Mmap,
-    refs_buf: &mut Vec<i64>,
-    id_buf: &mut [u8; OLD_ID_SIZE],
-    slot_cursor: &mut u64,
-    next_way_id: &mut i64,
-    stats: &mut RenumberStats,
-) -> Result<()> {
-    for element in block.elements() {
-        let Element::Way(w) = &element else { continue };
-        ensure_way_capacity(bb, writer)?;
-        let new_id = *next_way_id;
-        *next_way_id += 1;
-
-        refs_buf.clear();
-        for _ in w.refs() {
-            let offset = *slot_cursor as usize * NEW_REF_SIZE;
-            let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap
-                [offset..offset + NEW_REF_SIZE]
-                .try_into()
-                .map_err(|_| "stage 2d new_refs slice")?;
-            let new_node_id = i64::from_le_bytes(bytes);
-            refs_buf.push(new_node_id);
-            *slot_cursor += 1;
-        }
-
-        let meta = element_metadata(&w.info());
-        bb.add_way(new_id, w.tags(), refs_buf, meta.as_ref());
-
-        let old_way_id = w.id();
-        emit_old_id(way_map_buckets, id_buf, old_way_id, way_id_bucket(old_way_id))?;
-
-        stats.ways_written += 1;
-    }
     Ok(())
 }
 

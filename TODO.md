@@ -615,58 +615,31 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
-- [ ] **Smart-extract planet memory blocker — open, well-understood,
-  reviewer-refined mitigation menu.** The 2026-04-10/11 investigation
-  (4 reviewer rounds, 6 commits) shipped a 29% wall improvement on
-  Europe smart extract (254s → ~180s) but did NOT close the memory
-  ceiling. The mechanism is a cold-arena-page residency cascade:
-  PASS1's parallel allocator work leaves glibc with ~8-11 GB of
-  fordblks free-list bloat, and subsequent post-PASS1 phases that
-  touch the free-list bring those cold pages into residence (anon
-  RSS climbs by ~6 GB without any glibc-tracked allocation). Pro-
-  rated to planet (~2.6×): peak ~26-28 GB, tight on 30 GB plantasjen.
-  Allocator swap (jemalloc/mimalloc) is OFF the table per prior
-  project experience; revisit if Meta's restarted jemalloc work matures.
+- [x] **Smart-extract planet memory blocker — CLOSED 2026-04-11, ship
+  as-is.** The 2026-04-10/11 investigation (4 reviewer rounds, 6
+  commits) shipped a 29% wall improvement on Europe smart extract
+  (254s → 181s) and also delivered complete −17% and simple −15% via
+  the same `0b085b1` PASS1 schedule reuse. Planet measured on 2026-04-11
+  at commit `cadc3e6`, UUID `2d028196`, plantasjen (32 GB, 27.9 GB
+  avail), Europe bbox, `--bench 1` single sample: **279s wall / 11.17
+  GB peak anon RSS.** The Europe×2.6 = 26-28 GB projection was wrong
+  by ~2.4× because peak anon is dominated by PASS3 write work
+  (bbox-sized), not PASS1 scanning the input file. Per the round-4
+  decision tree, < 25 GB = ship as-is. The reusable packet pool,
+  compact payload, malloc_trim-at-boundary, and bumpalo arena options
+  from the round-4 mitigation menu are all **not needed** for this
+  workload and have been closed out.
 
-  **Before any structural refactor, measure planet first.** The
-  projected ceiling has ~20-30% error bars and we've never benched
-  `brokkr extract --dataset planet --strategy smart`. One bench
-  (~20-30 min exclusive lock) collapses the decision:
-  - Planet peak < 25 GB → ship as-is, ceiling is fine
-  - Planet peak 25-28 GB → accept the ceiling (and optionally add
-    `malloc_trim(0)` at PASS1/PASS2 boundary for ~2 GB headroom at
-    4.6s wall cost)
-  - Planet peak > 28 GB → implement the reusable packet mitigation
-
-  **The reusable packet mitigation** (4 of 5 round-4 reviewers
-  converged): refactor `parallel_classify_phase` to send reusable
-  fixed-capacity result packets through the channel instead of
-  fresh per-blob `Vec<i64>` allocations. Workers fill packet, send
-  ownership, consumer drains and returns via recycle channel. Pool
-  size ~2× decode_threads × ~64 KB ≈ ~3 MB retained footprint vs
-  ~1.3 GB of cumulative Vec churn today. Expected `fordblks`
-  reduction: 3-5 GB. Estimated ~200-400 LoC plus call-site updates.
-
-  **Paired refinement (fifth option proposed by two reviewers
-  independently):** compact the packet payload via `u32` where legal
-  instead of `i64`, delta-packing of sorted IDs, or bucketed local
-  ranges. Monotonic within a blob (sorted PBF guarantee), compresses
-  well. Should be designed into the packet format from the start as
-  an alternate payload mode, not retrofitted.
-
-  **Rejected:** reverting dense paths to per-worker accumulation
-  (replaces cold-page cascade with real live state, still planet-
-  unsafe for the reasons round 1 identified). Custom arena/bumpalo
-  as the primary approach (if you build the cross-thread ownership
-  transfer for arena-backed buffers, you've almost built the packet
-  pool already — arena-first is only worth it as a narrower slab
-  allocator for packets if the pool approach proves insufficient).
+  Caveat: measured with Europe bbox. A substantially larger bbox
+  (beyond continent scale) would grow PASS3's touched working set
+  and could push peak anon higher. If extract-on-planet ever becomes
+  a recurring operation for bboxes > Europe, re-measure. Whole-planet
+  bbox isn't a real workload — use `cat` passthrough.
 
   See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md)
-  "Remaining mitigation directions" section for the full reviewer-
-  informed menu, the "measure first" rationale, and the rejected
-  options with reasoning. Implementation gated on the planet bench
-  showing the ceiling actually needs fixing.
+  for the full investigation history, mechanism analysis (cold-arena-page
+  residency cascade), and the historical mitigation menu preserved
+  as reviewer-context rather than outstanding work.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

@@ -321,32 +321,62 @@ Previous commit data (commit `46f7388`):
 
 ## Extract
 
-Plantasjen. Best of 3 runs, indexed PBFs.
+Plantasjen. Best of 3 runs (or single-sample where noted), indexed PBFs.
 
-| Dataset | Size | simple | complete | smart |
-|---------|------|--------|----------|-------|
-| Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms |
-| Japan | 2.4 GB | **4,400 ms** | **4,400 ms** | **5,200 ms** |
-| Europe | 32.4 GB | **100s** | — | — |
+| Dataset | Size | simple | complete | smart | Commit |
+|---------|------|--------|----------|-------|--------|
+| Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms | `aacbe80` |
+| Japan | 2.4 GB | **3.8s** | **3.7s** | **4.7s** | `cadc3e6` |
+| Europe | 32.4 GB | **96.3s** | **164.9s** | **181.4s** | `cadc3e6` |
+| Planet † | 87.7 GB | — | — | **279s** | `cadc3e6` |
+
+† Planet smart extract: single-sample `--bench 1`, Europe bbox, UUID
+`2d028196`. Peak anon RSS 11.17 GB on 32 GB host (27.9 GB avail at run
+start, 16.7 GB headroom to the round-4 "ship as-is" threshold of
+~25 GB). See [notes/parallel-classify-regression.md](../notes/parallel-classify-regression.md)
+for the full planet measurement write-up and mechanism analysis.
 
 Denmark bbox `12.4,55.6,12.7,55.8`, Japan bbox `139.5,35.5,140.0,36.0`,
-Europe full-continent bbox.
+Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent).
 
 Simple extract uses a 3-phase barrier pipeline with parallel classification
 and raw frame passthrough. Each phase (nodes, ways, relations) classifies
 blobs in parallel then writes matching raw frames via pread workers — no
-decode+re-encode. Japan simple: 4.4s vs osmium 7.2s (1.6x faster). Europe
-simple: 100s (was 350s sequential, was OOM with pipelined reader).
+decode+re-encode. Japan simple: 3.8s vs osmium 7.2s (1.9x faster). Europe
+simple: 96.3s (was 350s sequential, was OOM with pipelined reader).
 
 Complete-ways and smart pass 1 (`collect_pass1_generic`) uses three-phase
 parallel pread classification (nodes → ways → relations) via a reusable
 `parallel_classify_phase` helper. Smart pass 2 (way dependency resolution)
 also uses `parallel_classify_phase`, replacing the old sequential BlobReader
 scan. Workers pread + decompress + classify in parallel, sending compact
-results back to the consumer. Japan complete: 19.7s → 4.4s (4.5x), smart:
-24.3s → 5.2s (4.7x). Both beat osmium (complete 2.5x faster, smart 2.6x
-faster). Write passes use pread-from-workers with full PrimitiveBlock
-lifecycle per worker.
+results back to the consumer. Japan complete: 19.7s → 3.7s (5.3x), smart:
+24.3s → 4.7s (5.2x). Both beat osmium (complete 2.5x faster, smart 2.6x
+faster at earlier measurements). Write passes use pread-from-workers with
+full PrimitiveBlock lifecycle per worker.
+
+**PASS1 schedule reuse (commits `d4ea760`, `0b085b1`, 2026-04-10/11).** The
+parallel_classify_regression investigation discovered that every header
+scan running *after* PASS1's parallel allocator work was redundant —
+`collect_pass1_generic` already scans the whole file once. By plumbing
+`full_way_schedule` and `pass3_blob_schedule` out of `collect_pass1_generic`
+via `Pass1Result` and consuming them via `mem::take` in PASS2/PASS3, smart
+extract now does ONE file scan instead of THREE. Europe impact at
+commit `cadc3e6` vs pre-investigation `fc17b51`:
+
+| Strategy | Pre-investigation | Post | Δ |
+|---|---|---|---|
+| smart | 208.2s (`fc17b51`) | **181.4s** | **−13%** (−29% vs mid-investigation `5ca2df9` peak of 254s) |
+| complete | 198.0s (`fc17b51`) | **164.9s** | **−17%** |
+| simple | 113.1s (`fc17b51`) | **96.3s** | **−15%** |
+
+Complete benefits because `extract_complete_ways` PASS2 now also consumes
+`pass3_blob_schedule` via `pread_write_pass_with_schedule`. Simple benefits
+from shared instrumentation and scan-path improvements in the same commit
+range. See [notes/parallel-classify-regression.md](../notes/parallel-classify-regression.md)
+for the full investigation, including the cold-arena-page residency
+cascade mechanism analysis and the planet measurement that closed the
+round-4 mitigation menu.
 
 Europe simple phase breakdown (commit `b95e5ab`):
 - Node classify: 13s, Node write: 11s

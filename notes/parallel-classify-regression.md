@@ -1,11 +1,17 @@
 # parallel_classify_phase regression — investigation summary
 
-**Status (2026-04-11):** Wall-time improvement shipped (~29% on Europe smart
-extract). Memory peak unchanged but now well-understood. Planet-scale memory
-ceiling remains tight (~26-27 GB pro-rated) but no longer described by the
-original "per-worker IdSetDense blowup" framing. Allocator swap (jemalloc/
-mimalloc) is **not** being pursued — see "The unresolved planet blocker"
-below.
+**Status (2026-04-11): CLOSED.** Wall-time improvement shipped (~29% on
+Europe smart extract, confirmed +17% on complete and +15% on simple via
+the same `0b085b1` schedule reuse). Planet smart extract measured at
+**11.17 GB peak anon / 279 s wall** on commit `cadc3e6` (UUID `2d028196`,
+plantasjen, 27.9 GB avail, Europe bbox) — the Europe×2.6 = 26-28 GB
+projection was wrong by ~2.4×, because peak anon is dominated by PASS3
+write work (bbox-sized) and not by PASS1 scanning the input file.
+Per the decision tree in "Planet ceiling" below, planet < 25 GB → **ship
+as-is**; no mitigation-menu item needs to be implemented. The round-4
+menu (packet pool, compact payload, malloc_trim-at-boundary, bumpalo
+arena) is preserved below as historical investigation context, not as
+outstanding work.
 
 ## What we shipped
 
@@ -131,49 +137,83 @@ The mallinfo2 data finally produced a confident answer that fits all the
 ruled-out hypotheses: the 6 GB is *not* an allocation at all — it's first-
 touch faulting of pre-existing reserved address space.
 
-## The unresolved planet blocker
+## Planet ceiling — MEASURED 2026-04-11, ship as-is
 
-**Memory ceiling on Europe smart extract:** ~10–11 GB peak anon, regardless
-of which phase reports it (`PREAD_WRITE_BLOB_SCHEDULE`, `PREAD_WRITE_EXECUTE`,
-or `SMART_PASS2_CLASSIFY` depending on the run). Pro-rated to planet
-(~2.6× Europe): ~26–28 GB. **Tight on the 30 GB plantasjen host but does
-not OOM in practice.**
+**Planet smart extract, commit `cadc3e6`, plantasjen 32 GB host, Europe
+bbox, `--bench 1` single sample, UUID `2d028196`:**
 
-The mechanism — cold-arena-page residency cascade — means the ceiling is
-gated by **how much fordblks bloat PASS1 leaves behind** (8–11 GB on
-Europe), not by what any single post-PASS1 phase does. Eliminating one
-consumer of the cold free-list helps wall time but doesn't shrink the
-free-list.
+| Metric | Europe-dataset (`48ca6bbb`) | Planet+EU bbox (`2d028196`) |
+|---|---|---|
+| Input file | 35.3 GB | 92.0 GB (2.6×) |
+| Wall total | 181 s | **279 s** (+54%) |
+| **Peak anon RSS** | **10.71 GB** | **11.17 GB** (+4%) |
+| SMART_PASS1 wall | 55.7 s | 89.4 s (+60%) |
+| SMART_PASS3 peak anon | 10.71 GB | 11.17 GB |
+| fordblks @ POST_EXECUTE | 10.93 GB | 13.41 GB (+23%) |
+| arena @ POST_EXECUTE | 13.21 GB | 19.07 GB (+44%) |
 
-**Allocator swap (jemalloc/mimalloc) is NOT being pursued.** Per project
+**Per the round-4 decision tree (step 0, `:160-176`):**
+
+- < ~25 GB → ship as-is, ceiling is fine in practice ← **we are here**
+- 25–28 GB → accept (Option 4) defensible
+- \> 28 GB → implement reusable packet pool
+
+**Why the Europe×2.6 projection was wrong by 2.4×:** peak anon is
+dominated by PASS3 *write* work, which scales with **bbox** (identical
+Europe bbox in both runs), not by PASS1 scanning the input file. PASS1's
+cold-arena cascade added only +0.46 GB of anon going from europe-dataset
+to planet-dataset, even though `fordblks` bloat grew from 10.93 GB →
+13.41 GB and total arena reservation grew from 13.21 GB → 19.07 GB. Most
+of the extra reserved free-list pages never got first-touched — the
+cascade mechanism is real but its magnitude is gated by what downstream
+consumers actually touch, not by the size of the reserved pool.
+
+**Caveats on the measurement:**
+
+- Single `--bench 1` sample; no variance bounds. The gap to the 25 GB
+  threshold (14 GB of headroom) is large enough that sample noise can't
+  flip the decision.
+- Europe bbox specifically. A substantially larger bbox (say, "most of
+  the planet minus one small island") would grow PASS3's touched
+  working set and could push peak anon higher by faulting in more of
+  the 13.4 GB fordblks pool. If extract-on-planet ever becomes a
+  recurring operation for bboxes larger than Europe, re-measure.
+  Whole-planet bbox isn't a real workload — `cat` passthrough is the
+  right tool for that.
+- 32 GB host (27.9 GB avail at run start). Smaller hosts (e.g., 16 GB)
+  would need a re-measurement; the headroom calculation is host-specific.
+
+**Allocator swap (jemalloc/mimalloc) remains NOT pursued.** Per project
 history (TODO.md "Global allocator investigation"), jemalloc and mimalloc
 have been benchmarked multiple times in this project and don't behave the
 way reasoning about their `madvise(DONTNEED)` policy would suggest. They
 were also removed from the CLI feature flags because they broke
 `--all-features` builds via duplicate `#[global_allocator]` definitions.
-**Meta has restarted active jemalloc development** — revisit when that
-work matures.
+Meta has restarted active jemalloc development — revisit if the planet
+measurement becomes tight for some other reason.
 
-**Remaining mitigation directions** (none currently planned, but the
-menu is informed by a round-4 reviewer consensus):
+## Historical mitigation menu (NOT NEEDED — preserved as investigation context)
 
-### Step 0: measure planet before implementing anything
+The round-4 reviewer consensus below predates the planet measurement
+above. None of these options need to be implemented given the 11.17 GB
+actual peak. The text is kept because it captures why we *would* have
+picked the packet pool had the measurement gone the other way, and
+because the mechanism analysis behind it (cold-arena-page residency
+cascade, fordblks reservation dynamics) remains correct and worth
+referencing in future investigations.
 
-**The most important action before spending engineering time on a
-structural fix.** The "~26-28 GB pro-rated planet" number is a projection
-from Europe peak × 2.6. Projections at that scale factor have ~20-30%
-error bars — the actual planet number might be ~22 GB (fits comfortably)
-or ~32 GB (clearly needs fixing). We have never actually benched
-`brokkr extract --dataset planet --strategy smart`. One planet bench
-(~20-30 minutes of exclusive lock) collapses the binary:
+### Step 0: measure planet before implementing anything ✅ DONE 2026-04-11
 
-- Planet peak < ~25 GB → ship as-is, the ceiling is fine in practice
-- Planet peak 25-28 GB → Option 4 (accept) is defensible with the 29%
-  wall win already shipped
-- Planet peak > 28 GB → implement the reusable packet mitigation below
+**Result: 11.17 GB peak anon, 279 s wall, commit `cadc3e6`, UUID
+`2d028196`** — see "Planet ceiling" section above for the full table
+and mechanism analysis. Decision tree landed in the < 25 GB bucket
+(ship as-is). Round-4 reviewers were correct that step 0 was the most
+important action: the original projection was off by 2.4× and would
+have motivated implementing the packet pool below for no benefit.
 
-**Don't build a fix for a problem you haven't measured.** (Attribution:
-perf/claude, round 4. Four other reviewers concurred.)
+Attribution: perf/claude, round 4, concurred by planet/codex, perf/codex,
+arch/codex, planet/claude. The collective "measure first, don't build a
+fix for a problem you haven't measured" instinct was vindicated.
 
 ### Primary recommendation: reusable result packets in parallel_classify_phase
 

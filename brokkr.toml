@@ -240,3 +240,14 @@ xxhash = "ee8279ed41e09043c130c2ae7d9d06ed"
 [plantasjen.datasets.planet.osc.4920]
 file = "planet-20260411-seq4920.osc.gz"
 xxhash = "92a56b4225b91f6b44150a69fe8e4679"
+
+[plantasjen.datasets.planet.snapshot.20260411]
+download_date = "2026-04-11"
+
+[plantasjen.datasets.planet.snapshot.20260411.pbf.raw]
+file = "planet-20260411.osm.pbf"
+xxhash = "f59b934d548446df7716b0163edc0126"
+
+[plantasjen.datasets.planet.snapshot.20260411.pbf.indexed]
+file = "planet-20260411-with-indexdata.osm.pbf"
+xxhash = "7facb6386ff18bba38b176ee720fec62"

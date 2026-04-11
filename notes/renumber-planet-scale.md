@@ -383,10 +383,14 @@ is structural work that the ALTW external code has already de-risked.
    into `src/external_radix.rs` or similar — both commands can share
    it and any future external-join commands would benefit. Not a
    blocker, can ship duplicated first and refactor later.
-3. **How does osmium renumber handle planet?** Worth reading the
-   libosmium source to see if they've chosen a different architecture
-   (spatial index? b-tree on disk?). We should know what the reference
-   implementation does before committing to our own.
+3. **How does osmium renumber handle planet?** ✅ **Answered** — see
+   "Prior art: osmium renumber" section below. Summary: osmium is
+   in-memory-only, explicitly documented as "needs >32 GB RAM for
+   planet." No external-join prior art to copy; our design is genuinely
+   novel relative to the reference implementation, and osmium's
+   upstream position is that planet-scale renumber requires a
+   fat-memory machine. Also validates our two-pass relation handling,
+   sorted-input requirement, and `--start-id` interface.
 4. **Sequential vs parallel merge-join in pass 2.** ALTW parallelized
    stage 4 (P2c, commit `6b09796`, 432 s → 136 s). Worth evaluating
    whether renumber pass 2 has similar parallelism headroom. The
@@ -401,6 +405,263 @@ is structural work that the ALTW external code has already de-risked.
    unsorted input via `require_sorted`. External-join variant should
    do the same. If unsorted input becomes a requirement later, the
    external-join path needs a sort pre-step (out of scope here).
+
+## Prior art: osmium renumber
+
+Research pass against `research/libosmium/` and `research/osmium-tool/`
+(2026-04-11, Opus Explore agent) to understand what the reference C++
+implementation does before we commit to our external-join design. Full
+findings below, with source citations.
+
+### Headline: osmium's architecture is in-memory-only, and upstream explicitly scopes it out of planet.
+
+`osmium-tool/src/command_renumber.cpp` (443 LoC) and `command_renumber.hpp`
+(149 LoC) hold the entire implementation. **`command_renumber.cpp` does
+not include a single header from `osmium/index/`** — the renumber command
+deliberately does not use any of libosmium's pluggable map backends
+(`flex_mem`, `dense_mmap_array`, `sparse_mmap_array`, the ones that `osmium
+add-locations-to-ways` and `create-locations-index` lean on). Instead it
+defines a bespoke `id_map` class, one per object type, held in an
+`osmium::nwr_array<id_map>`.
+
+The `id_map` data structure is a hybrid:
+
+```cpp
+std::vector<osmium::object_id_type> m_ids;          // 8 bytes each
+std::unordered_map<osmium::object_id_type, osmium::object_id_type> m_extra_ids;
+osmium::object_id_type m_start_id = 1;
+```
+
+The vector's index *is* the new ID (minus `m_start_id - 1`); the overflow
+map catches referenced-but-missing IDs that can't be appended in sorted
+order. The design assumes a sorted input file so most IDs can simply be
+appended to `m_ids` in one pass. Lookups are `std::lower_bound` on `m_ids`
+with `m_extra_ids` as a fallback.
+
+**Per-entry cost: 8 bytes for the common case, ~48–56 bytes for entries
+that land in `m_extra_ids`.** `m_extra_ids` is expected to be small on a
+self-contained planet file (few referenced-but-missing IDs in practice),
+so the floor is essentially `8 bytes × (node_count + way_count +
+relation_count)` per invocation.
+
+The `man/osmium-renumber.md` page makes the planet-scale position
+explicit (lines 110–115):
+
+> *"**osmium renumber** needs quite a bit of main memory to keep the
+> mapping between old and new IDs. It is intended for small to medium
+> sized extracts. You will need more than 32 GB RAM to run this on a
+> full planet. Memory use is at least 8 bytes per node, way, and
+> relation ID in the input file."*
+
+At planet scale (~10.3B objects), the 8-byte floor alone is ~82 GB
+before any `m_extra_ids` overhead. The 2020 manpage cites Germany
+(~600M objects, ~5% of planet) at 7 GB / 3 minutes. Naive scale:
+~135 GB and ~60 minutes for planet.
+
+**The direct conclusion for pbfhogg:** if we want planet renumber to
+fit on a 32 GB host, we cannot copy-and-adapt osmium's architecture.
+Upstream's own framing is that planet requires a fat-memory machine.
+Our external-join design is novel engineering relative to the reference
+implementation, not a port — and that's fine, because osmium has
+explicitly chosen not to solve this problem.
+
+### No external-join infrastructure to reuse.
+
+One hope going into the research was that `osmium renumber --index-directory`
+might be doing some form of disk-backed join. It isn't. The `--index-directory`
+flag persists each `id_map` to a simple binary file (`nodes.idx`, `ways.idx`,
+`relations.idx`) at the end of the run, for **cross-file consistency** (so a
+follow-up invocation on a matching `.osc` picks up the same IDs). On read,
+the files are mmap'd briefly, then the contents are immediately copied into
+a fresh `std::vector` in memory via a `push_back` loop. They are not
+queried from disk during the run and they are not partitioned.
+
+**There is no sort-then-join, no radix bucketing, no merge-join, no
+streaming, no external query path anywhere in command_renumber.cpp.** The
+full mapping lives in RAM for the duration of the run.
+
+This matters because our design re-uses ALTW's `ScratchDir` /
+`BucketWriters` / 256-bucket radix partitioning pattern from
+`src/commands/external_join.rs`. There is no analogue to that pattern
+in libosmium's renumber code, and no analogue anywhere else in libosmium
+either — the index backends in `include/osmium/index/map/` are point-lookup
+caches over dense-ish ID space (`flex_mem`, `dense_file_array`,
+`sparse_file_array`, etc.), not partitioned-bucket external joins. They
+solve a different problem: node-location maps for operations like
+`add-locations-to-ways`, not the symmetric old→new renumber map.
+
+### Two-pass relation handling: confirmed conventional.
+
+This is the most reassuring cross-check. Our design calls for a
+relations-only Pass R1 (assign new IDs, build the in-memory relation_map)
+followed by a full Pass R2 (merge-join node refs against node_map buckets,
+way refs against way_map buckets, relation member refs against the in-memory
+relation_map). The motivation was forward-reference handling: a relation
+can reference a higher-ID relation, and in a sorted PBF the target hasn't
+been assigned a new ID yet when the referring relation is first visited.
+
+`osmium-tool/src/command_renumber.cpp:380–403` does exactly the same
+thing. First pass (`:380–383`) calls `read_relations(m_input_file,
+&m_id_map(relation))` with `osmium::osm_entity_bits::relation` as the
+reader filter, which skips node and way blobs via entity filtering and
+walks only relations. Second pass (`:389–403`) walks the full file and
+calls `renumber(buffer)` on each buffer, which knows that all relation
+IDs are already assigned by the time it needs them. The first pass is
+skipped entirely in single-pass-mode when relations aren't being
+renumbered (e.g. `-t node -t way` on the CLI).
+
+**Confidence +1 on our two-pass relation design.** The reference
+implementation does exactly this, it's the conventional shape, and we
+shouldn't waste time looking for a forward-ref buffering alternative.
+
+### Sorted-input requirement: also confirmed conventional.
+
+osmium uses `osmium::handler::CheckOrder` (`command_renumber.hpp:106`,
+`command_renumber.cpp:262,268,279`) and throws on unsorted input. The
+manpage (`man/osmium-renumber.md:21–24`) says explicitly:
+
+> *"This command expects the input file to be ordered in the usual way:
+> First nodes in order of ID, then ways in order of ID, then relations in
+> order of ID. Negative IDs are allowed, they must be ordered before the
+> positive IDs."*
+
+Users are expected to pre-sort with `osmium sort` if they have unsorted
+input. pbfhogg should follow suit — `renumber_external` keeps the
+existing `require_sorted` check and documents "pre-sort with pbfhogg
+sort" as the workflow for unsorted input. Open Question #6 in this doc
+resolves to "no, we don't build unsorted support into renumber."
+
+### `--start-id` semantics: worth matching osmium's surface.
+
+osmium's `-s / --start-id` flag accepts two forms (`command_renumber.cpp:149–163`,
+`:189`):
+
+- Single integer: `-s 100` → all three types start at 100.
+- Three comma-separated integers: `-s 1,100,-200` → nodes 1, ways 100,
+  relations start at −200 and count downward.
+
+Negative start IDs trigger a "count downward" mode (`command_renumber.cpp:61–66`):
+
+```cpp
+if (m_start_id < 0) {
+    return -id + m_start_id + 1;
+}
+return id + m_start_id - 1;
+```
+
+Our current `RenumberOptions { start_node_id, start_way_id,
+start_relation_id }` is functionally equivalent to osmium's three-tuple
+form. The negative-countdown mode is a bonus osmium feature we don't
+strictly need for correctness, but matching it costs ~5 LoC and gives
+users drop-in compatibility with osmium's CLI. Worth adding during the
+refactor since we're touching the code anyway.
+
+### Bonus finding: osmium's apply-changes does NOT blob-passthrough.
+
+Not strictly a renumber topic, but the research pass answered a
+long-standing question about why pbfhogg's `apply-changes` is ~15× faster
+than osmium's on planet-scale workloads. The answer: osmium decodes and
+re-encodes **every** blob.
+
+`osmium-tool/src/command_apply_changes.cpp:278–379` runs the base input
+through `osmium::io::Reader` (full decode of every buffer) and every
+object through a `std::set_union` merge against the sorted change buffer,
+piped to `osmium::io::Writer` (full re-encode of every object). There is
+no "if this blob doesn't touch any changed IDs, pass the raw bytes
+through" optimization anywhere in the code path. For a typical daily diff
+where ~94% of blobs contain zero changed IDs, pbfhogg's blob-passthrough
+skips PBF zlib decode + re-encode on 94% of the input — which is exactly
+where the ~15× speedup comes from, and it's a strict algorithmic
+improvement over the upstream design.
+
+This is documented here rather than in `notes/` elsewhere because the
+finding was a by-product of the renumber research. Worth remembering if
+anyone ever asks "why is pbfhogg so much faster at apply-changes" — it's
+not tuning, it's an architectural difference that osmium has not
+implemented.
+
+### Bonus finding: osmium `derive-changes` has a real bug at `command_derive_changes.cpp:184`.
+
+README's cross-validation section has long documented that "osmium's
+derived OSC loses 1243 delete directives" on our Denmark cross-validation
+run. The research pass traced the failure to a specific buggy line.
+
+`osmium-tool/src/command_derive_changes.cpp:176–192` is a dual-iterator
+merge walk over two sorted OSM files:
+
+```cpp
+while (it1 != end1 || it2 != end2) {
+    if (it2 == end2) {
+        write_deleted(writer, *it1);
+        ++it1;
+    } else if (it1 == end1 || *it2 < *it1) {
+        writer(*it2);
+        ++it2;
+    } else if (*it1 < *it2) {
+        if (it2->id() != it1->id()) {            // <-- BUG
+            write_deleted(writer, *it1);
+        }
+        ++it1;
+    } else { /* *it1 == *it2 */
+        ++it1;
+        ++it2;
+    }
+}
+```
+
+The guard on line 184 compares raw `int64` IDs. OSM IDs are unique
+**only within a type**, not across types. When the merge walks past a
+type boundary — e.g. `it1` is on a deleted node, `it2` is parked on the
+first way of the new file (because all common nodes have been visited) —
+the comparison `*it1 < *it2` evaluates TRUE (because libosmium's
+`OSMObject::operator<` orders `(type, sign(id), |id|, version, ...)` so
+node < way regardless of ID value). We enter the `else if` branch, and
+**any coincidental numeric ID match between the deleted node and the
+next way silently drops the delete**.
+
+At planet scale with tens of millions of deletes and the way ID space
+heavily overlapping the node ID space, 1243 false-negative deletes is
+entirely plausible — it's roughly the number of deleted objects whose
+numeric IDs happen to coincide with another-type objects at the specific
+merge-walk boundary positions.
+
+**The fix** is to compare `(it2->type(), it2->id()) != (it1->type(),
+it1->id())` instead of just `id()`. pbfhogg's `diff --format osc` must
+be using the correct tuple comparison, which is why our roundtrip test
+passes and osmium's doesn't.
+
+**This is a real upstream bug** worth filing against osmium-tool in a
+future session. For now it's documented here, with the commit history
+detail that a 2018 fix (commit `3edb895`) corrected `write_deleted` to
+emit the right object type but didn't revisit the merge-walk comparison.
+The bug is older than that fix and has been present in every released
+version since.
+
+### Takeaways for the external-join refactor
+
+1. **Our architecture is novel relative to osmium.** No prior art to
+   copy. osmium is in-memory-only, explicitly scoped out of planet.
+   We're solving a problem the reference implementation has chosen
+   not to solve. That's the right framing to carry into the
+   implementation and the eventual README writeup.
+2. **Two-pass relations: ship as designed.** Exactly what osmium does,
+   same reasoning, same structure. Confidence level on that call is
+   now higher.
+3. **Sorted-input requirement: ship as designed.** Don't build unsorted
+   support; users pre-sort via `pbfhogg sort`. Resolves Open Question #6.
+4. **`--start-id` interface: matches osmium's surface.** Cheap to add
+   the negative-countdown mode during the refactor for drop-in CLI
+   compatibility.
+5. **`ScratchDir` / `BucketWriters` extraction (Open Question #2):**
+   still an open decision, but the research confirms there's nothing
+   to reuse from libosmium — the extraction is purely within
+   pbfhogg's own codebase. Decide based on pbfhogg's internal
+   architecture, not cross-project concerns.
+6. **`apply-changes` blob passthrough is a strict improvement over
+   osmium.** Structural speedup, not a measurement artifact. Preserve
+   that code path during any future refactors.
+7. **`derive-changes` upstream bug is real and filed (as TODO in
+   README's cross-validation section).** Future session work.
 
 ## Code references
 

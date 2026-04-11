@@ -477,15 +477,25 @@ single-pass, tag expression and bbox filtering.
 
   Pre-implementation tasks (from the design doc's "Open questions" section):
 
-  - [ ] **Read libosmium's renumber source** to see how the reference
-    implementation handles planet-scale. osmium renumber exists and
-    presumably runs on planet; their architecture choice (in-memory?
-    external sort? b-tree on disk? spatial index?) is worth knowing
-    before committing to our own external-join design. Small task —
-    ~1 hour of source reading. Informs but doesn't block implementation:
-    we can proceed with the design-doc architecture even if osmium's
-    approach is different, but understanding "different how, and why"
-    is useful context. Design doc open question #3.
+  - [x] **Read libosmium's renumber source** — done 2026-04-11 via
+    Opus Explore agent on `research/libosmium/` and
+    `research/osmium-tool/`. Finding: osmium is in-memory-only
+    (bespoke `id_map` class in `command_renumber.cpp`, sorted vector
+    + unordered_map overflow, 8 bytes per ID floor), explicitly
+    documented in the upstream manpage as "needs >32 GB RAM for
+    planet." No external-join prior art to copy; our design is novel
+    relative to the reference. Research also validated our two-pass
+    relation handling (osmium does the same thing), our sorted-input
+    requirement (osmium enforces the same), and our `--start-id`
+    CLI surface (osmium has the identical three-tuple form plus a
+    bonus negative-countdown mode we could match). Full findings in
+    `notes/renumber-planet-scale.md` "Prior art: osmium renumber"
+    section, including two bonus findings: osmium `apply-changes`
+    does not blob-passthrough (confirms the ~15x pbfhogg speedup is
+    structural), and osmium `derive-changes` has a real bug at
+    `command_derive_changes.cpp:184` (raw int64 ID comparison without
+    type discrimination — source of the "1243 missing deletes" in our
+    README cross-validation section).
   - [ ] **Extract `ScratchDir` / `BucketWriters` from
     `src/commands/external_join.rs`** into a shared module (proposed
     name `src/external_radix.rs`) so both `external_join` and the new

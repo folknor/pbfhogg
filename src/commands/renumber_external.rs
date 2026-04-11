@@ -397,15 +397,20 @@ pub fn renumber_external(
         compute_bucket_new_id_starts(opts.start_node_id, &node_map_counts);
 
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_START");
-    let mut slot_buckets = BucketWriters::create(&scratch, "slot")?;
+    // Two slot-bucket shards, one per stage 2b worker. Stage 2c reads
+    // from both when assembling the flat new_refs file.
+    let mut slot_buckets_a = BucketWriters::create(&scratch, "slot-a")?;
+    let mut slot_buckets_b = BucketWriters::create(&scratch, "slot-b")?;
     let resolved_count = stage2b_node_merge_join(
         &way_ref_buckets,
         &node_map_buckets,
         &node_map_bucket_starts,
-        &mut slot_buckets,
+        &mut slot_buckets_a,
+        &mut slot_buckets_b,
         total_slots,
     )?;
-    slot_buckets.finish()?;
+    slot_buckets_a.finish()?;
+    slot_buckets_b.finish()?;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("renumber_ext_resolved_entries", resolved_count as i64);
@@ -426,8 +431,13 @@ pub fn renumber_external(
     // ---- Pass 2 stage C: slot reorder → flat new_refs file ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_START");
     let new_refs_path: PathBuf = scratch.file_path("new-refs");
-    stage2c_slot_reorder(&slot_buckets, &new_refs_path, total_slots)?;
-    slot_buckets.cleanup();
+    stage2c_slot_reorder(
+        &[&slot_buckets_a, &slot_buckets_b],
+        &new_refs_path,
+        total_slots,
+    )?;
+    slot_buckets_a.cleanup();
+    slot_buckets_b.cleanup();
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_END");
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
@@ -483,33 +493,39 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
 
     // ---- Relation pass R2b: merge-join node/way members against maps ----
-    // Reuses the same stage2b_node_merge_join function used for the way
-    // pass. Passes the pre-computed bucket_new_id_starts for whichever
-    // map (node_map or way_map) is being used as the lookup side.
+    // Reuses the same parallel stage2b_node_merge_join function used for
+    // the way pass. Each call produces two slot shards (A and B) that
+    // stage R2c reads as a slice.
     crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
     let way_map_bucket_starts =
         compute_bucket_new_id_starts(opts.start_way_id, &way_map_counts);
 
-    let mut node_member_slot_buckets = BucketWriters::create(&scratch, "rel-node-slot")?;
+    let mut node_member_slot_a = BucketWriters::create(&scratch, "rel-node-slot-a")?;
+    let mut node_member_slot_b = BucketWriters::create(&scratch, "rel-node-slot-b")?;
     stage2b_node_merge_join(
         &node_member_ref_buckets,
         &node_map_buckets,
         &node_map_bucket_starts,
-        &mut node_member_slot_buckets,
+        &mut node_member_slot_a,
+        &mut node_member_slot_b,
         total_node_members,
     )?;
-    node_member_slot_buckets.finish()?;
+    node_member_slot_a.finish()?;
+    node_member_slot_b.finish()?;
     node_member_ref_buckets.cleanup();
 
-    let mut way_member_slot_buckets = BucketWriters::create(&scratch, "rel-way-slot")?;
+    let mut way_member_slot_a = BucketWriters::create(&scratch, "rel-way-slot-a")?;
+    let mut way_member_slot_b = BucketWriters::create(&scratch, "rel-way-slot-b")?;
     stage2b_node_merge_join(
         &way_member_ref_buckets,
         &way_map_buckets,
         &way_map_bucket_starts,
-        &mut way_member_slot_buckets,
+        &mut way_member_slot_a,
+        &mut way_member_slot_b,
         total_way_members,
     )?;
-    way_member_slot_buckets.finish()?;
+    way_member_slot_a.finish()?;
+    way_member_slot_b.finish()?;
     way_member_ref_buckets.cleanup();
     crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
 
@@ -517,19 +533,21 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R2C_START");
     let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
     stage2c_slot_reorder(
-        &node_member_slot_buckets,
+        &[&node_member_slot_a, &node_member_slot_b],
         &node_member_new_refs_path,
         total_node_members,
     )?;
-    node_member_slot_buckets.cleanup();
+    node_member_slot_a.cleanup();
+    node_member_slot_b.cleanup();
 
     let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
     stage2c_slot_reorder(
-        &way_member_slot_buckets,
+        &[&way_member_slot_a, &way_member_slot_b],
         &way_member_new_refs_path,
         total_way_members,
     )?;
-    way_member_slot_buckets.cleanup();
+    way_member_slot_a.cleanup();
+    way_member_slot_b.cleanup();
     crate::debug::emit_marker("RENUMBER_EXT_R2C_END");
 
     // ---- Relation pass R2d: write renumbered relations to output ----
@@ -551,12 +569,15 @@ pub fn renumber_external(
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
-    drop(node_member_slot_buckets);
-    drop(way_member_slot_buckets);
+    drop(node_member_slot_a);
+    drop(node_member_slot_b);
+    drop(way_member_slot_a);
+    drop(way_member_slot_b);
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
     drop(way_map_buckets);
-    drop(slot_buckets);
+    drop(slot_buckets_a);
+    drop(slot_buckets_b);
     drop(way_ref_buckets);
     drop(node_map_buckets);
     drop(scratch);
@@ -567,7 +588,7 @@ pub fn renumber_external(
 }
 
 // ---------------------------------------------------------------------------
-// Hot-path helper: write one IdPair into the correct node_map bucket
+// Hot-path helper: write one old id into the correct bucket
 // ---------------------------------------------------------------------------
 
 /// Compute the per-bucket new-id start offsets from a bucket-count
@@ -982,90 +1003,201 @@ mod radix_tests {
 /// With cleanup, it drops to `node_map + per-bucket way_ref (~650 MB)
 /// + slot = ~219 GB`. node_map stays alive because the relation pass
 /// needs it.
-#[hotpath::measure]
+/// Per-worker scratch buffers for stage 2b. Kept in a struct so the
+/// bucket-processing loop can declare one instance per worker and
+/// reuse allocations across its claimed buckets.
+struct Stage2bScratch {
+    way_refs: Vec<CooPair>,
+    way_refs_data: Vec<u8>,
+    way_refs_scratch: Vec<CooPair>,
+    node_map: Vec<i64>,
+    node_map_data: Vec<u8>,
+    entry_buf: [u8; RESOLVED_ENTRY_SIZE],
+}
+
+impl Stage2bScratch {
+    fn new() -> Self {
+        Self {
+            way_refs: Vec::new(),
+            way_refs_data: Vec::new(),
+            way_refs_scratch: Vec::new(),
+            node_map: Vec::new(),
+            node_map_data: Vec::new(),
+            entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
+        }
+    }
+}
+
+/// Process one source bucket for stage 2b: load, radix-sort, merge-join
+/// against node_map, emit resolved entries into `slot_buckets`.
+/// Returns the number of entries emitted (same as the bucket's way_ref
+/// entry count, since every way-ref produces exactly one resolved
+/// entry — orphan or not).
+///
+/// Deletes the way_ref bucket file on disk after reading it into RAM
+/// to minimize temp disk footprint. Safe because the bucket file is
+/// not read again by any other stage.
 #[allow(clippy::cast_possible_wrap)]
-fn stage2b_node_merge_join(
+fn stage2b_process_bucket(
+    bucket_idx: usize,
     way_ref_buckets: &BucketWriters,
     node_map_buckets: &BucketWriters,
     bucket_new_id_starts: &[i64; NUM_BUCKETS],
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
+    scratch: &mut Stage2bScratch,
 ) -> Result<u64> {
-    let mut resolved_count: u64 = 0;
-    let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
+    if way_ref_buckets.entry_counts[bucket_idx] == 0 {
+        return Ok(0);
+    }
 
-    // Scratch buffers reused across bucket loads. Prevents heap
-    // accumulation at planet scale. `load_coo_bucket` / `load_old_id_bucket`
-    // explicitly drop their data_buf backing store after parsing, so the
-    // raw bytes aren't held alongside the parsed Vecs during the merge-join.
-    let mut way_refs: Vec<CooPair> = Vec::new();
-    let mut way_refs_data: Vec<u8> = Vec::new();
-    let mut way_refs_scratch: Vec<CooPair> = Vec::new();
-    let mut node_map: Vec<i64> = Vec::new();
-    let mut node_map_data: Vec<u8> = Vec::new();
+    load_coo_bucket(
+        &way_ref_buckets.paths[bucket_idx],
+        &mut scratch.way_refs_data,
+        &mut scratch.way_refs,
+    )?;
+    // Delete the way_ref bucket file now that we've read it into
+    // RAM — no further stage consumes it. Cuts peak temp disk.
+    drop(std::fs::remove_file(&way_ref_buckets.paths[bucket_idx]));
+    // LSD radix sort by old_node_id — see `radix_sort_coo_pairs`.
+    radix_sort_coo_pairs(&mut scratch.way_refs, &mut scratch.way_refs_scratch);
 
-    for bucket_idx in 0..NUM_BUCKETS {
-        if way_ref_buckets.entry_counts[bucket_idx] == 0 {
-            continue;
-        }
-        load_coo_bucket(
-            &way_ref_buckets.paths[bucket_idx],
-            &mut way_refs_data,
-            &mut way_refs,
+    // node_map is already sorted by old_id because pass 1 scans a
+    // sorted input and emits in file order, and `id_bucket` is
+    // monotonic in the input id.
+    scratch.node_map.clear();
+    if node_map_buckets.entry_counts[bucket_idx] > 0 {
+        load_old_id_bucket(
+            &node_map_buckets.paths[bucket_idx],
+            &mut scratch.node_map_data,
+            &mut scratch.node_map,
         )?;
-        // Delete the way_ref bucket file now that we've read it into
-        // RAM — no further stage consumes it. Cuts peak temp disk.
-        drop(std::fs::remove_file(&way_ref_buckets.paths[bucket_idx]));
-        // LSD radix sort by old_node_id — see `radix_sort_coo_pairs`.
-        radix_sort_coo_pairs(&mut way_refs, &mut way_refs_scratch);
+    }
 
-        // node_map is already sorted by old_id because pass 1 scans a
-        // sorted input and emits in file order, and `id_bucket` is
-        // monotonic in the input id.
-        node_map.clear();
-        if node_map_buckets.entry_counts[bucket_idx] > 0 {
-            load_old_id_bucket(
-                &node_map_buckets.paths[bucket_idx],
-                &mut node_map_data,
-                &mut node_map,
-            )?;
+    let bucket_base = bucket_new_id_starts[bucket_idx];
+
+    // Two-cursor merge. Both sides sorted by old id; the node_map
+    // cursor only moves forward, so the walk is O(way_refs + node_map).
+    let mut resolved_count: u64 = 0;
+    let mut nm_cursor: usize = 0;
+    for wr in &scratch.way_refs {
+        while nm_cursor < scratch.node_map.len() && scratch.node_map[nm_cursor] < wr.old_node_id {
+            nm_cursor += 1;
         }
-
-        // new_id for the i-th entry in this bucket.
-        let bucket_base = bucket_new_id_starts[bucket_idx];
-
-        // Two-cursor merge. Both sides sorted by old id; the node_map
-        // cursor only moves forward, so the walk is O(way_refs + node_map).
-        let mut nm_cursor: usize = 0;
-        for wr in &way_refs {
-            while nm_cursor < node_map.len() && node_map[nm_cursor] < wr.old_node_id {
-                nm_cursor += 1;
-            }
-            let resolved_id = if nm_cursor < node_map.len()
-                && node_map[nm_cursor] == wr.old_node_id
-            {
-                // Position-based new id reconstruction.
-                bucket_base + nm_cursor as i64
-            } else {
-                // Orphan ref: no matching entry. Preserve old id,
-                // matching in-memory renumber's unwrap_or(old_id) policy.
-                wr.old_node_id
-            };
-            let entry = ResolvedEntry {
-                slot_pos: wr.slot_pos,
-                new_node_id: resolved_id,
-            };
-            let sb = entry.slot_bucket(total_slots);
-            entry.write_to(&mut entry_buf);
-            if let Some(w) = slot_buckets.writers[sb].as_mut() {
-                w.write_all(&entry_buf)?;
-            }
-            slot_buckets.entry_counts[sb] += 1;
-            resolved_count += 1;
+        let resolved_id = if nm_cursor < scratch.node_map.len()
+            && scratch.node_map[nm_cursor] == wr.old_node_id
+        {
+            // Position-based new id reconstruction.
+            bucket_base + nm_cursor as i64
+        } else {
+            // Orphan ref: no matching entry. Preserve old id,
+            // matching in-memory renumber's unwrap_or(old_id) policy.
+            wr.old_node_id
+        };
+        let entry = ResolvedEntry {
+            slot_pos: wr.slot_pos,
+            new_node_id: resolved_id,
+        };
+        let sb = entry.slot_bucket(total_slots);
+        entry.write_to(&mut scratch.entry_buf);
+        if let Some(w) = slot_buckets.writers[sb].as_mut() {
+            w.write_all(&scratch.entry_buf)?;
         }
+        slot_buckets.entry_counts[sb] += 1;
+        resolved_count += 1;
     }
 
     Ok(resolved_count)
+}
+
+/// Two-worker parallel stage 2b. Workers compete for source buckets
+/// via an atomic index counter — each worker claims the next unclaimed
+/// bucket, processes it to completion (including file delete), then
+/// grabs the next. Perfect load balance at the cost of a single
+/// `fetch_add` per bucket.
+///
+/// Each worker writes to its own `slot_buckets` shard (A or B). Stage
+/// 2c later reads from BOTH shards when assembling the flat `new_refs`
+/// file. Contention-free within stage 2b; zero lock overhead.
+///
+/// Memory at planet scale with 2 workers after the map-format shrink:
+/// 2 × (way_refs ~530 MB + way_refs_scratch ~530 MB + node_map ~325 MB +
+/// node_map_data transient ~325 MB) = ~3.4 GB peak, within the 4 GB
+/// design target. A third worker would overshoot; 2 is the ceiling.
+///
+/// The function signature takes both shards because each worker needs
+/// exclusive mutable access to one. Callers must pre-create two
+/// `BucketWriters` with distinct scratch prefixes (e.g. `"slot-a"` and
+/// `"slot-b"`).
+#[hotpath::measure]
+fn stage2b_node_merge_join(
+    way_ref_buckets: &BucketWriters,
+    node_map_buckets: &BucketWriters,
+    bucket_new_id_starts: &[i64; NUM_BUCKETS],
+    slot_buckets_a: &mut BucketWriters,
+    slot_buckets_b: &mut BucketWriters,
+    total_slots: u64,
+) -> Result<u64> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let next_bucket = AtomicUsize::new(0);
+
+    // Worker closures return `std::result::Result<u64, String>` instead
+    // of the module `Result<u64>` — the latter's error type
+    // (`Box<dyn Error>`) isn't Send, so it can't cross `thread::scope`
+    // boundaries. We stringify inside the worker and convert back at
+    // the join point.
+    type WorkerResult = std::result::Result<u64, String>;
+
+    let (count_a, count_b) = std::thread::scope(|s| -> Result<(u64, u64)> {
+        let next_ref = &next_bucket;
+        let nm_starts = bucket_new_id_starts;
+
+        let handle_a = s.spawn(move || -> WorkerResult {
+            let mut scratch = Stage2bScratch::new();
+            let mut count = 0u64;
+            loop {
+                let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= NUM_BUCKETS {
+                    break;
+                }
+                count += stage2b_process_bucket(
+                    i, way_ref_buckets, node_map_buckets, nm_starts,
+                    slot_buckets_a, total_slots, &mut scratch,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(count)
+        });
+        let handle_b = s.spawn(move || -> WorkerResult {
+            let mut scratch = Stage2bScratch::new();
+            let mut count = 0u64;
+            loop {
+                let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                if i >= NUM_BUCKETS {
+                    break;
+                }
+                count += stage2b_process_bucket(
+                    i, way_ref_buckets, node_map_buckets, nm_starts,
+                    slot_buckets_b, total_slots, &mut scratch,
+                )
+                .map_err(|e| e.to_string())?;
+            }
+            Ok(count)
+        });
+
+        let count_a = handle_a
+            .join()
+            .map_err(|_| "stage 2b worker A panicked".to_string())?
+            .map_err(|e| format!("stage 2b worker A: {e}"))?;
+        let count_b = handle_b
+            .join()
+            .map_err(|_| "stage 2b worker B panicked".to_string())?
+            .map_err(|e| format!("stage 2b worker B: {e}"))?;
+        Ok((count_a, count_b))
+    })?;
+
+    Ok(count_a + count_b)
 }
 
 /// Load a bucket file of `CooPair` tuples into the provided `pairs` Vec,
@@ -1132,6 +1264,14 @@ fn load_coo_bucket(
 /// holds one `i64 LE new_node_id` per slot_pos, ready for stage 2d to
 /// pread sequentially as it walks each way blob.
 ///
+/// `slot_bucket_shards` is a slice of shard sets. Stage 2b's
+/// two-worker parallelism produces TWO shards (A and B), each a full
+/// `BucketWriters` with 256 files. For each `bucket_idx`, this
+/// function reads the bytes from every shard's corresponding file,
+/// concatenates into a single parse buffer, and scatters the combined
+/// resolved entries into the output buffer. The single-shard case
+/// (older call sites, R2B) passes a one-element slice.
+///
 /// Empty slot buckets (a slot-pos range with no refs that landed in it)
 /// get zero-byte fills — harmless because stage 2d's way assembly reads
 /// each slot indexed by the actual way's (blob_slot_start, ref_index)
@@ -1139,7 +1279,7 @@ fn load_coo_bucket(
 #[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
 fn stage2c_slot_reorder(
-    slot_buckets: &BucketWriters,
+    slot_bucket_shards: &[&BucketWriters],
     new_refs_path: &Path,
     total_slots: u64,
 ) -> Result<()> {
@@ -1164,7 +1304,13 @@ fn stage2c_slot_reorder(
         }
         let bucket_slots = bucket_end - bucket_start;
 
-        if slot_buckets.entry_counts[bucket_idx] == 0 {
+        // Sum entry counts across shards for this bucket.
+        let total_bucket_entries: u64 = slot_bucket_shards
+            .iter()
+            .map(|s| s.entry_counts[bucket_idx])
+            .sum();
+
+        if total_bucket_entries == 0 {
             // Empty bucket: write zero-filled range. Stage 2d never reads
             // these positions because the flat file is addressed by ref
             // positions that map 1:1 to emitted slots, but we still need
@@ -1181,26 +1327,34 @@ fn stage2c_slot_reorder(
         scatter_buf.clear();
         scatter_buf.resize(bucket_bytes, 0);
 
+        // Read bytes from each shard's bucket file and concatenate.
+        // Entry order within data_buf doesn't matter — every entry is
+        // scattered by slot_pos into scatter_buf regardless of its
+        // position in the input stream.
         data_buf.clear();
-        let file = std::fs::File::open(&slot_buckets.paths[bucket_idx]).map_err(|e| {
-            format!(
-                "failed to open slot bucket {}: {e}",
-                slot_buckets.paths[bucket_idx].display()
-            )
-        })?;
-        std::io::Read::read_to_end(&mut &file, &mut data_buf).map_err(|e| {
-            format!(
-                "failed to read slot bucket {}: {e}",
-                slot_buckets.paths[bucket_idx].display()
-            )
-        })?;
-        #[cfg(feature = "linux-direct-io")]
-        super::external_radix::advise_dontneed_file(&file);
+        for shard in slot_bucket_shards {
+            if shard.entry_counts[bucket_idx] == 0 {
+                continue;
+            }
+            let file = std::fs::File::open(&shard.paths[bucket_idx]).map_err(|e| {
+                format!(
+                    "failed to open slot bucket {}: {e}",
+                    shard.paths[bucket_idx].display()
+                )
+            })?;
+            std::io::Read::read_to_end(&mut &file, &mut data_buf).map_err(|e| {
+                format!(
+                    "failed to read slot bucket {}: {e}",
+                    shard.paths[bucket_idx].display()
+                )
+            })?;
+            #[cfg(feature = "linux-direct-io")]
+            super::external_radix::advise_dontneed_file(&file);
+        }
 
         if !data_buf.len().is_multiple_of(RESOLVED_ENTRY_SIZE) {
             return Err(format!(
-                "slot bucket {} is {} bytes, not a multiple of {RESOLVED_ENTRY_SIZE} — truncated or corrupt",
-                slot_buckets.paths[bucket_idx].display(),
+                "slot bucket {bucket_idx} shards total {} bytes, not a multiple of {RESOLVED_ENTRY_SIZE} — truncated or corrupt",
                 data_buf.len()
             )
             .into());

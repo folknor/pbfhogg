@@ -240,18 +240,89 @@ writer itself.
 
 ## Temp disk estimate
 
+**Revised 2026-04-11 against the shipped implementation.** The
+original table below was an underestimate — the full-review pass
+enumerated every scratch file the pipeline actually creates and
+totaled them against the real coexistence windows. Reviewers
+reached consensus on a peak closer to 300-440 GB, not 185 GB.
+
+### Original estimate (design-time, inaccurate)
+
 | File | Planet size | Notes |
 |---|---|---|
 | `node_map.tuples` / 256 buckets | ~166 GB | 10.4B × 16 B pairs |
 | `way_map.tuples` / 256 buckets | ~19 GB | 1.17B × 16 B pairs |
 | Way-ref scratch (pass 2) | <1 GB peak | per-bucket sort buffer |
 | Relation-ref scratch (pass R1) | <100 MB peak | far fewer refs |
-| **Peak temp disk** | **~185 GB** | before cleanup |
+| **Peak temp disk (design)** | **~185 GB** | optimistic |
 
-After pass 2 completes, `node_map.tuples` can be deleted. After pass
-R2, `way_map.tuples` can be deleted. Peak is reached during pass R1
-when both map files are still present. Comparable to ALTW external's
-~300 GB planet temp disk footprint.
+### Measured design (what the shipped code produces)
+
+The implementation writes every bucket set listed below. Coexistence
+windows matter — at any given point, only a subset is live on disk
+simultaneously. Stage-2b's per-bucket cleanup (cutting `way_ref`
+buckets as their merge-join completes) is in place, so `way_ref`'s
+full ~136 GB is never resident at peak. But `node_map + way_ref +
+slot` do all coexist at the *start* of stage 2b before any per-bucket
+cleanups land, because stage 2a finishes writing all 256 `way_ref`
+buckets before stage 2b begins.
+
+| File | Planet size | Lifetime |
+|---|---|---|
+| `node_map-NNN` × 256 | ~166 GB | Pass 1 → end of renumber_external |
+| `way_ref-NNN` × 256 | ~136 GB | Stage 2a → per-bucket cleanup during stage 2b |
+| `slot-NNN` × 256 | ~136 GB | Stage 2b → stage 2c consumption |
+| `new_refs` flat file | ~83 GB | Stage 2c → end of stage 2d |
+| `way_map-NNN` × 256 | ~19 GB | Stage 2d → end of renumber_external |
+| `way-ref-counts` sidecar | ~200 KB | Stage 2a → stage 2d |
+| `rel-node-ref` + `rel-way-ref` buckets | ~3 GB | R1+R2a fused → R2b |
+| `rel-node-slot` + `rel-way-slot` buckets | ~3 GB | R2b → R2c |
+| `rel-node-new-refs` + `rel-way-new-refs` flat files | ~1.6 GB | R2c → R2d |
+
+**Peak coexistence windows**:
+
+1. **Start of stage 2b**: `node_map` (166 GB) + `way_ref` (136 GB) +
+   empty `slot` buckets = ~302 GB.
+2. **End of stage 2b**: per-bucket `way_ref` cleanup has run, but
+   the last bucket's way_ref may still be in flight (~0.65 GB). Plus
+   full `node_map` (166 GB) + growing `slot` (up to 136 GB). Peak:
+   ~302 GB again, approximately.
+3. **Stage 2c**: `node_map` (166 GB) + `slot` (136 GB) + growing
+   `new_refs` (up to 83 GB). Peak before slot_buckets cleanup:
+   ~385 GB.
+4. **Stage 2d start**: `node_map` (166 GB) + `new_refs` (83 GB) +
+   empty `way_map` = ~249 GB.
+5. **Stage 2d end**: `node_map` (166 GB) + `new_refs` (83 GB) +
+   full `way_map` (19 GB) = ~268 GB.
+6. **R1+R2a fused**: previous state + `rel-node-ref` + `rel-way-ref`
+   = ~271 GB.
+7. **R2b/R2c/R2d**: similar, ~275 GB peak.
+
+**Peak temp disk: ~385 GB** during stage 2c before `slot_buckets`
+cleanup. Close to the ALTW external's ~300 GB planet footprint,
+slightly higher because renumber has a richer set of intermediate
+files (`new_refs` flat + 4 relation-member bucket sets) that ALTW
+doesn't.
+
+**Budget implication**: the plantasjen host's data drive needs at
+least 450-500 GB free before running planet renumber. On a host
+with 180 GB NVMe (which might be tempting to optimize for), this
+won't fit. Document in the README planet-scale table once the
+actual bench lands.
+
+### Mitigations
+
+- **Shipped**: per-bucket `way_ref` cleanup during stage 2b loop
+  (cuts peak by ~136 GB vs batch cleanup).
+- **Followup (tracked in TODO.md)**: sparse-file `new_refs` via
+  `set_len` + `pwrite` so the flat file backs only populated slots.
+  Would remove ~83 GB from the peak at stage 2c.
+- **Followup**: delete `slot_buckets` per-bucket during stage 2c
+  scatter, analogous to the stage 2b cleanup. Cuts another ~136 GB
+  from the peak 3 window.
+
+With both followups applied, peak drops toward ~250 GB, roughly
+matching the ALTW external budget.
 
 ## Wall time estimate
 

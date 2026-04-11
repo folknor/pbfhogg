@@ -11,8 +11,8 @@
 mod common;
 
 use common::{
-    assert_elements_equivalent, read_normalized, write_test_pbf_sorted, TestMember, TestNode,
-    TestRelation, TestWay,
+    assert_elements_equivalent, assert_sorted_file, read_normalized, write_test_pbf_sorted,
+    TestMember, TestNode, TestRelation, TestWay,
 };
 use pbfhogg::renumber::{renumber, RenumberOptions};
 use pbfhogg::renumber_external::renumber_external;
@@ -117,6 +117,50 @@ fn external_pass1_respects_custom_start_id() {
 // ---------------------------------------------------------------------------
 // Relations: R1 + R2 end-to-end
 // ---------------------------------------------------------------------------
+
+#[test]
+fn external_preserves_sorted_header_and_type_order() {
+    // Dedicated sortedness check: an input with every element type
+    // must produce an output that passes `assert_sorted_file`. Failure
+    // modes this catches:
+    // - Missing sorted header flag on the output
+    // - Out-of-order ids within a type
+    // - Types interleaved across blobs (nodes after ways, etc.)
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+            TestWay { id: 20, refs: vec![2, 3], tags: vec![] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![
+                    TestMember { id: MemberId::Node(1), role: "a" },
+                    TestMember { id: MemberId::Way(10), role: "b" },
+                ],
+                tags: vec![("type", "route")],
+            },
+        ],
+    );
+
+    renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+
+    assert_sorted_file(&output);
+}
 
 #[test]
 fn external_relations_basic_end_to_end() {
@@ -431,6 +475,13 @@ fn external_nodes_and_ways_end_to_end() {
     // metadata) even if their byte representations differ. This is the
     // comparison harness designed in task #9.
     assert_elements_equivalent(&output_ext, &output_inmem);
+
+    // Sortedness invariant: both outputs must have the sorted header
+    // flag set and emit elements in monotonic file order within each
+    // type. `assert_elements_equivalent` sorts by id internally so it
+    // can miss file-order regressions — this check catches them.
+    assert_sorted_file(&output_ext);
+    assert_sorted_file(&output_inmem);
 
     // Spot-check the expected remapping.
     let norm = read_normalized(&output_ext);

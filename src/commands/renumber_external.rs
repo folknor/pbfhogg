@@ -453,22 +453,22 @@ pub fn renumber_external(
     }
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
-    // ---- Relation pass R1: assign new ids, build in-memory relation_map ----
-    crate::debug::emit_marker("RENUMBER_EXT_R1_START");
-    relation_r1_assign_ids(input, direct_io, &mut relation_map, &mut next_relation_id)?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
-    }
-    crate::debug::emit_marker("RENUMBER_EXT_R1_END");
-
-    // ---- Relation pass R2a: emit node/way member refs into buckets ----
-    crate::debug::emit_marker("RENUMBER_EXT_R2A_START");
+    // ---- Relation passes R1 + R2a (fused): assign ids + emit member refs ----
+    // Single scan over relation blobs. R1 assigns new_relation_ids and
+    // builds the in-memory relation_map. R2a emits (old_id, slot_pos)
+    // COO pairs for node and way members into their respective bucket
+    // sets. Both halves operate on each relation in isolation — R2a
+    // does not consult relation_map (relation members are resolved in
+    // R2d directly), so the two passes can share a single decoded
+    // block.
+    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_START");
     let mut node_member_ref_buckets = BucketWriters::create(&scratch, "rel-node-ref")?;
     let mut way_member_ref_buckets = BucketWriters::create(&scratch, "rel-way-ref")?;
-    let (total_node_members, total_way_members) = relation_r2a_emit_member_refs(
+    let (total_node_members, total_way_members) = relation_r1_r2a_fused(
         input,
         direct_io,
+        &mut relation_map,
+        &mut next_relation_id,
         &mut node_member_ref_buckets,
         &mut way_member_ref_buckets,
     )?;
@@ -476,10 +476,11 @@ pub fn renumber_external(
     way_member_ref_buckets.finish()?;
     #[allow(clippy::cast_possible_wrap)]
     {
+        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
         crate::debug::emit_counter("renumber_ext_rel_node_members", total_node_members as i64);
         crate::debug::emit_counter("renumber_ext_rel_way_members", total_way_members as i64);
     }
-    crate::debug::emit_marker("RENUMBER_EXT_R2A_END");
+    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
 
     // ---- Relation pass R2b: merge-join node/way members against maps ----
     // Reuses the same stage2b_node_merge_join function used for the way
@@ -1278,85 +1279,51 @@ fn build_blob_schedule(
 }
 
 // ---------------------------------------------------------------------------
-// Relation pass R1: assign new relation ids, build in-memory relation_map
+// Relation pass R1 + R2a (fused): assign new ids AND emit member refs
 // ---------------------------------------------------------------------------
 
-/// Stream relation blobs, assign new sequential ids, build the in-memory
-/// `relation_map: FxHashMap<i64, i64>`. The map is ~340 MB at planet
-/// scale (14.1M entries × 24 bytes), which fits comfortably in RAM even
-/// when node_map and way_map must live in external buckets.
+/// Single scan over relation blobs that performs both pass R1
+/// (assign new relation ids + build in-memory `relation_map`) AND
+/// pass R2a (emit `(old_id, slot_pos)` COO pairs for each node member
+/// and way member into their respective bucket sets).
 ///
-/// Does NOT write any relations to the output PBF. That's pass R2.
+/// ## Why fusing is safe
 ///
-/// Uses the schedule + pread pattern so only relation blobs pay disk
-/// I/O — at planet scale, relation blobs are ~3% of the file so this
-/// is ~97% less I/O than the prior pattern of reading every blob's
-/// compressed body.
+/// The two passes are independent per-relation:
+///
+/// - R1 side: inserts `(r.id(), new_id)` into `relation_map`.
+/// - R2a side: walks `r.members()` and emits node/way member CooPairs
+///   into buckets. Does **not** consult `relation_map` — relation
+///   members resolve directly from the in-memory map in R2d, not here.
+///
+/// So both halves operate on the current relation in isolation and can
+/// share the same decoded block. Fusing saves one full relation scan
+/// (decode + iterate), which at planet scale is ~14M relations spread
+/// across ~13K relation blobs.
+///
+/// ## State
+///
+/// - `relation_map` is populated with every relation's (old, new) pair.
+///   Must be fully loaded before R2d reads it — R2d runs after R2b/R2c,
+///   by which point this scan has completed.
+/// - `next_relation_id` advances monotonically.
+/// - `node_slot_pos` and `way_slot_pos` are independent slot counters.
+///   R2d walks relations in the same file order with matching counters,
+///   so the flat resolved files produced by R2b/R2c line up 1:1 with
+///   each member position.
+///
+/// Returns `(total_node_members, total_way_members)`.
+///
+/// Replaces the prior `relation_r1_assign_ids` + `relation_r2a_emit_member_refs`
+/// pair from the first cut of task #4. Review finding #8 — one scan
+/// instead of two.
 #[hotpath::measure]
-fn relation_r1_assign_ids(
+#[allow(clippy::too_many_arguments)]
+fn relation_r1_r2a_fused(
     input: &Path,
     _direct_io: bool,
     relation_map: &mut FxHashMap<i64, i64>,
     next_relation_id: &mut i64,
-) -> Result<()> {
-    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
-
-    let pool = crate::blob::DecompressPool::new();
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-    use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        raw_buf.resize(data_size, 0);
-        shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
-        let mut decompress_buf = pool.get();
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf,
-            &pool,
-            &mut st_scratch,
-            &mut gr_scratch,
-        )?;
-        for element in block.elements() {
-            if let Element::Relation(r) = &element {
-                reject_negative_id(r.id(), "relation")?;
-                let new_id = *next_relation_id;
-                *next_relation_id += 1;
-                relation_map.insert(r.id(), new_id);
-            }
-        }
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Relation pass R2a: emit node and way member ref COO pairs
-// ---------------------------------------------------------------------------
-
-/// Stream relation blobs and emit `(old_id, slot_pos)` COO pairs for
-/// each node member and way member into their respective bucket sets.
-///
-/// Relation members and unknown members are skipped — they don't need
-/// merge-join lookups. Relation members resolve directly from the
-/// in-memory relation_map in R2d; unknown members preserve their old
-/// ids unchanged.
-///
-/// Uses two independent slot counters — `node_slot_pos` and
-/// `way_slot_pos` — that advance in the order members are encountered.
-/// R2d walks relations in the same order and maintains matching
-/// counters, so the flat resolved files produced by R2b/R2c line up
-/// with each member position without any per-relation index bookkeeping.
-///
-/// Returns `(total_node_members, total_way_members)`.
-#[hotpath::measure]
-fn relation_r2a_emit_member_refs(
-    input: &Path,
-    _direct_io: bool,
     node_member_buckets: &mut BucketWriters,
     way_member_buckets: &mut BucketWriters,
 ) -> Result<(u64, u64)> {
@@ -1389,6 +1356,13 @@ fn relation_r2a_emit_member_refs(
         )?;
         for element in block.elements() {
             if let Element::Relation(r) = &element {
+                // R1 side: assign new id + record in relation_map.
+                reject_negative_id(r.id(), "relation")?;
+                let new_id = *next_relation_id;
+                *next_relation_id += 1;
+                relation_map.insert(r.id(), new_id);
+
+                // R2a side: emit member refs for merge-join lookup.
                 for m in r.members() {
                     match m.id {
                         MemberId::Node(old_id) => {

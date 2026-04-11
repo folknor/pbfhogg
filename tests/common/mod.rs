@@ -585,6 +585,69 @@ pub fn read_normalized(path: &Path) -> NormalizedPbf {
     contents
 }
 
+/// Assert that a PBF file is sorted by `Sort.Type_then_ID`:
+///
+/// - The header block declares `is_sorted() == true`.
+/// - Elements appear in file order as nodes → ways → relations (no
+///   out-of-order type transitions).
+/// - Within each type, ids are monotonically non-decreasing.
+///
+/// `read_normalized` sorts sections internally, so bugs that emit
+/// elements in the wrong file order can't be caught by element-
+/// equivalence alone. This helper reads the file in raw order via
+/// `read_all_elements_with_coords` (which preserves blob order) and
+/// asserts the sortedness contract.
+pub fn assert_sorted_file(path: &Path) {
+    // Header flag check.
+    let header = read_header(path);
+    assert!(
+        header.is_sorted(),
+        "PBF header is not declared sorted (Sort.Type_then_ID missing) for {}",
+        path.display()
+    );
+
+    // File-order contents via the non-normalized reader.
+    let contents = read_all_elements_with_coords(path);
+
+    // Within each section, ids must be monotonically non-decreasing.
+    // (The reader already walks per-type sections in file order, so
+    // this also implicitly asserts no out-of-type interleavings within
+    // a section.)
+    let mut last = i64::MIN;
+    for (id, _, _, _) in &contents.nodes {
+        assert!(
+            *id >= last,
+            "node ids not sorted in {}: {} followed by {}",
+            path.display(),
+            last,
+            id
+        );
+        last = *id;
+    }
+    let mut last = i64::MIN;
+    for (id, _, _) in &contents.ways {
+        assert!(
+            *id >= last,
+            "way ids not sorted in {}: {} followed by {}",
+            path.display(),
+            last,
+            id
+        );
+        last = *id;
+    }
+    let mut last = i64::MIN;
+    for (id, _, _) in &contents.relations {
+        assert!(
+            *id >= last,
+            "relation ids not sorted in {}: {} followed by {}",
+            path.display(),
+            last,
+            id
+        );
+        last = *id;
+    }
+}
+
 /// Assert that two PBF files are element-equivalent.
 ///
 /// Reads both via `read_normalized` and compares section-by-section. On

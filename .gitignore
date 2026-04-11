@@ -4,6 +4,7 @@ Cargo.lock
 .*.swo
 .idea
 .plans/
+.claude/
 data
 bench/osmpbf-baseline/target/
 .bench_stderr.*

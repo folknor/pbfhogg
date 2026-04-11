@@ -615,56 +615,26 @@ per-iteration allocations remain across the codebase, ordered by impact:
   Measured: multi-extract Japan node classify 1081ms → 748ms (-31%).
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
-- [ ] **Smart-extract planet memory blocker — STILL OPEN**, root cause not
-  the one we thought. Original framing: `extract.rs:2813`'s
-  `parallel_classify_accumulate(IdSetDense)` over way-dep refs. Fix
-  shipped in commit `cc19d26` (per-blob send via
-  `parallel_classify_phase<(), Vec<i64>>`). Re-measurement at `--bench 3`
-  on Europe showed peak anon barely moved (10.72 → 10.09 GB, −6%, three
-  runs cluster tightly). PASS2 wall improved 23% which is real — keep
-  the fix shipped (architecturally correct) but don't credit it for
-  fixing the planet blocker.
-
-  Sub-phase markers + hotpath annotations added (commit `51f820d`), and
-  re-bench on Europe (UUID `8ac56b15`) localized the burst to
-  **`SMART_PASS2_SCHEDULE`** (the wrapper around `build_classify_schedule`),
-  NOT `SMART_PASS2_CLASSIFY`. The 6.33 GB transient is somewhere inside
-  `build_classify_schedule`'s call path (`BlobReader::seekable_from_path`,
-  `next_header_with_data_offset`, or the indexdata parser at
-  `src/read/blob.rs`). Function body itself can't account for it (small
-  loop pushing 24-byte triples into a Vec).
-
-  Puzzle: `collect_pass1_generic` runs nearly identical scan code at
-  PASS1 start. Same code, same file, but PASS1 overall peak is 3.73 GB
-  with no 6 GB transient. Why does the same scan have different memory
-  behavior in two contexts?
-
-  Sent to reviewers for round 2 — see
-  [notes/parallel-classify-regression-2026-04-11-followup.md](notes/parallel-classify-regression-2026-04-11-followup.md)
-  for the brief and the four open questions. Awaiting their analysis
-  before next implementation step.
-
-  Other paths from the previous round, status unchanged:
-  - **`tags_filter.rs:1000`**: keep accumulate, tag-selective workload
-    is fine (~200 MB peak per-worker contribution at Europe, pro-rated
-    ~5.5 GB at planet). Safe.
-  - **Geocode referenced nodes**: not measured. Probably moot now since
-    the smart-extract diagnosis was wrong — likely the same kind of
-    structural issue elsewhere, not a parallel_classify problem.
-
-- [ ] **Cross-command wall regression (separate issue, defer)** —
-  2026-04-10 measurement showed +22-24% wall-time regression on both
-  extract-smart and tags-filter-twopass at Europe scale, post the
-  parallel_classify_phase refactor. NOT explained by memory:
-  tags-filter has flat memory and PASS1 (the +32% outlier) already
-  uses `parallel_classify_phase`, not accumulate. Likely multiple
-  causes: phase split in tags-filter (PASS1 → CLOSURE → WAYDEPS
-  re-reads way blobs), possibly columnar scratch in PASS1 even
-  where unused, lost producer/consumer overlap from accumulate's
-  merge barrier in extract-smart, plus cross-day measurement noise
-  from `--bench 1`. Investigate AFTER `extract.rs:2813` fix lands.
-  Approach: `--bench 3` baselines on the same day, then per-call-site
-  A/B toggles. Do NOT start with flamegraphs.
+- [ ] **Smart-extract planet memory blocker — open, well-understood,
+  no current mitigation path.** The 2026-04-10/11 investigation
+  (4 reviewer rounds, 5 commits) shipped a 29% wall improvement on
+  Europe smart extract but did NOT close the memory ceiling. The actual
+  mechanism is a cold-arena-page residency cascade: PASS1's parallel
+  allocator work leaves glibc with ~8-11 GB of fordblks free-list
+  bloat, and subsequent post-PASS1 phases that touch the free-list
+  bring those cold pages into residence (anon RSS climbs by ~6 GB
+  without any glibc-tracked allocation). Pro-rated to planet
+  (~2.6×): peak ~26-28 GB, tight on 30 GB plantasjen but does not
+  OOM in practice. Allocator swap (jemalloc/mimalloc) is NOT being
+  pursued — see TODO.md "Global allocator investigation" entry; prior
+  measurements don't behave as predicted, and Meta has restarted
+  jemalloc development which may change the picture later. Other
+  mitigation candidates (custom arena, pooled buffers, reduced PASS1
+  cumulative allocation) all require structural refactors and none
+  is currently planned. See
+  [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md)
+  for the full investigation summary, mechanism explanation, ruled-out
+  hypotheses, and open mitigation directions.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

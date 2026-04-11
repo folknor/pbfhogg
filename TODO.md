@@ -450,6 +450,92 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
+- [ ] **`renumber` external path — review followups (2026-04-11).** Six
+  commits landed the external renumber implementation (pass 1 + stages
+  2a-2d + relation R1/R2). A full review (bugs/perf/arch/correctness/
+  planet × claude+codex) surfaced a set of findings; the critical ones
+  landed immediately (see separate commits), the items below are
+  tracked followups.
+
+  **Memory / perf optimization frontier (planet bench depends on these):**
+
+  - [ ] **Radix sort in stage 2b** instead of `sort_unstable_by_key`.
+    At planet, each way_ref bucket is ~530 MB × 256 buckets ≈ ~40 min
+    sort time — likely the planet wall-time floor. Radix sort by next
+    8 bits below the bucket bits would go linear.
+  - [ ] **Zero-copy bucket reads via bytemuck** (or `#[repr(C)]` +
+    `slice::from_raw_parts`). `load_coo_bucket` / `load_id_pair_bucket`
+    currently do ~40 ns per-pair copy into a `Vec<Pair>`. At planet
+    that's ~164 s of deserialization overhead per full pass.
+  - [ ] **`fadvise(SEQUENTIAL)` before full bucket reads** in
+    `load_coo_bucket` / `load_id_pair_bucket`. Small win on cold cache
+    scenarios.
+  - [ ] **Sparse-file `new_refs` via `set_len` + `pwrite`** in stage 2c.
+    Avoids materializing zero-fill ranges for empty buckets entirely.
+    Relies on ext4/xfs hole support.
+  - [ ] **Add `scan_relation_members` fast-path** for R2a/R2d, analogous
+    to `scan_way_refs`. Would avoid full PrimitiveBlock decode in the
+    relation scans. Moderate win; not blocking planet correctness.
+  - [ ] **`MADV_DONTNEED` on mmap'd `new_refs` files after stage2d/R2d
+    completes** so the kernel evicts the working set pages before the
+    next stage. Affects RSS reporting more than actual performance but
+    improves the planet sidecar profile.
+
+  **Defensive asserts / hardening:**
+
+  - [ ] **`debug_assert!(node_map.is_sorted_by_key(|p| p.old_id))`** in
+    stage 2b after loading a node_map bucket. The merge-join relies on
+    this invariant (emission order = sorted input node order within a
+    bucket). Cheap in debug, zero in release.
+  - [ ] **`relation_map.len()` upper-bound warning.** At planet we see
+    ~14M relations; design doc targets `<4 GB` peak RSS. If OSM grows
+    past ~50M relations, log a warning at R1 completion.
+  - [ ] **Scratch dir concurrent-from-same-process collision risk.**
+    `ScratchDir::new(parent, name)` uses only `parent + name + pid`,
+    so two concurrent `renumber_external()` calls from the same process
+    would share the same scratch path and clobber each other. Add a
+    random/sequence suffix or include a per-call nonce. Not a problem
+    today (CLI is one-shot), flagged for library users.
+
+  **Ergonomics / architecture:**
+
+  - [ ] **`BucketWriters::write_pair(&mut self, bucket, bytes)` helper**
+    in `external_radix.rs` to hide the `.writers[b].as_mut()?.write_all`
+    + `entry_counts[b] += 1` pattern used at 4+ call sites across pass
+    1, stage 2a, stage 2d, relation R2a. Current direct field access
+    was chosen for hot-loop clarity but the consolidation has no
+    measurable cost and removes duplication.
+  - [ ] **Promote `CooPair` / `ResolvedEntry` to `external_radix.rs`** as
+    generic `IdSlotPair<K>` / `ResolvedEntry<V>` **when a third caller
+    appears.** Two callers (external_join, renumber_external) isn't
+    enough to justify the abstraction cost; wait for the next external-
+    bucket command (external sort, external dedupe, etc.) before
+    unifying.
+  - [ ] **`RenumberStats.orphan_refs_preserved: u64` counter.** Way refs
+    and relation members whose `old_id` isn't in the corresponding map
+    fall through with `resolved_id = old_id`, matching the in-memory
+    path and osmium. Count them so the CLI summary can warn if many
+    orphans leak old-ids into the new-id space. Non-zero orphan count
+    on a self-contained planet extract probably indicates a malformed
+    input.
+  - [ ] **Document orphan-ref policy** in `renumber_external.rs` module
+    docs: "orphan refs pass through with their old id, matching
+    in-memory behavior and osmium's semantics. Consumers that assume
+    new IDs are dense starting at `start_*_id` must tolerate mixed
+    old/new id spaces in the output."
+
+  **Test gaps:**
+
+  - [ ] **Non-indexed input test.** All current test PBFs are indexed
+    (written via `write_test_pbf_sorted` which emits indexdata). Add a
+    test that strips indexdata from the input so stage 2a / stage 2d /
+    R2a / R2d hit the full-decode fallback path.
+  - [ ] **Non-dense `Element::Node` element path.** Current test helpers
+    always use DenseNode via `BlockBuilder::add_node`. Pass 1's
+    `Element::Node(n)` branch (non-dense) is only reachable via
+    externally-produced PBFs. Either construct such an input or
+    document that the branch is dead-ish outside real-world inputs.
+
 - [ ] **`renumber` planet-scale refactor — design written, implementation pending.**
   Current `src/commands/renumber.rs` (153 LoC) is a single-pass in-memory
   implementation with three `FxHashMap<i64, i64>` mappings (`node_map`,

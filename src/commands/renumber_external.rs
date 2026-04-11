@@ -349,12 +349,15 @@ pub fn renumber_external(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("renumber_ext_way_ref_slots", total_slots as i64);
-        let bucket_total: u64 = way_ref_counts.iter().sum();
-        debug_assert_eq!(
-            bucket_total, total_slots,
-            "stage 2a bucket entry sum must equal slot counter"
-        );
     }
+    let bucket_total: u64 = way_ref_counts.iter().sum();
+    // Hard assert in release: this invariant is load-bearing for the
+    // whole pass 2 pipeline. If stage 2a miscounted, stage 2b would
+    // silently emit fewer entries than stage 2c expects.
+    assert_eq!(
+        bucket_total, total_slots,
+        "stage 2a bucket entry sum must equal slot counter"
+    );
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_END");
 
     // ---- Pass 2 stage B: node merge-join ----
@@ -371,14 +374,17 @@ pub fn renumber_external(
     {
         crate::debug::emit_counter("renumber_ext_resolved_entries", resolved_count as i64);
     }
-    debug_assert_eq!(
+    // Hard assert in release: one resolved entry per COO pair, orphans
+    // included. Mismatch means stage 2b dropped an entry and the new_refs
+    // flat file would have a zero-filled hole read as new_node_id=0.
+    assert_eq!(
         resolved_count, total_slots,
         "stage 2b must emit exactly total_slots resolved entries (orphans included)"
     );
-    // Way-ref buckets are no longer needed after the merge-join; the
-    // resolved entries live in slot_buckets now. node_map_buckets stay
-    // around for the relation passes in task #4.
-    way_ref_buckets.cleanup();
+    // Way-ref bucket files were deleted per-bucket inside stage 2b to cut
+    // peak temp disk. The `way_ref_buckets` struct's paths still exist
+    // but the filesystem entries are gone; drop the struct without
+    // calling cleanup() to avoid spurious remove_file errors.
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_END");
 
     // ---- Pass 2 stage C: slot reorder → flat new_refs file ----
@@ -662,6 +668,13 @@ fn stage2a_way_ref_pass(
 ///
 /// Returns the total number of resolved entries emitted. Expected to
 /// equal the `total_slots` returned by stage 2a.
+///
+/// **Temp disk discipline**: deletes each way-ref bucket file as soon
+/// as its merge-join completes. Without this per-bucket cleanup, stage
+/// 2b's peak temp disk footprint at planet scale would be `node_map
+/// (166 GB) + way_ref (166 GB) + slot (136 GB) = 468 GB`. With cleanup,
+/// it drops to `node_map + per-bucket way_ref (~650 MB) + slot =
+/// ~303 GB`. node_map stays alive because the relation pass needs it.
 #[hotpath::measure]
 fn stage2b_node_merge_join(
     way_ref_buckets: &BucketWriters,
@@ -675,6 +688,9 @@ fn stage2b_node_merge_join(
     // Scratch buffers reused across bucket loads. Prevents heap
     // accumulation at planet scale where 256 × ~650 MB bucket files
     // would otherwise leave ~166 GB of unreturned allocations behind.
+    // Note: `load_coo_bucket` / `load_id_pair_bucket` explicitly drop
+    // their data_buf backing store after parsing, so the raw bytes
+    // aren't held alongside the parsed Vecs during the merge-join.
     let mut way_refs: Vec<CooPair> = Vec::new();
     let mut way_refs_data: Vec<u8> = Vec::new();
     let mut node_map: Vec<IdPair> = Vec::new();
@@ -689,6 +705,9 @@ fn stage2b_node_merge_join(
             &mut way_refs_data,
             &mut way_refs,
         )?;
+        // Delete the way_ref bucket file now that we've read it into
+        // RAM — no further stage consumes it. Cuts peak temp disk.
+        drop(std::fs::remove_file(&way_ref_buckets.paths[bucket_idx]));
         // Sort the COO pairs by old_node_id so the merge walk's nm cursor
         // can advance monotonically across the whole bucket.
         way_refs.sort_unstable_by_key(|p| p.old_node_id);
@@ -742,6 +761,11 @@ fn stage2b_node_merge_join(
 /// reusing `data_buf` as the raw read scratch. On Linux with
 /// `linux-direct-io`, also fadvise(DONTNEED) the file after read so the
 /// kernel can evict the pages.
+///
+/// After parse, `data_buf` is shrunk back to zero capacity to release the
+/// raw-bytes backing store — stage 2b holds both sides of a merge-join
+/// live simultaneously, so keeping the raw bytes around doubles peak
+/// anon RSS per bucket.
 #[allow(clippy::cast_possible_truncation)]
 fn load_coo_bucket(
     path: &Path,
@@ -754,6 +778,13 @@ fn load_coo_bucket(
         .metadata()
         .map_err(|e| format!("failed to stat way_ref bucket {}: {e}", path.display()))?
         .len() as usize;
+    if !len.is_multiple_of(COO_PAIR_SIZE) {
+        return Err(format!(
+            "way_ref bucket {} is {len} bytes, not a multiple of {COO_PAIR_SIZE} — truncated or corrupt",
+            path.display()
+        )
+        .into());
+    }
     data_buf.clear();
     data_buf.resize(len, 0);
     std::io::Read::read_exact(&mut &file, data_buf)
@@ -761,16 +792,17 @@ fn load_coo_bucket(
     #[cfg(feature = "linux-direct-io")]
     super::external_radix::advise_dontneed_file(&file);
 
-    pairs.clear();
     let count = data_buf.len() / COO_PAIR_SIZE;
-    if count > pairs.capacity() {
-        pairs.reserve(count - pairs.capacity());
-    }
+    pairs.clear();
+    pairs.reserve_exact(count.saturating_sub(pairs.capacity()));
     let mut buf = [0u8; COO_PAIR_SIZE];
     for chunk in data_buf.chunks_exact(COO_PAIR_SIZE) {
         buf.copy_from_slice(chunk);
         pairs.push(CooPair::read_from(&buf));
     }
+    // Release raw-byte storage now that parsing is done. Keeping it
+    // alive double-counts the bucket in peak anon RSS during stage 2b.
+    *data_buf = Vec::new();
     Ok(())
 }
 
@@ -854,6 +886,15 @@ fn stage2c_slot_reorder(
         #[cfg(feature = "linux-direct-io")]
         super::external_radix::advise_dontneed_file(&file);
 
+        if !data_buf.len().is_multiple_of(RESOLVED_ENTRY_SIZE) {
+            return Err(format!(
+                "slot bucket {} is {} bytes, not a multiple of {RESOLVED_ENTRY_SIZE} — truncated or corrupt",
+                slot_buckets.paths[bucket_idx].display(),
+                data_buf.len()
+            )
+            .into());
+        }
+
         let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
         for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
             buf.copy_from_slice(chunk);
@@ -887,6 +928,7 @@ fn stage2c_slot_reorder(
 
 /// Load a bucket file of `IdPair` tuples into the provided `pairs` Vec.
 /// Counterpart of `load_coo_bucket` for the node_map / way_map side.
+/// See `load_coo_bucket` for the `data_buf` shrink-to-zero rationale.
 #[allow(clippy::cast_possible_truncation)]
 fn load_id_pair_bucket(
     path: &Path,
@@ -899,6 +941,13 @@ fn load_id_pair_bucket(
         .metadata()
         .map_err(|e| format!("failed to stat id_pair bucket {}: {e}", path.display()))?
         .len() as usize;
+    if !len.is_multiple_of(ID_PAIR_SIZE) {
+        return Err(format!(
+            "id_pair bucket {} is {len} bytes, not a multiple of {ID_PAIR_SIZE} — truncated or corrupt",
+            path.display()
+        )
+        .into());
+    }
     data_buf.clear();
     data_buf.resize(len, 0);
     std::io::Read::read_exact(&mut &file, data_buf)
@@ -906,16 +955,15 @@ fn load_id_pair_bucket(
     #[cfg(feature = "linux-direct-io")]
     super::external_radix::advise_dontneed_file(&file);
 
-    pairs.clear();
     let count = data_buf.len() / ID_PAIR_SIZE;
-    if count > pairs.capacity() {
-        pairs.reserve(count - pairs.capacity());
-    }
+    pairs.clear();
+    pairs.reserve_exact(count.saturating_sub(pairs.capacity()));
     let mut buf = [0u8; ID_PAIR_SIZE];
     for chunk in data_buf.chunks_exact(ID_PAIR_SIZE) {
         buf.copy_from_slice(chunk);
         pairs.push(IdPair::read_from(&buf));
     }
+    *data_buf = Vec::new();
     Ok(())
 }
 
@@ -1065,13 +1113,13 @@ fn stage2d_way_assembly(
 
                 // Read ref_count consecutive new_node_ids from the flat file.
                 refs_buf.clear();
-                for r in w.refs() {
-                    // Walk in file order. scan_way_refs in stage 2a and
-                    // block.elements() here both iterate groups in top-
-                    // level order and ways within a group in wire order,
-                    // so slot_cursor aligns with the emitted (old, slot)
-                    // pairs.
-                    let _ = r;
+                // Walk in file order. scan_way_refs in stage 2a and
+                // block.elements() here both iterate groups in top-
+                // level order and ways within a group in wire order,
+                // so slot_cursor aligns with the emitted (old, slot)
+                // pairs. The old ref ids themselves are discarded —
+                // we only use the count to advance the cursor.
+                for _ in w.refs() {
                     let offset = slot_cursor as usize * NEW_REF_SIZE;
                     let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap
                         [offset..offset + NEW_REF_SIZE]

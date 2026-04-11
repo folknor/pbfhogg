@@ -1931,27 +1931,6 @@ fn stage2d_worker(
 }
 
 // ---------------------------------------------------------------------------
-// Header-only scan helper: build a schedule of matching-type blobs
-// ---------------------------------------------------------------------------
-
-/// Walk the input PBF reading only blob headers (seeking past the
-/// compressed bodies), and return a schedule of `(data_offset, data_size)`
-/// for every OsmData blob whose `blob.index()` reports the requested
-/// `ElemKind`. Non-indexed blobs are included unconditionally so the
-/// caller's element-level dispatch still handles them — at the cost of
-/// some wasted decompression on non-indexed inputs.
-///
-/// Uses `BlobReader::seekable_from_path` + `next_header_with_data_offset`
-/// which seek past each blob's compressed body rather than reading it,
-/// so this walk pays O(header_bytes) I/O instead of O(total_file_size).
-/// At planet scale the header-walk is a few hundred MB vs 87 GB full
-/// read.
-///
-/// The schedule is then consumed by a pread-based blob reader so only
-/// matching blobs are ever pulled off disk. Matches the pattern used in
-/// `src/commands/extract.rs` and `src/commands/external_join.rs` stage 2.
-
-// ---------------------------------------------------------------------------
 // Pass 1: parallel node scan — worker pool with range-based dispatch
 // ---------------------------------------------------------------------------
 

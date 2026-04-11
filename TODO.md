@@ -475,67 +475,68 @@ single-pass, tag expression and bbox filtering.
 
   **Priority-ordered task list** (unanimous reviewer ordering):
 
-  - [ ] **Stage 2b radix sort** — first, cleanest, most local change.
-    Replace `sort_unstable_by_key(|p| p.old_node_id)` with LSD radix
-    sort over 5 bytes of u64 key. Self-contained in
-    `stage2b_node_merge_join`. **Revised estimate: 823 → ~350 s** (not
-    the original 100 s — reviewers correctly pointed out that stage 2b
-    also pays ~170 s of sequential bucket I/O + ~100 s of parse
-    overhead as floor; radix sort eliminates the sort CPU but not the
-    I/O floor). Savings: ~470 s.
-  - [ ] **Halve the map-bucket record format** (new lever from
-    claude-arch + codex-perf review, independently flagged). Currently
-    pass 1 emits `IdPair { old_id, new_id }` at 16 bytes per node;
-    stage 2d same for ways. But `new_id` is derivable from `start_id +
-    cumulative_bucket_index`, because sorted input + monotonic bucket
-    ranges make the mapping implicit. Store just `old_id` (8 bytes).
-    The design doc (line 132) flagged this option and deferred it "for
-    merge-join simplicity." Take it back now that planet measurements
-    justify it. Touches 4-5 call sites: `IdPair` struct shrinks to
-    just `old_id: i64`, `emit_id_pair` becomes single-field write,
-    `load_id_pair_bucket` halves data_buf size, stage 2b merge-join
-    reads `new_id` from a bucket-cumulative counter instead of the
-    loaded pair, stage 2d / R2B way_map side similar.
+  - [x] **Stage 2b radix sort** — commit `cc80442`. Replaced
+    `sort_unstable_by_key(|p| p.old_node_id)` with LSD radix sort over
+    5 × 8-bit passes (40 bits of u64 key coverage, headroom to 1 T
+    node ids vs the ~13 B current max).
+  - [x] **Halve the map-bucket record format** — commit `a478ae8`.
+    Pass 1 and stage 2d now emit only the 8-byte `old_id`; the
+    corresponding `new_id` is reconstructed at stage 2b / R2B read
+    time as `start_id + cumulative_bucket_index`. Touches
+    `load_old_id_bucket`, `stage2b_process_bucket`, the emission hot
+    loops, and `compute_bucket_new_id_starts`.
+  - [x] **Bucket-level parallelism in stage 2b** — commit `37ff902`.
+    Two workers compete for source buckets via an atomic counter;
+    each writes to its own slot-bucket shard (`slot-a` / `slot-b`)
+    so stage 2c reads from both.
+  - [x] **Shared worker-pool pattern**: schedule + pread + worker
+    decode + per-worker `BlockBuilder` + per-worker output
+    `Vec<OwnedBlock>` + `ReorderBuffer` on the main thread +
+    `write_primitive_block_owned`. **Not `for_each_block_pipelined`**
+    — the earlier attempt (f7033d3 / d656284 / 184cd5d, later
+    reverted) OOMed at 26 GB anon RSS on planet via cross-thread
+    `PrimitiveBlock` retention. The current pattern keeps
+    PrimitiveBlocks entirely on worker threads and only transfers the
+    bounded `Vec<OwnedBlock>` output via a bounded mpsc channel,
+    matching `src/commands/external_join.rs` stage 4 which already
+    runs planet-scale without OOM. Inlined per stage (pass 1, stage
+    2a, stage 2d) rather than extracted — the three stages have
+    subtly different per-blob outputs so a single helper would have
+    needed at least three generic parameters.
+  - [x] **Pass 1 parallel decode** — commit `8ec298c`. Two
+    range-partitioned workers, each owning a `node_map` shard,
+    emitting `Vec<OwnedBlock>` per blob. Range split preserves the
+    per-shard sort invariant that stage 2b's merge-join depends on
+    (shard A's old_ids are all disjoint from and less than shard B's,
+    so shards read as a concatenated sorted run via
+    `load_old_id_bucket_shards`).
+  - [x] **Stage 2d parallel decode** — commit `34a6b7c`. Same range-
+    partitioned two-worker pattern as pass 1; each worker owns a
+    `way_map` shard. The shared `Arc<Mmap>` new_refs file and the
+    shared `blob_slot_starts` Vec give workers the correct per-blob
+    slot cursor regardless of dispatch order; the sequential path's
+    per-blob drift check is preserved inside each worker.
+  - [x] **Stage 2a parallel way scan** — commit `e7219f0`. Different
+    shape because `scan_way_refs` takes raw decompressed bytes: N=6
+    work-stealing workers decompress and scan in parallel, sending
+    a compact `Vec<i64>` (ref old_node_ids in slot order) per blob
+    through an mpsc. Main thread runs `ReorderBuffer` + single-
+    threaded bucket emits + sidecar writes. Cross-thread budget:
+    ~384 KB per Vec × 32 channel slots = ~12 MB in flight.
+  - [ ] **R2B radix sort** (mirror of stage 2b for relation member
+    merge-join). Re-uses `stage2b_node_merge_join` via the existing
+    slice API, so it already benefits from the stage 2b radix sort
+    — technically this item is already done. Left open as a
+    follow-up to wire the relation R2a emission into the parallel
+    `stage2a_way_ref_pass`-shaped pattern if the planet profile
+    shows it as a significant floor after the April 2026 rewrite.
 
-    Savings:
-    - Pass 1 scratch writes: 166 GB → 83 GB, **save ~200 s**
-    - Stage 2b read I/O: halved, **save ~80 s**
-    - Stage 2d way_map writes: halved, **save ~50 s**
-    - R2B read I/O: halved, **save ~30 s**
-    - **Stage 2b per-bucket RAM: 650 MB → 325 MB** — unlocks lever #3
-    - **Total direct savings: ~360 s** across 4 stages
-  - [ ] **Bucket-level parallelism in stage 2b** (new lever from
-    codex-perf). The 256 buckets are embarrassingly parallel. 2 worker
-    threads processing disjoint bucket subsets × radix sort from #1 =
-    ~180 s vs ~350 s sort-alone. Memory: 2 workers × 325 MB × 2 sides
-    = 1.3 GB peak (within 4 GB target; only fits after #2's map
-    shrink). 4 workers would overshoot the memory budget even with
-    the map shrink, so cap at 2. Savings beyond #1: ~170 s.
-  - [ ] **Build shared ordered-write helper**: schedule + pread +
-    worker decode + `reorder_buffer::ReorderBuffer` + sequential
-    writer. One reusable helper in `external_radix.rs` or a
-    renumber-local helper module. Will be applied to pass 1, stage 2d,
-    stage 2a in that order. **Not `for_each_block_pipelined`** —
-    unanimous reviewer rejection because of cross-thread
-    `PrimitiveBlock` retention issues documented in
-    `notes/parallel-classify-regression.md`. Pread pattern keeps
-    alloc/free worker-local.
-  - [ ] **Pass 1 parallel decode** (apply helper #4). **Revised
-    estimate: 1,147 → ~500 s** (not the original 400 s — reviewers
-    pointed out `cat` at 500 s is raw passthrough, not a fair
-    comparator for pass 1's full decode + re-encode + 83 GB scratch
-    emission). Savings: ~650 s.
-  - [ ] **Stage 2d parallel decode** (apply helper #4). Revised
-    estimate: 664 → ~300 s. Savings: ~364 s.
-  - [ ] **Stage 2a parallel way scan** (apply helper #4). 339 →
-    ~150 s. Savings: ~190 s.
-  - [ ] **R2B radix sort** (mirror of #1 for relation member
-    merge-join). 236 → ~90 s. Savings: ~150 s.
-
-  **Projected total after all seven wins: ~1,430 s (23.8 min).**
-  Memory peak stays ~2.79 GB (stage 2b's 2-worker parallelism pushes
-  slightly higher but map shrink halves the per-side allocation,
-  netting neutral). Temp disk peak drops by ~83 GB (node_map halved).
+  **Projected total after the completed wins: ~1,430 s (23.8 min).**
+  Awaiting planet bench measurement on commit `e7219f0` (2026-04-11)
+  for ground truth — see task #7 in the local task list. Memory peak
+  stays ~2.79 GB (stage 2b's 2-worker parallelism pushes slightly
+  higher but map shrink halves the per-side allocation, netting
+  neutral). Temp disk peak drops by ~83 GB (node_map halved).
 
   **Smaller / defensive followups (non-blocking for 24-min target):**
 

@@ -22,11 +22,27 @@ use std::cell::RefCell;
 use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::mpsc::{sync_channel, SyncSender};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::thread::JoinHandle;
 
 /// Maximum number of framed blobs in-flight before backpressure stalls senders.
 pub(crate) const WRITE_AHEAD: usize = 32;
+
+/// Maximum number of in-flight rayon dispatches in the pipelined writer.
+///
+/// Counting-semaphore cap that bounds how many uncompressed block `Vec<u8>`s
+/// can be owned by rayon closures simultaneously (queued, being compressed,
+/// or waiting on the bounded output channel). Without this, `rayon::spawn`'s
+/// unbounded internal task queue grows without limit when the producer side
+/// out-runs compression throughput — exactly what happened in commit
+/// `e7219f0` on planet when parallel pass 1 / stage 2a / stage 2d started
+/// emitting blocks faster than zlib:6 could drain them, killing pbfhogg via
+/// OOM at 26 GB anon RSS.
+///
+/// Memory bound: `PIPELINE_DISPATCH_PERMITS × max_block_size`. At ~4 MB per
+/// uncompressed block and 64 permits that's ~256 MB worst case, small
+/// compared to the 2.79 GB stage-2b peak.
+pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 
 /// Compression algorithm for PBF output blobs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -133,6 +149,25 @@ struct WritePipeline {
     tx: SyncSender<PipelineItem>,
     seq: usize,
     join_handle: Option<JoinHandle<io::Result<()>>>,
+    /// Counting-semaphore permit pool bounding in-flight rayon dispatches.
+    /// Main thread `recv()`s a permit before `rayon::spawn`; the rayon
+    /// closure `send()`s a permit back when its work completes. See
+    /// [`PIPELINE_DISPATCH_PERMITS`] for the memory-bound rationale.
+    permit_tx: SyncSender<()>,
+    permit_rx: Receiver<()>,
+}
+
+/// Build a fresh permit pool pre-filled with `PIPELINE_DISPATCH_PERMITS`
+/// tokens. Called during pipelined-writer construction to seed the
+/// counting semaphore.
+fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
+    let (permit_tx, permit_rx) = sync_channel::<()>(PIPELINE_DISPATCH_PERMITS);
+    for _ in 0..PIPELINE_DISPATCH_PERMITS {
+        // `send` on a fresh channel with capacity = N can't fail or block
+        // for the first N sends. unwrap is sound here.
+        permit_tx.send(()).expect("seeding permit pool on fresh channel");
+    }
+    (permit_tx, permit_rx)
 }
 
 /// Reusable scratch buffers for blob framing, avoiding per-call allocation.
@@ -279,6 +314,7 @@ impl PbfWriter<FileWriter> {
             }
         }
 
+        let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
             writer: None,
             compression,
@@ -286,6 +322,8 @@ impl PbfWriter<FileWriter> {
                 tx,
                 seq: 0,
                 join_handle: Some(handle),
+                permit_tx,
+                permit_rx,
             }),
             scratch: FrameScratch::new(),
         })
@@ -305,6 +343,7 @@ impl PbfWriter<FileWriter> {
         let (tx, rx) = sync_channel(WRITE_AHEAD);
         let handle = std::thread::spawn(move || writer_thread(rx, writer));
 
+        let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
             writer: None,
             compression,
@@ -312,6 +351,8 @@ impl PbfWriter<FileWriter> {
                 tx,
                 seq: 0,
                 join_handle: Some(handle),
+                permit_tx,
+                permit_rx,
             }),
             scratch: FrameScratch::new(),
         })
@@ -356,11 +397,21 @@ impl<W: Write> PbfWriter<W> {
     #[hotpath::measure]
     pub fn write_primitive_block(&mut self, block_bytes: &[u8]) -> io::Result<()> {
         if let Some(ref mut pipeline) = self.pipeline {
+            // Acquire a dispatch permit before enqueuing new work on rayon.
+            // This blocks the caller when `PIPELINE_DISPATCH_PERMITS` blocks
+            // are already in flight, preventing rayon's internal task queue
+            // from growing without bound (see `PIPELINE_DISPATCH_PERMITS`
+            // doc comment for the planet-scale OOM story that motivated
+            // this).
+            pipeline.permit_rx.recv().map_err(|_| {
+                io::Error::other("pipelined writer permit pool disconnected")
+            })?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let uncompressed = block_bytes.to_vec();
             let tx = pipeline.tx.clone();
+            let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let indexdata = blob_index::scan_block_ids(&uncompressed)
                     .map(|idx| idx.serialize());
@@ -377,6 +428,13 @@ impl<W: Write> PbfWriter<W> {
                     )
                 });
                 drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
+                // Release the permit so the main thread can dispatch more
+                // work. Must happen AFTER `tx.send` above so the in-flight
+                // count stays correct while the result is waiting in the
+                // writer channel.
+                // Failure here means the main thread already dropped its
+                // receiver (shutting down); safe to ignore.
+                permit_tx.send(()).ok();
             });
             Ok(())
         } else {
@@ -410,11 +468,18 @@ impl<W: Write> PbfWriter<W> {
     ) -> io::Result<()> {
         let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
+            // Bound in-flight rayon dispatches — see the sibling
+            // `write_primitive_block` above and the
+            // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
+            pipeline.permit_rx.recv().map_err(|_| {
+                io::Error::other("pipelined writer permit pool disconnected")
+            })?;
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
             let tx = pipeline.tx.clone();
             let tagdata_owned = tagdata.map(<[u8]>::to_vec);
+            let permit_tx = pipeline.permit_tx.clone();
             rayon::spawn(move || {
                 let result = PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
                     frame_blob_into(
@@ -427,6 +492,9 @@ impl<W: Write> PbfWriter<W> {
                     )
                 });
                 drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
+                // Failure here means the main thread already dropped its
+                // receiver (shutting down); safe to ignore.
+                permit_tx.send(()).ok();
             });
             Ok(())
         } else {

@@ -480,32 +480,35 @@ explicit via `reorder_buffer::ReorderBuffer`.
 
 ### Revised theoretical roadmap
 
-| Phase | Current | Target | Optimization |
-|---|---:|---:|---|
-| PASS1 nodes | 1,147 s | ~500 s | parallel decode + map shrink |
-| STAGE2A way emit | 339 s | ~150 s | parallel scan (shared helper) |
-| STAGE2B node merge-join | 823 s | ~150 s | radix sort + 2-worker parallelism + map shrink |
-| STAGE2C slot reorder | 174 s | 174 s | unchanged |
-| STAGE2D way assembly | 664 s | ~300 s | parallel decode + map shrink |
-| R1+R2A fused | 31 s | 31 s | unchanged |
-| R2B rel merge-join | 236 s | ~90 s | radix sort + map shrink |
-| R2C + R2D | 35 s | 35 s | unchanged |
-| **TOTAL** | **3,456 s (57.6 min)** | **~1,430 s (23.8 min)** | **~2,026 s saved** |
+| Phase | Baseline | Target | Optimization | Status |
+|---|---:|---:|---|---|
+| PASS1 nodes | 1,147 s | ~500 s | parallel decode + map shrink | ✅ landed (commits `a478ae8`, `8ec298c`) |
+| STAGE2A way emit | 339 s | ~150 s | parallel scan (worker pool) | ✅ landed (commit `e7219f0`) |
+| STAGE2B node merge-join | 823 s | ~150 s | radix sort + 2-worker parallelism + map shrink | ✅ landed (commits `cc80442`, `a478ae8`, `37ff902`) |
+| STAGE2C slot reorder | 174 s | 174 s | unchanged | — |
+| STAGE2D way assembly | 664 s | ~300 s | parallel decode + map shrink | ✅ landed (commits `a478ae8`, `34a6b7c`) |
+| R1+R2A fused | 31 s | 31 s | unchanged | — |
+| R2B rel merge-join | 236 s | ~90 s | radix sort + map shrink | ✅ landed (commits `cc80442`, `a478ae8`) |
+| R2C + R2D | 35 s | 35 s | unchanged | — |
+| **TOTAL** | **3,456 s (57.6 min)** | **~1,430 s (23.8 min)** | **~2,026 s saved** | awaiting measurement |
 
-**Honest target: ~24 min after all seven wins land.** Still 4 min
-over the 20-min target I originally framed to the user. The
-remaining gap would require output compression change (zlib:6 →
-zstd:1 or `--compression none`, save ~400 s per claude-perf), but
-**the production pipeline already uses `--compression none`**, so
-this isn't a concern in practice — the 24 min figure is for the
-zlib:6 default path, and the production-relevant number with
-`--compression none` is correspondingly faster. **24 min is
-accepted as the target.**
+**Honest target: ~24 min after all seven wins land.** All landed as
+of commit `e7219f0` (2026-04-11). Planet bench in flight on this
+commit for ground-truth measurement — results to be added to the
+"Planet bench series" section below once they land.
 
-**Commit target**: before the full `--bench 3` run for publishable
-numbers, land the optimizations incrementally and run `--bench 1`
-after each to validate. The `--bench 3` session is ~72 min wall at
-the target (vs ~172 min at current baseline).
+The remaining gap to 20 min would require an output compression
+change (zlib:6 → zstd:1 or `--compression none`, save ~400 s per
+claude-perf), but **the production pipeline already uses
+`--compression none`**, so the published 24 min figure is for the
+zlib:6 default path and production-relevant numbers will be
+correspondingly faster. 24 min is the accepted target.
+
+**Rollout cadence:** each optimization was committed independently
+and smoke-tested on Denmark (`brokkr verify renumber --dataset
+denmark`, 306-relation-member orphan delta preserved exactly across
+every commit). Planet was deferred to a single bench run on the
+final commit to amortize the ~1 hour measurement cost.
 
 **Honest re-estimate vs ALTW context**: 24 min puts renumber in the
 same ballpark as `add-locations-to-ways --index-type external`

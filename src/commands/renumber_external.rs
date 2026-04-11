@@ -70,8 +70,18 @@ const MAX_NODE_ID: u64 = 14_000_000_000;
 /// into only the first ~20 of the 256 buckets).
 const MAX_WAY_ID: u64 = 2_000_000_000;
 
-/// Serialized size of one `(old_id, new_id)` tuple on disk.
-const ID_PAIR_SIZE: usize = 16;
+/// Serialized size of one `old_id` entry in a node_map / way_map
+/// bucket file. The new_id is NOT stored — it's derived at read time
+/// from `start_new_id + bucket_new_id_start + position_within_bucket`.
+/// This halves the bucket file size vs storing `(old_id, new_id)` pairs.
+///
+/// Rationale: pass 1 emits node ids in sorted-input order, and
+/// `node_id_bucket` is monotonic in the input id, so all nodes in
+/// bucket k are processed before any node in bucket k+1. The global
+/// new_id for the i-th entry in bucket k is therefore
+/// `start_node_id + sum(bucket_counts[0..k]) + i`. Same invariant
+/// holds for way_map via `way_id_bucket`.
+const OLD_ID_SIZE: usize = 8;
 
 /// Serialized size of one `(old_node_id, slot_pos)` COO pair on disk.
 const COO_PAIR_SIZE: usize = 16;
@@ -138,33 +148,16 @@ fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// IdPair: the (old, new) tuple written to node_map bucket files
+// Old-id entries in node_map / way_map bucket files
 // ---------------------------------------------------------------------------
-
-/// A pair mapping an old id to a new id. Serialized as two little-endian
-/// i64s for a fixed 16-byte on-disk layout.
-#[derive(Clone, Copy)]
-struct IdPair {
-    old_id: i64,
-    new_id: i64,
-}
-
-impl IdPair {
-    fn write_to(&self, buf: &mut [u8; ID_PAIR_SIZE]) {
-        buf[..8].copy_from_slice(&self.old_id.to_le_bytes());
-        buf[8..].copy_from_slice(&self.new_id.to_le_bytes());
-    }
-
-    fn read_from(buf: &[u8; ID_PAIR_SIZE]) -> Self {
-        let old_id = i64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-        let new_id = i64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]);
-        Self { old_id, new_id }
-    }
-}
+//
+// The bucket file stores only the old id per node/way. The new id is
+// derived at read time from the bucket's cumulative start offset plus
+// the entry's position within the bucket — see `OLD_ID_SIZE`'s docstring
+// for the derivation.
+//
+// No struct is defined for this; callers emit raw `i64` values via
+// `emit_old_id` and load them into `Vec<i64>` via `load_old_id_bucket`.
 
 // ---------------------------------------------------------------------------
 // CooPair: (old_node_id, slot_pos) emitted by the stage 2a way pass
@@ -299,7 +292,7 @@ pub fn renumber_external(
     let pool = crate::blob::DecompressPool::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut pair_buf = [0u8; ID_PAIR_SIZE];
+    let mut id_buf = [0u8; OLD_ID_SIZE];
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
@@ -332,9 +325,9 @@ pub fn renumber_external(
                     bb.add_node(
                         new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref(),
                     );
-                    let pair = IdPair { old_id: dn.id(), new_id };
-                    emit_id_pair(
-                        &mut node_map_buckets, &mut pair_buf, pair, node_id_bucket(pair.old_id),
+                    let old_id = dn.id();
+                    emit_old_id(
+                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
                     )?;
                     stats.nodes_written += 1;
                 }
@@ -347,9 +340,9 @@ pub fn renumber_external(
                     bb.add_node(
                         new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref(),
                     );
-                    let pair = IdPair { old_id: n.id(), new_id };
-                    emit_id_pair(
-                        &mut node_map_buckets, &mut pair_buf, pair, node_id_bucket(pair.old_id),
+                    let old_id = n.id();
+                    emit_old_id(
+                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
                     )?;
                     stats.nodes_written += 1;
                 }
@@ -397,11 +390,18 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_END");
 
     // ---- Pass 2 stage B: node merge-join ----
+    // Compute the per-bucket new_id start offsets for node_map. The
+    // i-th entry in bucket k has new_id = start_node_id + prefix_sum +
+    // i. This replaces storing `new_id` alongside `old_id` on disk.
+    let node_map_bucket_starts =
+        compute_bucket_new_id_starts(opts.start_node_id, &node_map_counts);
+
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_START");
     let mut slot_buckets = BucketWriters::create(&scratch, "slot")?;
     let resolved_count = stage2b_node_merge_join(
         &way_ref_buckets,
         &node_map_buckets,
+        &node_map_bucket_starts,
         &mut slot_buckets,
         total_slots,
     )?;
@@ -484,15 +484,17 @@ pub fn renumber_external(
 
     // ---- Relation pass R2b: merge-join node/way members against maps ----
     // Reuses the same stage2b_node_merge_join function used for the way
-    // pass. The only difference is the input buckets and their
-    // partitioning (node_member_ref_buckets are partitioned by
-    // node_id_bucket, matching node_map_buckets; way_member_ref_buckets
-    // are partitioned by way_id_bucket, matching way_map_buckets).
+    // pass. Passes the pre-computed bucket_new_id_starts for whichever
+    // map (node_map or way_map) is being used as the lookup side.
     crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
+    let way_map_bucket_starts =
+        compute_bucket_new_id_starts(opts.start_way_id, &way_map_counts);
+
     let mut node_member_slot_buckets = BucketWriters::create(&scratch, "rel-node-slot")?;
     stage2b_node_merge_join(
         &node_member_ref_buckets,
         &node_map_buckets,
+        &node_map_bucket_starts,
         &mut node_member_slot_buckets,
         total_node_members,
     )?;
@@ -503,6 +505,7 @@ pub fn renumber_external(
     stage2b_node_merge_join(
         &way_member_ref_buckets,
         &way_map_buckets,
+        &way_map_bucket_starts,
         &mut way_member_slot_buckets,
         total_way_members,
     )?;
@@ -567,18 +570,46 @@ pub fn renumber_external(
 // Hot-path helper: write one IdPair into the correct node_map bucket
 // ---------------------------------------------------------------------------
 
-/// Serialize `pair` into the given `bucket` and increment the bucket's
+/// Compute the per-bucket new-id start offsets from a bucket-count
+/// array produced by `BucketWriters::finish()`. The i-th entry in
+/// bucket k has new_id = `bucket_new_id_starts[k] + i`. Bucket 0's
+/// start equals `start_new_id`; each subsequent bucket's start is
+/// the prior bucket's start plus its count.
+///
+/// Used by the main entry function after pass 1 / stage 2d completes
+/// to build the lookup-side offsets for `stage2b_node_merge_join`.
+#[allow(clippy::cast_possible_wrap)]
+fn compute_bucket_new_id_starts(
+    start_new_id: i64,
+    bucket_counts: &[u64],
+) -> [i64; NUM_BUCKETS] {
+    let mut starts = [0i64; NUM_BUCKETS];
+    let mut cursor = start_new_id;
+    for (k, starts_k) in starts.iter_mut().enumerate() {
+        *starts_k = cursor;
+        if let Some(&count) = bucket_counts.get(k) {
+            cursor = cursor.saturating_add(count as i64);
+        }
+    }
+    starts
+}
+
+/// Write `old_id` into the given `bucket` and increment the bucket's
 /// entry counter. The caller chooses the bucket via `node_id_bucket`
 /// (pass 1 node_map emit) or `way_id_bucket` (stage 2d way_map emit).
-fn emit_id_pair(
+///
+/// Only the old id is stored; the new id is reconstructed at read time
+/// via `bucket_new_id_starts[bucket] + position_in_bucket`. See
+/// `OLD_ID_SIZE` for the invariant chain.
+fn emit_old_id(
     buckets: &mut BucketWriters,
-    pair_buf: &mut [u8; ID_PAIR_SIZE],
-    pair: IdPair,
+    id_buf: &mut [u8; OLD_ID_SIZE],
+    old_id: i64,
     bucket: usize,
 ) -> Result<()> {
-    pair.write_to(pair_buf);
+    *id_buf = old_id.to_le_bytes();
     if let Some(w) = buckets.writers[bucket].as_mut() {
-        w.write_all(pair_buf)?;
+        w.write_all(id_buf)?;
     }
     buckets.entry_counts[bucket] += 1;
     Ok(())
@@ -921,30 +952,42 @@ mod radix_tests {
 // ---------------------------------------------------------------------------
 
 /// For each of the 256 node-id buckets: load the way-ref `CooPair`s into
-/// RAM (sort by `old_node_id`), load the corresponding `node_map`
-/// `IdPair`s into RAM (already sorted by `old_id` because pass 1 emits
-/// in ascending input-file order), two-cursor merge-join, and emit
+/// RAM (radix-sort by `old_node_id`), load the corresponding `node_map`
+/// old-id entries (already sorted by `old_id` because pass 1 emits in
+/// ascending input-file order), two-cursor merge-join, and emit
 /// `(slot_pos, new_node_id)` resolved entries into slot buckets.
 ///
-/// Orphan refs (way-refs whose `old_node_id` has no `node_map` entry)
+/// `bucket_new_id_starts[k]` must hold the new id to assign to the
+/// 0-th node in bucket k — i.e., `start_node_id +
+/// sum(node_map_counts[0..k])`. The i-th entry in bucket k is then
+/// assigned `bucket_new_id_starts[k] + i`. This reconstructs the new
+/// id from position, avoiding the 8 bytes per entry that storing
+/// `(old, new)` pairs on disk used to cost.
+///
+/// Same function is reused in R2B for relation members: pass
+/// `way_map_buckets` as the lookup side with `bucket_new_id_starts`
+/// derived from `start_way_id + way_map_counts` prefix sums.
+///
+/// Orphan refs (way-refs whose `old_node_id` has no matching entry)
 /// fall through with `resolved_id = old_node_id`, matching the in-
-/// memory renumber's `unwrap_or(old_id)` semantics. This keeps the
-/// external and in-memory paths element-equivalent for inputs with
-/// orphan refs.
+/// memory renumber's `unwrap_or(old_id)` semantics.
 ///
 /// Returns the total number of resolved entries emitted. Expected to
 /// equal the `total_slots` returned by stage 2a.
 ///
 /// **Temp disk discipline**: deletes each way-ref bucket file as soon
 /// as its merge-join completes. Without this per-bucket cleanup, stage
-/// 2b's peak temp disk footprint at planet scale would be `node_map
-/// (166 GB) + way_ref (166 GB) + slot (136 GB) = 468 GB`. With cleanup,
-/// it drops to `node_map + per-bucket way_ref (~650 MB) + slot =
-/// ~303 GB`. node_map stays alive because the relation pass needs it.
+/// 2b's peak temp disk footprint at planet scale would be
+/// `node_map (83 GB) + way_ref (166 GB) + slot (136 GB) = 385 GB`.
+/// With cleanup, it drops to `node_map + per-bucket way_ref (~650 MB)
+/// + slot = ~219 GB`. node_map stays alive because the relation pass
+/// needs it.
 #[hotpath::measure]
+#[allow(clippy::cast_possible_wrap)]
 fn stage2b_node_merge_join(
     way_ref_buckets: &BucketWriters,
     node_map_buckets: &BucketWriters,
+    bucket_new_id_starts: &[i64; NUM_BUCKETS],
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
 ) -> Result<u64> {
@@ -952,15 +995,13 @@ fn stage2b_node_merge_join(
     let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
 
     // Scratch buffers reused across bucket loads. Prevents heap
-    // accumulation at planet scale where 256 × ~650 MB bucket files
-    // would otherwise leave ~166 GB of unreturned allocations behind.
-    // Note: `load_coo_bucket` / `load_id_pair_bucket` explicitly drop
-    // their data_buf backing store after parsing, so the raw bytes
-    // aren't held alongside the parsed Vecs during the merge-join.
+    // accumulation at planet scale. `load_coo_bucket` / `load_old_id_bucket`
+    // explicitly drop their data_buf backing store after parsing, so the
+    // raw bytes aren't held alongside the parsed Vecs during the merge-join.
     let mut way_refs: Vec<CooPair> = Vec::new();
     let mut way_refs_data: Vec<u8> = Vec::new();
     let mut way_refs_scratch: Vec<CooPair> = Vec::new();
-    let mut node_map: Vec<IdPair> = Vec::new();
+    let mut node_map: Vec<i64> = Vec::new();
     let mut node_map_data: Vec<u8> = Vec::new();
 
     for bucket_idx in 0..NUM_BUCKETS {
@@ -975,43 +1016,38 @@ fn stage2b_node_merge_join(
         // Delete the way_ref bucket file now that we've read it into
         // RAM — no further stage consumes it. Cuts peak temp disk.
         drop(std::fs::remove_file(&way_ref_buckets.paths[bucket_idx]));
-        // LSD radix sort by old_node_id (u64 key reinterpret). At planet
-        // scale this bucket contains ~40M pairs and the comparison-based
-        // `sort_unstable_by_key` costs ~500 s total over all 256 buckets
-        // — the dominant contribution to stage 2b wall time per the
-        // sidecar profile. Radix sort cuts this to ~60-80 s.
-        //
-        // Negative ids are rejected upstream (`reject_negative_id`), so
-        // `old_node_id as u64` preserves the signed order exactly. OSM's
-        // current ~13B node id max fits in 34 bits; we do 5 × 8-bit
-        // passes (40 bits = 1 T id headroom).
+        // LSD radix sort by old_node_id — see `radix_sort_coo_pairs`.
         radix_sort_coo_pairs(&mut way_refs, &mut way_refs_scratch);
 
-        // node_map is already sorted: pass 1 scans a sorted input and emits
-        // (old_id, new_id) in file order, so within a bucket (same high
-        // bits of old_id) the pairs are in ascending old_id order.
+        // node_map is already sorted by old_id because pass 1 scans a
+        // sorted input and emits in file order, and `id_bucket` is
+        // monotonic in the input id.
         node_map.clear();
         if node_map_buckets.entry_counts[bucket_idx] > 0 {
-            load_id_pair_bucket(
+            load_old_id_bucket(
                 &node_map_buckets.paths[bucket_idx],
                 &mut node_map_data,
                 &mut node_map,
             )?;
         }
 
+        // new_id for the i-th entry in this bucket.
+        let bucket_base = bucket_new_id_starts[bucket_idx];
+
         // Two-cursor merge. Both sides sorted by old id; the node_map
         // cursor only moves forward, so the walk is O(way_refs + node_map).
         let mut nm_cursor: usize = 0;
         for wr in &way_refs {
-            while nm_cursor < node_map.len() && node_map[nm_cursor].old_id < wr.old_node_id {
+            while nm_cursor < node_map.len() && node_map[nm_cursor] < wr.old_node_id {
                 nm_cursor += 1;
             }
             let resolved_id = if nm_cursor < node_map.len()
-                && node_map[nm_cursor].old_id == wr.old_node_id
+                && node_map[nm_cursor] == wr.old_node_id
             {
-                node_map[nm_cursor].new_id
+                // Position-based new id reconstruction.
+                bucket_base + nm_cursor as i64
             } else {
-                // Orphan ref: no matching node in input. Preserve old id,
+                // Orphan ref: no matching entry. Preserve old id,
                 // matching in-memory renumber's unwrap_or(old_id) policy.
                 wr.old_node_id
             };
@@ -1201,24 +1237,30 @@ fn stage2c_slot_reorder(
     Ok(())
 }
 
-/// Load a bucket file of `IdPair` tuples into the provided `pairs` Vec.
-/// Counterpart of `load_coo_bucket` for the node_map / way_map side.
-/// See `load_coo_bucket` for the `data_buf` shrink-to-zero rationale.
+/// Load a bucket file of `old_id` entries (one `i64` LE per entry)
+/// into the provided `ids` Vec. Counterpart of `load_coo_bucket` for
+/// the node_map / way_map side. See `load_coo_bucket` for the
+/// `data_buf` shrink-to-zero rationale.
+///
+/// The entries are stored in emission order (pass 1 / stage 2d file
+/// order), which — because input is sorted by id and `id_bucket` is
+/// monotonic — is also ascending `old_id` order within the bucket.
+/// Callers (stage 2b / R2B merge-join) depend on this invariant.
 #[allow(clippy::cast_possible_truncation)]
-fn load_id_pair_bucket(
+fn load_old_id_bucket(
     path: &Path,
     data_buf: &mut Vec<u8>,
-    pairs: &mut Vec<IdPair>,
+    ids: &mut Vec<i64>,
 ) -> Result<()> {
     let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open id_pair bucket {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to open old_id bucket {}: {e}", path.display()))?;
     let len = file
         .metadata()
-        .map_err(|e| format!("failed to stat id_pair bucket {}: {e}", path.display()))?
+        .map_err(|e| format!("failed to stat old_id bucket {}: {e}", path.display()))?
         .len() as usize;
-    if !len.is_multiple_of(ID_PAIR_SIZE) {
+    if !len.is_multiple_of(OLD_ID_SIZE) {
         return Err(format!(
-            "id_pair bucket {} is {len} bytes, not a multiple of {ID_PAIR_SIZE} — truncated or corrupt",
+            "old_id bucket {} is {len} bytes, not a multiple of {OLD_ID_SIZE} — truncated or corrupt",
             path.display()
         )
         .into());
@@ -1226,17 +1268,17 @@ fn load_id_pair_bucket(
     data_buf.clear();
     data_buf.resize(len, 0);
     std::io::Read::read_exact(&mut &file, data_buf)
-        .map_err(|e| format!("failed to read id_pair bucket {}: {e}", path.display()))?;
+        .map_err(|e| format!("failed to read old_id bucket {}: {e}", path.display()))?;
     #[cfg(feature = "linux-direct-io")]
     super::external_radix::advise_dontneed_file(&file);
 
-    let count = data_buf.len() / ID_PAIR_SIZE;
-    pairs.clear();
-    pairs.reserve_exact(count.saturating_sub(pairs.capacity()));
-    let mut buf = [0u8; ID_PAIR_SIZE];
-    for chunk in data_buf.chunks_exact(ID_PAIR_SIZE) {
+    let count = data_buf.len() / OLD_ID_SIZE;
+    ids.clear();
+    ids.reserve_exact(count.saturating_sub(ids.capacity()));
+    let mut buf = [0u8; OLD_ID_SIZE];
+    for chunk in data_buf.chunks_exact(OLD_ID_SIZE) {
         buf.copy_from_slice(chunk);
-        pairs.push(IdPair::read_from(&buf));
+        ids.push(i64::from_le_bytes(buf));
     }
     *data_buf = Vec::new();
     Ok(())
@@ -1365,7 +1407,7 @@ fn stage2d_way_assembly(
     let mut way_blob_idx: usize = 0;
     let mut raw_buf: Vec<u8> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
-    let mut pair_buf = [0u8; ID_PAIR_SIZE];
+    let mut id_buf = [0u8; OLD_ID_SIZE];
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -1411,9 +1453,14 @@ fn stage2d_way_assembly(
                 let meta = element_metadata(&w.info());
                 bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
 
-                // Emit (old_way_id, new_way_id) into the way_map bucket.
-                let pair = IdPair { old_id: w.id(), new_id };
-                emit_id_pair(way_map_buckets, &mut pair_buf, pair, way_id_bucket(pair.old_id))?;
+                // Emit the old_way_id into the way_map bucket. The
+                // corresponding new_way_id is reconstructed at R2B
+                // read time from `start_way_id + bucket_way_id_start
+                // [bucket] + position_within_bucket`.
+                let old_way_id = w.id();
+                emit_old_id(
+                    way_map_buckets, &mut id_buf, old_way_id, way_id_bucket(old_way_id),
+                )?;
 
                 stats.ways_written += 1;
             }

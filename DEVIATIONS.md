@@ -84,6 +84,46 @@ mode, pbfhogg includes more way-referenced nodes while osmium includes more rela
 near extract boundaries may see slightly different relation membership. The node/way
 coverage is effectively identical.
 
+## renumber: orphan-reference handling
+
+**osmium behavior:** When a way ref or relation member points to an object not
+present in the input, osmium assigns a **new** sequential id to the orphan
+target via its `id_map::m_extra_ids` overflow table. These ids continue past
+the last in-input id for each type, so a Denmark run with 6,616,526 ways emits
+orphan way refs as 6,616,527, 6,616,528, ... in the order they're first
+encountered. Guarantees contiguous new-space output, at the cost of assigning
+ids to "phantom" objects that don't exist in the output.
+
+**pbfhogg behavior:** Orphan refs pass through with their old id
+(`resolved_id = old_id` in both the in-memory `unwrap_or(old)` path and the
+external-join merge-join path). The output contains a mix of new-space ids
+(for in-input targets) and old-space ids (for orphans). Both the in-memory
+and external modes agree — they produce byte-identical outputs for any
+given input.
+
+**Cross-validation:** Denmark: 306 relations differ, all in their `member`
+list only. No nodes, ways, or other relation fields differ. The 306 affected
+relations are all transboundary admin boundaries, route relations, and TMC
+(Traffic Message Channel) segments — all expected to have cross-border
+member references. Total match: 59,151,976 / 59,152,282 elements (99.9995%).
+
+**Rationale:** Both policies are defensible. pbfhogg preserves the original
+id space boundary (a ref to old id `X` always means "the thing that had
+id X in the input" — whether or not X is in the output), while osmium
+produces contiguous new-space output at the cost of introducing ids that
+reference nothing. pbfhogg's choice is the lower-surprise default: the
+output never contains ids for objects that aren't in the output.
+
+Users who need osmium-compatible orphan handling can add a followup
+`--orphan-policy {preserve,assign}` flag — see
+[notes/renumber-planet-scale.md](notes/renumber-planet-scale.md) correctness
+review section 5b for the full analysis.
+
+**Impact:** Downstream tools that assume output ids are contiguous in
+`[start_id, start_id + N)` must tolerate orphan refs outside that range.
+Tools that only chase live references don't hit the orphan ids at all
+(because no output element has the orphan id).
+
 ## check-refs: occurrence-counting vs unique-counting for missing references
 
 **osmium behavior:** For missing relation-to-relation members, osmium reports the

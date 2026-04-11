@@ -474,6 +474,70 @@ for (rel_idx, mem_idx, new_id) in ... { members_out[mem_idx] = Some(...); }
 // Emission: members_out.into_iter().map(Option::unwrap).collect()
 ```
 
+### 5b. Orphan-reference handling diverges from osmium. ⚠️
+
+**Measured 2026-04-11 via `pbfhogg diff` against osmium renumber output
+on Denmark.** pbfhogg and osmium agree on 59,151,976 of 59,152,282
+elements (100.0% of nodes and ways, 99.3% of relations). 306 relations
+differ, and **the only differing field on each is the member list**.
+No tags, coords, refs, or metadata differ.
+
+The 306 differences are all orphan-reference handling — relation
+members pointing to objects not present in the input (e.g., Denmark
+relations with members referencing ways in Germany/Sweden/Norway).
+The two tools resolve orphans differently:
+
+- **pbfhogg**: `resolved_id = old_id`. The output contains a mix of
+  new-space ids (for in-input targets) and old-space ids (for
+  orphans). Downstream tools that assume contiguous new ids must
+  tolerate the mixed space.
+- **osmium**: assigns **new** sequential ids to orphan targets via
+  its `id_map::m_extra_ids` overflow table (bespoke `id_map` class
+  in `osmium-tool/src/command_renumber.cpp`, per the prior-art
+  research earlier in this doc). The ids continue past the last
+  in-input id for each type, so a Denmark run with 6,616,526 ways
+  emits orphan way refs as 6,616,527, 6,616,528, ... in the order
+  they're first encountered. Ensures contiguous new-space output
+  at the cost of assigning ids to objects that don't exist in the
+  output.
+
+**This reverses the claim earlier in this doc that "orphan refs
+match in-memory behavior and osmium's behavior."** The in-memory/
+external agreement holds (both preserve old ids for orphans), but
+the "matching osmium" half was wrong — I didn't verify that empirically
+until now.
+
+**Which is correct?** Both are defensible. osmium's choice is
+cleaner for downstream contiguous-id assumptions but introduces
+"phantom" ids referring to nothing. pbfhogg's choice preserves the
+original id space boundary but produces mixed output.
+
+**Decision**: ship pbfhogg's current behavior and document it as a
+known cross-validation delta. Matches the existing pattern for
+other semantic differences in the README (extract relation inclusion,
+diff 14-element comparison, check-refs occurrences vs unique).
+Users who need osmium-compatible orphan handling can add a followup
+`--orphan-policy assign|preserve` flag.
+
+The 306 Denmark relations affected are all transboundary admin
+boundaries, route relations, and TMC (Traffic Message Channel)
+segments — all expected to have cross-border member references.
+Planet will have many more orphan refs (every country extract has
+cross-border relations), but the structural behavior is unchanged.
+
+**Verification command** (used manually, pending `brokkr verify
+renumber` from the brokkr dev):
+
+```
+osmium renumber data/denmark-*.osm.pbf \
+    -o data/bench-tmp/osmium-out.osm.pbf --overwrite
+brokkr renumber --dataset denmark --mode external --force
+# manually move brokkr's output aside before the next run
+pbfhogg diff data/bench-tmp/osmium-out.osm.pbf \
+    data/bench-tmp/bench-renumber-external-output.osm.pbf -s -c
+# → Summary: left=59152282 right=59152282 same=59151976 different=306
+```
+
 ### 5. Reject negative IDs in external mode with a clear error.
 
 Design decision: external path requires non-negative input IDs. Detect

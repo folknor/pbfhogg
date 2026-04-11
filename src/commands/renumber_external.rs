@@ -570,17 +570,20 @@ fn emit_id_pair(
 #[hotpath::measure]
 fn stage2a_way_ref_pass(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     way_ref_buckets: &mut BucketWriters,
     ref_count_sidecar: &Path,
 ) -> Result<u64> {
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    // Consume the header blob so the iteration below starts at the first
-    // OsmData blob, matching the stage1_way_pass convention.
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    // Schedule + pread pattern: only way blobs are pulled from disk.
+    // Stage 2d reuses `build_blob_schedule` with the same `ElemKind::Way`
+    // filter so the blob set + order are identical between this pass
+    // and the way-assembly pass — the per-blob ref-count sidecar written
+    // below stays in lockstep with stage 2d's blob iteration.
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
@@ -593,21 +596,13 @@ fn stage2a_way_ref_pass(
             .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
     );
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        // Fast-skip non-way blobs via blob_index for indexed PBFs. Stage 2d
-        // MUST apply the identical filter during its re-scan so the blob
-        // order and indices line up — both phases see the same blob set.
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
-                continue;
-            }
-        }
-
-        blob.decompress_into(&mut decompress_buf)?;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let blob_start_pos = slot_pos;
         // The scan_way_refs callback is FnMut, so it can't return Result.
         // Stash the first I/O error and bail after scan returns.
@@ -1029,7 +1024,7 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
 )]
 fn stage2d_way_assembly(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     bb: &mut BlockBuilder,
     way_map_buckets: &mut BucketWriters,
@@ -1072,35 +1067,37 @@ fn stage2d_way_assembly(
         mmap
     };
 
-    // Re-open the input for the second way scan.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    // Second way scan via schedule + pread — same blob set and order
+    // as stage 2a so the per-blob ref-count sidecar aligns 1:1.
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
+    if schedule.len() != blob_slot_starts.len() {
+        return Err(format!(
+            "stage 2d: way blob schedule size {} != sidecar entries {}",
+            schedule.len(),
+            blob_slot_starts.len()
+        )
+        .into());
+    }
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
     let mut way_blob_idx: usize = 0;
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut pair_buf = [0u8; ID_PAIR_SIZE];
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
-                continue;
-            }
-        }
-        if way_blob_idx >= blob_slot_starts.len() {
-            return Err("stage 2d: way blob count exceeds stage 2a sidecar entries".into());
-        }
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
         let mut slot_cursor = blob_slot_starts[way_blob_idx];
 
-        blob.decompress_into(&mut decompress_buf)?;
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
         )?;
@@ -1141,6 +1138,26 @@ fn stage2d_way_assembly(
             }
         }
 
+        // Per-blob cross-check: slot_cursor must have advanced to exactly
+        // the next blob's start (or total_slots for the last blob). Any
+        // drift here indicates stage 2a and stage 2d disagreed on the way
+        // iteration order, which would silently misalign every subsequent
+        // blob's refs. This check catches the drift as soon as it happens
+        // rather than after the whole file is written.
+        let expected_end = blob_slot_starts
+            .get(way_blob_idx + 1)
+            .copied()
+            .unwrap_or(total_slots);
+        if slot_cursor != expected_end {
+            return Err(format!(
+                "stage 2d slot cursor drift at way blob {way_blob_idx}: \
+                 cursor = {slot_cursor}, expected = {expected_end} \
+                 (blob start = {})",
+                blob_slot_starts[way_blob_idx]
+            )
+            .into());
+        }
+
         way_blob_idx += 1;
     }
 
@@ -1156,6 +1173,51 @@ fn stage2d_way_assembly(
 }
 
 // ---------------------------------------------------------------------------
+// Header-only scan helper: build a schedule of matching-type blobs
+// ---------------------------------------------------------------------------
+
+/// Walk the input PBF reading only blob headers (seeking past the
+/// compressed bodies), and return a schedule of `(data_offset, data_size)`
+/// for every OsmData blob whose `blob.index()` reports the requested
+/// `ElemKind`. Non-indexed blobs are included unconditionally so the
+/// caller's element-level dispatch still handles them — at the cost of
+/// some wasted decompression on non-indexed inputs.
+///
+/// Uses `BlobReader::seekable_from_path` + `next_header_with_data_offset`
+/// which seek past each blob's compressed body rather than reading it,
+/// so this walk pays O(header_bytes) I/O instead of O(total_file_size).
+/// At planet scale the header-walk is a few hundred MB vs 87 GB full
+/// read.
+///
+/// The schedule is then consumed by a pread-based blob reader so only
+/// matching blobs are ever pulled off disk. Matches the pattern used in
+/// `src/commands/extract.rs` and `src/commands/external_join.rs` stage 2.
+fn build_blob_schedule(
+    input: &Path,
+    kind: crate::blob_index::ElemKind,
+) -> Result<Vec<(u64, usize)>> {
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner
+        .next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut schedule: Vec<(u64, usize)> = Vec::new();
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = hdr.index() {
+            if idx.kind != kind {
+                continue;
+            }
+        }
+        schedule.push((data_offset, data_size));
+    }
+    Ok(schedule)
+}
+
+// ---------------------------------------------------------------------------
 // Relation pass R1: assign new relation ids, build in-memory relation_map
 // ---------------------------------------------------------------------------
 
@@ -1165,33 +1227,34 @@ fn stage2d_way_assembly(
 /// when node_map and way_map must live in external buckets.
 ///
 /// Does NOT write any relations to the output PBF. That's pass R2.
+///
+/// Uses the schedule + pread pattern so only relation blobs pay disk
+/// I/O — at planet scale, relation blobs are ~3% of the file so this
+/// is ~97% less I/O than the prior pattern of reading every blob's
+/// compressed body.
 #[hotpath::measure]
 fn relation_r1_assign_ids(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     relation_map: &mut FxHashMap<i64, i64>,
     next_relation_id: &mut i64,
 ) -> Result<()> {
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
-                continue;
-            }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf),
             &mut st_scratch,
@@ -1230,15 +1293,15 @@ fn relation_r1_assign_ids(
 #[hotpath::measure]
 fn relation_r2a_emit_member_refs(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     node_member_buckets: &mut BucketWriters,
     way_member_buckets: &mut BucketWriters,
 ) -> Result<(u64, u64)> {
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1247,17 +1310,13 @@ fn relation_r2a_emit_member_refs(
     let mut node_slot_pos: u64 = 0;
     let mut way_slot_pos: u64 = 0;
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
-                continue;
-            }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf),
             &mut st_scratch,
@@ -1329,7 +1388,7 @@ fn relation_r2a_emit_member_refs(
 )]
 fn relation_r2d_assembly(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     bb: &mut BlockBuilder,
     node_member_new_refs_path: &Path,
@@ -1342,11 +1401,11 @@ fn relation_r2d_assembly(
     let node_mmap = open_new_refs_mmap(node_member_new_refs_path, total_node_members)?;
     let way_mmap = open_new_refs_mmap(way_member_new_refs_path, total_way_members)?;
 
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader
-        .next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let mut raw_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1354,17 +1413,13 @@ fn relation_r2d_assembly(
     let mut node_slot_cursor: u64 = 0;
     let mut way_slot_cursor: u64 = 0;
 
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
-                continue;
-            }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf),
             &mut st_scratch,

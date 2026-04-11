@@ -450,23 +450,97 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **`renumber` external path — review followups (2026-04-11).** Six
+- [ ] **`renumber` external path — optimization roadmap (2026-04-11).** Six
   commits landed the external renumber implementation (pass 1 + stages
-  2a-2d + relation R1/R2). A full review (bugs/perf/arch/correctness/
-  planet × claude+codex) surfaced a set of findings; the critical ones
-  landed immediately (see separate commits), the items below are
-  tracked followups.
+  2a-2d + relation R1/R2). First planet measurement on 2026-04-11
+  (commit `e156e97`, UUID `c5d00c22`): **3,456 s (57.6 min)**, peak
+  anon 2.79 GB, all element counts correct. That's 2.6× the design
+  estimate of ~1,300 s. Memory is well under the 4 GB target; wall time
+  is the outstanding issue.
 
-  **Memory / perf optimization frontier (planet bench depends on these):**
+  Reviewer brief sent to planet+perf+arch after the first measurement
+  revised the optimization plan. Two new levers nobody had in my
+  original 3-item list, plus honest revisions of the parallelization
+  and radix-sort savings. See
+  [notes/renumber-planet-scale.md](notes/renumber-planet-scale.md)
+  "Optimization roadmap — reviewer consensus" for the full analysis;
+  summarizing here for tracking.
 
-  - [ ] **Radix sort in stage 2b** instead of `sort_unstable_by_key`.
-    At planet, each way_ref bucket is ~530 MB × 256 buckets ≈ ~40 min
-    sort time — likely the planet wall-time floor. Radix sort by next
-    8 bits below the bucket bits would go linear.
-  - [ ] **Zero-copy bucket reads via bytemuck** (or `#[repr(C)]` +
-    `slice::from_raw_parts`). `load_coo_bucket` / `load_id_pair_bucket`
-    currently do ~40 ns per-pair copy into a `Vec<Pair>`. At planet
-    that's ~164 s of deserialization overhead per full pass.
+  **Accepted target: ~24 min wall for single `--bench 1` run** (down
+  from 57.6 min). Not the original 20-min framing — reviewers agreed
+  20 min isn't reachable without output compression changes, and
+  production uses `--compression none` anyway which is faster.
+  24 min puts renumber in the same ballpark as ALTW external
+  (24m22s) and build-geocode-index (22m26s) at planet scale.
+
+  **Priority-ordered task list** (unanimous reviewer ordering):
+
+  - [ ] **Stage 2b radix sort** — first, cleanest, most local change.
+    Replace `sort_unstable_by_key(|p| p.old_node_id)` with LSD radix
+    sort over 5 bytes of u64 key. Self-contained in
+    `stage2b_node_merge_join`. **Revised estimate: 823 → ~350 s** (not
+    the original 100 s — reviewers correctly pointed out that stage 2b
+    also pays ~170 s of sequential bucket I/O + ~100 s of parse
+    overhead as floor; radix sort eliminates the sort CPU but not the
+    I/O floor). Savings: ~470 s.
+  - [ ] **Halve the map-bucket record format** (new lever from
+    claude-arch + codex-perf review, independently flagged). Currently
+    pass 1 emits `IdPair { old_id, new_id }` at 16 bytes per node;
+    stage 2d same for ways. But `new_id` is derivable from `start_id +
+    cumulative_bucket_index`, because sorted input + monotonic bucket
+    ranges make the mapping implicit. Store just `old_id` (8 bytes).
+    The design doc (line 132) flagged this option and deferred it "for
+    merge-join simplicity." Take it back now that planet measurements
+    justify it. Touches 4-5 call sites: `IdPair` struct shrinks to
+    just `old_id: i64`, `emit_id_pair` becomes single-field write,
+    `load_id_pair_bucket` halves data_buf size, stage 2b merge-join
+    reads `new_id` from a bucket-cumulative counter instead of the
+    loaded pair, stage 2d / R2B way_map side similar.
+
+    Savings:
+    - Pass 1 scratch writes: 166 GB → 83 GB, **save ~200 s**
+    - Stage 2b read I/O: halved, **save ~80 s**
+    - Stage 2d way_map writes: halved, **save ~50 s**
+    - R2B read I/O: halved, **save ~30 s**
+    - **Stage 2b per-bucket RAM: 650 MB → 325 MB** — unlocks lever #3
+    - **Total direct savings: ~360 s** across 4 stages
+  - [ ] **Bucket-level parallelism in stage 2b** (new lever from
+    codex-perf). The 256 buckets are embarrassingly parallel. 2 worker
+    threads processing disjoint bucket subsets × radix sort from #1 =
+    ~180 s vs ~350 s sort-alone. Memory: 2 workers × 325 MB × 2 sides
+    = 1.3 GB peak (within 4 GB target; only fits after #2's map
+    shrink). 4 workers would overshoot the memory budget even with
+    the map shrink, so cap at 2. Savings beyond #1: ~170 s.
+  - [ ] **Build shared ordered-write helper**: schedule + pread +
+    worker decode + `reorder_buffer::ReorderBuffer` + sequential
+    writer. One reusable helper in `external_radix.rs` or a
+    renumber-local helper module. Will be applied to pass 1, stage 2d,
+    stage 2a in that order. **Not `for_each_block_pipelined`** —
+    unanimous reviewer rejection because of cross-thread
+    `PrimitiveBlock` retention issues documented in
+    `notes/parallel-classify-regression.md`. Pread pattern keeps
+    alloc/free worker-local.
+  - [ ] **Pass 1 parallel decode** (apply helper #4). **Revised
+    estimate: 1,147 → ~500 s** (not the original 400 s — reviewers
+    pointed out `cat` at 500 s is raw passthrough, not a fair
+    comparator for pass 1's full decode + re-encode + 83 GB scratch
+    emission). Savings: ~650 s.
+  - [ ] **Stage 2d parallel decode** (apply helper #4). Revised
+    estimate: 664 → ~300 s. Savings: ~364 s.
+  - [ ] **Stage 2a parallel way scan** (apply helper #4). 339 →
+    ~150 s. Savings: ~190 s.
+  - [ ] **R2B radix sort** (mirror of #1 for relation member
+    merge-join). 236 → ~90 s. Savings: ~150 s.
+
+  **Projected total after all seven wins: ~1,430 s (23.8 min).**
+  Memory peak stays ~2.79 GB (stage 2b's 2-worker parallelism pushes
+  slightly higher but map shrink halves the per-side allocation,
+  netting neutral). Temp disk peak drops by ~83 GB (node_map halved).
+
+  **Smaller / defensive followups (non-blocking for 24-min target):**
+
+  **Smaller / defensive followups (non-blocking for planet bench):**
+
   - [ ] **`fadvise(SEQUENTIAL)` before full bucket reads** in
     `load_coo_bucket` / `load_id_pair_bucket`. Small win on cold cache
     scenarios.

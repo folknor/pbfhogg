@@ -324,22 +324,194 @@ actual bench lands.
 With both followups applied, peak drops toward ~250 GB, roughly
 matching the ALTW external budget.
 
-## Wall time estimate
+## Wall time — design estimate vs first measurement
 
-Rough extrapolation from ALTW external (1,462 s at planet scale) and
-the renumber operation's shape:
+**Design estimate** (pre-implementation, extrapolated from ALTW
+external's 1,462 s planet run):
 
-| Pass | Estimate | Comparison |
-|---|---|---|
-| Pass 1 (nodes): scan + emit tuples + write | ~500 s | ALTW stage 1 was 333 s on planet; renumber adds output write |
-| Pass 2 (ways): bucket merge-join + write | ~700 s | ALTW stage 2 + 4 combined was ~881 s (612 + 269); renumber does less work per ref (i64 lookup vs i32×2 coord lookup) but also writes PBF output |
-| Pass R1 (relations, assign IDs) | ~30 s | tiny volume |
-| Pass R2 (relations, remap + write) | ~50 s | merge-joins against bucket files |
-| **Total** | **~1,300 s (~22 min)** | in the same ballpark as ALTW external and geocode-builder on planet |
+| Pass | Estimate |
+|---|---|
+| Pass 1 (nodes) | ~500 s |
+| Pass 2 (ways) | ~700 s |
+| Pass R1 (relations, assign IDs) | ~30 s |
+| Pass R2 (relations, remap + write) | ~50 s |
+| **Total estimate** | **~1,300 s (~22 min)** |
 
-This is a guess and will likely be off by ±50%. The real number depends
-heavily on whether merge-join cursor walks dominate (sequential I/O)
-or the output PBF write path dominates (compression CPU bound).
+### First planet measurement: 2026-04-11, commit `e156e97`, UUID `c5d00c22`
+
+**`brokkr renumber --dataset planet --mode external --bench 1` on
+plantasjen** (AMD Ryzen 9 5900X, 30 GB DDR4, 24 GB avail, NVMe data
+drive, performance governor, kernel 7.0.0-12).
+
+| Phase | Duration | Peak Anon RSS | Share of total |
+|---|---:|---:|---:|
+| `RENUMBER_EXT_PASS1` (nodes) | **1,147 s (19.1 min)** | 130 MB | **33.2%** |
+| `RENUMBER_EXT_STAGE2A` (way COO emit) | 339 s (5.6 min) | 131 MB | 9.8% |
+| `RENUMBER_EXT_STAGE2B` (node merge-join) | **823 s (13.7 min)** | **2.79 GB** | **23.8%** |
+| `RENUMBER_EXT_STAGE2C` (slot reorder) | 174 s (2.9 min) | 1.27 GB | 5.0% |
+| `RENUMBER_EXT_STAGE2D` (way assembly) | **664 s (11.1 min)** | 1.19 GB | **19.2%** |
+| `RENUMBER_EXT_R1_R2A` (rel assign+emit) | 31 s | 487 MB | 0.9% |
+| `RENUMBER_EXT_R2B` (rel merge-join) | 236 s (3.9 min) | 1.98 GB | 6.8% |
+| `RENUMBER_EXT_R2C` (rel slot reorder) | 2 s | 419 MB | <0.1% |
+| `RENUMBER_EXT_R2D` (rel write) | 33 s | 431 MB | 1.0% |
+| **TOTAL** | **3,456 s (57.6 min)** | **2.79 GB peak anon** | — |
+
+Memory trajectory (100 ms sidecar samples, n=34,566): min 0, **max
+2,785,084 kB (2.79 GB)**, avg 721 MB, p50 122 MB, p95 2.45 GB. The
+2.79 GB peak lives entirely in stage 2b; every other stage runs with
+<200 MB anon.
+
+Element counters (all verified against expected planet scale):
+
+- nodes: 10,447,738,627
+- way refs (total slots): 12,435,459,911
+- ways: 1,165,589,744
+- relations: 14,124,889
+- relation node members: 22,732,221
+- relation way members: 136,900,241
+
+### Analysis: 2.6× over design estimate
+
+The measured 57.6 min is 2.6× over the 1,300 s design estimate. The
+design doc caveat "will likely be off by ±50%" understated it. Where
+the time went:
+
+**Pass 1 (1,147 s, design est. 500 s): 2.3× over.** The node scan is
+single-threaded end-to-end — `BlobReader` reads blob-by-blob, single-
+thread decompress, single-thread parse, `BlockBuilder::add_node` in a
+tight loop, output through the pipelined writer. At planet's 10.4B
+nodes, each node crosses ~6 function boundaries in the hot path.
+Effective I/O throughput during pass 1 was ~50 MB/s on an NVMe that
+can do 3+ GB/s, so the bottleneck is CPU per node (~110 ns/node)
+rather than disk. The comparable `pbfhogg cat` planet run takes ~500 s
+because it uses the pipelined reader with parallel decompression;
+pass 1 doesn't. **Pass 1 parallelization is the biggest available win.**
+
+**Stage 2b (823 s, design est. ~400 s of the ~700 s "pass 2"): as
+predicted by the review.** The full-review pass flagged
+`sort_unstable_by_key` on 40M-entry buckets × 256 buckets as the
+"likely planet wall-time floor" and pointed at radix sort. Measured
+823 s is exactly in the predicted range. Radix sort over the 5-byte
+key range would run in linear time; expected speedup ~8×, bringing
+stage 2b toward ~100 s. **Second biggest available win.**
+
+**Stage 2d (664 s, design est. ~300 s of pass 2): 2.2× over.** Same
+single-threaded pattern as pass 1 — pread a way blob, decompress,
+walk each way's refs via mmap'd `new_refs`, push to `BlockBuilder`,
+write. Parallel decode would help here too.
+
+**Everything else** (stages 2a, 2c, all relation phases) ran under
+the collective budget of the design estimate and isn't worth
+optimizing.
+
+**Peak memory 2.79 GB vs 4 GB target: 30% under budget.** No
+memory-bound concern. Temp disk peak came in well under the 912 GB
+available and is not worth re-measuring precisely from this run
+(sidecar doesn't track disk).
+
+### Optimization roadmap — reviewer consensus (2026-04-11)
+
+After the first planet measurement, I sent a brief to the planet +
+perf + arch reviewers (claude + codex per archetype) asking for
+optimization guidance to hit ≤20 min wall. The review landed two
+**new** levers I hadn't considered and revised my own estimates
+down:
+
+**Reviewer findings:**
+
+1. **My stage 2b `823 → 100 s` estimate was too optimistic.** The
+   sort isn't the whole cost. Stage 2b also pays ~170 s of sequential
+   bucket I/O (650 MB × 2 sides × 256 buckets at ~3 GB/s NVMe floor)
+   and ~100 s of parse overhead. Radix sort eliminates the ~500 s
+   sort CPU cost but the I/O floor remains. **Realistic target with
+   radix sort alone: 823 → ~350 s.**
+
+2. **My pass 1 `1147 → 400 s` estimate was too optimistic.** `cat`
+   at ~500 s on planet is raw-frame passthrough, not a fair
+   comparator. Pass 1 does full decode + re-encode + 166 GB scratch
+   emission. **Realistic target with parallel decode: 1147 → ~600 s.**
+
+3. **New lever A: halve the map-bucket record format.** Currently
+   pass 1 emits `IdPair { old_id, new_id }` at 16 bytes per node;
+   stage 2d emits the same shape per way. But `new_id` is derivable
+   from `start_id + cumulative_bucket_index`, because input is sorted
+   and bucket ranges are monotonic. Store just `old_id` (8 bytes).
+   The design doc flagged this option at line 132 and deferred it
+   "for merge-join simplicity." Given measured planet numbers, the
+   trade is worth taking back. Halves:
+   - Pass 1 scratch writes (166 GB → 83 GB) — save ~200 s
+   - Stage 2b read I/O — save ~80 s
+   - Stage 2d way_map writes — save ~50 s
+   - R2B read I/O — save ~30 s
+   - **Stage 2b per-bucket RAM (650 MB → 325 MB)**, enabling lever B
+
+   **Total direct savings: ~360 s.** Flagged by claude-arch and
+   codex-perf independently.
+
+4. **New lever B: bucket-level parallelism in stage 2b.** The 256
+   buckets are embarrassingly parallel. 2 worker threads × radix sort
+   = ~180 s vs ~350 s sort-alone. Memory: 2 workers × 325 MB per side
+   × 2 sides = 1.3 GB peak (within the 4 GB target). 4 workers would
+   need the map shrink to fit under budget; 2 is safer. Flagged by
+   codex-perf.
+
+**Unanimous sequencing (all three reviewers):**
+
+1. **Stage 2b radix sort first.** Self-contained, one function in
+   one file, element-equivalence tests verify immediately. Clean
+   measurement loop before structural changes.
+2. **Map record format shrink.** Cross-cutting (touches 4-5 call
+   sites) but unlocks memory headroom for bucket-level parallelism
+   and halves I/O in pass 1, stage 2b, stage 2d, R2B simultaneously.
+3. **Bucket-level parallelism in stage 2b.** Builds on #1 + #2.
+4. **Build one shared schedule + pread + worker decode + reorder
+   ordered-write helper.** Apply to pass 1, stage 2d, stage 2a in
+   that order.
+5. **R2B radix sort** (mirror of 2b, smaller N).
+
+**Parallel decode pattern choice**: **not** `for_each_block_pipelined`.
+All three reviewers unanimous: use the schedule + pread + worker
+decode pattern from `external_join.rs` / `extract.rs` /
+`tags_filter.rs`. The pipelined reader has cross-thread
+`PrimitiveBlock` retention issues documented in
+`notes/parallel-classify-regression.md` that the pread pattern
+avoids. Worker-local alloc/free stays bounded, ordered emission is
+explicit via `reorder_buffer::ReorderBuffer`.
+
+### Revised theoretical roadmap
+
+| Phase | Current | Target | Optimization |
+|---|---:|---:|---|
+| PASS1 nodes | 1,147 s | ~500 s | parallel decode + map shrink |
+| STAGE2A way emit | 339 s | ~150 s | parallel scan (shared helper) |
+| STAGE2B node merge-join | 823 s | ~150 s | radix sort + 2-worker parallelism + map shrink |
+| STAGE2C slot reorder | 174 s | 174 s | unchanged |
+| STAGE2D way assembly | 664 s | ~300 s | parallel decode + map shrink |
+| R1+R2A fused | 31 s | 31 s | unchanged |
+| R2B rel merge-join | 236 s | ~90 s | radix sort + map shrink |
+| R2C + R2D | 35 s | 35 s | unchanged |
+| **TOTAL** | **3,456 s (57.6 min)** | **~1,430 s (23.8 min)** | **~2,026 s saved** |
+
+**Honest target: ~24 min after all seven wins land.** Still 4 min
+over the 20-min target I originally framed to the user. The
+remaining gap would require output compression change (zlib:6 →
+zstd:1 or `--compression none`, save ~400 s per claude-perf), but
+**the production pipeline already uses `--compression none`**, so
+this isn't a concern in practice — the 24 min figure is for the
+zlib:6 default path, and the production-relevant number with
+`--compression none` is correspondingly faster. **24 min is
+accepted as the target.**
+
+**Commit target**: before the full `--bench 3` run for publishable
+numbers, land the optimizations incrementally and run `--bench 1`
+after each to validate. The `--bench 3` session is ~72 min wall at
+the target (vs ~172 min at current baseline).
+
+**Honest re-estimate vs ALTW context**: 24 min puts renumber in the
+same ballpark as `add-locations-to-ways --index-type external`
+(24m22s) and `build-geocode-index` (22m26s) at planet scale — both
+other disk-backed external transforms. That's the expected shape
+for planet transforms that touch every element.
 
 ## Differences from ALTW external join
 

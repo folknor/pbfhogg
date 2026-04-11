@@ -45,8 +45,8 @@ use std::path::{Path, PathBuf};
 use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::renumber::{RenumberOptions, RenumberStats};
 use super::{
-    dense_node_metadata, element_metadata, ensure_node_capacity, flush_block, require_sorted,
-    writer_from_header, HeaderOverrides, Result,
+    dense_node_metadata, element_metadata, ensure_node_capacity, ensure_way_capacity,
+    flush_block, require_sorted, writer_from_header, HeaderOverrides, Result,
 };
 use crate::block_builder::BlockBuilder;
 use crate::writer::Compression;
@@ -60,6 +60,12 @@ use crate::Element;
 /// current ~13B OSM node-id maximum; matches `external_join::MAX_NODE_ID`.
 const MAX_NODE_ID: u64 = 14_000_000_000;
 
+/// Upper bound for way id partitioning. 2B gives headroom above the
+/// current ~1.17B OSM way-id maximum while keeping the way_map buckets
+/// well-populated (reusing MAX_NODE_ID=14B for ways would dump all ways
+/// into only the first ~20 of the 256 buckets).
+const MAX_WAY_ID: u64 = 2_000_000_000;
+
 /// Serialized size of one `(old_id, new_id)` tuple on disk.
 const ID_PAIR_SIZE: usize = 16;
 
@@ -69,19 +75,36 @@ const COO_PAIR_SIZE: usize = 16;
 /// Serialized size of one `(slot_pos, new_node_id)` resolved entry on disk.
 const RESOLVED_ENTRY_SIZE: usize = 16;
 
-/// Byte offset bucket index function. Partitions a `u64`-castable id into
-/// one of `NUM_BUCKETS` buckets by its position in `[0, MAX_NODE_ID)`.
-/// Negative ids clamp to bucket 0 — the external path currently accepts
-/// negative ids through this clamp (a balance wart, not a correctness
-/// one) rather than rejecting them at the entry gate; that policy
-/// decision lives in the design doc's section 5 and can be revisited
-/// when the renumber tests exercise negative input.
+/// Size of a single slot in the flat `new_refs` file produced by stage 2c.
+/// Each slot holds one `i64 LE` new_node_id.
+const NEW_REF_SIZE: usize = 8;
+
+/// Partition a signed id into one of `NUM_BUCKETS` buckets by its
+/// position in `[0, max_id)`. Negative ids clamp to bucket 0.
+///
+/// The external path currently accepts negative ids through this clamp
+/// (a balance wart, not a correctness one) rather than rejecting them
+/// at the entry gate; the policy decision is captured in the design
+/// doc's section 5 and can be revisited when the renumber tests
+/// exercise negative input.
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn node_id_bucket(id: i64) -> usize {
+fn id_bucket(id: i64, max_id: u64) -> usize {
     let u = if id < 0 { 0u64 } else { id as u64 };
-    let range_size = MAX_NODE_ID.div_ceil(NUM_BUCKETS as u64);
+    let range_size = max_id.div_ceil(NUM_BUCKETS as u64);
     let bucket = u / range_size;
     (bucket as usize).min(NUM_BUCKETS - 1)
+}
+
+/// Bucket index for node id partitioning. Shared by pass 1 (node_map
+/// emit) and stage 2b (node merge-join).
+fn node_id_bucket(id: i64) -> usize {
+    id_bucket(id, MAX_NODE_ID)
+}
+
+/// Bucket index for way id partitioning. Used by stage 2d way_map emit
+/// and by the relation pass (task #4) when merge-joining way members.
+fn way_id_bucket(id: i64) -> usize {
+    id_bucket(id, MAX_WAY_ID)
 }
 
 // ---------------------------------------------------------------------------
@@ -227,6 +250,7 @@ pub fn renumber_external(
     let mut node_map_buckets = BucketWriters::create(&scratch, "node-map")?;
 
     let mut next_node_id = opts.start_node_id;
+    let mut next_way_id = opts.start_way_id;
     let mut stats = RenumberStats {
         nodes_written: 0,
         ways_written: 0,
@@ -267,9 +291,9 @@ pub fn renumber_external(
                     bb.add_node(
                         new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref(),
                     );
+                    let pair = IdPair { old_id: dn.id(), new_id };
                     emit_id_pair(
-                        &mut node_map_buckets, &mut pair_buf,
-                        IdPair { old_id: dn.id(), new_id },
+                        &mut node_map_buckets, &mut pair_buf, pair, node_id_bucket(pair.old_id),
                     )?;
                     stats.nodes_written += 1;
                 }
@@ -281,9 +305,9 @@ pub fn renumber_external(
                     bb.add_node(
                         new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref(),
                     );
+                    let pair = IdPair { old_id: n.id(), new_id };
                     emit_id_pair(
-                        &mut node_map_buckets, &mut pair_buf,
-                        IdPair { old_id: n.id(), new_id },
+                        &mut node_map_buckets, &mut pair_buf, pair, node_id_bucket(pair.old_id),
                     )?;
                     stats.nodes_written += 1;
                 }
@@ -351,13 +375,46 @@ pub fn renumber_external(
     way_ref_buckets.cleanup();
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_END");
 
-    // TODO(task #3 stages 2c/2d): scatter slot entries into a flat
-    // new_refs file (2c), then re-stream ways, rewrite refs from that
-    // file, and emit way_map tuples (2d).
+    // ---- Pass 2 stage C: slot reorder → flat new_refs file ----
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_START");
+    let new_refs_path: PathBuf = scratch.file_path("new-refs");
+    stage2c_slot_reorder(&slot_buckets, &new_refs_path, total_slots)?;
+    slot_buckets.cleanup();
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_END");
+
+    // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
+    let mut way_map_buckets = BucketWriters::create(&scratch, "way-map")?;
+    stage2d_way_assembly(
+        input,
+        direct_io,
+        &mut writer,
+        &mut bb,
+        &mut way_map_buckets,
+        &new_refs_path,
+        &ref_count_sidecar,
+        total_slots,
+        &mut next_way_id,
+        &mut stats,
+    )?;
+    let way_map_counts = way_map_buckets.finish()?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        let total: u64 = way_map_counts.iter().sum();
+        crate::debug::emit_counter("renumber_ext_way_map_entries", total as i64);
+    }
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
+
+    // TODO(task #4): relation two-pass. Reads node_map_buckets +
+    // way_map_buckets for member remap; writes renumbered relations to
+    // output. Until then, the output has renumbered nodes + ways but
+    // no relations, which is still incomplete for end-to-end renumber
+    // semantics on inputs with relations.
 
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
+    drop(way_map_buckets);
     drop(slot_buckets);
     drop(way_ref_buckets);
     drop(node_map_buckets);
@@ -372,15 +429,15 @@ pub fn renumber_external(
 // Hot-path helper: write one IdPair into the correct node_map bucket
 // ---------------------------------------------------------------------------
 
-/// Serialize `pair` into the bucket matching its `old_id` high bits and
-/// increment the bucket's entry counter. Matches the direct-field-access
-/// pattern in `external_join::stage1_way_pass` for consistency.
+/// Serialize `pair` into the given `bucket` and increment the bucket's
+/// entry counter. The caller chooses the bucket via `node_id_bucket`
+/// (pass 1 node_map emit) or `way_id_bucket` (stage 2d way_map emit).
 fn emit_id_pair(
     buckets: &mut BucketWriters,
     pair_buf: &mut [u8; ID_PAIR_SIZE],
     pair: IdPair,
+    bucket: usize,
 ) -> Result<()> {
-    let bucket = node_id_bucket(pair.old_id);
     pair.write_to(pair_buf);
     if let Some(w) = buckets.writers[bucket].as_mut() {
         w.write_all(pair_buf)?;
@@ -622,6 +679,117 @@ fn load_coo_bucket(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Pass 2 stage C: slot reorder — build the flat new_refs file
+// ---------------------------------------------------------------------------
+
+/// Read slot buckets in order, scatter their `ResolvedEntry` payloads into
+/// a dense position-indexed buffer per bucket, write the buffer
+/// sequentially to the `new_refs` file.
+///
+/// Ports `external_join::stage3_slot_reorder`. Each bucket covers a
+/// contiguous `slot_pos` range; within a bucket, `local_pos = slot_pos -
+/// bucket_start` is used as a direct index into a pre-sized byte buffer.
+/// The resulting flat file is `total_slots × NEW_REF_SIZE` bytes and
+/// holds one `i64 LE new_node_id` per slot_pos, ready for stage 2d to
+/// pread sequentially as it walks each way blob.
+///
+/// Empty slot buckets (a slot-pos range with no refs that landed in it)
+/// get zero-byte fills — harmless because stage 2d's way assembly reads
+/// each slot indexed by the actual way's (blob_slot_start, ref_index)
+/// and never touches an empty range.
+#[hotpath::measure]
+#[allow(clippy::cast_possible_truncation)]
+fn stage2c_slot_reorder(
+    slot_buckets: &BucketWriters,
+    new_refs_path: &Path,
+    total_slots: u64,
+) -> Result<()> {
+    let file = std::fs::File::create(new_refs_path).map_err(|e| {
+        format!(
+            "failed to create new_refs file {}: {e}",
+            new_refs_path.display()
+        )
+    })?;
+    let mut out = BufWriter::with_capacity(256 * 1024, file);
+
+    let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
+    let mut data_buf: Vec<u8> = Vec::new();
+    let mut scatter_buf: Vec<u8> = Vec::new();
+    let mut next_slot: u64 = 0;
+
+    for bucket_idx in 0..NUM_BUCKETS {
+        let bucket_start = bucket_idx as u64 * range_size;
+        let bucket_end = ((bucket_idx as u64 + 1) * range_size).min(total_slots);
+        if bucket_start >= total_slots {
+            break;
+        }
+        let bucket_slots = bucket_end - bucket_start;
+
+        if slot_buckets.entry_counts[bucket_idx] == 0 {
+            // Empty bucket: write zero-filled range. Stage 2d never reads
+            // these positions because the flat file is addressed by ref
+            // positions that map 1:1 to emitted slots, but we still need
+            // to advance the file pointer to keep slot_pos alignment.
+            let zero_bytes = bucket_slots as usize * NEW_REF_SIZE;
+            scatter_buf.clear();
+            scatter_buf.resize(zero_bytes, 0);
+            out.write_all(&scatter_buf)?;
+            next_slot = bucket_end;
+            continue;
+        }
+
+        let bucket_bytes = bucket_slots as usize * NEW_REF_SIZE;
+        scatter_buf.clear();
+        scatter_buf.resize(bucket_bytes, 0);
+
+        data_buf.clear();
+        let file = std::fs::File::open(&slot_buckets.paths[bucket_idx]).map_err(|e| {
+            format!(
+                "failed to open slot bucket {}: {e}",
+                slot_buckets.paths[bucket_idx].display()
+            )
+        })?;
+        std::io::Read::read_to_end(&mut &file, &mut data_buf).map_err(|e| {
+            format!(
+                "failed to read slot bucket {}: {e}",
+                slot_buckets.paths[bucket_idx].display()
+            )
+        })?;
+        #[cfg(feature = "linux-direct-io")]
+        super::external_radix::advise_dontneed_file(&file);
+
+        let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
+        for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
+            buf.copy_from_slice(chunk);
+            let slot_pos = u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ]);
+            let new_node_id = i64::from_le_bytes([
+                buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
+            ]);
+            let local_pos = (slot_pos - bucket_start) as usize;
+            let offset = local_pos * NEW_REF_SIZE;
+            scatter_buf[offset..offset + NEW_REF_SIZE]
+                .copy_from_slice(&new_node_id.to_le_bytes());
+        }
+
+        out.write_all(&scatter_buf)?;
+        next_slot = bucket_end;
+    }
+
+    // Trailing slots if total_slots isn't bucket-aligned.
+    if next_slot < total_slots {
+        let remaining = (total_slots - next_slot) as usize * NEW_REF_SIZE;
+        scatter_buf.clear();
+        scatter_buf.resize(remaining, 0);
+        out.write_all(&scatter_buf)?;
+    }
+
+    out.flush()?;
+    Ok(())
+}
+
 /// Load a bucket file of `IdPair` tuples into the provided `pairs` Vec.
 /// Counterpart of `load_coo_bucket` for the node_map / way_map side.
 #[allow(clippy::cast_possible_truncation)]
@@ -653,5 +821,193 @@ fn load_id_pair_bucket(
         buf.copy_from_slice(chunk);
         pairs.push(IdPair::read_from(&buf));
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2 stage D: way assembly — re-scan ways, rewrite refs, write output
+// ---------------------------------------------------------------------------
+
+/// Load the per-blob ref-count sidecar written by stage 2a and compute
+/// prefix sums so stage 2d can look up each way blob's starting
+/// `slot_pos` in O(1). Returns a Vec of starting offsets indexed by way
+/// blob order (matching the stage-2a and stage-2d way-blob filter).
+///
+/// The sidecar layout: `u64 LE` per way blob followed by a trailer
+/// `u64 LE` with the total. The trailer is checked against `total_slots`
+/// for alignment verification.
+fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("failed to read ref-count sidecar: {e}"))?;
+    if data.len() < 8 {
+        return Err("ref-count sidecar is too small".into());
+    }
+    let trailer_bytes: [u8; 8] = data[data.len() - 8..]
+        .try_into()
+        .map_err(|_| "ref-count sidecar trailer read failed")?;
+    let trailer_total = u64::from_le_bytes(trailer_bytes);
+    if trailer_total != total_slots {
+        return Err(format!(
+            "ref-count sidecar total ({trailer_total}) != stage 2a total_slots ({total_slots})"
+        )
+        .into());
+    }
+    let entry_bytes = &data[..data.len() - 8];
+    if !entry_bytes.len().is_multiple_of(8) {
+        return Err("ref-count sidecar has non-aligned entries".into());
+    }
+    let num_entries = entry_bytes.len() / 8;
+    let mut slot_starts = Vec::with_capacity(num_entries);
+    let mut cumulative: u64 = 0;
+    for chunk in entry_bytes.chunks_exact(8) {
+        slot_starts.push(cumulative);
+        let bytes: [u8; 8] = chunk.try_into().map_err(|_| "sidecar chunk size")?;
+        cumulative += u64::from_le_bytes(bytes);
+    }
+    Ok(slot_starts)
+}
+
+/// Re-scan way blobs, rewrite refs from the flat `new_refs` file using
+/// each blob's starting `slot_pos` from the ref-count sidecar, assign
+/// new sequential way ids, emit `(old_way_id, new_way_id)` pairs into
+/// `way_map` buckets, and write the renumbered ways to the output PBF.
+///
+/// The second scan reuses the same blob filter as stage 2a (OsmData +
+/// `ElemKind::Way` when indexed) so the blob-index count matches the
+/// sidecar's entry count. Within each blob, ways are iterated via the
+/// full element path (`block.elements()` matched on `Element::Way`),
+/// which gives tags + metadata + refs — vs stage 2a's `scan_way_refs`
+/// which is a refs-only fast path.
+#[hotpath::measure]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+fn stage2d_way_assembly(
+    input: &Path,
+    direct_io: bool,
+    writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
+    bb: &mut BlockBuilder,
+    way_map_buckets: &mut BucketWriters,
+    new_refs_path: &Path,
+    ref_count_sidecar: &Path,
+    total_slots: u64,
+    next_way_id: &mut i64,
+    stats: &mut RenumberStats,
+) -> Result<()> {
+    // Load sidecar and compute per-blob starting slot positions.
+    let blob_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
+
+    // mmap the flat new_refs file for zero-syscall slot lookups. Stage 2d
+    // accesses slots sequentially as it walks way refs in file order, so
+    // MADV_SEQUENTIAL gives the kernel a hint for readahead. Matches
+    // external_join::CoordSlots.
+    let new_refs_file = std::fs::File::open(new_refs_path)
+        .map_err(|e| format!("failed to open new_refs file: {e}"))?;
+    let new_refs_len = new_refs_file
+        .metadata()
+        .map_err(|e| format!("failed to stat new_refs file: {e}"))?
+        .len();
+    let expected_len = total_slots * NEW_REF_SIZE as u64;
+    if new_refs_len != expected_len {
+        return Err(format!(
+            "new_refs file size {new_refs_len} != expected {expected_len} (total_slots={total_slots})"
+        )
+        .into());
+    }
+    // The zero-length case is legitimate: input had no way refs at all
+    // (e.g. an empty or nodes-only PBF). mmap rejects zero-length maps on
+    // some kernels; fall back to an anonymous empty mmap in that case.
+    let new_refs_mmap: memmap2::Mmap = if new_refs_len == 0 {
+        memmap2::MmapOptions::new().map_anon()?.make_read_only()?
+    } else {
+        let mmap = unsafe { memmap2::Mmap::map(&new_refs_file) }
+            .map_err(|e| format!("failed to mmap new_refs file: {e}"))?;
+        #[cfg(unix)]
+        mmap.advise(memmap2::Advice::Sequential).ok();
+        mmap
+    };
+
+    // Re-open the input for the second way scan.
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader
+        .next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut way_blob_idx: usize = 0;
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut pair_buf = [0u8; ID_PAIR_SIZE];
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                continue;
+            }
+        }
+        if way_blob_idx >= blob_slot_starts.len() {
+            return Err("stage 2d: way blob count exceeds stage 2a sidecar entries".into());
+        }
+        let mut slot_cursor = blob_slot_starts[way_blob_idx];
+
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
+
+        for element in block.elements() {
+            if let Element::Way(w) = &element {
+                ensure_way_capacity(bb, writer)?;
+                let new_id = *next_way_id;
+                *next_way_id += 1;
+
+                // Read ref_count consecutive new_node_ids from the flat file.
+                refs_buf.clear();
+                for r in w.refs() {
+                    // Walk in file order. scan_way_refs in stage 2a and
+                    // block.elements() here both iterate groups in top-
+                    // level order and ways within a group in wire order,
+                    // so slot_cursor aligns with the emitted (old, slot)
+                    // pairs.
+                    let _ = r;
+                    let offset = slot_cursor as usize * NEW_REF_SIZE;
+                    let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap
+                        [offset..offset + NEW_REF_SIZE]
+                        .try_into()
+                        .map_err(|_| "stage 2d new_refs slice")?;
+                    let new_node_id = i64::from_le_bytes(bytes);
+                    refs_buf.push(new_node_id);
+                    slot_cursor += 1;
+                }
+
+                let meta = element_metadata(&w.info());
+                bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
+
+                // Emit (old_way_id, new_way_id) into the way_map bucket.
+                let pair = IdPair { old_id: w.id(), new_id };
+                emit_id_pair(way_map_buckets, &mut pair_buf, pair, way_id_bucket(pair.old_id))?;
+
+                stats.ways_written += 1;
+            }
+        }
+
+        way_blob_idx += 1;
+    }
+
+    if way_blob_idx != blob_slot_starts.len() {
+        return Err(format!(
+            "stage 2d: way blob count mismatch — scanned {way_blob_idx}, sidecar has {}",
+            blob_slot_starts.len()
+        )
+        .into());
+    }
+
     Ok(())
 }

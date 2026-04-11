@@ -10,10 +10,14 @@
 
 mod common;
 
-use common::{read_normalized, write_test_pbf_sorted, TestNode, TestRelation, TestWay};
-use pbfhogg::renumber::RenumberOptions;
+use common::{
+    assert_elements_equivalent, read_normalized, write_test_pbf_sorted, TestMember, TestNode,
+    TestRelation, TestWay,
+};
+use pbfhogg::renumber::{renumber, RenumberOptions};
 use pbfhogg::renumber_external::renumber_external;
 use pbfhogg::writer::Compression;
+use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 fn default_opts() -> RenumberOptions {
@@ -111,10 +115,10 @@ fn external_pass1_respects_custom_start_id() {
 }
 
 #[test]
-fn external_pass1_skips_ways_and_relations_for_now() {
-    // Explicit documentation that the pass-1-only skeleton drops ways
-    // and relations from the output. When task #3 and #4 land, this test
-    // should be updated to assert the full roundtrip instead.
+fn external_skips_relations_for_now() {
+    // Pass 1 + stage 2a-2d handle nodes and ways. Relations are deferred
+    // to task #4. This test makes that state visible; when task #4 lands,
+    // it should be updated to assert the full roundtrip.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -136,12 +140,12 @@ fn external_pass1_skips_ways_and_relations_for_now() {
     .expect("renumber_external");
 
     assert_eq!(stats.nodes_written, 2);
-    assert_eq!(stats.ways_written, 0, "pass 1 skeleton does not write ways yet (task #3)");
-    assert_eq!(stats.relations_written, 0, "pass 1 skeleton does not write relations yet (task #4)");
+    assert_eq!(stats.ways_written, 1, "stage 2d writes ways");
+    assert_eq!(stats.relations_written, 0, "task #4 pending");
 
     let norm = read_normalized(&output);
     assert_eq!(norm.nodes.len(), 2);
-    assert_eq!(norm.ways.len(), 0);
+    assert_eq!(norm.ways.len(), 1);
     assert_eq!(norm.relations.len(), 0);
 }
 
@@ -149,30 +153,42 @@ fn external_pass1_skips_ways_and_relations_for_now() {
 // Pass 2 stage 2a: way-ref COO pair emission
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Pass 2: full end-to-end (nodes + ways)
+// ---------------------------------------------------------------------------
+
 #[test]
-fn external_stage2a_runs_on_input_with_ways() {
-    // Stage 2a streams way blobs and emits (old_node_id, slot_pos) COO
-    // pairs into way_ref buckets + a per-blob ref-count sidecar. The test
-    // input has multiple ways with overlapping refs — enough to exercise
-    // the bucket partitioning logic — and the assertion just verifies the
-    // function doesn't error out and pass 1 still produces the expected
-    // nodes. Bucket contents become observable when stage 2b lands.
+fn external_nodes_and_ways_end_to_end() {
+    // With stages 2a-2d landed, renumber_external now produces a complete
+    // nodes + ways output (relations still deferred to task #4). The
+    // element-equivalence cross-check against the in-memory renumber is
+    // the acceptance test for the external path.
+    //
+    // Input deliberately includes:
+    //
+    // - 3 ways with overlapping refs that span bucket partition lines
+    //   (bucket 0 vs bucket N boundaries are small here since test ids
+    //   are tiny, but the test still exercises the end-to-end pipeline
+    //   structure).
+    // - A duplicate ref (way 100 refs [1, 2, 2]) to exercise scatter-
+    //   back position preservation, the correctness-review trap from
+    //   notes/renumber-planet-scale.md section 2.
+    // - A way with refs in non-sorted order (way 300 [3, 4, 1]) so the
+    //   per-way ref order check catches any incorrect sorting.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
 
     write_test_pbf_sorted(
         &input,
         &[
-            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
             TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
-            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![("amenity", "cafe")] },
             TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
         ],
         &[
-            // 3 ways × avg 3 refs = 9 total slots. Duplicate ref (2 twice
-            // in way 100) exercises the scatter-back position preservation
-            // that tasks #3 stages 2c/2d will need to get right.
             TestWay { id: 100, refs: vec![1, 2, 2], tags: vec![("highway", "stop")] },
             TestWay { id: 200, refs: vec![2, 3], tags: vec![] },
             TestWay { id: 300, refs: vec![3, 4, 1], tags: vec![("barrier", "gate")] },
@@ -180,19 +196,144 @@ fn external_stage2a_runs_on_input_with_ways() {
         &[],
     );
 
-    let stats = renumber_external(
-        &input, &output, &default_opts(), Compression::default(), false,
+    // Run both paths on the same input.
+    let stats_ext = renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
         &pbfhogg::HeaderOverrides::default(),
     )
     .expect("renumber_external");
+    let stats_inmem = renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
 
-    // Pass 1 still wrote 4 nodes.
-    assert_eq!(stats.nodes_written, 4);
-    // Ways still not written to output (stage 2d is what does that).
-    assert_eq!(stats.ways_written, 0, "stage 2d will populate this");
-    let norm = read_normalized(&output);
+    assert_eq!(stats_ext.nodes_written, 4);
+    assert_eq!(stats_ext.ways_written, 3);
+    assert_eq!(stats_ext.relations_written, 0);
+    assert_eq!(stats_inmem.nodes_written, 4);
+    assert_eq!(stats_inmem.ways_written, 3);
+
+    // Element-equivalence cross-check: the two outputs must contain
+    // semantically identical elements (same ids, tags, refs, members,
+    // metadata) even if their byte representations differ. This is the
+    // comparison harness designed in task #9.
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    // Spot-check the expected remapping.
+    let norm = read_normalized(&output_ext);
     assert_eq!(norm.nodes.len(), 4);
-    assert_eq!(norm.ways.len(), 0);
+    assert_eq!(norm.ways.len(), 3);
+    assert_eq!(norm.nodes[0].id, 1);
+    assert_eq!(norm.nodes[3].id, 4);
+
+    // Find each way by new id (sorted by id in normalized form). With
+    // default_opts() both paths start way ids at 1, and file order is
+    // 100 → 1, 200 → 2, 300 → 3.
+    let way_100 = &norm.ways.iter().find(|w| w.id == 1).expect("way 100→1");
+    let way_200 = &norm.ways.iter().find(|w| w.id == 2).expect("way 200→2");
+    let way_300 = &norm.ways.iter().find(|w| w.id == 3).expect("way 300→3");
+
+    // Way 100 had refs [1, 2, 2] — all remapped to new node ids
+    // [1, 2, 2] (identity here since we start at 1).
+    assert_eq!(way_100.refs, vec![1, 2, 2]);
+    assert_eq!(way_200.refs, vec![2, 3]);
+    assert_eq!(way_300.refs, vec![3, 4, 1]);
+    // Tag preservation:
+    assert_eq!(way_100.tags.get("highway"), Some(&"stop".to_string()));
+    assert_eq!(way_300.tags.get("barrier"), Some(&"gate".to_string()));
+}
+
+#[test]
+fn external_custom_start_ids_nodes_and_ways() {
+    // Run with non-default start ids, element-equivalence check against
+    // the in-memory path.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 500, refs: vec![10, 20, 30], tags: vec![("name", "line")] },
+        ],
+        &[],
+    );
+
+    let opts = RenumberOptions {
+        start_node_id: 1000,
+        start_way_id: 5000,
+        start_relation_id: 9000,
+    };
+
+    renumber_external(
+        &input, &output_ext, &opts, Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+    renumber(
+        &input, &output_inmem, &opts, Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
+
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    let norm = read_normalized(&output_ext);
+    // Nodes start at 1000 → [1000, 1001, 1002].
+    assert_eq!(norm.nodes.iter().map(|n| n.id).collect::<Vec<_>>(), vec![1000, 1001, 1002]);
+    // Way 500 → 5000 with refs remapped to [1000, 1001, 1002].
+    assert_eq!(norm.ways.len(), 1);
+    assert_eq!(norm.ways[0].id, 5000);
+    assert_eq!(norm.ways[0].refs, vec![1000, 1001, 1002]);
+}
+
+#[test]
+fn external_orphan_way_ref_preserves_old_id() {
+    // If a way references a node id that doesn't exist in the input,
+    // the in-memory path writes the old id through (unwrap_or(r)).
+    // The external path must match so the two produce element-
+    // equivalent output.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[
+            // Way 100 refs node 99999 which doesn't exist.
+            TestWay { id: 100, refs: vec![10, 99999, 20], tags: vec![] },
+        ],
+        &[],
+    );
+
+    renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+    renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
+
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    let norm = read_normalized(&output_ext);
+    // Orphan ref 99999 survives as 99999 in the output.
+    assert_eq!(norm.ways[0].refs, vec![1, 99999, 2]);
 }
 
 fn pbfhogg_test_way(id: i64, refs: Vec<i64>) -> TestWay {

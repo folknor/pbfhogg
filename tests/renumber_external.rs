@@ -506,6 +506,69 @@ fn external_custom_start_ids_nodes_and_ways() {
     assert_eq!(norm.ways[0].refs, vec![1000, 1001, 1002]);
 }
 
+// ---------------------------------------------------------------------------
+// Negative-id rejection (design doc section 5)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn external_rejects_negative_node_id() {
+    // External mode rejects negative input ids with a clear error
+    // pointing users at --mode inmem. In-memory renumber continues to
+    // handle them transparently for users with JOSM-local staging data.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: -5, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+        ],
+        &[],
+        &[],
+    );
+
+    let err = renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect_err("expected rejection of negative node id");
+
+    let msg = format!("{err}");
+    assert!(msg.contains("non-negative"), "error message lacks 'non-negative': {msg}");
+    assert!(msg.contains("-5"), "error message should mention the offending id: {msg}");
+    assert!(msg.contains("inmem"), "error message should suggest --mode inmem: {msg}");
+}
+
+#[test]
+fn external_rejects_negative_way_ref() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10, -1, 20], tags: vec![] },
+        ],
+        &[],
+    );
+
+    let err = renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect_err("expected rejection of negative way ref");
+
+    let msg = format!("{err}");
+    assert!(msg.contains("negative"), "error message lacks 'negative': {msg}");
+    assert!(msg.contains("-1"), "error message should mention the offending ref: {msg}");
+}
+
 #[test]
 fn external_orphan_way_ref_preserves_old_id() {
     // If a way references a node id that doesn't exist in the input,

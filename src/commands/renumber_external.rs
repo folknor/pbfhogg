@@ -111,6 +111,32 @@ fn way_id_bucket(id: i64) -> usize {
     id_bucket(id, MAX_WAY_ID)
 }
 
+/// Reject negative ids at the entry of the external path.
+///
+/// The external pipeline's bucket partition assumes non-negative ids —
+/// `id_bucket` clamps negatives to bucket 0 which is functionally
+/// correct (intra-bucket sort/merge-join both use signed i64) but
+/// violates the bucket-balance assumptions. Production OSM planet
+/// extracts don't contain negative ids (they're JOSM-local editor
+/// staging identifiers resolved before upload); `renumber --mode inmem`
+/// still handles them transparently via the in-memory FxHashMap path.
+///
+/// Per the design doc (notes/renumber-planet-scale.md correctness review
+/// finding #5), the external path rejects negative ids rather than
+/// silently accepting them. Users with negative-id input get a clear
+/// error directing them to the in-memory mode.
+fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
+    if id < 0 {
+        return Err(format!(
+            "renumber --mode external requires non-negative input ids. \
+             Input contains {kind} id {id}. \
+             Use --mode inmem for files with negative (editor-local) ids."
+        )
+        .into());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // IdPair: the (old, new) tuple written to node_map bucket files
 // ---------------------------------------------------------------------------
@@ -290,6 +316,7 @@ pub fn renumber_external(
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
+                    reject_negative_id(dn.id(), "node")?;
                     ensure_node_capacity(&mut bb, &mut writer)?;
                     let new_id = next_node_id;
                     next_node_id += 1;
@@ -304,6 +331,7 @@ pub fn renumber_external(
                     stats.nodes_written += 1;
                 }
                 Element::Node(n) => {
+                    reject_negative_id(n.id(), "node")?;
                     ensure_node_capacity(&mut bb, &mut writer)?;
                     let new_id = next_node_id;
                     next_node_id += 1;
@@ -605,23 +633,46 @@ fn stage2a_way_ref_pass(
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let blob_start_pos = slot_pos;
         // The scan_way_refs callback is FnMut, so it can't return Result.
-        // Stash the first I/O error and bail after scan returns.
-        let mut write_err: Option<std::io::Error> = None;
+        // Stash the first error (I/O or negative-id rejection) and bail
+        // after scan returns.
+        let mut scan_err: Option<crate::error::Error> = None;
         super::way_scanner::scan_way_refs(
             &decompress_buf,
             &mut refs_buf,
             &mut group_starts,
-            |_way_id, refs| {
-                if write_err.is_some() {
+            |way_id, refs| {
+                if scan_err.is_some() {
+                    return;
+                }
+                if way_id < 0 {
+                    scan_err = Some(crate::error::new_error(
+                        crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                            "renumber --mode external requires non-negative input ids. \
+                             Input contains way id {way_id}. \
+                             Use --mode inmem for files with negative (editor-local) ids."
+                        ))),
+                    ));
                     return;
                 }
                 for &old_node_id in refs {
+                    if old_node_id < 0 {
+                        scan_err = Some(crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                                "renumber --mode external requires non-negative input ids. \
+                                 Way {way_id} references negative node id {old_node_id}. \
+                                 Use --mode inmem for files with negative (editor-local) ids."
+                            ))),
+                        ));
+                        return;
+                    }
                     let pair = CooPair { old_node_id, slot_pos };
                     let bucket = node_id_bucket(old_node_id);
                     pair.write_to(&mut pair_buf);
                     if let Some(w) = way_ref_buckets.writers[bucket].as_mut() {
                         if let Err(e) = w.write_all(&pair_buf) {
-                            write_err = Some(e);
+                            scan_err = Some(crate::error::new_error(
+                                crate::error::ErrorKind::Io(e),
+                            ));
                             return;
                         }
                     }
@@ -630,7 +681,7 @@ fn stage2a_way_ref_pass(
                 }
             },
         )?;
-        if let Some(e) = write_err {
+        if let Some(e) = scan_err {
             return Err(e.into());
         }
         // Record this blob's ref count in the sidecar.
@@ -1262,6 +1313,7 @@ fn relation_r1_assign_ids(
         )?;
         for element in block.elements() {
             if let Element::Relation(r) = &element {
+                reject_negative_id(r.id(), "relation")?;
                 let new_id = *next_relation_id;
                 *next_relation_id += 1;
                 relation_map.insert(r.id(), new_id);
@@ -1327,6 +1379,7 @@ fn relation_r2a_emit_member_refs(
                 for m in r.members() {
                     match m.id {
                         MemberId::Node(old_id) => {
+                            reject_negative_id(old_id, "relation node member")?;
                             let pair = CooPair {
                                 old_node_id: old_id,
                                 slot_pos: node_slot_pos,
@@ -1340,6 +1393,7 @@ fn relation_r2a_emit_member_refs(
                             node_slot_pos += 1;
                         }
                         MemberId::Way(old_id) => {
+                            reject_negative_id(old_id, "relation way member")?;
                             let pair = CooPair {
                                 old_node_id: old_id,
                                 slot_pos: way_slot_pos,
@@ -1352,11 +1406,12 @@ fn relation_r2a_emit_member_refs(
                             way_member_buckets.entry_counts[bucket] += 1;
                             way_slot_pos += 1;
                         }
-                        // Relation and Unknown members don't need
-                        // merge-join lookups. Relation is resolved via
-                        // the in-memory relation_map in R2d; Unknown
-                        // preserves its old id.
-                        _ => {}
+                        MemberId::Relation(old_id) => {
+                            reject_negative_id(old_id, "relation relation member")?;
+                            // Resolved via in-memory relation_map in R2d.
+                        }
+                        // Unknown members preserve their old id.
+                        MemberId::Unknown(_, _) => {}
                     }
                 }
             }

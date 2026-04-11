@@ -34,6 +34,7 @@ pub struct RenumberOptions {
 }
 
 /// Statistics from a renumber operation.
+#[derive(Debug, Clone)]
 pub struct RenumberStats {
     pub nodes_written: u64,
     pub ways_written: u64,

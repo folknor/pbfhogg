@@ -45,12 +45,16 @@ use std::path::{Path, PathBuf};
 use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::renumber::{RenumberOptions, RenumberStats};
 use super::{
-    dense_node_metadata, element_metadata, ensure_node_capacity, ensure_way_capacity,
-    flush_block, require_sorted, writer_from_header, HeaderOverrides, Result,
+    dense_node_metadata, element_metadata, ensure_node_capacity, ensure_relation_capacity,
+    ensure_way_capacity, flush_block, require_sorted, writer_from_header, HeaderOverrides,
+    Result,
 };
-use crate::block_builder::BlockBuilder;
+use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::Compression;
-use crate::Element;
+use crate::{Element, MemberId};
+
+/// Alias for the deterministic hash map used by the in-memory relation map.
+type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -251,6 +255,8 @@ pub fn renumber_external(
 
     let mut next_node_id = opts.start_node_id;
     let mut next_way_id = opts.start_way_id;
+    let mut next_relation_id = opts.start_relation_id;
+    let mut relation_map: FxHashMap<i64, i64> = FxHashMap::default();
     let mut stats = RenumberStats {
         nodes_written: 0,
         ways_written: 0,
@@ -405,15 +411,104 @@ pub fn renumber_external(
     }
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
-    // TODO(task #4): relation two-pass. Reads node_map_buckets +
-    // way_map_buckets for member remap; writes renumbered relations to
-    // output. Until then, the output has renumbered nodes + ways but
-    // no relations, which is still incomplete for end-to-end renumber
-    // semantics on inputs with relations.
+    // ---- Relation pass R1: assign new ids, build in-memory relation_map ----
+    crate::debug::emit_marker("RENUMBER_EXT_R1_START");
+    relation_r1_assign_ids(input, direct_io, &mut relation_map, &mut next_relation_id)?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
+    }
+    crate::debug::emit_marker("RENUMBER_EXT_R1_END");
+
+    // ---- Relation pass R2a: emit node/way member refs into buckets ----
+    crate::debug::emit_marker("RENUMBER_EXT_R2A_START");
+    let mut node_member_ref_buckets = BucketWriters::create(&scratch, "rel-node-ref")?;
+    let mut way_member_ref_buckets = BucketWriters::create(&scratch, "rel-way-ref")?;
+    let (total_node_members, total_way_members) = relation_r2a_emit_member_refs(
+        input,
+        direct_io,
+        &mut node_member_ref_buckets,
+        &mut way_member_ref_buckets,
+    )?;
+    node_member_ref_buckets.finish()?;
+    way_member_ref_buckets.finish()?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("renumber_ext_rel_node_members", total_node_members as i64);
+        crate::debug::emit_counter("renumber_ext_rel_way_members", total_way_members as i64);
+    }
+    crate::debug::emit_marker("RENUMBER_EXT_R2A_END");
+
+    // ---- Relation pass R2b: merge-join node/way members against maps ----
+    // Reuses the same stage2b_node_merge_join function used for the way
+    // pass. The only difference is the input buckets and their
+    // partitioning (node_member_ref_buckets are partitioned by
+    // node_id_bucket, matching node_map_buckets; way_member_ref_buckets
+    // are partitioned by way_id_bucket, matching way_map_buckets).
+    crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
+    let mut node_member_slot_buckets = BucketWriters::create(&scratch, "rel-node-slot")?;
+    stage2b_node_merge_join(
+        &node_member_ref_buckets,
+        &node_map_buckets,
+        &mut node_member_slot_buckets,
+        total_node_members,
+    )?;
+    node_member_slot_buckets.finish()?;
+    node_member_ref_buckets.cleanup();
+
+    let mut way_member_slot_buckets = BucketWriters::create(&scratch, "rel-way-slot")?;
+    stage2b_node_merge_join(
+        &way_member_ref_buckets,
+        &way_map_buckets,
+        &mut way_member_slot_buckets,
+        total_way_members,
+    )?;
+    way_member_slot_buckets.finish()?;
+    way_member_ref_buckets.cleanup();
+    crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
+
+    // ---- Relation pass R2c: slot reorder for each member type ----
+    crate::debug::emit_marker("RENUMBER_EXT_R2C_START");
+    let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
+    stage2c_slot_reorder(
+        &node_member_slot_buckets,
+        &node_member_new_refs_path,
+        total_node_members,
+    )?;
+    node_member_slot_buckets.cleanup();
+
+    let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
+    stage2c_slot_reorder(
+        &way_member_slot_buckets,
+        &way_member_new_refs_path,
+        total_way_members,
+    )?;
+    way_member_slot_buckets.cleanup();
+    crate::debug::emit_marker("RENUMBER_EXT_R2C_END");
+
+    // ---- Relation pass R2d: write renumbered relations to output ----
+    crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
+    relation_r2d_assembly(
+        input,
+        direct_io,
+        &mut writer,
+        &mut bb,
+        &node_member_new_refs_path,
+        &way_member_new_refs_path,
+        total_node_members,
+        total_way_members,
+        &relation_map,
+        &mut stats,
+    )?;
+    crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
 
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
+    drop(node_member_slot_buckets);
+    drop(way_member_slot_buckets);
+    drop(node_member_ref_buckets);
+    drop(way_member_ref_buckets);
     drop(way_map_buckets);
     drop(slot_buckets);
     drop(way_ref_buckets);
@@ -1010,4 +1105,317 @@ fn stage2d_way_assembly(
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Relation pass R1: assign new relation ids, build in-memory relation_map
+// ---------------------------------------------------------------------------
+
+/// Stream relation blobs, assign new sequential ids, build the in-memory
+/// `relation_map: FxHashMap<i64, i64>`. The map is ~340 MB at planet
+/// scale (14.1M entries × 24 bytes), which fits comfortably in RAM even
+/// when node_map and way_map must live in external buckets.
+///
+/// Does NOT write any relations to the output PBF. That's pass R2.
+#[hotpath::measure]
+fn relation_r1_assign_ids(
+    input: &Path,
+    direct_io: bool,
+    relation_map: &mut FxHashMap<i64, i64>,
+    next_relation_id: &mut i64,
+) -> Result<()> {
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader
+        .next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                continue;
+            }
+        }
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf),
+            &mut st_scratch,
+            &mut gr_scratch,
+        )?;
+        for element in block.elements() {
+            if let Element::Relation(r) = &element {
+                let new_id = *next_relation_id;
+                *next_relation_id += 1;
+                relation_map.insert(r.id(), new_id);
+            }
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Relation pass R2a: emit node and way member ref COO pairs
+// ---------------------------------------------------------------------------
+
+/// Stream relation blobs and emit `(old_id, slot_pos)` COO pairs for
+/// each node member and way member into their respective bucket sets.
+///
+/// Relation members and unknown members are skipped — they don't need
+/// merge-join lookups. Relation members resolve directly from the
+/// in-memory relation_map in R2d; unknown members preserve their old
+/// ids unchanged.
+///
+/// Uses two independent slot counters — `node_slot_pos` and
+/// `way_slot_pos` — that advance in the order members are encountered.
+/// R2d walks relations in the same order and maintains matching
+/// counters, so the flat resolved files produced by R2b/R2c line up
+/// with each member position without any per-relation index bookkeeping.
+///
+/// Returns `(total_node_members, total_way_members)`.
+#[hotpath::measure]
+fn relation_r2a_emit_member_refs(
+    input: &Path,
+    direct_io: bool,
+    node_member_buckets: &mut BucketWriters,
+    way_member_buckets: &mut BucketWriters,
+) -> Result<(u64, u64)> {
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader
+        .next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut pair_buf = [0u8; COO_PAIR_SIZE];
+
+    let mut node_slot_pos: u64 = 0;
+    let mut way_slot_pos: u64 = 0;
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                continue;
+            }
+        }
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf),
+            &mut st_scratch,
+            &mut gr_scratch,
+        )?;
+        for element in block.elements() {
+            if let Element::Relation(r) = &element {
+                for m in r.members() {
+                    match m.id {
+                        MemberId::Node(old_id) => {
+                            let pair = CooPair {
+                                old_node_id: old_id,
+                                slot_pos: node_slot_pos,
+                            };
+                            let bucket = node_id_bucket(old_id);
+                            pair.write_to(&mut pair_buf);
+                            if let Some(w) = node_member_buckets.writers[bucket].as_mut() {
+                                w.write_all(&pair_buf)?;
+                            }
+                            node_member_buckets.entry_counts[bucket] += 1;
+                            node_slot_pos += 1;
+                        }
+                        MemberId::Way(old_id) => {
+                            let pair = CooPair {
+                                old_node_id: old_id,
+                                slot_pos: way_slot_pos,
+                            };
+                            let bucket = way_id_bucket(old_id);
+                            pair.write_to(&mut pair_buf);
+                            if let Some(w) = way_member_buckets.writers[bucket].as_mut() {
+                                w.write_all(&pair_buf)?;
+                            }
+                            way_member_buckets.entry_counts[bucket] += 1;
+                            way_slot_pos += 1;
+                        }
+                        // Relation and Unknown members don't need
+                        // merge-join lookups. Relation is resolved via
+                        // the in-memory relation_map in R2d; Unknown
+                        // preserves its old id.
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    Ok((node_slot_pos, way_slot_pos))
+}
+
+// ---------------------------------------------------------------------------
+// Relation pass R2d: rewrite member refs, write relations to output
+// ---------------------------------------------------------------------------
+
+/// Third (and final) scan over relation blobs. For each relation, look
+/// up its new id from the in-memory relation_map, remap each member
+/// (node/way members via the flat resolved files from R2c, relation
+/// members via the in-memory relation_map), and write to output via
+/// `bb.add_relation`.
+///
+/// Walks members in the exact same order as R2a, advancing
+/// `node_slot_cursor` and `way_slot_cursor` in lockstep — so the n-th
+/// node member encountered reads slot n of `node_member_new_refs`, and
+/// likewise for ways. No per-relation index bookkeeping needed.
+#[hotpath::measure]
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
+fn relation_r2d_assembly(
+    input: &Path,
+    direct_io: bool,
+    writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
+    bb: &mut BlockBuilder,
+    node_member_new_refs_path: &Path,
+    way_member_new_refs_path: &Path,
+    total_node_members: u64,
+    total_way_members: u64,
+    relation_map: &FxHashMap<i64, i64>,
+    stats: &mut RenumberStats,
+) -> Result<()> {
+    let node_mmap = open_new_refs_mmap(node_member_new_refs_path, total_node_members)?;
+    let way_mmap = open_new_refs_mmap(way_member_new_refs_path, total_way_members)?;
+
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    blob_reader
+        .next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+    let mut node_slot_cursor: u64 = 0;
+    let mut way_slot_cursor: u64 = 0;
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                continue;
+            }
+        }
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf),
+            &mut st_scratch,
+            &mut gr_scratch,
+        )?;
+        // members_buf borrows role strings from the block so it must not
+        // outlive it — declare inside the blob loop.
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+        for element in block.elements() {
+            let Element::Relation(r) = &element else { continue };
+            ensure_relation_capacity(bb, writer)?;
+            let new_id = relation_map.get(&r.id()).copied().ok_or_else(|| {
+                format!(
+                    "internal error: relation id {} missing from relation_map in R2d",
+                    r.id()
+                )
+            })?;
+
+            members_buf.clear();
+            for m in r.members() {
+                let remapped_id = match m.id {
+                    MemberId::Node(_old_id) => {
+                        let offset = node_slot_cursor as usize * NEW_REF_SIZE;
+                        let bytes: [u8; NEW_REF_SIZE] = node_mmap
+                            [offset..offset + NEW_REF_SIZE]
+                            .try_into()
+                            .map_err(|_| "R2d node member slice")?;
+                        let new_node_id = i64::from_le_bytes(bytes);
+                        node_slot_cursor += 1;
+                        MemberId::Node(new_node_id)
+                    }
+                    MemberId::Way(_old_id) => {
+                        let offset = way_slot_cursor as usize * NEW_REF_SIZE;
+                        let bytes: [u8; NEW_REF_SIZE] = way_mmap
+                            [offset..offset + NEW_REF_SIZE]
+                            .try_into()
+                            .map_err(|_| "R2d way member slice")?;
+                        let new_way_id = i64::from_le_bytes(bytes);
+                        way_slot_cursor += 1;
+                        MemberId::Way(new_way_id)
+                    }
+                    MemberId::Relation(old_id) => MemberId::Relation(
+                        relation_map.get(&old_id).copied().unwrap_or(old_id),
+                    ),
+                    MemberId::Unknown(t, id) => MemberId::Unknown(t, id),
+                };
+                members_buf.push(MemberData {
+                    id: remapped_id,
+                    role: m.role().unwrap_or(""),
+                });
+            }
+
+            let meta = element_metadata(&r.info());
+            bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
+            stats.relations_written += 1;
+        }
+    }
+
+    // Sanity: the walk must have consumed every resolved ref.
+    if node_slot_cursor != total_node_members {
+        return Err(format!(
+            "R2d node cursor mismatch: walked {node_slot_cursor}, expected {total_node_members}"
+        )
+        .into());
+    }
+    if way_slot_cursor != total_way_members {
+        return Err(format!(
+            "R2d way cursor mismatch: walked {way_slot_cursor}, expected {total_way_members}"
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+/// Open the flat new_refs file produced by stage 2c as an mmap. Handles
+/// the empty-file case with an anonymous zero-length mmap since some
+/// kernels reject `memmap2::Mmap::map` on zero-length files.
+fn open_new_refs_mmap(path: &Path, total_slots: u64) -> Result<memmap2::Mmap> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open new_refs file {}: {e}", path.display()))?;
+    let len = file
+        .metadata()
+        .map_err(|e| format!("failed to stat new_refs file {}: {e}", path.display()))?
+        .len();
+    let expected_len = total_slots * NEW_REF_SIZE as u64;
+    if len != expected_len {
+        return Err(format!(
+            "new_refs file {} size {len} != expected {expected_len} (total_slots={total_slots})",
+            path.display()
+        )
+        .into());
+    }
+    if len == 0 {
+        return Ok(memmap2::MmapOptions::new().map_anon()?.make_read_only()?);
+    }
+    let mmap = unsafe { memmap2::Mmap::map(&file) }
+        .map_err(|e| format!("failed to mmap new_refs file {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    mmap.advise(memmap2::Advice::Sequential).ok();
+    Ok(mmap)
 }

@@ -114,14 +114,18 @@ fn external_pass1_respects_custom_start_id() {
     assert_eq!(norm.nodes[1].id, 5001);
 }
 
+// ---------------------------------------------------------------------------
+// Relations: R1 + R2 end-to-end
+// ---------------------------------------------------------------------------
+
 #[test]
-fn external_skips_relations_for_now() {
-    // Pass 1 + stage 2a-2d handle nodes and ways. Relations are deferred
-    // to task #4. This test makes that state visible; when task #4 lands,
-    // it should be updated to assert the full roundtrip.
+fn external_relations_basic_end_to_end() {
+    // Input with all four member types + tag preservation + node/way/
+    // relation remap. Cross-checked against the in-memory path.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
-    let output = dir.path().join("output.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
 
     write_test_pbf_sorted(
         &input,
@@ -129,24 +133,232 @@ fn external_skips_relations_for_now() {
             TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
             TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
         ],
-        &[pbfhogg_test_way(100, vec![10, 20])],
-        &[pbfhogg_test_relation(500)],
+        &[
+            TestWay { id: 100, refs: vec![10, 20], tags: vec![("highway", "road")] },
+        ],
+        &[
+            TestRelation {
+                id: 500,
+                members: vec![
+                    TestMember { id: MemberId::Node(10), role: "stop" },
+                    TestMember { id: MemberId::Way(100), role: "outer" },
+                ],
+                tags: vec![("type", "multipolygon")],
+            },
+            TestRelation {
+                id: 600,
+                members: vec![
+                    // Relation 600 references relation 500 (backward ref).
+                    TestMember { id: MemberId::Relation(500), role: "subarea" },
+                    TestMember { id: MemberId::Node(20), role: "label" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+        ],
     );
 
-    let stats = renumber_external(
-        &input, &output, &default_opts(), Compression::default(), false,
+    let stats_ext = renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
         &pbfhogg::HeaderOverrides::default(),
     )
     .expect("renumber_external");
+    let stats_inmem = renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
 
-    assert_eq!(stats.nodes_written, 2);
-    assert_eq!(stats.ways_written, 1, "stage 2d writes ways");
-    assert_eq!(stats.relations_written, 0, "task #4 pending");
+    assert_eq!(stats_ext.nodes_written, 2);
+    assert_eq!(stats_ext.ways_written, 1);
+    assert_eq!(stats_ext.relations_written, 2);
+    assert_eq!(stats_inmem.relations_written, 2);
 
-    let norm = read_normalized(&output);
-    assert_eq!(norm.nodes.len(), 2);
-    assert_eq!(norm.ways.len(), 1);
-    assert_eq!(norm.relations.len(), 0);
+    // The external and in-memory paths must produce element-equivalent
+    // output even though their block layouts, string tables, and dense
+    // encoding may differ byte-wise.
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    let norm = read_normalized(&output_ext);
+    assert_eq!(norm.relations.len(), 2);
+
+    // Relation 500 → new id 1, relation 600 → new id 2.
+    let rel_1 = &norm.relations.iter().find(|r| r.id == 1).expect("rel 500→1");
+    let rel_2 = &norm.relations.iter().find(|r| r.id == 2).expect("rel 600→2");
+
+    // Rel 500's members: Node(10→1), Way(100→1)
+    assert_eq!(rel_1.members.len(), 2);
+    assert_eq!(rel_1.members[0].member_type, "node");
+    assert_eq!(rel_1.members[0].ref_id, 1);
+    assert_eq!(rel_1.members[0].role, "stop");
+    assert_eq!(rel_1.members[1].member_type, "way");
+    assert_eq!(rel_1.members[1].ref_id, 1);
+    assert_eq!(rel_1.members[1].role, "outer");
+
+    // Rel 600's members: Relation(500→1), Node(20→2)
+    assert_eq!(rel_2.members.len(), 2);
+    assert_eq!(rel_2.members[0].member_type, "relation");
+    assert_eq!(rel_2.members[0].ref_id, 1);
+    assert_eq!(rel_2.members[1].member_type, "node");
+    assert_eq!(rel_2.members[1].ref_id, 2);
+}
+
+#[test]
+fn external_relation_forward_ref() {
+    // Regression test mirroring the in-memory forward-ref bug fix from
+    // task #8. Rel 500 references rel 600, which isn't assigned yet at
+    // scan time. The in-memory two-pass resolves this; the external
+    // R1→R2 structure must do the same.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+        ],
+        &[],
+        &[
+            TestRelation {
+                id: 500,
+                members: vec![
+                    TestMember { id: MemberId::Relation(600), role: "subarea" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+            TestRelation {
+                id: 600,
+                members: vec![
+                    TestMember { id: MemberId::Node(10), role: "label" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+        ],
+    );
+
+    renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+    renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
+
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    let norm = read_normalized(&output_ext);
+    // Rel 500 → 1, rel 600 → 2. Rel 500's forward ref to rel 600 must
+    // resolve to new id 2, not old id 600.
+    let rel_1 = &norm.relations.iter().find(|r| r.id == 1).expect("rel 500→1");
+    assert_eq!(rel_1.members[0].ref_id, 2, "forward ref: 600→2, not 600");
+}
+
+#[test]
+fn external_relation_self_reference() {
+    // Rel 42 → member Relation(42). R1 assigns the new id before R2d
+    // reads it, so the self-reference resolves correctly.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[],
+        &[],
+        &[
+            TestRelation {
+                id: 42,
+                members: vec![
+                    TestMember { id: MemberId::Relation(42), role: "self" },
+                ],
+                tags: vec![("type", "loop")],
+            },
+        ],
+    );
+
+    renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+    renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
+
+    assert_elements_equivalent(&output_ext, &output_inmem);
+
+    let norm = read_normalized(&output_ext);
+    assert_eq!(norm.relations.len(), 1);
+    assert_eq!(norm.relations[0].id, 1, "rel 42 → 1");
+    assert_eq!(norm.relations[0].members[0].ref_id, 1, "self: 42→1");
+}
+
+#[test]
+fn external_relation_mixed_member_types_interleaved() {
+    // Relation with members in non-type-sorted order to stress the
+    // lockstep slot_cursor walk between R2a and R2d. If the cursors
+    // drift (e.g. because one stage counts all node members in one
+    // relation before moving to the next while the other interleaves
+    // per file order), the node and way slot indices diverge.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_ext = dir.path().join("output_ext.osm.pbf");
+    let output_inmem = dir.path().join("output_inmem.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+        ],
+        &[
+            TestWay { id: 10, refs: vec![1, 2], tags: vec![] },
+            TestWay { id: 20, refs: vec![2, 3], tags: vec![] },
+        ],
+        &[
+            TestRelation {
+                id: 100,
+                members: vec![
+                    TestMember { id: MemberId::Node(1), role: "a" },
+                    TestMember { id: MemberId::Way(10), role: "b" },
+                    TestMember { id: MemberId::Node(2), role: "c" },
+                    TestMember { id: MemberId::Relation(100), role: "self" },
+                    TestMember { id: MemberId::Way(20), role: "d" },
+                    TestMember { id: MemberId::Node(3), role: "e" },
+                ],
+                tags: vec![("type", "mixed")],
+            },
+            TestRelation {
+                id: 200,
+                members: vec![
+                    TestMember { id: MemberId::Way(20), role: "only" },
+                    TestMember { id: MemberId::Node(3), role: "tail" },
+                ],
+                tags: vec![],
+            },
+        ],
+    );
+
+    renumber_external(
+        &input, &output_ext, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+    renumber(
+        &input, &output_inmem, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber (in-memory)");
+
+    assert_elements_equivalent(&output_ext, &output_inmem);
 }
 
 // ---------------------------------------------------------------------------
@@ -334,16 +546,4 @@ fn external_orphan_way_ref_preserves_old_id() {
     let norm = read_normalized(&output_ext);
     // Orphan ref 99999 survives as 99999 in the output.
     assert_eq!(norm.ways[0].refs, vec![1, 99999, 2]);
-}
-
-fn pbfhogg_test_way(id: i64, refs: Vec<i64>) -> TestWay {
-    TestWay { id, refs, tags: vec![] }
-}
-
-fn pbfhogg_test_relation(id: i64) -> TestRelation {
-    TestRelation {
-        id,
-        members: vec![],
-        tags: vec![("type", "test")],
-    }
 }

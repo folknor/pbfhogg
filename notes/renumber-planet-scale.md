@@ -305,6 +305,163 @@ external.
   processes nodes in file order, but worth calling out in the test
   suite.
 
+## Correctness review findings (2026-04-11)
+
+Pre-implementation correctness review (`review correctness`, claude + codex)
+on the design and the current `src/commands/renumber.rs`. Six questions,
+six concrete answers. Actionable findings:
+
+### 1. Target element-identical output, not byte-identical.
+
+Byte-identical is unachievable in general — BlockBuilder rebuilds the
+string table in encounter order, DenseNodes re-packs with its own delta
+encoding, and block flush boundaries depend on the `ensure_*_capacity`
+call timing (which legitimately differs between in-memory and external
+paths). Even two runs of the current in-memory path wouldn't be
+byte-identical if the string table has duplicates in different order.
+
+**Cross-check is element-equivalence**: read both outputs via
+`ElementReader::from_path`, collect `(type, id, tags as BTreeMap, refs
+as Vec, members as Vec, metadata)` tuples sorted by new id, `assert_eq!`.
+Extend `tests/common/mod.rs` helpers. Do **not** compare on-disk bytes.
+
+### 2. The scatter-back pattern must key on `(elem_index, subindex)`.
+
+Sorted-output invariant holds — file-order emission + monotonic ID
+assignment preserves sortedness. The trap is **within** a way or
+relation: refs/members must be rewritten at their original positions.
+
+Specifically, if a way has refs `[A, B, A]` (same node twice, in
+positions 0 and 2), sorting by `old_node_id` alone collapses them, and
+scatter-back without `ref_index` as secondary key produces wrong
+ordering. The COO pair for the way pass is `(old_node_id, way_index,
+ref_index)`, not just `(old_node_id, slot_pos)` — explicit ref_index
+preservation is mandatory, not optional.
+
+Add a unit test on a way with `[A, B, A]` ref pattern.
+
+### 3. ⚠️ Pre-existing bug in in-memory `renumber.rs:135` (forward relation refs). ✅ Fixed 2026-04-11.
+
+```rust
+MemberId::Relation(id) => MemberId::Relation(
+    relation_map.get(&id).copied().unwrap_or(id)
+),
+```
+
+When a relation at old_id=500 references old_id=600 (forward ref, not
+yet assigned), the lookup returns None, `unwrap_or(id)` falls through to
+the OLD id 600, and **the old id is written into the new output** where
+it either collides with a different renumbered relation or dangles as
+an orphan reference.
+
+Existing test `renumber_relation_referencing_relation` at
+`tests/renumber.rs:274` only covers the **backward-ref** case (rel 600
+references rel 500, backward), not the forward case. Bug is
+pre-existing and latent.
+
+**Both paths must be two-pass.** The external path already solves it
+structurally via R1→R2 (relation_map is fully built before R2 reads
+it). The in-memory path now does the same: Pass 1 scans the input
+streaming nodes+ways to output and assigning relation IDs without
+writing; Pass 2 reopens the input, fast-skips non-relation blobs via
+the blob index, and writes relations with the now-complete map.
+
+**Resolution.** Shipped in-memory two-pass refactor 2026-04-11.
+`src/commands/renumber.rs` now has Pass 1 (nodes + ways + assign
+relation IDs) and Pass 2 (reopen input, fast-skip via `blob.index()`,
+remap relation members, write). Regression tests added to
+`tests/renumber.rs`:
+
+- `renumber_relation_forward_ref` — rel 500 → member Relation(600),
+  rel 600 empty. Output asserts new rel 500 member references new rel
+  600's new id (not old 600). **This test fails against the pre-fix
+  single-pass code** (reproduced locally: `left: 600, right: 2`).
+- `renumber_relation_self_reference` — rel 42 → member Relation(42).
+  Output asserts new id 1 references itself.
+
+Denmark wall time: 19.3s on the refactored path, within the historical
+18.8-19.3s noise band (baseline commits `b685342`, `f9ba88d`, `8e8240e`,
+`b45b731`, `6b74436`). The second scan is effectively free at this
+scale because pass 2 fast-skips ~300 node/way blobs via `blob.index()`
+and only decompresses the ~5-10 relation blobs at the end of the file.
+
+### 4. Relation member order preservation: `Vec<Option<Member>>` per relation, indexed by position.
+
+The three merge-join phases (node members, way members, relation members)
+each write into the **same** pre-allocated slot array per relation, at
+stable `member_index` positions. Never append in join order. Never
+filter. Never rebuild. Final emission reads sequentially by index.
+
+Concrete pattern:
+```rust
+let mut members_out: Vec<Option<RemappedMember>> =
+    (0..original.members().count()).map(|_| None).collect();
+// Phase 1: node members
+for (rel_idx, mem_idx, new_id) in ... { members_out[mem_idx] = Some(...); }
+// Phase 2: way members (same slot array)
+// Phase 3: in-memory relation members
+// Emission: members_out.into_iter().map(Option::unwrap).collect()
+```
+
+### 5. Reject negative IDs in external mode with a clear error.
+
+Design decision: external path requires non-negative input IDs. Detect
+at stage 1 entry, error out with:
+
+```
+error: `renumber --mode external` requires non-negative input IDs.
+       Input contains node id -42 at offset 0x...
+       Use `--mode inmem` for files with negative (editor-local) IDs.
+```
+
+Rationale:
+- Production planet/region data never contains negative IDs — they are
+  editor-local (JOSM staging) identifiers resolved before upload.
+- The in-memory path handles negatives transparently via FxHashMap and
+  is retained as the sub-Europe default, so users with negative-ID
+  input lose no functionality.
+- Partition-by-high-bits clamps negatives to bucket 0, which is a
+  bucket imbalance, not a semantic error — as long as intra-bucket
+  sort/merge-join use signed i64, it would "work." But rejecting is
+  simpler than guaranteeing correctness across the negative/positive
+  boundary in a future change, and gives users a clear error path.
+
+Test: input with negative node IDs → external mode errors, in-memory
+mode succeeds.
+
+### 6. Revised test matrix.
+
+Minimal set for the external-path test harness (additive to the existing
+320-line suite in `tests/renumber.rs`):
+
+- **Forward-ref relation** (the R1→R2 regression test) — rel 500 →
+  member Relation(600), rel 600 empty. Output: new rel references new
+  rel's new id.
+- **Self-loop relation** — rel X → member Relation(X). Output: new rel
+  references its own new id.
+- **Mixed-type interleaved members** — relation with members in order
+  `[Node, Way, Node, Relation, Way]` to stress phase-specific scatter.
+- **Duplicate refs in a single way** — way with refs `[A, B, A]`,
+  positions must survive scatter-back.
+- **Custom `--start-id` overlapping old IDs** — e.g. `start_node_id=5`
+  when input has nodes 3..10. No self-collision.
+- **Orphan members** — relation member referencing an id not in input.
+  Preserve current behavior (`unwrap_or(old_id)`) for compatibility
+  with the in-memory path and osmium. Document as intentional.
+- **Negative node id rejected in external mode** — must error,
+  not silently corrupt.
+- **Empty input** (header only), **no ways**, **no relations**,
+  **zero-member relation**, **single-ref way** — smoke tests for blob
+  boundary / pass-skip logic.
+- **Sortedness of output by new id per type** — assert explicit type-by-
+  type monotonicity rather than relying solely on the header flag.
+
+Existing suite already covers back-ref relations, tag preservation,
+sorted-header-flag check, and basic node/way/relation roundtrips;
+don't duplicate.
+
+---
+
 ## Testing plan
 
 1. **Unit: renumber correctness on Denmark** — existing

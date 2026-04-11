@@ -318,3 +318,113 @@ fn renumber_relation_referencing_relation() {
     assert_eq!(members[0].1, "relation");
     assert_eq!(members[0].2, "subarea");
 }
+
+// ---------------------------------------------------------------------------
+// Forward-ref relation: rel 500 (first) references rel 600 (later in sort
+// order). Pre-2026-04-11, the single-pass in-memory implementation hit
+// `.unwrap_or(id)` at renumber.rs:135 on the not-yet-assigned target and
+// silently wrote the OLD id 600 into the new output. Regression test for
+// that correctness bug — requires two-pass relation handling to resolve.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renumber_relation_forward_ref() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+        ],
+        &[],
+        &[
+            // Rel 500 references rel 600 (forward reference — target
+            // appears LATER in sort order, not yet assigned).
+            TestRelation {
+                id: 500,
+                members: vec![
+                    TestMember { id: MemberId::Relation(600), role: "subarea" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+            TestRelation {
+                id: 600,
+                members: vec![
+                    TestMember { id: MemberId::Node(10), role: "label" },
+                ],
+                tags: vec![("type", "boundary")],
+            },
+        ],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    let c = read_all_elements_with_coords(&output);
+
+    // Node 10 → 1, Rel 500 → 1, Rel 600 → 2
+    assert_eq!(c.nodes[0].0, 1);
+    assert_eq!(c.relations.len(), 2);
+    assert_eq!(c.relations[0].0, 1, "rel 500 → 1");
+    assert_eq!(c.relations[1].0, 2, "rel 600 → 2");
+
+    // Rel 500's member (the forward ref) must reference the NEW id 2,
+    // not the old id 600. The buggy single-pass code writes 600 here.
+    let members_500 = &c.relations[0].1;
+    assert_eq!(members_500.len(), 1);
+    assert_eq!(members_500[0].0, 2, "forward relation member should be remapped: 600→2");
+    assert_eq!(members_500[0].1, "relation");
+    assert_eq!(members_500[0].2, "subarea");
+
+    // Rel 600's node member must reference the remapped node 10→1.
+    let members_600 = &c.relations[1].1;
+    assert_eq!(members_600.len(), 1);
+    assert_eq!(members_600[0].0, 1, "node member should be remapped: 10→1");
+    assert_eq!(members_600[0].1, "node");
+    assert_eq!(members_600[0].2, "label");
+}
+
+// ---------------------------------------------------------------------------
+// Self-referencing relation: rel X with a member pointing to itself. The
+// two-pass structure assigns X's new id in pass 1 and resolves the self-
+// reference via the fully-populated map in pass 2. Natural follow-on to
+// the forward-ref regression test.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn renumber_relation_self_reference() {
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[],
+        &[],
+        &[
+            TestRelation {
+                id: 42,
+                members: vec![
+                    TestMember { id: MemberId::Relation(42), role: "self" },
+                ],
+                tags: vec![("type", "loop")],
+            },
+        ],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    let c = read_all_elements_with_coords(&output);
+
+    // Rel 42 → 1, self-reference remapped: 42 → 1.
+    assert_eq!(c.relations.len(), 1);
+    assert_eq!(c.relations[0].0, 1, "rel 42 → 1");
+    let members = &c.relations[0].1;
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].0, 1, "self-reference should be remapped: 42→1");
+    assert_eq!(members[0].1, "relation");
+    assert_eq!(members[0].2, "self");
+}

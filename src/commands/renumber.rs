@@ -1,7 +1,20 @@
 //! Renumber OSM elements with sequential IDs. Equivalent to `osmium renumber`.
 //!
-//! Single-pass sequential scan: assigns new IDs starting from configurable values
-//! and remaps all cross-references (way→node, relation→node/way/relation).
+//! Two-pass sequential scan:
+//!
+//! - **Pass 1**: stream nodes + ways, assign new IDs, remap way refs via
+//!   `node_map`, write to output. For relations, assign new IDs into
+//!   `relation_map` only — do not write.
+//! - **Pass 2**: reopen the input, fast-skip non-relation blobs via the blob
+//!   index, remap relation members using the now-complete maps, write to
+//!   output.
+//!
+//! The two-pass relation handling is required for correctness: a single-pass
+//! implementation falls through to `unwrap_or(old_id)` on forward relation→
+//! relation references (target not yet assigned), silently writing the OLD
+//! id into the new output. osmium-tool uses the same two-pass structure in
+//! `command_renumber.cpp:380-403` for the same reason. See
+//! `notes/renumber-planet-scale.md` for the full correctness analysis.
 
 use std::path::Path;
 
@@ -83,6 +96,12 @@ pub fn renumber(
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     crate::debug::emit_marker("RENUMBER_START");
+
+    // Pass 1: assign IDs for all three types, write nodes + ways to output,
+    // defer relation writes to pass 2. Relation ID assignment happens here so
+    // the full relation_map is ready by the time pass 2 begins remapping
+    // forward relation→relation references.
+    crate::debug::emit_marker("RENUMBER_PASS1_START");
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -90,7 +109,6 @@ pub fn renumber(
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
         )?;
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
         for element in block.elements() {
             match &element {
                 Element::DenseNode(dn) => {
@@ -123,27 +141,70 @@ pub fn renumber(
                     stats.ways_written += 1;
                 }
                 Element::Relation(r) => {
-                    ensure_relation_capacity(&mut bb, &mut writer)?;
+                    // Pass 1: assign a new id only. Member remap + write deferred
+                    // to pass 2 so forward relation→relation refs see a fully-
+                    // populated relation_map.
                     let new_id = next_relation_id;
                     next_relation_id += 1;
                     relation_map.insert(r.id(), new_id);
-                    members_buf.clear();
-                    members_buf.extend(r.members().map(|m| {
-                        let remapped_id = match m.id {
-                            MemberId::Node(id) => MemberId::Node(node_map.get(&id).copied().unwrap_or(id)),
-                            MemberId::Way(id) => MemberId::Way(way_map.get(&id).copied().unwrap_or(id)),
-                            MemberId::Relation(id) => MemberId::Relation(relation_map.get(&id).copied().unwrap_or(id)),
-                            MemberId::Unknown(t, id) => MemberId::Unknown(t, id),
-                        };
-                        MemberData { id: remapped_id, role: m.role().unwrap_or("") }
-                    }));
-                    let meta = element_metadata(&r.info());
-                    bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
-                    stats.relations_written += 1;
                 }
             }
         }
     }
+    crate::debug::emit_marker("RENUMBER_PASS1_END");
+    drop(blob_reader);
+
+    // Pass 2: rescan the input, fast-skip non-relation blobs, remap relation
+    // members using the now-complete maps, and write to output.
+    crate::debug::emit_marker("RENUMBER_PASS2_START");
+    let mut blob_reader2 = crate::blob::BlobReader::open(input, direct_io)?;
+    // Skip the header blob (already validated above).
+    blob_reader2.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    for blob_result in &mut blob_reader2 {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
+        // Fast-skip non-relation blobs when the blob carries an indexdata
+        // hint (the `indexed` variant datasets all do). Non-indexed PBFs
+        // fall through to full decompress + element-level filter.
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                continue;
+            }
+        }
+        blob.decompress_into(&mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
+        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+        for element in block.elements() {
+            let Element::Relation(r) = &element else { continue };
+            ensure_relation_capacity(&mut bb, &mut writer)?;
+            // Every relation id was inserted in pass 1; missing entry is an
+            // internal consistency violation, not a user-facing condition.
+            let new_id = relation_map.get(&r.id()).copied().ok_or_else(|| {
+                format!(
+                    "internal error: relation id {} missing from relation_map in pass 2",
+                    r.id()
+                )
+            })?;
+            members_buf.clear();
+            members_buf.extend(r.members().map(|m| {
+                let remapped_id = match m.id {
+                    MemberId::Node(id) => MemberId::Node(node_map.get(&id).copied().unwrap_or(id)),
+                    MemberId::Way(id) => MemberId::Way(way_map.get(&id).copied().unwrap_or(id)),
+                    MemberId::Relation(id) => MemberId::Relation(relation_map.get(&id).copied().unwrap_or(id)),
+                    MemberId::Unknown(t, id) => MemberId::Unknown(t, id),
+                };
+                MemberData { id: remapped_id, role: m.role().unwrap_or("") }
+            }));
+            let meta = element_metadata(&r.info());
+            bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
+            stats.relations_written += 1;
+        }
+    }
+    crate::debug::emit_marker("RENUMBER_PASS2_END");
 
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;

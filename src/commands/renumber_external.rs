@@ -46,7 +46,7 @@ use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::renumber::{RenumberOptions, RenumberStats};
 use super::{
     dense_node_metadata, element_metadata, ensure_node_capacity_local, ensure_relation_capacity,
-    ensure_way_capacity, flush_block, flush_local, require_sorted, writer_from_header,
+    ensure_way_capacity_local, flush_block, flush_local, require_sorted, writer_from_header,
     HeaderOverrides, Result,
 };
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
@@ -279,7 +279,6 @@ pub fn renumber_external(
         "renumber-external",
     )?;
 
-    let mut next_way_id = opts.start_way_id;
     let mut next_relation_id = opts.start_relation_id;
     let mut relation_map: FxHashMap<i64, i64> = FxHashMap::default();
     let mut stats = RenumberStats {
@@ -325,7 +324,8 @@ pub fn renumber_external(
     // per-blob OwnedBlock output on the worker thread (so PrimitiveBlocks
     // drop on the worker) and only crossing the Vec<u8> of already-encoded
     // output bytes.
-    let pass1_schedule = build_node_blob_schedule(input)?;
+    let pass1_schedule =
+        build_kind_blob_schedule(input, crate::blob_index::ElemKind::Node)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
     // Balance workers by node count: find the blob index where
@@ -472,20 +472,26 @@ pub fn renumber_external(
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    let mut way_map_buckets = BucketWriters::create(&scratch, "way-map")?;
-    stage2d_way_assembly(
+    let mut way_map_shard_a = BucketWriters::create(&scratch, "way-map-a")?;
+    let mut way_map_shard_b = BucketWriters::create(&scratch, "way-map-b")?;
+    let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
+    stage2d_parallel_way_assembly(
         input,
-        direct_io,
         &mut writer,
-        &mut bb,
-        &mut way_map_buckets,
+        &mut way_map_shard_a,
+        &mut way_map_shard_b,
         &new_refs_path,
         &ref_count_sidecar,
         total_slots,
-        &mut next_way_id,
-        &mut stats,
+        opts.start_way_id,
+        &stage2d_ways_atomic,
     )?;
-    let way_map_counts = way_map_buckets.finish()?;
+    stats.ways_written += stage2d_ways_atomic.load(std::sync::atomic::Ordering::Relaxed);
+    let way_map_counts_a = way_map_shard_a.finish()?;
+    let way_map_counts_b = way_map_shard_b.finish()?;
+    let way_map_counts: Vec<u64> = (0..NUM_BUCKETS)
+        .map(|i| way_map_counts_a[i] + way_map_counts_b[i])
+        .collect();
     #[allow(clippy::cast_possible_wrap)]
     {
         let total: u64 = way_map_counts.iter().sum();
@@ -548,7 +554,7 @@ pub fn renumber_external(
     let mut way_member_slot_b = BucketWriters::create(&scratch, "rel-way-slot-b")?;
     stage2b_node_merge_join(
         &way_member_ref_buckets,
-        &[&way_map_buckets],
+        &[&way_map_shard_a, &way_map_shard_b],
         &way_map_bucket_starts,
         &mut way_member_slot_a,
         &mut way_member_slot_b,
@@ -605,7 +611,8 @@ pub fn renumber_external(
     drop(way_member_slot_b);
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
-    drop(way_map_buckets);
+    drop(way_map_shard_a);
+    drop(way_map_shard_b);
     drop(slot_buckets_a);
     drop(slot_buckets_b);
     drop(way_ref_buckets);
@@ -644,27 +651,6 @@ fn compute_bucket_new_id_starts(
         }
     }
     starts
-}
-
-/// Write `old_id` into the given `bucket` and increment the bucket's
-/// entry counter. The caller chooses the bucket via `node_id_bucket`
-/// (pass 1 node_map emit) or `way_id_bucket` (stage 2d way_map emit).
-///
-/// Only the old id is stored; the new id is reconstructed at read time
-/// via `bucket_new_id_starts[bucket] + position_in_bucket`. See
-/// `OLD_ID_SIZE` for the invariant chain.
-fn emit_old_id(
-    buckets: &mut BucketWriters,
-    id_buf: &mut [u8; OLD_ID_SIZE],
-    old_id: i64,
-    bucket: usize,
-) -> Result<()> {
-    *id_buf = old_id.to_le_bytes();
-    if let Some(w) = buckets.writers[bucket].as_mut() {
-        w.write_all(id_buf)?;
-    }
-    buckets.entry_counts[bucket] += 1;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,31 +1531,40 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
 /// full element path (`block.elements()` matched on `Element::Way`),
 /// which gives tags + metadata + refs — vs stage 2a's `scan_way_refs`
 /// which is a refs-only fast path.
+/// Parallel stage 2d way assembly.
+///
+/// Mirrors the pass-1 worker-pool pattern: two range-partitioned
+/// workers, each owning a way_map shard, a `BlockBuilder`, its own
+/// scratch buffers, and an `output_blocks: Vec<OwnedBlock>` staging
+/// vec. Workers pread way blobs, construct PrimitiveBlocks locally
+/// (dropped on the worker thread), iterate ways, look up new node ids
+/// from the shared `new_refs_mmap`, rewrite refs into their local
+/// `BlockBuilder`, and send `(seq, Vec<OwnedBlock>)` via a bounded
+/// channel. The main thread reorders by seq and writes via
+/// `write_primitive_block_owned`.
+///
+/// Returns the next available way id after the pass.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
     clippy::too_many_lines,
     clippy::cast_possible_truncation
 )]
-fn stage2d_way_assembly(
+fn stage2d_parallel_way_assembly(
     input: &Path,
-    _direct_io: bool,
-    writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    bb: &mut BlockBuilder,
-    way_map_buckets: &mut BucketWriters,
+    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+    way_map_shard_a: &mut BucketWriters,
+    way_map_shard_b: &mut BucketWriters,
     new_refs_path: &Path,
     ref_count_sidecar: &Path,
     total_slots: u64,
-    next_way_id: &mut i64,
-    stats: &mut RenumberStats,
+    start_way_id: i64,
+    ways_written: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
     // Load sidecar and compute per-blob starting slot positions.
     let blob_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
 
-    // mmap the flat new_refs file for zero-syscall slot lookups. Stage 2d
-    // accesses slots sequentially as it walks way refs in file order, so
-    // MADV_SEQUENTIAL gives the kernel a hint for readahead. Matches
-    // external_join::CoordSlots.
+    // mmap the flat new_refs file for zero-syscall slot lookups.
     let new_refs_file = std::fs::File::open(new_refs_path)
         .map_err(|e| format!("failed to open new_refs file: {e}"))?;
     let new_refs_len = new_refs_file
@@ -1583,9 +1578,6 @@ fn stage2d_way_assembly(
         )
         .into());
     }
-    // The zero-length case is legitimate: input had no way refs at all
-    // (e.g. an empty or nodes-only PBF). mmap rejects zero-length maps on
-    // some kernels; fall back to an anonymous empty mmap in that case.
     let new_refs_mmap: memmap2::Mmap = if new_refs_len == 0 {
         memmap2::MmapOptions::new().map_anon()?.make_read_only()?
     } else {
@@ -1595,10 +1587,12 @@ fn stage2d_way_assembly(
         mmap.advise(memmap2::Advice::Sequential).ok();
         mmap
     };
+    let new_refs_mmap = std::sync::Arc::new(new_refs_mmap);
 
-    // Second way scan via schedule + pread — same blob set and order
-    // as stage 2a so the per-blob ref-count sidecar aligns 1:1.
-    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
+    // Build a way-blob schedule with per-blob element counts. The
+    // sidecar length must match the schedule 1:1 (both filtered to
+    // OsmData + ElemKind::Way).
+    let schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
     if schedule.len() != blob_slot_starts.len() {
         return Err(format!(
             "stage 2d: way blob schedule size {} != sidecar entries {}",
@@ -1607,104 +1601,240 @@ fn stage2d_way_assembly(
         )
         .into());
     }
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
-    let pool = crate::blob::DecompressPool::new();
-    let mut way_blob_idx: usize = 0;
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut id_buf = [0u8; OLD_ID_SIZE];
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let total_ways: u64 = schedule.iter().map(|t| t.element_count).sum();
+    // Sanity check: ensure total_ways would fit as an i64 offset.
+    // We only need the value to validate overflow, not to carry out.
+    i64::try_from(total_ways).map_err(|_| "planet way count > i64")?;
 
-    use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        let mut slot_cursor = blob_slot_starts[way_blob_idx];
+    if schedule.is_empty() {
+        return Ok(());
+    }
 
-        raw_buf.resize(data_size, 0);
-        shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
-        let mut decompress_buf = pool.get();
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
-        )?;
-
-        for element in block.elements() {
-            if let Element::Way(w) = &element {
-                ensure_way_capacity(bb, writer)?;
-                let new_id = *next_way_id;
-                *next_way_id += 1;
-
-                // Read ref_count consecutive new_node_ids from the flat file.
-                refs_buf.clear();
-                // Walk in file order. scan_way_refs in stage 2a and
-                // block.elements() here both iterate groups in top-
-                // level order and ways within a group in wire order,
-                // so slot_cursor aligns with the emitted (old, slot)
-                // pairs. The old ref ids themselves are discarded —
-                // we only use the count to advance the cursor.
-                for _ in w.refs() {
-                    let offset = slot_cursor as usize * NEW_REF_SIZE;
-                    let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap
-                        [offset..offset + NEW_REF_SIZE]
-                        .try_into()
-                        .map_err(|_| "stage 2d new_refs slice")?;
-                    let new_node_id = i64::from_le_bytes(bytes);
-                    refs_buf.push(new_node_id);
-                    slot_cursor += 1;
-                }
-
-                let meta = element_metadata(&w.info());
-                bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
-
-                // Emit the old_way_id into the way_map bucket. The
-                // corresponding new_way_id is reconstructed at R2B
-                // read time from `start_way_id + bucket_way_id_start
-                // [bucket] + position_within_bucket`.
-                let old_way_id = w.id();
-                emit_old_id(
-                    way_map_buckets, &mut id_buf, old_way_id, way_id_bucket(old_way_id),
-                )?;
-
-                stats.ways_written += 1;
+    // Balance workers by way count (not blob count) for load balance.
+    let split_idx = {
+        let half = total_ways / 2;
+        let mut running = 0u64;
+        let mut split = schedule.len();
+        for (i, task) in schedule.iter().enumerate() {
+            running += task.element_count;
+            if running >= half {
+                split = i + 1;
+                break;
             }
         }
+        split.min(schedule.len())
+    };
 
-        // Per-blob cross-check: slot_cursor must have advanced to exactly
-        // the next blob's start (or total_slots for the last blob). Any
-        // drift here indicates stage 2a and stage 2d disagreed on the way
-        // iteration order, which would silently misalign every subsequent
-        // blob's refs. This check catches the drift as soon as it happens
-        // rather than after the whole file is written.
-        let expected_end = blob_slot_starts
-            .get(way_blob_idx + 1)
-            .copied()
-            .unwrap_or(total_slots);
-        if slot_cursor != expected_end {
-            return Err(format!(
-                "stage 2d slot cursor drift at way blob {way_blob_idx}: \
-                 cursor = {slot_cursor}, expected = {expected_end} \
-                 (blob start = {})",
-                blob_slot_starts[way_blob_idx]
-            )
-            .into());
-        }
-
-        way_blob_idx += 1;
-    }
-
-    if way_blob_idx != blob_slot_starts.len() {
-        return Err(format!(
-            "stage 2d: way blob count mismatch — scanned {way_blob_idx}, sidecar has {}",
-            blob_slot_starts.len()
+    let a_element_count: u64 = schedule[..split_idx].iter().map(|t| t.element_count).sum();
+    let a_start_way_id = start_way_id;
+    let b_start_way_id = start_way_id
+        .checked_add(
+            i64::try_from(a_element_count).map_err(|_| "stage 2d worker A count overflow")?,
         )
-        .into());
-    }
+        .ok_or("stage 2d worker B base way_id overflow")?;
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    let tasks_a = &schedule[..split_idx];
+    let tasks_b = &schedule[split_idx..];
+
+    type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let file_a = std::sync::Arc::clone(&shared_file);
+        let mmap_a = std::sync::Arc::clone(&new_refs_mmap);
+        let slots_a = &blob_slot_starts;
+        let tx_a = decoded_tx.clone();
+        scope.spawn(move || {
+            stage2d_worker(
+                tasks_a,
+                a_start_way_id,
+                &file_a,
+                &mmap_a,
+                slots_a,
+                total_slots,
+                way_map_shard_a,
+                ways_written,
+                &tx_a,
+            );
+        });
+
+        let file_b = std::sync::Arc::clone(&shared_file);
+        let mmap_b = std::sync::Arc::clone(&new_refs_mmap);
+        let slots_b = &blob_slot_starts;
+        let tx_b = decoded_tx.clone();
+        scope.spawn(move || {
+            stage2d_worker(
+                tasks_b,
+                b_start_way_id,
+                &file_b,
+                &mmap_b,
+                slots_b,
+                total_slots,
+                way_map_shard_b,
+                ways_written,
+                &tx_b,
+            );
+        });
+
+        drop(decoded_tx);
+
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<Vec<OwnedBlock>, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        for (seq_num, item) in decoded_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })?;
 
     Ok(())
+}
+
+/// Stage 2d per-worker loop. Processes tasks in range order, owns a
+/// BlockBuilder and output Vec<OwnedBlock>, and emits one owned-block
+/// batch per blob through the channel. Looks up the ref_count_sidecar-
+/// derived `slot_cursor` for each blob from the shared `blob_slot_starts`
+/// slice so per-blob alignment stays deterministic regardless of the
+/// parallel dispatch order.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn stage2d_worker(
+    tasks: &[BlobTask],
+    worker_start_way_id: i64,
+    shared_file: &std::sync::Arc<std::fs::File>,
+    new_refs_mmap: &std::sync::Arc<memmap2::Mmap>,
+    blob_slot_starts: &[u64],
+    total_slots: u64,
+    shard: &mut BucketWriters,
+    ways_written: &std::sync::atomic::AtomicU64,
+    tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
+) {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut local_bb = BlockBuilder::new();
+    let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut id_buf = [0u8; OLD_ID_SIZE];
+    let mut current_way_id = worker_start_way_id;
+
+    for task in tasks {
+        let base_way_id = current_way_id;
+        let expected_slot_start = blob_slot_starts[task.seq];
+        let expected_slot_end = blob_slot_starts
+            .get(task.seq + 1)
+            .copied()
+            .unwrap_or(total_slots);
+
+        let result: std::result::Result<Vec<OwnedBlock>, String> = (|| {
+            read_buf.resize(task.data_size, 0);
+            shared_file
+                .read_exact_at(&mut read_buf, task.data_offset)
+                .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
+            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                .map_err(|e| e.to_string())?;
+            let block = crate::block::PrimitiveBlock::new(bytes::Bytes::from(
+                std::mem::take(&mut decompress_buf),
+            ))
+            .map_err(|e| e.to_string())?;
+
+            output_blocks.clear();
+            let mut slot_cursor = expected_slot_start;
+            let mut blob_way_count: u64 = 0;
+            let mut next_id = base_way_id;
+
+            for element in block.elements() {
+                if let Element::Way(w) = &element {
+                    reject_negative_id(w.id(), "way").map_err(|e| e.to_string())?;
+                    ensure_way_capacity_local(&mut local_bb, &mut output_blocks)?;
+                    let new_id = next_id;
+                    next_id += 1;
+
+                    refs_buf.clear();
+                    for _ in w.refs() {
+                        let offset = usize::try_from(slot_cursor)
+                            .map_err(|_| "slot_cursor > usize".to_string())?
+                            .checked_mul(NEW_REF_SIZE)
+                            .ok_or_else(|| "slot offset overflow".to_string())?;
+                        let end = offset
+                            .checked_add(NEW_REF_SIZE)
+                            .ok_or_else(|| "slot offset end overflow".to_string())?;
+                        let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap[offset..end]
+                            .try_into()
+                            .map_err(|_| "stage 2d new_refs slice".to_string())?;
+                        refs_buf.push(i64::from_le_bytes(bytes));
+                        slot_cursor += 1;
+                    }
+
+                    let meta = element_metadata(&w.info());
+                    local_bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
+
+                    // Emit old_way_id into the worker's way_map shard.
+                    let old_way_id = w.id();
+                    let bucket = way_id_bucket(old_way_id);
+                    id_buf = old_way_id.to_le_bytes();
+                    if let Some(w) = shard.writers[bucket].as_mut() {
+                        w.write_all(&id_buf).map_err(|e| e.to_string())?;
+                    }
+                    shard.entry_counts[bucket] += 1;
+                    blob_way_count += 1;
+                }
+            }
+
+            // Per-blob drift check — same invariant the sequential path
+            // enforced. Misalignment here means stage 2a and stage 2d
+            // disagreed on way iteration order and every subsequent
+            // blob's refs would be shifted.
+            if slot_cursor != expected_slot_end {
+                return Err(format!(
+                    "stage 2d slot cursor drift at way blob seq={}: \
+                     cursor = {slot_cursor}, expected = {expected_slot_end} \
+                     (blob start = {expected_slot_start})",
+                    task.seq
+                ));
+            }
+
+            flush_local(&mut local_bb, &mut output_blocks)?;
+
+            // Worker-side way id counter advances by actual decoded
+            // count (robust to minor indexdata inaccuracy).
+            current_way_id = current_way_id
+                .checked_add(
+                    i64::try_from(blob_way_count)
+                        .map_err(|_| "blob way count > i64".to_string())?,
+                )
+                .ok_or_else(|| "way id overflow in stage 2d".to_string())?;
+
+            ways_written.fetch_add(blob_way_count, std::sync::atomic::Ordering::Relaxed);
+
+            if decompress_buf.capacity() == 0 {
+                decompress_buf = Vec::new();
+            }
+
+            Ok(std::mem::take(&mut output_blocks))
+        })();
+
+        if tx.send((task.seq, result)).is_err() {
+            break;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,31 +1862,34 @@ fn stage2d_way_assembly(
 // Pass 1: parallel node scan — worker pool with range-based dispatch
 // ---------------------------------------------------------------------------
 
-/// Per-blob task for pass 1. `seq` is the filtered-index position (monotonic
-/// within the node-blob list, used for writer reorder). `data_offset` /
-/// `data_size` address the compressed blob body for pread. `element_count`
-/// comes from the indexdata `BlobIndex.count` and is used to precompute
-/// base new_ids without racing the decode path.
-struct NodeBlobTask {
+/// Per-blob task for the parallel pass pool. `seq` is the filtered-index
+/// position (monotonic within the per-kind blob list, used for writer
+/// reorder). `data_offset` / `data_size` address the compressed blob body
+/// for pread. `element_count` comes from the indexdata `BlobIndex.count`
+/// and lets the caller precompute base new_ids without racing decode.
+struct BlobTask {
     seq: usize,
     data_offset: u64,
     data_size: usize,
     element_count: u64,
 }
 
-/// Header-only scan building the pass-1 schedule. Requires indexed PBFs
-/// (all brokkr datasets are indexed): the per-blob element count is read
-/// from `BlobIndex.count`, which is required to precompute each blob's
-/// `base_new_id` without a full decode pass. If a node blob is missing
-/// indexdata, we error out with a pointer to `brokkr cat` / indexed
-/// datasets — matching how `--force` fallbacks are gated elsewhere.
-fn build_node_blob_schedule(input: &Path) -> Result<Vec<NodeBlobTask>> {
+/// Header-only scan building a per-kind schedule with element counts.
+/// Requires indexed PBFs (all brokkr datasets are indexed): the per-blob
+/// element count is read from `BlobIndex.count`, which is required to
+/// precompute each blob's `base_new_id` without a full decode pass. If a
+/// matching blob is missing indexdata, we error out with a pointer to
+/// `brokkr cat` / indexed datasets.
+fn build_kind_blob_schedule(
+    input: &Path,
+    kind: crate::blob_index::ElemKind,
+) -> Result<Vec<BlobTask>> {
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner
         .next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut schedule: Vec<NodeBlobTask> = Vec::new();
+    let mut schedule: Vec<BlobTask> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result?;
@@ -1770,10 +1903,10 @@ fn build_node_blob_schedule(input: &Path) -> Result<Vec<NodeBlobTask>> {
                     .into(),
             );
         };
-        if idx.kind != crate::blob_index::ElemKind::Node {
+        if idx.kind != kind {
             continue;
         }
-        schedule.push(NodeBlobTask {
+        schedule.push(BlobTask {
             seq,
             data_offset,
             data_size,
@@ -1811,7 +1944,7 @@ fn build_node_blob_schedule(input: &Path) -> Result<Vec<NodeBlobTask>> {
 /// PrimitiveBlock lifecycle entirely worker-local.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_parallel_scan(
-    schedule: &[NodeBlobTask],
+    schedule: &[BlobTask],
     split_idx: usize,
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
@@ -1907,7 +2040,7 @@ fn pass1_parallel_scan(
 /// consumed and dropped inside this function, so no cross-thread
 /// retention of decompressed payloads.
 fn pass1_worker(
-    tasks: &[NodeBlobTask],
+    tasks: &[BlobTask],
     worker_start_new_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
     shard: &mut BucketWriters,

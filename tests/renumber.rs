@@ -3,10 +3,9 @@
 mod common;
 
 use common::{
-    read_all_elements_id_only as read_all_elements,
-    read_all_elements_with_coords,
-    node_ids_id_only as node_ids, way_ids_id_only as way_ids,
-    relation_ids_id_only as relation_ids,
+    assert_elements_equivalent, read_all_elements_id_only as read_all_elements,
+    read_all_elements_with_coords, read_normalized, node_ids_id_only as node_ids,
+    way_ids_id_only as way_ids, relation_ids_id_only as relation_ids,
     write_test_pbf_sorted, TestMember, TestNode, TestRelation, TestWay,
 };
 use pbfhogg::renumber::{renumber, RenumberOptions};
@@ -427,4 +426,114 @@ fn renumber_relation_self_reference() {
     assert_eq!(members[0].0, 1, "self-reference should be remapped: 42→1");
     assert_eq!(members[0].1, "relation");
     assert_eq!(members[0].2, "self");
+}
+
+// ---------------------------------------------------------------------------
+// Element-equivalence helper smoke tests — exercise
+// `common::assert_elements_equivalent` and `common::read_normalized`. These
+// are the comparison primitives the upcoming external-mode renumber will use
+// as its Denmark cross-check against the in-memory path.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn element_equivalence_self_comparison() {
+    // Renumbering produces a single output file. Comparing that file to
+    // itself must always succeed — the simplest sanity check on the helper.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a"), ("highway", "stop")] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 30, lat: 120_000_000, lon: 220_000_000, tags: vec![("amenity", "cafe")] },
+        ],
+        &[
+            TestWay { id: 100, refs: vec![10, 20, 30], tags: vec![("highway", "primary")] },
+        ],
+        &[
+            TestRelation {
+                id: 500,
+                members: vec![
+                    TestMember { id: MemberId::Node(10), role: "stop" },
+                    TestMember { id: MemberId::Way(100), role: "outer" },
+                ],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    renumber(&input, &output, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber");
+
+    assert_elements_equivalent(&output, &output);
+
+    // Also verify read_normalized returns the expected shape for a non-trivial
+    // input. This catches any future regression where the normalization silently
+    // drops fields.
+    let norm = read_normalized(&output);
+    assert_eq!(norm.nodes.len(), 3);
+    assert_eq!(norm.ways.len(), 1);
+    assert_eq!(norm.relations.len(), 1);
+    assert_eq!(norm.nodes[0].id, 1);
+    assert_eq!(norm.nodes[0].tags.get("name"), Some(&"a".to_string()));
+    assert_eq!(norm.nodes[0].tags.get("highway"), Some(&"stop".to_string()));
+    assert_eq!(norm.ways[0].refs, vec![1, 2, 3]);
+    assert_eq!(norm.relations[0].members.len(), 2);
+    assert_eq!(norm.relations[0].members[0].member_type, "node");
+    assert_eq!(norm.relations[0].members[0].ref_id, 1);
+    assert_eq!(norm.relations[0].members[1].member_type, "way");
+    assert_eq!(norm.relations[0].members[1].ref_id, 1);
+}
+
+#[test]
+fn element_equivalence_two_independent_renumber_runs() {
+    // Two independent renumber runs on the same input must produce
+    // element-equivalent output. This is the exact comparison pattern that
+    // the upcoming `--mode external` cross-check will use against
+    // `--mode inmem`.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output_a = dir.path().join("output_a.osm.pbf");
+    let output_b = dir.path().join("output_b.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 10, lat: 100_000_000, lon: 200_000_000, tags: vec![("name", "a")] },
+            TestNode { id: 20, lat: 110_000_000, lon: 210_000_000, tags: vec![("name", "b")] },
+        ],
+        &[
+            TestWay { id: 50, refs: vec![10, 20], tags: vec![("highway", "secondary")] },
+        ],
+        &[
+            // Forward-ref relation + self-loop + ordinary back-ref, all at
+            // once. The helper must treat these as equivalent across runs.
+            TestRelation {
+                id: 300,
+                members: vec![
+                    TestMember { id: MemberId::Relation(400), role: "next" },
+                    TestMember { id: MemberId::Node(10), role: "label" },
+                ],
+                tags: vec![("type", "route")],
+            },
+            TestRelation {
+                id: 400,
+                members: vec![
+                    TestMember { id: MemberId::Relation(400), role: "self" },
+                    TestMember { id: MemberId::Way(50), role: "outer" },
+                ],
+                tags: vec![("type", "multipolygon")],
+            },
+        ],
+    );
+
+    renumber(&input, &output_a, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber a");
+    renumber(&input, &output_b, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default())
+        .expect("renumber b");
+
+    assert_elements_equivalent(&output_a, &output_b);
 }

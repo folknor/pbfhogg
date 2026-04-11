@@ -15,6 +15,7 @@
 //! - [`PbfContentsIdOnly`] / [`read_all_elements_id_only`]: used by extract,
 //!   getid, and tags_filter tests that only need element IDs and tags.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use pbfhogg::block_builder::{self, BlockBuilder, MemberData};
@@ -368,6 +369,263 @@ pub fn way_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
 /// Extract just the relation IDs from a [`PbfContentsIdOnly`].
 pub fn relation_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
     c.relations.iter().map(|(id, _)| *id).collect()
+}
+
+// ---------------------------------------------------------------------------
+// PBF reading helpers — "normalized" variant for element-equivalence cross-checks
+// ---------------------------------------------------------------------------
+//
+// Used by tests that need to assert two PBFs contain the same elements without
+// requiring byte-identical output. Byte-identical comparison is too strict: two
+// semantically-equivalent PBFs can differ in string-table ordering, DenseNodes
+// delta packing, and block flush boundaries without any actual element
+// difference. The normalized form captures what callers actually care about:
+//
+// - ID, coordinates (nodes), tags as a BTreeMap (order-insensitive), refs/
+//   members as a Vec (order-sensitive, since OSM semantics depend on it),
+//   metadata per element.
+//
+// Each type section is sorted by id so two PBFs with the same element set but
+// different file orderings compare equal. This is the element-equivalence
+// cross-check called for in the renumber refactor — see
+// notes/renumber-planet-scale.md "Correctness review findings" #1.
+
+/// Normalized element metadata. Matches `pbfhogg::block_builder::Metadata`
+/// shape with owned strings. `None` means the element has no metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedMeta {
+    pub version: i32,
+    pub timestamp: i64,
+    pub changeset: i64,
+    pub uid: i32,
+    pub user: String,
+    pub visible: bool,
+}
+
+/// Normalized node: id + coords + tags (order-insensitive) + metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedNode {
+    pub id: i64,
+    pub lat: i32,
+    pub lon: i32,
+    pub tags: BTreeMap<String, String>,
+    pub meta: Option<NormalizedMeta>,
+}
+
+/// Normalized way: id + refs (order-sensitive) + tags + metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedWay {
+    pub id: i64,
+    pub refs: Vec<i64>,
+    pub tags: BTreeMap<String, String>,
+    pub meta: Option<NormalizedMeta>,
+}
+
+/// Normalized relation member: type + ref id + role.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedMember {
+    pub member_type: String,
+    pub ref_id: i64,
+    pub role: String,
+}
+
+/// Normalized relation: id + members (order-sensitive) + tags + metadata.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NormalizedRelation {
+    pub id: i64,
+    pub members: Vec<NormalizedMember>,
+    pub tags: BTreeMap<String, String>,
+    pub meta: Option<NormalizedMeta>,
+}
+
+/// Normalized view of a complete PBF file. Each section sorted by id.
+#[derive(Debug)]
+pub struct NormalizedPbf {
+    pub nodes: Vec<NormalizedNode>,
+    pub ways: Vec<NormalizedWay>,
+    pub relations: Vec<NormalizedRelation>,
+}
+
+/// Build a `NormalizedMeta` from a Node/Way/Relation `Info`. Returns `None`
+/// when the info has no version (i.e. no metadata block was present, matching
+/// `commands::element_metadata`).
+fn meta_from_info(info: &pbfhogg::Info<'_>) -> Option<NormalizedMeta> {
+    info.version().map(|v| NormalizedMeta {
+        version: v,
+        timestamp: info.milli_timestamp().unwrap_or(0) / 1000,
+        changeset: info.changeset().unwrap_or(0),
+        uid: info.uid().unwrap_or(0),
+        user: info
+            .user()
+            .and_then(std::result::Result::ok)
+            .unwrap_or("")
+            .to_string(),
+        visible: info.visible(),
+    })
+}
+
+/// Build a `NormalizedMeta` from a `DenseNode`. Returns `None` when no info
+/// block is present (matching `commands::dense_node_metadata`).
+fn meta_from_dense_node(dn: &pbfhogg::DenseNode<'_>) -> Option<NormalizedMeta> {
+    dn.info()
+        .filter(|i| i.version() != -1)
+        .map(|i| NormalizedMeta {
+            version: i.version(),
+            timestamp: i.milli_timestamp() / 1000,
+            changeset: i.changeset(),
+            uid: i.uid(),
+            user: i.user().unwrap_or("").to_string(),
+            visible: i.visible(),
+        })
+}
+
+/// Convert a `Node`/`DenseNode` into a `NormalizedNode`.
+fn normalize_node(n: &pbfhogg::Node<'_>) -> NormalizedNode {
+    let tags: BTreeMap<String, String> = n
+        .tags()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    NormalizedNode {
+        id: n.id(),
+        lat: n.decimicro_lat(),
+        lon: n.decimicro_lon(),
+        tags,
+        meta: meta_from_info(&n.info()),
+    }
+}
+
+fn normalize_dense_node(dn: &pbfhogg::DenseNode<'_>) -> NormalizedNode {
+    let tags: BTreeMap<String, String> = dn
+        .tags()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    NormalizedNode {
+        id: dn.id(),
+        lat: dn.decimicro_lat(),
+        lon: dn.decimicro_lon(),
+        tags,
+        meta: meta_from_dense_node(dn),
+    }
+}
+
+fn normalize_way(w: &pbfhogg::Way<'_>) -> NormalizedWay {
+    let tags: BTreeMap<String, String> = w
+        .tags()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    NormalizedWay {
+        id: w.id(),
+        refs: w.refs().collect(),
+        tags,
+        meta: meta_from_info(&w.info()),
+    }
+}
+
+fn normalize_relation(r: &pbfhogg::Relation<'_>) -> NormalizedRelation {
+    let tags: BTreeMap<String, String> = r
+        .tags()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    let members: Vec<NormalizedMember> = r
+        .members()
+        .map(|m| {
+            let member_type = match m.id.member_type() {
+                pbfhogg::MemberType::Node => "node",
+                pbfhogg::MemberType::Way => "way",
+                pbfhogg::MemberType::Relation => "relation",
+                _ => "unknown",
+            }
+            .to_string();
+            NormalizedMember {
+                member_type,
+                ref_id: m.id.id(),
+                role: m.role().unwrap_or("").to_string(),
+            }
+        })
+        .collect();
+    NormalizedRelation {
+        id: r.id(),
+        members,
+        tags,
+        meta: meta_from_info(&r.info()),
+    }
+}
+
+/// Read a PBF file into its normalized, element-equivalence form.
+///
+/// Both `DenseNode` and `Node` element variants are coalesced into the same
+/// `NormalizedNode` shape so the serialization choice doesn't affect
+/// comparison. Each section is sorted by id on return.
+pub fn read_normalized(path: &Path) -> NormalizedPbf {
+    let reader = BlobReader::from_path(path).expect("open pbf");
+    let mut contents = NormalizedPbf {
+        nodes: Vec::new(),
+        ways: Vec::new(),
+        relations: Vec::new(),
+    };
+
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode blob") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => contents.nodes.push(normalize_dense_node(&dn)),
+                    Element::Node(n) => contents.nodes.push(normalize_node(&n)),
+                    Element::Way(w) => contents.ways.push(normalize_way(&w)),
+                    Element::Relation(r) => contents.relations.push(normalize_relation(&r)),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    contents.nodes.sort_by_key(|n| n.id);
+    contents.ways.sort_by_key(|w| w.id);
+    contents.relations.sort_by_key(|r| r.id);
+    contents
+}
+
+/// Assert that two PBF files are element-equivalent.
+///
+/// Reads both via `read_normalized` and compares section-by-section. On
+/// mismatch, panics with the standard `assert_eq!` pretty-printed diff so the
+/// first diverging element is visible. Compares sizes separately from
+/// contents so a count mismatch surfaces before an iterator zip stops early.
+pub fn assert_elements_equivalent(path_a: &Path, path_b: &Path) {
+    let a = read_normalized(path_a);
+    let b = read_normalized(path_b);
+
+    assert_eq!(
+        a.nodes.len(),
+        b.nodes.len(),
+        "node count differs: {} vs {}",
+        a.nodes.len(),
+        b.nodes.len()
+    );
+    assert_eq!(
+        a.ways.len(),
+        b.ways.len(),
+        "way count differs: {} vs {}",
+        a.ways.len(),
+        b.ways.len()
+    );
+    assert_eq!(
+        a.relations.len(),
+        b.relations.len(),
+        "relation count differs: {} vs {}",
+        a.relations.len(),
+        b.relations.len()
+    );
+
+    for (i, (na, nb)) in a.nodes.iter().zip(b.nodes.iter()).enumerate() {
+        assert_eq!(na, nb, "node at sorted index {i} differs");
+    }
+    for (i, (wa, wb)) in a.ways.iter().zip(b.ways.iter()).enumerate() {
+        assert_eq!(wa, wb, "way at sorted index {i} differs");
+    }
+    for (i, (ra, rb)) in a.relations.iter().zip(b.relations.iter()).enumerate() {
+        assert_eq!(ra, rb, "relation at sorted index {i} differs");
+    }
 }
 
 // ---------------------------------------------------------------------------

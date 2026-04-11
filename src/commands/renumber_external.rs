@@ -45,11 +45,11 @@ use std::path::{Path, PathBuf};
 use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::renumber::{RenumberOptions, RenumberStats};
 use super::{
-    dense_node_metadata, element_metadata, ensure_node_capacity, ensure_relation_capacity,
-    ensure_way_capacity, flush_block, require_sorted, writer_from_header, HeaderOverrides,
-    Result,
+    dense_node_metadata, element_metadata, ensure_node_capacity_local, ensure_relation_capacity,
+    ensure_way_capacity, flush_block, flush_local, require_sorted, writer_from_header,
+    HeaderOverrides, Result,
 };
-use crate::block_builder::{BlockBuilder, MemberData};
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::Compression;
 use crate::{Element, MemberId};
 
@@ -248,31 +248,37 @@ pub fn renumber_external(
     overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
     // ---- Header validation + output writer setup ----
-    // Same pattern as the in-memory renumber. require_sorted ensures we
-    // read nodes in ascending old-id order, which makes the node_map
-    // bucket files internally sorted by old_id with no extra sort step.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    let header_blob = blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let header = header_blob.to_headerblock()?;
-    require_sorted(&header, input, "Input PBF")?;
-    super::warn_locations_on_ways_loss(&header);
-
+    // Open once to validate the header and build the writer; the actual
+    // blob I/O for pass 1 happens via shared_file pread from worker
+    // threads below.
+    {
+        let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let header_blob = header_reader
+            .next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        let header = header_blob.to_headerblock()?;
+        require_sorted(&header, input, "Input PBF")?;
+        super::warn_locations_on_ways_loss(&header);
+    }
+    // Re-parse header for writer construction (the earlier reader is dropped).
+    let header = {
+        let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+        let header_blob = header_reader
+            .next()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+        header_blob.to_headerblock()?
+    };
     let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
     let mut bb = BlockBuilder::new();
 
-    // ---- Scratch dir + node_map buckets ----
-    // Distinct name from external_join's "external-join" so concurrent
-    // runs of the two commands don't collide.
+    // ---- Scratch dir ----
     let scratch = ScratchDir::new(
         output.parent().unwrap_or(Path::new(".")),
         "renumber-external",
     )?;
-    let mut node_map_buckets = BucketWriters::create(&scratch, "node-map")?;
 
-    let mut next_node_id = opts.start_node_id;
     let mut next_way_id = opts.start_way_id;
     let mut next_relation_id = opts.start_relation_id;
     let mut relation_map: FxHashMap<i64, i64> = FxHashMap::default();
@@ -282,86 +288,110 @@ pub fn renumber_external(
         relations_written: 0,
     };
 
-    // Decompression buffer recycling: buffers flow from the pool into
-    // each PrimitiveBlock via `from_vec_pooled_with_scratch` and return
-    // to the pool on block drop. Without the pool, `std::mem::take`
-    // would leave the caller's buf empty on every iteration, forcing a
-    // fresh allocation per blob — at planet scale, that's ~27 GB of
-    // cumulative alloc churn across pass 1 + stage 2a + stage 2d +
-    // R1 + R2a + R2d.
-    let pool = crate::blob::DecompressPool::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut id_buf = [0u8; OLD_ID_SIZE];
-
     crate::debug::emit_marker("RENUMBER_EXT_START");
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
 
-    // ---- Pass 1: node scan ----
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) { continue; }
-        // Fast-skip non-node blobs via blob_index (all brokkr datasets are
-        // indexed). Non-indexed PBFs fall through and decompress every
-        // blob, matching the pass-2 pattern in the in-memory renumber.
-        if let Some(idx) = blob.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                continue;
+    // ---- Pass 1: parallel node scan ----
+    //
+    // Architecture ports external_join.rs stage 4 (assembly) pattern:
+    //
+    // 1. Pre-scan blob headers to build a schedule filtered to node
+    //    blobs, with each blob's element count. Compute prefix sums so
+    //    each blob's base new_id is known before any decode work runs.
+    // 2. Range-split the schedule in half by blob index. Worker 0 gets
+    //    the first half, worker 1 gets the second. Range-based (not
+    //    work-stealing) dispatch preserves per-shard bucket-file sort:
+    //    each shard's bucket N contains old_ids in strictly ascending
+    //    order, and the two shards are disjoint (shard 0's old_ids are
+    //    all less than shard 1's). Stage 2b reads them as a concatenated
+    //    sorted run.
+    // 3. Each worker owns: its node_map bucket shard (BucketWriters),
+    //    its BlockBuilder, its read_buf + decompress_buf + scratch Vecs,
+    //    its output_blocks Vec<OwnedBlock>. All allocations stay worker-
+    //    local — no cross-thread malloc/free churn.
+    // 4. Workers send (seq, Result<Vec<OwnedBlock>>) via a bounded
+    //    channel. The OwnedBlock's Vec<u8> IS cross-thread-transferred to
+    //    the consumer, but bounded at ~32 items × ~1.4 MB = ~45 MB
+    //    in flight. Matches the external_join stage 4 pattern which
+    //    runs planet-scale without OOM.
+    // 5. Main thread consumer drains the channel, uses ReorderBuffer to
+    //    deliver (seq, blocks) in file order, pushes each OwnedBlock via
+    //    writer.write_primitive_block_owned.
+    //
+    // The for_each_block_pipelined path was attempted first and OOMed at
+    // 26 GB anon RSS on planet — cross-thread PrimitiveBlock retention
+    // via glibc arena accumulation, exactly as notes/parallel-classify-
+    // regression.md predicted. This pattern avoids that by extracting
+    // per-blob OwnedBlock output on the worker thread (so PrimitiveBlocks
+    // drop on the worker) and only crossing the Vec<u8> of already-encoded
+    // output bytes.
+    let pass1_schedule = build_node_blob_schedule(input)?;
+    let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
+
+    // Balance workers by node count: find the blob index where
+    // cumulative_count first exceeds half the total.
+    let pass1_split_idx = {
+        let half = pass1_total_nodes / 2;
+        let mut running = 0u64;
+        let mut split = pass1_schedule.len();
+        for (i, task) in pass1_schedule.iter().enumerate() {
+            running += task.element_count;
+            if running >= half {
+                split = i + 1;
+                break;
             }
         }
-        let mut decompress_buf = pool.get();
-        blob.decompress_into(&mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
-        )?;
-        for element in block.elements() {
-            match &element {
-                Element::DenseNode(dn) => {
-                    reject_negative_id(dn.id(), "node")?;
-                    ensure_node_capacity(&mut bb, &mut writer)?;
-                    let new_id = next_node_id;
-                    next_node_id += 1;
-                    let meta = dense_node_metadata(dn);
-                    bb.add_node(
-                        new_id, dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref(),
-                    );
-                    let old_id = dn.id();
-                    emit_old_id(
-                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
-                    )?;
-                    stats.nodes_written += 1;
-                }
-                Element::Node(n) => {
-                    reject_negative_id(n.id(), "node")?;
-                    ensure_node_capacity(&mut bb, &mut writer)?;
-                    let new_id = next_node_id;
-                    next_node_id += 1;
-                    let meta = element_metadata(&n.info());
-                    bb.add_node(
-                        new_id, n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref(),
-                    );
-                    let old_id = n.id();
-                    emit_old_id(
-                        &mut node_map_buckets, &mut id_buf, old_id, node_id_bucket(old_id),
-                    )?;
-                    stats.nodes_written += 1;
-                }
-                // Ways and relations are deferred to pass 2 (task #3) and
-                // relation passes (task #4). Skipping them here is fine for
-                // the skeleton: the output PBF will contain only renumbered
-                // nodes until those tasks land.
-                _ => {}
-            }
-        }
+        split.min(pass1_schedule.len())
+    };
+
+    // Per-worker node_map bucket shards. Each shard gets a distinct
+    // name so the files don't collide; stage 2b reads them as a
+    // concatenated sorted run via the multi-shard slice pattern.
+    let mut node_map_shard_a = BucketWriters::create(&scratch, "node-map-a")?;
+    let mut node_map_shard_b = BucketWriters::create(&scratch, "node-map-b")?;
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input).map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    // Track cumulative nodes_written via atomics so both workers can
+    // contribute without sharing `&mut RenumberStats`.
+    let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
+
+    pass1_parallel_scan(
+        &pass1_schedule,
+        pass1_split_idx,
+        opts.start_node_id,
+        &shared_file,
+        &mut node_map_shard_a,
+        &mut node_map_shard_b,
+        &nodes_written_atomic,
+        &mut writer,
+    )?;
+
+    stats.nodes_written += nodes_written_atomic.load(std::sync::atomic::Ordering::Relaxed);
+    // Sanity check: the two-worker prefix sum must match the actual
+    // atomic count. If not, either the schedule's indexdata count
+    // diverged from the decoded node count or a worker dropped work.
+    if stats.nodes_written != pass1_total_nodes {
+        return Err(format!(
+            "pass1 node count mismatch: schedule reported {pass1_total_nodes}, \
+             workers wrote {}",
+            stats.nodes_written,
+        )
+        .into());
     }
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
-    drop(blob_reader);
 
-    // Finalize the node_map bucket writers now that pass 1 is done emitting.
-    // Files stay on disk until stage 2b consumes them (forthcoming); we just
-    // need the underlying writers closed so the buffered bytes are durable.
-    let node_map_counts = node_map_buckets.finish()?;
+    // Finalize both node_map shards. Files stay on disk for stage 2b.
+    let node_map_counts_a = node_map_shard_a.finish()?;
+    let node_map_counts_b = node_map_shard_b.finish()?;
+    // Per-bucket counts summed across shards — used to compute
+    // bucket_new_id_starts for stage 2b.
+    let node_map_counts: Vec<u64> = (0..NUM_BUCKETS)
+        .map(|i| node_map_counts_a[i] + node_map_counts_b[i])
+        .collect();
     #[allow(clippy::cast_possible_wrap)]
     {
         let total: u64 = node_map_counts.iter().sum();
@@ -403,7 +433,7 @@ pub fn renumber_external(
     let mut slot_buckets_b = BucketWriters::create(&scratch, "slot-b")?;
     let resolved_count = stage2b_node_merge_join(
         &way_ref_buckets,
-        &node_map_buckets,
+        &[&node_map_shard_a, &node_map_shard_b],
         &node_map_bucket_starts,
         &mut slot_buckets_a,
         &mut slot_buckets_b,
@@ -504,7 +534,7 @@ pub fn renumber_external(
     let mut node_member_slot_b = BucketWriters::create(&scratch, "rel-node-slot-b")?;
     stage2b_node_merge_join(
         &node_member_ref_buckets,
-        &node_map_buckets,
+        &[&node_map_shard_a, &node_map_shard_b],
         &node_map_bucket_starts,
         &mut node_member_slot_a,
         &mut node_member_slot_b,
@@ -518,7 +548,7 @@ pub fn renumber_external(
     let mut way_member_slot_b = BucketWriters::create(&scratch, "rel-way-slot-b")?;
     stage2b_node_merge_join(
         &way_member_ref_buckets,
-        &way_map_buckets,
+        &[&way_map_buckets],
         &way_map_bucket_starts,
         &mut way_member_slot_a,
         &mut way_member_slot_b,
@@ -579,7 +609,8 @@ pub fn renumber_external(
     drop(slot_buckets_a);
     drop(slot_buckets_b);
     drop(way_ref_buckets);
-    drop(node_map_buckets);
+    drop(node_map_shard_a);
+    drop(node_map_shard_b);
     drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
@@ -972,37 +1003,6 @@ mod radix_tests {
 // Pass 2 stage B: node merge-join
 // ---------------------------------------------------------------------------
 
-/// For each of the 256 node-id buckets: load the way-ref `CooPair`s into
-/// RAM (radix-sort by `old_node_id`), load the corresponding `node_map`
-/// old-id entries (already sorted by `old_id` because pass 1 emits in
-/// ascending input-file order), two-cursor merge-join, and emit
-/// `(slot_pos, new_node_id)` resolved entries into slot buckets.
-///
-/// `bucket_new_id_starts[k]` must hold the new id to assign to the
-/// 0-th node in bucket k — i.e., `start_node_id +
-/// sum(node_map_counts[0..k])`. The i-th entry in bucket k is then
-/// assigned `bucket_new_id_starts[k] + i`. This reconstructs the new
-/// id from position, avoiding the 8 bytes per entry that storing
-/// `(old, new)` pairs on disk used to cost.
-///
-/// Same function is reused in R2B for relation members: pass
-/// `way_map_buckets` as the lookup side with `bucket_new_id_starts`
-/// derived from `start_way_id + way_map_counts` prefix sums.
-///
-/// Orphan refs (way-refs whose `old_node_id` has no matching entry)
-/// fall through with `resolved_id = old_node_id`, matching the in-
-/// memory renumber's `unwrap_or(old_id)` semantics.
-///
-/// Returns the total number of resolved entries emitted. Expected to
-/// equal the `total_slots` returned by stage 2a.
-///
-/// **Temp disk discipline**: deletes each way-ref bucket file as soon
-/// as its merge-join completes. Without this per-bucket cleanup, stage
-/// 2b's peak temp disk footprint at planet scale would be
-/// `node_map (83 GB) + way_ref (166 GB) + slot (136 GB) = 385 GB`.
-/// With cleanup, it drops to `node_map + per-bucket way_ref (~650 MB)
-/// + slot = ~219 GB`. node_map stays alive because the relation pass
-/// needs it.
 /// Per-worker scratch buffers for stage 2b. Kept in a struct so the
 /// bucket-processing loop can declare one instance per worker and
 /// reuse allocations across its claimed buckets.
@@ -1041,7 +1041,7 @@ impl Stage2bScratch {
 fn stage2b_process_bucket(
     bucket_idx: usize,
     way_ref_buckets: &BucketWriters,
-    node_map_buckets: &BucketWriters,
+    node_map_shards: &[&BucketWriters],
     bucket_new_id_starts: &[i64; NUM_BUCKETS],
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
@@ -1064,15 +1064,17 @@ fn stage2b_process_bucket(
 
     // node_map is already sorted by old_id because pass 1 scans a
     // sorted input and emits in file order, and `id_bucket` is
-    // monotonic in the input id.
+    // monotonic in the input id. When pass 1 is parallel, multiple
+    // shards are read in order: shard 0 holds all ids from the first
+    // half of node blobs (all less than shard 1's ids), so
+    // concatenating the shards yields a single sorted run.
     scratch.node_map.clear();
-    if node_map_buckets.entry_counts[bucket_idx] > 0 {
-        load_old_id_bucket(
-            &node_map_buckets.paths[bucket_idx],
-            &mut scratch.node_map_data,
-            &mut scratch.node_map,
-        )?;
-    }
+    load_old_id_bucket_shards(
+        node_map_shards,
+        bucket_idx,
+        &mut scratch.node_map_data,
+        &mut scratch.node_map,
+    )?;
 
     let bucket_base = bucket_new_id_starts[bucket_idx];
 
@@ -1110,6 +1112,38 @@ fn stage2b_process_bucket(
     Ok(resolved_count)
 }
 
+/// For each of the 256 node-id buckets: load the way-ref `CooPair`s into
+/// RAM (radix-sort by `old_node_id`), load the corresponding `node_map`
+/// old-id entries (already sorted by `old_id` because pass 1 emits in
+/// ascending input-file order), two-cursor merge-join, and emit
+/// `(slot_pos, new_node_id)` resolved entries into slot buckets.
+///
+/// `bucket_new_id_starts[k]` must hold the new id to assign to the
+/// 0-th node in bucket k — i.e., `start_node_id +
+/// sum(node_map_counts[0..k])`. The i-th entry in bucket k is then
+/// assigned `bucket_new_id_starts[k] + i`. This reconstructs the new
+/// id from position, avoiding the 8 bytes per entry that storing
+/// `(old, new)` pairs on disk used to cost.
+///
+/// Same function is reused in R2B for relation members: pass
+/// `way_map_buckets` as the lookup side with `bucket_new_id_starts`
+/// derived from `start_way_id + way_map_counts` prefix sums.
+///
+/// Orphan refs (way-refs whose `old_node_id` has no matching entry)
+/// fall through with `resolved_id = old_node_id`, matching the in-
+/// memory renumber's `unwrap_or(old_id)` semantics.
+///
+/// Returns the total number of resolved entries emitted. Expected to
+/// equal the `total_slots` returned by stage 2a.
+///
+/// **Temp disk discipline**: deletes each way-ref bucket file as soon
+/// as its merge-join completes. Without this per-bucket cleanup, stage
+/// 2b's peak temp disk footprint at planet scale would be
+/// `node_map (83 GB) + way_ref (166 GB) + slot (136 GB) = 385 GB`.
+/// With cleanup, it drops to `node_map + per-bucket way_ref (~650 MB)
+/// + slot = ~219 GB`. node_map stays alive because the relation pass
+/// needs it.
+///
 /// Two-worker parallel stage 2b. Workers compete for source buckets
 /// via an atomic index counter — each worker claims the next unclaimed
 /// bucket, processes it to completion (including file delete), then
@@ -1132,7 +1166,7 @@ fn stage2b_process_bucket(
 #[hotpath::measure]
 fn stage2b_node_merge_join(
     way_ref_buckets: &BucketWriters,
-    node_map_buckets: &BucketWriters,
+    node_map_shards: &[&BucketWriters],
     bucket_new_id_starts: &[i64; NUM_BUCKETS],
     slot_buckets_a: &mut BucketWriters,
     slot_buckets_b: &mut BucketWriters,
@@ -1152,6 +1186,7 @@ fn stage2b_node_merge_join(
     let (count_a, count_b) = std::thread::scope(|s| -> Result<(u64, u64)> {
         let next_ref = &next_bucket;
         let nm_starts = bucket_new_id_starts;
+        let nm_shards = node_map_shards;
 
         let handle_a = s.spawn(move || -> WorkerResult {
             let mut scratch = Stage2bScratch::new();
@@ -1162,7 +1197,7 @@ fn stage2b_node_merge_join(
                     break;
                 }
                 count += stage2b_process_bucket(
-                    i, way_ref_buckets, node_map_buckets, nm_starts,
+                    i, way_ref_buckets, nm_shards, nm_starts,
                     slot_buckets_a, total_slots, &mut scratch,
                 )
                 .map_err(|e| e.to_string())?;
@@ -1178,7 +1213,7 @@ fn stage2b_node_merge_join(
                     break;
                 }
                 count += stage2b_process_bucket(
-                    i, way_ref_buckets, node_map_buckets, nm_starts,
+                    i, way_ref_buckets, nm_shards, nm_starts,
                     slot_buckets_b, total_slots, &mut scratch,
                 )
                 .map_err(|e| e.to_string())?;
@@ -1391,48 +1426,66 @@ fn stage2c_slot_reorder(
     Ok(())
 }
 
-/// Load a bucket file of `old_id` entries (one `i64` LE per entry)
-/// into the provided `ids` Vec. Counterpart of `load_coo_bucket` for
-/// the node_map / way_map side. See `load_coo_bucket` for the
-/// `data_buf` shrink-to-zero rationale.
-///
-/// The entries are stored in emission order (pass 1 / stage 2d file
-/// order), which — because input is sorted by id and `id_bucket` is
-/// monotonic — is also ascending `old_id` order within the bucket.
-/// Callers (stage 2b / R2B merge-join) depend on this invariant.
-#[allow(clippy::cast_possible_truncation)]
-fn load_old_id_bucket(
-    path: &Path,
+/// Load multiple shards' `bucket_idx` files and concatenate them into
+/// a single sorted `ids` Vec. Each shard's bucket file is already
+/// sorted internally (pass 1 scans monotonic input), and the shards
+/// are disjoint with shard 0 holding the smallest ids. So reading in
+/// shard order and appending gives a single ascending run — no merge
+/// needed. This is what makes two-worker pass 1 composable with the
+/// existing two-cursor merge-join in stage 2b.
+fn load_old_id_bucket_shards(
+    shards: &[&BucketWriters],
+    bucket_idx: usize,
     data_buf: &mut Vec<u8>,
     ids: &mut Vec<i64>,
 ) -> Result<()> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open old_id bucket {}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("failed to stat old_id bucket {}: {e}", path.display()))?
-        .len() as usize;
-    if !len.is_multiple_of(OLD_ID_SIZE) {
-        return Err(format!(
-            "old_id bucket {} is {len} bytes, not a multiple of {OLD_ID_SIZE} — truncated or corrupt",
-            path.display()
-        )
-        .into());
-    }
-    data_buf.clear();
-    data_buf.resize(len, 0);
-    std::io::Read::read_exact(&mut &file, data_buf)
-        .map_err(|e| format!("failed to read old_id bucket {}: {e}", path.display()))?;
-    #[cfg(feature = "linux-direct-io")]
-    super::external_radix::advise_dontneed_file(&file);
-
-    let count = data_buf.len() / OLD_ID_SIZE;
+    use std::io::Read as _;
     ids.clear();
-    ids.reserve_exact(count.saturating_sub(ids.capacity()));
-    let mut buf = [0u8; OLD_ID_SIZE];
-    for chunk in data_buf.chunks_exact(OLD_ID_SIZE) {
-        buf.copy_from_slice(chunk);
-        ids.push(i64::from_le_bytes(buf));
+    let total: u64 = shards
+        .iter()
+        .map(|s| s.entry_counts[bucket_idx])
+        .sum();
+    if total == 0 {
+        return Ok(());
+    }
+    ids.reserve_exact(
+        usize::try_from(total)
+            .map_err(|_| "node_map bucket shard total overflow")?
+            .saturating_sub(ids.capacity()),
+    );
+    for shard in shards {
+        if shard.entry_counts[bucket_idx] == 0 {
+            continue;
+        }
+        let path = &shard.paths[bucket_idx];
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open old_id bucket {}: {e}", path.display()))?;
+        let len = usize::try_from(
+            file.metadata()
+                .map_err(|e| format!("failed to stat old_id bucket {}: {e}", path.display()))?
+                .len(),
+        )
+        .map_err(|_| format!("old_id bucket {} too large for usize", path.display()))?;
+        if !len.is_multiple_of(OLD_ID_SIZE) {
+            return Err(format!(
+                "old_id bucket {} is {len} bytes, not a multiple of {OLD_ID_SIZE} — \
+                 truncated or corrupt",
+                path.display()
+            )
+            .into());
+        }
+        data_buf.clear();
+        data_buf.resize(len, 0);
+        (&file)
+            .read_exact(data_buf)
+            .map_err(|e| format!("failed to read old_id bucket {}: {e}", path.display()))?;
+        #[cfg(feature = "linux-direct-io")]
+        super::external_radix::advise_dontneed_file(&file);
+        let mut buf = [0u8; OLD_ID_SIZE];
+        for chunk in data_buf.chunks_exact(OLD_ID_SIZE) {
+            buf.copy_from_slice(chunk);
+            ids.push(i64::from_le_bytes(buf));
+        }
     }
     *data_buf = Vec::new();
     Ok(())
@@ -1674,6 +1727,318 @@ fn stage2d_way_assembly(
 /// The schedule is then consumed by a pread-based blob reader so only
 /// matching blobs are ever pulled off disk. Matches the pattern used in
 /// `src/commands/extract.rs` and `src/commands/external_join.rs` stage 2.
+
+// ---------------------------------------------------------------------------
+// Pass 1: parallel node scan — worker pool with range-based dispatch
+// ---------------------------------------------------------------------------
+
+/// Per-blob task for pass 1. `seq` is the filtered-index position (monotonic
+/// within the node-blob list, used for writer reorder). `data_offset` /
+/// `data_size` address the compressed blob body for pread. `element_count`
+/// comes from the indexdata `BlobIndex.count` and is used to precompute
+/// base new_ids without racing the decode path.
+struct NodeBlobTask {
+    seq: usize,
+    data_offset: u64,
+    data_size: usize,
+    element_count: u64,
+}
+
+/// Header-only scan building the pass-1 schedule. Requires indexed PBFs
+/// (all brokkr datasets are indexed): the per-blob element count is read
+/// from `BlobIndex.count`, which is required to precompute each blob's
+/// `base_new_id` without a full decode pass. If a node blob is missing
+/// indexdata, we error out with a pointer to `brokkr cat` / indexed
+/// datasets — matching how `--force` fallbacks are gated elsewhere.
+fn build_node_blob_schedule(input: &Path) -> Result<Vec<NodeBlobTask>> {
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner
+        .next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let mut schedule: Vec<NodeBlobTask> = Vec::new();
+    let mut seq: usize = 0;
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        let Some(idx) = hdr.index() else {
+            return Err(
+                "renumber --mode external requires an indexed PBF — run `brokkr cat` to add \
+                 indexdata or use the indexed variant"
+                    .into(),
+            );
+        };
+        if idx.kind != crate::blob_index::ElemKind::Node {
+            continue;
+        }
+        schedule.push(NodeBlobTask {
+            seq,
+            data_offset,
+            data_size,
+            element_count: idx.count,
+        });
+        seq += 1;
+    }
+    Ok(schedule)
+}
+
+/// Two-worker parallel pass 1. Worker A processes blobs `0..split_idx`,
+/// worker B processes `split_idx..`, both in monotonic file order.
+/// Range-based (not work-stealing) dispatch preserves the per-shard
+/// invariant that stage 2b relies on: each shard's bucket N contains
+/// old_ids in strictly ascending order, AND shard A's old_ids are
+/// disjoint from (and all less than) shard B's old_ids for any given
+/// bucket. Together the two shards read as a concatenated sorted run.
+///
+/// Each worker owns: its node_map bucket shard (`&mut BucketWriters`),
+/// a `BlockBuilder`, read_buf + decompress_buf scratch Vecs, an
+/// `output_blocks: Vec<OwnedBlock>` staging buffer, and its own
+/// nodes-written counter. All allocations stay worker-local — no
+/// cross-thread malloc/free churn. PrimitiveBlocks drop on the worker
+/// thread. Only `Vec<OwnedBlock>` (owned by the output-buffer Vec)
+/// crosses the channel, bounded at ~32 items in flight.
+///
+/// The main thread consumes `(seq, Result<Vec<OwnedBlock>>)` from a
+/// bounded mpsc channel and uses a `ReorderBuffer` to deliver blocks
+/// in file order to the writer via `write_primitive_block_owned`.
+///
+/// The for_each_block_pipelined path was attempted first and OOMed at
+/// 26 GB anon RSS on planet — cross-thread PrimitiveBlock retention via
+/// glibc arena accumulation, exactly as notes/parallel-classify-
+/// regression.md predicted. This pattern avoids that by keeping the
+/// PrimitiveBlock lifecycle entirely worker-local.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn pass1_parallel_scan(
+    schedule: &[NodeBlobTask],
+    split_idx: usize,
+    start_node_id: i64,
+    shared_file: &std::sync::Arc<std::fs::File>,
+    node_map_shard_a: &mut BucketWriters,
+    node_map_shard_b: &mut BucketWriters,
+    nodes_written: &std::sync::atomic::AtomicU64,
+    writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
+) -> Result<()> {
+    if schedule.is_empty() {
+        return Ok(());
+    }
+
+    // Compute each worker's starting new_id. Worker A starts at
+    // `start_node_id`; worker B starts after worker A's slice has
+    // consumed `sum(element_count[0..split_idx])` ids.
+    let a_element_count: u64 = schedule[..split_idx].iter().map(|t| t.element_count).sum();
+    let a_start_new_id = start_node_id;
+    let b_start_new_id = start_node_id
+        .checked_add(
+            i64::try_from(a_element_count).map_err(|_| "pass1 worker A count overflow")?,
+        )
+        .ok_or("pass1 worker B base new_id overflow")?;
+
+    let tasks_a = &schedule[..split_idx];
+    let tasks_b = &schedule[split_idx..];
+
+    type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Worker A
+        let file_a = std::sync::Arc::clone(shared_file);
+        let tx_a = decoded_tx.clone();
+        scope.spawn(move || {
+            pass1_worker(
+                tasks_a,
+                a_start_new_id,
+                &file_a,
+                node_map_shard_a,
+                nodes_written,
+                &tx_a,
+            );
+        });
+
+        // Worker B
+        let file_b = std::sync::Arc::clone(shared_file);
+        let tx_b = decoded_tx.clone();
+        scope.spawn(move || {
+            pass1_worker(
+                tasks_b,
+                b_start_new_id,
+                &file_b,
+                node_map_shard_b,
+                nodes_written,
+                &tx_b,
+            );
+        });
+
+        drop(decoded_tx);
+
+        // Consumer: reorder by `seq` and push OwnedBlocks to writer.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<Vec<OwnedBlock>, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        for (seq_num, item) in decoded_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                for (block_bytes, index, tagdata) in blocks {
+                    writer.write_primitive_block_owned(
+                        block_bytes,
+                        index,
+                        tagdata.as_deref(),
+                    )?;
+                }
+            }
+        }
+
+        // Each worker owns its own local BlockBuilder — the caller's
+        // `bb` is never touched inside pass 1. Subsequent stages
+        // reuse the caller's `bb` and start fresh, so there's nothing
+        // to flush here.
+        Ok(())
+    })?;
+
+    Ok(())
+}
+
+/// Per-worker loop: processes `tasks` in file order, emits node_map
+/// entries into `shard`, and sends `(seq, Vec<OwnedBlock>)` through
+/// `tx`. The worker owns all its scratch buffers. PrimitiveBlocks are
+/// consumed and dropped inside this function, so no cross-thread
+/// retention of decompressed payloads.
+fn pass1_worker(
+    tasks: &[NodeBlobTask],
+    worker_start_new_id: i64,
+    shared_file: &std::sync::Arc<std::fs::File>,
+    shard: &mut BucketWriters,
+    nodes_written: &std::sync::atomic::AtomicU64,
+    tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
+) {
+    use std::os::unix::fs::FileExt as _;
+
+    let mut read_buf: Vec<u8> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut local_bb = BlockBuilder::new();
+    let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+    let mut id_buf = [0u8; OLD_ID_SIZE];
+    let mut current_new_id = worker_start_new_id;
+
+    for task in tasks {
+        let base_new_id = current_new_id;
+        let result: std::result::Result<Vec<OwnedBlock>, String> = (|| {
+            read_buf.resize(task.data_size, 0);
+            shared_file
+                .read_exact_at(&mut read_buf, task.data_offset)
+                .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
+            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                .map_err(|e| e.to_string())?;
+            let block = crate::block::PrimitiveBlock::new(bytes::Bytes::from(
+                std::mem::take(&mut decompress_buf),
+            ))
+            .map_err(|e| e.to_string())?;
+
+            output_blocks.clear();
+            let blob_node_count = pass1_process_blob(
+                &block,
+                &mut local_bb,
+                &mut output_blocks,
+                base_new_id,
+                shard,
+                &mut id_buf,
+            )?;
+            flush_local(&mut local_bb, &mut output_blocks)?;
+
+            // Advance the worker's new_id cursor by this blob's
+            // actual decoded node count. For indexed PBFs this
+            // matches `task.element_count`; we use the decode count
+            // so we're not dependent on indexdata accuracy.
+            current_new_id = current_new_id
+                .checked_add(
+                    i64::try_from(blob_node_count)
+                        .map_err(|_| "blob node count > i64".to_string())?,
+                )
+                .ok_or_else(|| "node id overflow in pass1".to_string())?;
+
+            nodes_written.fetch_add(blob_node_count, std::sync::atomic::Ordering::Relaxed);
+
+            if decompress_buf.capacity() == 0 {
+                decompress_buf = Vec::new();
+            }
+
+            Ok(std::mem::take(&mut output_blocks))
+        })();
+
+        if tx.send((task.seq, result)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Process a single decoded blob: iterate elements, assign new ids,
+/// emit `bb.add_node` into `output_blocks`, and write `old_id` entries
+/// into this worker's `shard`. Returns the number of nodes emitted.
+fn pass1_process_blob(
+    block: &crate::block::PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    base_new_id: i64,
+    shard: &mut BucketWriters,
+    id_buf: &mut [u8; OLD_ID_SIZE],
+) -> std::result::Result<u64, String> {
+    let mut count: u64 = 0;
+    let mut next_id = base_new_id;
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                reject_negative_id(dn.id(), "node").map_err(|e| e.to_string())?;
+                ensure_node_capacity_local(bb, output)?;
+                let new_id = next_id;
+                next_id += 1;
+                let meta = dense_node_metadata(dn);
+                bb.add_node(
+                    new_id,
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    dn.tags(),
+                    meta.as_ref(),
+                );
+                let old_id = dn.id();
+                let bucket = node_id_bucket(old_id);
+                *id_buf = old_id.to_le_bytes();
+                if let Some(w) = shard.writers[bucket].as_mut() {
+                    w.write_all(id_buf).map_err(|e| e.to_string())?;
+                }
+                shard.entry_counts[bucket] += 1;
+                count += 1;
+            }
+            Element::Node(n) => {
+                reject_negative_id(n.id(), "node").map_err(|e| e.to_string())?;
+                ensure_node_capacity_local(bb, output)?;
+                let new_id = next_id;
+                next_id += 1;
+                let meta = element_metadata(&n.info());
+                bb.add_node(
+                    new_id,
+                    n.decimicro_lat(),
+                    n.decimicro_lon(),
+                    n.tags(),
+                    meta.as_ref(),
+                );
+                let old_id = n.id();
+                let bucket = node_id_bucket(old_id);
+                *id_buf = old_id.to_le_bytes();
+                if let Some(w) = shard.writers[bucket].as_mut() {
+                    w.write_all(id_buf).map_err(|e| e.to_string())?;
+                }
+                shard.entry_counts[bucket] += 1;
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    Ok(count)
+}
+
 fn build_blob_schedule(
     input: &Path,
     kind: crate::blob_index::ElemKind,

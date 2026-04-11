@@ -1710,12 +1710,34 @@ fn pread_write_pass<F>(
 where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
 {
+    crate::debug::emit_mallinfo2("MI_PRE_BLOB_SCHEDULE");
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_START");
     let schedule = build_blob_schedule(input)?;
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
+    crate::debug::emit_mallinfo2("MI_POST_BLOB_SCHEDULE");
+    pread_write_pass_with_schedule(input, schedule, writer, stats, block_fn)
+}
+
+/// Variant of [`pread_write_pass`] that takes a pre-built blob schedule
+/// instead of calling [`build_blob_schedule`]. Used by smart/complete extract
+/// to reuse the schedule built during PASS1's manual header scan, avoiding
+/// a third post-PASS1 file scan and its associated cold-arena-page residency
+/// cascade. See `notes/parallel-classify-regression-2026-04-11-round3.md`.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+fn pread_write_pass_with_schedule<F>(
+    input: &Path,
+    schedule: Vec<BlobDesc>,
+    writer: &mut PbfWriter<crate::file_writer::FileWriter>,
+    stats: &mut ExtractStats,
+    block_fn: F,
+) -> Result<()>
+where
+    F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
+{
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
     pread_execute(input, &schedule, writer, stats, block_fn)?;
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
+    crate::debug::emit_mallinfo2("MI_POST_EXECUTE");
     crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");
     writer.flush()?;
     crate::debug::emit_marker("PREAD_WRITE_FLUSH_END");
@@ -2324,7 +2346,7 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
     crate::debug::emit_marker("COMPLETE_PASS1_START");
     let bbox_int = BboxInt::from_bbox(region.bbox());
     let mut handler = CompleteRelationHandler;
-    let result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
+    let mut result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     crate::debug::emit_marker("COMPLETE_PASS1_END");
 
     // --- Pass 2: Write matching elements via pread-from-workers ---
@@ -2347,6 +2369,11 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
         hb.sorted()
     }, direct_io, false)?;
 
+    // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
+    // holds immutable borrows of `result` and we need a brief mutable borrow
+    // here to mem::take the schedule.
+    let pass1_blob_schedule = std::mem::take(&mut result.pass3_blob_schedule);
+
     let ids = ExtractPass2IdSets {
         bbox_node_ids: &result.bbox_node_ids,
         all_way_node_ids: &result.all_way_node_ids,
@@ -2356,9 +2383,18 @@ fn extract_complete_ways(input: &Path, output: &Path, region: &Region, set_bound
 
     crate::debug::emit_marker("COMPLETE_PASS2_SETUP_END");
     crate::debug::emit_marker("COMPLETE_PASS2_WRITE_START");
-    pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
-        extract_block_pass2(block, &ids, clean, bb, output_blocks)
-    })?;
+    // Reuse PASS1's pre-built blob schedule if available, falling back to
+    // build_blob_schedule for the unsorted-fallback path. Avoids the second
+    // post-PASS1 header scan and its cold-arena-page residency cascade.
+    if pass1_blob_schedule.is_empty() {
+        pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
+            extract_block_pass2(block, &ids, clean, bb, output_blocks)
+        })?;
+    } else {
+        pread_write_pass_with_schedule(input, pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
+            extract_block_pass2(block, &ids, clean, bb, output_blocks)
+        })?;
+    }
     crate::debug::emit_marker("COMPLETE_PASS2_WRITE_END");
 
     crate::debug::emit_marker("COMPLETE_PASS2_END");
@@ -2383,6 +2419,15 @@ struct Pass1Result {
     /// a second 19-second header scan. Empty for the unsorted-fallback path
     /// (smart PASS2 falls back to `build_classify_schedule` in that case).
     way_schedule: Vec<(usize, u64, usize)>,
+    /// Full BlobDesc schedule for all OsmData blobs, built during PASS1's
+    /// manual scan and used by smart/complete PASS3 instead of calling
+    /// `build_blob_schedule` again. Eliminates a third post-PASS1 header scan
+    /// (~28 seconds on Europe). Empty for the unsorted-fallback path. See
+    /// notes/parallel-classify-regression-2026-04-11-round3.md for the
+    /// mechanism: post-PASS1 header scans cause cold-arena-page residency
+    /// cascades that don't show up in glibc's accounting but do show up
+    /// in anon RSS.
+    pass3_blob_schedule: Vec<BlobDesc>,
 }
 
 /// Strategy-specific relation handling for pass 1.
@@ -2525,6 +2570,7 @@ fn collect_pass1_generic<H: RelationHandler>(
         return Ok(Pass1Result {
             bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
             way_schedule: Vec::new(),
+            pass3_blob_schedule: Vec::new(),
         });
     }
 
@@ -2550,11 +2596,36 @@ fn collect_pass1_generic<H: RelationHandler>(
     // build_classify_schedule call entirely, saving ~16% wall on Europe
     // (one fewer 19-second header scan after PASS1's parallel work).
     let mut full_way_schedule: Vec<(usize, u64, usize)> = Vec::new();
+    // Full BlobDesc schedule for all OsmData blobs, returned via Pass1Result
+    // for smart/complete PASS3 to reuse. Eliminates the third post-PASS1
+    // header scan (build_blob_schedule) and its associated cold-arena-page
+    // residency cascade.
+    let mut pass3_blob_schedule: Vec<BlobDesc> = Vec::new();
     let mut seq: usize = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        let (hdr, frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
+        let idx = hdr.index();
+        // Build pass3_blob_schedule unconditionally for all OsmData blobs.
+        // Mirrors build_blob_schedule's behavior (no kind/spatial filter,
+        // raw_passthrough=false since smart/complete don't use the
+        // passthrough optimization).
+        let bbox = idx.as_ref().and_then(|i| i.bbox);
+        let count = idx.as_ref().map_or(0, |i| i.count);
+        let kind_for_blob = idx.as_ref().map(|i| i.kind);
+        #[allow(clippy::cast_possible_truncation)]
+        let frame_size = (data_offset - frame_offset) as usize + data_size;
+        pass3_blob_schedule.push(BlobDesc {
+            frame_offset,
+            frame_size,
+            offset: data_offset,
+            size: data_size,
+            kind: kind_for_blob,
+            bbox,
+            count,
+            raw_passthrough: false,
+        });
+        if let Some(idx) = idx {
             // Build full_way_schedule unconditionally for way blobs.
             if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
                 full_way_schedule.push((seq, data_offset, data_size));
@@ -2680,6 +2751,7 @@ fn collect_pass1_generic<H: RelationHandler>(
     Ok(Pass1Result {
         bbox_node_ids, matched_way_ids, all_way_node_ids, matched_relation_ids,
         way_schedule: full_way_schedule,
+        pass3_blob_schedule,
     })
 }
 
@@ -2834,6 +2906,7 @@ fn extract_smart(
     let mut result = collect_pass1_generic(input, region, &bbox_int, direct_io, &mut handler)?;
     let mut extra_node_ids = handler.extra_node_ids;
     crate::debug::emit_marker("SMART_PASS1_END");
+    crate::debug::emit_mallinfo2("MI_PASS1_END");
 
     // --- Pass 2: Resolve extra way node deps (parallel pread) ---
     crate::debug::emit_marker("SMART_PASS2_START");
@@ -2914,6 +2987,11 @@ fn extract_smart(
         hb.sorted()
     }, direct_io, false)?;
 
+    // Take the pre-built blob schedule BEFORE creating `ids`, since `ids`
+    // holds immutable borrows of `result` and we need a brief mutable borrow
+    // here to mem::take the schedule.
+    let pass1_blob_schedule = std::mem::take(&mut result.pass3_blob_schedule);
+
     let ids = ExtractPass3IdSets {
         bbox_node_ids: &result.bbox_node_ids,
         all_way_node_ids: &result.all_way_node_ids,
@@ -2925,9 +3003,18 @@ fn extract_smart(
 
     crate::debug::emit_marker("SMART_PASS3_SETUP_END");
     crate::debug::emit_marker("SMART_PASS3_WRITE_START");
-    pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
-        extract_block_pass3(block, &ids, clean, bb, output_blocks)
-    })?;
+    // Reuse PASS1's pre-built blob schedule if available, falling back to
+    // build_blob_schedule for the unsorted-fallback path. Avoids the third
+    // post-PASS1 header scan and its cold-arena-page residency cascade.
+    if pass1_blob_schedule.is_empty() {
+        pread_write_pass(input, &mut writer, &mut stats, |block, bb, output_blocks| {
+            extract_block_pass3(block, &ids, clean, bb, output_blocks)
+        })?;
+    } else {
+        pread_write_pass_with_schedule(input, pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
+            extract_block_pass3(block, &ids, clean, bb, output_blocks)
+        })?;
+    }
     crate::debug::emit_marker("SMART_PASS3_WRITE_END");
 
     crate::debug::emit_marker("SMART_PASS3_END");

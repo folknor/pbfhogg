@@ -21,6 +21,40 @@ pub fn emit_counter(name: &str, value: i64) {
     write_fifo(|f, us| { drop((&*f).write_all(format!("{us} @{name}={value}\n").as_bytes())); });
 }
 
+/// Snapshot glibc allocator state via `mallinfo2()` and emit the key fields
+/// as counters with `<prefix>_<field>` names.
+///
+/// DIAGNOSTIC (2026-04-11 round 3): used to distinguish brk arena growth
+/// (`arena`) from mmap-backed heap chunks (`hblkhd`) at marker boundaries
+/// during the post-PASS1 header scan burst investigation.
+///
+/// Fields emitted:
+/// - `<prefix>_arena`     — total brk-managed heap size in bytes
+/// - `<prefix>_hblks`     — count of mmap-managed chunks
+/// - `<prefix>_hblkhd`    — total bytes in mmap-managed chunks
+/// - `<prefix>_uordblks`  — bytes allocated in normal blocks (live)
+/// - `<prefix>_fordblks`  — bytes free in normal blocks (free-list)
+/// - `<prefix>_keepcost`  — top-most releasable block in arena
+///
+/// On non-glibc platforms this is a no-op.
+#[cfg(target_os = "linux")]
+pub fn emit_mallinfo2(prefix: &str) {
+    // SAFETY: mallinfo2 is a glibc function safe to call from any thread.
+    let info = unsafe { libc::mallinfo2() };
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        emit_counter(&format!("{prefix}_arena"), info.arena as i64);
+        emit_counter(&format!("{prefix}_hblks"), info.hblks as i64);
+        emit_counter(&format!("{prefix}_hblkhd"), info.hblkhd as i64);
+        emit_counter(&format!("{prefix}_uordblks"), info.uordblks as i64);
+        emit_counter(&format!("{prefix}_fordblks"), info.fordblks as i64);
+        emit_counter(&format!("{prefix}_keepcost"), info.keepcost as i64);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn emit_mallinfo2(_prefix: &str) {}
+
 /// Shared FIFO write logic for markers and counters.
 fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
     use std::sync::OnceLock;

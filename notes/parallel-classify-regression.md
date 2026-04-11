@@ -154,22 +154,162 @@ were also removed from the CLI feature flags because they broke
 **Meta has restarted active jemalloc development** — revisit when that
 work matures.
 
-**Remaining mitigation directions** (none currently planned):
+**Remaining mitigation directions** (none currently planned, but the
+menu is informed by a round-4 reviewer consensus):
 
-1. **Reduce PASS1's cumulative allocation footprint.** The `parallel_classify_phase`
-   per-blob `Vec<i64>` channel pattern is the dominant source of small-allocation
-   churn (~4.2 GB cumulative on Japan, ~63 GB on Europe extrapolated). Switching
-   back to per-worker accumulation for some paths would reduce churn but reintroduces
-   the planet-safety concerns the round-1 design review was about.
-2. **Custom arena allocator** (e.g., bumpalo) for PASS1's parallel work that
-   gets explicitly munmap'd at PASS1 end. Larger structural change. See
-   TODO.md "Custom allocators (per-block arena)" entry.
-3. **Restructure PASS1 to use pooled fixed-size buffers** instead of per-blob
-   `Vec` allocations. Would require redesigning the `parallel_classify_phase`
-   API to expose buffer recycling. Significant refactor.
-4. **Accept the ceiling and document it.** Pro-rated to planet, the ceiling
-   is 26–28 GB. Not an OOM in production (the pipeline runs as one cycle,
-   not concurrently with anything heavy), just tight headroom on plantasjen.
+### Step 0: measure planet before implementing anything
+
+**The most important action before spending engineering time on a
+structural fix.** The "~26-28 GB pro-rated planet" number is a projection
+from Europe peak × 2.6. Projections at that scale factor have ~20-30%
+error bars — the actual planet number might be ~22 GB (fits comfortably)
+or ~32 GB (clearly needs fixing). We have never actually benched
+`brokkr extract --dataset planet --strategy smart`. One planet bench
+(~20-30 minutes of exclusive lock) collapses the binary:
+
+- Planet peak < ~25 GB → ship as-is, the ceiling is fine in practice
+- Planet peak 25-28 GB → Option 4 (accept) is defensible with the 29%
+  wall win already shipped
+- Planet peak > 28 GB → implement the reusable packet mitigation below
+
+**Don't build a fix for a problem you haven't measured.** (Attribution:
+perf/claude, round 4. Four other reviewers concurred.)
+
+### Primary recommendation: reusable result packets in parallel_classify_phase
+
+4 of 5 round-4 reviewers (planet/codex, perf/claude, perf/codex,
+arch/codex) independently converged on this with nearly identical
+language. The shape:
+
+- Worker-local reusable result buffer, owned, fixed capacity sized for
+  a typical blob's output
+- Worker fills the buffer, sends ownership through the channel
+- Consumer merges, clears, returns the buffer to a recycle pool
+  (`crossbeam::ArrayQueue<Packet>` or similar)
+- The same ~12 buffers (≈ 2× `decode_threads`) cycle through all ~20K
+  blobs instead of spawning 20K fresh `Vec<i64>` allocations
+
+**Why this attacks the cold-arena cascade directly:** the current code
+allocates a fresh `Vec<i64>` for each blob's classification result and
+drops it after the consumer merges. The allocator scatters these
+small-Vec lifetimes across the arena, growing the `fordblks` reservation
+to ~8-11 GB. A pool bounded at ~12 buffers of ~64 KB each has a touched-
+page footprint of ~3 MB. The current cumulative channel allocation is
+~1.3 GB of Vec churn → pool version is ~3 MB retained. Expected
+`fordblks` reduction: 3-5 GB.
+
+**Specific implementation shape (from perf/codex and arch/codex):**
+make the result type an explicit reusable packet struct, not a generic
+`Vec<i64>`. Something like `IdPacket { ids: Box<[i64; N]>, len: usize }`
+or a slab-backed variable-length packet with fixed capacity. Workers
+fill a packet, send ownership, consumer drains and returns via a
+recycle channel. This is easier to optimize, instrument, and A/B
+against the current code than generic `R: Send` pooling.
+
+**What to watch for:** `R` crossing the thread boundary is the tricky
+part. The packet must be `Send` but the current `parallel_classify_phase`
+signature already handles that. The refactor is localized to the
+worker loop body, the channel send, and the consumer's merge call.
+Estimated ~200-400 LoC plus call-site updates. Planet-safe because
+the pool size is bounded, worker memory is bounded by the packet
+capacity, and the consumer's merge pattern doesn't change.
+
+### Paired fifth option: compact packet payload
+
+Two reviewers (perf/codex and arch/codex) independently proposed this
+as a partner to the packet pool:
+
+- Use `u32` where legal instead of `i64` for IDs that fit (node/way IDs
+  within a 32-bit range — many real datasets)
+- Delta-pack sorted IDs within a blob (classify results are monotonic
+  within a blob because blobs are sorted)
+- Or bucket local IDs/ranges before sending
+
+**Why this is attractive on top of the pool:** smaller per-packet
+capacity means smaller pool footprint (fewer cache lines touched,
+lower memory bandwidth), and monotonic runs compress well. Even at
+small pool sizes this is a measurable win on cache pressure and
+consumer-side merge cost.
+
+**This should be designed into the packet format from the start**, not
+retrofitted. If the packet is opaque (just `Box<[i64; N]>`) the
+compact payload becomes a separate refactor; if the packet type is a
+protocol (`IdPacket { format: Compact | Raw, payload: ... }`) the
+compact path is a drop-in optimization.
+
+### Rejected: revert to per-worker accumulation for dense paths (Option 3)
+
+4 of 5 reviewers rejected this for the dense paths. **The new mechanism
+understanding does NOT rescue per-worker `IdSetDense` accumulation.**
+Per-worker accumulation replaces "cold-page residency cascade" with
+"real live state that scales with result cardinality and chunk spread."
+For dense node/way classify paths, that live state still hits the
+planet-safety concerns from round 1 — it just does so via a different
+mechanism.
+
+The only reviewer dissent (planet/claude) framed Option 3 as a 30-
+minute validation experiment to re-check whether round 1's conclusion
+was wrong under the new mechanism, not as a shipping recommendation.
+If anyone wants to do that experiment: revert one dense-path call
+site (e.g., `extract.rs`'s Pass 1 way classify) back to `parallel_classify_accumulate`,
+add `mallinfo2` print at PASS1 end, measure the `fordblks` delta. If
+`fordblks` drops from ~11 GB to ~1-2 GB, round 1's conclusion needs
+revisiting. Otherwise this option is closed.
+
+### Downgraded: custom arena / bumpalo for PASS1 (original Option 1)
+
+Three reviewers (planet/codex, perf/codex, arch/codex) classified this
+as "a bigger hammer than you need right now" and "a second-line
+implementation strategy for the same basic idea." The reasoning: if
+you build the ownership transfer semantics for moving arena-backed
+buffers safely between workers and the consumer, **you've almost built
+the packet pool already**. Arena-first reintroduces lifetime complexity
+(R crosses the thread boundary, must not borrow from the per-worker
+Bump) without producing anything the pool doesn't also produce.
+
+The one case where arena-first wins is if PASS1 has MANY allocation
+sources beyond the channel Vecs (PrimitiveBlock scratch, string
+tables, decompress buffers) and you want to capture all of them in
+one bump. But that's a much broader refactor affecting read-path code
+that has nothing to do with this bug.
+
+**Keep bumpalo in reserve as a narrower slab allocator for packet
+storage if the pool approach isn't sufficient.** Not as the first
+thing to try.
+
+### Accept the ceiling (Option 4)
+
+Only 2 of 4 reviewers recommended this as a primary path. perf/claude
+framed it as defensible if the operational constraint is loose and the
+planet bench shows the ceiling is actually fit-able with swap. The
+other three said "only later if nothing else works."
+
+This is still a valid choice given:
+- 29% wall improvement is already shipped
+- The production pipeline doesn't use smart extract (tile gen uses
+  ALTW → elivagar → PMTiles; geocoding uses the geocode index)
+- Extract-smart on planet is an ad-hoc user operation, not a recurring
+  automated job
+
+**Take this option if the planet bench from step 0 shows the ceiling
+fits, or if implementation cost of the packet pool exceeds the
+operational pain.**
+
+### Opportunistic: malloc_trim(0) at PASS1/PASS2 boundary
+
+perf/claude flagged this as a cheap partial mitigation we reverted
+prematurely. The round 3 experiment showed `malloc_trim(0)` between
+PASS1 and PASS2 freed ~2 GB of carried-forward arena pages (visible
+as ~2 GB lower peaks in subsequent CLASSIFY and PASS3 phases) at a
+cost of 4.6 seconds wall time. We reverted it because "it costs
+4.6 seconds for benefits that don't address the planet blocker."
+
+With the 29% wall improvement already shipped (254s → 180s), 4.6
+seconds is ~2.5% of total wall, and the 2 GB reclaim is meaningful
+headroom on a 30 GB host. **Worth reconsidering as a shipped partial
+mitigation** — not a fix for the ceiling, but a guaranteed ~2 GB
+cushion at a 2.5% wall cost. Take this if the planet bench shows the
+ceiling is tight-but-fitting and you want a safety margin.
 
 ## What's instrumented now
 

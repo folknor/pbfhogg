@@ -616,25 +616,57 @@ per-iteration allocations remain across the codebase, ordered by impact:
   See [notes/columnar-integration.md](notes/columnar-integration.md).
 
 - [ ] **Smart-extract planet memory blocker — open, well-understood,
-  no current mitigation path.** The 2026-04-10/11 investigation
-  (4 reviewer rounds, 5 commits) shipped a 29% wall improvement on
-  Europe smart extract but did NOT close the memory ceiling. The actual
-  mechanism is a cold-arena-page residency cascade: PASS1's parallel
-  allocator work leaves glibc with ~8-11 GB of fordblks free-list
-  bloat, and subsequent post-PASS1 phases that touch the free-list
-  bring those cold pages into residence (anon RSS climbs by ~6 GB
-  without any glibc-tracked allocation). Pro-rated to planet
-  (~2.6×): peak ~26-28 GB, tight on 30 GB plantasjen but does not
-  OOM in practice. Allocator swap (jemalloc/mimalloc) is NOT being
-  pursued — see TODO.md "Global allocator investigation" entry; prior
-  measurements don't behave as predicted, and Meta has restarted
-  jemalloc development which may change the picture later. Other
-  mitigation candidates (custom arena, pooled buffers, reduced PASS1
-  cumulative allocation) all require structural refactors and none
-  is currently planned. See
-  [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md)
-  for the full investigation summary, mechanism explanation, ruled-out
-  hypotheses, and open mitigation directions.
+  reviewer-refined mitigation menu.** The 2026-04-10/11 investigation
+  (4 reviewer rounds, 6 commits) shipped a 29% wall improvement on
+  Europe smart extract (254s → ~180s) but did NOT close the memory
+  ceiling. The mechanism is a cold-arena-page residency cascade:
+  PASS1's parallel allocator work leaves glibc with ~8-11 GB of
+  fordblks free-list bloat, and subsequent post-PASS1 phases that
+  touch the free-list bring those cold pages into residence (anon
+  RSS climbs by ~6 GB without any glibc-tracked allocation). Pro-
+  rated to planet (~2.6×): peak ~26-28 GB, tight on 30 GB plantasjen.
+  Allocator swap (jemalloc/mimalloc) is OFF the table per prior
+  project experience; revisit if Meta's restarted jemalloc work matures.
+
+  **Before any structural refactor, measure planet first.** The
+  projected ceiling has ~20-30% error bars and we've never benched
+  `brokkr extract --dataset planet --strategy smart`. One bench
+  (~20-30 min exclusive lock) collapses the decision:
+  - Planet peak < 25 GB → ship as-is, ceiling is fine
+  - Planet peak 25-28 GB → accept the ceiling (and optionally add
+    `malloc_trim(0)` at PASS1/PASS2 boundary for ~2 GB headroom at
+    4.6s wall cost)
+  - Planet peak > 28 GB → implement the reusable packet mitigation
+
+  **The reusable packet mitigation** (4 of 5 round-4 reviewers
+  converged): refactor `parallel_classify_phase` to send reusable
+  fixed-capacity result packets through the channel instead of
+  fresh per-blob `Vec<i64>` allocations. Workers fill packet, send
+  ownership, consumer drains and returns via recycle channel. Pool
+  size ~2× decode_threads × ~64 KB ≈ ~3 MB retained footprint vs
+  ~1.3 GB of cumulative Vec churn today. Expected `fordblks`
+  reduction: 3-5 GB. Estimated ~200-400 LoC plus call-site updates.
+
+  **Paired refinement (fifth option proposed by two reviewers
+  independently):** compact the packet payload via `u32` where legal
+  instead of `i64`, delta-packing of sorted IDs, or bucketed local
+  ranges. Monotonic within a blob (sorted PBF guarantee), compresses
+  well. Should be designed into the packet format from the start as
+  an alternate payload mode, not retrofitted.
+
+  **Rejected:** reverting dense paths to per-worker accumulation
+  (replaces cold-page cascade with real live state, still planet-
+  unsafe for the reasons round 1 identified). Custom arena/bumpalo
+  as the primary approach (if you build the cross-thread ownership
+  transfer for arena-backed buffers, you've almost built the packet
+  pool already — arena-first is only worth it as a narrower slab
+  allocator for packets if the pool approach proves insufficient).
+
+  See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md)
+  "Remaining mitigation directions" section for the full reviewer-
+  informed menu, the "measure first" rationale, and the rejected
+  options with reasoning. Implementation gated on the planet bench
+  showing the ceiling actually needs fixing.
 
 **Milestone B: vectorization (after columnar layout stabilizes)**
 

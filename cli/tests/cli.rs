@@ -14,12 +14,26 @@ fn pbfhogg_bin() -> &'static str {
 
 /// Write a minimal valid PBF file using the library API.
 fn write_minimal_pbf(path: &Path) {
+    write_minimal_pbf_impl(path, false);
+}
+
+/// Write a minimal valid PBF with the `Sort.Type_then_ID` header flag set.
+/// Required for `renumber` which rejects unsorted input.
+fn write_minimal_sorted_pbf(path: &Path) {
+    write_minimal_pbf_impl(path, true);
+}
+
+fn write_minimal_pbf_impl(path: &Path, sorted: bool) {
     use pbfhogg::block_builder::{BlockBuilder, HeaderBuilder};
     use pbfhogg::writer::{Compression, PbfWriter};
 
     let file = std::fs::File::create(path).expect("create file");
     let mut writer = PbfWriter::new(file, Compression::default());
-    let header = HeaderBuilder::new().build().expect("build header");
+    let mut hb = HeaderBuilder::new();
+    if sorted {
+        hb = hb.sorted();
+    }
+    let header = hb.build().expect("build header");
     writer.write_header(&header).expect("write header");
 
     let mut bb = BlockBuilder::new();
@@ -129,6 +143,145 @@ fn cli_check() {
         .expect("run pbfhogg check");
 
     assert!(result.status.success(), "check failed: {}", String::from_utf8_lossy(&result.stderr));
+}
+
+// ---------------------------------------------------------------------------
+// Renumber CLI: --mode inmem | external
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cli_renumber_default_is_inmem() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_minimal_sorted_pbf(&input);
+
+    let result = Command::new(pbfhogg_bin())
+        .args([
+            "renumber",
+            input.to_str().expect("path"),
+            "-o", output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run pbfhogg renumber");
+
+    assert!(result.status.success(), "renumber failed: {}", String::from_utf8_lossy(&result.stderr));
+    assert!(output.exists(), "output file should exist");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("Renumbered") && stderr.contains("2 nodes") && stderr.contains("1 ways"),
+        "expected element count summary, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_renumber_mode_external() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_minimal_sorted_pbf(&input);
+
+    let result = Command::new(pbfhogg_bin())
+        .args([
+            "renumber",
+            "--mode", "external",
+            input.to_str().expect("path"),
+            "-o", output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run pbfhogg renumber --mode external");
+
+    assert!(
+        result.status.success(),
+        "renumber --mode external failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(output.exists(), "output file should exist");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("Renumbered") && stderr.contains("2 nodes") && stderr.contains("1 ways"),
+        "expected element count summary, got: {stderr}"
+    );
+}
+
+#[test]
+fn cli_renumber_mode_external_custom_start_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_minimal_sorted_pbf(&input);
+
+    let result = Command::new(pbfhogg_bin())
+        .args([
+            "renumber",
+            "--mode", "external",
+            "-s", "1000,5000,9000",
+            input.to_str().expect("path"),
+            "-o", output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run pbfhogg renumber --mode external -s ...");
+
+    assert!(
+        result.status.success(),
+        "renumber --mode external with custom start_id failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+
+    // Verify the output by reading it back and checking the first node's id
+    // is the requested start_node_id.
+    use pbfhogg::{BlobDecode, BlobReader, Element};
+    let reader = BlobReader::from_path(&output).expect("open output");
+    let mut first_node_id: Option<i64> = None;
+    for blob in reader {
+        let blob = blob.expect("read blob");
+        if let BlobDecode::OsmData(block) = blob.decode().expect("decode") {
+            for element in block.elements() {
+                match element {
+                    Element::DenseNode(dn) => {
+                        first_node_id = Some(dn.id());
+                        break;
+                    }
+                    Element::Node(n) => {
+                        first_node_id = Some(n.id());
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if first_node_id.is_some() { break; }
+    }
+    assert_eq!(first_node_id, Some(1000), "first node id should be start_node_id=1000");
+}
+
+#[test]
+fn cli_renumber_mode_invalid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_minimal_sorted_pbf(&input);
+
+    let result = Command::new(pbfhogg_bin())
+        .args([
+            "renumber",
+            "--mode", "bogus",
+            input.to_str().expect("path"),
+            "-o", output.to_str().expect("path"),
+        ])
+        .output()
+        .expect("run pbfhogg renumber --mode bogus");
+
+    assert!(!result.status.success(), "invalid --mode should be rejected");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("inmem") && stderr.contains("external"),
+        "error should list valid modes, got: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -328,25 +328,11 @@ pub fn renumber_external(
         build_kind_blob_schedule(input, crate::blob_index::ElemKind::Node)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
-    // Balance workers by node count: find the blob index where
-    // cumulative_count first exceeds half the total.
-    let pass1_split_idx = {
-        let half = pass1_total_nodes / 2;
-        let mut running = 0u64;
-        let mut split = pass1_schedule.len();
-        for (i, task) in pass1_schedule.iter().enumerate() {
-            running += task.element_count;
-            if running >= half {
-                split = i + 1;
-                break;
-            }
-        }
-        split.min(pass1_schedule.len())
-    };
-
-    // Per-worker node_map bucket shards. Each shard gets a distinct
-    // name so the files don't collide; stage 2b reads them as a
-    // concatenated sorted run via the multi-shard slice pattern.
+    // Per-worker node_map bucket shards. Workers pull blobs from a
+    // shared FIFO queue (work-stealing), so each shard's per-bucket
+    // old_ids are still internally sorted (dispatcher FIFO + sorted
+    // input) but the two shards interleave in id space. Stage 2b's
+    // `load_old_id_bucket_shards` concatenates then radix-sorts.
     let mut node_map_shard_a = BucketWriters::create(&scratch, "node-map-a")?;
     let mut node_map_shard_b = BucketWriters::create(&scratch, "node-map-b")?;
 
@@ -360,7 +346,6 @@ pub fn renumber_external(
 
     pass1_parallel_scan(
         &pass1_schedule,
-        pass1_split_idx,
         opts.start_node_id,
         &shared_file,
         &mut node_map_shard_a,
@@ -895,6 +880,47 @@ const RADIX_PASSES: usize = 5;
 /// end of each pass. `RADIX_PASSES` is even → no final swap needed
 /// beyond the per-pass swaps... actually 5 is odd, so after 5 swaps
 /// the data is in `scratch` and we do one final swap. Handled below.
+/// LSD radix sort a `Vec<i64>` of non-negative old_ids in ascending order.
+/// Used by stage 2b on the combined node_map shard output: each shard
+/// is internally sorted but work-stealing pass 1 interleaves shard A
+/// and shard B ids in the global id space, so the concat needs one
+/// full sort pass before the two-cursor merge-join can run.
+///
+/// Same 5×8-bit pass shape as `radix_sort_coo_pairs` — 40 bits of key
+/// coverage, comfortably more than the ~37 bits current OSM node ids
+/// need.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn radix_sort_ids(ids: &mut Vec<i64>, scratch: &mut Vec<i64>) {
+    let n = ids.len();
+    if n < 2 {
+        return;
+    }
+    scratch.clear();
+    scratch.resize(n, 0);
+
+    for pass in 0..RADIX_PASSES {
+        let shift = pass * 8;
+        let mut counts = [0u32; 256];
+        for &id in ids.iter() {
+            let byte = ((id as u64 >> shift) & 0xff) as usize;
+            counts[byte] += 1;
+        }
+        let mut total: u32 = 0;
+        for c in &mut counts {
+            let saved = *c;
+            *c = total;
+            total = total.saturating_add(saved);
+        }
+        for &id in ids.iter() {
+            let byte = ((id as u64 >> shift) & 0xff) as usize;
+            let dst = counts[byte] as usize;
+            scratch[dst] = id;
+            counts[byte] += 1;
+        }
+        std::mem::swap(ids, scratch);
+    }
+}
+
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn radix_sort_coo_pairs(pairs: &mut Vec<CooPair>, scratch: &mut Vec<CooPair>) {
     let n = pairs.len();
@@ -1090,6 +1116,12 @@ struct Stage2bScratch {
     way_refs_data: Vec<u8>,
     way_refs_scratch: Vec<CooPair>,
     node_map: Vec<i64>,
+    /// Reusable scratch buffer for the node_map radix sort. Sized to
+    /// match `node_map.len()` each bucket — with the work-stealing
+    /// pass 1, `node_map` is the interleaved concatenation of multiple
+    /// internally-sorted shards and must be re-sorted before the
+    /// merge-join runs.
+    node_map_scratch: Vec<i64>,
     node_map_data: Vec<u8>,
     entry_buf: [u8; RESOLVED_ENTRY_SIZE],
 }
@@ -1101,6 +1133,7 @@ impl Stage2bScratch {
             way_refs_data: Vec::new(),
             way_refs_scratch: Vec::new(),
             node_map: Vec::new(),
+            node_map_scratch: Vec::new(),
             node_map_data: Vec::new(),
             entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
         }
@@ -1141,12 +1174,13 @@ fn stage2b_process_bucket(
     // LSD radix sort by old_node_id — see `radix_sort_coo_pairs`.
     radix_sort_coo_pairs(&mut scratch.way_refs, &mut scratch.way_refs_scratch);
 
-    // node_map is already sorted by old_id because pass 1 scans a
-    // sorted input and emits in file order, and `id_bucket` is
-    // monotonic in the input id. When pass 1 is parallel, multiple
-    // shards are read in order: shard 0 holds all ids from the first
-    // half of node blobs (all less than shard 1's ids), so
-    // concatenating the shards yields a single sorted run.
+    // Load combined old_ids from every node_map shard. Each individual
+    // shard is internally sorted (work-stealing pass 1 pulls blobs in
+    // FIFO order, and within each blob old_ids are sorted), but two
+    // shards processed by different workers interleave in id space,
+    // so the concatenation must be re-sorted before the two-cursor
+    // merge-join runs. Radix sort is linear and matches what stage 2b
+    // already does on the way_refs side.
     scratch.node_map.clear();
     load_old_id_bucket_shards(
         node_map_shards,
@@ -1154,6 +1188,7 @@ fn stage2b_process_bucket(
         &mut scratch.node_map_data,
         &mut scratch.node_map,
     )?;
+    radix_sort_ids(&mut scratch.node_map, &mut scratch.node_map_scratch);
 
     let bucket_base = bucket_new_id_starts[bucket_idx];
 
@@ -1695,61 +1730,63 @@ fn stage2d_parallel_way_assembly(
         .into());
     }
 
-    let total_ways: u64 = schedule.iter().map(|t| t.element_count).sum();
-    // Sanity check: ensure total_ways would fit as an i64 offset.
-    // We only need the value to validate overflow, not to carry out.
-    i64::try_from(total_ways).map_err(|_| "planet way count > i64")?;
-
     if schedule.is_empty() {
         return Ok(());
     }
 
-    // Balance workers by way count (not blob count) for load balance.
-    let split_idx = {
-        let half = total_ways / 2;
-        let mut running = 0u64;
-        let mut split = schedule.len();
-        for (i, task) in schedule.iter().enumerate() {
-            running += task.element_count;
-            if running >= half {
-                split = i + 1;
-                break;
-            }
-        }
-        split.min(schedule.len())
-    };
-
-    let a_element_count: u64 = schedule[..split_idx].iter().map(|t| t.element_count).sum();
-    let a_start_way_id = start_way_id;
-    let b_start_way_id = start_way_id
-        .checked_add(
-            i64::try_from(a_element_count).map_err(|_| "stage 2d worker A count overflow")?,
-        )
-        .ok_or("stage 2d worker B base way_id overflow")?;
+    // Pre-compute per-blob base way_id (prefix sum, same pattern as
+    // pass 1). Workers pull blobs from a shared FIFO queue and look
+    // up `base_way_ids[task.seq]` instead of maintaining a worker-
+    // local counter — they can process tasks in any order.
+    let total_ways: u64 = schedule.iter().map(|t| t.element_count).sum();
+    i64::try_from(total_ways).map_err(|_| "planet way count > i64")?;
+    let mut base_way_ids: Vec<i64> = Vec::with_capacity(schedule.len());
+    let mut cursor = start_way_id;
+    for task in &schedule {
+        base_way_ids.push(cursor);
+        cursor = cursor
+            .checked_add(
+                i64::try_from(task.element_count)
+                    .map_err(|_| "stage 2d way count > i64 in prefix sum")?,
+            )
+            .ok_or("stage 2d base way_id overflow")?;
+    }
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    let tasks_a = &schedule[..split_idx];
-    let tasks_b = &schedule[split_idx..];
-
     type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+    let schedule_ref = &schedule;
+    let base_ids_ref: &[i64] = &base_way_ids;
+    let slots_ref: &[u64] = &blob_slot_starts;
 
     std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher thread
+        scope.spawn(move || {
+            for task in schedule_ref {
+                if desc_tx.send(task).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Worker A
+        let rx_a = std::sync::Arc::clone(&desc_rx);
         let file_a = std::sync::Arc::clone(&shared_file);
         let mmap_a = std::sync::Arc::clone(&new_refs_mmap);
-        let slots_a = &blob_slot_starts;
         let tx_a = decoded_tx.clone();
         scope.spawn(move || {
             stage2d_worker(
-                tasks_a,
-                a_start_way_id,
+                &rx_a,
+                base_ids_ref,
                 &file_a,
                 &mmap_a,
-                slots_a,
+                slots_ref,
                 total_slots,
                 way_map_shard_a,
                 ways_written,
@@ -1757,17 +1794,18 @@ fn stage2d_parallel_way_assembly(
             );
         });
 
+        // Worker B
+        let rx_b = std::sync::Arc::clone(&desc_rx);
         let file_b = std::sync::Arc::clone(&shared_file);
         let mmap_b = std::sync::Arc::clone(&new_refs_mmap);
-        let slots_b = &blob_slot_starts;
         let tx_b = decoded_tx.clone();
         scope.spawn(move || {
             stage2d_worker(
-                tasks_b,
-                b_start_way_id,
+                &rx_b,
+                base_ids_ref,
                 &file_b,
                 &mmap_b,
-                slots_b,
+                slots_ref,
                 total_slots,
                 way_map_shard_b,
                 ways_written,
@@ -1776,6 +1814,7 @@ fn stage2d_parallel_way_assembly(
         });
 
         drop(decoded_tx);
+        drop(desc_rx);
 
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             std::result::Result<Vec<OwnedBlock>, String>,
@@ -1800,16 +1839,16 @@ fn stage2d_parallel_way_assembly(
     Ok(())
 }
 
-/// Stage 2d per-worker loop. Processes tasks in range order, owns a
-/// BlockBuilder and output Vec<OwnedBlock>, and emits one owned-block
-/// batch per blob through the channel. Looks up the ref_count_sidecar-
-/// derived `slot_cursor` for each blob from the shared `blob_slot_starts`
-/// slice so per-blob alignment stays deterministic regardless of the
-/// parallel dispatch order.
+/// Stage 2d per-worker loop. Claims blobs from a shared FIFO queue
+/// and emits one owned-block batch per blob through the channel.
+/// Looks up each blob's slot_cursor from the shared `blob_slot_starts`
+/// (sidecar prefix sums) and its base_way_id from the pre-computed
+/// prefix-sum array, so per-blob alignment is deterministic regardless
+/// of dispatch order — same work-stealing shape as pass 1.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage2d_worker(
-    tasks: &[BlobTask],
-    worker_start_way_id: i64,
+    rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
+    base_way_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
     new_refs_mmap: &std::sync::Arc<memmap2::Mmap>,
     blob_slot_starts: &[u64],
@@ -1826,10 +1865,19 @@ fn stage2d_worker(
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
-    let mut current_way_id = worker_start_way_id;
 
-    for task in tasks {
-        let base_way_id = current_way_id;
+    loop {
+        let task = {
+            let guard = rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.recv() {
+                Ok(t) => t,
+                Err(_) => break,
+            }
+        };
+
+        let base_way_id = base_way_ids[task.seq];
         let expected_slot_start = blob_slot_starts[task.seq];
         let expected_slot_end = blob_slot_starts
             .get(task.seq + 1)
@@ -1906,14 +1954,15 @@ fn stage2d_worker(
 
             flush_local(&mut local_bb, &mut output_blocks)?;
 
-            // Worker-side way id counter advances by actual decoded
-            // count (robust to minor indexdata inaccuracy).
-            current_way_id = current_way_id
-                .checked_add(
-                    i64::try_from(blob_way_count)
-                        .map_err(|_| "blob way count > i64".to_string())?,
-                )
-                .ok_or_else(|| "way id overflow in stage 2d".to_string())?;
+            // Sanity-check decoded count against indexdata so a
+            // mismatch surfaces immediately instead of collapsing the
+            // new_id space between neighboring blobs.
+            if blob_way_count != task.element_count {
+                return Err(format!(
+                    "stage 2d blob {} decoded {} ways, indexdata said {}",
+                    task.seq, blob_way_count, task.element_count
+                ));
+            }
 
             ways_written.fetch_add(blob_way_count, std::sync::atomic::Ordering::Relaxed);
 
@@ -1931,7 +1980,7 @@ fn stage2d_worker(
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1: parallel node scan — worker pool with range-based dispatch
+// Pass 1: parallel node scan — worker pool with work-stealing dispatch
 // ---------------------------------------------------------------------------
 
 /// Per-blob task for the parallel pass pool. `seq` is the filtered-index
@@ -1989,35 +2038,41 @@ fn build_kind_blob_schedule(
     Ok(schedule)
 }
 
-/// Two-worker parallel pass 1. Worker A processes blobs `0..split_idx`,
-/// worker B processes `split_idx..`, both in monotonic file order.
-/// Range-based (not work-stealing) dispatch preserves the per-shard
-/// invariant that stage 2b relies on: each shard's bucket N contains
-/// old_ids in strictly ascending order, AND shard A's old_ids are
-/// disjoint from (and all less than) shard B's old_ids for any given
-/// bucket. Together the two shards read as a concatenated sorted run.
+/// Two-worker parallel pass 1 via **work-stealing** dispatch.
 ///
-/// Each worker owns: its node_map bucket shard (`&mut BucketWriters`),
-/// a `BlockBuilder`, read_buf + decompress_buf scratch Vecs, an
-/// `output_blocks: Vec<OwnedBlock>` staging buffer, and its own
-/// nodes-written counter. All allocations stay worker-local — no
-/// cross-thread malloc/free churn. PrimitiveBlocks drop on the worker
-/// thread. Only `Vec<OwnedBlock>` (owned by the output-buffer Vec)
-/// crosses the channel, bounded at ~32 items in flight.
+/// Both workers pull blob tasks from a shared `Arc<Mutex<Receiver>>`
+/// queue fed in monotonic file order by a dispatcher thread. This is a
+/// deliberate departure from the original range-based split: range
+/// splitting produced disjoint seq ranges `[0..split)` and
+/// `[split..n)` which could *never* be interleaved in a single
+/// `ReorderBuffer`, so the buffer accumulated worker B's entire
+/// backlog (up to ~200k `Vec<OwnedBlock>`s at ~400 KB each = ~80 GB)
+/// while worker A's range drained. Measured on planet as linear
+/// ~118 MB/s anon-RSS growth, OOM-kill at 26 GB by t=295 s — see
+/// commits `9695ad5` / `e7219f0` and `notes/renumber-planet-scale.md`
+/// "Pass 1 memory blowup" for the full forensic.
 ///
-/// The main thread consumes `(seq, Result<Vec<OwnedBlock>>)` from a
-/// bounded mpsc channel and uses a `ReorderBuffer` to deliver blocks
-/// in file order to the writer via `write_primitive_block_owned`.
+/// Work-stealing keeps the reorder-buffer gap bounded by
+/// `num_workers × channel_capacity` ≈ O(64) slots instead of
+/// O(schedule_len / 2). Each worker still owns its own `node_map`
+/// bucket shard (no cross-worker contention on BucketWriters) but the
+/// shard is no longer disjoint-and-less-than its sibling — the two
+/// shards interleave in id space. Stage 2b's
+/// `load_old_id_bucket_shards` compensates by concatenating then
+/// radix-sorting the combined old_id list, mirroring how stage 2b
+/// already sorts the `way_refs` side.
 ///
-/// The for_each_block_pipelined path was attempted first and OOMed at
-/// 26 GB anon RSS on planet — cross-thread PrimitiveBlock retention via
-/// glibc arena accumulation, exactly as notes/parallel-classify-
-/// regression.md predicted. This pattern avoids that by keeping the
-/// PrimitiveBlock lifecycle entirely worker-local.
+/// Each worker owns: its node_map bucket shard, a local
+/// `BlockBuilder`, read_buf + decompress_buf scratch Vecs, and an
+/// `output_blocks: Vec<OwnedBlock>` staging buffer. All allocations
+/// stay worker-local — PrimitiveBlocks drop on the worker thread,
+/// only `Vec<OwnedBlock>` crosses the channel bounded at ~32 items.
+/// The per-blob starting `new_id` is pre-computed in a prefix-sum
+/// array so workers can process any blob out of FIFO order and still
+/// know which `new_id` slice to assign.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_parallel_scan(
     schedule: &[BlobTask],
-    split_idx: usize,
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
     node_map_shard_a: &mut BucketWriters,
@@ -2029,31 +2084,47 @@ fn pass1_parallel_scan(
         return Ok(());
     }
 
-    // Compute each worker's starting new_id. Worker A starts at
-    // `start_node_id`; worker B starts after worker A's slice has
-    // consumed `sum(element_count[0..split_idx])` ids.
-    let a_element_count: u64 = schedule[..split_idx].iter().map(|t| t.element_count).sum();
-    let a_start_new_id = start_node_id;
-    let b_start_new_id = start_node_id
-        .checked_add(
-            i64::try_from(a_element_count).map_err(|_| "pass1 worker A count overflow")?,
-        )
-        .ok_or("pass1 worker B base new_id overflow")?;
-
-    let tasks_a = &schedule[..split_idx];
-    let tasks_b = &schedule[split_idx..];
+    // Pre-compute per-blob base new_id = start + sum(element_count[..seq]).
+    // Workers look up `base_new_ids[task.seq]` instead of maintaining a
+    // sequential counter — they may process tasks in any order.
+    let mut base_new_ids: Vec<i64> = Vec::with_capacity(schedule.len());
+    let mut cursor = start_node_id;
+    for task in schedule {
+        base_new_ids.push(cursor);
+        cursor = cursor
+            .checked_add(
+                i64::try_from(task.element_count)
+                    .map_err(|_| "planet node count > i64 in pass1 prefix sum")?,
+            )
+            .ok_or("pass1 base new_id overflow")?;
+    }
 
     type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+    let base_ids_ref: &[i64] = &base_new_ids;
 
     std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule into the descriptor queue in file
+        // order. Workers compete for items, so each shard receives a
+        // FIFO-monotonic *subset* of the schedule.
+        scope.spawn(move || {
+            for task in schedule {
+                if desc_tx.send(task).is_err() {
+                    break;
+                }
+            }
+        });
+
         // Worker A
+        let rx_a = std::sync::Arc::clone(&desc_rx);
         let file_a = std::sync::Arc::clone(shared_file);
         let tx_a = decoded_tx.clone();
         scope.spawn(move || {
             pass1_worker(
-                tasks_a,
-                a_start_new_id,
+                &rx_a,
+                base_ids_ref,
                 &file_a,
                 node_map_shard_a,
                 nodes_written,
@@ -2062,12 +2133,13 @@ fn pass1_parallel_scan(
         });
 
         // Worker B
+        let rx_b = std::sync::Arc::clone(&desc_rx);
         let file_b = std::sync::Arc::clone(shared_file);
         let tx_b = decoded_tx.clone();
         scope.spawn(move || {
             pass1_worker(
-                tasks_b,
-                b_start_new_id,
+                &rx_b,
+                base_ids_ref,
                 &file_b,
                 node_map_shard_b,
                 nodes_written,
@@ -2076,8 +2148,11 @@ fn pass1_parallel_scan(
         });
 
         drop(decoded_tx);
+        drop(desc_rx);
 
         // Consumer: reorder by `seq` and push OwnedBlocks to writer.
+        // Gap between lowest-pending and highest-pulled is bounded by
+        // (workers × channel_cap) ≈ 64 slots — see module doc comment.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             std::result::Result<Vec<OwnedBlock>, String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
@@ -2096,24 +2171,23 @@ fn pass1_parallel_scan(
             }
         }
 
-        // Each worker owns its own local BlockBuilder — the caller's
-        // `bb` is never touched inside pass 1. Subsequent stages
-        // reuse the caller's `bb` and start fresh, so there's nothing
-        // to flush here.
         Ok(())
     })?;
 
     Ok(())
 }
 
-/// Per-worker loop: processes `tasks` in file order, emits node_map
-/// entries into `shard`, and sends `(seq, Vec<OwnedBlock>)` through
-/// `tx`. The worker owns all its scratch buffers. PrimitiveBlocks are
-/// consumed and dropped inside this function, so no cross-thread
-/// retention of decompressed payloads.
+/// Per-worker loop: claims blobs from a shared FIFO queue, emits
+/// node_map entries into its private `shard`, and sends `(seq,
+/// Vec<OwnedBlock>)` through `tx`. Because multiple workers pull
+/// from the same queue, the per-worker blob subset is still in
+/// ascending file order (dispatcher FIFO + PBF sort), so each
+/// shard's bucket stays internally sorted — but shards interleave
+/// across workers, which stage 2b handles with a concatenate +
+/// radix-sort pass in `load_old_id_bucket_shards`.
 fn pass1_worker(
-    tasks: &[BlobTask],
-    worker_start_new_id: i64,
+    rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
+    base_new_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
     shard: &mut BucketWriters,
     nodes_written: &std::sync::atomic::AtomicU64,
@@ -2126,10 +2200,19 @@ fn pass1_worker(
     let mut local_bb = BlockBuilder::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
-    let mut current_new_id = worker_start_new_id;
 
-    for task in tasks {
-        let base_new_id = current_new_id;
+    loop {
+        let task = {
+            let guard = rx
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match guard.recv() {
+                Ok(t) => t,
+                Err(_) => break,
+            }
+        };
+
+        let base_new_id = base_new_ids[task.seq];
         let result: std::result::Result<Vec<OwnedBlock>, String> = (|| {
             read_buf.resize(task.data_size, 0);
             shared_file
@@ -2153,16 +2236,15 @@ fn pass1_worker(
             )?;
             flush_local(&mut local_bb, &mut output_blocks)?;
 
-            // Advance the worker's new_id cursor by this blob's
-            // actual decoded node count. For indexed PBFs this
-            // matches `task.element_count`; we use the decode count
-            // so we're not dependent on indexdata accuracy.
-            current_new_id = current_new_id
-                .checked_add(
-                    i64::try_from(blob_node_count)
-                        .map_err(|_| "blob node count > i64".to_string())?,
-                )
-                .ok_or_else(|| "node id overflow in pass1".to_string())?;
+            // Sanity-check the decoded count against the pre-computed
+            // prefix sum. A mismatch would silently collide new_ids
+            // between neighboring blobs.
+            if blob_node_count != task.element_count {
+                return Err(format!(
+                    "pass1 blob {} decoded {} nodes, indexdata said {}",
+                    task.seq, blob_node_count, task.element_count
+                ));
+            }
 
             nodes_written.fetch_add(blob_node_count, std::sync::atomic::Ordering::Relaxed);
 

@@ -212,3 +212,31 @@ target = "nvme"
 [plantasjen.datasets.planet.osc.4913]
 file = "planet-20260329-seq4913.osc.gz"
 xxhash = "e75c2eb5e8b98c0ceb66baf70b4c34a2"
+
+[plantasjen.datasets.planet.osc.4914]
+file = "planet-20260411-seq4914.osc.gz"
+xxhash = "94e8338dc50368bdabb555d75d3a89d1"
+
+[plantasjen.datasets.planet.osc.4915]
+file = "planet-20260411-seq4915.osc.gz"
+xxhash = "971a611b319070fb78a2dfc9b3d2a218"
+
+[plantasjen.datasets.planet.osc.4916]
+file = "planet-20260411-seq4916.osc.gz"
+xxhash = "087eff7748722107da50044188ed7119"
+
+[plantasjen.datasets.planet.osc.4917]
+file = "planet-20260411-seq4917.osc.gz"
+xxhash = "420ee081bd2fe778ef886826f8ace1f5"
+
+[plantasjen.datasets.planet.osc.4918]
+file = "planet-20260411-seq4918.osc.gz"
+xxhash = "db91b95b8bbc67286c142722ec5df637"
+
+[plantasjen.datasets.planet.osc.4919]
+file = "planet-20260411-seq4919.osc.gz"
+xxhash = "ee8279ed41e09043c130c2ae7d9d06ed"
+
+[plantasjen.datasets.planet.osc.4920]
+file = "planet-20260411-seq4920.osc.gz"
+xxhash = "92a56b4225b91f6b44150a69fe8e4679"

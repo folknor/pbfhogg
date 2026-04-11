@@ -14,9 +14,7 @@
 
 ---
 
-Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. The full planet (87 GB) processes on a 32 GB machine — every command, bounded memory, no compromises.
-
-Applying a daily diff to the full planet (87 GB, 3.4M changes, 86% rewrite fraction) takes 13 minutes and 1.8 GB of RAM on a 30 GB machine. Enriching the planet with way-node coordinates takes 24 minutes and 17 GB. Building a reverse geocoding index takes 22 minutes and 18 GB. The entire production pipeline runs on normal hardware — no 128 GB server required.
+Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. **The full planet (87 GB, 11.6B elements) processes on a 32 GB machine — every command, bounded memory, no compromises.** See the [Planet scale](#planet-scale) table below for per-command wall time and peak RSS.
 
 Developed on Linux, untested elsewhere. Production-relevant features (O_DIRECT, io_uring) are Linux-only.
 
@@ -32,6 +30,33 @@ Built with LLMs. See [LLM.md](LLM.md).
 - **Configurable compression** — zlib (default), zstd, or none; zlib-rs for fast pure-Rust decompression and compression (no C dependencies)
 - **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale (80 GB+) reads and writes, preventing cache pollution on the host
 - **io_uring writes** — optional `linux-io-uring` feature replaces the synchronous writer thread with io_uring `WriteFixed` and registered buffers for maximum throughput when I/O-bound
+
+## Planet scale
+
+Every pbfhogg CLI command is designed to run on the full planet on normal hardware. Measured on **plantasjen** (AMD Ryzen 9 5900X, 32 GB DDR4, NVMe SSD, Linux 6.18), ~28 GB available memory at run start. Input: 87 GB indexed planet PBF (92 GB raw), 11.6B elements. Peak anon RSS excludes file-backed mmap (kernel-reclaimable page cache), so it represents the actual pressure the process puts on system memory.
+
+Sorted by peak memory — the hardest operations still fit in 32 GB with room to spare.
+
+| Command | Wall | Peak anon RSS | Notes |
+|---------|------|---------------|-------|
+| `cat --type way` (raw passthrough) | 44s | **10 MB** | zero decompression, indexdata blob filter |
+| `getid --invert` | 1m23s | 102 MB | raw-frame passthrough for non-intersecting blobs |
+| `cat` (indexdata generation, passthrough) | 8m17s | ~200 MB ‡ | rewrites BlobHeader without re-compressing |
+| `tags-filter highway=primary` | 52s | 688 MB | two-pass, parallel classify |
+| `getid` | 1m12s | 833 MB | multi-blob ID resolution via indexdata |
+| `check --refs` | 20m54s | 1.73 GB | full referential integrity over 11.6B elements |
+| `apply-changes` (daily diff, buffered+none) | 8m35s | ~1.8 GB ‡ | 3.4M-change daily diff, 86% rewrite fraction |
+| `apply-changes` (daily diff, buffered+zlib) | 12m42s | ~1.8 GB ‡ | same + recompression |
+| `extract --smart` (Europe bbox) | 4m39s | 11.17 GB † | three-pass, multipolygon-complete |
+| `build-geocode-index` | 22m26s | 14.59 GB | reverse geocoding index, S2 cells |
+| `add-locations-to-ways --index-type external` | 24m22s | **16.67 GB** | double-radix permutation, ~112 GB temp disk |
+
+† Single-sample `--bench 1` measurement with Europe bbox. See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md) for the investigation that validated the 32 GB host ceiling. \
+‡ Older runs without sidecar profiler; peak RSS stated from investigation notes.
+
+Not yet measured on planet, all pending tonight's overnight bench suite: `sort`, `inspect`, `getparents`, `extract --simple` / `--complete`, `multi-extract`, `diff`, `diff --format osc`, `merge-changes` (multi-OSC, 7-file range), and fresh sidecar-profiled runs for `cat` indexdata generation and `apply-changes`. `time-filter` stays unmeasured — it needs a history PBF we don't have. `add-locations-to-ways --index-type dense` is expected to thrash on ≤32 GB hosts (~30+ GB mmap working set) — use `external` instead. **`renumber`** is **not currently planet-safe** — the in-memory `FxHashMap` architecture requires ~278 GB at planet scale; a planet-safe external-join replacement is designed in [notes/renumber-planet-scale.md](notes/renumber-planet-scale.md) but not yet implemented.
+
+Full commit hashes, sidecar UUIDs, and phase breakdowns are in [reference/performance.md](reference/performance.md).
 
 ## Usage
 

@@ -37,13 +37,16 @@ pbfhogg commands (every CLI command is a brokkr subcommand):
 - `brokkr build-geocode-index --dataset denmark --hotpath`
 - `brokkr multi-extract --dataset japan --regions 5 --bench` — single-pass multi-extract
 - `brokkr read --bench` — multi-variant read benchmark
+- `brokkr cat --dataset planet --bench` — indexdata-generation passthrough (no `--type` filter). Defaults to `--variant raw` since that's the natural bootstrap input. Supports `--bench`, `--hotpath`, `--alloc`, `--direct-io`; `--io-uring` is parsed but rejected at dispatch. Recorded as `variant="cat"` in results — distinct from `cat-way` / `cat-relation` / `cat-dedupe` which take the filtered full-decode path. See "Indexdata PBFs" below.
+- `brokkr merge-changes --dataset planet --osc-range 4914..4920 --bench` — multi-OSC merge. Expands to every configured `osc.<seq>` in the inclusive range (in ascending order) and passes them as positional args to a single `pbfhogg merge-changes` invocation. Fails fast if any seq in the range isn't in `brokkr.toml`. `--osc-seq` (single-file) is preserved and conflicts with `--osc-range` at the parser level. Range runs land in the results DB with a `+range-LO-HI` variant suffix (e.g. `merge-changes+range-4914-4920`) so `brokkr results --command merge-changes` keeps single-seq and range runs distinguishable.
+- `brokkr diff-snapshots --dataset planet --from base --to 20260411 --bench 1` — diff two point-in-time snapshots of the same dataset. Unlike `brokkr diff` (which runs apply-changes internally and diffs against the merged output, creating blob-level byte-equality that short-circuits most of the decode), `diff-snapshots` compares two **independent** PBFs with zero byte-level overlap — every blob decodes on both sides. Measures the "full decode" cost of diff that `brokkr diff` can't. `--from` and `--to` accept `base` (sentinel for the legacy top-level `[datasets.<region>.pbf.*]` data) or any registered snapshot key. `--format default|osc` picks summary diff or OSC-format output. Single `--variant` (default `indexed`) applied to both sides. Records in results with `variant="diff-snapshots-<from>-to-<to>"` and `meta.from_snapshot` / `meta.to_snapshot` / `meta.format`. Needs a second snapshot registered via `brokkr download ... --as-snapshot <key>` before it can be used on a dataset (see `brokkr download` below). See "Snapshot model" section.
 - `brokkr suite pbfhogg --bench` — full suite
 
 Utility commands (unchanged):
 - `brokkr check [-- args]` — run clippy + tests. Supports `--features`, `--no-default-features`, `--package` / `-p`.
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report + sidecar profile data).
-- `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [-n N] [--top N]` — query/compare benchmark results from SQLite.
+- `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [--dataset D] [--meta K=V ...] [-n N] [--top N]` — query/compare benchmark results from SQLite. `--meta K=V` filters by metadata fields stored in the result row (e.g. `--meta strategy=smart`, `--meta format=osc`, `--meta merged_cache=miss`). Multiple `--meta` filters compose with AND semantics. Rows missing the requested key are silently excluded (so querying for a field that only post-fix runs record won't error on pre-fix rows, it'll just skip them). `--variant` and `--dataset` use substring match; `--meta` uses exact-match on key and value.
 - `brokkr results <UUID> --timeline` — raw JSONL samples (t in fractional seconds). Query flags compose:
   `--summary` (per-phase table), `--fields rss,anon,majflt` (project fields),
   `--where "majflt>0"` (filter), `--every 50` (downsample), `--head N` / `--tail N`,
@@ -55,16 +58,95 @@ Utility commands (unchanged):
 - `brokkr results dirty` — access sidecar data from the most recent run, even if it was OOM-killed or crashed.
   Useful for inspecting memory trajectory of failed runs: `brokkr results dirty --timeline --stat anon`,
   `brokkr results dirty --timeline --fields anon --every 100`.
-- `brokkr download <region> [--osc-seq N]` — download region datasets from Geofabrik.
-  Downloads PBF (if no variant exists), generates indexed PBF, fetches OSC diffs.
-  `--osc-seq N` downloads all missing diffs from last configured seq+1 through N.
-  Planet uses planet.openstreetmap.org replication; everything else uses Geofabrik.
-  Short aliases (denmark, europe, japan) or full paths (europe/france, asia/japan/kanto).
-  Re-running is safe (only writes entries that don't already exist in brokkr.toml).
+- `brokkr download <region> [--osc-seq N] [--as-snapshot <key> | --refresh] [--force]` — download region datasets.
+  - **Primary PBF side (default invocation): no-op once `pbf.raw` is configured**, with an explicit multi-line log message naming the `--refresh` and `--as-snapshot` flags so users understand why nothing was downloaded and what to do if they wanted to refresh. brokkr never silently replaces the primary — rotation is opt-in via `--refresh`.
+  - **OSC side: rolls forward on the primary.** Downloads every missing diff in `max_osc_seq+1..=target_seq`, appends new `[osc.<seq>]` entries to `brokkr.toml`, never overwrites existing ones.
+  - **Indexed PBF: existence-checked, regenerated via `pbfhogg cat` on cache miss.** If `pbf.indexed`'s file is already on disk, SKIP. If absent, runs the passthrough cat path to produce it.
+  - **`--as-snapshot <key>`** registers the download as an **additional snapshot** of an existing dataset, not a refresh of the primary. Writes under `[<host>.datasets.<region>.snapshot.<key>]` in `brokkr.toml` with snapshot-specific filenames. Requires the primary dataset to exist first — errors out if not. The snapshot key must match `[a-zA-Z0-9_-]+` and cannot be `base` (reserved as a CLI sentinel pointing at the legacy top-level data; see "Snapshot model" below). `--osc-seq N` combined with `--as-snapshot K` writes OSC entries into the snapshot's own `[...snapshot.<K>.osc.<seq>]` table, which is consumed by `--snapshot <key>` on apply-changes / merge-changes / diff / diff-osc / tags-filter-osc. Mutually exclusive with `--refresh`.
+  - **`--refresh`** rotates the dataset to a newer upstream snapshot. Archives the existing primary `pbf.*` and `osc.*` entries into a `[snapshot.<key>]` block (key auto-derived from the existing `download_date` if present, else from the existing `pbf.raw` file's mtime, formatted `YYYYMMDD`), then downloads the new PBF and resets the top-level OSC chain. HEAD-checks the upstream `Last-Modified` header against the local state first and no-ops with a log line if upstream isn't newer. `--force` bypasses the HEAD check and rotates anyway — use when the heuristic gets it wrong (mtime touched by rsync, restored from backup, etc.). Collision handling: if the auto-derived archive key already exists under `[snapshot.<key>]`, brokkr errors out and asks the user to clean up the existing block and retry. No override flag — the user fixes the TOML and re-runs. Mutually exclusive with `--as-snapshot`.
+  - Planet uses planet.openstreetmap.org replication; everything else uses Geofabrik.
+  - Short aliases (denmark, europe, japan) or full paths (europe/france, asia/japan/kanto).
 - `brokkr lock` — check if a brokkr command is currently running (PID, duration, I/O stats). Use this to poll long-running benchmarks instead of reading output files. Never compile or run CPU-intensive work while a bench holds the lock.
 - `brokkr clean` — remove scratch temp files and verify output directories.
 - `brokkr history [--command CMD] [--project P] [--failed] [--since DATE] [--slow MS] [-n N] [--all]` — query global command history.
 - `brokkr verify <command> [--dataset name]` — cross-validate against reference tools.
+
+### Default OSC resolver
+
+`--osc-seq` auto-selects only when the table being looked at has **exactly one** `[osc.<seq>]` entry. When there are multiple OSCs, commands that need to pick one (`merge`, `apply-changes`, `diff`, `diff-osc`, `verify merge`, `verify diff`) **error out** with "multiple OSCs configured, pick one" unless `--osc-seq N` is passed explicitly. This matters for overnight bench suites: pin `--osc-seq` explicitly on every OSC-consuming command once a dataset (or a snapshot within it) has more than one diff configured, otherwise the command refuses to run. The resolver applies to both the top-level primary OSC table and snapshot-scoped OSC tables reached via `--snapshot <key>` — same ergonomics, the lookup is just scoped under a different parent.
+
+### Snapshot model
+
+A dataset can have one **primary** PBF plus any number of named **snapshots**. Primary lives at the top level of the dataset's TOML block — `[datasets.<region>.pbf.*]` and `[datasets.<region>.osc.*]`. Snapshots live under `[datasets.<region>.snapshot.<key>.*]`, each with its own `pbf` and optional `osc` tables. Primary is what every command reads by default; snapshots are addressable via `--snapshot <key>` on `apply-changes`, `merge-changes`, `tags-filter-osc`, `diff`, and `diff-osc`, or as `--from` / `--to` on `diff-snapshots`. Commands that currently have no snapshot-aware surface (`extract`, `add-locations-to-ways`, `build-geocode-index`, `merge`, `sort`, `renumber`, etc.) always read the primary — they don't need snapshot awareness today, and adding it is a followup if a concrete use case surfaces.
+
+```toml
+# Primary — read by default by every command; every command with `--snapshot base`
+[plantasjen.datasets.planet.pbf.raw]
+file = "planet-20260223.osm.pbf"
+seq = 4704
+
+[plantasjen.datasets.planet.pbf.indexed]
+file = "planet-20260223-with-indexdata.osm.pbf"
+
+[plantasjen.datasets.planet.osc.4913]
+file = "planet-20260329-seq4913.osc.gz"
+# ... [osc.4914] ... [osc.4920]
+
+# Additional snapshot, registered via `brokkr download planet --as-snapshot 20260411`
+[plantasjen.datasets.planet.snapshot.20260411]
+download_date = "2026-04-11"
+
+[plantasjen.datasets.planet.snapshot.20260411.pbf.raw]
+file = "planet-20260411.osm.pbf"
+seq = 4921
+
+[plantasjen.datasets.planet.snapshot.20260411.pbf.indexed]
+file = "planet-20260411-with-indexdata.osm.pbf"
+
+# Consumed by apply-changes / merge-changes / diff / diff-osc / tags-filter-osc
+# when invoked with `--snapshot 20260411`
+[plantasjen.datasets.planet.snapshot.20260411.osc.4922]
+file = "planet-20260412-seq4922.osc.gz"
+```
+
+**The `base` sentinel.** `brokkr diff-snapshots --from <ref> --to <ref>` accepts either a snapshot key or the literal `base`. `base` resolves to the dataset's primary (top-level) data — that is, the legacy single-PBF-with-rolling-OSCs shape that every existing dataset already has. This is a CLI-layer alias so diff-snapshots can reference both old and new data without migration. The name `base` is reserved: `brokkr download <region> --as-snapshot base` is rejected by the CLI validator (`'base' is a reserved snapshot name`), and snapshot keys must match `[a-zA-Z0-9_-]+`.
+
+Examples:
+- `brokkr diff-snapshots --dataset planet --from base --to 20260411 --bench 1` — diff the original frozen planet against a newly-registered snapshot. The archetypal "two real independent snapshots" benchmark.
+- `brokkr diff-snapshots --dataset planet --from 20260411 --to 20260418 --format osc --bench 1` — diff two weekly snapshots, output OSC format. Requires both to be registered.
+- `brokkr apply-changes --dataset planet --snapshot 20260411 --osc-seq 4922 --bench 1` — run the apply-changes benchmark against a historical snapshot's state rather than the primary. Produces a result row with `variant="apply-changes+snap-20260411"` and `meta.snapshot="20260411"`.
+- `brokkr results --variant snap-20260411 -n 20` — list every command run recorded against snapshot `20260411`, across all subcommands, via the `+snap-<key>` variant suffix.
+
+**Snapshot-scoped commands: `--snapshot <key>`.** `apply-changes`, `merge-changes`, `tags-filter-osc`, `diff`, and `diff-osc` all accept `--snapshot <key>`, which resolves PBF and OSC lookups against `[datasets.<region>.snapshot.<key>.*]` instead of the top-level. `--snapshot base` (or omitting the flag) preserves the default behavior — useful for scripts that parameterize over snapshot keys and want to include the primary without special-casing. Snapshot-scoped bench runs are recorded two ways: the variant column gains a `+snap-<key>` suffix (e.g. `apply-changes+snap-20260411`), and the result metadata records `meta.snapshot = <key>`. Either surface is queryable via `brokkr results --variant snap-20260411` (substring match across commands) or `brokkr results --meta snapshot=20260411` (exact match). The merge benchmark subcommand (`brokkr merge`) does NOT yet accept `--snapshot` — it lives in a legacy non-PbfhoggCommand dispatch path and would need a larger refactor; addressable via `apply-changes --snapshot <key>` as a workaround.
+
+**`brokkr download <region> --refresh`** rotates the primary to a newer upstream snapshot and archives the old primary into a `[snapshot.<key>]` block, populating the snapshot tables automatically. The archive key auto-derives from `download_date` (if present) or the existing `pbf.raw`'s mtime, formatted `YYYYMMDD`. Refresh HEAD-checks upstream `Last-Modified` first and no-ops if upstream isn't newer (`--force` bypasses). After rotation, the archived state is reachable via `brokkr diff-snapshots --from <key> --to base` or `brokkr apply-changes --dataset <region> --snapshot <key> --osc-seq <N>`.
+
+**`brokkr diff-snapshots` vs `brokkr diff`.** Different code paths, different things measured:
+- `brokkr diff` runs `apply-changes` internally via `ensure_merged_pbf`, then diffs against that output. The two PBFs on each side share most blobs at the byte level (apply-changes uses raw-passthrough for non-touched blobs), so pbfhogg's diff can fast-path byte-equal blobs and skip decode on most of the input.
+- `brokkr diff-snapshots` compares two **independent** snapshots (e.g. `planet-20260223` vs `planet-20260411`). Zero blob-level byte equality because each weekly planet dump re-encodes from scratch. Every blob decodes on both sides. Different working set, different peak memory, different wall time profile — measures the "full decode" cost of diff that `brokkr diff` can't surface.
+
+Both are valid benchmarks and the README Planet scale table should eventually carry both rows.
+
+### diff / diff-osc caching
+
+`brokkr diff` and `brokkr diff-osc` are the only subcommand pair that shares state through scratch. Each invocation calls an internal `ensure_merged_pbf` setup step in `build_pbfhogg_context`: it produces `<pbf-stem>-osc<seq>-bench-merged.osm.pbf` in scratch, either by running apply-changes on cache miss or by reusing an existing file on cache hit. The cache key includes the OSC seq, so runs with different `--osc-seq` values cache independently.
+
+Key semantics (matters when reading bench numbers and designing overnight suites):
+
+- **Recorded `elapsed_ms` is cache-state-independent.** `ensure_merged_pbf` runs **before** the harness starts its per-iteration timer (`harness.rs:206`). So whether the cache was hit or missed, the `elapsed_ms` stored in `results.db` reflects only the diff work itself, never the apply-changes setup cost. For README Planet scale table numbers and regression queries, the recorded measurement doesn't depend on prior cache state.
+- **Total brokkr-invocation wall DOES depend on cache state.** If you're timing `brokkr diff ...` from outside its harness (wall-clock measurement of the whole command), that number includes the setup cost on cache miss but not on cache hit. Only relevant when timing brokkr externally.
+- **`brokkr merge` is completely independent** of `brokkr diff` / `diff-osc`. Merge writes to a different filename (`bench-merge-output.osm.pbf`), deletes it on exit, shares no state with diff's cache. Running merge before diff does NOT populate diff's cache.
+
+Cache rebuild policy:
+
+- **Measured modes (`--bench`, `--hotpath`, `--alloc`) rebuild the cache by default.** This keeps the total brokkr wall deterministic in measured-mode invocations (useful for anyone timing brokkr externally), even though it doesn't affect the recorded `elapsed_ms`.
+- **Run mode (no measurement flag) reuses the cache** for dev-loop speed.
+- **`--keep-cache`** on `diff` / `diff-osc` opts measured modes back into cache reuse. Useful when running `diff` and `diff-osc` back-to-back on the same `--osc-seq`: the second invocation reuses the cache from the first, saving ~10 min of duplicate apply-changes on planet. Because recorded `elapsed_ms` is cache-state-independent, this costs nothing for the bench numbers. **Planet overnight uses `--keep-cache` on both diff and diff-osc for this reason.**
+- **`brokkr clean` wipes the cache** — it lives in scratch.
+
+Telemetry:
+
+- Result metadata records `meta.merged_cache = hit|miss` and `meta.merged_cache_age_s` (on hit). `brokkr results <uuid>` shows both. `brokkr results --command diff` queries can filter by cache state for post-hoc auditing. Hit/miss log lines at invocation time also include the cached file's age; the miss path times the apply-changes setup and logs the elapsed.
 
 ### brokkr.toml
 
@@ -77,7 +159,7 @@ scratch = "data/scratch"
 
 [plantasjen.datasets.denmark]
 origin = "Geofabrik"
-download_date = "2026-02-20"
+download_date = "2026-02-20"   # purely informational — not functionally read by any brokkr code
 bbox = "8.0,54.5,13.0,58.0"
 
 [plantasjen.datasets.denmark.pbf.indexed]
@@ -92,13 +174,21 @@ seq = 4704
 [plantasjen.datasets.denmark.osc.4705]
 file = "denmark-4705.osc.gz"
 xxhash = "fa581f7b..."
+
+# Datasets can accumulate OSC entries over time as `brokkr download` rolls forward.
+# Planet after downloading 4913..4920 looks like:
+[plantasjen.datasets.planet.osc.4913]
+file = "planet-20260329-seq4913.osc.gz"
+# [osc.4914] ... [osc.4920] also present (omitted for brevity)
 ```
 
-- `pbf.<variant>` — PBF files keyed by variant name. `--variant` selects (default: `indexed`).
-- `osc.<seq>` — OSC diff files keyed by sequence number. `--osc-seq` selects.
+- `pbf.<variant>` — PBF files keyed by variant name. `--variant` selects (default: `indexed`). Variants are *transforms* of the same underlying snapshot (raw / indexed / altw / locations), not different point-in-time captures.
+- `osc.<seq>` — OSC diff files keyed by sequence number. `--osc-seq` selects. A dataset can have many OSCs configured; see "Default OSC resolver" above.
+- `snapshot.<key>` — named point-in-time captures of the same dataset. Each snapshot has its own `pbf.<variant>` / `osc.<seq>` tables. Consumed by `diff-snapshots` (via `--from` / `--to`) and by `apply-changes`, `merge-changes`, `tags-filter-osc`, `diff`, `diff-osc` (via `--snapshot <key>`). The legacy top-level data is implicitly snapshot `base` (reserved name). Snapshot keys must match `[a-zA-Z0-9_-]+`. Populated by `brokkr download <region> --as-snapshot <key>` (manual registration) or `brokkr download <region> --refresh` (auto-archive during primary rotation). See "Snapshot model" above for the full schema, usage semantics, and the `meta.snapshot` / `+snap-<key>` result-column surface.
+- `download_date` — human annotation only. No code path reads or writes it; it's round-tripped by the parser and otherwise ignored.
 - `xxhash` — XXH128 file hash. Run `brokkr env` to see computed values.
 
-Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git — stage it with your next commit when modified). `--runs N` repeats each benchmark N times but only stores the best (minimum) result. Default is 3 runs. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored). **`--force` is a top-level flag before the subcommand**, e.g. `brokkr bench --force commands add-locations-to-ways`, NOT `brokkr bench commands add-locations-to-ways --force`.
+Benchmark results stored in `.brokkr/results.db` (SQLite, tracked in git — stage it with your next commit when modified). `--bench` accepts an optional run count: `--bench N` runs the command N times and stores only the best (minimum) result. Default is `--bench 3`. Bench and hotpath commands require a clean git tree (ignoring `*.md` and `.brokkr/results.db`); use `--force` to run anyway (results will not be stored). **`--force` is a top-level flag before the subcommand**, e.g. `brokkr bench --force commands add-locations-to-ways`, NOT `brokkr bench commands add-locations-to-ways --force`.
 
 ## Scripts
 
@@ -106,11 +196,16 @@ No shell scripts remain. All development tooling is in `brokkr`.
 
 ## Indexdata PBFs
 
-To generate a PBF with blob-level indexdata, use `cat`:
+Indexed PBFs are generated automatically by `brokkr download` (see above): after the raw PBF lands, the download path runs the passthrough cat step via the `pbfhogg cat` binary and writes the result into `pbf.indexed`'s configured file. No manual step is needed as part of the normal download workflow.
+
+To **benchmark** the passthrough cat path on its own (e.g., to measure wall time / peak RSS for the bootstrap step on a specific dataset), use the new `brokkr cat` subcommand:
+
 ```
-brokkr cat input.osm.pbf -o output-with-indexdata.osm.pbf
+brokkr cat --dataset planet --bench 1           # passthrough path, default --variant raw
+brokkr cat --dataset planet --direct-io --bench # O_DIRECT variant
 ```
-The passthrough path (no `--type`) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files. Planet (87 GB): 497s buffered, 520s `--direct-io` (+5% slower); Denmark (461 MB): 2.8s buffered (commit `69a127f`, plantasjen). Buffered wins for sequential single-file passthrough — `--direct-io` only helps with concurrent read/write (merge). The `--type` filtered path also embeds indexdata but does full decode+re-encode (OOMs on planet at 30 GB host).
+
+The passthrough path (no `--type`) adds indexdata via decompress+scan without re-compressing blobs — minimal memory, suitable for planet-scale files. Planet (87 GB): 497s buffered, 520s `--direct-io` (+5% slower); Denmark (461 MB): 2.8s buffered (commit `69a127f`, plantasjen). Buffered wins for sequential single-file passthrough — `--direct-io` only helps with concurrent read/write (merge). The `--type` filtered path (exposed as `brokkr cat-way`, `brokkr cat-relation`, `brokkr cat-dedupe`) also embeds indexdata but does full decode+re-encode (OOMs on planet at 30 GB host).
 
 `apply-changes`, `sort`, `add-locations-to-ways`, `extract` (complete/smart), `tags-filter`, `getid`, `cat --type`, `inspect tags --type`, `inspect --nodes`, and `build-geocode-index` are much faster with indexed PBFs and will error if indexdata is missing. Use `--force` to override the check and run with raw PBFs (slower). `inspect --indexed` checks a PBF and exits 0 (indexed) or 1 (not indexed).
 

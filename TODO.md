@@ -450,10 +450,52 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] Document `renumber` planet-scale limitation — the `FxHashMap<i64, i64>`
-  for node ID mapping requires ~250 GB for 10.4B nodes (24 bytes/entry).
-  Infeasible without a different data structure (e.g., dense array for
-  sequential-assign renumbering, or external sort + streaming rewrite).
+- [ ] **`renumber` planet-scale refactor — design written, implementation pending.**
+  Current `src/commands/renumber.rs` (153 LoC) is a single-pass in-memory
+  implementation with three `FxHashMap<i64, i64>` mappings (`node_map`,
+  `way_map`, `relation_map`). Planet memory math: node_map ~250 GB + way_map
+  ~28 GB + relation_map ~340 MB = **~278 GB total** at 10.4B nodes / 1.17B
+  ways / 14.1M relations × 24 bytes per hashbrown entry. OOM-kills within
+  ~60 seconds of the pass 1 scan on a 32 GB host; not even safe on a 256 GB
+  server.
+
+  Recommended architecture: 3-pass external join modeled after
+  `src/commands/external_join.rs` (the ALTW external-index code), with
+  256-bucket radix partition of node_map/way_map tuple files on disk and
+  in-memory `relation_map` (small enough to stay in RAM). Relation
+  forward-reference handling via a deliberate two-pass relation phase.
+  Estimated work: **~1.5-3 weeks** comparable to the ALTW external
+  development arc. Temp disk footprint ~185 GB at planet scale. Expected
+  planet wall time ~22 min, in the same ballpark as ALTW external
+  (24 min) and build-geocode-index (22 min).
+
+  Full design document with memory math, pass structure, prior-art analogy,
+  gotchas, testing plan, and work breakdown:
+  [notes/renumber-planet-scale.md](notes/renumber-planet-scale.md). Read
+  that and `notes/altw-optimization-history.md` (the prior art) before
+  implementing.
+
+  Pre-implementation tasks (from the design doc's "Open questions" section):
+
+  - [ ] **Read libosmium's renumber source** to see how the reference
+    implementation handles planet-scale. osmium renumber exists and
+    presumably runs on planet; their architecture choice (in-memory?
+    external sort? b-tree on disk? spatial index?) is worth knowing
+    before committing to our own external-join design. Small task —
+    ~1 hour of source reading. Informs but doesn't block implementation:
+    we can proceed with the design-doc architecture even if osmium's
+    approach is different, but understanding "different how, and why"
+    is useful context. Design doc open question #3.
+  - [ ] **Extract `ScratchDir` / `BucketWriters` from
+    `src/commands/external_join.rs`** into a shared module (proposed
+    name `src/external_radix.rs`) so both `external_join` and the new
+    `renumber_external` can depend on it without duplicating ~200 LoC of
+    scaffolding (bucket-file writers with flush-sync-fadvise-close
+    semantics, scratch-dir lifecycle, radix bucket index derivation).
+    Decide up-front: doing it as a standalone refactor now (~0.5 days,
+    no behavior change, verifiable via the existing ALTW test suite)
+    is much easier than retrofitting after duplicating the scaffolding
+    in `renumber_external`. Design doc open question #2.
 
 ### Ecosystem
 

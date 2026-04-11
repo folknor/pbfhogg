@@ -379,10 +379,18 @@ is structural work that the ALTW external code has already de-risked.
    slightly different access pattern.
 2. **Can we share the `ScratchDir` / `BucketWriters` code with
    `external_join.rs` via extraction**, or should we duplicate the
-   scaffolding into `renumber_external.rs`? Probably worth extracting
-   into `src/external_radix.rs` or similar — both commands can share
-   it and any future external-join commands would benefit. Not a
-   blocker, can ship duplicated first and refactor later.
+   scaffolding into `renumber_external.rs`? ✅ **Resolved 2026-04-11** —
+   extracted to `src/commands/external_radix.rs` before implementation
+   started. Contains `ScratchDir` (with a `name` parameter so callers
+   distinguish `external-join` from `renumber-external` scratch dirs),
+   `BucketWriters`, `NUM_BUCKETS`, `BUCKET_BUF_SIZE`, and
+   `advise_dontneed_file`. ALTW payload types (`CooPair`,
+   `ResolvedEntry`, `load_coo_bucket_into`, `MAX_NODE_ID`) stayed in
+   `external_join.rs` since they are join-specific and not shared
+   scaffolding. `renumber_external.rs` will define its own
+   `(old_id, new_id)` pair type and its own id-range partitioning
+   constants. Verified via `brokkr check` + ALTW external-index
+   end-to-end on Denmark.
 3. **How does osmium renumber handle planet?** ✅ **Answered** — see
    "Prior art: osmium renumber" section below. Summary: osmium is
    in-memory-only, explicitly documented as "needs >32 GB RAM for

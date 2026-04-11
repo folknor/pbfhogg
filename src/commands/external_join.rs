@@ -18,13 +18,16 @@
 //! See `notes/altw-partitioned.md` for the full design.
 
 use std::io::{BufWriter, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
 use crate::writer::Compression;
 use crate::{Element, ElementReader, PrimitiveBlock};
 
 use super::add_locations_to_ways::Stats;
+use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
+#[cfg(feature = "linux-direct-io")]
+use super::external_radix::advise_dontneed_file;
 use super::id_set_dense::IdSetDense;
 use super::{
     dense_node_metadata, element_metadata,
@@ -37,15 +40,9 @@ use super::{
 // Constants
 // ---------------------------------------------------------------------------
 
-/// Number of buckets for radix partitioning. 256 = partition by high byte.
-const NUM_BUCKETS: usize = 256;
-
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
 /// 14B gives headroom above the current ~13B maximum.
 const MAX_NODE_ID: u64 = 14_000_000_000;
-
-/// Size of the write buffer per bucket file (256 KB).
-const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
 /// Size of a COO pair on disk: `(node_id: i64, slot_pos: u64)` = 16 bytes.
 const COO_PAIR_SIZE: usize = 16;
@@ -55,102 +52,6 @@ const RESOLVED_ENTRY_SIZE: usize = 16;
 
 /// Size of a coordinate slot: `(lat: i32, lon: i32)` = 8 bytes.
 const COORD_SLOT_SIZE: usize = 8;
-
-// ---------------------------------------------------------------------------
-// Scratch directory management
-// ---------------------------------------------------------------------------
-
-/// Managed scratch directory for bucket files. Cleaned up on drop.
-struct ScratchDir {
-    path: PathBuf,
-}
-
-impl ScratchDir {
-    fn new(parent: &Path) -> Result<Self> {
-        let path = parent.join(format!(".pbfhogg-external-join-{}", std::process::id()));
-        std::fs::create_dir_all(&path).map_err(|e| {
-            format!("failed to create scratch directory {}: {e}", path.display())
-        })?;
-        Ok(Self { path })
-    }
-
-    fn bucket_path(&self, prefix: &str, index: usize) -> PathBuf {
-        self.path.join(format!("{prefix}-{index:03}"))
-    }
-
-    fn file_path(&self, name: &str) -> PathBuf {
-        self.path.join(name)
-    }
-}
-
-impl Drop for ScratchDir {
-    fn drop(&mut self) {
-        // Best-effort cleanup. Ignore errors (crash leaves stale dir, user can clean).
-        drop(std::fs::remove_dir_all(&self.path));
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Bucket writers
-// ---------------------------------------------------------------------------
-
-/// Set of buffered writers for radix bucket files.
-struct BucketWriters {
-    writers: Vec<Option<BufWriter<std::fs::File>>>,
-    paths: Vec<PathBuf>,
-    entry_counts: Vec<u64>,
-}
-
-impl BucketWriters {
-    /// Create bucket files eagerly. Each bucket gets a buffered writer.
-    fn create(scratch: &ScratchDir, prefix: &str) -> Result<Self> {
-        let mut writers = Vec::with_capacity(NUM_BUCKETS);
-        let mut paths = Vec::with_capacity(NUM_BUCKETS);
-        let entry_counts = vec![0u64; NUM_BUCKETS];
-
-        for i in 0..NUM_BUCKETS {
-            let path = scratch.bucket_path(prefix, i);
-            let file = std::fs::File::create(&path)
-                .map_err(|e| format!("failed to create bucket {}: {e}", path.display()))?;
-            writers.push(Some(BufWriter::with_capacity(BUCKET_BUF_SIZE, file)));
-            paths.push(path);
-        }
-
-        Ok(Self { writers, paths, entry_counts })
-    }
-
-    /// Flush, sync, fadvise(DONTNEED), and close all writers.
-    /// sync_data ensures pages are clean so fadvise can evict them.
-    fn finish(&mut self) -> Result<Vec<u64>> {
-        for writer in &mut self.writers {
-            if let Some(w) = writer.as_mut() {
-                w.flush()?;
-                #[cfg(feature = "linux-direct-io")]
-                {
-                    use std::os::unix::io::AsRawFd;
-                    drop(w.get_ref().sync_data());
-                    unsafe {
-                        libc::posix_fadvise(
-                            w.get_ref().as_raw_fd(),
-                            0,
-                            0,
-                            libc::POSIX_FADV_DONTNEED,
-                        )
-                    };
-                }
-            }
-            *writer = None;
-        }
-        Ok(self.entry_counts.clone())
-    }
-
-    /// Delete all bucket files.
-    fn cleanup(&self) {
-        for path in &self.paths {
-            drop(std::fs::remove_file(path));
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // COO pair: (node_id, slot_pos)
@@ -713,13 +614,6 @@ fn stage3_slot_reorder(
 // Stage 4: Assembly — emit enriched PBF
 // ---------------------------------------------------------------------------
 
-/// Advise the kernel to evict a single file's pages from page cache.
-#[cfg(feature = "linux-direct-io")]
-fn advise_dontneed_file(file: &std::fs::File) {
-    use std::os::unix::io::AsRawFd;
-    unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
-}
-
 /// Memory-mapped coord_slots file for zero-syscall coordinate lookup.
 /// Access is sequential (slot_pos advances monotonically during assembly),
 /// so MADV_SEQUENTIAL enables kernel readahead. Replaces the previous
@@ -1177,7 +1071,7 @@ pub fn external_join(
         }
     }
 
-    let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")))?;
+    let scratch_dir = ScratchDir::new(output.parent().unwrap_or(Path::new(".")), "external-join")?;
 
     // --- Stage 1: Way pass ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");

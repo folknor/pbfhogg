@@ -496,16 +496,20 @@ single-pass, tag expression and bbox filtering.
     `command_derive_changes.cpp:184` (raw int64 ID comparison without
     type discrimination — source of the "1243 missing deletes" in our
     README cross-validation section).
-  - [ ] **Extract `ScratchDir` / `BucketWriters` from
-    `src/commands/external_join.rs`** into a shared module (proposed
-    name `src/external_radix.rs`) so both `external_join` and the new
-    `renumber_external` can depend on it without duplicating ~200 LoC of
-    scaffolding (bucket-file writers with flush-sync-fadvise-close
-    semantics, scratch-dir lifecycle, radix bucket index derivation).
-    Decide up-front: doing it as a standalone refactor now (~0.5 days,
-    no behavior change, verifiable via the existing ALTW test suite)
-    is much easier than retrofitting after duplicating the scaffolding
-    in `renumber_external`. Design doc open question #2.
+  - [x] **Extract `ScratchDir` / `BucketWriters` from
+    `src/commands/external_join.rs`** — done 2026-04-11. Moved to
+    `src/commands/external_radix.rs` (not `src/external_radix.rs` as the
+    design doc proposed — kept it alongside the other `commands/` sibling
+    modules). Extracted items: `ScratchDir` (now takes a `name` parameter
+    so `external-join` and `renumber-external` get distinct scratch
+    directories), `BucketWriters`, `NUM_BUCKETS`, `BUCKET_BUF_SIZE`,
+    `advise_dontneed_file`. Fields are `pub(crate)` so both callers can
+    use the same direct-field-access patterns as before. Left in
+    `external_join.rs`: `CooPair`, `ResolvedEntry`, `load_coo_bucket_into`,
+    and `MAX_NODE_ID` — these are ALTW-specific payload types, not shared
+    scaffolding. `brokkr check` passes; `brokkr add-locations-to-ways
+    --index-type external` runs end-to-end on Denmark (10.3s, no missing
+    locations, matches baseline). Resolves design doc open question #2.
 
 ### Ecosystem
 

@@ -289,7 +289,14 @@ pub fn renumber_external(
         relations_written: 0,
     };
 
-    let mut decompress_buf: Vec<u8> = Vec::new();
+    // Decompression buffer recycling: buffers flow from the pool into
+    // each PrimitiveBlock via `from_vec_pooled_with_scratch` and return
+    // to the pool on block drop. Without the pool, `std::mem::take`
+    // would leave the caller's buf empty on every iteration, forcing a
+    // fresh allocation per blob — at planet scale, that's ~27 GB of
+    // cumulative alloc churn across pass 1 + stage 2a + stage 2d +
+    // R1 + R2a + R2d.
+    let pool = crate::blob::DecompressPool::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut pair_buf = [0u8; ID_PAIR_SIZE];
@@ -309,9 +316,10 @@ pub fn renumber_external(
                 continue;
             }
         }
+        let mut decompress_buf = pool.get();
         blob.decompress_into(&mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
         )?;
         for element in block.elements() {
             match &element {
@@ -1132,9 +1140,9 @@ fn stage2d_way_assembly(
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let pool = crate::blob::DecompressPool::new();
     let mut way_blob_idx: usize = 0;
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut pair_buf = [0u8; ID_PAIR_SIZE];
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
@@ -1148,9 +1156,10 @@ fn stage2d_way_assembly(
         shared_file
             .read_exact_at(&mut raw_buf, data_offset)
             .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf, &pool, &mut st_scratch, &mut gr_scratch,
         )?;
 
         for element in block.elements() {
@@ -1294,8 +1303,8 @@ fn relation_r1_assign_ids(
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -1305,9 +1314,11 @@ fn relation_r1_assign_ids(
         shared_file
             .read_exact_at(&mut raw_buf, data_offset)
             .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf),
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf,
+            &pool,
             &mut st_scratch,
             &mut gr_scratch,
         )?;
@@ -1353,8 +1364,8 @@ fn relation_r2a_emit_member_refs(
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
@@ -1368,9 +1379,11 @@ fn relation_r2a_emit_member_refs(
         shared_file
             .read_exact_at(&mut raw_buf, data_offset)
             .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf),
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf,
+            &pool,
             &mut st_scratch,
             &mut gr_scratch,
         )?;
@@ -1460,8 +1473,8 @@ fn relation_r2d_assembly(
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
@@ -1474,9 +1487,11 @@ fn relation_r2d_assembly(
         shared_file
             .read_exact_at(&mut raw_buf, data_offset)
             .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf),
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf,
+            &pool,
             &mut st_scratch,
             &mut gr_scratch,
         )?;

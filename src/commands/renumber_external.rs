@@ -673,28 +673,38 @@ fn compute_bucket_new_id_starts(
 ///   indexdata filter — i.e. `ElemKind::Way` blobs — are counted).
 /// - A trailer `u64 LE` with the total ref count for alignment
 ///   verification. Stage 2d checks the trailer equals `total_slots`.
+/// Parallel stage 2a way-ref COO emission.
+///
+/// Architecture (simpler than pass 1 / stage 2d because `scan_way_refs`
+/// takes raw decompressed bytes — no PrimitiveBlock lifetime to manage):
+///
+/// 1. Pre-scan way blob headers to build the schedule.
+/// 2. Launch N decode workers behind a bounded descriptor channel.
+///    Each worker owns: read_buf, decompress_buf, refs_buf,
+///    group_starts scratch, plus a per-blob output Vec<i64> for the
+///    ref ids it collected. Workers pread + decompress, run
+///    `scan_way_refs`, collect every ref's `old_node_id` into the
+///    per-blob Vec (in slot-order within the blob), and send
+///    `(seq, Vec<i64>)` through an mpsc.
+/// 3. Main thread: `ReorderBuffer` delivers (seq, Vec<i64>) in file
+///    order. For each ref, compute bucket + write to way_ref_buckets
+///    with the current global `slot_pos`, then increment. Write
+///    `blob_ref_count` to the sidecar after each blob.
+///
+/// Cross-thread data per blob: `Vec<i64>` bounded by ~48K entries
+/// (largest real way blob) × 8 bytes = ~384 KB. Bounded channel holds
+/// ~32 items → ~12 MB max in flight. Matches the external_join stage
+/// 4 Vec<OwnedBlock> bounded-transfer pattern that runs planet-scale
+/// without the OOM we saw from for_each_block_pipelined.
 #[hotpath::measure]
+#[allow(clippy::too_many_lines)]
 fn stage2a_way_ref_pass(
     input: &Path,
     _direct_io: bool,
     way_ref_buckets: &mut BucketWriters,
     ref_count_sidecar: &Path,
 ) -> Result<u64> {
-    // Schedule + pread pattern: only way blobs are pulled from disk.
-    // Stage 2d reuses `build_blob_schedule` with the same `ElemKind::Way`
-    // filter so the blob set + order are identical between this pass
-    // and the way-assembly pass — the per-blob ref-count sidecar written
-    // below stays in lockstep with stage 2d's blob iteration.
-    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
-
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut slot_pos: u64 = 0;
-    let mut pair_buf = [0u8; COO_PAIR_SIZE];
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+    let schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
 
     let mut sidecar_writer = BufWriter::with_capacity(
         64 * 1024,
@@ -702,72 +712,155 @@ fn stage2a_way_ref_pass(
             .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
     );
 
-    use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        raw_buf.resize(data_size, 0);
-        shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let blob_start_pos = slot_pos;
-        // The scan_way_refs callback is FnMut, so it can't return Result.
-        // Stash the first error (I/O or negative-id rejection) and bail
-        // after scan returns.
-        let mut scan_err: Option<crate::error::Error> = None;
-        super::way_scanner::scan_way_refs(
-            &decompress_buf,
-            &mut refs_buf,
-            &mut group_starts,
-            |way_id, refs| {
-                if scan_err.is_some() {
-                    return;
+    let mut slot_pos: u64 = 0;
+
+    if schedule.is_empty() {
+        sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
+        sidecar_writer.flush()?;
+        return Ok(slot_pos);
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    // Use (cores - 2) workers to match the external_join pattern, but
+    // cap at a modest number since the main thread is the bottleneck
+    // (it does all the bucket writes).
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(6);
+
+    type ScanItem = (usize, std::result::Result<Vec<i64>, String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (scan_tx, scan_rx) = std::sync::mpsc::sync_channel::<ScanItem>(32);
+
+    let mut pair_buf = [0u8; COO_PAIR_SIZE];
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule into descriptor channel.
+        let schedule_ref = &schedule;
+        scope.spawn(move || {
+            for task in schedule_ref {
+                if desc_tx.send(task).is_err() {
+                    break;
                 }
-                if way_id < 0 {
-                    scan_err = Some(crate::error::new_error(
-                        crate::error::ErrorKind::Io(std::io::Error::other(format!(
-                            "renumber --mode external requires non-negative input ids. \
-                             Input contains way id {way_id}. \
-                             Use --mode inmem for files with negative (editor-local) ids."
-                        ))),
-                    ));
-                    return;
-                }
-                for &old_node_id in refs {
-                    if old_node_id < 0 {
-                        scan_err = Some(crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(format!(
-                                "renumber --mode external requires non-negative input ids. \
-                                 Way {way_id} references negative node id {old_node_id}. \
-                                 Use --mode inmem for files with negative (editor-local) ids."
-                            ))),
-                        ));
-                        return;
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = scan_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::os::unix::fs::FileExt as _;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut refs_buf: Vec<i64> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+                loop {
+                    let task = {
+                        let guard =
+                            rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let result: std::result::Result<Vec<i64>, String> = (|| {
+                        read_buf.resize(task.data_size, 0);
+                        file.read_exact_at(&mut read_buf, task.data_offset)
+                            .map_err(|e| {
+                                format!("pread failed at offset {}: {e}", task.data_offset)
+                            })?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| e.to_string())?;
+
+                        let mut blob_refs: Vec<i64> = Vec::with_capacity(64 * 1024);
+                        let mut scan_err: Option<String> = None;
+                        super::way_scanner::scan_way_refs(
+                            &decompress_buf,
+                            &mut refs_buf,
+                            &mut group_starts,
+                            |way_id, refs| {
+                                if scan_err.is_some() {
+                                    return;
+                                }
+                                if way_id < 0 {
+                                    scan_err = Some(format!(
+                                        "renumber --mode external requires non-negative \
+                                         input ids. Input contains way id {way_id}. \
+                                         Use --mode inmem for files with negative \
+                                         (editor-local) ids."
+                                    ));
+                                    return;
+                                }
+                                for &old_node_id in refs {
+                                    if old_node_id < 0 {
+                                        scan_err = Some(format!(
+                                            "renumber --mode external requires non-negative \
+                                             input ids. Way {way_id} references negative \
+                                             node id {old_node_id}. Use --mode inmem for \
+                                             files with negative (editor-local) ids."
+                                        ));
+                                        return;
+                                    }
+                                    blob_refs.push(old_node_id);
+                                }
+                            },
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if let Some(e) = scan_err {
+                            return Err(e);
+                        }
+                        Ok(blob_refs)
+                    })();
+
+                    if tx.send((task.seq, result)).is_err() {
+                        break;
                     }
-                    let pair = CooPair { old_node_id, slot_pos };
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(scan_tx);
+
+        // Consumer: reorder by seq, emit to buckets in file order.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<Vec<i64>, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        for (seq_num, item) in scan_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let blob_refs = result
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let blob_start_pos = slot_pos;
+                for old_node_id in blob_refs {
+                    let pair = CooPair {
+                        old_node_id,
+                        slot_pos,
+                    };
                     let bucket = node_id_bucket(old_node_id);
                     pair.write_to(&mut pair_buf);
                     if let Some(w) = way_ref_buckets.writers[bucket].as_mut() {
-                        if let Err(e) = w.write_all(&pair_buf) {
-                            scan_err = Some(crate::error::new_error(
-                                crate::error::ErrorKind::Io(e),
-                            ));
-                            return;
-                        }
+                        w.write_all(&pair_buf)?;
                     }
                     way_ref_buckets.entry_counts[bucket] += 1;
                     slot_pos += 1;
                 }
-            },
-        )?;
-        if let Some(e) = scan_err {
-            return Err(e.into());
+                let blob_ref_count = slot_pos - blob_start_pos;
+                sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+            }
         }
-        // Record this blob's ref count in the sidecar.
-        let blob_ref_count = slot_pos - blob_start_pos;
-        sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
-    }
+        Ok(())
+    })?;
 
-    // Trailer: total ref count for alignment verification in stage 2d.
     sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
     sidecar_writer.flush()?;
 

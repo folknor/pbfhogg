@@ -692,24 +692,25 @@ fn emit_old_id(
 #[hotpath::measure]
 fn stage2a_way_ref_pass(
     input: &Path,
-    direct_io: bool,
+    _direct_io: bool,
     way_ref_buckets: &mut BucketWriters,
     ref_count_sidecar: &Path,
 ) -> Result<u64> {
-    // Pipelined reader with blob filter for ways only. Background
-    // pipeline pre-fetches and decompresses way blobs; the consumer
-    // closure on this thread walks ways via block.elements() and emits
-    // COO pairs + per-blob ref counts into the sidecar.
-    //
-    // The previous sequential implementation used `scan_way_refs` for
-    // a refs-only fast path. Switching to `block.elements()` adds some
-    // CPU (string table parse, info metadata parse) but the parallel
-    // decompression win at planet scale more than offsets it.
-    let reader = crate::ElementReader::open(input, direct_io)?
-        .with_blob_filter(crate::BlobFilter::only_ways());
+    // Schedule + pread pattern: only way blobs are pulled from disk.
+    // Stage 2d reuses `build_blob_schedule` with the same `ElemKind::Way`
+    // filter so the blob set + order are identical between this pass
+    // and the way-assembly pass — the per-blob ref-count sidecar written
+    // below stays in lockstep with stage 2d's blob iteration.
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
     let mut slot_pos: u64 = 0;
     let mut pair_buf = [0u8; COO_PAIR_SIZE];
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     let mut sidecar_writer = BufWriter::with_capacity(
         64 * 1024,
@@ -717,61 +718,76 @@ fn stage2a_way_ref_pass(
             .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
     );
 
-    reader
-        .for_each_block_pipelined(|block: crate::PrimitiveBlock| -> crate::error::Result<()> {
-            let blob_start_pos = slot_pos;
-            stage2a_process_block(
-                &block,
-                way_ref_buckets,
-                &mut pair_buf,
-                &mut slot_pos,
-            )
-            .map_err(|e| {
-                crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                    e.to_string(),
-                )))
-            })?;
-            let blob_ref_count = slot_pos - blob_start_pos;
-            sidecar_writer.write_all(&blob_ref_count.to_le_bytes()).map_err(|e| {
-                crate::error::new_error(crate::error::ErrorKind::Io(e))
-            })?;
-            Ok(())
-        })?;
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread way blob at {data_offset}: {e}"))?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
+        let blob_start_pos = slot_pos;
+        // The scan_way_refs callback is FnMut, so it can't return Result.
+        // Stash the first error (I/O or negative-id rejection) and bail
+        // after scan returns.
+        let mut scan_err: Option<crate::error::Error> = None;
+        super::way_scanner::scan_way_refs(
+            &decompress_buf,
+            &mut refs_buf,
+            &mut group_starts,
+            |way_id, refs| {
+                if scan_err.is_some() {
+                    return;
+                }
+                if way_id < 0 {
+                    scan_err = Some(crate::error::new_error(
+                        crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                            "renumber --mode external requires non-negative input ids. \
+                             Input contains way id {way_id}. \
+                             Use --mode inmem for files with negative (editor-local) ids."
+                        ))),
+                    ));
+                    return;
+                }
+                for &old_node_id in refs {
+                    if old_node_id < 0 {
+                        scan_err = Some(crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(format!(
+                                "renumber --mode external requires non-negative input ids. \
+                                 Way {way_id} references negative node id {old_node_id}. \
+                                 Use --mode inmem for files with negative (editor-local) ids."
+                            ))),
+                        ));
+                        return;
+                    }
+                    let pair = CooPair { old_node_id, slot_pos };
+                    let bucket = node_id_bucket(old_node_id);
+                    pair.write_to(&mut pair_buf);
+                    if let Some(w) = way_ref_buckets.writers[bucket].as_mut() {
+                        if let Err(e) = w.write_all(&pair_buf) {
+                            scan_err = Some(crate::error::new_error(
+                                crate::error::ErrorKind::Io(e),
+                            ));
+                            return;
+                        }
+                    }
+                    way_ref_buckets.entry_counts[bucket] += 1;
+                    slot_pos += 1;
+                }
+            },
+        )?;
+        if let Some(e) = scan_err {
+            return Err(e.into());
+        }
+        // Record this blob's ref count in the sidecar.
+        let blob_ref_count = slot_pos - blob_start_pos;
+        sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+    }
 
     // Trailer: total ref count for alignment verification in stage 2d.
     sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
     sidecar_writer.flush()?;
 
     Ok(slot_pos)
-}
-
-/// Process a single way blob block for stage 2a. Iterates ways in the
-/// block, validates no negative ids, and emits `(old_node_id, slot_pos)`
-/// COO pairs into `way_ref_buckets` partitioned by high bits of
-/// `old_node_id`. `slot_pos` advances by 1 per ref walked.
-fn stage2a_process_block(
-    block: &crate::PrimitiveBlock,
-    way_ref_buckets: &mut BucketWriters,
-    pair_buf: &mut [u8; COO_PAIR_SIZE],
-    slot_pos: &mut u64,
-) -> Result<()> {
-    for element in block.elements() {
-        let Element::Way(w) = &element else { continue };
-        let way_id = w.id();
-        reject_negative_id(way_id, "way")?;
-        for old_node_id in w.refs() {
-            reject_negative_id(old_node_id, "way node ref")?;
-            let pair = CooPair { old_node_id, slot_pos: *slot_pos };
-            let bucket = node_id_bucket(old_node_id);
-            pair.write_to(pair_buf);
-            if let Some(w) = way_ref_buckets.writers[bucket].as_mut() {
-                w.write_all(pair_buf)?;
-            }
-            way_ref_buckets.entry_counts[bucket] += 1;
-            *slot_pos += 1;
-        }
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

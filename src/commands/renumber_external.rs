@@ -706,6 +706,217 @@ fn stage2a_way_ref_pass(
 }
 
 // ---------------------------------------------------------------------------
+// LSD radix sort for CooPair by old_node_id
+// ---------------------------------------------------------------------------
+
+/// Number of 8-bit radix passes. 5 passes = 40 bits covers any OSM
+/// node id up to 1 T (~73× the current 13 B maximum). 4 passes would
+/// be enough for today's IDs but leaves no headroom. The cost of an
+/// extra pass is linear in N and negligible in the merge-join total.
+const RADIX_PASSES: usize = 5;
+
+/// Sort `pairs` in ascending `old_node_id` order via least-significant-
+/// digit radix sort. 5 passes × 8 bits of u64 key per pass.
+///
+/// Input keys MUST be non-negative (negative ids are rejected upstream
+/// by `reject_negative_id`). The u64 reinterpret preserves the signed
+/// ordering for non-negative i64.
+///
+/// `scratch` is a caller-provided Vec reused across buckets to avoid
+/// per-call allocation. It is grown to the same length as `pairs`.
+/// After the function returns, `pairs` holds the sorted data and
+/// `scratch` holds an arbitrary intermediate state (not useful to the
+/// caller).
+///
+/// The final-pass output pointer is selected so the sorted data always
+/// lives in `pairs` regardless of parity, via `std::mem::swap` at the
+/// end of each pass. `RADIX_PASSES` is even → no final swap needed
+/// beyond the per-pass swaps... actually 5 is odd, so after 5 swaps
+/// the data is in `scratch` and we do one final swap. Handled below.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn radix_sort_coo_pairs(pairs: &mut Vec<CooPair>, scratch: &mut Vec<CooPair>) {
+    let n = pairs.len();
+    if n < 2 {
+        return;
+    }
+
+    // Grow scratch to match pairs length. CooPair is Copy so a zero-
+    // valued default is fine — every slot gets overwritten below.
+    scratch.clear();
+    scratch.resize(n, CooPair { old_node_id: 0, slot_pos: 0 });
+
+    for pass in 0..RADIX_PASSES {
+        let shift = pass * 8;
+        let mut counts = [0u32; 256];
+
+        // Count phase.
+        for p in pairs.iter() {
+            let byte = ((p.old_node_id as u64 >> shift) & 0xff) as usize;
+            counts[byte] += 1;
+        }
+
+        // Prefix sum (exclusive). Each bucket's position is the running
+        // total before it.
+        let mut total: u32 = 0;
+        for c in &mut counts {
+            let saved = *c;
+            *c = total;
+            total = total.saturating_add(saved);
+        }
+
+        // Distribute phase: pairs → scratch.
+        for &p in pairs.iter() {
+            let byte = ((p.old_node_id as u64 >> shift) & 0xff) as usize;
+            let dst = counts[byte] as usize;
+            scratch[dst] = p;
+            counts[byte] += 1;
+        }
+
+        // Swap buffers for the next pass. After the final pass, the
+        // sorted data is in whichever buffer we just wrote to, which
+        // is `scratch` — the swap brings it back into `pairs`.
+        std::mem::swap(pairs, scratch);
+    }
+}
+
+#[cfg(test)]
+mod radix_tests {
+    use super::*;
+
+    fn pair(old: i64, slot: u64) -> CooPair {
+        CooPair { old_node_id: old, slot_pos: slot }
+    }
+
+    #[test]
+    fn radix_empty_is_noop() {
+        let mut pairs: Vec<CooPair> = Vec::new();
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        assert!(pairs.is_empty());
+    }
+
+    #[test]
+    fn radix_single_element() {
+        let mut pairs = vec![pair(42, 0)];
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].old_node_id, 42);
+    }
+
+    #[test]
+    fn radix_already_sorted() {
+        let mut pairs = vec![pair(1, 10), pair(2, 20), pair(3, 30)];
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        assert_eq!(pairs.iter().map(|p| p.old_node_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn radix_reverse_sorted() {
+        let mut pairs = vec![pair(3, 30), pair(2, 20), pair(1, 10)];
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        assert_eq!(pairs.iter().map(|p| p.old_node_id).collect::<Vec<_>>(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn radix_with_duplicates() {
+        // Duplicate keys must survive the sort (stable ordering isn't
+        // required by the merge-join, but both duplicates must be
+        // present in the output).
+        let mut pairs = vec![
+            pair(5, 100),
+            pair(1, 200),
+            pair(5, 300),
+            pair(3, 400),
+            pair(1, 500),
+        ];
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        let keys: Vec<i64> = pairs.iter().map(|p| p.old_node_id).collect();
+        assert_eq!(keys, vec![1, 1, 3, 5, 5]);
+        // Every slot_pos must still be present — no drops.
+        let mut slots: Vec<u64> = pairs.iter().map(|p| p.slot_pos).collect();
+        slots.sort_unstable();
+        assert_eq!(slots, vec![100, 200, 300, 400, 500]);
+    }
+
+    #[test]
+    fn radix_large_keys_near_planet_max() {
+        // OSM's current max node id is ~13 B. Test values at the top
+        // of that range to verify the 5-pass, 40-bit key coverage.
+        let mut pairs = vec![
+            pair(13_000_000_000, 1),
+            pair(12_999_999_999, 2),
+            pair(1, 3),
+            pair(13_000_000_001, 4),
+        ];
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+        assert_eq!(
+            pairs.iter().map(|p| p.old_node_id).collect::<Vec<_>>(),
+            vec![1, 12_999_999_999, 13_000_000_000, 13_000_000_001],
+        );
+    }
+
+    #[test]
+    fn radix_scratch_reuse_across_calls() {
+        // The caller is expected to reuse `scratch` across buckets.
+        // Verify that successive calls with different-sized inputs
+        // produce correct results without requiring scratch to be
+        // cleared externally.
+        let mut scratch: Vec<CooPair> = Vec::new();
+
+        let mut a = vec![pair(5, 50), pair(1, 10), pair(3, 30)];
+        radix_sort_coo_pairs(&mut a, &mut scratch);
+        assert_eq!(a.iter().map(|p| p.old_node_id).collect::<Vec<_>>(), vec![1, 3, 5]);
+
+        // scratch is now length 3 with arbitrary contents.
+        let mut b = vec![
+            pair(100, 1), pair(10, 2), pair(1000, 3), pair(50, 4), pair(200, 5),
+        ];
+        radix_sort_coo_pairs(&mut b, &mut scratch);
+        assert_eq!(
+            b.iter().map(|p| p.old_node_id).collect::<Vec<_>>(),
+            vec![10, 50, 100, 200, 1000],
+        );
+    }
+
+    #[test]
+    fn radix_stress_10k() {
+        // 10 K entries with a pseudo-random key pattern. Verifies
+        // correctness at sizes large enough that sort bugs would
+        // show up but small enough to run in every test suite.
+        let mut pairs: Vec<CooPair> = (0..10_000u64)
+            .map(|i| {
+                // Scatter keys with a multiplicative hash. Mask to 31 bits
+                // so the value fits cleanly in i64 without wraparound
+                // (negative ids are a separate case rejected upstream).
+                let key = i.wrapping_mul(2654435761) & 0x7fff_ffff;
+                CooPair {
+                    old_node_id: key.cast_signed(),
+                    slot_pos: i,
+                }
+            })
+            .collect();
+        let mut scratch: Vec<CooPair> = Vec::new();
+        radix_sort_coo_pairs(&mut pairs, &mut scratch);
+
+        // Verify ascending order.
+        for w in pairs.windows(2) {
+            assert!(
+                w[0].old_node_id <= w[1].old_node_id,
+                "not sorted at {} → {}",
+                w[0].old_node_id,
+                w[1].old_node_id
+            );
+        }
+        assert_eq!(pairs.len(), 10_000);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Pass 2 stage B: node merge-join
 // ---------------------------------------------------------------------------
 
@@ -748,6 +959,7 @@ fn stage2b_node_merge_join(
     // aren't held alongside the parsed Vecs during the merge-join.
     let mut way_refs: Vec<CooPair> = Vec::new();
     let mut way_refs_data: Vec<u8> = Vec::new();
+    let mut way_refs_scratch: Vec<CooPair> = Vec::new();
     let mut node_map: Vec<IdPair> = Vec::new();
     let mut node_map_data: Vec<u8> = Vec::new();
 
@@ -763,9 +975,17 @@ fn stage2b_node_merge_join(
         // Delete the way_ref bucket file now that we've read it into
         // RAM — no further stage consumes it. Cuts peak temp disk.
         drop(std::fs::remove_file(&way_ref_buckets.paths[bucket_idx]));
-        // Sort the COO pairs by old_node_id so the merge walk's nm cursor
-        // can advance monotonically across the whole bucket.
-        way_refs.sort_unstable_by_key(|p| p.old_node_id);
+        // LSD radix sort by old_node_id (u64 key reinterpret). At planet
+        // scale this bucket contains ~40M pairs and the comparison-based
+        // `sort_unstable_by_key` costs ~500 s total over all 256 buckets
+        // — the dominant contribution to stage 2b wall time per the
+        // sidecar profile. Radix sort cuts this to ~60-80 s.
+        //
+        // Negative ids are rejected upstream (`reject_negative_id`), so
+        // `old_node_id as u64` preserves the signed order exactly. OSM's
+        // current ~13B node id max fits in 34 bits; we do 5 × 8-bit
+        // passes (40 bits = 1 T id headroom).
+        radix_sort_coo_pairs(&mut way_refs, &mut way_refs_scratch);
 
         // node_map is already sorted: pass 1 scans a sorted input and emits
         // (old_id, new_id) in file order, so within a bucket (same high

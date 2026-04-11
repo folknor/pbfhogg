@@ -145,6 +145,56 @@ fn external_pass1_skips_ways_and_relations_for_now() {
     assert_eq!(norm.relations.len(), 0);
 }
 
+// ---------------------------------------------------------------------------
+// Pass 2 stage 2a: way-ref COO pair emission
+// ---------------------------------------------------------------------------
+
+#[test]
+fn external_stage2a_runs_on_input_with_ways() {
+    // Stage 2a streams way blobs and emits (old_node_id, slot_pos) COO
+    // pairs into way_ref buckets + a per-blob ref-count sidecar. The test
+    // input has multiple ways with overlapping refs — enough to exercise
+    // the bucket partitioning logic — and the assertion just verifies the
+    // function doesn't error out and pass 1 still produces the expected
+    // nodes. Bucket contents become observable when stage 2b lands.
+    let dir = TempDir::new().expect("tempdir");
+    let input = dir.path().join("input.osm.pbf");
+    let output = dir.path().join("output.osm.pbf");
+
+    write_test_pbf_sorted(
+        &input,
+        &[
+            TestNode { id: 1, lat: 100_000_000, lon: 200_000_000, tags: vec![] },
+            TestNode { id: 2, lat: 110_000_000, lon: 210_000_000, tags: vec![] },
+            TestNode { id: 3, lat: 120_000_000, lon: 220_000_000, tags: vec![] },
+            TestNode { id: 4, lat: 130_000_000, lon: 230_000_000, tags: vec![] },
+        ],
+        &[
+            // 3 ways × avg 3 refs = 9 total slots. Duplicate ref (2 twice
+            // in way 100) exercises the scatter-back position preservation
+            // that tasks #3 stages 2c/2d will need to get right.
+            TestWay { id: 100, refs: vec![1, 2, 2], tags: vec![("highway", "stop")] },
+            TestWay { id: 200, refs: vec![2, 3], tags: vec![] },
+            TestWay { id: 300, refs: vec![3, 4, 1], tags: vec![("barrier", "gate")] },
+        ],
+        &[],
+    );
+
+    let stats = renumber_external(
+        &input, &output, &default_opts(), Compression::default(), false,
+        &pbfhogg::HeaderOverrides::default(),
+    )
+    .expect("renumber_external");
+
+    // Pass 1 still wrote 4 nodes.
+    assert_eq!(stats.nodes_written, 4);
+    // Ways still not written to output (stage 2d is what does that).
+    assert_eq!(stats.ways_written, 0, "stage 2d will populate this");
+    let norm = read_normalized(&output);
+    assert_eq!(norm.nodes.len(), 4);
+    assert_eq!(norm.ways.len(), 0);
+}
+
 fn pbfhogg_test_way(id: i64, refs: Vec<i64>) -> TestWay {
     TestWay { id, refs, tags: vec![] }
 }

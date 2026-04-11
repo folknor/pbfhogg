@@ -26,14 +26,21 @@
 //!
 //! ## Status
 //!
-//! This module currently implements **pass 1 only**. The output PBF
-//! produced by a pass-1-only invocation contains renumbered nodes but
-//! no ways or relations, so it is not a valid end-to-end renumber
-//! result — only useful for harness-level testing of the node pass
-//! until tasks #3 and #4 land.
+//! This module currently implements **pass 1 + pass 2 stage A**:
+//!
+//! - Pass 1: streams nodes, assigns new ids, writes renumbered nodes to
+//!   output, emits `node_map` bucket tuples.
+//! - Stage 2a: streams ways, emits `(old_node_id, slot_pos)` COO pairs
+//!   into `way_ref` buckets partitioned by high bits of `old_node_id`,
+//!   and writes per-blob ref counts to a sidecar file for stage 2d.
+//!
+//! Stages 2b (node merge-join), 2c (slot reorder), and 2d (way assembly)
+//! are in progress. Until they land, the output PBF contains only
+//! renumbered nodes — ways are not yet rewritten. Tests against the
+//! current state verify that stage 2a runs end-to-end without errors.
 
-use std::io::Write as _;
-use std::path::Path;
+use std::io::{BufWriter, Write as _};
+use std::path::{Path, PathBuf};
 
 use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::renumber::{RenumberOptions, RenumberStats};
@@ -56,6 +63,24 @@ const MAX_NODE_ID: u64 = 14_000_000_000;
 /// Serialized size of one `(old_id, new_id)` tuple on disk.
 const ID_PAIR_SIZE: usize = 16;
 
+/// Serialized size of one `(old_node_id, slot_pos)` COO pair on disk.
+const COO_PAIR_SIZE: usize = 16;
+
+/// Byte offset bucket index function. Partitions a `u64`-castable id into
+/// one of `NUM_BUCKETS` buckets by its position in `[0, MAX_NODE_ID)`.
+/// Negative ids clamp to bucket 0 — the external path currently accepts
+/// negative ids through this clamp (a balance wart, not a correctness
+/// one) rather than rejecting them at the entry gate; that policy
+/// decision lives in the design doc's section 5 and can be revisited
+/// when the renumber tests exercise negative input.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn node_id_bucket(id: i64) -> usize {
+    let u = if id < 0 { 0u64 } else { id as u64 };
+    let range_size = MAX_NODE_ID.div_ceil(NUM_BUCKETS as u64);
+    let bucket = u / range_size;
+    (bucket as usize).min(NUM_BUCKETS - 1)
+}
+
 // ---------------------------------------------------------------------------
 // IdPair: the (old, new) tuple written to node_map bucket files
 // ---------------------------------------------------------------------------
@@ -73,17 +98,27 @@ impl IdPair {
         buf[..8].copy_from_slice(&self.old_id.to_le_bytes());
         buf[8..].copy_from_slice(&self.new_id.to_le_bytes());
     }
+}
 
-    /// Bucket index for node-id partitioning. Matches
-    /// `external_join::CooPair::node_bucket` — negative ids clamp to
-    /// bucket 0 (a balance wart, not a correctness wart, since the
-    /// external path rejects negative ids at the pass-1 entry gate).
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    fn node_bucket(&self) -> usize {
-        let id = if self.old_id < 0 { 0u64 } else { self.old_id as u64 };
-        let range_size = MAX_NODE_ID.div_ceil(NUM_BUCKETS as u64);
-        let bucket = id / range_size;
-        (bucket as usize).min(NUM_BUCKETS - 1)
+// ---------------------------------------------------------------------------
+// CooPair: (old_node_id, slot_pos) emitted by the stage 2a way pass
+// ---------------------------------------------------------------------------
+
+/// A coordinate-list (COO) pair linking an old node id to a slot position
+/// in the flattened way-ref stream. Matches the shape of
+/// `external_join::CooPair`. The slot_pos is a global monotonic counter
+/// over all refs of all ways in the stream; the stage 2c slot reorder
+/// uses it as a direct index into the flat new_refs file.
+#[derive(Clone, Copy)]
+struct CooPair {
+    old_node_id: i64,
+    slot_pos: u64,
+}
+
+impl CooPair {
+    fn write_to(&self, buf: &mut [u8; COO_PAIR_SIZE]) {
+        buf[..8].copy_from_slice(&self.old_node_id.to_le_bytes());
+        buf[8..].copy_from_slice(&self.slot_pos.to_le_bytes());
     }
 }
 
@@ -207,28 +242,45 @@ pub fn renumber_external(
     }
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
+    drop(blob_reader);
 
-    // Flush in-flight node block before finishing the output. The writer
-    // stays open across passes in the full implementation — for the
-    // pass-1 skeleton we flush and close immediately.
-    flush_block(&mut bb, &mut writer)?;
-    writer.flush()?;
-
-    // Flush + sync + fadvise the bucket files. We don't consume them here
-    // (that's pass 2), but finishing makes the file contents durable and
-    // frees the writer buffers. Total entry counts are summed across
-    // buckets and emitted as a debug counter for sanity-checking against
-    // stats.nodes_written.
-    let bucket_counts = node_map_buckets.finish()?;
+    // Finalize the node_map bucket writers now that pass 1 is done emitting.
+    // Files stay on disk until stage 2b consumes them (forthcoming); we just
+    // need the underlying writers closed so the buffered bytes are durable.
+    let node_map_counts = node_map_buckets.finish()?;
     #[allow(clippy::cast_possible_wrap)]
     {
-        let total: u64 = bucket_counts.iter().sum();
+        let total: u64 = node_map_counts.iter().sum();
         crate::debug::emit_counter("renumber_ext_node_map_entries", total as i64);
     }
 
-    // Drop the scratch dir explicitly so the pass-1-only skeleton cleans
-    // up its bucket files. Once pass 2 lands, the scratch dir lives across
-    // both passes and only drops at end of function.
+    // ---- Pass 2 stage A: way-ref COO pair emission ----
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_START");
+    let mut way_ref_buckets = BucketWriters::create(&scratch, "way-ref")?;
+    let ref_count_sidecar: PathBuf = scratch.file_path("way-ref-counts");
+    let total_slots =
+        stage2a_way_ref_pass(input, direct_io, &mut way_ref_buckets, &ref_count_sidecar)?;
+    let way_ref_counts = way_ref_buckets.finish()?;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("renumber_ext_way_ref_slots", total_slots as i64);
+        let bucket_total: u64 = way_ref_counts.iter().sum();
+        debug_assert_eq!(
+            bucket_total, total_slots,
+            "stage 2a bucket entry sum must equal slot counter"
+        );
+    }
+    crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_END");
+
+    // TODO(task #3 stages 2b/2c/2d): consume way_ref_buckets + node_map
+    // bucket files to produce the remapped way refs, then re-scan ways
+    // and write renumbered ways to output. Until that lands, flush the
+    // nodes-only output and drop the scratch dir — ways remain absent.
+
+    flush_block(&mut bb, &mut writer)?;
+    writer.flush()?;
+
+    drop(way_ref_buckets);
     drop(node_map_buckets);
     drop(scratch);
 
@@ -249,11 +301,114 @@ fn emit_id_pair(
     pair_buf: &mut [u8; ID_PAIR_SIZE],
     pair: IdPair,
 ) -> Result<()> {
-    let bucket = pair.node_bucket();
+    let bucket = node_id_bucket(pair.old_id);
     pair.write_to(pair_buf);
     if let Some(w) = buckets.writers[bucket].as_mut() {
         w.write_all(pair_buf)?;
     }
     buckets.entry_counts[bucket] += 1;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Pass 2 stage A: way scan — emit (old_node_id, slot_pos) COO pairs
+// ---------------------------------------------------------------------------
+
+/// Stream way blobs from the input PBF, emit `(old_node_id, slot_pos)` COO
+/// pairs into 256 `way_ref` buckets partitioned by high bits of
+/// `old_node_id`, and write per-blob ref counts to a sidecar file.
+///
+/// Ports `external_join::stage1_way_pass`. Returns the total number of
+/// way refs seen (= total slot count, = the eventual size of the flat
+/// new_refs file stage 2c produces). The sidecar lets stage 2d
+/// (assembly) pre-compute each blob's starting slot_pos without having
+/// to re-count refs during the re-scan.
+///
+/// The per-blob ref-count sidecar layout:
+///
+/// - `u64 LE` per way blob, in file order (only blobs that pass the
+///   indexdata filter — i.e. `ElemKind::Way` blobs — are counted).
+/// - A trailer `u64 LE` with the total ref count for alignment
+///   verification. Stage 2d checks the trailer equals `total_slots`.
+#[hotpath::measure]
+fn stage2a_way_ref_pass(
+    input: &Path,
+    direct_io: bool,
+    way_ref_buckets: &mut BucketWriters,
+    ref_count_sidecar: &Path,
+) -> Result<u64> {
+    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    // Consume the header blob so the iteration below starts at the first
+    // OsmData blob, matching the stage1_way_pass convention.
+    blob_reader
+        .next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut slot_pos: u64 = 0;
+    let mut pair_buf = [0u8; COO_PAIR_SIZE];
+    let mut refs_buf: Vec<i64> = Vec::new();
+    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+    let mut sidecar_writer = BufWriter::with_capacity(
+        64 * 1024,
+        std::fs::File::create(ref_count_sidecar)
+            .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
+    );
+
+    for blob_result in &mut blob_reader {
+        let blob = blob_result?;
+        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+        // Fast-skip non-way blobs via blob_index for indexed PBFs. Stage 2d
+        // MUST apply the identical filter during its re-scan so the blob
+        // order and indices line up — both phases see the same blob set.
+        if let Some(idx) = blob.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                continue;
+            }
+        }
+
+        blob.decompress_into(&mut decompress_buf)?;
+        let blob_start_pos = slot_pos;
+        // The scan_way_refs callback is FnMut, so it can't return Result.
+        // Stash the first I/O error and bail after scan returns.
+        let mut write_err: Option<std::io::Error> = None;
+        super::way_scanner::scan_way_refs(
+            &decompress_buf,
+            &mut refs_buf,
+            &mut group_starts,
+            |_way_id, refs| {
+                if write_err.is_some() {
+                    return;
+                }
+                for &old_node_id in refs {
+                    let pair = CooPair { old_node_id, slot_pos };
+                    let bucket = node_id_bucket(old_node_id);
+                    pair.write_to(&mut pair_buf);
+                    if let Some(w) = way_ref_buckets.writers[bucket].as_mut() {
+                        if let Err(e) = w.write_all(&pair_buf) {
+                            write_err = Some(e);
+                            return;
+                        }
+                    }
+                    way_ref_buckets.entry_counts[bucket] += 1;
+                    slot_pos += 1;
+                }
+            },
+        )?;
+        if let Some(e) = write_err {
+            return Err(e.into());
+        }
+        // Record this blob's ref count in the sidecar.
+        let blob_ref_count = slot_pos - blob_start_pos;
+        sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+    }
+
+    // Trailer: total ref count for alignment verification in stage 2d.
+    sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
+    sidecar_writer.flush()?;
+
+    Ok(slot_pos)
 }

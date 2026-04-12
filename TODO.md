@@ -597,10 +597,10 @@ single-pass, tag expression and bbox filtering.
   - [ ] **Re-apply `from_vec_with_scratch`** in pass1_worker and
     stage2d_worker (committed as `bcd7cbc`, reverted during dirty
     iteration). Eliminates PrimitiveBlock::new .to_vec() copy.
-  - [ ] **Batch bucket writes per block.** Accumulate old_ids into a
+  - [x] **Batch bucket writes per block.** Accumulate old_ids into a
     local `[u8; 64000]` stack buffer, flush once per block. Saves
     7999/8000 BufWriter calls per block. ~12 s wall. (planet-claude)
-  - [ ] **Per-block negative-id check via indexdata min_id.** If
+  - [x] **Per-block negative-id check via indexdata min_id.** If
     `min_id >= 0`, skip per-element `reject_negative_id`. ~3 s wall.
     (planet-claude)
   - [ ] **Dense-node block-type fast path.** If block is DenseNodes,
@@ -609,16 +609,17 @@ single-pass, tag expression and bbox filtering.
   - [ ] **Current-bucket fast path for old_id emission.** Node IDs are
     sorted, `node_id_bucket` is monotone. Track active bucket + end
     range, skip division for nodes in the same bucket. (perf-codex)
-  - [ ] **`take_owned` buffer reuse.** Return emptied encode_buf
-    capacity back to the worker instead of `mem::take` leaving cap 0.
-    Reduces per-block reallocation. (perf-codex)
+  - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker and
+    stage2d_worker `mem::take` the reframe_buf into OwnedBlock each blob,
+    losing capacity. A ping-pong pair or consumer→worker return channel
+    would keep the buffer hot across 1.3M+ blobs. (perf-codex round 3+4)
 
   **Next-round optimization levers (round 2 reviewer consensus, 2026-04-12):**
 
   - [x] **4 workers for pass 1 / stage 2d.** Pass 1: measured at 416 s
     (4 workers, ARENA=2). Stage 2d: not yet measured with 4 workers.
     Consumer is not the limiter for either stage.
-  - [ ] **Parallel stage 2c.** Slot buckets map to disjoint output ranges
+  - [x] **Parallel stage 2c.** Slot buckets map to disjoint output ranges
     in the flat new_refs file. Workers can preallocate via `ftruncate`
     and `pwrite` independent bucket ranges concurrently. ~10% of total
     wall (197 s), worth doing once the bigger wins are squeezed.
@@ -629,7 +630,7 @@ single-pass, tag expression and bbox filtering.
     and stage 2c writes by bucket (sequential within each bucket range).
     Complex to implement but would overlap ~197 s of stage 2c with
     stage 2d. (arch-claude)
-  - [ ] **Schedule reuse across stages.** Renumber rebuilds blob schedules
+  - [x] **Schedule reuse across stages.** Renumber rebuilds blob schedules
     in pass 1, stage 2a, stage 2d, and relation passes independently.
     Extract already solved this via `Pass1Result` plumbing — apply the
     same pattern to renumber. (perf-codex)
@@ -650,9 +651,9 @@ single-pass, tag expression and bbox filtering.
   - [ ] **`fadvise(SEQUENTIAL)` before full bucket reads** in
     `load_coo_bucket` / `load_single_old_id_bucket`. Small win on cold
     cache scenarios.
-  - [ ] **Sparse-file `new_refs` via `set_len` + `pwrite`** in stage 2c.
-    Avoids materializing zero-fill ranges for empty buckets entirely.
-    Relies on ext4/xfs hole support.
+  - [x] **Sparse-file `new_refs` via `set_len` + `pwrite`** in stage 2c.
+    Subsumed by the parallel stage 2c rewrite (ftruncate + pwrite +
+    sparse holes for empty buckets).
   - [ ] **Add `scan_relation_members` fast-path** for R2a/R2d, analogous
     to `scan_way_refs`. Would avoid full PrimitiveBlock decode in the
     relation scans. Moderate win; not blocking planet correctness.
@@ -664,6 +665,36 @@ single-pass, tag expression and bbox filtering.
     sorted-concat model in `renumber_external.rs` (around the pass 1
     arch comment block and stage 2d doc comments). Not a bug but
     confusing for future optimization work. (perf-codex)
+
+  **Round 4 reviewer findings (2026-04-12, perf-codex + planet-claude):**
+
+  - [ ] **Hoist `group_ranges` / `scalar_fields` to worker scratch** in
+    both reframe functions. Currently per-blob allocations (1.3M node
+    blobs + 17K way blobs). Trivially reusable — `group_ranges` usually
+    has 1 entry, `scalar_fields` ~20 bytes. (planet-claude, perf-codex)
+  - [ ] **Redundant radix pass in stage 2b.** Within one bucket, keys
+    only span that bucket's range, so the highest 8-bit pass of
+    `radix_sort_coo_pairs` is redundant. Reducing from 5 to 4 passes
+    saves ~20% of the sort cost. (perf-codex)
+  - [ ] **Pre-compute ref deltas in stage 2c.** Store deltas (not
+    absolutes) in the flat `new_refs` file. Shifts 12.4B delta
+    computations from stage 2d (per-blob, hot reframe loop) to stage 2c
+    (per-slot, cold, I/O-bound). Would let the way rewriter skip
+    delta-encoding entirely and copy pre-computed packed bytes. Complex
+    but large savings if stage 2d reframe remains the bottleneck.
+    (planet-claude)
+  - [ ] **Merge node_map directly from raw byte slices** in stage 2b
+    instead of materializing `Vec<i64>` per shard. The streams are
+    forward-only; a byte cursor per shard with inline varint-to-i64
+    decode would eliminate the parse-into-Vec allocation. (perf-codex)
+  - [ ] **Consumer drain-rate instrumentation.** Measure time spent
+    blocking on `rx.recv()` vs time spent in `write_primitive_block_
+    owned`. Distinguishes worker-bound vs consumer-bound pipelines.
+    (planet-claude)
+  - [ ] **Finer stage 2d reframe instrumentation.** Split `reframe_ms`
+    into `way_parse_ms`, `ref_lookup_ms`, `ref_encode_ms`, `frame_ms`
+    to identify which sub-step dominates after the splice optimization
+    lands. (perf-codex)
 
   **Defensive asserts / hardening:**
 

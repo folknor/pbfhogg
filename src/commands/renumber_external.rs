@@ -419,11 +419,15 @@ pub fn renumber_external(
     let mut way_map_shards: Vec<BucketWriters> = (0..STAGE2D_WORKERS)
         .map(|i| BucketWriters::create(&scratch, &format!("way-map-{i}")))
         .collect::<Result<Vec<_>>>()?;
+    let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
+        .map(|_| super::id_set_dense::IdSetDense::new())
+        .collect();
     let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
     stage2d_parallel_way_assembly(
         input,
         &mut writer,
         &mut way_map_shards,
+        &mut way_id_sets,
         &way_schedule,
         &new_refs_path,
         &ref_count_sidecar,
@@ -486,25 +490,10 @@ pub fn renumber_external(
     // into the flat new_refs file via pwrite.
     crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
 
-    // Build way_id_set from stage 2d's old_way_ids.
-    // (stage 2d workers already collected old_ids — we need to rebuild
-    // from the way_map shard files, or build during stage 2d.)
-    // For now: build from way_map shard files.
-    let mut way_id_set = super::id_set_dense::IdSetDense::new();
-    for shard in &way_map_shards {
-        for bucket_idx in 0..NUM_BUCKETS {
-            if shard.entry_counts[bucket_idx] == 0 {
-                continue;
-            }
-            let mut data = Vec::new();
-            if let Ok(f) = std::fs::File::open(&shard.paths[bucket_idx]) {
-                std::io::Read::read_to_end(&mut &f, &mut data).ok();
-            }
-            for chunk in data.chunks_exact(OLD_ID_SIZE) {
-                let old_id = i64::from_le_bytes(chunk.try_into().unwrap_or_else(|_| unreachable!()));
-                way_id_set.set(old_id);
-            }
-        }
+    // Merge per-worker way_id_sets built during stage 2d.
+    let mut way_id_set = way_id_sets.remove(0);
+    for other in way_id_sets {
+        way_id_set.merge(other);
     }
     way_id_set.build_rank_index();
 
@@ -1625,6 +1614,7 @@ fn stage2d_parallel_way_assembly(
     input: &Path,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
     way_map_shards: &mut [BucketWriters],
+    way_id_sets: &mut [super::id_set_dense::IdSetDense],
     way_schedule: &[BlobTask],
     new_refs_path: &Path,
     ref_count_sidecar: &Path,
@@ -1712,11 +1702,15 @@ fn stage2d_parallel_way_assembly(
         });
 
         {
-            let mut remaining: &mut [BucketWriters] = way_map_shards;
-            for _ in 0..remaining.len() {
-                let (head, tail) = remaining.split_at_mut(1);
-                remaining = tail;
-                let shard = &mut head[0];
+            let mut remaining_shards: &mut [BucketWriters] = way_map_shards;
+            let mut remaining_sets: &mut [super::id_set_dense::IdSetDense] = way_id_sets;
+            for _ in 0..remaining_shards.len() {
+                let (sh, st) = remaining_shards.split_at_mut(1);
+                remaining_shards = st;
+                let shard = &mut sh[0];
+                let (is, it) = remaining_sets.split_at_mut(1);
+                remaining_sets = it;
+                let id_set = &mut is[0];
                 let rx = std::sync::Arc::clone(&desc_rx);
                 let file = std::sync::Arc::clone(&shared_file);
                 let mmap = std::sync::Arc::clone(&new_refs_mmap);
@@ -1730,6 +1724,7 @@ fn stage2d_parallel_way_assembly(
                         slots_ref,
                         total_slots,
                         shard,
+                        id_set,
                         ways_written,
                         stage2d_cref,
                         &tx,
@@ -1786,6 +1781,7 @@ fn stage2d_worker(
     blob_slot_starts: &[u64],
     total_slots: u64,
     shard: &mut BucketWriters,
+    way_id_set: &mut super::id_set_dense::IdSetDense,
     ways_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
     tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
@@ -1884,6 +1880,11 @@ fn stage2d_worker(
                     #[allow(clippy::cast_possible_truncation)]
                     { shard.entry_counts[cur_bucket] += (bucket_batch.len() / OLD_ID_SIZE) as u64; }
                 }
+            }
+            // Also set old_way_ids in the per-worker IdSetDense so the
+            // way_id_set is ready for R2B rank lookup after stage 2d.
+            for &old_way_id in &old_ids_buf {
+                way_id_set.set(old_way_id);
             }
             #[allow(clippy::cast_possible_truncation)]
             counters.bucket_emit_ms.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);

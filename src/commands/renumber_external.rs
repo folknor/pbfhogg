@@ -105,11 +105,16 @@ pub fn renumber_external(
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         header_blob.to_headerblock()?
     };
-    // External renumber uses zlib:1 — the compression pipeline is on the
-    // critical path for pass 1 and stage 2d, and zlib:6 adds ~22 s of
-    // backpressure at planet scale for ~15% smaller output.
-    let _ = compression;
-    let mut writer = writer_from_header(output, Compression::Zlib(1), &header, true, overrides, |hb| {
+    // Default to zlib:1 for external renumber — the compression pipeline
+    // is on the critical path for pass 1 and stage 2d, and zlib:6 adds
+    // ~22 s of backpressure at planet scale for ~15% smaller output.
+    // Respect explicit caller overrides (e.g. --compression zlib:6).
+    let effective_compression = if compression == Compression::default() {
+        Compression::Zlib(1)
+    } else {
+        compression
+    };
+    let mut writer = writer_from_header(output, effective_compression, &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
 

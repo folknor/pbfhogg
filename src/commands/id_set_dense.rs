@@ -17,7 +17,7 @@ pub struct IdSetDense {
     /// Rank index for O(1) rank queries. Built on demand via `build_rank_index()`.
     /// `chunk_prefix[cid]` = total set bits in chunks 0..cid.
     /// `block_prefix[cid][block]` = set bits in chunk `cid` before block `block`.
-    /// Block size = 256 bytes (2048 bits, 32 u64 words). Max 32 words scanned per rank().
+    /// Block size = 64 bytes (512 bits, 8 u64 words). Max 7 words scanned per rank().
     rank_chunk_prefix: Option<Vec<u64>>,
     rank_block_prefix: Option<Vec<Option<Vec<u32>>>>,
 }
@@ -140,7 +140,7 @@ impl IdSetDense {
     /// Must be called after all `set()` calls are complete.
     /// Invalidated by subsequent `set()` or `merge()` calls.
     pub fn build_rank_index(&mut self) {
-        const BLOCK_BYTES: usize = 256; // 32 u64 words = 2048 bits per block
+        const BLOCK_BYTES: usize = 64; // 8 u64 words = 512 bits per block
         const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
         const BLOCKS_PER_CHUNK: usize = CHUNK_SIZE / BLOCK_BYTES;
 
@@ -182,7 +182,7 @@ impl IdSetDense {
     /// Requires `build_rank_index()` to have been called first.
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     pub fn rank(&self, id: i64) -> u64 {
-        const BLOCK_BYTES: usize = 256;
+        const BLOCK_BYTES: usize = 64;
         const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
 
         let chunk_prefix = self.rank_chunk_prefix.as_ref()
@@ -237,7 +237,7 @@ impl IdSetDense {
     #[inline]
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
     pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
-        const BLOCK_BYTES: usize = 256;
+        const BLOCK_BYTES: usize = 64;
         const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
 
         let uid = id as u64;

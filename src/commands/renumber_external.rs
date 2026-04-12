@@ -2270,9 +2270,9 @@ fn reframe_dense_with_new_ids(
                 group_ranges.push((offset, data.len()));
             }
             (17 | 18 | 19 | 20, WIRE_VARINT) => {
-                let val = cursor.read_varint().map_err(|e| e.to_string())?;
-                protohoggr::encode_varint(&mut scalar_fields, u64::from((field << 3) | wire_type));
-                protohoggr::encode_varint(&mut scalar_fields, val);
+                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                protohoggr::encode_tag(&mut scalar_fields, field, wire_type);
+                scalar_fields.extend_from_slice(raw);
             }
             _ => cursor.skip_field(wire_type).map_err(|e| e.to_string())?,
         }
@@ -2319,18 +2319,11 @@ fn reframe_dense_with_new_ids(
         while let Some((field, wire_type)) = dn_cursor.read_tag().map_err(|e| e.to_string())? {
             if field == 1 && wire_type == WIRE_LEN {
                 id_field = Some(dn_cursor.read_len_delimited().map_err(|e| e.to_string())?);
-            } else if wire_type == WIRE_LEN {
-                let data = dn_cursor.read_len_delimited().map_err(|e| e.to_string())?;
-                protohoggr::encode_bytes_field(&mut other_fields_buf, field, data);
             } else {
-                let pos_before = dn_cursor.position();
-                dn_cursor.skip_field(wire_type).map_err(|e| e.to_string())?;
-                let pos_after = dn_cursor.position();
-                protohoggr::encode_varint(
-                    &mut other_fields_buf,
-                    u64::from((field << 3) | wire_type),
-                );
-                other_fields_buf.extend_from_slice(&dense_bytes[pos_before..pos_after]);
+                // Copy this field verbatim: tag + raw value bytes.
+                let raw = dn_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                protohoggr::encode_tag(&mut other_fields_buf, field, wire_type);
+                other_fields_buf.extend_from_slice(raw);
             }
         }
 

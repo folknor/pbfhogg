@@ -542,13 +542,46 @@ single-pass, tag expression and bbox filtering.
   notes/renumber-planet-scale.md). Peak anon 7.31 GB (up from 2.79
   GB), well under the 30 GB host limit.
 
-  **Smaller / defensive followups (non-blocking for 24-min target):**
+  **Next-round optimization levers (round 2 reviewer consensus, 2026-04-12):**
+
+  - [ ] **3 workers for pass 1 / stage 2d** (revisit now that two-cursor
+    merge landed). The consumer thread (writer pipeline + compression)
+    may be the limiter — measure worker idle time vs consumer backpressure
+    before committing. Each additional worker adds one shard but the two-
+    cursor merge generalizes to K-way merge (min-heap) if needed. Try 3
+    first, not 4+. (arch-codex, planet-codex)
+  - [ ] **Parallel stage 2c.** Slot buckets map to disjoint output ranges
+    in the flat new_refs file. Workers can preallocate via `ftruncate`
+    and `pwrite` independent bucket ranges concurrently. ~10% of total
+    wall (197 s), worth doing once the bigger wins are squeezed.
+    (arch-codex, planet-claude)
+  - [ ] **Stage 2c/2d pipeline overlap.** Stage 2d could start consuming
+    buckets from the new_refs file while stage 2c is still scattering
+    later buckets. Feasible because stage 2d reads slots sequentially
+    and stage 2c writes by bucket (sequential within each bucket range).
+    Complex to implement but would overlap ~197 s of stage 2c with
+    stage 2d. (arch-claude)
+  - [ ] **Schedule reuse across stages.** Renumber rebuilds blob schedules
+    in pass 1, stage 2a, stage 2d, and relation passes independently.
+    Extract already solved this via `Pass1Result` plumbing — apply the
+    same pattern to renumber. (perf-codex)
+  - [ ] **`direct_io` flag honored in pread stages.** `stage2d_worker`
+    and `relation_r1_r2a_fused` take `_direct_io` but open the input
+    with plain `File::open` + `read_exact_at`. Should use O_DIRECT
+    when the flag is set, for cache discipline on planet-scale hosts.
+    (arch-codex)
+  - [ ] **Check output disk target.** `brokkr env` shows `target=hdd`.
+    At 88 GB / 100 MB/s sequential write = 880 s of pure write time —
+    potentially the dominant bottleneck for pass 1 and stage 2d if
+    compression throughput exceeds HDD write bandwidth. Moving output
+    to NVMe (or tmpfs) and copying afterward is a zero-code-change
+    lever worth ~300-500 s if confirmed. (planet-claude)
 
   **Smaller / defensive followups (non-blocking for planet bench):**
 
   - [ ] **`fadvise(SEQUENTIAL)` before full bucket reads** in
-    `load_coo_bucket` / `load_id_pair_bucket`. Small win on cold cache
-    scenarios.
+    `load_coo_bucket` / `load_single_old_id_bucket`. Small win on cold
+    cache scenarios.
   - [ ] **Sparse-file `new_refs` via `set_len` + `pwrite`** in stage 2c.
     Avoids materializing zero-fill ranges for empty buckets entirely.
     Relies on ext4/xfs hole support.
@@ -559,6 +592,10 @@ single-pass, tag expression and bbox filtering.
     completes** so the kernel evicts the working set pages before the
     next stage. Affects RSS reporting more than actual performance but
     improves the planet sidecar profile.
+  - [ ] **Clean up stale comments** still describing the range-split /
+    sorted-concat model in `renumber_external.rs` (around the pass 1
+    arch comment block and stage 2d doc comments). Not a bug but
+    confusing for future optimization work. (perf-codex)
 
   **Defensive asserts / hardening:**
 

@@ -677,6 +677,31 @@ single-pass, tag expression and bbox filtering.
     Reduced from 5 to 4 passes. Within one bucket, ID range ≈ 55M <
     2^32, so byte 4 (bits 32-39) was constant = no-op shuffle.
     (perf-codex)
+  - [ ] **Fuse stage 2a + 2b via IdSetDense rank lookup** (unanimous
+    perf + planet reviewer consensus, 2026-04-12). Replace the entire
+    CooPair bucket → radix sort → merge-join pipeline with a single
+    fused way scan that resolves refs inline via `IdSetDense::rank()`.
+    Pass 1 builds a global bitset of all old node IDs (~1.6 GB) +
+    rank prefix sums (~1 GB) = 2.6 GB. The fused scan replaces both
+    stage2a_way_ref_pass and stage2b_node_merge_join: for each way
+    ref, `new_id = start_node_id + rank(old_node_id)`. O(1) per ref
+    via popcount (~10-20 ns). Deletes ~520 LoC, eliminates 128 GB
+    CooPair temp disk + 166 GB node_map shard files. Estimated:
+    stage 2a (119 s) + 2b (288 s) = 407 s → ~170 s fused. Total
+    960 → ~683 s (11.4 min). IdSetDense with rank() already exists
+    in `src/commands/id_set_dense.rs` from the geocode builder.
+    (planet-claude, perf-codex)
+  - [ ] **Way_id_set for R2B.** Build a second `IdSetDense` during
+    stage 2d (set all old_way_ids, build_rank_index). Replaces R2B's
+    merge-join with O(1) rank lookup. Estimated R2B: 68 → ~10 s.
+    Eliminates way_map shard bucket files. (planet-claude)
+  - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker
+    and stage2d_worker `mem::take` the reframe_buf into OwnedBlock
+    each blob, losing capacity. Ping-pong pair or consumer→worker
+    return channel. (perf-codex round 3+4)
+  - [ ] **Consumer drain-rate instrumentation.** Measure time blocking
+    on `rx.recv()` vs time in `write_primitive_block_owned`.
+    Distinguishes worker-bound vs consumer-bound. (planet-claude)
   - [ ] **Pre-compute ref deltas in stage 2c.** Store deltas (not
     absolutes) in the flat `new_refs` file. Shifts 12.4B delta
     computations from stage 2d (per-blob, hot reframe loop) to stage 2c

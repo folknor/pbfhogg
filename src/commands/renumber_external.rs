@@ -31,8 +31,6 @@ use crate::block_builder::OwnedBlock;
 use crate::writer::Compression;
 use crate::Element;
 
-/// Alias for the deterministic hash map used by the in-memory relation map.
-type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -118,8 +116,6 @@ pub fn renumber_external(
         hb.sorted()
     }, direct_io, false)?;
 
-    let mut next_relation_id = opts.start_relation_id;
-    let mut relation_map: FxHashMap<i64, i64> = FxHashMap::default();
     let mut stats = RenumberStats {
         nodes_written: 0,
         ways_written: 0,
@@ -263,15 +259,16 @@ pub fn renumber_external(
     }
     way_id_set.build_rank_index();
 
-    relation_r1_assign_ids(
+    let mut relation_id_set = super::id_set_dense::IdSetDense::new();
+    relation_r1_collect_ids(
         input,
         &relation_schedule,
-        &mut relation_map,
-        &mut next_relation_id,
+        &mut relation_id_set,
     )?;
+    relation_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
+        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_id_set.total_count() as i64);
     }
     crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
 
@@ -287,7 +284,8 @@ pub fn renumber_external(
         opts.start_node_id,
         &way_id_set,
         opts.start_way_id,
-        &relation_map,
+        &relation_id_set,
+        opts.start_relation_id,
         &mut stats,
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
@@ -1250,7 +1248,8 @@ fn reframe_ways_with_new_ids(
 #[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
 fn reframe_relations_with_new_ids(
     decompressed: &[u8],
-    relation_map: &FxHashMap<i64, i64>,
+    relation_id_set: &super::id_set_dense::IdSetDense,
+    start_relation_id: i64,
     node_id_set: &super::id_set_dense::IdSetDense,
     start_node_id: i64,
     way_id_set: &super::id_set_dense::IdSetDense,
@@ -1346,9 +1345,7 @@ fn reframe_relations_with_new_ids(
                 }
 
                 // Look up new relation id.
-                let new_rel_id = relation_map.get(&old_rel_id).copied().ok_or_else(|| {
-                    format!("reframe_relations: relation id {old_rel_id} missing from relation_map")
-                })?;
+                let new_rel_id = relation_id_set.resolve(old_rel_id, start_relation_id);
 
                 if new_rel_id < min_new_id {
                     min_new_id = new_rel_id;
@@ -1394,7 +1391,7 @@ fn reframe_relations_with_new_ids(
                         let new_abs_id = match member_type {
                             0 => node_id_set.resolve(old_abs_id, start_node_id),
                             1 => way_id_set.resolve(old_abs_id, start_way_id),
-                            2 => relation_map.get(&old_abs_id).copied().unwrap_or(old_abs_id),
+                            2 => relation_id_set.resolve(old_abs_id, start_relation_id),
                             _ => old_abs_id, // unknown type — preserve
                         };
 
@@ -1470,14 +1467,13 @@ fn reframe_relations_with_new_ids(
 // Fused relation resolve: R1 + R2A + R2B in one pass
 // ---------------------------------------------------------------------------
 
-/// R1 pass: assign sequential relation IDs and build the in-memory
-/// `relation_map`. No member ref resolution — that's done inline by
-/// R2d's wire-format rewriter via `resolve()`.
-fn relation_r1_assign_ids(
+/// R1 pass: collect relation IDs into an IdSetDense bitset.
+/// New IDs are derived via `start_relation_id + rank(old_id)` —
+/// no explicit mapping needed.
+fn relation_r1_collect_ids(
     input: &Path,
     relation_schedule: &[BlobTask],
-    relation_map: &mut FxHashMap<i64, i64>,
-    next_relation_id: &mut i64,
+    relation_id_set: &mut super::id_set_dense::IdSetDense,
 ) -> Result<()> {
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
@@ -1504,9 +1500,7 @@ fn relation_r1_assign_ids(
         for element in block.elements() {
             if let Element::Relation(r) = &element {
                 reject_negative_id(r.id(), "relation")?;
-                let new_id = *next_relation_id;
-                *next_relation_id += 1;
-                relation_map.insert(r.id(), new_id);
+                relation_id_set.set(r.id());
             }
         }
     }
@@ -1535,7 +1529,8 @@ fn relation_r2d_assembly(
     start_node_id: i64,
     way_id_set: &super::id_set_dense::IdSetDense,
     start_way_id: i64,
-    relation_map: &FxHashMap<i64, i64>,
+    relation_id_set: &super::id_set_dense::IdSetDense,
+    start_relation_id: i64,
     stats: &mut RenumberStats,
 ) -> Result<()> {
 
@@ -1578,7 +1573,8 @@ fn relation_r2d_assembly(
             let rx = std::sync::Arc::clone(&desc_rx);
             let file = std::sync::Arc::clone(&shared_file);
             let tx = decoded_tx.clone();
-            let rmap = relation_map;
+            let rid_set = relation_id_set;
+            let start_rid = start_relation_id;
             let rw = &rels_written;
             scope.spawn(move || {
                 use std::os::unix::fs::FileExt as _;
@@ -1609,7 +1605,8 @@ fn relation_r2d_assembly(
 
                         let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
                             &decompress_buf,
-                            rmap,
+                            rid_set,
+                            start_rid,
                             node_id_set,
                             start_node_id,
                             way_id_set,

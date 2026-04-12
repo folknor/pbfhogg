@@ -464,14 +464,15 @@ pub fn renumber_external(
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    let mut way_map_shard_a = BucketWriters::create(&scratch, "way-map-a")?;
-    let mut way_map_shard_b = BucketWriters::create(&scratch, "way-map-b")?;
+    const STAGE2D_WORKERS: usize = 4;
+    let mut way_map_shards: Vec<BucketWriters> = (0..STAGE2D_WORKERS)
+        .map(|i| BucketWriters::create(&scratch, &format!("way-map-{i}")))
+        .collect::<Result<Vec<_>>>()?;
     let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
     stage2d_parallel_way_assembly(
         input,
         &mut writer,
-        &mut way_map_shard_a,
-        &mut way_map_shard_b,
+        &mut way_map_shards,
         &new_refs_path,
         &ref_count_sidecar,
         total_slots,
@@ -479,10 +480,12 @@ pub fn renumber_external(
         &stage2d_ways_atomic,
     )?;
     stats.ways_written += stage2d_ways_atomic.load(std::sync::atomic::Ordering::Relaxed);
-    let way_map_counts_a = way_map_shard_a.finish()?;
-    let way_map_counts_b = way_map_shard_b.finish()?;
+    let shard_counts_2d: Vec<Vec<u64>> = way_map_shards
+        .iter_mut()
+        .map(BucketWriters::finish)
+        .collect::<Result<Vec<_>>>()?;
     let way_map_counts: Vec<u64> = (0..NUM_BUCKETS)
-        .map(|i| way_map_counts_a[i] + way_map_counts_b[i])
+        .map(|i| shard_counts_2d.iter().map(|sc| sc[i]).sum())
         .collect();
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -546,7 +549,7 @@ pub fn renumber_external(
     let mut way_member_slot_b = BucketWriters::create(&scratch, "rel-way-slot-b")?;
     stage2b_node_merge_join(
         &way_member_ref_buckets,
-        &[&way_map_shard_a, &way_map_shard_b],
+        &way_map_shards.iter().collect::<Vec<_>>(),
         &way_map_bucket_starts,
         &mut way_member_slot_a,
         &mut way_member_slot_b,
@@ -603,8 +606,7 @@ pub fn renumber_external(
     drop(way_member_slot_b);
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
-    drop(way_map_shard_a);
-    drop(way_map_shard_b);
+    drop(way_map_shards);
     drop(slot_buckets_a);
     drop(slot_buckets_b);
     drop(way_ref_buckets);
@@ -1634,8 +1636,7 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
 fn stage2d_parallel_way_assembly(
     input: &Path,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    way_map_shard_a: &mut BucketWriters,
-    way_map_shard_b: &mut BucketWriters,
+    way_map_shards: &mut [BucketWriters],
     new_refs_path: &Path,
     ref_count_sidecar: &Path,
     total_slots: u64,
@@ -1728,43 +1729,31 @@ fn stage2d_parallel_way_assembly(
             }
         });
 
-        // Worker A
-        let rx_a = std::sync::Arc::clone(&desc_rx);
-        let file_a = std::sync::Arc::clone(&shared_file);
-        let mmap_a = std::sync::Arc::clone(&new_refs_mmap);
-        let tx_a = decoded_tx.clone();
-        scope.spawn(move || {
-            stage2d_worker(
-                &rx_a,
-                base_ids_ref,
-                &file_a,
-                &mmap_a,
-                slots_ref,
-                total_slots,
-                way_map_shard_a,
-                ways_written,
-                &tx_a,
-            );
-        });
-
-        // Worker B
-        let rx_b = std::sync::Arc::clone(&desc_rx);
-        let file_b = std::sync::Arc::clone(&shared_file);
-        let mmap_b = std::sync::Arc::clone(&new_refs_mmap);
-        let tx_b = decoded_tx.clone();
-        scope.spawn(move || {
-            stage2d_worker(
-                &rx_b,
-                base_ids_ref,
-                &file_b,
-                &mmap_b,
-                slots_ref,
-                total_slots,
-                way_map_shard_b,
-                ways_written,
-                &tx_b,
-            );
-        });
+        {
+            let mut remaining: &mut [BucketWriters] = way_map_shards;
+            for _ in 0..remaining.len() {
+                let (head, tail) = remaining.split_at_mut(1);
+                remaining = tail;
+                let shard = &mut head[0];
+                let rx = std::sync::Arc::clone(&desc_rx);
+                let file = std::sync::Arc::clone(&shared_file);
+                let mmap = std::sync::Arc::clone(&new_refs_mmap);
+                let tx = decoded_tx.clone();
+                scope.spawn(move || {
+                    stage2d_worker(
+                        &rx,
+                        base_ids_ref,
+                        &file,
+                        &mmap,
+                        slots_ref,
+                        total_slots,
+                        shard,
+                        ways_written,
+                        &tx,
+                    );
+                });
+            }
+        }
 
         drop(decoded_tx);
         drop(desc_rx);

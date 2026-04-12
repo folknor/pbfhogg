@@ -523,7 +523,7 @@ single-pass, tag expression and bbox filtering.
     through an mpsc. Main thread runs `ReorderBuffer` + single-
     threaded bucket emits + sidecar writes. Cross-thread budget:
     ~384 KB per Vec × 32 channel slots = ~12 MB in flight.
-  - [ ] **R2B radix sort** (mirror of stage 2b for relation member
+  - [x] **R2B radix sort** — superseded by IdSetDense rank. (mirror of stage 2b for relation member
     merge-join). Re-uses `stage2b_node_merge_join` via the existing
     slice API, so it already benefits from the stage 2b radix sort
     — technically this item is already done. Left open as a
@@ -595,7 +595,7 @@ single-pass, tag expression and bbox filtering.
     Scopes the arena limit to external renumber only. 1 LoC:
     `unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }`. Not a global
     env var — other commands are unaffected. (planet-claude)
-  - [ ] **Re-apply `from_vec_with_scratch`** in pass1_worker and
+  - [x] **Re-apply `from_vec_with_scratch`** — superseded by wire-format rewriters. In pass1_worker and
     stage2d_worker (committed as `bcd7cbc`, reverted during dirty
     iteration). Eliminates PrimitiveBlock::new .to_vec() copy.
   - [x] **Batch bucket writes per block.** Accumulate old_ids into a
@@ -604,10 +604,10 @@ single-pass, tag expression and bbox filtering.
   - [x] **Per-block negative-id check via indexdata min_id.** If
     `min_id >= 0`, skip per-element `reject_negative_id`. ~3 s wall.
     (planet-claude)
-  - [ ] **Dense-node block-type fast path.** If block is DenseNodes,
+  - [x] **Dense-node block-type fast path.** Superseded by rewriter. If block is DenseNodes,
     skip the `Element` match dispatch entirely. ~minor. (planet-codex,
     perf-codex)
-  - [ ] **Current-bucket fast path for old_id emission.** Node IDs are
+  - [x] **Current-bucket fast path for old_id emission.** Superseded by IdSetDense::set. Node IDs are
     sorted, `node_id_bucket` is monotone. Track active bucket + end
     range, skip division for nodes in the same bucket. (perf-codex)
   - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker and
@@ -625,7 +625,7 @@ single-pass, tag expression and bbox filtering.
     and `pwrite` independent bucket ranges concurrently. ~10% of total
     wall (197 s), worth doing once the bigger wins are squeezed.
     (arch-codex, planet-claude)
-  - [ ] **Stage 2c/2d pipeline overlap.** Stage 2d could start consuming
+  - [x] **Stage 2c/2d pipeline overlap.** Superseded — stage 2c eliminated by IdSetDense fusion. Stage 2d could start consuming
     buckets from the new_refs file while stage 2c is still scattering
     later buckets. Feasible because stage 2d reads slots sequentially
     and stage 2c writes by bucket (sequential within each bucket range).
@@ -649,7 +649,7 @@ single-pass, tag expression and bbox filtering.
 
   **Smaller / defensive followups (non-blocking for planet bench):**
 
-  - [ ] **`fadvise(SEQUENTIAL)` before full bucket reads** in
+  - [x] **`fadvise(SEQUENTIAL)` before full bucket reads** — superseded, bucket reads eliminated. In
     `load_coo_bucket` / `load_single_old_id_bucket`. Small win on cold
     cache scenarios.
   - [x] **Sparse-file `new_refs` via `set_len` + `pwrite`** in stage 2c.
@@ -669,7 +669,7 @@ single-pass, tag expression and bbox filtering.
 
   **Round 4 reviewer findings (2026-04-12, perf-codex + planet-claude):**
 
-  - [ ] **Hoist `group_ranges` / `scalar_fields` to worker scratch** in
+  - [x] **Hoist `group_ranges` / `scalar_fields` to worker scratch** — commit `67fafac`. In
     both reframe functions. Currently per-blob allocations (1.3M node
     blobs + 17K way blobs). Trivially reusable — `group_ranges` usually
     has 1 entry, `scalar_fields` ~20 bytes. (planet-claude, perf-codex)
@@ -677,7 +677,7 @@ single-pass, tag expression and bbox filtering.
     Reduced from 5 to 4 passes. Within one bucket, ID range ≈ 55M <
     2^32, so byte 4 (bits 32-39) was constant = no-op shuffle.
     (perf-codex)
-  - [ ] **Fuse stage 2a + 2b via IdSetDense rank lookup** (unanimous
+  - [x] **Fuse stage 2a + 2b via IdSetDense rank lookup** — commit `9ec5eda`. (unanimous
     perf + planet reviewer consensus, 2026-04-12). Replace the entire
     CooPair bucket → radix sort → merge-join pipeline with a single
     fused way scan that resolves refs inline via `IdSetDense::rank()`.
@@ -691,7 +691,7 @@ single-pass, tag expression and bbox filtering.
     960 → ~683 s (11.4 min). IdSetDense with rank() already exists
     in `src/commands/id_set_dense.rs` from the geocode builder.
     (planet-claude, perf-codex)
-  - [ ] **Way_id_set for R2B.** Build a second `IdSetDense` during
+  - [x] **Way_id_set for R2B** — commits `c5c0e08`, `ae45fd6`. Build a second `IdSetDense` during
     stage 2d (set all old_way_ids, build_rank_index). Replaces R2B's
     merge-join with O(1) rank lookup. Estimated R2B: 68 → ~10 s.
     Eliminates way_map shard bucket files. (planet-claude)
@@ -702,14 +702,14 @@ single-pass, tag expression and bbox filtering.
   - [ ] **Consumer drain-rate instrumentation.** Measure time blocking
     on `rx.recv()` vs time in `write_primitive_block_owned`.
     Distinguishes worker-bound vs consumer-bound. (planet-claude)
-  - [ ] **Pre-compute ref deltas in stage 2c.** Store deltas (not
+  - [x] **Pre-compute ref deltas in stage 2c.** Superseded — stage 2c eliminated. Store deltas (not
     absolutes) in the flat `new_refs` file. Shifts 12.4B delta
     computations from stage 2d (per-blob, hot reframe loop) to stage 2c
     (per-slot, cold, I/O-bound). Would let the way rewriter skip
     delta-encoding entirely and copy pre-computed packed bytes. Complex
     but large savings if stage 2d reframe remains the bottleneck.
     (planet-claude)
-  - [ ] **Merge node_map directly from raw byte slices** in stage 2b
+  - [x] **Merge node_map directly from raw byte slices** — superseded by IdSetDense. In stage 2b
     instead of materializing `Vec<i64>` per shard. The streams are
     forward-only; a byte cursor per shard with inline varint-to-i64
     decode would eliminate the parse-into-Vec allocation. (perf-codex)
@@ -724,7 +724,7 @@ single-pass, tag expression and bbox filtering.
 
   **Defensive asserts / hardening:**
 
-  - [ ] **`debug_assert!(node_map.is_sorted_by_key(|p| p.old_id))`** in
+  - [x] **`debug_assert!(node_map.is_sorted_by_key(|p| p.old_id))`** — superseded, node_map eliminated. In
     stage 2b after loading a node_map bucket. The merge-join relies on
     this invariant (emission order = sorted input node order within a
     bucket). Cheap in debug, zero in release.
@@ -746,7 +746,7 @@ single-pass, tag expression and bbox filtering.
     1, stage 2a, stage 2d, relation R2a. Current direct field access
     was chosen for hot-loop clarity but the consolidation has no
     measurable cost and removes duplication.
-  - [ ] **Promote `CooPair` / `ResolvedEntry` to `external_radix.rs`** as
+  - [x] **Promote `CooPair` / `ResolvedEntry` to `external_radix.rs`** — superseded, most of stage 2b deleted. As
     generic `IdSlotPair<K>` / `ResolvedEntry<V>` **when a third caller
     appears.** Two callers (external_join, renumber_external) isn't
     enough to justify the abstraction cost; wait for the next external-

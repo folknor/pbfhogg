@@ -122,6 +122,12 @@ pub fn renumber_external(
         relations_written: 0,
     };
 
+    // Single shared input fd for all phases — pread is concurrent-safe.
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
     crate::debug::emit_marker("RENUMBER_EXT_START");
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
 
@@ -172,10 +178,6 @@ pub fn renumber_external(
     let mut worker_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..PASS1_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input).map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
 
     let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
 
@@ -229,7 +231,7 @@ pub fn renumber_external(
         .collect();
     let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
     stage2d_parallel_way_assembly(
-        input,
+        &shared_file,
         &mut writer,
         &mut way_id_sets,
         &way_schedule,
@@ -261,7 +263,7 @@ pub fn renumber_external(
 
     let mut relation_id_set = super::id_set_dense::IdSetDense::new();
     relation_r1_collect_ids(
-        input,
+        &shared_file,
         &relation_schedule,
         &mut relation_id_set,
     )?;
@@ -277,7 +279,7 @@ pub fn renumber_external(
     // No flat files, no mmaps, no sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
     relation_r2d_assembly(
-        input,
+        &shared_file,
         &relation_schedule,
         &mut writer,
         &node_id_set,
@@ -322,7 +324,7 @@ pub fn renumber_external(
     clippy::cast_possible_truncation
 )]
 fn stage2d_parallel_way_assembly(
-    input: &Path,
+    shared_file: &std::sync::Arc<std::fs::File>,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
     way_id_sets: &mut [super::id_set_dense::IdSetDense],
     way_schedule: &[BlobTask],
@@ -348,11 +350,6 @@ fn stage2d_parallel_way_assembly(
             )
             .ok_or("stage 2d base way_id overflow")?;
     }
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
 
     type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
@@ -380,7 +377,7 @@ fn stage2d_parallel_way_assembly(
                 remaining_sets = it;
                 let id_set = &mut is[0];
                 let rx = std::sync::Arc::clone(&desc_rx);
-                let file = std::sync::Arc::clone(&shared_file);
+                let file = std::sync::Arc::clone(shared_file);
                 let tx = decoded_tx.clone();
                 scope.spawn(move || {
                     stage2d_worker(
@@ -1471,12 +1468,10 @@ fn reframe_relations_with_new_ids(
 /// New IDs are derived via `start_relation_id + rank(old_id)` —
 /// no explicit mapping needed.
 fn relation_r1_collect_ids(
-    input: &Path,
+    shared_file: &std::fs::File,
     relation_schedule: &[BlobTask],
     relation_id_set: &mut super::id_set_dense::IdSetDense,
 ) -> Result<()> {
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
     let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
@@ -1522,7 +1517,7 @@ fn relation_r1_collect_ids(
     clippy::cast_possible_truncation
 )]
 fn relation_r2d_assembly(
-    input: &Path,
+    shared_file: &std::sync::Arc<std::fs::File>,
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     node_id_set: &super::id_set_dense::IdSetDense,
@@ -1537,11 +1532,6 @@ fn relation_r2d_assembly(
     if relation_schedule.is_empty() {
         return Ok(());
     }
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
 
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -1571,7 +1561,7 @@ fn relation_r2d_assembly(
         // Worker threads.
         for _ in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
-            let file = std::sync::Arc::clone(&shared_file);
+            let file = std::sync::Arc::clone(shared_file);
             let tx = decoded_tx.clone();
             let rid_set = relation_id_set;
             let start_rid = start_relation_id;

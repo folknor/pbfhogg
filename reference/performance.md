@@ -334,19 +334,23 @@ merge across 4 node_map shards. In-memory `FxHashMap` relation map
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
-Commit `48183b5`, UUID `cc59cc67`. Single-sample `--bench 1`.
+Commit `6165394`, dirty `--force --bench 1`. Single-sample.
 
 | Phase | Duration | Peak Anon | Share |
 |---|---:|---:|---:|
-| PASS1 nodes | **170 s** | 857 MB | 12.8% |
-| STAGE2A way emit | **125 s** | 1.03 GB | 9.4% |
-| STAGE2B node merge-join | **391 s** | **7.10 GB** | 29.3% |
-| STAGE2C slot reorder | 222 s | 1.93 GB | 16.7% |
-| STAGE2D way assembly | **284 s** | 789 MB | 21.3% |
-| R1+R2A fused | 29 s | 1.15 GB | 2.2% |
-| R2B rel merge-join | 68 s | 1.96 GB | 5.1% |
-| R2C + R2D | 34 s | 1.10 GB | 2.5% |
-| **TOTAL** | **1,334 s (22.2 min)** | **7.10 GB** | — |
+| PASS1 nodes | **169 s** | 610 MB | 15.5% |
+| STAGE2A way emit | **119 s** | 934 MB | 10.9% |
+| STAGE2B node merge-join | **381 s** | **7.32 GB** | 34.9% |
+| STAGE2C slot reorder | **146 s** | 3.03 GB | 13.4% |
+| STAGE2D way assembly | **129 s** | 809 MB | 11.8% |
+| R1+R2A fused | 29 s | 1.04 GB | 2.7% |
+| R2B rel merge-join | 68 s | 2.03 GB | 6.2% |
+| R2C + R2D | 34 s | 1.04 GB | 3.1% |
+| **TOTAL** | **1,092 s (18.2 min)** | **7.32 GB** | — |
+
+Stage 2b breakdown (cumulative across 2 workers):
+  load_way_refs 276 s, radix_sort 243 s, load_node_map 101 s,
+  merge_join 130 s. Stage 2b is the #1 remaining target.
 
 Element counts: 10,447,738,627 nodes / 1,165,589,744 ways / 14,124,889
 relations / 12,435,459,911 way refs. All match the first-measurement
@@ -368,8 +372,11 @@ baseline (`c5d00c22`) exactly.
 | `d3da65f` | Two-cursor merge + PrimitiveBlock copy fix | **1,901 s (31.7 min)** |
 | `dc13a7b` | DenseNodes wire-format rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
 | `48183b5` | Way wire-format rewriter for stage 2d | **1,334 s (22.2 min)** |
+| `dc13a7b` | DenseNodes rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
+| `d11166b` | Stage 2d 4 workers | **1,325 s (22.1 min)** |
+| `6165394` | 14-opt batch: splice, parallel 2c, schedule reuse, batch writes | **1,092 s (18.2 min)** |
 
-**−2,122 s (−61%)** from baseline. Each commit verified on Denmark
+**−2,364 s (−68%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS — see
 [notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md) for

@@ -334,19 +334,19 @@ merge across 4 node_map shards. In-memory `FxHashMap` relation map
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
 
-Commit `dc13a7b`, UUID `4d0e2c17`. Single-sample `--bench 1`.
+Commit `48183b5`, UUID `cc59cc67`. Single-sample `--bench 1`.
 
 | Phase | Duration | Peak Anon | Share |
 |---|---:|---:|---:|
-| PASS1 nodes | **168 s** | 834 MB | 11.4% |
-| STAGE2A way emit | **129 s** | 1.05 GB | 8.8% |
-| STAGE2B node merge-join | **382 s** | **7.04 GB** | 26.0% |
-| STAGE2C slot reorder | 224 s | 1.89 GB | 15.3% |
-| STAGE2D way assembly | **418 s** | 753 MB | 28.5% |
-| R1+R2A fused | 29 s | 1.03 GB | 2.0% |
-| R2B rel merge-join | 68 s | 1.95 GB | 4.6% |
-| R2C + R2D | 40 s | 983 MB | 2.7% |
-| **TOTAL** | **1,468 s (24.5 min)** | **7.04 GB** | — |
+| PASS1 nodes | **170 s** | 857 MB | 12.8% |
+| STAGE2A way emit | **125 s** | 1.03 GB | 9.4% |
+| STAGE2B node merge-join | **391 s** | **7.10 GB** | 29.3% |
+| STAGE2C slot reorder | 222 s | 1.93 GB | 16.7% |
+| STAGE2D way assembly | **284 s** | 789 MB | 21.3% |
+| R1+R2A fused | 29 s | 1.15 GB | 2.2% |
+| R2B rel merge-join | 68 s | 1.96 GB | 5.1% |
+| R2C + R2D | 34 s | 1.10 GB | 2.5% |
+| **TOTAL** | **1,334 s (22.2 min)** | **7.10 GB** | — |
 
 Element counts: 10,447,738,627 nodes / 1,165,589,744 ways / 14,124,889
 relations / 12,435,459,911 way refs. All match the first-measurement
@@ -367,8 +367,9 @@ baseline (`c5d00c22`) exactly.
 | `f607842` | Work-stealing dispatch for pass 1 + stage 2d | **2,033 s (33.9 min)** |
 | `d3da65f` | Two-cursor merge + PrimitiveBlock copy fix | **1,901 s (31.7 min)** |
 | `dc13a7b` | DenseNodes wire-format rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
+| `48183b5` | Way wire-format rewriter for stage 2d | **1,334 s (22.2 min)** |
 
-**−1,988 s (−57%)** from baseline. Each commit verified on Denmark
+**−2,122 s (−61%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS — see
 [notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md) for

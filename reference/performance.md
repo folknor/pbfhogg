@@ -377,8 +377,10 @@ baseline (`c5d00c22`) exactly.
 | `6165394` | 14-opt batch: splice, parallel 2c, schedule reuse, batch writes | **1,092 s (18.2 min)** |
 | `7839303` | Stage 2b/2c 4 workers + radix 4 passes | **960 s (16.0 min)** |
 | `9ec5eda` | IdSetDense rank fusion (eliminates stage 2a+2b+2c) | **505 s (8.4 min)** |
+| `c5c0e08` | Build way_id_set during stage 2d | **479 s (8.0 min)** |
+| `ae45fd6` | Eliminate way_map files + mmap R2B scatter | **442 s (7.4 min)** |
 
-**−2,951 s (−85%)** from baseline. Each commit verified on Denmark
+**−3,014 s (−87%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS — see
 [notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md) for

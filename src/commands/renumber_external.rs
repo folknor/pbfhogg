@@ -1814,11 +1814,12 @@ fn stage2d_worker(
 
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut local_bb = BlockBuilder::new();
+    let mut reframe_buf: Vec<u8> = Vec::new();
+    let mut old_ids_buf: Vec<i64> = Vec::new();
+    let mut refs_scratch: Vec<u8> = Vec::new();
+    let mut way_scratch: Vec<u8> = Vec::new();
+    let mut group_scratch: Vec<u8> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-    let mut refs_buf: Vec<i64> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
 
     loop {
@@ -1846,74 +1847,47 @@ fn stage2d_worker(
                 .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                 .map_err(|e| e.to_string())?;
-            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-                std::mem::take(&mut decompress_buf),
-                &mut st_scratch,
-                &mut gr_scratch,
-            )
-            .map_err(|e| e.to_string())?;
 
-            output_blocks.clear();
-            let mut slot_cursor = expected_slot_start;
-            let mut blob_way_count: u64 = 0;
-            let mut next_id = base_way_id;
+            // Wire-format rewriter: patch way IDs + refs, copy
+            // everything else verbatim. No PrimitiveBlock, no
+            // BlockBuilder.
+            reframe_buf.clear();
+            old_ids_buf.clear();
+            let blob_way_count = reframe_ways_with_new_ids(
+                &decompress_buf,
+                base_way_id,
+                new_refs_mmap,
+                expected_slot_start,
+                expected_slot_end,
+                &mut old_ids_buf,
+                &mut reframe_buf,
+                &mut refs_scratch,
+                &mut way_scratch,
+                &mut group_scratch,
+            )?;
 
-            for element in block.elements() {
-                if let Element::Way(w) = &element {
-                    reject_negative_id(w.id(), "way").map_err(|e| e.to_string())?;
-                    ensure_way_capacity_local(&mut local_bb, &mut output_blocks)?;
-                    let new_id = next_id;
-                    next_id += 1;
-
-                    refs_buf.clear();
-                    for _ in w.refs() {
-                        let offset = usize::try_from(slot_cursor)
-                            .map_err(|_| "slot_cursor > usize".to_string())?
-                            .checked_mul(NEW_REF_SIZE)
-                            .ok_or_else(|| "slot offset overflow".to_string())?;
-                        let end = offset
-                            .checked_add(NEW_REF_SIZE)
-                            .ok_or_else(|| "slot offset end overflow".to_string())?;
-                        let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap[offset..end]
-                            .try_into()
-                            .map_err(|_| "stage 2d new_refs slice".to_string())?;
-                        refs_buf.push(i64::from_le_bytes(bytes));
-                        slot_cursor += 1;
-                    }
-
-                    let meta = element_metadata(&w.info());
-                    local_bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
-
-                    // Emit old_way_id into the worker's way_map shard.
-                    let old_way_id = w.id();
-                    let bucket = way_id_bucket(old_way_id);
-                    id_buf = old_way_id.to_le_bytes();
-                    if let Some(w) = shard.writers[bucket].as_mut() {
-                        w.write_all(&id_buf).map_err(|e| e.to_string())?;
-                    }
-                    shard.entry_counts[bucket] += 1;
-                    blob_way_count += 1;
+            // Emit old_way_ids into the bucket shard.
+            for &old_way_id in &old_ids_buf {
+                let bucket = way_id_bucket(old_way_id);
+                id_buf = old_way_id.to_le_bytes();
+                if let Some(w) = shard.writers[bucket].as_mut() {
+                    w.write_all(&id_buf).map_err(|e| e.to_string())?;
                 }
+                shard.entry_counts[bucket] += 1;
             }
 
-            // Per-blob drift check — same invariant the sequential path
-            // enforced. Misalignment here means stage 2a and stage 2d
-            // disagreed on way iteration order and every subsequent
-            // blob's refs would be shifted.
-            if slot_cursor != expected_slot_end {
-                return Err(format!(
-                    "stage 2d slot cursor drift at way blob seq={}: \
-                     cursor = {slot_cursor}, expected = {expected_slot_end} \
-                     (blob start = {expected_slot_start})",
-                    task.seq
-                ));
-            }
+            // Build the OwnedBlock from the reframed bytes.
+            let index = crate::blob_index::BlobIndex {
+                kind: crate::blob_index::ElemKind::Way,
+                min_id: base_way_id,
+                #[allow(clippy::cast_possible_wrap)]
+                max_id: base_way_id + blob_way_count as i64 - 1,
+                count: blob_way_count,
+                bbox: None,
+            };
+            output_blocks.clear();
+            output_blocks.push((std::mem::take(&mut reframe_buf), index, None));
 
-            flush_local(&mut local_bb, &mut output_blocks)?;
-
-            // Sanity-check decoded count against indexdata so a
-            // mismatch surfaces immediately instead of collapsing the
-            // new_id space between neighboring blobs.
             if blob_way_count != task.element_count {
                 return Err(format!(
                     "stage 2d blob {} decoded {} ways, indexdata said {}",
@@ -1922,10 +1896,6 @@ fn stage2d_worker(
             }
 
             ways_written.fetch_add(blob_way_count, std::sync::atomic::Ordering::Relaxed);
-
-            if decompress_buf.capacity() == 0 {
-                decompress_buf = Vec::new();
-            }
 
             Ok(std::mem::take(&mut output_blocks))
         })();
@@ -2380,6 +2350,172 @@ fn reframe_dense_with_new_ids(
     output.extend_from_slice(&scalar_fields);
 
     Ok(total_nodes)
+}
+
+/// Reframe a decompressed way-blob PrimitiveBlock by replacing way IDs
+/// and node refs while copying everything else verbatim.
+///
+/// For each way: decode old way id (for bucket emission), assign new
+/// sequential way id, look up each ref's new node id from the new_refs
+/// mmap at the appropriate slot position, delta-encode the new refs,
+/// and copy keys/vals/info/lat/lon raw bytes verbatim.
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn reframe_ways_with_new_ids(
+    decompressed: &[u8],
+    base_new_way_id: i64,
+    new_refs_mmap: &[u8],
+    blob_slot_start: u64,
+    expected_slot_end: u64,
+    old_ids_out: &mut Vec<i64>,
+    output: &mut Vec<u8>,
+    refs_scratch: &mut Vec<u8>,
+    way_scratch: &mut Vec<u8>,
+    group_scratch: &mut Vec<u8>,
+) -> std::result::Result<u64, String> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+
+    // Phase 1: scan PrimitiveBlock top-level fields.
+    let mut stringtable_range: Option<(usize, usize)> = None;
+    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut scalar_fields: Vec<u8> = Vec::new();
+
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                stringtable_range = Some((offset, data.len()));
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                group_ranges.push((offset, data.len()));
+            }
+            _ => {
+                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                protohoggr::encode_tag(&mut scalar_fields, field, wire_type);
+                scalar_fields.extend_from_slice(raw);
+            }
+        }
+    }
+
+    let (st_offset, st_len) = stringtable_range
+        .ok_or("reframe_ways: no StringTable in PrimitiveBlock")?;
+    let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
+
+    output.clear();
+    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+
+    old_ids_out.clear();
+    let mut total_ways: u64 = 0;
+    let mut current_new_id = base_new_way_id;
+    let mut slot_cursor = blob_slot_start;
+
+    for &(gr_offset, gr_len) in &group_ranges {
+        let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+        group_scratch.clear();
+
+        let mut gr_cursor = Cursor::new(group_bytes);
+        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| e.to_string())? {
+            if field == 3 && wire_type == WIRE_LEN {
+                // Way submessage — reframe it.
+                let way_bytes = gr_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+
+                // Parse the Way: extract id (field 1) and refs (field 8),
+                // copy everything else verbatim.
+                let mut old_way_id: i64 = 0;
+                let mut old_refs_data: &[u8] = &[];
+                way_scratch.clear();
+
+                let mut way_cursor = Cursor::new(way_bytes);
+                while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| e.to_string())? {
+                    if wf == 1 && wt == WIRE_VARINT {
+                        old_way_id = way_cursor.read_varint_i64().map_err(|e| e.to_string())?;
+                    } else if wf == 8 && wt == WIRE_LEN {
+                        old_refs_data = way_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                    } else {
+                        // Copy other fields (keys, vals, info, lat, lon) verbatim.
+                        let raw = way_cursor.read_raw_field(wt).map_err(|e| e.to_string())?;
+                        protohoggr::encode_tag(way_scratch, wf, wt);
+                        way_scratch.extend_from_slice(raw);
+                    }
+                }
+
+                if old_way_id < 0 {
+                    return Err(format!(
+                        "renumber --mode external requires non-negative input ids. \
+                         Input contains way id {old_way_id}."
+                    ));
+                }
+                old_ids_out.push(old_way_id);
+
+                // Count refs by decoding old ref deltas (just to count).
+                let mut ref_count: u64 = 0;
+                let mut ref_cursor = Cursor::new(old_refs_data);
+                while ref_cursor.remaining() > 0 {
+                    let _delta = ref_cursor.read_sint64().map_err(|e| e.to_string())?;
+                    ref_count += 1;
+                }
+
+                // Look up new node IDs from the mmap and build new refs.
+                refs_scratch.clear();
+                let mut prev_new_ref: i64 = 0;
+                for i in 0..ref_count {
+                    let slot = usize::try_from(slot_cursor + i)
+                        .map_err(|_| "slot_cursor > usize")?;
+                    let offset = slot
+                        .checked_mul(NEW_REF_SIZE)
+                        .ok_or("slot offset overflow")?;
+                    let end = offset
+                        .checked_add(NEW_REF_SIZE)
+                        .ok_or("slot offset end overflow")?;
+                    let bytes: [u8; NEW_REF_SIZE] = new_refs_mmap[offset..end]
+                        .try_into()
+                        .map_err(|_| "new_refs slice")?;
+                    let new_ref = i64::from_le_bytes(bytes);
+                    let delta = new_ref - prev_new_ref;
+                    protohoggr::encode_varint(
+                        refs_scratch,
+                        protohoggr::zigzag_encode_64(delta),
+                    );
+                    prev_new_ref = new_ref;
+                }
+                slot_cursor += ref_count;
+
+                // Emit reframed Way: new id + copied fields + new refs.
+                let mut reframed_way: Vec<u8> = Vec::new();
+                protohoggr::encode_int64_field(&mut reframed_way, 1, current_new_id);
+                reframed_way.extend_from_slice(way_scratch);
+                protohoggr::encode_bytes_field(&mut reframed_way, 8, refs_scratch);
+
+                // Wrap as PrimitiveGroup field 3 (Way)
+                protohoggr::encode_bytes_field(group_scratch, 3, &reframed_way);
+
+                current_new_id += 1;
+                total_ways += 1;
+            } else {
+                // Non-way field in the group — copy verbatim.
+                let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                protohoggr::encode_tag(group_scratch, field, wire_type);
+                group_scratch.extend_from_slice(raw);
+            }
+        }
+
+        protohoggr::encode_bytes_field(output, 2, group_scratch);
+    }
+
+    output.extend_from_slice(&scalar_fields);
+
+    // Drift check
+    if slot_cursor != expected_slot_end {
+        return Err(format!(
+            "reframe_ways slot cursor drift: cursor = {slot_cursor}, \
+             expected = {expected_slot_end} (blob start = {blob_slot_start})"
+        ));
+    }
+
+    Ok(total_ways)
 }
 
 /// Process a single decoded blob: iterate elements, assign new ids,

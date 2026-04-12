@@ -52,8 +52,7 @@ pbfhogg commands (every CLI command is a brokkr subcommand):
 Utility commands (unchanged):
 - `brokkr check [-- args]` — run clippy + tests. Supports `--features`, `--no-default-features`, `--package` / `-p`.
   Output is minified by default: errors and warnings are shown as one-line summaries
-  with file:line locations. Use `--raw` for full unfiltered cargo output, or `--json`
-  for structured JSON (parseable via `jq` or similar).
+  with file:line locations.
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
 - `brokkr results` — with no UUID, auto-resolves to the most recent stored result.
 - `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report + sidecar profile data).

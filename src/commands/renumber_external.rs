@@ -335,15 +335,13 @@ pub fn renumber_external(
         build_kind_blob_schedule(input, crate::blob_index::ElemKind::Node)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
-    // Per-worker node_map bucket shards. Workers pull blobs from a
-    // shared FIFO queue (work-stealing), so each shard's per-bucket
-    // old_ids are still internally sorted (dispatcher FIFO + sorted
-    // input) but the two shards interleave in id space. Stage 2b's
-    // `load_old_id_bucket_shards` concatenates then radix-sorts.
+    // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
+    // single bitset with rank index for O(1) new_id lookup in the fused
+    // way scan. Replaces the old node_map shard bucket files entirely.
     const PASS1_WORKERS: usize = 4;
-    let mut node_map_shards: Vec<BucketWriters> = (0..PASS1_WORKERS)
-        .map(|i| BucketWriters::create(&scratch, &format!("node-map-{i}")))
-        .collect::<Result<Vec<_>>>()?;
+    let mut worker_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..PASS1_WORKERS)
+        .map(|_| super::id_set_dense::IdSetDense::new())
+        .collect();
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input).map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -355,7 +353,7 @@ pub fn renumber_external(
         &pass1_schedule,
         opts.start_node_id,
         &shared_file,
-        &mut node_map_shards,
+        &mut worker_id_sets,
         &nodes_written_atomic,
         &mut writer,
     )?;
@@ -375,95 +373,45 @@ pub fn renumber_external(
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
-    // Finalize all node_map shards. Files stay on disk for stage 2b.
-    let shard_counts: Vec<Vec<u64>> = node_map_shards
-        .iter_mut()
-        .map(BucketWriters::finish)
-        .collect::<Result<Vec<_>>>()?;
-    let node_map_counts: Vec<u64> = (0..NUM_BUCKETS)
-        .map(|i| shard_counts.iter().map(|sc| sc[i]).sum())
-        .collect();
+    // ---- Merge per-worker IdSetDense bitsets and build rank index ----
+    // Workers each built an independent bitset. Merge via bitwise OR,
+    // then build the rank prefix sums for O(1) rank() lookup.
+    let mut node_id_set = worker_id_sets.remove(0);
+    for other in worker_id_sets {
+        node_id_set.merge(other);
+    }
+    node_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap)]
     {
-        let total: u64 = node_map_counts.iter().sum();
-        crate::debug::emit_counter("renumber_ext_node_map_entries", total as i64);
+        crate::debug::emit_counter(
+            "renumber_ext_node_map_entries",
+            node_id_set.total_count() as i64,
+        );
     }
 
-    // ---- Pass 2 stage A: way-ref COO pair emission ----
-    // Build the way schedule once and reuse for both stage 2a and 2d.
+    // ---- Fused way scan: resolve refs via rank + emit to flat file ----
+    // Replaces old stage 2a (CooPair emission) + stage 2b (sort +
+    // merge-join) in a single pass. For each way ref, the new node id
+    // is `start_node_id + rank(old_node_id)` via the IdSetDense rank
+    // index. No CooPair temp files, no radix sort, no merge-join.
     let way_schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
 
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_START");
-    let mut way_ref_buckets = BucketWriters::create(&scratch, "way-ref")?;
+    crate::debug::emit_marker("RENUMBER_EXT_FUSED_WAY_START");
     let ref_count_sidecar: PathBuf = scratch.file_path("way-ref-counts");
-    let total_slots =
-        stage2a_way_ref_pass(input, direct_io, &way_schedule, &mut way_ref_buckets, &ref_count_sidecar)?;
-    let way_ref_counts = way_ref_buckets.finish()?;
+    let new_refs_path: PathBuf = scratch.file_path("new-refs");
+    let total_slots = fused_way_resolve(
+        input,
+        &way_schedule,
+        &node_id_set,
+        opts.start_node_id,
+        &ref_count_sidecar,
+        &new_refs_path,
+    )?;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("renumber_ext_way_ref_slots", total_slots as i64);
     }
-    let bucket_total: u64 = way_ref_counts.iter().sum();
-    // Hard assert in release: this invariant is load-bearing for the
-    // whole pass 2 pipeline. If stage 2a miscounted, stage 2b would
-    // silently emit fewer entries than stage 2c expects.
-    assert_eq!(
-        bucket_total, total_slots,
-        "stage 2a bucket entry sum must equal slot counter"
-    );
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2A_END");
-
-    // ---- Pass 2 stage B: node merge-join ----
-    // Compute the per-bucket new_id start offsets for node_map. The
-    // i-th entry in bucket k has new_id = start_node_id + prefix_sum +
-    // i. This replaces storing `new_id` alongside `old_id` on disk.
-    let node_map_bucket_starts =
-        compute_bucket_new_id_starts(opts.start_node_id, &node_map_counts);
-
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_START");
-    const STAGE2B_WORKERS: usize = 4;
-    let mut slot_bucket_shards: Vec<BucketWriters> = (0..STAGE2B_WORKERS)
-        .map(|i| BucketWriters::create(&scratch, &format!("slot-{i}")))
-        .collect::<Result<Vec<_>>>()?;
-    let resolved_count = stage2b_node_merge_join(
-        &way_ref_buckets,
-        &node_map_shards.iter().collect::<Vec<_>>(),
-        &node_map_bucket_starts,
-        &mut slot_bucket_shards,
-        total_slots,
-    )?;
-    for shard in &mut slot_bucket_shards {
-        shard.finish()?;
-    }
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("renumber_ext_resolved_entries", resolved_count as i64);
-    }
-    // Hard assert in release: one resolved entry per COO pair, orphans
-    // included. Mismatch means stage 2b dropped an entry and the new_refs
-    // flat file would have a zero-filled hole read as new_node_id=0.
-    assert_eq!(
-        resolved_count, total_slots,
-        "stage 2b must emit exactly total_slots resolved entries (orphans included)"
-    );
-    // Way-ref bucket files were deleted per-bucket inside stage 2b to cut
-    // peak temp disk. The `way_ref_buckets` struct's paths still exist
-    // but the filesystem entries are gone; drop the struct without
-    // calling cleanup() to avoid spurious remove_file errors.
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_END");
-
-    // ---- Pass 2 stage C: slot reorder → flat new_refs file ----
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_START");
-    let new_refs_path: PathBuf = scratch.file_path("new-refs");
-    stage2c_slot_reorder(
-        &slot_bucket_shards.iter().collect::<Vec<_>>(),
-        &new_refs_path,
-        total_slots,
-    )?;
-    for shard in &slot_bucket_shards {
-        shard.cleanup();
-    }
-    crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_END");
+    crate::debug::emit_marker("RENUMBER_EXT_FUSED_WAY_END");
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
@@ -531,55 +479,56 @@ pub fn renumber_external(
     // Reuses the same parallel stage2b_node_merge_join function used for
     // the way pass. Each call produces two slot shards (A and B) that
     // stage R2c reads as a slice.
+    // ---- Relation pass R2b+R2c: resolve member refs via rank ----
+    // Replaces the old merge-join + slot-reorder pipeline for relation
+    // members. For each (old_id, slot_pos) COO pair in the member ref
+    // buckets, resolve new_id via IdSetDense rank and scatter directly
+    // into the flat new_refs file via pwrite.
     crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
-    let way_map_bucket_starts =
-        compute_bucket_new_id_starts(opts.start_way_id, &way_map_counts);
 
-    let mut node_member_slots: Vec<BucketWriters> = (0..2)
-        .map(|i| BucketWriters::create(&scratch, &format!("rel-node-slot-{i}")))
-        .collect::<Result<Vec<_>>>()?;
-    stage2b_node_merge_join(
-        &node_member_ref_buckets,
-        &node_map_shards.iter().collect::<Vec<_>>(),
-        &node_map_bucket_starts,
-        &mut node_member_slots,
-        total_node_members,
-    )?;
-    for s in &mut node_member_slots { s.finish()?; }
-    node_member_ref_buckets.cleanup();
+    // Build way_id_set from stage 2d's old_way_ids.
+    // (stage 2d workers already collected old_ids — we need to rebuild
+    // from the way_map shard files, or build during stage 2d.)
+    // For now: build from way_map shard files.
+    let mut way_id_set = super::id_set_dense::IdSetDense::new();
+    for shard in &way_map_shards {
+        for bucket_idx in 0..NUM_BUCKETS {
+            if shard.entry_counts[bucket_idx] == 0 {
+                continue;
+            }
+            let mut data = Vec::new();
+            if let Ok(f) = std::fs::File::open(&shard.paths[bucket_idx]) {
+                std::io::Read::read_to_end(&mut &f, &mut data).ok();
+            }
+            for chunk in data.chunks_exact(OLD_ID_SIZE) {
+                let old_id = i64::from_le_bytes(chunk.try_into().unwrap_or_else(|_| unreachable!()));
+                way_id_set.set(old_id);
+            }
+        }
+    }
+    way_id_set.build_rank_index();
 
-    let mut way_member_slots: Vec<BucketWriters> = (0..2)
-        .map(|i| BucketWriters::create(&scratch, &format!("rel-way-slot-{i}")))
-        .collect::<Result<Vec<_>>>()?;
-    stage2b_node_merge_join(
-        &way_member_ref_buckets,
-        &way_map_shards.iter().collect::<Vec<_>>(),
-        &way_map_bucket_starts,
-        &mut way_member_slots,
-        total_way_members,
-    )?;
-    for s in &mut way_member_slots { s.finish()?; }
-    way_member_ref_buckets.cleanup();
-    crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
-
-    // ---- Relation pass R2c: slot reorder for each member type ----
-    crate::debug::emit_marker("RENUMBER_EXT_R2C_START");
     let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
-    stage2c_slot_reorder(
-        &node_member_slots.iter().collect::<Vec<_>>(),
+    resolve_member_refs_via_rank(
+        &node_member_ref_buckets,
+        &node_id_set,
+        opts.start_node_id,
         &node_member_new_refs_path,
         total_node_members,
     )?;
-    for s in &node_member_slots { s.cleanup(); }
+    node_member_ref_buckets.cleanup();
 
     let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
-    stage2c_slot_reorder(
-        &way_member_slots.iter().collect::<Vec<_>>(),
+    resolve_member_refs_via_rank(
+        &way_member_ref_buckets,
+        &way_id_set,
+        opts.start_way_id,
         &way_member_new_refs_path,
         total_way_members,
     )?;
-    for s in &way_member_slots { s.cleanup(); }
-    crate::debug::emit_marker("RENUMBER_EXT_R2C_END");
+    way_member_ref_buckets.cleanup();
+    crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
+    // R2C is eliminated — resolved entries scatter directly to flat file.
 
     // ---- Relation pass R2d: write renumbered relations to output ----
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
@@ -600,14 +549,9 @@ pub fn renumber_external(
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
-    drop(node_member_slots);
-    drop(way_member_slots);
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
     drop(way_map_shards);
-    drop(slot_bucket_shards);
-    drop(way_ref_buckets);
-    drop(node_map_shards);
     drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
@@ -2081,7 +2025,7 @@ fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
-    node_map_shards: &mut [BucketWriters],
+    id_sets: &mut [super::id_set_dense::IdSetDense],
     nodes_written: &std::sync::atomic::AtomicU64,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<()> {
@@ -2125,7 +2069,7 @@ fn pass1_parallel_scan(
         });
 
         {
-            let mut remaining: &mut [BucketWriters] = node_map_shards;
+            let mut remaining: &mut [super::id_set_dense::IdSetDense] = id_sets;
             for _ in 0..remaining.len() {
                 let (head, tail) = remaining.split_at_mut(1);
                 remaining = tail;
@@ -2225,7 +2169,7 @@ fn pass1_worker(
     rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
     base_new_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
-    shard: &mut BucketWriters,
+    id_set: &mut super::id_set_dense::IdSetDense,
     nodes_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
     tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
@@ -2238,7 +2182,6 @@ fn pass1_worker(
     let mut reframe_buf: Vec<u8> = Vec::new();
     let mut old_ids_buf: Vec<i64> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-    let mut bucket_batch: Vec<u8> = Vec::new();
     // Reusable scratch for reframe_dense_with_new_ids.
     let mut group_ranges_scratch: Vec<(usize, usize)> = Vec::new();
     let mut scalar_fields_scratch: Vec<u8> = Vec::new();
@@ -2307,32 +2250,11 @@ fn pass1_worker(
             }
 
             let t3 = std::time::Instant::now();
-            // Batch bucket writes: IDs are sorted, node_id_bucket is
-            // monotone. Accumulate consecutive same-bucket IDs into a
-            // byte buffer, flush with one write_all per bucket transition.
-            {
-                let mut cur_bucket: usize = usize::MAX;
-                bucket_batch.clear();
-                for &old_id in &old_ids_buf {
-                    let bucket = node_id_bucket(old_id);
-                    if bucket != cur_bucket && !bucket_batch.is_empty() {
-                        if let Some(w) = shard.writers[cur_bucket].as_mut() {
-                            w.write_all(&bucket_batch).map_err(|e| e.to_string())?;
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        { shard.entry_counts[cur_bucket] += (bucket_batch.len() / OLD_ID_SIZE) as u64; }
-                        bucket_batch.clear();
-                    }
-                    cur_bucket = bucket;
-                    bucket_batch.extend_from_slice(&old_id.to_le_bytes());
-                }
-                if !bucket_batch.is_empty() {
-                    if let Some(w) = shard.writers[cur_bucket].as_mut() {
-                        w.write_all(&bucket_batch).map_err(|e| e.to_string())?;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    { shard.entry_counts[cur_bucket] += (bucket_batch.len() / OLD_ID_SIZE) as u64; }
-                }
+            // Set all old_ids in the per-worker IdSetDense bitset.
+            // No bucket files — the bitset + rank index replaces
+            // the external node_map entirely.
+            for &old_id in &old_ids_buf {
+                id_set.set(old_id);
             }
             #[allow(clippy::cast_possible_truncation)]
             counters.bucket_emit_ms.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
@@ -2373,6 +2295,249 @@ fn pass1_worker(
 // ---------------------------------------------------------------------------
 // DenseNodes wire-format rewriter for pass 1
 // ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Relation member resolve via rank
+// ---------------------------------------------------------------------------
+
+/// Resolve relation member refs directly via IdSetDense rank lookup.
+/// Reads (old_id, slot_pos) COO pairs from the member ref buckets,
+/// resolves each to new_id = start_id + rank(old_id), and scatters
+/// the results into a flat file at position slot_pos * NEW_REF_SIZE
+/// via pwrite. Replaces the old R2B merge-join + R2C slot-reorder.
+#[allow(clippy::cast_possible_truncation)]
+fn resolve_member_refs_via_rank(
+    ref_buckets: &BucketWriters,
+    id_set: &super::id_set_dense::IdSetDense,
+    start_id: i64,
+    output_path: &Path,
+    total_slots: u64,
+) -> Result<()> {
+    use std::os::unix::fs::FileExt as _;
+
+    if total_slots == 0 {
+        std::fs::write(output_path, &[]).map_err(|e| format!("create empty refs: {e}"))?;
+        return Ok(());
+    }
+
+    let file = std::fs::File::create(output_path)
+        .map_err(|e| format!("create member refs file: {e}"))?;
+    file.set_len(total_slots * NEW_REF_SIZE as u64)?;
+
+    let mut data_buf: Vec<u8> = Vec::new();
+
+    for bucket_idx in 0..NUM_BUCKETS {
+        if ref_buckets.entry_counts[bucket_idx] == 0 {
+            continue;
+        }
+        data_buf.clear();
+        let f = std::fs::File::open(&ref_buckets.paths[bucket_idx])
+            .map_err(|e| format!("open member ref bucket: {e}"))?;
+        std::io::Read::read_to_end(&mut &f, &mut data_buf)
+            .map_err(|e| format!("read member ref bucket: {e}"))?;
+
+        for chunk in data_buf.chunks_exact(COO_PAIR_SIZE) {
+            let old_id = i64::from_le_bytes(
+                chunk[..8].try_into().unwrap_or_else(|_| unreachable!()),
+            );
+            let slot_pos = u64::from_le_bytes(
+                chunk[8..16].try_into().unwrap_or_else(|_| unreachable!()),
+            );
+            #[allow(clippy::cast_possible_wrap)]
+            let new_id = if id_set.get(old_id) {
+                start_id + id_set.rank(old_id) as i64
+            } else {
+                old_id // orphan
+            };
+            let offset = slot_pos * NEW_REF_SIZE as u64;
+            file.write_all_at(&new_id.to_le_bytes(), offset)
+                .map_err(|e| format!("pwrite member ref at {offset}: {e}"))?;
+        }
+    }
+
+    file.sync_data()?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Fused way resolve: replaces stage 2a + stage 2b
+// ---------------------------------------------------------------------------
+
+/// Single-pass fused way scan that resolves node refs via IdSetDense
+/// rank() and writes the resolved new_node_ids directly to the flat
+/// new_refs file. Replaces the old CooPair emission → radix sort →
+/// merge-join pipeline entirely.
+///
+/// Workers decompress + scan way blobs in parallel, collecting per-blob
+/// ref old_ids. For each old_id, the worker computes:
+///   new_id = start_node_id + rank(old_id) if present, else old_id
+/// and sends a Vec<i64> of new_node_ids to the consumer.
+///
+/// The consumer writes new_node_ids sequentially to the flat file
+/// (one i64 LE per slot) and per-blob ref counts to the sidecar.
+/// No intermediate bucket files, no sort, no merge-join.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn fused_way_resolve(
+    input: &Path,
+    schedule: &[BlobTask],
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
+    ref_count_sidecar: &Path,
+    new_refs_path: &Path,
+) -> Result<u64> {
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    let mut sidecar_writer = BufWriter::with_capacity(
+        64 * 1024,
+        std::fs::File::create(ref_count_sidecar)
+            .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
+    );
+
+    let mut refs_file = BufWriter::with_capacity(
+        256 * 1024,
+        std::fs::File::create(new_refs_path)
+            .map_err(|e| format!("failed to create new_refs file: {e}"))?,
+    );
+
+    let mut slot_pos: u64 = 0;
+
+    if schedule.is_empty() {
+        sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
+        sidecar_writer.flush()?;
+        return Ok(slot_pos);
+    }
+
+    // Workers: decompress + scan_way_refs + resolve via rank().
+    // Send Vec<i64> of new_node_ids per blob to consumer.
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(6);
+
+    type ScanItem = (usize, std::result::Result<Vec<i64>, String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (scan_tx, scan_rx) = std::sync::mpsc::sync_channel::<ScanItem>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher
+        scope.spawn(move || {
+            for task in schedule {
+                if desc_tx.send(task).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Workers
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = scan_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::os::unix::fs::FileExt as _;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut refs_buf: Vec<i64> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+                loop {
+                    let task = {
+                        let guard =
+                            rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(t) => t,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let result: std::result::Result<Vec<i64>, String> = (|| {
+                        read_buf.resize(task.data_size, 0);
+                        file.read_exact_at(&mut read_buf, task.data_offset)
+                            .map_err(|e| {
+                                format!("pread failed at offset {}: {e}", task.data_offset)
+                            })?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| e.to_string())?;
+
+                        // Scan way refs and resolve each via rank().
+                        let mut new_ids: Vec<i64> = Vec::with_capacity(64 * 1024);
+                        let mut scan_err: Option<String> = None;
+                        super::way_scanner::scan_way_refs(
+                            &decompress_buf,
+                            &mut refs_buf,
+                            &mut group_starts,
+                            |_way_id, refs| {
+                                if scan_err.is_some() {
+                                    return;
+                                }
+                                for &old_node_id in refs {
+                                    if old_node_id < 0 {
+                                        scan_err = Some(format!(
+                                            "renumber --mode external requires non-negative \
+                                             input ids. Way references negative node id \
+                                             {old_node_id}. Use --mode inmem for files with \
+                                             negative (editor-local) ids."
+                                        ));
+                                        return;
+                                    }
+                                    let new_id = if node_id_set.get(old_node_id) {
+                                        #[allow(clippy::cast_possible_wrap)]
+                                        { start_node_id + node_id_set.rank(old_node_id) as i64 }
+                                    } else {
+                                        old_node_id // orphan
+                                    };
+                                    new_ids.push(new_id);
+                                }
+                            },
+                        )
+                        .map_err(|e| e.to_string())?;
+                        if let Some(e) = scan_err {
+                            return Err(e);
+                        }
+                        Ok(new_ids)
+                    })();
+
+                    if tx.send((task.seq, result)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(scan_tx);
+
+        // Consumer: reorder by seq, write to flat file + sidecar.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<Vec<i64>, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        for (seq_num, item) in scan_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let new_ids =
+                    result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let blob_ref_count = new_ids.len() as u64;
+                for new_id in new_ids {
+                    refs_file.write_all(&new_id.to_le_bytes())?;
+                }
+                slot_pos += blob_ref_count;
+                sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    })?;
+
+    // Trailer: total ref count for alignment verification in stage 2d.
+    sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
+    sidecar_writer.flush()?;
+    refs_file.flush()?;
+
+    Ok(slot_pos)
+}
 
 /// Reframe a decompressed PrimitiveBlock by replacing only the DenseNodes
 /// ID deltas while copying everything else (string table, lat/lon, tags,

@@ -169,8 +169,10 @@ pub fn renumber_external(
     // per-blob OwnedBlock output on the worker thread (so PrimitiveBlocks
     // drop on the worker) and only crossing the Vec<u8> of already-encoded
     // output bytes.
-    let pass1_schedule =
-        build_kind_blob_schedule(input, crate::blob_index::ElemKind::Node)?;
+    // Scan all blob headers once — builds node/way/relation schedules
+    // in a single pass instead of scanning 3-4 times.
+    let (pass1_schedule, way_schedule, relation_schedule) =
+        build_all_blob_schedules(input)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
     // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
@@ -227,9 +229,6 @@ pub fn renumber_external(
         );
     }
 
-    // ---- Fused way scan: resolve refs via rank + emit to flat file ----
-    let way_schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
-
     // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
     // Resolves way refs inline via node_id_set.rank() during
     // wire-format splice. No intermediate flat file or sidecar.
@@ -275,6 +274,7 @@ pub fn renumber_external(
     let rel_member_count_sidecar: PathBuf = scratch.file_path("rel-member-counts");
     let (total_node_members, total_way_members) = fused_relation_resolve(
         input,
+        &relation_schedule,
         &node_id_set,
         opts.start_node_id,
         &way_id_set,
@@ -298,6 +298,7 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
     relation_r2d_assembly(
         input,
+        &relation_schedule,
         &mut writer,
         &node_member_new_refs_path,
         &way_member_new_refs_path,
@@ -589,17 +590,22 @@ struct BlobTask {
 /// precompute each blob's `base_new_id` without a full decode pass. If a
 /// matching blob is missing indexdata, we error out with a pointer to
 /// `brokkr cat` / indexed datasets.
-fn build_kind_blob_schedule(
+/// Scan all blob headers once and build per-kind schedules.
+/// Returns `(node_schedule, way_schedule, relation_schedule)`.
+fn build_all_blob_schedules(
     input: &Path,
-    kind: crate::blob_index::ElemKind,
-) -> Result<Vec<BlobTask>> {
+) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner
         .next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut schedule: Vec<BlobTask> = Vec::new();
-    let mut seq: usize = 0;
+    let mut nodes: Vec<BlobTask> = Vec::new();
+    let mut ways: Vec<BlobTask> = Vec::new();
+    let mut relations: Vec<BlobTask> = Vec::new();
+    let mut node_seq: usize = 0;
+    let mut way_seq: usize = 0;
+    let mut rel_seq: usize = 0;
     while let Some(result) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
@@ -612,20 +618,22 @@ fn build_kind_blob_schedule(
                     .into(),
             );
         };
-        if idx.kind != kind {
-            continue;
-        }
-        schedule.push(BlobTask {
-            seq,
+        let (sched, seq) = match idx.kind {
+            crate::blob_index::ElemKind::Node => (&mut nodes, &mut node_seq),
+            crate::blob_index::ElemKind::Way => (&mut ways, &mut way_seq),
+            crate::blob_index::ElemKind::Relation => (&mut relations, &mut rel_seq),
+        };
+        sched.push(BlobTask {
+            seq: *seq,
             data_offset,
             data_size,
             element_count: idx.count,
             min_id: idx.min_id,
             bbox: idx.bbox,
         });
-        seq += 1;
+        *seq += 1;
     }
-    Ok(schedule)
+    Ok((nodes, ways, relations))
 }
 
 /// Two-worker parallel pass 1 via **work-stealing** dispatch.
@@ -1534,31 +1542,6 @@ fn reframe_relations_with_new_ids(
     Ok((total_relations, min_new_id, max_new_id))
 }
 
-fn build_blob_schedule(
-    input: &Path,
-    kind: crate::blob_index::ElemKind,
-) -> Result<Vec<(u64, usize)>> {
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner
-        .next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut schedule: Vec<(u64, usize)> = Vec::new();
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, _frame_offset, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if let Some(idx) = hdr.index() {
-            if idx.kind != kind {
-                continue;
-            }
-        }
-        schedule.push((data_offset, data_size));
-    }
-    Ok(schedule)
-}
-
 // ---------------------------------------------------------------------------
 // Fused relation resolve: R1 + R2A + R2B in one pass
 // ---------------------------------------------------------------------------
@@ -1573,6 +1556,7 @@ fn build_blob_schedule(
 #[allow(clippy::too_many_arguments)]
 fn fused_relation_resolve(
     input: &Path,
+    relation_schedule: &[BlobTask],
     node_id_set: &super::id_set_dense::IdSetDense,
     start_node_id: i64,
     way_id_set: &super::id_set_dense::IdSetDense,
@@ -1583,7 +1567,6 @@ fn fused_relation_resolve(
     way_refs_path: &Path,
     member_count_sidecar_path: &Path,
 ) -> Result<(u64, u64)> {
-    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
@@ -1605,11 +1588,11 @@ fn fused_relation_resolve(
     );
 
     use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        raw_buf.resize(data_size, 0);
+    for task in relation_schedule {
+        raw_buf.resize(task.data_size, 0);
         shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+            .read_exact_at(&mut raw_buf, task.data_offset)
+            .map_err(|e| format!("failed to pread relation blob at {}: {e}", task.data_offset))?;
         let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
@@ -1741,6 +1724,7 @@ fn load_member_count_sidecar(
 )]
 fn relation_r2d_assembly(
     input: &Path,
+    relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     node_member_new_refs_path: &Path,
     way_member_new_refs_path: &Path,
@@ -1759,18 +1743,16 @@ fn relation_r2d_assembly(
         total_way_members,
     )?;
 
-    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
-
-    if schedule.len() != node_starts.len() {
+    if relation_schedule.len() != node_starts.len() {
         return Err(format!(
             "R2d: relation blob schedule size {} != sidecar entries {}",
-            schedule.len(),
+            relation_schedule.len(),
             node_starts.len()
         )
         .into());
     }
 
-    if schedule.is_empty() {
+    if relation_schedule.is_empty() {
         return Ok(());
     }
 
@@ -1798,12 +1780,12 @@ fn relation_r2d_assembly(
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher thread — sends (seq, data_offset, data_size, node_start, way_start).
-        let sched = &schedule;
+        let sched = relation_schedule;
         let n_starts = &node_starts;
         let w_starts = &way_starts;
         scope.spawn(move || {
-            for (i, &(data_offset, data_size)) in sched.iter().enumerate() {
-                let msg = (i, data_offset, data_size, n_starts[i], w_starts[i]);
+            for (i, task) in sched.iter().enumerate() {
+                let msg = (i, task.data_offset, task.data_size, n_starts[i], w_starts[i]);
                 if desc_tx.send(msg).is_err() {
                     break;
                 }

@@ -610,6 +610,37 @@ single-pass, tag expression and bbox filtering.
   - [x] **Current-bucket fast path for old_id emission.** Superseded by IdSetDense::set. Node IDs are
     sorted, `node_id_bucket` is monotone. Track active bucket + end
     range, skip division for nodes in the same bucket. (perf-codex)
+  **Sub-6 minute plan (round 6 reviewer consensus, 2026-04-12):**
+
+  Current: 442 s (7m22s). Target: 360 s (6 min). Need 82 s.
+
+  - [ ] **Parallelize R1+R2A** (28 → ~8 s, save ~20 s). Pre-scan
+    relation blob headers for per-blob element counts, compute prefix
+    sums for starting relation IDs. Workers pread + decompress +
+    assign IDs + emit CooPairs. Consumer merges relation_map entries
+    and CooPair bucket writes. Same dispatch pattern as pass 1.
+    (planet-claude, perf-codex)
+  - [ ] **Parallelize R2D** (32 → ~10 s, save ~22 s). Workers produce
+    OwnedBlocks via reorder buffer, same as pass 1/stage 2d. Need a
+    per-blob `(node_member_count, way_member_count)` sidecar from
+    R2A for per-worker slot cursor starts. (planet-claude, perf-codex)
+  - [ ] **Relation wire-format rewriter for R2D.** Splice approach:
+    patch relation id + member ids, copy roles/keys/vals/info
+    verbatim. Stacks on top of R2D parallelization. (perf-codex)
+  - [ ] **zlib-ng feature flag.** `flate2 = { features = ["zlib-ng"] }`
+    for 20-40% faster inflate on x86-64 with AVX2. Decompress is the
+    dominant cumulative cost: pass 1 (282 s) + stage 2d (131 s) +
+    fused way (embedded). Estimated ~20-25 s wall save. Requires C
+    compiler at build time. (planet-claude)
+  - [ ] **Parallel direct-write FUSED_WAY.** Workers pwrite resolved
+    refs directly to disjoint regions of the flat new_refs file
+    instead of the current sequential consumer write. Requires
+    pre-computing per-blob ref counts (sidecar). (perf-codex)
+  - [x] **6 workers for pass 1 + stage 2d.** Consumer headroom
+    confirmed (116 ms / 6 ms). Stage 2d has only ~20K way blobs
+    so pread contention should be negligible. Pass 1 may see
+    diminishing returns from pread contention on 1.3M node blobs.
+
   - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker and
     stage2d_worker `mem::take` the reframe_buf into OwnedBlock each blob,
     losing capacity. A ping-pong pair or consumer→worker return channel

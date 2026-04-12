@@ -338,7 +338,7 @@ pub fn renumber_external(
     // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
     // single bitset with rank index for O(1) new_id lookup in the fused
     // way scan. Replaces the old node_map shard bucket files entirely.
-    const PASS1_WORKERS: usize = 4;
+    const PASS1_WORKERS: usize = 6;
     let mut worker_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..PASS1_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
@@ -415,7 +415,7 @@ pub fn renumber_external(
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    const STAGE2D_WORKERS: usize = 4;
+    const STAGE2D_WORKERS: usize = 6;
     let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();

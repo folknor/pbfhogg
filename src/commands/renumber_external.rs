@@ -1861,6 +1861,8 @@ fn stage2d_worker(
 
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut local_bb = BlockBuilder::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut refs_buf: Vec<i64> = Vec::new();
@@ -1891,9 +1893,11 @@ fn stage2d_worker(
                 .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                 .map_err(|e| e.to_string())?;
-            let block = crate::block::PrimitiveBlock::new(bytes::Bytes::from(
+            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
                 std::mem::take(&mut decompress_buf),
-            ))
+                &mut st_scratch,
+                &mut gr_scratch,
+            )
             .map_err(|e| e.to_string())?;
 
             output_blocks.clear();
@@ -2197,6 +2201,8 @@ fn pass1_worker(
 
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
     let mut local_bb = BlockBuilder::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
@@ -2220,9 +2226,11 @@ fn pass1_worker(
                 .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                 .map_err(|e| e.to_string())?;
-            let block = crate::block::PrimitiveBlock::new(bytes::Bytes::from(
+            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
                 std::mem::take(&mut decompress_buf),
-            ))
+                &mut st_scratch,
+                &mut gr_scratch,
+            )
             .map_err(|e| e.to_string())?;
 
             output_blocks.clear();

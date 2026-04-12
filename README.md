@@ -50,11 +50,10 @@ Sorted by peak memory — the hardest operations still fit in 32 GB with room to
 | `extract --smart` (Europe bbox) | 4m39s | 11.17 GB † | three-pass, multipolygon-complete |
 | `build-geocode-index` | 22m26s | 14.59 GB | reverse geocoding index, S2 cells |
 | `add-locations-to-ways --index-type external` | 24m22s | **16.67 GB** | double-radix permutation, ~112 GB temp disk |
-| `renumber --mode external` §     | 57m36s | **2.79 GB** | 256-bucket radix partition; design note [notes/renumber-planet-scale.md](notes/renumber-planet-scale.md) |
+| `renumber --mode external`       | 33m53s | **7.31 GB** | 256-bucket radix partition, parallel decode (pass 1 + stage 2a + stage 2d), work-stealing dispatch |
 
 † Single-sample `--bench 1` measurement with Europe bbox. See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md) for the investigation that validated the 32 GB host ceiling. \
-‡ Older runs without sidecar profiler; peak RSS stated from investigation notes. \
-§ First planet measurement (commit `e156e97`, UUID `c5d00c22`). Functionally correct (element counts match: 10.4B nodes / 1.17B ways / 14.1M relations), memory well under target. Wall time 2.6× the design estimate, accepted target after planet+perf+arch review is **~24 min** — a seven-item optimization roadmap (stage 2b radix sort, halve the map-bucket record format, stage 2b bucket-level parallelism, shared ordered-write pread helper applied to pass 1/stage 2d/stage 2a, R2B radix sort) lands incrementally. Same ballpark as `add-locations-to-ways --index-type external` (24m22s) and `build-geocode-index` (22m26s). See [notes/renumber-planet-scale.md](notes/renumber-planet-scale.md) for the per-stage breakdown, reviewer consensus findings, and priority-ordered task list.
+‡ Older runs without sidecar profiler; peak RSS stated from investigation notes.
 
 Not yet measured on planet, all pending tonight's overnight bench suite: `sort`, `inspect`, `getparents`, `extract --simple` / `--complete`, `multi-extract`, `diff`, `diff --format osc`, `merge-changes` (multi-OSC, 7-file range), and fresh sidecar-profiled runs for `cat` indexdata generation and `apply-changes`. `time-filter` stays unmeasured — it needs a history PBF we don't have. `add-locations-to-ways --index-type dense` is expected to thrash on ≤32 GB hosts (~30+ GB mmap working set) — use `external` instead. **`renumber --mode inmem`** (the default) remains **not planet-safe** — the in-memory `FxHashMap` architecture requires ~278 GB at planet scale. Users needing planet-scale renumber should pass `--mode external`.
 

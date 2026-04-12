@@ -531,12 +531,16 @@ single-pass, tag expression and bbox filtering.
     `stage2a_way_ref_pass`-shaped pattern if the planet profile
     shows it as a significant floor after the April 2026 rewrite.
 
-  **Projected total after the completed wins: ~1,430 s (23.8 min).**
-  Awaiting planet bench measurement on commit `e7219f0` (2026-04-11)
-  for ground truth — see task #7 in the local task list. Memory peak
-  stays ~2.79 GB (stage 2b's 2-worker parallelism pushes slightly
-  higher but map shrink halves the per-side allocation, netting
-  neutral). Temp disk peak drops by ~83 GB (node_map halved).
+  **Projected total was ~1,430 s (23.8 min). Measured: 2,033 s (33.9 min)**
+  on commit `f607842` (UUID `d8330e2a`, 2026-04-12). **−41% vs the
+  3,456 s baseline**, short of the 24-min stretch target. Gap is mainly
+  stage 2b (427 s measured vs 150 s target) — work-stealing dispatch
+  requires `load_old_id_bucket_shards` to concat + radix-sort two
+  interleaved node_map shards, which doubled the per-bucket read I/O
+  and added a sort pass the range-based approach didn't need (but the
+  range-based approach OOMed, see "Pass 1 memory blowup" in
+  notes/renumber-planet-scale.md). Peak anon 7.31 GB (up from 2.79
+  GB), well under the 30 GB host limit.
 
   **Smaller / defensive followups (non-blocking for 24-min target):**
 

@@ -510,11 +510,74 @@ denmark`, 306-relation-member orphan delta preserved exactly across
 every commit). Planet was deferred to a single bench run on the
 final commit to amortize the ~1 hour measurement cost.
 
-**Honest re-estimate vs ALTW context**: 24 min puts renumber in the
-same ballpark as `add-locations-to-ways --index-type external`
-(24m22s) and `build-geocode-index` (22m26s) at planet scale — both
-other disk-backed external transforms. That's the expected shape
-for planet transforms that touch every element.
+### Second planet measurement: 2026-04-12, commit `f607842`, UUID `d8330e2a`
+
+**All seven optimizations landed.** `brokkr renumber --dataset planet
+--mode external --bench 1` on plantasjen (same host as first
+measurement).
+
+| Phase | Baseline | Measured | Δ |
+|---|---:|---:|---|
+| PASS1 nodes | 1,147 s | **676 s** | −471 s (−41%) |
+| STAGE2A way emit | 339 s | **133 s** | −206 s (−61%) |
+| STAGE2B node merge-join | 823 s | **427 s** | −396 s (−48%) |
+| STAGE2C slot reorder | 174 s | 197 s | +23 s |
+| STAGE2D way assembly | 664 s | **391 s** | −273 s (−41%) |
+| R1+R2A fused | 31 s | 30 s | ≈ |
+| R2B rel merge-join | 236 s | **138 s** | −98 s (−42%) |
+| R2C + R2D | 35 s | 35 s | ≈ |
+| **TOTAL** | **3,456 s (57.6 min)** | **2,033 s (33.9 min)** | **−1,423 s (−41%)** |
+
+Peak anon RSS: **7.31 GB** (up from 2.79 GB). The growth is in stage
+2b — work-stealing dispatch means `load_old_id_bucket_shards`
+concatenates two interleaved shards and radix-sorts the combined
+vector. Two workers × (way_refs + scratch + node_map + node_map_scratch)
+≈ 3.4 GB per worker ≈ 6.8 GB peak. Well under the 30 GB host
+limit.
+
+Element counters all match the baseline exactly: 10,447,738,627
+nodes / 12,435,459,911 way refs / 1,165,589,744 ways / 14,124,889
+relations.
+
+### Analysis: 33.9 min vs 23.8 min target
+
+Missed the stretch target by ~10 min. Stage 2b is the main gap
+(427 s measured vs 150 s projected). Three factors:
+
+1. **Node_map radix sort.** The range-based dispatch used in commits
+   `8ec298c`–`e7219f0` OOMed at 26 GB anon RSS because the single
+   `ReorderBuffer` accumulated worker B's entire backlog while worker
+   A's range drained (118 MB/s linear growth, killed at t=295 s). The
+   fix (commit `f607842`) switched to work-stealing dispatch, which
+   keeps the reorder gap bounded at O(64) — but shards now interleave
+   in id space, requiring a `radix_sort_ids` pass after concatenation.
+   The original roadmap assumed sorted-concat from disjoint ranges
+   which would have been free.
+2. **Double shard I/O.** With work-stealing, each shard contains an
+   arbitrary subset of the input's node blobs. Stage 2b reads both
+   shards' files for every bucket — 2× the disk I/O per bucket vs
+   the old single-node_map path.
+3. **Higher per-bucket RAM.** Combined shards + radix scratch ≈ 3.4
+   GB per worker. Planet's 7.31 GB peak is exactly here.
+
+Remaining levers if the 24-min target is revisited:
+- **Sorted merge instead of concat + sort.** Each shard is internally
+  sorted (work-stealing pulls in FIFO order, PBF is sorted). A 2-way
+  merge would eliminate the `radix_sort_ids` pass entirely. Estimated
+  savings: ~50–100 s on stage 2b.
+- **More workers (4 instead of 2)** for pass 1 / stage 2d. Smaller
+  per-shard data but more shard files for stage 2b to read. Trade-off
+  needs measurement.
+- **`--compression none`** for the production path. Eliminates writer
+  backpressure entirely (the permit-pool from `9695ad5` is still in
+  place as a safety net). The published 33.9 min is with zlib:6;
+  `--compression none` should be measurably faster.
+
+**Honest re-estimate vs ALTW context**: 33.9 min is 1.4× ALTW
+external (24m22s) and 1.5× build-geocode-index (22m26s) at planet.
+Acceptable for a first ship — renumber touches every element AND
+requires a 256-bucket external join per-element-type, while the
+other transforms operate on a single element type.
 
 ## Differences from ALTW external join
 

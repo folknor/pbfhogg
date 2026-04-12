@@ -319,6 +319,62 @@ Previous commit data (commit `46f7388`):
 | add-locations-to-ways | **8.3s** | 12.6s | **1.5x** |
 | check --refs | **4.8s** | 4.5s | 0.94x |
 
+## Renumber (external mode)
+
+Planet-scale renumber via 256-bucket radix partition. Three decode-heavy
+stages (pass 1: nodes, stage 2a: way-ref COO emission, stage 2d: way
+assembly) run parallel pread workers with work-stealing dispatch. Stage
+2b (node merge-join) uses 2-worker bucket-level parallelism with LSD
+radix sort. In-memory `FxHashMap` relation map (~14M entries, <500 MB).
+
+### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
+
+Commit `f607842`, UUID `d8330e2a`. Single-sample `--bench 1`.
+
+| Phase | Duration | Peak Anon | Share |
+|---|---:|---:|---:|
+| PASS1 nodes | **676 s** | 275 MB | 33.3% |
+| STAGE2A way emit | **133 s** | 830 MB | 6.5% |
+| STAGE2B node merge-join | **427 s** | **7.31 GB** | 21.0% |
+| STAGE2C slot reorder | 197 s | 1.38 GB | 9.7% |
+| STAGE2D way assembly | **391 s** | 362 MB | 19.2% |
+| R1+R2A fused | 30 s | 726 MB | 1.5% |
+| R2B rel merge-join | 138 s | 2.58 GB | 6.8% |
+| R2C + R2D | 35 s | 675 MB | 1.7% |
+| **TOTAL** | **2,033 s (33.9 min)** | **7.31 GB** | — |
+
+Element counts: 10,447,738,627 nodes / 1,165,589,744 ways / 14,124,889
+relations / 12,435,459,911 way refs. All match the first-measurement
+baseline (`c5d00c22`) exactly.
+
+### Optimization history
+
+| Commit | Change | Planet Time |
+|--------|--------|-------------|
+| `e156e97` | First planet measurement (sequential all stages) | **3,456 s (57.6 min)** |
+| `cc80442` | Stage 2b LSD radix sort | — (Denmark only) |
+| `a478ae8` | Halve map-bucket format (drop new_id field) | — |
+| `37ff902` | Stage 2b 2-worker bucket parallelism | — |
+| `8ec298c` | Pass 1 parallel decode (worker pool) | — |
+| `34a6b7c` | Stage 2d parallel decode (worker pool) | — |
+| `e7219f0` | Stage 2a parallel scan (worker pool) | — (OOM on planet, see below) |
+| `9695ad5` | Writer backpressure (permit pool) | — (still OOM) |
+| `f607842` | Work-stealing dispatch for pass 1 + stage 2d | **2,033 s (33.9 min)** |
+
+**−1,423 s (−41%)** from baseline. Each intermediate commit was verified
+on Denmark (`brokkr verify renumber`, 306-relation orphan delta preserved
+exactly). Planet was deferred to commit `f607842` — two earlier attempts
+OOM-killed at ~26 GB anon RSS; see [notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md)
+for the reorder-buffer forensic.
+
+### Memory
+
+Peak anon 7.31 GB (up from 2.79 GB baseline). The growth is in stage 2b:
+with work-stealing dispatch, `load_old_id_bucket_shards` now loads two
+interleaved shards and radix-sorts the combined vector. Two workers ×
+(way_refs + scratch + node_map + node_map_scratch) ≈ 3.4 GB per worker ≈
+6.8 GB peak. Well under the 30 GB host limit.
+
 ## Extract
 
 Plantasjen. Best of 3 runs (or single-sample where noted), indexed PBFs.

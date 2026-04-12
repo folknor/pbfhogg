@@ -247,10 +247,18 @@ pub fn renumber_external(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<RenumberStats> {
+    // Limit glibc malloc arenas to prevent cross-thread free
+    // fragmentation. Without this, OwnedBlock Vec<u8>s allocated on
+    // pass1/stage2d worker threads and freed on rayon compression
+    // threads cause glibc arena accumulation growing to ~26 GB anon
+    // RSS on planet. With 2 arenas the peak stays under 1 GB.
+    // Scoped to this command — other pbfhogg commands are unaffected.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
     // ---- Header validation + output writer setup ----
-    // Open once to validate the header and build the writer; the actual
-    // blob I/O for pass 1 happens via shared_file pread from worker
-    // threads below.
     {
         let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
         let header_blob = header_reader
@@ -333,23 +341,22 @@ pub fn renumber_external(
     // old_ids are still internally sorted (dispatcher FIFO + sorted
     // input) but the two shards interleave in id space. Stage 2b's
     // `load_old_id_bucket_shards` concatenates then radix-sorts.
-    let mut node_map_shard_a = BucketWriters::create(&scratch, "node-map-a")?;
-    let mut node_map_shard_b = BucketWriters::create(&scratch, "node-map-b")?;
+    const PASS1_WORKERS: usize = 4;
+    let mut node_map_shards: Vec<BucketWriters> = (0..PASS1_WORKERS)
+        .map(|i| BucketWriters::create(&scratch, &format!("node-map-{i}")))
+        .collect::<Result<Vec<_>>>()?;
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input).map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    // Track cumulative nodes_written via atomics so both workers can
-    // contribute without sharing `&mut RenumberStats`.
     let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
 
     pass1_parallel_scan(
         &pass1_schedule,
         opts.start_node_id,
         &shared_file,
-        &mut node_map_shard_a,
-        &mut node_map_shard_b,
+        &mut node_map_shards,
         &nodes_written_atomic,
         &mut writer,
     )?;
@@ -369,13 +376,13 @@ pub fn renumber_external(
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
-    // Finalize both node_map shards. Files stay on disk for stage 2b.
-    let node_map_counts_a = node_map_shard_a.finish()?;
-    let node_map_counts_b = node_map_shard_b.finish()?;
-    // Per-bucket counts summed across shards — used to compute
-    // bucket_new_id_starts for stage 2b.
+    // Finalize all node_map shards. Files stay on disk for stage 2b.
+    let shard_counts: Vec<Vec<u64>> = node_map_shards
+        .iter_mut()
+        .map(BucketWriters::finish)
+        .collect::<Result<Vec<_>>>()?;
     let node_map_counts: Vec<u64> = (0..NUM_BUCKETS)
-        .map(|i| node_map_counts_a[i] + node_map_counts_b[i])
+        .map(|i| shard_counts.iter().map(|sc| sc[i]).sum())
         .collect();
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -418,7 +425,7 @@ pub fn renumber_external(
     let mut slot_buckets_b = BucketWriters::create(&scratch, "slot-b")?;
     let resolved_count = stage2b_node_merge_join(
         &way_ref_buckets,
-        &[&node_map_shard_a, &node_map_shard_b],
+        &node_map_shards.iter().collect::<Vec<_>>(),
         &node_map_bucket_starts,
         &mut slot_buckets_a,
         &mut slot_buckets_b,
@@ -525,7 +532,7 @@ pub fn renumber_external(
     let mut node_member_slot_b = BucketWriters::create(&scratch, "rel-node-slot-b")?;
     stage2b_node_merge_join(
         &node_member_ref_buckets,
-        &[&node_map_shard_a, &node_map_shard_b],
+        &node_map_shards.iter().collect::<Vec<_>>(),
         &node_map_bucket_starts,
         &mut node_member_slot_a,
         &mut node_member_slot_b,
@@ -601,8 +608,7 @@ pub fn renumber_external(
     drop(slot_buckets_a);
     drop(slot_buckets_b);
     drop(way_ref_buckets);
-    drop(node_map_shard_a);
-    drop(node_map_shard_b);
+    drop(node_map_shards);
     drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
@@ -1074,12 +1080,11 @@ struct Stage2bScratch {
     way_refs: Vec<CooPair>,
     way_refs_data: Vec<u8>,
     way_refs_scratch: Vec<CooPair>,
-    /// Per-shard node_map slices. Each shard's bucket file is
+    /// Per-shard node_map Vecs. Each shard's bucket file is
     /// individually sorted (work-stealing FIFO + sorted PBF). The
-    /// merge-join walks two cursors instead of materializing a
+    /// merge-join walks K cursors instead of materializing a
     /// combined sorted vector.
-    node_map_a: Vec<i64>,
-    node_map_b: Vec<i64>,
+    node_maps: Vec<Vec<i64>>,
     node_map_data: Vec<u8>,
     entry_buf: [u8; RESOLVED_ENTRY_SIZE],
 }
@@ -1090,8 +1095,7 @@ impl Stage2bScratch {
             way_refs: Vec::new(),
             way_refs_data: Vec::new(),
             way_refs_scratch: Vec::new(),
-            node_map_a: Vec::new(),
-            node_map_b: Vec::new(),
+            node_maps: Vec::new(),
             node_map_data: Vec::new(),
             entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
         }
@@ -1138,61 +1142,42 @@ fn stage2b_process_bucket(
     // join walks two cursors over the shard slices simultaneously.
     // This eliminates the radix_sort_ids pass and the node_map_scratch
     // allocation that the concat+sort approach required.
-    scratch.node_map_a.clear();
-    scratch.node_map_b.clear();
-    if node_map_shards.len() >= 2 {
+    while scratch.node_maps.len() < node_map_shards.len() {
+        scratch.node_maps.push(Vec::new());
+    }
+    for (i, shard) in node_map_shards.iter().enumerate() {
+        scratch.node_maps[i].clear();
         load_single_old_id_bucket(
-            node_map_shards[0],
+            shard,
             bucket_idx,
             &mut scratch.node_map_data,
-            &mut scratch.node_map_a,
-        )?;
-        load_single_old_id_bucket(
-            node_map_shards[1],
-            bucket_idx,
-            &mut scratch.node_map_data,
-            &mut scratch.node_map_b,
-        )?;
-    } else if !node_map_shards.is_empty() {
-        load_single_old_id_bucket(
-            node_map_shards[0],
-            bucket_idx,
-            &mut scratch.node_map_data,
-            &mut scratch.node_map_a,
+            &mut scratch.node_maps[i],
         )?;
     }
 
     let bucket_base = bucket_new_id_starts[bucket_idx];
-    let nm_a = &scratch.node_map_a;
-    let nm_b = &scratch.node_map_b;
+    let k = node_map_shards.len();
+    let mut cursors = [0usize; 8];
 
-    // Two-shard merge-join. Both shard slices are sorted ascending.
-    // Advance whichever cursor points to the smaller value. The
-    // "merged position" = ca + cb = the position this old_id occupies
-    // in the virtual sorted concatenation of both shards. The new_id
-    // is `bucket_base + merged_position`.
     let mut resolved_count: u64 = 0;
-    let mut ca: usize = 0;
-    let mut cb: usize = 0;
     for wr in &scratch.way_refs {
         let target = wr.old_node_id;
-        // Advance both cursors past entries < target.
-        while ca < nm_a.len() && nm_a[ca] < target {
-            ca += 1;
+        let mut merged_pos: usize = 0;
+        let mut found = false;
+        for si in 0..k {
+            let nm = &scratch.node_maps[si];
+            let c = &mut cursors[si];
+            while *c < nm.len() && nm[*c] < target {
+                *c += 1;
+            }
+            merged_pos += *c;
+            if *c < nm.len() && nm[*c] == target {
+                found = true;
+            }
         }
-        while cb < nm_b.len() && nm_b[cb] < target {
-            cb += 1;
-        }
-        let merged_pos = ca + cb;
-        let found = (ca < nm_a.len() && nm_a[ca] == target)
-            || (cb < nm_b.len() && nm_b[cb] == target);
         let resolved_id = if found {
-            // Position-based new id reconstruction from the merged
-            // virtual index.
             bucket_base + merged_pos as i64
         } else {
-            // Orphan ref: no matching entry. Preserve old id,
-            // matching in-memory renumber's unwrap_or(old_id) policy.
             wr.old_node_id
         };
         let entry = ResolvedEntry {
@@ -1965,6 +1950,10 @@ struct BlobTask {
     data_offset: u64,
     data_size: usize,
     element_count: u64,
+    /// Source blob's spatial bbox (node blobs only). Carried through to
+    /// the output BlobIndex so the reframed block preserves spatial
+    /// indexdata without re-scanning coords.
+    bbox: Option<crate::blob_index::BlobBbox>,
 }
 
 /// Header-only scan building a per-kind schedule with element counts.
@@ -2004,6 +1993,7 @@ fn build_kind_blob_schedule(
             data_offset,
             data_size,
             element_count: idx.count,
+            bbox: idx.bbox,
         });
         seq += 1;
     }
@@ -2047,8 +2037,7 @@ fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
-    node_map_shard_a: &mut BucketWriters,
-    node_map_shard_b: &mut BucketWriters,
+    node_map_shards: &mut [BucketWriters],
     nodes_written: &std::sync::atomic::AtomicU64,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<()> {
@@ -2089,35 +2078,27 @@ fn pass1_parallel_scan(
             }
         });
 
-        // Worker A
-        let rx_a = std::sync::Arc::clone(&desc_rx);
-        let file_a = std::sync::Arc::clone(shared_file);
-        let tx_a = decoded_tx.clone();
-        scope.spawn(move || {
-            pass1_worker(
-                &rx_a,
-                base_ids_ref,
-                &file_a,
-                node_map_shard_a,
-                nodes_written,
-                &tx_a,
-            );
-        });
-
-        // Worker B
-        let rx_b = std::sync::Arc::clone(&desc_rx);
-        let file_b = std::sync::Arc::clone(shared_file);
-        let tx_b = decoded_tx.clone();
-        scope.spawn(move || {
-            pass1_worker(
-                &rx_b,
-                base_ids_ref,
-                &file_b,
-                node_map_shard_b,
-                nodes_written,
-                &tx_b,
-            );
-        });
+        {
+            let mut remaining: &mut [BucketWriters] = node_map_shards;
+            for _ in 0..remaining.len() {
+                let (head, tail) = remaining.split_at_mut(1);
+                remaining = tail;
+                let shard = &mut head[0];
+                let rx = std::sync::Arc::clone(&desc_rx);
+                let file = std::sync::Arc::clone(shared_file);
+                let tx = decoded_tx.clone();
+                scope.spawn(move || {
+                    pass1_worker(
+                        &rx,
+                        base_ids_ref,
+                        &file,
+                        shard,
+                        nodes_written,
+                        &tx,
+                    );
+                });
+            }
+        }
 
         drop(decoded_tx);
         drop(desc_rx);
@@ -2169,9 +2150,8 @@ fn pass1_worker(
 
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut local_bb = BlockBuilder::new();
+    let mut reframe_buf: Vec<u8> = Vec::new();
+    let mut old_ids_buf: Vec<i64> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut id_buf = [0u8; OLD_ID_SIZE];
 
@@ -2194,27 +2174,40 @@ fn pass1_worker(
                 .map_err(|e| format!("pread failed at offset {}: {e}", task.data_offset))?;
             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                 .map_err(|e| e.to_string())?;
-            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-                std::mem::take(&mut decompress_buf),
-                &mut st_scratch,
-                &mut gr_scratch,
-            )
-            .map_err(|e| e.to_string())?;
 
-            output_blocks.clear();
-            let blob_node_count = pass1_process_blob(
-                &block,
-                &mut local_bb,
-                &mut output_blocks,
+            // Wire-format rewriter: decode only IDs, copy everything
+            // else verbatim. No PrimitiveBlock, no BlockBuilder.
+            reframe_buf.clear();
+            old_ids_buf.clear();
+            let blob_node_count = reframe_dense_with_new_ids(
+                &decompress_buf,
                 base_new_id,
-                shard,
-                &mut id_buf,
+                &mut old_ids_buf,
+                &mut reframe_buf,
             )?;
-            flush_local(&mut local_bb, &mut output_blocks)?;
 
-            // Sanity-check the decoded count against the pre-computed
-            // prefix sum. A mismatch would silently collide new_ids
-            // between neighboring blobs.
+            // Emit old_ids into the bucket shard.
+            for &old_id in &old_ids_buf {
+                let bucket = node_id_bucket(old_id);
+                id_buf = old_id.to_le_bytes();
+                if let Some(w) = shard.writers[bucket].as_mut() {
+                    w.write_all(&id_buf).map_err(|e| e.to_string())?;
+                }
+                shard.entry_counts[bucket] += 1;
+            }
+
+            // Build the OwnedBlock from the reframed bytes.
+            let index = crate::blob_index::BlobIndex {
+                kind: crate::blob_index::ElemKind::Node,
+                min_id: base_new_id,
+                #[allow(clippy::cast_possible_wrap)]
+                max_id: base_new_id + blob_node_count as i64 - 1,
+                count: blob_node_count,
+                bbox: task.bbox,
+            };
+            output_blocks.clear();
+            output_blocks.push((std::mem::take(&mut reframe_buf), index, None));
+
             if blob_node_count != task.element_count {
                 return Err(format!(
                     "pass1 blob {} decoded {} nodes, indexdata said {}",
@@ -2224,10 +2217,6 @@ fn pass1_worker(
 
             nodes_written.fetch_add(blob_node_count, std::sync::atomic::Ordering::Relaxed);
 
-            if decompress_buf.capacity() == 0 {
-                decompress_buf = Vec::new();
-            }
-
             Ok(std::mem::take(&mut output_blocks))
         })();
 
@@ -2235,6 +2224,169 @@ fn pass1_worker(
             break;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DenseNodes wire-format rewriter for pass 1
+// ---------------------------------------------------------------------------
+
+/// Reframe a decompressed PrimitiveBlock by replacing only the DenseNodes
+/// ID deltas while copying everything else (string table, lat/lon, tags,
+/// metadata) verbatim at the byte level.
+///
+/// This is the renumber-specific fast path: renumber only changes IDs,
+/// so we avoid the full decode→BlockBuilder→re-encode cycle. Per-node
+/// cost drops from ~113 ns (HashMap lookups, delta arrays, metadata) to
+/// ~10-15 ns (varint decode of old ID + varint encode of new delta).
+///
+/// Returns the number of nodes in the block. `old_ids_out` is populated
+/// with the absolute old IDs (for bucket emission). `output` receives
+/// the reframed PrimitiveBlock bytes.
+#[allow(clippy::too_many_lines)]
+fn reframe_dense_with_new_ids(
+    decompressed: &[u8],
+    base_new_id: i64,
+    old_ids_out: &mut Vec<i64>,
+    output: &mut Vec<u8>,
+) -> std::result::Result<u64, String> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+
+    // Phase 1: scan PrimitiveBlock top-level fields.
+    let mut stringtable_range: Option<(usize, usize)> = None;
+    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut scalar_fields: Vec<u8> = Vec::new();
+
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                stringtable_range = Some((offset, data.len()));
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                group_ranges.push((offset, data.len()));
+            }
+            (17 | 18 | 19 | 20, WIRE_VARINT) => {
+                let val = cursor.read_varint().map_err(|e| e.to_string())?;
+                protohoggr::encode_varint(&mut scalar_fields, u64::from((field << 3) | wire_type));
+                protohoggr::encode_varint(&mut scalar_fields, val);
+            }
+            _ => cursor.skip_field(wire_type).map_err(|e| e.to_string())?,
+        }
+    }
+
+    let (st_offset, st_len) = stringtable_range
+        .ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    if group_ranges.is_empty() {
+        return Err("reframe: no PrimitiveGroup in PrimitiveBlock".into());
+    }
+    let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
+
+    // Phase 2-5: process each PrimitiveGroup, reframing its DenseNodes.
+    output.clear();
+
+    // PrimitiveBlock field 1: StringTable (copy verbatim)
+    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+
+    old_ids_out.clear();
+    let mut total_nodes: u64 = 0;
+    let mut current_new_id = base_new_id;
+
+    for &(gr_offset, gr_len) in &group_ranges {
+        let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+
+        // Find DenseNodes (field 2) within this group.
+        let mut dense_data: Option<&[u8]> = None;
+        let mut gr_cursor = Cursor::new(group_bytes);
+        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| e.to_string())? {
+            if field == 2 && wire_type == WIRE_LEN {
+                dense_data = Some(gr_cursor.read_len_delimited().map_err(|e| e.to_string())?);
+            } else {
+                gr_cursor.skip_field(wire_type).map_err(|e| e.to_string())?;
+            }
+        }
+
+        let dense_bytes = dense_data.ok_or("reframe: no DenseNodes in PrimitiveGroup")?;
+
+        // Scan DenseNodes fields: extract packed IDs, copy rest verbatim.
+        let mut id_field: Option<&[u8]> = None;
+        let mut other_fields_buf: Vec<u8> = Vec::new();
+
+        let mut dn_cursor = Cursor::new(dense_bytes);
+        while let Some((field, wire_type)) = dn_cursor.read_tag().map_err(|e| e.to_string())? {
+            if field == 1 && wire_type == WIRE_LEN {
+                id_field = Some(dn_cursor.read_len_delimited().map_err(|e| e.to_string())?);
+            } else if wire_type == WIRE_LEN {
+                let data = dn_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                protohoggr::encode_bytes_field(&mut other_fields_buf, field, data);
+            } else {
+                let pos_before = dn_cursor.position();
+                dn_cursor.skip_field(wire_type).map_err(|e| e.to_string())?;
+                let pos_after = dn_cursor.position();
+                protohoggr::encode_varint(
+                    &mut other_fields_buf,
+                    u64::from((field << 3) | wire_type),
+                );
+                other_fields_buf.extend_from_slice(&dense_bytes[pos_before..pos_after]);
+            }
+        }
+
+        let id_bytes = id_field.ok_or("reframe: no packed ID field in DenseNodes")?;
+
+        // Decode old ID deltas → absolute old IDs.
+        let mut old_id: i64 = 0;
+        let mut id_cursor = Cursor::new(id_bytes);
+        let group_start_idx = old_ids_out.len();
+        while id_cursor.remaining() > 0 {
+            let delta = id_cursor.read_sint64().map_err(|e| e.to_string())?;
+            old_id += delta;
+            old_ids_out.push(old_id);
+        }
+        // Validate: reject negative IDs (same policy as the full-decode path).
+        for &id in &old_ids_out[group_start_idx..] {
+            if id < 0 {
+                return Err(format!(
+                    "renumber --mode external requires non-negative input ids. \
+                     Input contains node id {id}. \
+                     Use --mode inmem for files with negative (editor-local) ids."
+                ));
+            }
+        }
+        let group_node_count = (old_ids_out.len() - group_start_idx) as u64;
+        total_nodes += group_node_count;
+
+        // Build new packed ID field for this group.
+        let gnc = usize::try_from(group_node_count)
+            .map_err(|_| "group node count > usize")?;
+        let mut new_id_packed: Vec<u8> = Vec::with_capacity(gnc + 10);
+        protohoggr::encode_varint(
+            &mut new_id_packed,
+            protohoggr::zigzag_encode_64(current_new_id),
+        );
+        // Remaining deltas are all 1: zigzag(1) = 2, varint(2) = 0x02.
+        new_id_packed.extend(std::iter::repeat_n(0x02u8, gnc.saturating_sub(1)));
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            current_new_id += group_node_count as i64;
+        }
+
+        // Reconstruct DenseNodes → PrimitiveGroup → PrimitiveBlock field 2.
+        let mut dense_out: Vec<u8> = Vec::new();
+        protohoggr::encode_bytes_field(&mut dense_out, 1, &new_id_packed);
+        dense_out.extend_from_slice(&other_fields_buf);
+
+        let mut group_out: Vec<u8> = Vec::new();
+        protohoggr::encode_bytes_field(&mut group_out, 2, &dense_out);
+        protohoggr::encode_bytes_field(output, 2, &group_out);
+    }
+
+    // PrimitiveBlock scalar fields (17-20, if any)
+    output.extend_from_slice(&scalar_fields);
+
+    Ok(total_nodes)
 }
 
 /// Process a single decoded blob: iterate elements, assign new ids,

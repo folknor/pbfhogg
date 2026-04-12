@@ -678,6 +678,43 @@ for the same wire-format rewriter treatment (way IDs change but refs
 are already resolved via the new_refs flat file — a specialized
 rewriter could patch only the ID + refs fields).
 
+### Fifth measurement: 401 s (6m42s), commit `71bb548`
+
+Session 2 (2026-04-12). Three commits on top of the IdSetDense
+rank-fusion architecture (442 s baseline from commit `94bf351`):
+
+1. **Dead code cleanup** (`7df705c`): deleted 1366 lines of orphaned
+   CooPair/bucket infrastructure. No behavioral change.
+2. **Wire-format splice rewriter for R2d** (`cbffb45`): patches relation
+   id (field 1) + member ids (field 9, delta-encoded), copies all other
+   fields verbatim. Walks types + memids in parallel for member dispatch.
+   R2d: 31.5 → 24.7 s.
+3. **Parallel R2d** (`71bb548`): work-stealing dispatch with per-blob
+   member-count sidecar from the fused relation scan. R2d: 24.7 → 18.4 s.
+
+| Phase | Previous (442 s) | **Current (401 s)** | Δ |
+|---|---:|---:|---|
+| PASS1 (4 workers) | 145 s | **147 s** | noise |
+| FUSED_WAY | 89 s | **88 s** | — |
+| STAGE2D (6 workers) | 126 s | **101 s** | −25 s |
+| R1+R2A | 28 s | **29 s** | — |
+| R2D | 31.5 s | **18 s** | **−13 s (−42%)** |
+| **TOTAL** | **442 s** | **401 s** | **−41 s (−9%)** |
+
+Peak anon: 9.62 GB. All element counts match baseline exactly. Denmark
+cross-validated (PASS, identical to osmium sort) on every commit.
+
+**Attempted and reverted:** parallel fused-way direct-write (two-phase:
+parallel ref-count pre-scan + parallel pwrite). Regressed 88 → 117 s
+because decompressing way blobs twice costs more than the parallel
+writes save. Workers are the bottleneck, not the sequential consumer.
+
+**Next opportunity:** fuse the fused-way scan + stage 2d into a single
+pass. Currently decompresses every way blob twice (once for ref
+resolution, once for wire-format splice). Merging them with inline
+rank() resolution during the splice would eliminate one full decompress
+pass (~80 s estimated savings).
+
 ## Differences from ALTW external join
 
 For the implementer: where this is easier and harder than ALTW

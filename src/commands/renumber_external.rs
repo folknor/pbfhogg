@@ -226,24 +226,9 @@ pub fn renumber_external(
     // ---- Fused way scan: resolve refs via rank + emit to flat file ----
     let way_schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Way)?;
 
-    crate::debug::emit_marker("RENUMBER_EXT_FUSED_WAY_START");
-    let ref_count_sidecar: PathBuf = scratch.file_path("way-ref-counts");
-    let new_refs_path: PathBuf = scratch.file_path("new-refs");
-    let total_slots = fused_way_resolve(
-        input,
-        &way_schedule,
-        &node_id_set,
-        opts.start_node_id,
-        &ref_count_sidecar,
-        &new_refs_path,
-    )?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("renumber_ext_way_ref_slots", total_slots as i64);
-    }
-    crate::debug::emit_marker("RENUMBER_EXT_FUSED_WAY_END");
-
-    // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
+    // ---- Stage 2d: fused way resolve + rewrite (single pass) ----
+    // Resolves way refs inline via node_id_set.rank() during
+    // wire-format splice. No intermediate flat file or sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
     const STAGE2D_WORKERS: usize = 6;
     let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
@@ -255,9 +240,8 @@ pub fn renumber_external(
         &mut writer,
         &mut way_id_sets,
         &way_schedule,
-        &new_refs_path,
-        &ref_count_sidecar,
-        total_slots,
+        &node_id_set,
+        opts.start_node_id,
         opts.start_way_id,
         &stage2d_ways_atomic,
     )?;
@@ -335,69 +319,19 @@ pub fn renumber_external(
 // Pass 2 stage D: way assembly — re-scan ways, rewrite refs, write output
 // ---------------------------------------------------------------------------
 
-/// Load the per-blob ref-count sidecar written by the fused way scan and compute
-/// prefix sums so stage 2d can look up each way blob's starting
-/// `slot_pos` in O(1). Returns a Vec of starting offsets indexed by way
-/// blob order (matching the stage-2a and stage-2d way-blob filter).
+/// Parallel stage 2d: fused way resolve + wire-format rewrite.
 ///
-/// The sidecar layout: `u64 LE` per way blob followed by a trailer
-/// `u64 LE` with the total. The trailer is checked against `total_slots`
-/// for alignment verification.
-fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("failed to read ref-count sidecar: {e}"))?;
-    if data.len() < 8 {
-        return Err("ref-count sidecar is too small".into());
-    }
-    let trailer_bytes: [u8; 8] = data[data.len() - 8..]
-        .try_into()
-        .map_err(|_| "ref-count sidecar trailer read failed")?;
-    let trailer_total = u64::from_le_bytes(trailer_bytes);
-    if trailer_total != total_slots {
-        return Err(format!(
-            "ref-count sidecar total ({trailer_total}) != fused_way total_slots ({total_slots})"
-        )
-        .into());
-    }
-    let entry_bytes = &data[..data.len() - 8];
-    if !entry_bytes.len().is_multiple_of(8) {
-        return Err("ref-count sidecar has non-aligned entries".into());
-    }
-    let num_entries = entry_bytes.len() / 8;
-    let mut slot_starts = Vec::with_capacity(num_entries);
-    let mut cumulative: u64 = 0;
-    for chunk in entry_bytes.chunks_exact(8) {
-        slot_starts.push(cumulative);
-        let bytes: [u8; 8] = chunk.try_into().map_err(|_| "sidecar chunk size")?;
-        cumulative += u64::from_le_bytes(bytes);
-    }
-    Ok(slot_starts)
-}
-
-/// Re-scan way blobs, rewrite refs from the flat `new_refs` file using
-/// each blob's starting `slot_pos` from the ref-count sidecar, assign
-/// new sequential way ids, emit `(old_way_id, new_way_id)` pairs into
-/// `way_map` buckets, and write the renumbered ways to the output PBF.
-///
-/// The second scan reuses the same blob filter as the fused way scan (OsmData +
-/// `ElemKind::Way` when indexed) so the blob-index count matches the
-/// sidecar's entry count. Within each blob, ways are iterated via the
-/// full element path (`block.elements()` matched on `Element::Way`),
-/// which gives tags + metadata + refs — vs the fused way scan's `scan_way_refs`
-/// which is a refs-only fast path.
-/// Parallel stage 2d way assembly.
+/// Single pass over way blobs: resolves refs inline via
+/// `node_id_set.rank()` and splices new IDs into the wire format.
+/// No intermediate flat file, no sidecar, no mmap.
 ///
 /// Mirrors the pass-1 worker-pool pattern: two range-partitioned
 /// workers, each owning a way_map shard, a `BlockBuilder`, its own
 /// scratch buffers, and an `output_blocks: Vec<OwnedBlock>` staging
-/// vec. Workers pread way blobs, construct PrimitiveBlocks locally
-/// (dropped on the worker thread), iterate ways, look up new node ids
-/// from the shared `new_refs_mmap`, rewrite refs into their local
-/// `BlockBuilder`, and send `(seq, Vec<OwnedBlock>)` via a bounded
-/// channel. The main thread reorders by seq and writes via
-/// `write_primitive_block_owned`.
-///
-/// Returns the next available way id after the pass.
+/// vec. Workers pread way blobs, decompress, resolve refs inline via
+/// `node_id_set.rank()`, wire-format splice new IDs, and send
+/// `(seq, Vec<OwnedBlock>)` via a bounded channel. The main thread
+/// reorders by seq and writes via `write_primitive_block_owned`.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
@@ -409,48 +343,11 @@ fn stage2d_parallel_way_assembly(
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
     way_id_sets: &mut [super::id_set_dense::IdSetDense],
     way_schedule: &[BlobTask],
-    new_refs_path: &Path,
-    ref_count_sidecar: &Path,
-    total_slots: u64,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
     start_way_id: i64,
     ways_written: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
-    let blob_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
-
-    // mmap the flat new_refs file for zero-syscall slot lookups.
-    let new_refs_file = std::fs::File::open(new_refs_path)
-        .map_err(|e| format!("failed to open new_refs file: {e}"))?;
-    let new_refs_len = new_refs_file
-        .metadata()
-        .map_err(|e| format!("failed to stat new_refs file: {e}"))?
-        .len();
-    let expected_len = total_slots * NEW_REF_SIZE as u64;
-    if new_refs_len != expected_len {
-        return Err(format!(
-            "new_refs file size {new_refs_len} != expected {expected_len} (total_slots={total_slots})"
-        )
-        .into());
-    }
-    let new_refs_mmap: memmap2::Mmap = if new_refs_len == 0 {
-        memmap2::MmapOptions::new().map_anon()?.make_read_only()?
-    } else {
-        let mmap = unsafe { memmap2::Mmap::map(&new_refs_file) }
-            .map_err(|e| format!("failed to mmap new_refs file: {e}"))?;
-        #[cfg(unix)]
-        mmap.advise(memmap2::Advice::Sequential).ok();
-        mmap
-    };
-    let new_refs_mmap = std::sync::Arc::new(new_refs_mmap);
-
-    if way_schedule.len() != blob_slot_starts.len() {
-        return Err(format!(
-            "stage 2d: way blob schedule size {} != sidecar entries {}",
-            way_schedule.len(),
-            blob_slot_starts.len()
-        )
-        .into());
-    }
-
     if way_schedule.is_empty() {
         return Ok(());
     }
@@ -480,7 +377,6 @@ fn stage2d_parallel_way_assembly(
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
     let schedule_ref = way_schedule;
     let base_ids_ref: &[i64] = &base_way_ids;
-    let slots_ref: &[u64] = &blob_slot_starts;
     let stage2d_counters = StageCounters::new();
     let stage2d_cref = &stage2d_counters;
 
@@ -502,16 +398,14 @@ fn stage2d_parallel_way_assembly(
                 let id_set = &mut is[0];
                 let rx = std::sync::Arc::clone(&desc_rx);
                 let file = std::sync::Arc::clone(&shared_file);
-                let mmap = std::sync::Arc::clone(&new_refs_mmap);
                 let tx = decoded_tx.clone();
                 scope.spawn(move || {
                     stage2d_worker(
                         &rx,
                         base_ids_ref,
                         &file,
-                        &mmap,
-                        slots_ref,
-                        total_slots,
+                        node_id_set,
+                        start_node_id,
                         id_set,
                         ways_written,
                         stage2d_cref,
@@ -556,18 +450,15 @@ fn stage2d_parallel_way_assembly(
 
 /// Stage 2d per-worker loop. Claims blobs from a shared FIFO queue
 /// and emits one owned-block batch per blob through the channel.
-/// Looks up each blob's slot_cursor from the shared `blob_slot_starts`
-/// (sidecar prefix sums) and its base_way_id from the pre-computed
-/// prefix-sum array, so per-blob alignment is deterministic regardless
-/// of dispatch order — same work-stealing shape as pass 1.
+/// Resolves way refs inline via `node_id_set.rank()` — no flat file
+/// or mmap needed.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage2d_worker(
     rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
     base_way_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
-    new_refs_mmap: &std::sync::Arc<memmap2::Mmap>,
-    blob_slot_starts: &[u64],
-    total_slots: u64,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
     way_id_set: &mut super::id_set_dense::IdSetDense,
     ways_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
@@ -599,11 +490,6 @@ fn stage2d_worker(
         };
 
         let base_way_id = base_way_ids[task.seq];
-        let expected_slot_start = blob_slot_starts[task.seq];
-        let expected_slot_end = blob_slot_starts
-            .get(task.seq + 1)
-            .copied()
-            .unwrap_or(total_slots);
 
         let result: std::result::Result<Vec<OwnedBlock>, String> = (|| {
             let t0 = std::time::Instant::now();
@@ -626,9 +512,8 @@ fn stage2d_worker(
             let blob_way_count = reframe_ways_with_new_ids(
                 &decompress_buf,
                 base_way_id,
-                new_refs_mmap,
-                expected_slot_start,
-                expected_slot_end,
+                node_id_set,
+                start_node_id,
                 &mut old_ids_buf,
                 &mut reframe_buf,
                 &mut refs_scratch,
@@ -1055,184 +940,6 @@ fn pass1_worker(
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// Fused way resolve
-// ---------------------------------------------------------------------------
-
-/// Single-pass fused way scan that resolves node refs via IdSetDense
-/// rank() and writes resolved new_node_ids directly to the flat
-/// new_refs file.
-///
-/// Workers decompress + scan way blobs in parallel, collecting per-blob
-/// ref old_ids. For each old_id, the worker computes:
-///   new_id = start_node_id + rank(old_id) if present, else old_id
-/// and sends a Vec<i64> of new_node_ids to the consumer.
-///
-/// The consumer writes new_node_ids sequentially to the flat file
-/// (one i64 LE per slot) and per-blob ref counts to the sidecar.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn fused_way_resolve(
-    input: &Path,
-    schedule: &[BlobTask],
-    node_id_set: &super::id_set_dense::IdSetDense,
-    start_node_id: i64,
-    ref_count_sidecar: &Path,
-    new_refs_path: &Path,
-) -> Result<u64> {
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
-    );
-
-    let mut sidecar_writer = BufWriter::with_capacity(
-        64 * 1024,
-        std::fs::File::create(ref_count_sidecar)
-            .map_err(|e| format!("failed to create ref-count sidecar: {e}"))?,
-    );
-
-    let mut refs_file = BufWriter::with_capacity(
-        256 * 1024,
-        std::fs::File::create(new_refs_path)
-            .map_err(|e| format!("failed to create new_refs file: {e}"))?,
-    );
-
-    let mut slot_pos: u64 = 0;
-
-    if schedule.is_empty() {
-        sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
-        sidecar_writer.flush()?;
-        return Ok(slot_pos);
-    }
-
-    // Workers: decompress + scan_way_refs + resolve via rank().
-    // Send Vec<i64> of new_node_ids per blob to consumer.
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4)
-        .min(6);
-
-    type ScanItem = (usize, std::result::Result<Vec<i64>, String>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (scan_tx, scan_rx) = std::sync::mpsc::sync_channel::<ScanItem>(32);
-
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher
-        scope.spawn(move || {
-            for task in schedule {
-                if desc_tx.send(task).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Workers
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = scan_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            scope.spawn(move || {
-                use std::os::unix::fs::FileExt as _;
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut refs_buf: Vec<i64> = Vec::new();
-                let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-                loop {
-                    let task = {
-                        let guard =
-                            rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(t) => t,
-                            Err(_) => break,
-                        }
-                    };
-
-                    let result: std::result::Result<Vec<i64>, String> = (|| {
-                        read_buf.resize(task.data_size, 0);
-                        file.read_exact_at(&mut read_buf, task.data_offset)
-                            .map_err(|e| {
-                                format!("pread failed at offset {}: {e}", task.data_offset)
-                            })?;
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                            .map_err(|e| e.to_string())?;
-
-                        // Scan way refs and resolve each via rank().
-                        let mut new_ids: Vec<i64> = Vec::with_capacity(64 * 1024);
-                        let mut scan_err: Option<String> = None;
-                        super::way_scanner::scan_way_refs(
-                            &decompress_buf,
-                            &mut refs_buf,
-                            &mut group_starts,
-                            |_way_id, refs| {
-                                if scan_err.is_some() {
-                                    return;
-                                }
-                                for &old_node_id in refs {
-                                    if old_node_id < 0 {
-                                        scan_err = Some(format!(
-                                            "renumber --mode external requires non-negative \
-                                             input ids. Way references negative node id \
-                                             {old_node_id}. Use --mode inmem for files with \
-                                             negative (editor-local) ids."
-                                        ));
-                                        return;
-                                    }
-                                    let new_id = if node_id_set.get(old_node_id) {
-                                        #[allow(clippy::cast_possible_wrap)]
-                                        { start_node_id + node_id_set.rank(old_node_id) as i64 }
-                                    } else {
-                                        old_node_id // orphan
-                                    };
-                                    new_ids.push(new_id);
-                                }
-                            },
-                        )
-                        .map_err(|e| e.to_string())?;
-                        if let Some(e) = scan_err {
-                            return Err(e);
-                        }
-                        Ok(new_ids)
-                    })();
-
-                    if tx.send((task.seq, result)).is_err() {
-                        break;
-                    }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(scan_tx);
-
-        // Consumer: reorder by seq, write to flat file + sidecar.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            std::result::Result<Vec<i64>, String>,
-        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
-
-        for (seq_num, item) in scan_rx {
-            reorder.push(seq_num, item);
-            while let Some(result) = reorder.pop_ready() {
-                let new_ids =
-                    result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-                let blob_ref_count = new_ids.len() as u64;
-                for new_id in new_ids {
-                    refs_file.write_all(&new_id.to_le_bytes())?;
-                }
-                slot_pos += blob_ref_count;
-                sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
-            }
-        }
-        Ok(())
-    })?;
-
-    // Trailer: total ref count for alignment verification in stage 2d.
-    sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
-    sidecar_writer.flush()?;
-    refs_file.flush()?;
-
-    Ok(slot_pos)
-}
-
 /// Reframe a decompressed PrimitiveBlock by replacing only the DenseNodes
 /// ID deltas while copying everything else (string table, lat/lon, tags,
 /// metadata) verbatim at the byte level.
@@ -1389,9 +1096,8 @@ fn reframe_dense_with_new_ids(
 fn reframe_ways_with_new_ids(
     decompressed: &[u8],
     base_new_way_id: i64,
-    new_refs_mmap: &[u8],
-    blob_slot_start: u64,
-    expected_slot_end: u64,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
     old_ids_out: &mut Vec<i64>,
     output: &mut Vec<u8>,
     refs_scratch: &mut Vec<u8>,
@@ -1438,7 +1144,6 @@ fn reframe_ways_with_new_ids(
     old_ids_out.clear();
     let mut total_ways: u64 = 0;
     let mut current_new_id = base_new_way_id;
-    let mut slot_cursor = blob_slot_start;
 
     for &(gr_offset, gr_len) in group_ranges_scratch.iter() {
         let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
@@ -1487,37 +1192,36 @@ fn reframe_ways_with_new_ids(
                 }
                 old_ids_out.push(old_way_id);
 
-                // Count refs via varint boundary scan.
-                let ref_count: u64 = old_refs_data
-                    .iter()
-                    .filter(|&&b| b & 0x80 == 0)
-                    .count() as u64;
-
-                // Batch mmap read + delta-encode new refs.
-                let slot_start = usize::try_from(slot_cursor)
-                    .map_err(|_| "slot_cursor > usize")?;
-                let rc = usize::try_from(ref_count).map_err(|_| "ref_count > usize")?;
-                let mmap_start = slot_start * NEW_REF_SIZE;
-                let mmap_end = mmap_start + rc * NEW_REF_SIZE;
-                if mmap_end > new_refs_mmap.len() {
-                    return Err(format!(
-                        "mmap out of bounds: {mmap_end} > {}",
-                        new_refs_mmap.len()
-                    ));
-                }
+                // Decode old ref deltas, resolve via rank(), delta-encode new refs.
                 refs_scratch.clear();
+                let mut prev_old_ref: i64 = 0;
                 let mut prev_new_ref: i64 = 0;
-                for chunk in new_refs_mmap[mmap_start..mmap_end].chunks_exact(NEW_REF_SIZE) {
-                    let new_ref = i64::from_le_bytes(
-                        chunk.try_into().unwrap_or_else(|_| unreachable!()),
-                    );
+                let mut refs_cursor = protohoggr::Cursor::new(old_refs_data);
+                while !refs_cursor.is_empty() {
+                    let raw = refs_cursor.read_varint().map_err(|e| e.to_string())?;
+                    let delta = protohoggr::zigzag_decode_64(raw);
+                    prev_old_ref += delta;
+                    let old_node_id = prev_old_ref;
+                    if old_node_id < 0 {
+                        return Err(format!(
+                            "renumber --mode external requires non-negative \
+                             input ids. Way references negative node id \
+                             {old_node_id}. Use --mode inmem for files with \
+                             negative (editor-local) ids."
+                        ));
+                    }
+                    #[allow(clippy::cast_possible_wrap)]
+                    let new_ref = if node_id_set.get(old_node_id) {
+                        start_node_id + node_id_set.rank(old_node_id) as i64
+                    } else {
+                        old_node_id // orphan
+                    };
                     protohoggr::encode_varint(
                         refs_scratch,
                         protohoggr::zigzag_encode_64(new_ref - prev_new_ref),
                     );
                     prev_new_ref = new_ref;
                 }
-                slot_cursor += ref_count;
 
                 // Splice: emit way_bytes with id and refs replaced.
                 // Sort the two replacement ranges by start position to
@@ -1566,14 +1270,6 @@ fn reframe_ways_with_new_ids(
     }
 
     output.extend_from_slice(scalar_fields_scratch);
-
-    // Drift check
-    if slot_cursor != expected_slot_end {
-        return Err(format!(
-            "reframe_ways slot cursor drift: cursor = {slot_cursor}, \
-             expected = {expected_slot_end} (blob start = {blob_slot_start})"
-        ));
-    }
 
     Ok(total_ways)
 }

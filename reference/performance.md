@@ -321,15 +321,17 @@ Previous commit data (commit `46f7388`):
 
 ## Renumber (external mode)
 
-Planet-scale renumber via 256-bucket radix partition. Pass 1 uses a
-DenseNodes wire-format rewriter that patches only ID deltas and copies
-coords/tags/metadata/string table verbatim — no BlockBuilder, no
-PrimitiveBlock construction, ~16 ns/node. Stages 2a (way-ref COO
-emission) and 2d (way assembly) use parallel pread workers with
-work-stealing dispatch. Stage 2b (node merge-join) uses 2-worker
-bucket-level parallelism with LSD radix sort and K-way sorted-cursor
-merge across 4 node_map shards. In-memory `FxHashMap` relation map
-(~14M entries, <500 MB). `mallopt(M_ARENA_MAX, 2)` inside
+Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces
+the original 256-bucket radix partition). Wire-format splice rewriters
+for all three element types — pass 1 (DenseNodes), stage 2d (ways),
+and R2d (relations) — patch only the ID/ref fields and copy everything
+else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
+construction. Pass 1: 4 work-stealing workers. Stage 2d: 6 workers.
+R2d: parallel with per-blob member-count sidecar for cursor offset
+prefix sums. Fused way scan resolves refs via `node_id_set.rank()`.
+Fused relation scan resolves member refs via `node_id_set.rank()` +
+`way_id_set.rank()` inline. In-memory `FxHashMap` relation map (~14M
+entries, <500 MB). `mallopt(M_ARENA_MAX, 2)` inside
 `renumber_external()` prevents glibc cross-thread arena fragmentation.
 
 ### Planet (87.7 GB indexed, 11.6B elements, plantasjen)
@@ -379,8 +381,11 @@ baseline (`c5d00c22`) exactly.
 | `9ec5eda` | IdSetDense rank fusion (eliminates stage 2a+2b+2c) | **505 s (8.4 min)** |
 | `c5c0e08` | Build way_id_set during stage 2d | **479 s (8.0 min)** |
 | `ae45fd6` | Eliminate way_map files + mmap R2B scatter | **442 s (7.4 min)** |
+| `94bf351` | Pass 1 back to 4 workers, fuse R1+R2A+R2B | **442 s (7.4 min)** |
+| `cbffb45` | Wire-format splice rewriter for R2d relations | **412 s (6.9 min)** |
+| `71bb548` | Parallel R2d (work-stealing + member-count sidecar) | **401 s (6.7 min)** |
 
-**−3,014 s (−87%)** from baseline. Each commit verified on Denmark
+**−3,055 s (−88%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS — see
 [notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md) for
@@ -388,11 +393,22 @@ the reorder-buffer forensic and the glibc arena fragmentation analysis.
 
 ### Memory
 
-Peak anon 7.04 GB. Entirely in stage 2b: 4 node_map shards loaded via
-K-way sorted-cursor merge (no radix sort), 2 stage-2b workers each
-holding way_refs + scratch + per-shard cursor state. `mallopt(M_ARENA_MAX,
-2)` inside `renumber_external()` caps glibc arena growth from cross-thread
+Peak anon 9.62 GB (commit `71bb548`). Dominated by IdSetDense bitsets
+(node_id_set ~1.6 GB + rank index ~1 GB, way_id_set ~200 MB + rank)
+plus relation_map FxHashMap (~500 MB). `mallopt(M_ARENA_MAX, 2)` inside
+`renumber_external()` caps glibc arena growth from cross-thread
 OwnedBlock `Vec<u8>` frees. Well under the 30 GB host limit.
+
+### Phase breakdown (commit `71bb548`, planet, `--bench 1`)
+
+| Phase | Duration | Peak Anon | Share |
+|---|---:|---:|---:|
+| PASS1 (4 workers, wire-format nodes) | **147 s** | 8.09 GB | 37% |
+| FUSED_WAY (parallel resolve via rank) | **88 s** | 8.01 GB | 22% |
+| STAGE2D (6 workers, wire-format ways) | **101 s** | 8.05 GB | 25% |
+| R1+R2A (fused relation scan) | **29 s** | 9.62 GB | 7% |
+| R2D (parallel wire-format relations) | **18 s** | 8.35 GB | 5% |
+| **TOTAL** | **401 s (6m42s)** | **9.62 GB** | — |
 
 ## Extract
 

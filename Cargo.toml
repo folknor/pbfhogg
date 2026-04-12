@@ -67,7 +67,7 @@ linux-direct-io = []
 linux-io-uring = ["dep:io-uring"]
 
 [dependencies]
-protohoggr = { version = "0.3.0", path = "../protohoggr" }
+protohoggr = { version = "0.4.0", path = "../protohoggr" }
 bytes = "1"
 flate2 = { version = "1.0", default-features = false, features = ["zlib-rs"] }
 memmap2 = "0.9"

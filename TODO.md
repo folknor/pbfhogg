@@ -531,16 +531,12 @@ single-pass, tag expression and bbox filtering.
     `stage2a_way_ref_pass`-shaped pattern if the planet profile
     shows it as a significant floor after the April 2026 rewrite.
 
-  **Projected total was ~1,430 s (23.8 min). Measured: 2,033 s (33.9 min)**
-  on commit `f607842` (UUID `d8330e2a`, 2026-04-12). **−41% vs the
-  3,456 s baseline**, short of the 24-min stretch target. Gap is mainly
-  stage 2b (427 s measured vs 150 s target) — work-stealing dispatch
-  requires `load_old_id_bucket_shards` to concat + radix-sort two
-  interleaved node_map shards, which doubled the per-bucket read I/O
-  and added a sort pass the range-based approach didn't need (but the
-  range-based approach OOMed, see "Pass 1 memory blowup" in
-  notes/renumber-planet-scale.md). Peak anon 7.31 GB (up from 2.79
-  GB), well under the 30 GB host limit.
+  **Final measurement: 1,468 s (24.5 min)** on commit `dc13a7b`
+  (UUID `4d0e2c17`, 2026-04-12). **−57% vs the 3,456 s baseline.**
+  Hits the 24-min accepted target. Pass 1 dropped from 1,147 s →
+  168 s (−85%) via the DenseNodes wire-format rewriter + 4 workers.
+  New bottleneck is stage 2d (418 s, 28%) and stage 2b (382 s, 26%).
+  Peak anon 7.04 GB, well under the 30 GB host limit.
 
   **Pass 1 deep-dive (round 3 reviewer consensus, 2026-04-12):**
 
@@ -574,8 +570,8 @@ single-pass, tag expression and bbox filtering.
 
   Priority-ordered pass 1 task list:
 
-  - [ ] **DenseNodes wire-format rewriter** (perf-codex + planet-claude,
-    unanimous). Stop using BlockBuilder for pass 1. Renumber only
+  - [x] **DenseNodes wire-format rewriter** — commit `dc13a7b`. (perf-codex
+    + planet-claude, unanimous). Stop using BlockBuilder for pass 1. Renumber only
     changes node IDs — coords, tags, metadata, string table are
     preserved verbatim. New `reframe_dense_with_new_ids` function:
     (1) decompress blob → raw protobuf bytes, (2) parse DenseNodes
@@ -593,7 +589,8 @@ single-pass, tag expression and bbox filtering.
     headroom confirmed (16 s of 416 s wall). K-way merge in stage 2b
     generalizes cleanly to 4 shards. Done in dirty iteration, needs
     commit.
-  - [ ] **`mallopt(M_ARENA_MAX, 2)` inside `renumber_external()`.**
+  - [x] **`mallopt(M_ARENA_MAX, 2)` inside `renumber_external()`** —
+    commit `dc13a7b`.
     Scopes the arena limit to external renumber only. 1 LoC:
     `unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }`. Not a global
     env var — other commands are unaffected. (planet-claude)

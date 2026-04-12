@@ -653,6 +653,31 @@ lat_offset (field 19 ≠ 0), or lon_offset (field 20 ≠ 0) must be
 detected and handled by falling back to the full decode+re-encode
 path. All standard planet PBFs use defaults. Add an assertion.
 
+### Fourth measurement: 1,468 s (24.5 min), commit `dc13a7b`, UUID `4d0e2c17`
+
+DenseNodes wire-format rewriter + 4 pass-1 workers + mallopt landed.
+
+| Phase | Baseline | Previous | **Final** | Δ vs baseline |
+|---|---:|---:|---:|---:|
+| PASS1 nodes | 1,147 s | 666 s | **168 s** | **−85%** |
+| STAGE2A way emit | 339 s | 132 s | **129 s** | −62% |
+| STAGE2B merge-join | 823 s | 366 s | **382 s** | −54% |
+| STAGE2C slot reorder | 174 s | 202 s | 224 s | +29% |
+| STAGE2D way assembly | 664 s | 394 s | **418 s** | −37% |
+| R1+R2A fused | 31 s | 30 s | 29 s | — |
+| R2B rel merge-join | 236 s | 70 s | **68 s** | −71% |
+| R2C + R2D | 35 s | 35 s | 40 s | — |
+| **TOTAL** | **3,456 s** | 1,901 s | **1,468 s** | **−57%** |
+
+Peak anon: **7.04 GB**. All element counts match baseline exactly.
+
+Pass 1 is no longer the bottleneck — it's now the fastest stage at
+168 s (11% of total). The new bottleneck is **stage 2d (418 s, 28%)**
+followed by **stage 2b (382 s, 26%)**. Stage 2d is the next candidate
+for the same wire-format rewriter treatment (way IDs change but refs
+are already resolved via the new_refs flat file — a specialized
+rewriter could patch only the ID + refs fields).
+
 ## Differences from ALTW external join
 
 For the implementer: where this is easier and harder than ALTW

@@ -542,14 +542,85 @@ single-pass, tag expression and bbox filtering.
   notes/renumber-planet-scale.md). Peak anon 7.31 GB (up from 2.79
   GB), well under the 30 GB host limit.
 
+  **Pass 1 deep-dive (round 3 reviewer consensus, 2026-04-12):**
+
+  Instrumented pass 1 with per-phase counters (pread / decompress /
+  parse / process / send) on workers and write timing on consumer.
+  Five planet runs with different configurations:
+
+  | Config | Wall | Process (cum) | Peak Anon |
+  |---|---:|---:|---:|
+  | 2w, add_node, ARENA=2 | 709 s | 1,049 s | 298 MB |
+  | 4w, add_node, ARENA=2 | **416 s** | 1,174 s | 486 MB |
+  | 4w, add_node_raw, no limit | 730 s | 2,291 s | 1,014 MB |
+  | 4w, add_node_raw, ARENA=2 | 1,048 s | 3,617 s | 1,027 MB |
+  | 4w, add_node, no limit | ~700 s | — | 26 GB (arena frag) |
+
+  Key findings:
+  - **`process` is the bottleneck** at 1,174 s cumulative = ~294 s/worker
+    = 113 ns/node. Consumer write is only 16 s — massive headroom.
+  - **4 workers scales well** (709→416 s, 1.7×). Consumer not the limiter.
+  - **`add_node_raw` + `pre_seed_string_table` is a regression** — the
+    per-block pre_seed overhead (Rc::from allocs + HashMap inserts)
+    exceeds the per-node tag-lookup savings. With ARENA=2, the extra
+    malloc contention makes it catastrophically slow (1,048 s).
+  - **glibc arena fragmentation confirmed** as the 26 GB growth cause:
+    OwnedBlock Vec<u8> allocated on pass1 worker, freed on rayon
+    thread. MALLOC_ARENA_MAX=2 caps it at 486 MB.
+  - **Planet-claude's cache analysis:** add_node touches ~12 memory
+    regions per node, working set ~536 KB per block — barely fits L2
+    (512 KB on Zen 3). L1 misses (~5 ns × 15 accesses × 10.4B) ≈
+    780 s cumulative. Likely the dominant process cost.
+
+  Priority-ordered pass 1 task list:
+
+  - [ ] **DenseNodes wire-format rewriter** (perf-codex + planet-claude,
+    unanimous). Stop using BlockBuilder for pass 1. Renumber only
+    changes node IDs — coords, tags, metadata, string table are
+    preserved verbatim. New `reframe_dense_with_new_ids` function:
+    (1) decompress blob → raw protobuf bytes, (2) parse DenseNodes
+    wire format to locate packed ID field + extract old_ids for bucket
+    emission, (3) generate new packed ID deltas (sequential renumber =
+    delta of 1 = single varint byte `0x02` repeated for all but the
+    first node), (4) copy lat/lon/keys_vals/denseinfo/string table raw
+    bytes verbatim, (5) re-frame as PrimitiveBlock. Eliminates all 12
+    dense arrays, string table HashMap, metadata construction, tag
+    iteration. Per-node cost drops from ~113 ns to ~10-15 ns.
+    Estimated process: 1,174 → ~200 s. ~200-300 LoC. Risk: blocks
+    with non-default granularity/lat_offset/lon_offset must assert and
+    fall back to full decode+re-encode. (planet-claude)
+  - [x] **4 workers for pass 1.** Measured: 709→416 s (1.7×). Consumer
+    headroom confirmed (16 s of 416 s wall). K-way merge in stage 2b
+    generalizes cleanly to 4 shards. Done in dirty iteration, needs
+    commit.
+  - [ ] **`mallopt(M_ARENA_MAX, 2)` inside `renumber_external()`.**
+    Scopes the arena limit to external renumber only. 1 LoC:
+    `unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }`. Not a global
+    env var — other commands are unaffected. (planet-claude)
+  - [ ] **Re-apply `from_vec_with_scratch`** in pass1_worker and
+    stage2d_worker (committed as `bcd7cbc`, reverted during dirty
+    iteration). Eliminates PrimitiveBlock::new .to_vec() copy.
+  - [ ] **Batch bucket writes per block.** Accumulate old_ids into a
+    local `[u8; 64000]` stack buffer, flush once per block. Saves
+    7999/8000 BufWriter calls per block. ~12 s wall. (planet-claude)
+  - [ ] **Per-block negative-id check via indexdata min_id.** If
+    `min_id >= 0`, skip per-element `reject_negative_id`. ~3 s wall.
+    (planet-claude)
+  - [ ] **Dense-node block-type fast path.** If block is DenseNodes,
+    skip the `Element` match dispatch entirely. ~minor. (planet-codex,
+    perf-codex)
+  - [ ] **Current-bucket fast path for old_id emission.** Node IDs are
+    sorted, `node_id_bucket` is monotone. Track active bucket + end
+    range, skip division for nodes in the same bucket. (perf-codex)
+  - [ ] **`take_owned` buffer reuse.** Return emptied encode_buf
+    capacity back to the worker instead of `mem::take` leaving cap 0.
+    Reduces per-block reallocation. (perf-codex)
+
   **Next-round optimization levers (round 2 reviewer consensus, 2026-04-12):**
 
-  - [ ] **3 workers for pass 1 / stage 2d** (revisit now that two-cursor
-    merge landed). The consumer thread (writer pipeline + compression)
-    may be the limiter — measure worker idle time vs consumer backpressure
-    before committing. Each additional worker adds one shard but the two-
-    cursor merge generalizes to K-way merge (min-heap) if needed. Try 3
-    first, not 4+. (arch-codex, planet-codex)
+  - [x] **4 workers for pass 1 / stage 2d.** Pass 1: measured at 416 s
+    (4 workers, ARENA=2). Stage 2d: not yet measured with 4 workers.
+    Consumer is not the limiter for either stage.
   - [ ] **Parallel stage 2c.** Slot buckets map to disjoint output ranges
     in the flat new_refs file. Workers can preallocate via `ftruncate`
     and `pwrite` independent bucket ranges concurrently. ~10% of total

@@ -573,11 +573,85 @@ Remaining levers if the 24-min target is revisited:
   place as a safety net). The published 33.9 min is with zlib:6;
   `--compression none` should be measurably faster.
 
-**Honest re-estimate vs ALTW context**: 33.9 min is 1.4× ALTW
-external (24m22s) and 1.5× build-geocode-index (22m26s) at planet.
-Acceptable for a first ship — renumber touches every element AND
-requires a 256-bucket external join per-element-type, while the
-other transforms operate on a single element type.
+### Third measurement: 1,901 s (31.7 min), commit `d3da65f`, UUID `7372cddb`
+
+Two-cursor merge (replaces concat + radix sort in stage 2b) and
+`PrimitiveBlock::from_vec_with_scratch` (eliminates `.to_vec()` copy
+in pass 1 and stage 2d workers). Stage 2b: 427→366 s. R2B: 138→70 s.
+Peak anon: 7.31→6.57 GB. Total: 2,033→1,901 s (−6.5%).
+
+### Pass 1 deep-dive (2026-04-12, dirty iteration with early exit)
+
+Instrumented pass 1 with per-phase counters (pread / decompress /
+parse / process / send on workers, write timing on consumer). Five
+planet runs across different configurations. Key data:
+
+**Best run: 4 workers, `add_node`, `MALLOC_ARENA_MAX=2` → 416 s.**
+
+| Metric | Cumulative | Per-worker |
+|---|---:|---:|
+| pread | 123 s | 31 s |
+| decompress | 226 s | 57 s |
+| parse | 9 s | 2 s |
+| **process** | **1,174 s** | **294 s** |
+| send | 0 s | 0 s |
+| consumer write | 16 s | (single thread) |
+
+Process = `pass1_process_blob` = `block.elements()` iteration +
+`bb.add_node` (delta encode + string table HashMap + metadata) +
+`ensure_node_capacity_local` + shard bucket `write_all(8 bytes)`.
+At 10.4B nodes = **113 ns/node**.
+
+**Glibc arena fragmentation confirmed.** Without `MALLOC_ARENA_MAX=2`,
+anon RSS grows linearly at 118 MB/s to 26 GB (OOM threshold). Cause:
+OwnedBlock `Vec<u8>` allocated on pass1 worker thread, freed on rayon
+compression thread. `MALLOC_ARENA_MAX=2` caps this at 486 MB with
+negligible contention penalty at 4 workers.
+
+**`add_node_raw` + `pre_seed_string_table` is a regression.** Process
+went from 1,174 → 3,617 s with ARENA=2. The per-block `pre_seed`
+cost (~150 `Rc::from` allocs + HashMap inserts × 1.3M blocks) exceeds
+the per-node tag-lookup savings. Abandoned.
+
+**Cache analysis (planet-claude).** `add_node` touches ~12 memory
+regions per node. Working set per 8000-node block ≈ 536 KB — barely
+fits Zen 3 L2 (512 KB). Every access is an L1 miss at ~5 ns. Estimated
+L1-miss cost: 780 s cumulative, likely the dominant process expense.
+
+### DenseNodes wire-format rewriter (next step)
+
+Unanimous perf + planet reviewer recommendation: stop using
+`BlockBuilder` for pass 1. Build a renumber-specific `reframe_dense_
+with_new_ids` function that operates at the wire-format level:
+
+1. Decompress blob → raw protobuf bytes.
+2. Parse DenseNodes message just enough to locate the packed ID field
+   (field 1, wire type LEN) and other payload fields.
+3. Decode old IDs (zigzag varints) to count nodes and emit old_ids
+   into the node_map bucket shard.
+4. Generate new packed ID deltas: sequential renumber means delta = 1
+   for all but the first node. `zigzag(1) = 0x02`, repeated N−1
+   times. First delta = `zigzag(new_block_start_id)`.
+5. Copy lat/lon/keys_vals/denseinfo raw bytes verbatim.
+6. Copy the input block's StringTable bytes verbatim.
+7. Re-frame as PrimitiveBlock: field 1 = copied StringTable, field 2 =
+   PrimitiveGroup containing the reconstructed DenseNodes.
+8. The output block has different byte length from the input (because
+   the new ID deltas have different varint widths), so enclosing
+   message lengths must be recomputed. But the lat/lon/tag/info
+   payload bytes are bit-identical to the input.
+
+**What this eliminates:** all 12 dense arrays in BlockBuilder, the
+string table HashMap, metadata construction, tag iteration,
+`add_node`. Per-node cost drops from ~113 ns to ~10-15 ns.
+
+**Estimated savings:** process 1,174 → ~200 s cumulative. At 4
+workers: ~50 s wall for process (down from ~294 s).
+
+**Risk:** blocks with non-default granularity (field 17 ≠ 100),
+lat_offset (field 19 ≠ 0), or lon_offset (field 20 ≠ 0) must be
+detected and handled by falling back to the full decode+re-encode
+path. All standard planet PBFs use defaults. Add an assertion.
 
 ## Differences from ALTW external join
 

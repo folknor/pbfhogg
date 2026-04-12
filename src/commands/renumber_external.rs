@@ -352,36 +352,26 @@ fn stage2d_parallel_way_assembly(
     }
 
     type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
-    let schedule_ref = way_schedule;
     let base_ids_ref: &[i64] = &base_way_ids;
     let stage2d_counters = StageCounters::new();
     let stage2d_cref = &stage2d_counters;
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next_idx;
 
     std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher thread
-        scope.spawn(move || {
-            for task in schedule_ref {
-                if desc_tx.send(task).is_err() {
-                    break;
-                }
-            }
-        });
-
         {
             let mut remaining_sets: &mut [super::id_set_dense::IdSetDense] = way_id_sets;
             for _ in 0..remaining_sets.len() {
                 let (is, it) = remaining_sets.split_at_mut(1);
                 remaining_sets = it;
                 let id_set = &mut is[0];
-                let rx = std::sync::Arc::clone(&desc_rx);
                 let file = std::sync::Arc::clone(shared_file);
                 let tx = decoded_tx.clone();
                 scope.spawn(move || {
                     stage2d_worker(
-                        &rx,
+                        way_schedule,
+                        next_ref,
                         base_ids_ref,
                         &file,
                         node_id_set,
@@ -396,7 +386,6 @@ fn stage2d_parallel_way_assembly(
         }
 
         drop(decoded_tx);
-        drop(desc_rx);
 
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             std::result::Result<Vec<OwnedBlock>, String>,
@@ -434,7 +423,8 @@ fn stage2d_parallel_way_assembly(
 /// or mmap needed.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage2d_worker(
-    rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
+    schedule: &[BlobTask],
+    next_idx: &std::sync::atomic::AtomicUsize,
     base_way_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
     node_id_set: &super::id_set_dense::IdSetDense,
@@ -458,15 +448,11 @@ fn stage2d_worker(
     let mut way_scalar_fields: Vec<u8> = Vec::new();
 
     loop {
-        let task = {
-            let guard = rx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match guard.recv() {
-                Ok(t) => t,
-                Err(_) => break,
-            }
-        };
+        let idx = next_idx.fetch_add(1, Relaxed);
+        if idx >= schedule.len() {
+            break;
+        }
+        let task = &schedule[idx];
 
         let base_way_id = base_way_ids[task.seq];
 
@@ -514,7 +500,10 @@ fn stage2d_worker(
                 bbox: None,
             };
             output_blocks.clear();
-            output_blocks.push((std::mem::take(&mut reframe_buf), index, None));
+            let taken = std::mem::take(&mut reframe_buf);
+            // Pre-reserve for next blob based on this blob's output size.
+            reframe_buf.reserve(taken.len());
+            output_blocks.push((taken, index, None));
 
             if blob_way_count != task.element_count {
                 return Err(format!(
@@ -667,37 +656,26 @@ fn pass1_parallel_scan(
     }
 
     type DecodedItem = (usize, std::result::Result<Vec<OwnedBlock>, String>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<&BlobTask>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
     let base_ids_ref: &[i64] = &base_new_ids;
     let pass1_counters = StageCounters::new();
     let pass1_cref = &pass1_counters;
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next_idx;
 
     std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed schedule into the descriptor queue in file
-        // order. Workers compete for items, so each shard receives a
-        // FIFO-monotonic *subset* of the schedule.
-        scope.spawn(move || {
-            for task in schedule {
-                if desc_tx.send(task).is_err() {
-                    break;
-                }
-            }
-        });
-
         {
             let mut remaining: &mut [super::id_set_dense::IdSetDense] = id_sets;
             for _ in 0..remaining.len() {
                 let (head, tail) = remaining.split_at_mut(1);
                 remaining = tail;
                 let shard = &mut head[0];
-                let rx = std::sync::Arc::clone(&desc_rx);
                 let file = std::sync::Arc::clone(shared_file);
                 let tx = decoded_tx.clone();
                 scope.spawn(move || {
                     pass1_worker(
-                        &rx,
+                        schedule,
+                        next_ref,
                         base_ids_ref,
                         &file,
                         shard,
@@ -710,7 +688,6 @@ fn pass1_parallel_scan(
         }
 
         drop(decoded_tx);
-        drop(desc_rx);
 
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
             std::result::Result<Vec<OwnedBlock>, String>,
@@ -784,7 +761,8 @@ impl StageCounters {
 
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_worker(
-    rx: &std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<&BlobTask>>>,
+    schedule: &[BlobTask],
+    next_idx: &std::sync::atomic::AtomicUsize,
     base_new_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
     id_set: &mut super::id_set_dense::IdSetDense,
@@ -799,7 +777,6 @@ fn pass1_worker(
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut reframe_buf: Vec<u8> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-    // Reusable scratch for reframe_dense_with_new_ids.
     let mut group_ranges_scratch: Vec<(usize, usize)> = Vec::new();
     let mut scalar_fields_scratch: Vec<u8> = Vec::new();
     let mut other_fields_scratch: Vec<u8> = Vec::new();
@@ -808,15 +785,11 @@ fn pass1_worker(
     let mut group_out_scratch: Vec<u8> = Vec::new();
 
     loop {
-        let task = {
-            let guard = rx
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            match guard.recv() {
-                Ok(t) => t,
-                Err(_) => break,
-            }
-        };
+        let idx = next_idx.fetch_add(1, Relaxed);
+        if idx >= schedule.len() {
+            break;
+        }
+        let task = &schedule[idx];
 
         let base_new_id = base_new_ids[task.seq];
         let result: std::result::Result<Vec<OwnedBlock>, String> = (|| {
@@ -861,7 +834,9 @@ fn pass1_worker(
                 bbox: task.bbox,
             };
             output_blocks.clear();
-            output_blocks.push((std::mem::take(&mut reframe_buf), index, None));
+            let taken = std::mem::take(&mut reframe_buf);
+            reframe_buf.reserve(taken.len());
+            output_blocks.push((taken, index, None));
 
             if blob_node_count != task.element_count {
                 return Err(format!(
@@ -1540,27 +1515,14 @@ fn relation_r2d_assembly(
 
     // Each blob produces one OwnedBlock tuple.
     type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>);
-    let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
 
     let rels_written = std::sync::atomic::AtomicU64::new(0);
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next_idx;
 
     std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher thread — sends (seq, data_offset, data_size, node_start, way_start).
-        let sched = relation_schedule;
-        scope.spawn(move || {
-            for (i, task) in sched.iter().enumerate() {
-                if desc_tx.send((i, task.data_offset, task.data_size)).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Worker threads.
         for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
             let file = std::sync::Arc::clone(shared_file);
             let tx = decoded_tx.clone();
             let rid_set = relation_id_set;
@@ -1578,18 +1540,16 @@ fn relation_r2d_assembly(
                 let mut scalar_fields: Vec<u8> = Vec::new();
 
                 loop {
-                    let (seq, data_offset, data_size) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(msg) => msg,
-                            Err(_) => break,
-                        }
-                    };
+                    let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if idx >= relation_schedule.len() {
+                        break;
+                    }
+                    let task = &relation_schedule[idx];
 
                     let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String> = (|| {
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| format!("pread at {data_offset}: {e}"))?;
+                        read_buf.resize(task.data_size, 0);
+                        file.read_exact_at(&mut read_buf, task.data_offset)
+                            .map_err(|e| format!("pread at {}: {e}", task.data_offset))?;
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                             .map_err(|e| e.to_string())?;
 
@@ -1618,10 +1578,12 @@ fn relation_r2d_assembly(
                             count: blob_count,
                             bbox: None,
                         };
-                        Ok((std::mem::take(&mut reframe_buf), index, blob_count))
+                        let taken = std::mem::take(&mut reframe_buf);
+                        reframe_buf.reserve(taken.len());
+                        Ok((taken, index, blob_count))
                     })();
 
-                    if tx.send((seq, result)).is_err() {
+                    if tx.send((idx, result)).is_err() {
                         break;
                     }
                 }
@@ -1629,7 +1591,6 @@ fn relation_r2d_assembly(
         }
 
         drop(decoded_tx);
-        drop(desc_rx);
 
         // Consumer: reorder by seq, write to output in file order.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<

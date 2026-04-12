@@ -111,7 +111,11 @@ pub fn renumber_external(
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         header_blob.to_headerblock()?
     };
-    let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| {
+    // External renumber uses zlib:1 — the compression pipeline is on the
+    // critical path for pass 1 and stage 2d, and zlib:6 adds ~22 s of
+    // backpressure at planet scale for ~15% smaller output.
+    let _ = compression;
+    let mut writer = writer_from_header(output, Compression::Zlib(1), &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
     // ---- Scratch dir ----
@@ -1210,12 +1214,7 @@ fn reframe_ways_with_new_ids(
                              negative (editor-local) ids."
                         ));
                     }
-                    #[allow(clippy::cast_possible_wrap)]
-                    let new_ref = if node_id_set.get(old_node_id) {
-                        start_node_id + node_id_set.rank(old_node_id) as i64
-                    } else {
-                        old_node_id // orphan
-                    };
+                    let new_ref = node_id_set.resolve(old_node_id, start_node_id);
                     protohoggr::encode_varint(
                         refs_scratch,
                         protohoggr::zigzag_encode_64(new_ref - prev_new_ref),
@@ -1666,22 +1665,12 @@ fn fused_relation_resolve(
                     match m.id {
                         MemberId::Node(old_id) => {
                             reject_negative_id(old_id, "relation node member")?;
-                            #[allow(clippy::cast_possible_wrap)]
-                            let new_id = if node_id_set.get(old_id) {
-                                start_node_id + node_id_set.rank(old_id) as i64
-                            } else {
-                                old_id
-                            };
+                            let new_id = node_id_set.resolve(old_id, start_node_id);
                             node_refs.extend_from_slice(&new_id.to_le_bytes());
                         }
                         MemberId::Way(old_id) => {
                             reject_negative_id(old_id, "relation way member")?;
-                            #[allow(clippy::cast_possible_wrap)]
-                            let new_id = if way_id_set.get(old_id) {
-                                start_way_id + way_id_set.rank(old_id) as i64
-                            } else {
-                                old_id
-                            };
+                            let new_id = way_id_set.resolve(old_id, start_way_id);
                             way_refs.extend_from_slice(&new_id.to_le_bytes());
                         }
                         MemberId::Relation(old_id) => {

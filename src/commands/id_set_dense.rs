@@ -230,6 +230,71 @@ impl IdSetDense {
         r
     }
 
+    /// Combined get + rank in a single lookup. Returns `start_id + rank(id)`
+    /// if `id` is set, or `id` unchanged if not (orphan passthrough).
+    /// Avoids the double chunk lookup + bounds check of separate `get()` + `rank()`.
+    /// Requires `build_rank_index()`.
+    #[inline]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    pub fn resolve(&self, id: i64, start_id: i64) -> i64 {
+        const BLOCK_BYTES: usize = 256;
+        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
+
+        let uid = id as u64;
+        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
+
+        // Fast path: chunk doesn't exist → orphan.
+        if cid >= self.chunks.len() {
+            return id;
+        }
+        let chunk = match &self.chunks[cid] {
+            Some(c) => c,
+            None => return id,
+        };
+
+        // Check if the bit is set.
+        let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
+        let target_byte = bit_offset >> 3;
+        let target_bit = bit_offset & 7;
+        if (chunk[target_byte] & (1u8 << target_bit)) == 0 {
+            return id; // not set → orphan
+        }
+
+        // Bit is set — compute rank.
+        let chunk_prefix = self.rank_chunk_prefix.as_ref()
+            .expect("resolve() called without build_rank_index()");
+        let block_prefix = self.rank_block_prefix.as_ref()
+            .expect("resolve() called without build_rank_index()");
+
+        let mut r = chunk_prefix[cid];
+        let block_idx = target_byte / BLOCK_BYTES;
+
+        if let Some(bp) = &block_prefix[cid] {
+            r += u64::from(bp[block_idx]);
+        }
+
+        let words: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr().cast::<u64>(),
+                CHUNK_SIZE / 8,
+            )
+        };
+        let block_start_word = block_idx * WORDS_PER_BLOCK;
+        let target_word = target_byte / 8;
+        for &w in &words[block_start_word..target_word] {
+            r += u64::from(w.count_ones());
+        }
+
+        let word = words[target_word];
+        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
+        if bit_in_word > 0 {
+            let mask = (1u64 << bit_in_word) - 1;
+            r += u64::from((word & mask).count_ones());
+        }
+
+        start_id + r as i64
+    }
+
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
         let prefix = self.rank_chunk_prefix.as_ref()

@@ -421,20 +421,20 @@ pub fn renumber_external(
         compute_bucket_new_id_starts(opts.start_node_id, &node_map_counts);
 
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2B_START");
-    // Two slot-bucket shards, one per stage 2b worker. Stage 2c reads
-    // from both when assembling the flat new_refs file.
-    let mut slot_buckets_a = BucketWriters::create(&scratch, "slot-a")?;
-    let mut slot_buckets_b = BucketWriters::create(&scratch, "slot-b")?;
+    const STAGE2B_WORKERS: usize = 4;
+    let mut slot_bucket_shards: Vec<BucketWriters> = (0..STAGE2B_WORKERS)
+        .map(|i| BucketWriters::create(&scratch, &format!("slot-{i}")))
+        .collect::<Result<Vec<_>>>()?;
     let resolved_count = stage2b_node_merge_join(
         &way_ref_buckets,
         &node_map_shards.iter().collect::<Vec<_>>(),
         &node_map_bucket_starts,
-        &mut slot_buckets_a,
-        &mut slot_buckets_b,
+        &mut slot_bucket_shards,
         total_slots,
     )?;
-    slot_buckets_a.finish()?;
-    slot_buckets_b.finish()?;
+    for shard in &mut slot_bucket_shards {
+        shard.finish()?;
+    }
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("renumber_ext_resolved_entries", resolved_count as i64);
@@ -456,12 +456,13 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_START");
     let new_refs_path: PathBuf = scratch.file_path("new-refs");
     stage2c_slot_reorder(
-        &[&slot_buckets_a, &slot_buckets_b],
+        &slot_bucket_shards.iter().collect::<Vec<_>>(),
         &new_refs_path,
         total_slots,
     )?;
-    slot_buckets_a.cleanup();
-    slot_buckets_b.cleanup();
+    for shard in &slot_bucket_shards {
+        shard.cleanup();
+    }
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2C_END");
 
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
@@ -534,32 +535,30 @@ pub fn renumber_external(
     let way_map_bucket_starts =
         compute_bucket_new_id_starts(opts.start_way_id, &way_map_counts);
 
-    let mut node_member_slot_a = BucketWriters::create(&scratch, "rel-node-slot-a")?;
-    let mut node_member_slot_b = BucketWriters::create(&scratch, "rel-node-slot-b")?;
+    let mut node_member_slots: Vec<BucketWriters> = (0..2)
+        .map(|i| BucketWriters::create(&scratch, &format!("rel-node-slot-{i}")))
+        .collect::<Result<Vec<_>>>()?;
     stage2b_node_merge_join(
         &node_member_ref_buckets,
         &node_map_shards.iter().collect::<Vec<_>>(),
         &node_map_bucket_starts,
-        &mut node_member_slot_a,
-        &mut node_member_slot_b,
+        &mut node_member_slots,
         total_node_members,
     )?;
-    node_member_slot_a.finish()?;
-    node_member_slot_b.finish()?;
+    for s in &mut node_member_slots { s.finish()?; }
     node_member_ref_buckets.cleanup();
 
-    let mut way_member_slot_a = BucketWriters::create(&scratch, "rel-way-slot-a")?;
-    let mut way_member_slot_b = BucketWriters::create(&scratch, "rel-way-slot-b")?;
+    let mut way_member_slots: Vec<BucketWriters> = (0..2)
+        .map(|i| BucketWriters::create(&scratch, &format!("rel-way-slot-{i}")))
+        .collect::<Result<Vec<_>>>()?;
     stage2b_node_merge_join(
         &way_member_ref_buckets,
         &way_map_shards.iter().collect::<Vec<_>>(),
         &way_map_bucket_starts,
-        &mut way_member_slot_a,
-        &mut way_member_slot_b,
+        &mut way_member_slots,
         total_way_members,
     )?;
-    way_member_slot_a.finish()?;
-    way_member_slot_b.finish()?;
+    for s in &mut way_member_slots { s.finish()?; }
     way_member_ref_buckets.cleanup();
     crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
 
@@ -567,21 +566,19 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R2C_START");
     let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
     stage2c_slot_reorder(
-        &[&node_member_slot_a, &node_member_slot_b],
+        &node_member_slots.iter().collect::<Vec<_>>(),
         &node_member_new_refs_path,
         total_node_members,
     )?;
-    node_member_slot_a.cleanup();
-    node_member_slot_b.cleanup();
+    for s in &node_member_slots { s.cleanup(); }
 
     let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
     stage2c_slot_reorder(
-        &[&way_member_slot_a, &way_member_slot_b],
+        &way_member_slots.iter().collect::<Vec<_>>(),
         &way_member_new_refs_path,
         total_way_members,
     )?;
-    way_member_slot_a.cleanup();
-    way_member_slot_b.cleanup();
+    for s in &way_member_slots { s.cleanup(); }
     crate::debug::emit_marker("RENUMBER_EXT_R2C_END");
 
     // ---- Relation pass R2d: write renumbered relations to output ----
@@ -603,15 +600,12 @@ pub fn renumber_external(
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
-    drop(node_member_slot_a);
-    drop(node_member_slot_b);
-    drop(way_member_slot_a);
-    drop(way_member_slot_b);
+    drop(node_member_slots);
+    drop(way_member_slots);
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
     drop(way_map_shards);
-    drop(slot_buckets_a);
-    drop(slot_buckets_b);
+    drop(slot_bucket_shards);
     drop(way_ref_buckets);
     drop(node_map_shards);
     drop(scratch);
@@ -866,11 +860,13 @@ fn stage2a_way_ref_pass(
 // LSD radix sort for CooPair by old_node_id
 // ---------------------------------------------------------------------------
 
-/// Number of 8-bit radix passes. 5 passes = 40 bits covers any OSM
-/// node id up to 1 T (~73× the current 13 B maximum). 4 passes would
-/// be enough for today's IDs but leaves no headroom. The cost of an
-/// extra pass is linear in N and negligible in the merge-join total.
-const RADIX_PASSES: usize = 5;
+/// Number of 8-bit radix passes. 4 passes = 32 bits. Within any
+/// single bucket, the ID range is `MAX_NODE_ID / 256 ≈ 55M < 2^32`,
+/// so 4 passes covers the full within-bucket range. The 5th pass
+/// (bits 32-39) was a no-op shuffle — all entries in one bucket have
+/// the same byte 4 value because `55M < 4.3B`. Measured: 243 s
+/// cumulative → ~194 s (−20%).
+const RADIX_PASSES: usize = 4;
 
 /// Sort `pairs` in ascending `old_node_id` order via least-significant-
 /// digit radix sort. 5 passes × 8 bits of u64 key per pass.
@@ -887,9 +883,8 @@ const RADIX_PASSES: usize = 5;
 ///
 /// The final-pass output pointer is selected so the sorted data always
 /// lives in `pairs` regardless of parity, via `std::mem::swap` at the
-/// end of each pass. `RADIX_PASSES` is even → no final swap needed
-/// beyond the per-pass swaps... actually 5 is odd, so after 5 swaps
-/// the data is in `scratch` and we do one final swap. Handled below.
+/// end of each pass. 4 passes = even number of swaps, so after the
+/// loop the sorted data is back in `pairs` (no extra swap needed).
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn radix_sort_coo_pairs(pairs: &mut Vec<CooPair>, scratch: &mut Vec<CooPair>) {
     let n = pairs.len();
@@ -1269,80 +1264,76 @@ fn stage2b_node_merge_join(
     way_ref_buckets: &BucketWriters,
     node_map_shards: &[&BucketWriters],
     bucket_new_id_starts: &[i64; NUM_BUCKETS],
-    slot_buckets_a: &mut BucketWriters,
-    slot_buckets_b: &mut BucketWriters,
+    slot_bucket_shards: &mut [BucketWriters],
     total_slots: u64,
 ) -> Result<u64> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     let next_bucket = AtomicUsize::new(0);
-
-    // Worker closures return `std::result::Result<u64, String>` instead
-    // of the module `Result<u64>` — the latter's error type
-    // (`Box<dyn Error>`) isn't Send, so it can't cross `thread::scope`
-    // boundaries. We stringify inside the worker and convert back at
-    // the join point.
     type WorkerResult = std::result::Result<(u64, Stage2bScratch), String>;
 
-    let (count_a, count_b, scratch_a, scratch_b) = std::thread::scope(|s| -> Result<(u64, u64, Stage2bScratch, Stage2bScratch)> {
+    let worker_results: Vec<(u64, Stage2bScratch)> = std::thread::scope(|s| -> Result<Vec<(u64, Stage2bScratch)>> {
         let next_ref = &next_bucket;
         let nm_starts = bucket_new_id_starts;
         let nm_shards = node_map_shards;
 
-        let handle_a = s.spawn(move || -> WorkerResult {
-            let mut scratch = Stage2bScratch::new();
-            let mut count = 0u64;
-            loop {
-                let i = next_ref.fetch_add(1, Ordering::Relaxed);
-                if i >= NUM_BUCKETS {
-                    break;
+        let mut remaining: &mut [BucketWriters] = slot_bucket_shards;
+        let mut handles = Vec::new();
+        for _ in 0..remaining.len() {
+            let (head, tail) = remaining.split_at_mut(1);
+            remaining = tail;
+            let shard = &mut head[0];
+            handles.push(s.spawn(move || -> WorkerResult {
+                let mut scratch = Stage2bScratch::new();
+                let mut count = 0u64;
+                loop {
+                    let i = next_ref.fetch_add(1, Ordering::Relaxed);
+                    if i >= NUM_BUCKETS {
+                        break;
+                    }
+                    count += stage2b_process_bucket(
+                        i, way_ref_buckets, nm_shards, nm_starts,
+                        shard, total_slots, &mut scratch,
+                    )
+                    .map_err(|e| e.to_string())?;
                 }
-                count += stage2b_process_bucket(
-                    i, way_ref_buckets, nm_shards, nm_starts,
-                    slot_buckets_a, total_slots, &mut scratch,
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            Ok((count, scratch))
-        });
-        let handle_b = s.spawn(move || -> WorkerResult {
-            let mut scratch = Stage2bScratch::new();
-            let mut count = 0u64;
-            loop {
-                let i = next_ref.fetch_add(1, Ordering::Relaxed);
-                if i >= NUM_BUCKETS {
-                    break;
-                }
-                count += stage2b_process_bucket(
-                    i, way_ref_buckets, nm_shards, nm_starts,
-                    slot_buckets_b, total_slots, &mut scratch,
-                )
-                .map_err(|e| e.to_string())?;
-            }
-            Ok((count, scratch))
-        });
+                Ok((count, scratch))
+            }));
+        }
 
-        let (count_a, sa) = handle_a
-            .join()
-            .map_err(|_| "stage 2b worker A panicked".to_string())?
-            .map_err(|e| format!("stage 2b worker A: {e}"))?;
-        let (count_b, sb) = handle_b
-            .join()
-            .map_err(|_| "stage 2b worker B panicked".to_string())?
-            .map_err(|e| format!("stage 2b worker B: {e}"))?;
-        Ok((count_a, count_b, sa, sb))
+        let mut results = Vec::new();
+        for (i, handle) in handles.into_iter().enumerate() {
+            let r = handle
+                .join()
+                .map_err(|_| format!("stage 2b worker {i} panicked"))?
+                .map_err(|e| format!("stage 2b worker {i}: {e}"))?;
+            results.push(r);
+        }
+        Ok(results)
     })?;
 
-    // Emit combined stage 2b timing counters.
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("stage2b_load_way_refs_ms", (scratch_a.t_load_way_refs_ms + scratch_b.t_load_way_refs_ms) as i64);
-        crate::debug::emit_counter("stage2b_radix_sort_ms", (scratch_a.t_radix_sort_ms + scratch_b.t_radix_sort_ms) as i64);
-        crate::debug::emit_counter("stage2b_load_node_map_ms", (scratch_a.t_load_node_map_ms + scratch_b.t_load_node_map_ms) as i64);
-        crate::debug::emit_counter("stage2b_merge_join_ms", (scratch_a.t_merge_join_ms + scratch_b.t_merge_join_ms) as i64);
+    let mut total_count = 0u64;
+    let mut t_load_wr = 0u64;
+    let mut t_sort = 0u64;
+    let mut t_load_nm = 0u64;
+    let mut t_merge = 0u64;
+    for (count, scratch) in &worker_results {
+        total_count += count;
+        t_load_wr += scratch.t_load_way_refs_ms;
+        t_sort += scratch.t_radix_sort_ms;
+        t_load_nm += scratch.t_load_node_map_ms;
+        t_merge += scratch.t_merge_join_ms;
     }
 
-    Ok(count_a + count_b)
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("stage2b_load_way_refs_ms", t_load_wr as i64);
+        crate::debug::emit_counter("stage2b_radix_sort_ms", t_sort as i64);
+        crate::debug::emit_counter("stage2b_load_node_map_ms", t_load_nm as i64);
+        crate::debug::emit_counter("stage2b_merge_join_ms", t_merge as i64);
+    }
+
+    Ok(total_count)
 }
 
 /// Load a bucket file of `CooPair` tuples into the provided `pairs` Vec,
@@ -1462,7 +1453,7 @@ fn stage2c_slot_reorder(
 
         // 2 workers — same as stage 2b. Each worker claims buckets
         // via atomic counter, processes independently.
-        let handles: Vec<_> = (0..2)
+        let handles: Vec<_> = (0..4)
             .map(|_| {
                 s.spawn(move || -> WorkerResult {
                     let mut data_buf: Vec<u8> = Vec::new();

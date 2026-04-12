@@ -531,12 +531,13 @@ single-pass, tag expression and bbox filtering.
     `stage2a_way_ref_pass`-shaped pattern if the planet profile
     shows it as a significant floor after the April 2026 rewrite.
 
-  **Final measurement: 1,468 s (24.5 min)** on commit `dc13a7b`
-  (UUID `4d0e2c17`, 2026-04-12). **−57% vs the 3,456 s baseline.**
-  Hits the 24-min accepted target. Pass 1 dropped from 1,147 s →
-  168 s (−85%) via the DenseNodes wire-format rewriter + 4 workers.
-  New bottleneck is stage 2d (418 s, 28%) and stage 2b (382 s, 26%).
-  Peak anon 7.04 GB, well under the 30 GB host limit.
+  **Latest measurement: 960 s (16.0 min)** on commit `7839303`
+  (2026-04-12). **−72% vs the 3,456 s baseline.** DenseNodes
+  wire-format rewriter (pass 1), way splice rewriter (stage 2d),
+  4-worker parallelism across all stages, parallel pwrite (stage 2c),
+  radix 4 passes, batch bucket writes, schedule reuse, mallopt
+  M_ARENA_MAX=2. Stage 2b (288 s, 30%) is the remaining #1 target.
+  Peak anon 13.2 GB (stage 2b 4 workers).
 
   **Pass 1 deep-dive (round 3 reviewer consensus, 2026-04-12):**
 
@@ -672,10 +673,10 @@ single-pass, tag expression and bbox filtering.
     both reframe functions. Currently per-blob allocations (1.3M node
     blobs + 17K way blobs). Trivially reusable — `group_ranges` usually
     has 1 entry, `scalar_fields` ~20 bytes. (planet-claude, perf-codex)
-  - [ ] **Redundant radix pass in stage 2b.** Within one bucket, keys
-    only span that bucket's range, so the highest 8-bit pass of
-    `radix_sort_coo_pairs` is redundant. Reducing from 5 to 4 passes
-    saves ~20% of the sort cost. (perf-codex)
+  - [x] **Redundant radix pass in stage 2b** — commit `7839303`.
+    Reduced from 5 to 4 passes. Within one bucket, ID range ≈ 55M <
+    2^32, so byte 4 (bits 32-39) was constant = no-op shuffle.
+    (perf-codex)
   - [ ] **Pre-compute ref deltas in stage 2c.** Store deltas (not
     absolutes) in the flat `new_refs` file. Shifts 12.4B delta
     computations from stage 2d (per-blob, hot reframe loop) to stage 2c

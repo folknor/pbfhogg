@@ -284,6 +284,7 @@ pub fn renumber_external(
 
     let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
     let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
+    let rel_member_count_sidecar: PathBuf = scratch.file_path("rel-member-counts");
     let (total_node_members, total_way_members) = fused_relation_resolve(
         input,
         &node_id_set,
@@ -294,6 +295,7 @@ pub fn renumber_external(
         &mut next_relation_id,
         &node_member_new_refs_path,
         &way_member_new_refs_path,
+        &rel_member_count_sidecar,
     )?;
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -308,10 +310,10 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
     relation_r2d_assembly(
         input,
-        direct_io,
         &mut writer,
         &node_member_new_refs_path,
         &way_member_new_refs_path,
+        &rel_member_count_sidecar,
         total_node_members,
         total_way_members,
         &relation_map,
@@ -1907,6 +1909,7 @@ fn build_blob_schedule(
 ///
 /// Returns `(total_node_members, total_way_members)`.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn fused_relation_resolve(
     input: &Path,
     node_id_set: &super::id_set_dense::IdSetDense,
@@ -1917,6 +1920,7 @@ fn fused_relation_resolve(
     next_relation_id: &mut i64,
     node_refs_path: &Path,
     way_refs_path: &Path,
+    member_count_sidecar_path: &Path,
 ) -> Result<(u64, u64)> {
     let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
     let shared_file = std::fs::File::open(input)
@@ -1929,6 +1933,15 @@ fn fused_relation_resolve(
 
     let mut node_refs: Vec<u8> = Vec::new();
     let mut way_refs: Vec<u8> = Vec::new();
+
+    // Per-blob member count sidecar for R2d parallelization.
+    // Layout: (node_count: u64, way_count: u64) per relation blob,
+    // followed by (total_node_members: u64, total_way_members: u64) trailer.
+    let mut sidecar_writer = BufWriter::with_capacity(
+        64 * 1024,
+        std::fs::File::create(member_count_sidecar_path)
+            .map_err(|e| format!("failed to create member-count sidecar: {e}"))?,
+    );
 
     use std::os::unix::fs::FileExt;
     for &(data_offset, data_size) in &schedule {
@@ -1944,6 +1957,8 @@ fn fused_relation_resolve(
             &mut st_scratch,
             &mut gr_scratch,
         )?;
+        let node_refs_before = node_refs.len();
+        let way_refs_before = way_refs.len();
         for element in block.elements() {
             if let Element::Relation(r) = &element {
                 reject_negative_id(r.id(), "relation")?;
@@ -1981,10 +1996,19 @@ fn fused_relation_resolve(
                 }
             }
         }
+        let blob_node_count = ((node_refs.len() - node_refs_before) / NEW_REF_SIZE) as u64;
+        let blob_way_count = ((way_refs.len() - way_refs_before) / NEW_REF_SIZE) as u64;
+        sidecar_writer.write_all(&blob_node_count.to_le_bytes())?;
+        sidecar_writer.write_all(&blob_way_count.to_le_bytes())?;
     }
 
     let total_node_members = (node_refs.len() / NEW_REF_SIZE) as u64;
     let total_way_members = (way_refs.len() / NEW_REF_SIZE) as u64;
+
+    // Trailer.
+    sidecar_writer.write_all(&total_node_members.to_le_bytes())?;
+    sidecar_writer.write_all(&total_way_members.to_le_bytes())?;
+    sidecar_writer.flush()?;
 
     // Write flat files.
     std::fs::write(node_refs_path, &node_refs)
@@ -1996,13 +2020,68 @@ fn fused_relation_resolve(
 }
 
 // ---------------------------------------------------------------------------
-// Relation pass R2d: wire-format rewrite of member refs + write output
+// Relation pass R2d: parallel wire-format rewrite + write output
 // ---------------------------------------------------------------------------
 
-/// Third (and final) scan over relation blobs. Wire-format splice
-/// rewriter: patches relation id (field 1) and member ids (field 9),
-/// copies all other fields verbatim. Writes each reframed blob via
-/// `write_primitive_block_owned` — no BlockBuilder, no full decode.
+/// Load the per-blob member-count sidecar and compute prefix sums for
+/// node and way slot cursors. Returns `(node_starts, way_starts)` —
+/// each vector has one entry per relation blob.
+///
+/// Sidecar layout: `(node_count: u64, way_count: u64)` per blob,
+/// followed by a `(total_node: u64, total_way: u64)` trailer.
+#[allow(clippy::cast_possible_truncation)]
+fn load_member_count_sidecar(
+    path: &Path,
+    total_node_members: u64,
+    total_way_members: u64,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("failed to read member-count sidecar: {e}"))?;
+    if data.len() < 16 {
+        return Err("member-count sidecar is too small".into());
+    }
+    // Verify trailer.
+    let trailer_node = u64::from_le_bytes(
+        data[data.len() - 16..data.len() - 8]
+            .try_into()
+            .map_err(|_| "sidecar trailer read")?,
+    );
+    let trailer_way = u64::from_le_bytes(
+        data[data.len() - 8..]
+            .try_into()
+            .map_err(|_| "sidecar trailer read")?,
+    );
+    if trailer_node != total_node_members || trailer_way != total_way_members {
+        return Err(format!(
+            "member-count sidecar trailer ({trailer_node}, {trailer_way}) != \
+             expected ({total_node_members}, {total_way_members})"
+        )
+        .into());
+    }
+    let entry_bytes = &data[..data.len() - 16];
+    if !entry_bytes.len().is_multiple_of(16) {
+        return Err("member-count sidecar has non-aligned entries".into());
+    }
+    let num_blobs = entry_bytes.len() / 16;
+    let mut node_starts = Vec::with_capacity(num_blobs);
+    let mut way_starts = Vec::with_capacity(num_blobs);
+    let mut node_cum: u64 = 0;
+    let mut way_cum: u64 = 0;
+    for chunk in entry_bytes.chunks_exact(16) {
+        node_starts.push(node_cum);
+        way_starts.push(way_cum);
+        let nc = u64::from_le_bytes(chunk[..8].try_into().map_err(|_| "sidecar chunk")?);
+        let wc = u64::from_le_bytes(chunk[8..16].try_into().map_err(|_| "sidecar chunk")?);
+        node_cum += nc;
+        way_cum += wc;
+    }
+    Ok((node_starts, way_starts))
+}
+
+/// Parallel R2d: wire-format splice rewriter for relation blobs.
+/// Work-stealing dispatch with ReorderBuffer, same pattern as pass 1
+/// and stage 2d. Each worker knows its per-blob cursor offsets from
+/// the member-count sidecar prefix sums.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
@@ -2011,10 +2090,10 @@ fn fused_relation_resolve(
 )]
 fn relation_r2d_assembly(
     input: &Path,
-    _direct_io: bool,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
     node_member_new_refs_path: &Path,
     way_member_new_refs_path: &Path,
+    member_count_sidecar_path: &Path,
     total_node_members: u64,
     total_way_members: u64,
     relation_map: &FxHashMap<i64, i64>,
@@ -2023,82 +2102,159 @@ fn relation_r2d_assembly(
     let node_mmap = open_new_refs_mmap(node_member_new_refs_path, total_node_members)?;
     let way_mmap = open_new_refs_mmap(way_member_new_refs_path, total_way_members)?;
 
+    let (node_starts, way_starts) = load_member_count_sidecar(
+        member_count_sidecar_path,
+        total_node_members,
+        total_way_members,
+    )?;
+
     let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
-    let pool = crate::blob::DecompressPool::new();
-    let mut raw_buf: Vec<u8> = Vec::new();
-
-    let mut node_slot_cursor: u64 = 0;
-    let mut way_slot_cursor: u64 = 0;
-
-    // Reusable scratch buffers for reframe_relations_with_new_ids.
-    let mut reframe_buf: Vec<u8> = Vec::new();
-    let mut memids_scratch: Vec<u8> = Vec::new();
-    let mut group_scratch: Vec<u8> = Vec::new();
-    let mut reframed_rel_scratch: Vec<u8> = Vec::new();
-    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut scalar_fields: Vec<u8> = Vec::new();
-
-    use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        raw_buf.resize(data_size, 0);
-        shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
-        let mut decompress_buf = pool.get();
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-
-        let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
-            &decompress_buf,
-            relation_map,
-            &node_mmap,
-            &way_mmap,
-            &mut node_slot_cursor,
-            &mut way_slot_cursor,
-            total_node_members,
-            total_way_members,
-            &mut reframe_buf,
-            &mut memids_scratch,
-            &mut group_scratch,
-            &mut reframed_rel_scratch,
-            &mut group_ranges,
-            &mut scalar_fields,
+    if schedule.len() != node_starts.len() {
+        return Err(format!(
+            "R2d: relation blob schedule size {} != sidecar entries {}",
+            schedule.len(),
+            node_starts.len()
         )
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        .into());
+    }
 
-        if blob_count > 0 {
-            let index = crate::blob_index::BlobIndex {
-                kind: crate::blob_index::ElemKind::Relation,
-                min_id,
-                max_id,
-                count: blob_count,
-                bbox: None,
-            };
-            writer.write_primitive_block_owned(
-                std::mem::take(&mut reframe_buf),
-                index,
-                None,
-            )?;
+    if schedule.is_empty() {
+        return Ok(());
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    let node_mmap = std::sync::Arc::new(node_mmap);
+    let way_mmap = std::sync::Arc::new(way_mmap);
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(6);
+
+    // Each blob produces one OwnedBlock tuple.
+    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>);
+    let (desc_tx, desc_rx) =
+        std::sync::mpsc::sync_channel::<(usize, u64, usize, u64, u64)>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
+
+    let rels_written = std::sync::atomic::AtomicU64::new(0);
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher thread — sends (seq, data_offset, data_size, node_start, way_start).
+        let sched = &schedule;
+        let n_starts = &node_starts;
+        let w_starts = &way_starts;
+        scope.spawn(move || {
+            for (i, &(data_offset, data_size)) in sched.iter().enumerate() {
+                let msg = (i, data_offset, data_size, n_starts[i], w_starts[i]);
+                if desc_tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Worker threads.
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let file = std::sync::Arc::clone(&shared_file);
+            let nm = std::sync::Arc::clone(&node_mmap);
+            let wm = std::sync::Arc::clone(&way_mmap);
+            let tx = decoded_tx.clone();
+            let rmap = relation_map;
+            let rw = &rels_written;
+            scope.spawn(move || {
+                use std::os::unix::fs::FileExt as _;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut reframe_buf: Vec<u8> = Vec::new();
+                let mut memids_scratch: Vec<u8> = Vec::new();
+                let mut group_scratch: Vec<u8> = Vec::new();
+                let mut reframed_rel_scratch: Vec<u8> = Vec::new();
+                let mut group_ranges: Vec<(usize, usize)> = Vec::new();
+                let mut scalar_fields: Vec<u8> = Vec::new();
+
+                loop {
+                    let (seq, data_offset, data_size, node_start, way_start) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(msg) => msg,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String> = (|| {
+                        read_buf.resize(data_size, 0);
+                        file.read_exact_at(&mut read_buf, data_offset)
+                            .map_err(|e| format!("pread at {data_offset}: {e}"))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| e.to_string())?;
+
+                        let mut nc = node_start;
+                        let mut wc = way_start;
+                        let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
+                            &decompress_buf,
+                            rmap,
+                            &nm,
+                            &wm,
+                            &mut nc,
+                            &mut wc,
+                            total_node_members,
+                            total_way_members,
+                            &mut reframe_buf,
+                            &mut memids_scratch,
+                            &mut group_scratch,
+                            &mut reframed_rel_scratch,
+                            &mut group_ranges,
+                            &mut scalar_fields,
+                        )?;
+
+                        rw.fetch_add(blob_count, std::sync::atomic::Ordering::Relaxed);
+
+                        let index = crate::blob_index::BlobIndex {
+                            kind: crate::blob_index::ElemKind::Relation,
+                            min_id,
+                            max_id,
+                            count: blob_count,
+                            bbox: None,
+                        };
+                        Ok((std::mem::take(&mut reframe_buf), index, blob_count))
+                    })();
+
+                    if tx.send((seq, result)).is_err() {
+                        break;
+                    }
+                }
+            });
         }
 
-        stats.relations_written += blob_count;
-    }
+        drop(decoded_tx);
+        drop(desc_rx);
 
-    // Sanity: the walk must have consumed every resolved ref.
-    if node_slot_cursor != total_node_members {
-        return Err(format!(
-            "R2d node cursor mismatch: walked {node_slot_cursor}, expected {total_node_members}"
-        )
-        .into());
-    }
-    if way_slot_cursor != total_way_members {
-        return Err(format!(
-            "R2d way cursor mismatch: walked {way_slot_cursor}, expected {total_way_members}"
-        )
-        .into());
-    }
+        // Consumer: reorder by seq, write to output in file order.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        for (seq_num, item) in decoded_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let (block_bytes, index, _count) =
+                    result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                if index.count > 0 {
+                    writer.write_primitive_block_owned(block_bytes, index, None)?;
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    stats.relations_written += rels_written.load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

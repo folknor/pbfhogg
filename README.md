@@ -50,7 +50,7 @@ Sorted by peak memory — the hardest operations still fit in 32 GB with room to
 | `extract --smart` (Europe bbox) | 4m39s | 11.17 GB † | three-pass, multipolygon-complete |
 | `build-geocode-index` | 22m26s | 14.59 GB | reverse geocoding index, S2 cells |
 | `add-locations-to-ways --index-type external` | 24m22s | **16.67 GB** | double-radix permutation, ~112 GB temp disk |
-| `renumber --mode external`       | 6m42s | **9.62 GB** | IdSetDense rank fusion, wire-format rewriters (pass 1 + stage 2d + R2d relations), parallel R2d |
+| `renumber --mode external`       | 3m29s | **7.0 GB** | IdSetDense rank fusion, wire-format rewriters (all 3 types), zero temp disk, single shared fd, atomic dispatch |
 
 † Single-sample `--bench 1` measurement with Europe bbox. See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md) for the investigation that validated the 32 GB host ceiling. \
 ‡ Older runs without sidecar profiler; peak RSS stated from investigation notes.

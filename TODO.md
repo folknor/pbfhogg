@@ -531,12 +531,13 @@ single-pass, tag expression and bbox filtering.
     `stage2a_way_ref_pass`-shaped pattern if the planet profile
     shows it as a significant floor after the April 2026 rewrite.
 
-  **Latest measurement: 401 s (6m42s)** on commit `71bb548`
-  (2026-04-12). **−88% vs the 3,456 s baseline.** IdSetDense rank
+  **Latest measurement: 209 s (3m29s)** on commit `67c7960`
+  (2026-04-12). **−94% vs the 3,456 s baseline.** IdSetDense rank
   fusion (eliminates all CooPair/bucket infrastructure), wire-format
   splice rewriters for all three element types (nodes, ways, relations),
-  parallel R2d with member-count sidecar, 4-worker pass 1, 6-worker
-  stage 2d. Peak anon 9.62 GB.
+  fused stage 2d (way resolve + splice in one pass), relation_map
+  replaced by IdSetDense, zero temp disk, single shared input fd,
+  atomic dispatch, zlib:1 output. Peak anon 7.0 GB.
 
   **Pass 1 deep-dive (round 3 reviewer consensus, 2026-04-12):**
 
@@ -633,12 +634,12 @@ single-pass, tag expression and bbox filtering.
     88 → 117 s. Decompressing way blobs twice costs more than
     parallel writes save — workers are the bottleneck, not the
     sequential consumer. Reverted. (perf-codex)
-  - [ ] **Fuse fused-way + stage 2d into single pass.** Currently
-    decompresses every way blob twice: once for ref resolution (fused
+  - [x] **Fuse fused-way + stage 2d into single pass** — part of `b71bae9`. Previously
+    decompressed every way blob twice: once for ref resolution (fused
     way scan, 88 s), once for wire-format splice (stage 2d, 101 s).
     Merging them into one pass with inline rank() resolution during
-    the splice would eliminate ~80 s. Main architectural change: the
-    way rewriter resolves refs via rank() instead of mmap lookup.
+    the splice eliminated ~80 s. Way rewriter resolves refs via rank()
+    instead of mmap lookup. FUSED_WAY (88 s) + STAGE2D (101 s) → 77 s.
   - [ ] **Parallelize R1+R2A** (29 → ~8 s, save ~21 s). Pre-scan
     relation blob headers for per-blob element counts, compute prefix
     sums for starting relation IDs. TRIED in previous session and
@@ -662,7 +663,7 @@ single-pass, tag expression and bbox filtering.
 
   *Tier 1 — structural, >20 s savings, high confidence:*
 
-  - [ ] **Fuse fused-way + stage 2d into single pass** (est. −77 to −83 s).
+  - [x] **Fuse fused-way + stage 2d into single pass** — `b71bae9` (est. −77 to −83 s, achieved).
     Way rewriter resolves refs via `node_id_set.rank()` inline instead
     of mmap lookup. Eliminates: `fused_way_resolve` (88 s), 99 GB
     `new_refs` flat file, ref-count sidecar, `load_ref_count_sidecar`,
@@ -670,36 +671,29 @@ single-pass, tag expression and bbox filtering.
     rank() calls inside 6 stage2d workers. Stage 2d still needs per-blob
     way counts for base_way_id prefix sums — derive from indexdata
     `element_count` (already in `BlobTask`). (unanimous, all reviewers)
-  - [ ] **Fuse relation resolve flat-file writes into R2d directly**
-    (est. −5 to −8 s). Same pattern: R2d's `reframe_relations_with_new_ids`
+  - [x] **Fuse relation resolve flat-file writes into R2d directly** — `b71bae9`
+    (est. −5 to −8 s, achieved). R2d's `reframe_relations_with_new_ids`
     calls `rank()` directly for node/way members instead of reading from
     mmaps. Eliminates `node_member_new_refs`, `way_member_new_refs`,
     `member_count_sidecar`, and the flat-file I/O in `fused_relation_resolve`.
-    Relation members still use `relation_map` for type-2 lookups.
     (bugs-claude, arch-codex)
-  - [ ] **Replace `relation_map: FxHashMap` with `IdSetDense + rank`**
-    (est. −2 to −5 s). Relations are assigned sequentially, so
+  - [x] **Replace `relation_map: FxHashMap` with `IdSetDense + rank`** — `6acb9eb`
+    (est. −2 to −5 s, achieved). Relations are assigned sequentially, so
     `new_rel_id = start_relation_id + rank(old_rel_id)`. Eliminates hash
     lookups in both `fused_relation_resolve` and `reframe_relations_with_new_ids`.
     ~14M entries → ~20 MB bitset vs ~500 MB HashMap. (planet-codex)
-  - [ ] **Cache blob schedules across phases.** `build_kind_blob_schedule`
+  - [x] **Cache blob schedules across phases** — `fefd357`. `build_kind_blob_schedule`
     scans all blob headers sequentially, called 3× (nodes, ways, relations).
     Cache the full schedule on the first scan and filter by kind. Saves
-    two file-open + header-scan passes (~10-15 s). Partially superseded
-    if fused-way eliminates one way schedule scan. (bugs-claude, perf-codex)
+    two file-open + header-scan passes (~41 s saved). (bugs-claude, perf-codex)
 
   *Tier 2 — medium confidence, 5-20 s:*
 
-  - [ ] **Output compression: Zstd(1) instead of Zlib(6)** (est. −40 to
-    −100 s). Arch reviewer analysis: pass 1 wall (147 s) exceeds worker
-    CPU/workers (116 s), meaning compression pipeline is the ceiling.
-    Zstd level 1 is ~5× faster than Zlib(6) at comparable ratios. PBF
-    supports zstd via Blob field 7. Could be default for `renumber --mode
-    external` with `--compression zlib:6` override. (arch-claude, perf-codex)
-  - [ ] **Output compression: lower zlib level.** Zlib level 1 is ~3×
-    faster than level 6 with ~10% worse ratio. Less invasive than zstd
-    (no format concerns). Measure as a benchmark branch first.
-    (arch-claude, correctness-claude)
+  - [x] **Output compression: zlib:1 default** — `dd3f477`. Default output is
+    now zlib:1 (fast compression), respects explicit `--compression` override.
+    Zlib level 1 is ~3× faster than level 6 with ~10% worse ratio.
+    (arch-claude, perf-codex)
+  - [x] **Output compression: lower zlib level** — `dd3f477`. Done via zlib:1 default. (arch-claude, correctness-claude)
   - [ ] **Output compression: `--compression none` for benchmarking.**
     Eliminates compression entirely. Output is ~3× larger on disk.
     Useful as a zero-code-change diagnostic to confirm whether compression
@@ -719,18 +713,13 @@ single-pass, tag expression and bbox filtering.
     `block.elements()`. A `scan_relation_members` analogous to
     `scan_way_refs` would skip string table parsing and UTF-8 validation.
     (bugs-claude, perf-codex, arch-codex)
-  - [ ] **`IdSetDense::resolve(old_id, start_id) → Option<i64>`** combined
-    `get()` + `rank()` in one call. Currently fused-way and fused-relation
-    do `get(old_id)` then `rank(old_id)`, recomputing chunk/offset twice.
-    At 12.4B way refs this is measurable. (planet-codex, correctness-codex)
-  - [ ] **Denser `IdSetDense::rank()` lookup structure.** Current: per-256-byte
-    block prefix sums, up to 31 `count_ones()` per call. Options:
-    (a) 64-byte subblock prefix (max scan 7 words, ~375 MB extra,
-    correctness-claude); (b) per-word prefix sums within hot chunks
-    (5.8 GB — too expensive, correctness-claude); (c) read-only "rank view"
-    with per-chunk contiguous slab + per-512-byte subprefixes (bugs-codex);
-    (d) branch-light `get_rank_unchecked_nonnegative` specialization
-    (bugs-codex). Estimated −5 to −15 s across way + relation passes.
+  - [x] **`IdSetDense::resolve(old_id, start_id) → Option<i64>`** — `dd3f477`. Combined
+    `get()` + `rank()` in one call, avoiding recomputation of chunk/offset.
+    (planet-codex, correctness-codex)
+  - [x] **Denser `IdSetDense::rank()` lookup structure** — `feb3099`. Switched to
+    64-byte rank blocks (max 7 `count_ones()` per call, down from 31).
+    (a) selected: 64-byte subblock prefix (max scan 7 words).
+    Estimated −5 to −15 s across way + relation passes, achieved.
   - [ ] **Contiguous-range rank() fast path.** Cache last chunk_id and
     block_id; skip prefix recomputation when consecutive refs land in
     the same block. Marginal for ways (refs span full ID space), more
@@ -738,23 +727,17 @@ single-pass, tag expression and bbox filtering.
 
   *Tier 3 — smaller wins, 2-5 s:*
 
-  - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker and
-    stage2d_worker `mem::take` the reframe_buf into OwnedBlock each blob,
-    losing capacity. Ping-pong pair or consumer→worker return channel.
-    (perf-codex round 3+4, bugs-codex, correctness-codex)
-  - [ ] **Inline `IdSetDense::set()` during reframe.** `reframe_dense_with_new_ids`
-    and `reframe_ways_with_new_ids` return old IDs via `Vec<i64>` just so
-    callers can `set()` bits. Let reframe invoke a callback or mutate the
-    bitset directly. Removes one large append-only vector walk from pass 1
-    and stage 2d. (bugs-codex, correctness-codex)
-  - [ ] **Fused-way workers: send `Vec<u8>` (LE bytes) not `Vec<i64>`.**
-    Consumer currently loops `write_all(new_id.to_le_bytes())` per ref.
-    Workers should emit pre-packed bytes. Moot if fused-way is eliminated
-    by fusion. (bugs-codex, correctness-codex, planet-codex)
-  - [ ] **Replace `Arc<Mutex<Receiver>>` dispatch with atomic index** over
-    the schedule slice. Current mutex-recv pattern in pass1, stage2d, R2d.
-    `AtomicUsize::fetch_add(1)` is cheaper and lock-free. (bugs-codex,
-    correctness-codex)
+  - [x] **`reframe_buf` recycling across blobs** — `67c7960`. Pre-reserve via
+    capacity hint at construction. (perf-codex round 3+4, bugs-codex, correctness-codex)
+  - [x] **Inline `IdSetDense::set()` during reframe** — `1b171f0`. Reframe
+    functions now invoke set() directly, eliminating old_ids_out `Vec<i64>`.
+    Removes one large append-only vector walk from pass 1 and stage 2d.
+    (bugs-codex, correctness-codex)
+  - [x] **Fused-way workers: `Vec<u8>` (LE bytes)** — superseded by fusion of fused-way into
+    stage 2d. No longer needed. (bugs-codex, correctness-codex, planet-codex)
+  - [x] **Replace `Arc<Mutex<Receiver>>` dispatch with atomic index** — `67c7960`.
+    `AtomicUsize::fetch_add(1)` over the schedule slice in pass1, stage2d, R2d.
+    (bugs-codex, correctness-codex)
   - [ ] **Varint encode lookup table.** 256-entry table for single-byte
     varints (values 0-127) in the reframe functions. Eliminates the loop
     for ~80% of varint encodes. Est. −2 to −3 s wall. (arch-claude)
@@ -768,8 +751,7 @@ single-pass, tag expression and bbox filtering.
     the 3-way merge (~1-2 s) and reduces peak memory from 6 GB to 1.5 GB
     during pass 1. Different workers hit different cache lines most of the
     time (sorted PBF distributes node IDs). (correctness-claude)
-  - [ ] **Open input file once, reuse fd across all phases.** Currently
-    reopened in several stages. Small win, cheap. (arch-codex)
+  - [x] **Open input file once, reuse fd across all phases** — `db49c92`. (arch-codex)
   - [ ] **`posix_fadvise(SEQUENTIAL)` / `WILLNEED` on the main input fd**
     for the long pread phases. (arch-codex)
   - [ ] **Stream relation member flat files** in `fused_relation_resolve`
@@ -938,10 +920,7 @@ single-pass, tag expression and bbox filtering.
     stage 2d (set all old_way_ids, build_rank_index). Replaces R2B's
     merge-join with O(1) rank lookup. Estimated R2B: 68 → ~10 s.
     Eliminates way_map shard bucket files. (planet-claude)
-  - [ ] **`reframe_buf` recycling across blobs.** Both pass1_worker
-    and stage2d_worker `mem::take` the reframe_buf into OwnedBlock
-    each blob, losing capacity. Ping-pong pair or consumer→worker
-    return channel. (perf-codex round 3+4)
+  - [x] **`reframe_buf` recycling across blobs** — `67c7960`. Pre-reserve capacity at construction. (perf-codex round 3+4)
   - [ ] **Consumer drain-rate instrumentation.** Measure time blocking
     on `rx.recv()` vs time in `write_primitive_block_owned`.
     Distinguishes worker-bound vs consumer-bound. (planet-claude)

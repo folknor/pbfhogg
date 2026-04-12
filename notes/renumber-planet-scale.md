@@ -715,6 +715,51 @@ resolution, once for wire-format splice). Merging them with inline
 rank() resolution during the splice would eliminate one full decompress
 pass (~80 s estimated savings).
 
+### Sixth measurement: 209 s (3m29s), commit `67c7960`
+
+Session 3 (2026-04-12). Eight commits on top of the parallel R2d
+architecture (401 s baseline from commit `71bb548`):
+
+1. **zlib:1 output + IdSetDense::resolve()** (`dd3f477`): default output
+   switched to zlib:1 (fast compression); `resolve()` combines `get()` +
+   `rank()` in one call, saving chunk/offset recomputation at 12.4B way refs.
+2. **Inline IdSetDense::set() during reframe** (`1b171f0`): reframe functions
+   now call `set()` directly, eliminating the `old_ids_out Vec<i64>`.
+3. **Cache blob schedules across all phases** (`fefd357`): `build_kind_blob_schedule`
+   called once and results cached; saves two full header-scan passes. −41 s.
+4. **Fuse relation resolve into R2d, eliminate all temp files** (`b71bae9`):
+   also fused fused_way_resolve into stage 2d. R2d's reframe calls `rank()`
+   directly for node/way members; way rewriter resolves refs inline via
+   `node_id_set.rank()`. Eliminates `node_member_new_refs`,
+   `way_member_new_refs`, `member_count_sidecar`, `new_refs` flat file,
+   `ref_count_sidecar`, `blob_slot_starts`, and all mmap reads. Zero scratch
+   disk. FUSED_WAY (88 s) + STAGE2D (101 s) → stage 2d 77 s fused.
+5. **Denser rank() blocks** (`feb3099`): 64-byte rank blocks (max 7 popcount
+   calls per lookup, down from 31). Respects explicit `--compression` flag.
+6. **Replace relation_map FxHashMap with IdSetDense** (`6acb9eb`): ~500 MB
+   HashMap → ~20 MB bitset + rank index. Sequential assignment means
+   `new_rel_id = start_relation_id + relation_id_set.rank(old_rel_id)`.
+7. **Open input file once, reuse fd across all phases** (`db49c92`): single
+   shared fd eliminates repeated `File::open` + `fstat` overhead.
+8. **Atomic index dispatch + reframe_buf pre-reserve** (`67c7960`):
+   `AtomicUsize::fetch_add(1)` replaces `Arc<Mutex<Receiver>>` in pass1,
+   stage2d, R2d. `reframe_buf` pre-reserved at construction.
+
+| Phase | Previous (401 s) | **Current (209 s)** | Δ |
+|---|---:|---:|---|
+| PASS1 (4 workers, wire-format nodes) | 147 s | **124 s** | −23 s |
+| FUSED_WAY | 88 s | — | eliminated (fused into stage 2d) |
+| STAGE2D (6 workers, fused resolve + ways) | 101 s | **77 s** | −112 s total |
+| R1+R2A (sequential relation ID assignment) | 29 s | **4.4 s** | −25 s |
+| R2D (parallel wire-format relations) | 18 s | **2.0 s** | −16 s |
+| **TOTAL** | **401 s** | **209 s** | **−192 s (−48%)** |
+
+Peak anon: 7.0 GB (down from 9.62 GB — relation_map FxHashMap eliminated).
+All element counts match baseline exactly. Denmark cross-validated on every
+commit.
+
+Sprint total: **3,456 s → 209 s (−94%), 57.6 min → 3m29s.**
+
 ## Differences from ALTW external join
 
 For the implementer: where this is easier and harder than ALTW

@@ -442,37 +442,11 @@ pub fn renumber_external(
     // does not consult relation_map (relation members are resolved in
     // R2d directly), so the two passes can share a single decoded
     // block.
+    // ---- Fused relation pass: R1 + R2A + R2B in one scan ----
+    // Assign new relation IDs, resolve node/way member refs via rank()
+    // inline, write resolved refs directly to flat files. Eliminates
+    // CooPair bucket emission + R2B merge-join/scatter entirely.
     crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_START");
-    let mut node_member_ref_buckets = BucketWriters::create(&scratch, "rel-node-ref")?;
-    let mut way_member_ref_buckets = BucketWriters::create(&scratch, "rel-way-ref")?;
-    let (total_node_members, total_way_members) = relation_r1_r2a_fused(
-        input,
-        direct_io,
-        &mut relation_map,
-        &mut next_relation_id,
-        &mut node_member_ref_buckets,
-        &mut way_member_ref_buckets,
-    )?;
-    node_member_ref_buckets.finish()?;
-    way_member_ref_buckets.finish()?;
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
-        crate::debug::emit_counter("renumber_ext_rel_node_members", total_node_members as i64);
-        crate::debug::emit_counter("renumber_ext_rel_way_members", total_way_members as i64);
-    }
-    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
-
-    // ---- Relation pass R2b: merge-join node/way members against maps ----
-    // Reuses the same parallel stage2b_node_merge_join function used for
-    // the way pass. Each call produces two slot shards (A and B) that
-    // stage R2c reads as a slice.
-    // ---- Relation pass R2b+R2c: resolve member refs via rank ----
-    // Replaces the old merge-join + slot-reorder pipeline for relation
-    // members. For each (old_id, slot_pos) COO pair in the member ref
-    // buckets, resolve new_id via IdSetDense rank and scatter directly
-    // into the flat new_refs file via pwrite.
-    crate::debug::emit_marker("RENUMBER_EXT_R2B_START");
 
     // Merge per-worker way_id_sets built during stage 2d.
     let mut way_id_set = way_id_sets.remove(0);
@@ -482,26 +456,26 @@ pub fn renumber_external(
     way_id_set.build_rank_index();
 
     let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
-    resolve_member_refs_via_rank(
-        &node_member_ref_buckets,
+    let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
+    let (total_node_members, total_way_members) = fused_relation_resolve(
+        input,
         &node_id_set,
         opts.start_node_id,
-        &node_member_new_refs_path,
-        total_node_members,
-    )?;
-    node_member_ref_buckets.cleanup();
-
-    let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
-    resolve_member_refs_via_rank(
-        &way_member_ref_buckets,
         &way_id_set,
         opts.start_way_id,
+        &mut relation_map,
+        &mut next_relation_id,
+        &node_member_new_refs_path,
         &way_member_new_refs_path,
-        total_way_members,
     )?;
-    way_member_ref_buckets.cleanup();
-    crate::debug::emit_marker("RENUMBER_EXT_R2B_END");
-    // R2C is eliminated — resolved entries scatter directly to flat file.
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
+        crate::debug::emit_counter("renumber_ext_rel_node_members", total_node_members as i64);
+        crate::debug::emit_counter("renumber_ext_rel_way_members", total_way_members as i64);
+    }
+    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
+    // R2B is eliminated — member refs resolved inline during the scan.
 
     // ---- Relation pass R2d: write renumbered relations to output ----
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
@@ -522,8 +496,6 @@ pub fn renumber_external(
     flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
-    drop(node_member_ref_buckets);
-    drop(way_member_ref_buckets);
     drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
@@ -2872,7 +2844,107 @@ fn build_blob_schedule(
 }
 
 // ---------------------------------------------------------------------------
-// Relation pass R1 + R2a (fused): assign new ids AND emit member refs
+// Fused relation resolve: R1 + R2A + R2B in one pass
+// ---------------------------------------------------------------------------
+
+/// Single scan over relation blobs that:
+/// 1. Assigns new relation IDs (R1) and builds `relation_map`
+/// 2. Resolves node/way member refs via IdSetDense rank (R2A+R2B)
+/// 3. Writes resolved refs directly to flat files (eliminates CooPair
+///    buckets and R2B scatter)
+///
+/// Returns `(total_node_members, total_way_members)`.
+#[allow(clippy::too_many_arguments)]
+fn fused_relation_resolve(
+    input: &Path,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
+    way_id_set: &super::id_set_dense::IdSetDense,
+    start_way_id: i64,
+    relation_map: &mut FxHashMap<i64, i64>,
+    next_relation_id: &mut i64,
+    node_refs_path: &Path,
+    way_refs_path: &Path,
+) -> Result<(u64, u64)> {
+    let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
+    let shared_file = std::fs::File::open(input)
+        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
+
+    let pool = crate::blob::DecompressPool::new();
+    let mut raw_buf: Vec<u8> = Vec::new();
+    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+    let mut node_refs: Vec<u8> = Vec::new();
+    let mut way_refs: Vec<u8> = Vec::new();
+
+    use std::os::unix::fs::FileExt;
+    for &(data_offset, data_size) in &schedule {
+        raw_buf.resize(data_size, 0);
+        shared_file
+            .read_exact_at(&mut raw_buf, data_offset)
+            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
+        let mut decompress_buf = pool.get();
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
+        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
+            decompress_buf,
+            &pool,
+            &mut st_scratch,
+            &mut gr_scratch,
+        )?;
+        for element in block.elements() {
+            if let Element::Relation(r) = &element {
+                reject_negative_id(r.id(), "relation")?;
+                let new_id = *next_relation_id;
+                *next_relation_id += 1;
+                relation_map.insert(r.id(), new_id);
+
+                for m in r.members() {
+                    match m.id {
+                        MemberId::Node(old_id) => {
+                            reject_negative_id(old_id, "relation node member")?;
+                            #[allow(clippy::cast_possible_wrap)]
+                            let new_id = if node_id_set.get(old_id) {
+                                start_node_id + node_id_set.rank(old_id) as i64
+                            } else {
+                                old_id
+                            };
+                            node_refs.extend_from_slice(&new_id.to_le_bytes());
+                        }
+                        MemberId::Way(old_id) => {
+                            reject_negative_id(old_id, "relation way member")?;
+                            #[allow(clippy::cast_possible_wrap)]
+                            let new_id = if way_id_set.get(old_id) {
+                                start_way_id + way_id_set.rank(old_id) as i64
+                            } else {
+                                old_id
+                            };
+                            way_refs.extend_from_slice(&new_id.to_le_bytes());
+                        }
+                        MemberId::Relation(old_id) => {
+                            reject_negative_id(old_id, "relation relation member")?;
+                        }
+                        MemberId::Unknown(_, _) => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let total_node_members = (node_refs.len() / NEW_REF_SIZE) as u64;
+    let total_way_members = (way_refs.len() / NEW_REF_SIZE) as u64;
+
+    // Write flat files.
+    std::fs::write(node_refs_path, &node_refs)
+        .map_err(|e| format!("write node member refs: {e}"))?;
+    std::fs::write(way_refs_path, &way_refs)
+        .map_err(|e| format!("write way member refs: {e}"))?;
+
+    Ok((total_node_members, total_way_members))
+}
+
+// ---------------------------------------------------------------------------
+// Legacy relation pass R1 + R2a (retained for reference, unused)
 // ---------------------------------------------------------------------------
 
 /// Single scan over relation blobs that performs both pass R1

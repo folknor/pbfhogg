@@ -416,9 +416,6 @@ pub fn renumber_external(
     // ---- Pass 2 stage D: way assembly — rewrite refs + write output ----
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
     const STAGE2D_WORKERS: usize = 4;
-    let mut way_map_shards: Vec<BucketWriters> = (0..STAGE2D_WORKERS)
-        .map(|i| BucketWriters::create(&scratch, &format!("way-map-{i}")))
-        .collect::<Result<Vec<_>>>()?;
     let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
@@ -426,7 +423,6 @@ pub fn renumber_external(
     stage2d_parallel_way_assembly(
         input,
         &mut writer,
-        &mut way_map_shards,
         &mut way_id_sets,
         &way_schedule,
         &new_refs_path,
@@ -436,18 +432,6 @@ pub fn renumber_external(
         &stage2d_ways_atomic,
     )?;
     stats.ways_written += stage2d_ways_atomic.load(std::sync::atomic::Ordering::Relaxed);
-    let shard_counts_2d: Vec<Vec<u64>> = way_map_shards
-        .iter_mut()
-        .map(BucketWriters::finish)
-        .collect::<Result<Vec<_>>>()?;
-    let way_map_counts: Vec<u64> = (0..NUM_BUCKETS)
-        .map(|i| shard_counts_2d.iter().map(|sc| sc[i]).sum())
-        .collect();
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        let total: u64 = way_map_counts.iter().sum();
-        crate::debug::emit_counter("renumber_ext_way_map_entries", total as i64);
-    }
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
     // ---- Relation passes R1 + R2a (fused): assign ids + emit member refs ----
@@ -540,7 +524,6 @@ pub fn renumber_external(
 
     drop(node_member_ref_buckets);
     drop(way_member_ref_buckets);
-    drop(way_map_shards);
     drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
@@ -1613,7 +1596,6 @@ fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
 fn stage2d_parallel_way_assembly(
     input: &Path,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
-    way_map_shards: &mut [BucketWriters],
     way_id_sets: &mut [super::id_set_dense::IdSetDense],
     way_schedule: &[BlobTask],
     new_refs_path: &Path,
@@ -1702,12 +1684,8 @@ fn stage2d_parallel_way_assembly(
         });
 
         {
-            let mut remaining_shards: &mut [BucketWriters] = way_map_shards;
             let mut remaining_sets: &mut [super::id_set_dense::IdSetDense] = way_id_sets;
-            for _ in 0..remaining_shards.len() {
-                let (sh, st) = remaining_shards.split_at_mut(1);
-                remaining_shards = st;
-                let shard = &mut sh[0];
+            for _ in 0..remaining_sets.len() {
                 let (is, it) = remaining_sets.split_at_mut(1);
                 remaining_sets = it;
                 let id_set = &mut is[0];
@@ -1723,7 +1701,6 @@ fn stage2d_parallel_way_assembly(
                         &mmap,
                         slots_ref,
                         total_slots,
-                        shard,
                         id_set,
                         ways_written,
                         stage2d_cref,
@@ -1780,7 +1757,6 @@ fn stage2d_worker(
     new_refs_mmap: &std::sync::Arc<memmap2::Mmap>,
     blob_slot_starts: &[u64],
     total_slots: u64,
-    shard: &mut BucketWriters,
     way_id_set: &mut super::id_set_dense::IdSetDense,
     ways_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
@@ -1797,7 +1773,6 @@ fn stage2d_worker(
     let mut group_scratch: Vec<u8> = Vec::new();
     let mut reframed_way_scratch: Vec<u8> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-    let mut bucket_batch: Vec<u8> = Vec::new();
     let mut way_group_ranges: Vec<(usize, usize)> = Vec::new();
     let mut way_scalar_fields: Vec<u8> = Vec::new();
 
@@ -1856,33 +1831,9 @@ fn stage2d_worker(
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
             let t3 = std::time::Instant::now();
-            // Batch bucket writes: way IDs sorted, way_id_bucket monotone.
-            {
-                let mut cur_bucket: usize = usize::MAX;
-                bucket_batch.clear();
-                for &old_way_id in &old_ids_buf {
-                    let bucket = way_id_bucket(old_way_id);
-                    if bucket != cur_bucket && !bucket_batch.is_empty() {
-                        if let Some(w) = shard.writers[cur_bucket].as_mut() {
-                            w.write_all(&bucket_batch).map_err(|e| e.to_string())?;
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        { shard.entry_counts[cur_bucket] += (bucket_batch.len() / OLD_ID_SIZE) as u64; }
-                        bucket_batch.clear();
-                    }
-                    cur_bucket = bucket;
-                    bucket_batch.extend_from_slice(&old_way_id.to_le_bytes());
-                }
-                if !bucket_batch.is_empty() {
-                    if let Some(w) = shard.writers[cur_bucket].as_mut() {
-                        w.write_all(&bucket_batch).map_err(|e| e.to_string())?;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    { shard.entry_counts[cur_bucket] += (bucket_batch.len() / OLD_ID_SIZE) as u64; }
-                }
-            }
-            // Also set old_way_ids in the per-worker IdSetDense so the
-            // way_id_set is ready for R2B rank lookup after stage 2d.
+            // Set old_way_ids in the per-worker IdSetDense.
+            // No bucket files — way_id_set replaces the external
+            // way_map entirely for R2B rank lookup.
             for &old_way_id in &old_ids_buf {
                 way_id_set.set(old_way_id);
             }
@@ -2321,9 +2272,19 @@ fn resolve_member_refs_via_rank(
         return Ok(());
     }
 
-    let file = std::fs::File::create(output_path)
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(output_path)
         .map_err(|e| format!("create member refs file: {e}"))?;
-    file.set_len(total_slots * NEW_REF_SIZE as u64)?;
+    let file_len = total_slots * NEW_REF_SIZE as u64;
+    file.set_len(file_len)?;
+
+    // mmap for scatter writes — avoids 137M pwrite syscalls.
+    let mut mmap = unsafe { memmap2::MmapMut::map_mut(&file) }
+        .map_err(|e| format!("mmap member refs file: {e}"))?;
 
     let mut data_buf: Vec<u8> = Vec::new();
 
@@ -2350,13 +2311,13 @@ fn resolve_member_refs_via_rank(
             } else {
                 old_id // orphan
             };
-            let offset = slot_pos * NEW_REF_SIZE as u64;
-            file.write_all_at(&new_id.to_le_bytes(), offset)
-                .map_err(|e| format!("pwrite member ref at {offset}: {e}"))?;
+            let offset = (slot_pos as usize) * NEW_REF_SIZE;
+            mmap[offset..offset + NEW_REF_SIZE]
+                .copy_from_slice(&new_id.to_le_bytes());
         }
     }
 
-    file.sync_data()?;
+    mmap.flush()?;
     Ok(())
 }
 

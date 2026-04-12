@@ -880,47 +880,6 @@ const RADIX_PASSES: usize = 5;
 /// end of each pass. `RADIX_PASSES` is even → no final swap needed
 /// beyond the per-pass swaps... actually 5 is odd, so after 5 swaps
 /// the data is in `scratch` and we do one final swap. Handled below.
-/// LSD radix sort a `Vec<i64>` of non-negative old_ids in ascending order.
-/// Used by stage 2b on the combined node_map shard output: each shard
-/// is internally sorted but work-stealing pass 1 interleaves shard A
-/// and shard B ids in the global id space, so the concat needs one
-/// full sort pass before the two-cursor merge-join can run.
-///
-/// Same 5×8-bit pass shape as `radix_sort_coo_pairs` — 40 bits of key
-/// coverage, comfortably more than the ~37 bits current OSM node ids
-/// need.
-#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn radix_sort_ids(ids: &mut Vec<i64>, scratch: &mut Vec<i64>) {
-    let n = ids.len();
-    if n < 2 {
-        return;
-    }
-    scratch.clear();
-    scratch.resize(n, 0);
-
-    for pass in 0..RADIX_PASSES {
-        let shift = pass * 8;
-        let mut counts = [0u32; 256];
-        for &id in ids.iter() {
-            let byte = ((id as u64 >> shift) & 0xff) as usize;
-            counts[byte] += 1;
-        }
-        let mut total: u32 = 0;
-        for c in &mut counts {
-            let saved = *c;
-            *c = total;
-            total = total.saturating_add(saved);
-        }
-        for &id in ids.iter() {
-            let byte = ((id as u64 >> shift) & 0xff) as usize;
-            let dst = counts[byte] as usize;
-            scratch[dst] = id;
-            counts[byte] += 1;
-        }
-        std::mem::swap(ids, scratch);
-    }
-}
-
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn radix_sort_coo_pairs(pairs: &mut Vec<CooPair>, scratch: &mut Vec<CooPair>) {
     let n = pairs.len();
@@ -1115,13 +1074,12 @@ struct Stage2bScratch {
     way_refs: Vec<CooPair>,
     way_refs_data: Vec<u8>,
     way_refs_scratch: Vec<CooPair>,
-    node_map: Vec<i64>,
-    /// Reusable scratch buffer for the node_map radix sort. Sized to
-    /// match `node_map.len()` each bucket — with the work-stealing
-    /// pass 1, `node_map` is the interleaved concatenation of multiple
-    /// internally-sorted shards and must be re-sorted before the
-    /// merge-join runs.
-    node_map_scratch: Vec<i64>,
+    /// Per-shard node_map slices. Each shard's bucket file is
+    /// individually sorted (work-stealing FIFO + sorted PBF). The
+    /// merge-join walks two cursors instead of materializing a
+    /// combined sorted vector.
+    node_map_a: Vec<i64>,
+    node_map_b: Vec<i64>,
     node_map_data: Vec<u8>,
     entry_buf: [u8; RESOLVED_ENTRY_SIZE],
 }
@@ -1132,8 +1090,8 @@ impl Stage2bScratch {
             way_refs: Vec::new(),
             way_refs_data: Vec::new(),
             way_refs_scratch: Vec::new(),
-            node_map: Vec::new(),
-            node_map_scratch: Vec::new(),
+            node_map_a: Vec::new(),
+            node_map_b: Vec::new(),
             node_map_data: Vec::new(),
             entry_buf: [0u8; RESOLVED_ENTRY_SIZE],
         }
@@ -1174,37 +1132,64 @@ fn stage2b_process_bucket(
     // LSD radix sort by old_node_id — see `radix_sort_coo_pairs`.
     radix_sort_coo_pairs(&mut scratch.way_refs, &mut scratch.way_refs_scratch);
 
-    // Load combined old_ids from every node_map shard. Each individual
-    // shard is internally sorted (work-stealing pass 1 pulls blobs in
-    // FIFO order, and within each blob old_ids are sorted), but two
-    // shards processed by different workers interleave in id space,
-    // so the concatenation must be re-sorted before the two-cursor
-    // merge-join runs. Radix sort is linear and matches what stage 2b
-    // already does on the way_refs side.
-    scratch.node_map.clear();
-    load_old_id_bucket_shards(
-        node_map_shards,
-        bucket_idx,
-        &mut scratch.node_map_data,
-        &mut scratch.node_map,
-    )?;
-    radix_sort_ids(&mut scratch.node_map, &mut scratch.node_map_scratch);
+    // Load each node_map shard's bucket independently. Each shard is
+    // internally sorted (work-stealing FIFO + sorted PBF). Instead of
+    // concatenating + radix-sorting into a combined vector, the merge-
+    // join walks two cursors over the shard slices simultaneously.
+    // This eliminates the radix_sort_ids pass and the node_map_scratch
+    // allocation that the concat+sort approach required.
+    scratch.node_map_a.clear();
+    scratch.node_map_b.clear();
+    if node_map_shards.len() >= 2 {
+        load_single_old_id_bucket(
+            node_map_shards[0],
+            bucket_idx,
+            &mut scratch.node_map_data,
+            &mut scratch.node_map_a,
+        )?;
+        load_single_old_id_bucket(
+            node_map_shards[1],
+            bucket_idx,
+            &mut scratch.node_map_data,
+            &mut scratch.node_map_b,
+        )?;
+    } else if !node_map_shards.is_empty() {
+        load_single_old_id_bucket(
+            node_map_shards[0],
+            bucket_idx,
+            &mut scratch.node_map_data,
+            &mut scratch.node_map_a,
+        )?;
+    }
 
     let bucket_base = bucket_new_id_starts[bucket_idx];
+    let nm_a = &scratch.node_map_a;
+    let nm_b = &scratch.node_map_b;
 
-    // Two-cursor merge. Both sides sorted by old id; the node_map
-    // cursor only moves forward, so the walk is O(way_refs + node_map).
+    // Two-shard merge-join. Both shard slices are sorted ascending.
+    // Advance whichever cursor points to the smaller value. The
+    // "merged position" = ca + cb = the position this old_id occupies
+    // in the virtual sorted concatenation of both shards. The new_id
+    // is `bucket_base + merged_position`.
     let mut resolved_count: u64 = 0;
-    let mut nm_cursor: usize = 0;
+    let mut ca: usize = 0;
+    let mut cb: usize = 0;
     for wr in &scratch.way_refs {
-        while nm_cursor < scratch.node_map.len() && scratch.node_map[nm_cursor] < wr.old_node_id {
-            nm_cursor += 1;
+        let target = wr.old_node_id;
+        // Advance both cursors past entries < target.
+        while ca < nm_a.len() && nm_a[ca] < target {
+            ca += 1;
         }
-        let resolved_id = if nm_cursor < scratch.node_map.len()
-            && scratch.node_map[nm_cursor] == wr.old_node_id
-        {
-            // Position-based new id reconstruction.
-            bucket_base + nm_cursor as i64
+        while cb < nm_b.len() && nm_b[cb] < target {
+            cb += 1;
+        }
+        let merged_pos = ca + cb;
+        let found = (ca < nm_a.len() && nm_a[ca] == target)
+            || (cb < nm_b.len() && nm_b[cb] == target);
+        let resolved_id = if found {
+            // Position-based new id reconstruction from the merged
+            // virtual index.
+            bucket_base + merged_pos as i64
         } else {
             // Orphan ref: no matching entry. Preserve old id,
             // matching in-memory renumber's unwrap_or(old_id) policy.
@@ -1540,66 +1525,49 @@ fn stage2c_slot_reorder(
     Ok(())
 }
 
-/// Load multiple shards' `bucket_idx` files and concatenate them into
-/// a single sorted `ids` Vec. Each shard's bucket file is already
-/// sorted internally (pass 1 scans monotonic input), and the shards
-/// are disjoint with shard 0 holding the smallest ids. So reading in
-/// shard order and appending gives a single ascending run — no merge
-/// needed. This is what makes two-worker pass 1 composable with the
-/// existing two-cursor merge-join in stage 2b.
-fn load_old_id_bucket_shards(
-    shards: &[&BucketWriters],
+/// Load a single shard's `bucket_idx` file into `ids`, appending to
+/// whatever is already in the Vec. Used by the two-cursor merge-join
+/// path in `stage2b_process_bucket`.
+fn load_single_old_id_bucket(
+    shard: &BucketWriters,
     bucket_idx: usize,
     data_buf: &mut Vec<u8>,
     ids: &mut Vec<i64>,
 ) -> Result<()> {
     use std::io::Read as _;
-    ids.clear();
-    let total: u64 = shards
-        .iter()
-        .map(|s| s.entry_counts[bucket_idx])
-        .sum();
-    if total == 0 {
+    if shard.entry_counts[bucket_idx] == 0 {
         return Ok(());
     }
-    ids.reserve_exact(
-        usize::try_from(total)
-            .map_err(|_| "node_map bucket shard total overflow")?
-            .saturating_sub(ids.capacity()),
-    );
-    for shard in shards {
-        if shard.entry_counts[bucket_idx] == 0 {
-            continue;
-        }
-        let path = &shard.paths[bucket_idx];
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open old_id bucket {}: {e}", path.display()))?;
-        let len = usize::try_from(
-            file.metadata()
-                .map_err(|e| format!("failed to stat old_id bucket {}: {e}", path.display()))?
-                .len(),
+    let path = &shard.paths[bucket_idx];
+    let file = std::fs::File::open(path)
+        .map_err(|e| format!("failed to open old_id bucket {}: {e}", path.display()))?;
+    let len = usize::try_from(
+        file.metadata()
+            .map_err(|e| format!("failed to stat old_id bucket {}: {e}", path.display()))?
+            .len(),
+    )
+    .map_err(|_| format!("old_id bucket {} too large for usize", path.display()))?;
+    if !len.is_multiple_of(OLD_ID_SIZE) {
+        return Err(format!(
+            "old_id bucket {} is {len} bytes, not a multiple of {OLD_ID_SIZE} — \
+             truncated or corrupt",
+            path.display()
         )
-        .map_err(|_| format!("old_id bucket {} too large for usize", path.display()))?;
-        if !len.is_multiple_of(OLD_ID_SIZE) {
-            return Err(format!(
-                "old_id bucket {} is {len} bytes, not a multiple of {OLD_ID_SIZE} — \
-                 truncated or corrupt",
-                path.display()
-            )
-            .into());
-        }
-        data_buf.clear();
-        data_buf.resize(len, 0);
-        (&file)
-            .read_exact(data_buf)
-            .map_err(|e| format!("failed to read old_id bucket {}: {e}", path.display()))?;
-        #[cfg(feature = "linux-direct-io")]
-        super::external_radix::advise_dontneed_file(&file);
-        let mut buf = [0u8; OLD_ID_SIZE];
-        for chunk in data_buf.chunks_exact(OLD_ID_SIZE) {
-            buf.copy_from_slice(chunk);
-            ids.push(i64::from_le_bytes(buf));
-        }
+        .into());
+    }
+    data_buf.clear();
+    data_buf.resize(len, 0);
+    (&file)
+        .read_exact(data_buf)
+        .map_err(|e| format!("failed to read old_id bucket {}: {e}", path.display()))?;
+    #[cfg(feature = "linux-direct-io")]
+    super::external_radix::advise_dontneed_file(&file);
+    let count = data_buf.len() / OLD_ID_SIZE;
+    ids.reserve(count.saturating_sub(ids.capacity()));
+    let mut buf = [0u8; OLD_ID_SIZE];
+    for chunk in data_buf.chunks_exact(OLD_ID_SIZE) {
+        buf.copy_from_slice(chunk);
+        ids.push(i64::from_le_bytes(buf));
     }
     *data_buf = Vec::new();
     Ok(())

@@ -23,15 +23,13 @@
 //!
 //! Planet: 442 s (7m22s). Denmark cross-validated against in-memory mode.
 
-use std::io::{BufWriter, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-use super::external_radix::ScratchDir;
 use super::renumber::{RenumberOptions, RenumberStats};
 use super::{require_sorted, writer_from_header, HeaderOverrides, Result};
 use crate::block_builder::OwnedBlock;
 use crate::writer::Compression;
-use crate::{Element, MemberId};
+use crate::Element;
 
 /// Alias for the deterministic hash map used by the in-memory relation map.
 type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
@@ -39,10 +37,6 @@ type FxHashMap<K, V> = rustc_hash::FxHashMap<K, V>;
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
-
-/// Size of a single slot in the flat `new_refs` file.
-/// Each slot holds one `i64 LE` new_node_id.
-const NEW_REF_SIZE: usize = 8;
 
 /// Reject negative ids at the entry of the external path.
 ///
@@ -118,11 +112,6 @@ pub fn renumber_external(
     let mut writer = writer_from_header(output, Compression::Zlib(1), &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
-    // ---- Scratch dir ----
-    let scratch = ScratchDir::new(
-        output.parent().unwrap_or(Path::new(".")),
-        "renumber-external",
-    )?;
 
     let mut next_relation_id = opts.start_relation_id;
     let mut relation_map: FxHashMap<i64, i64> = FxHashMap::default();
@@ -259,7 +248,7 @@ pub fn renumber_external(
     // does not consult relation_map (relation members are resolved in
     // R2d directly), so the two passes can share a single decoded
     // block.
-    // ---- Fused relation pass: R1 + R2A + R2B in one scan ----
+    // ---- R1: assign relation IDs + build relation_map ----
     crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_START");
 
     // Merge per-worker way_id_sets built during stage 2d.
@@ -269,50 +258,36 @@ pub fn renumber_external(
     }
     way_id_set.build_rank_index();
 
-    let node_member_new_refs_path: PathBuf = scratch.file_path("rel-node-new-refs");
-    let way_member_new_refs_path: PathBuf = scratch.file_path("rel-way-new-refs");
-    let rel_member_count_sidecar: PathBuf = scratch.file_path("rel-member-counts");
-    let (total_node_members, total_way_members) = fused_relation_resolve(
+    relation_r1_assign_ids(
         input,
         &relation_schedule,
-        &node_id_set,
-        opts.start_node_id,
-        &way_id_set,
-        opts.start_way_id,
         &mut relation_map,
         &mut next_relation_id,
-        &node_member_new_refs_path,
-        &way_member_new_refs_path,
-        &rel_member_count_sidecar,
     )?;
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_map.len() as i64);
-        crate::debug::emit_counter("renumber_ext_rel_node_members", total_node_members as i64);
-        crate::debug::emit_counter("renumber_ext_rel_way_members", total_way_members as i64);
     }
     crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
-    // R2B is eliminated — member refs resolved inline during the scan.
 
-    // ---- Relation pass R2d: write renumbered relations to output ----
+    // ---- R2d: parallel wire-format rewrite of relations ----
+    // Resolves node/way member refs inline via resolve().
+    // No flat files, no mmaps, no sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_R2D_START");
     relation_r2d_assembly(
         input,
         &relation_schedule,
         &mut writer,
-        &node_member_new_refs_path,
-        &way_member_new_refs_path,
-        &rel_member_count_sidecar,
-        total_node_members,
-        total_way_members,
+        &node_id_set,
+        opts.start_node_id,
+        &way_id_set,
+        opts.start_way_id,
         &relation_map,
         &mut stats,
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
 
     writer.flush()?;
-
-    drop(scratch);
 
     crate::debug::emit_marker("RENUMBER_EXT_END");
 
@@ -1271,12 +1246,10 @@ fn reframe_ways_with_new_ids(
 fn reframe_relations_with_new_ids(
     decompressed: &[u8],
     relation_map: &FxHashMap<i64, i64>,
-    node_mmap: &[u8],
-    way_mmap: &[u8],
-    node_slot_cursor: &mut u64,
-    way_slot_cursor: &mut u64,
-    total_node_members: u64,
-    total_way_members: u64,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
+    way_id_set: &super::id_set_dense::IdSetDense,
+    start_way_id: i64,
     output: &mut Vec<u8>,
     memids_scratch: &mut Vec<u8>,
     group_scratch: &mut Vec<u8>,
@@ -1414,50 +1387,10 @@ fn reframe_relations_with_new_ids(
 
                         // Look up new absolute id by member type.
                         let new_abs_id = match member_type {
-                            0 => {
-                                // Node member — read from node_mmap.
-                                let nc = *node_slot_cursor as usize;
-                                let offset = nc * NEW_REF_SIZE;
-                                if offset + NEW_REF_SIZE > node_mmap.len() {
-                                    return Err(format!(
-                                        "reframe_relations: node_mmap out of bounds: \
-                                         cursor {nc}, mmap len {}",
-                                        node_mmap.len()
-                                    ));
-                                }
-                                let bytes: [u8; NEW_REF_SIZE] = node_mmap
-                                    [offset..offset + NEW_REF_SIZE]
-                                    .try_into()
-                                    .unwrap_or_else(|_| unreachable!());
-                                *node_slot_cursor += 1;
-                                i64::from_le_bytes(bytes)
-                            }
-                            1 => {
-                                // Way member — read from way_mmap.
-                                let wc = *way_slot_cursor as usize;
-                                let offset = wc * NEW_REF_SIZE;
-                                if offset + NEW_REF_SIZE > way_mmap.len() {
-                                    return Err(format!(
-                                        "reframe_relations: way_mmap out of bounds: \
-                                         cursor {wc}, mmap len {}",
-                                        way_mmap.len()
-                                    ));
-                                }
-                                let bytes: [u8; NEW_REF_SIZE] = way_mmap
-                                    [offset..offset + NEW_REF_SIZE]
-                                    .try_into()
-                                    .unwrap_or_else(|_| unreachable!());
-                                *way_slot_cursor += 1;
-                                i64::from_le_bytes(bytes)
-                            }
-                            2 => {
-                                // Relation member — look up in relation_map.
-                                relation_map.get(&old_abs_id).copied().unwrap_or(old_abs_id)
-                            }
-                            _ => {
-                                // Unknown member type — preserve old id.
-                                old_abs_id
-                            }
+                            0 => node_id_set.resolve(old_abs_id, start_node_id),
+                            1 => way_id_set.resolve(old_abs_id, start_way_id),
+                            2 => relation_map.get(&old_abs_id).copied().unwrap_or(old_abs_id),
+                            _ => old_abs_id, // unknown type — preserve
                         };
 
                         // Delta-encode the new id.
@@ -1525,20 +1458,6 @@ fn reframe_relations_with_new_ids(
 
     output.extend_from_slice(scalar_fields_scratch);
 
-    // Per-blob cursor drift check.
-    if *node_slot_cursor > total_node_members {
-        return Err(format!(
-            "reframe_relations: node cursor {} > total {total_node_members}",
-            *node_slot_cursor,
-        ));
-    }
-    if *way_slot_cursor > total_way_members {
-        return Err(format!(
-            "reframe_relations: way cursor {} > total {total_way_members}",
-            *way_slot_cursor,
-        ));
-    }
-
     Ok((total_relations, min_new_id, max_new_id))
 }
 
@@ -1546,27 +1465,15 @@ fn reframe_relations_with_new_ids(
 // Fused relation resolve: R1 + R2A + R2B in one pass
 // ---------------------------------------------------------------------------
 
-/// Single scan over relation blobs that:
-/// 1. Assigns new relation IDs (R1) and builds `relation_map`
-/// 2. Resolves node/way member refs via IdSetDense rank
-/// 3. Writes resolved refs directly to flat files
-///
-/// Returns `(total_node_members, total_way_members)`.
-#[allow(clippy::too_many_arguments)]
-#[allow(clippy::too_many_arguments)]
-fn fused_relation_resolve(
+/// R1 pass: assign sequential relation IDs and build the in-memory
+/// `relation_map`. No member ref resolution — that's done inline by
+/// R2d's wire-format rewriter via `resolve()`.
+fn relation_r1_assign_ids(
     input: &Path,
     relation_schedule: &[BlobTask],
-    node_id_set: &super::id_set_dense::IdSetDense,
-    start_node_id: i64,
-    way_id_set: &super::id_set_dense::IdSetDense,
-    start_way_id: i64,
     relation_map: &mut FxHashMap<i64, i64>,
     next_relation_id: &mut i64,
-    node_refs_path: &Path,
-    way_refs_path: &Path,
-    member_count_sidecar_path: &Path,
-) -> Result<(u64, u64)> {
+) -> Result<()> {
     let shared_file = std::fs::File::open(input)
         .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
@@ -1574,18 +1481,6 @@ fn fused_relation_resolve(
     let mut raw_buf: Vec<u8> = Vec::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-
-    let mut node_refs: Vec<u8> = Vec::new();
-    let mut way_refs: Vec<u8> = Vec::new();
-
-    // Per-blob member count sidecar for R2d parallelization.
-    // Layout: (node_count: u64, way_count: u64) per relation blob,
-    // followed by (total_node_members: u64, total_way_members: u64) trailer.
-    let mut sidecar_writer = BufWriter::with_capacity(
-        64 * 1024,
-        std::fs::File::create(member_count_sidecar_path)
-            .map_err(|e| format!("failed to create member-count sidecar: {e}"))?,
-    );
 
     use std::os::unix::fs::FileExt;
     for task in relation_schedule {
@@ -1601,121 +1496,26 @@ fn fused_relation_resolve(
             &mut st_scratch,
             &mut gr_scratch,
         )?;
-        let node_refs_before = node_refs.len();
-        let way_refs_before = way_refs.len();
         for element in block.elements() {
             if let Element::Relation(r) = &element {
                 reject_negative_id(r.id(), "relation")?;
                 let new_id = *next_relation_id;
                 *next_relation_id += 1;
                 relation_map.insert(r.id(), new_id);
-
-                for m in r.members() {
-                    match m.id {
-                        MemberId::Node(old_id) => {
-                            reject_negative_id(old_id, "relation node member")?;
-                            let new_id = node_id_set.resolve(old_id, start_node_id);
-                            node_refs.extend_from_slice(&new_id.to_le_bytes());
-                        }
-                        MemberId::Way(old_id) => {
-                            reject_negative_id(old_id, "relation way member")?;
-                            let new_id = way_id_set.resolve(old_id, start_way_id);
-                            way_refs.extend_from_slice(&new_id.to_le_bytes());
-                        }
-                        MemberId::Relation(old_id) => {
-                            reject_negative_id(old_id, "relation relation member")?;
-                        }
-                        MemberId::Unknown(_, _) => {}
-                    }
-                }
             }
         }
-        let blob_node_count = ((node_refs.len() - node_refs_before) / NEW_REF_SIZE) as u64;
-        let blob_way_count = ((way_refs.len() - way_refs_before) / NEW_REF_SIZE) as u64;
-        sidecar_writer.write_all(&blob_node_count.to_le_bytes())?;
-        sidecar_writer.write_all(&blob_way_count.to_le_bytes())?;
     }
-
-    let total_node_members = (node_refs.len() / NEW_REF_SIZE) as u64;
-    let total_way_members = (way_refs.len() / NEW_REF_SIZE) as u64;
-
-    // Trailer.
-    sidecar_writer.write_all(&total_node_members.to_le_bytes())?;
-    sidecar_writer.write_all(&total_way_members.to_le_bytes())?;
-    sidecar_writer.flush()?;
-
-    // Write flat files.
-    std::fs::write(node_refs_path, &node_refs)
-        .map_err(|e| format!("write node member refs: {e}"))?;
-    std::fs::write(way_refs_path, &way_refs)
-        .map_err(|e| format!("write way member refs: {e}"))?;
-
-    Ok((total_node_members, total_way_members))
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // Relation pass R2d: parallel wire-format rewrite + write output
 // ---------------------------------------------------------------------------
 
-/// Load the per-blob member-count sidecar and compute prefix sums for
-/// node and way slot cursors. Returns `(node_starts, way_starts)` —
-/// each vector has one entry per relation blob.
-///
-/// Sidecar layout: `(node_count: u64, way_count: u64)` per blob,
-/// followed by a `(total_node: u64, total_way: u64)` trailer.
-#[allow(clippy::cast_possible_truncation)]
-fn load_member_count_sidecar(
-    path: &Path,
-    total_node_members: u64,
-    total_way_members: u64,
-) -> Result<(Vec<u64>, Vec<u64>)> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("failed to read member-count sidecar: {e}"))?;
-    if data.len() < 16 {
-        return Err("member-count sidecar is too small".into());
-    }
-    // Verify trailer.
-    let trailer_node = u64::from_le_bytes(
-        data[data.len() - 16..data.len() - 8]
-            .try_into()
-            .map_err(|_| "sidecar trailer read")?,
-    );
-    let trailer_way = u64::from_le_bytes(
-        data[data.len() - 8..]
-            .try_into()
-            .map_err(|_| "sidecar trailer read")?,
-    );
-    if trailer_node != total_node_members || trailer_way != total_way_members {
-        return Err(format!(
-            "member-count sidecar trailer ({trailer_node}, {trailer_way}) != \
-             expected ({total_node_members}, {total_way_members})"
-        )
-        .into());
-    }
-    let entry_bytes = &data[..data.len() - 16];
-    if !entry_bytes.len().is_multiple_of(16) {
-        return Err("member-count sidecar has non-aligned entries".into());
-    }
-    let num_blobs = entry_bytes.len() / 16;
-    let mut node_starts = Vec::with_capacity(num_blobs);
-    let mut way_starts = Vec::with_capacity(num_blobs);
-    let mut node_cum: u64 = 0;
-    let mut way_cum: u64 = 0;
-    for chunk in entry_bytes.chunks_exact(16) {
-        node_starts.push(node_cum);
-        way_starts.push(way_cum);
-        let nc = u64::from_le_bytes(chunk[..8].try_into().map_err(|_| "sidecar chunk")?);
-        let wc = u64::from_le_bytes(chunk[8..16].try_into().map_err(|_| "sidecar chunk")?);
-        node_cum += nc;
-        way_cum += wc;
-    }
-    Ok((node_starts, way_starts))
-}
-
 /// Parallel R2d: wire-format splice rewriter for relation blobs.
 /// Work-stealing dispatch with ReorderBuffer, same pattern as pass 1
-/// and stage 2d. Each worker knows its per-blob cursor offsets from
-/// the member-count sidecar prefix sums.
+/// and stage 2d. Each worker resolves node/way member refs inline via
+/// `resolve()` — no flat files, no mmaps, no sidecar.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
@@ -1726,31 +1526,13 @@ fn relation_r2d_assembly(
     input: &Path,
     relation_schedule: &[BlobTask],
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    node_member_new_refs_path: &Path,
-    way_member_new_refs_path: &Path,
-    member_count_sidecar_path: &Path,
-    total_node_members: u64,
-    total_way_members: u64,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    start_node_id: i64,
+    way_id_set: &super::id_set_dense::IdSetDense,
+    start_way_id: i64,
     relation_map: &FxHashMap<i64, i64>,
     stats: &mut RenumberStats,
 ) -> Result<()> {
-    let node_mmap = open_new_refs_mmap(node_member_new_refs_path, total_node_members)?;
-    let way_mmap = open_new_refs_mmap(way_member_new_refs_path, total_way_members)?;
-
-    let (node_starts, way_starts) = load_member_count_sidecar(
-        member_count_sidecar_path,
-        total_node_members,
-        total_way_members,
-    )?;
-
-    if relation_schedule.len() != node_starts.len() {
-        return Err(format!(
-            "R2d: relation blob schedule size {} != sidecar entries {}",
-            relation_schedule.len(),
-            node_starts.len()
-        )
-        .into());
-    }
 
     if relation_schedule.is_empty() {
         return Ok(());
@@ -1761,9 +1543,6 @@ fn relation_r2d_assembly(
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    let node_mmap = std::sync::Arc::new(node_mmap);
-    let way_mmap = std::sync::Arc::new(way_mmap);
-
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4)
@@ -1772,7 +1551,7 @@ fn relation_r2d_assembly(
     // Each blob produces one OwnedBlock tuple.
     type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>);
     let (desc_tx, desc_rx) =
-        std::sync::mpsc::sync_channel::<(usize, u64, usize, u64, u64)>(16);
+        std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
 
@@ -1781,12 +1560,9 @@ fn relation_r2d_assembly(
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher thread — sends (seq, data_offset, data_size, node_start, way_start).
         let sched = relation_schedule;
-        let n_starts = &node_starts;
-        let w_starts = &way_starts;
         scope.spawn(move || {
             for (i, task) in sched.iter().enumerate() {
-                let msg = (i, task.data_offset, task.data_size, n_starts[i], w_starts[i]);
-                if desc_tx.send(msg).is_err() {
+                if desc_tx.send((i, task.data_offset, task.data_size)).is_err() {
                     break;
                 }
             }
@@ -1796,8 +1572,6 @@ fn relation_r2d_assembly(
         for _ in 0..decode_threads {
             let rx = std::sync::Arc::clone(&desc_rx);
             let file = std::sync::Arc::clone(&shared_file);
-            let nm = std::sync::Arc::clone(&node_mmap);
-            let wm = std::sync::Arc::clone(&way_mmap);
             let tx = decoded_tx.clone();
             let rmap = relation_map;
             let rw = &rels_written;
@@ -1813,7 +1587,7 @@ fn relation_r2d_assembly(
                 let mut scalar_fields: Vec<u8> = Vec::new();
 
                 loop {
-                    let (seq, data_offset, data_size, node_start, way_start) = {
+                    let (seq, data_offset, data_size) = {
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(msg) => msg,
@@ -1828,17 +1602,13 @@ fn relation_r2d_assembly(
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                             .map_err(|e| e.to_string())?;
 
-                        let mut nc = node_start;
-                        let mut wc = way_start;
                         let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
                             &decompress_buf,
                             rmap,
-                            &nm,
-                            &wm,
-                            &mut nc,
-                            &mut wc,
-                            total_node_members,
-                            total_way_members,
+                            node_id_set,
+                            start_node_id,
+                            way_id_set,
+                            start_way_id,
                             &mut reframe_buf,
                             &mut memids_scratch,
                             &mut group_scratch,
@@ -1892,30 +1662,3 @@ fn relation_r2d_assembly(
     Ok(())
 }
 
-/// Open the flat new_refs file as an mmap. Handles
-/// the empty-file case with an anonymous zero-length mmap since some
-/// kernels reject `memmap2::Mmap::map` on zero-length files.
-fn open_new_refs_mmap(path: &Path, total_slots: u64) -> Result<memmap2::Mmap> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open new_refs file {}: {e}", path.display()))?;
-    let len = file
-        .metadata()
-        .map_err(|e| format!("failed to stat new_refs file {}: {e}", path.display()))?
-        .len();
-    let expected_len = total_slots * NEW_REF_SIZE as u64;
-    if len != expected_len {
-        return Err(format!(
-            "new_refs file {} size {len} != expected {expected_len} (total_slots={total_slots})",
-            path.display()
-        )
-        .into());
-    }
-    if len == 0 {
-        return Ok(memmap2::MmapOptions::new().map_anon()?.make_read_only()?);
-    }
-    let mmap = unsafe { memmap2::Mmap::map(&file) }
-        .map_err(|e| format!("failed to mmap new_refs file {}: {e}", path.display()))?;
-    #[cfg(unix)]
-    mmap.advise(memmap2::Advice::Sequential).ok();
-    Ok(mmap)
-}

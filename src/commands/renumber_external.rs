@@ -1415,13 +1415,12 @@ fn load_coo_bucket(
 /// get zero-byte fills — harmless because stage 2d's way assembly reads
 /// each slot indexed by the actual way's (blob_slot_start, ref_index)
 /// and never touches an empty range.
-#[hotpath::measure]
-#[allow(clippy::cast_possible_truncation)]
 /// Parallel stage 2c: scatter resolved entries into the flat new_refs
 /// file via pwrite. Each bucket covers a disjoint slot_pos range, so
 /// workers process different buckets independently with no
 /// synchronization on the output file. The file is pre-sized via
 /// ftruncate so empty buckets are implicitly zero-filled (sparse).
+#[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
 fn stage2c_slot_reorder(
     slot_bucket_shards: &[&BucketWriters],
@@ -1859,6 +1858,8 @@ fn stage2d_worker(
     let mut reframed_way_scratch: Vec<u8> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut bucket_batch: Vec<u8> = Vec::new();
+    let mut way_group_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut way_scalar_fields: Vec<u8> = Vec::new();
 
     loop {
         let task = {
@@ -1908,6 +1909,8 @@ fn stage2d_worker(
                 &mut group_scratch,
                 &mut reframed_way_scratch,
                 task.min_id < 0,
+                &mut way_group_ranges,
+                &mut way_scalar_fields,
             )?;
             #[allow(clippy::cast_possible_truncation)]
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
@@ -2236,6 +2239,13 @@ fn pass1_worker(
     let mut old_ids_buf: Vec<i64> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     let mut bucket_batch: Vec<u8> = Vec::new();
+    // Reusable scratch for reframe_dense_with_new_ids.
+    let mut group_ranges_scratch: Vec<(usize, usize)> = Vec::new();
+    let mut scalar_fields_scratch: Vec<u8> = Vec::new();
+    let mut other_fields_scratch: Vec<u8> = Vec::new();
+    let mut new_id_packed_scratch: Vec<u8> = Vec::new();
+    let mut dense_out_scratch: Vec<u8> = Vec::new();
+    let mut group_out_scratch: Vec<u8> = Vec::new();
 
     loop {
         let task = {
@@ -2272,6 +2282,12 @@ fn pass1_worker(
                 base_new_id,
                 &mut old_ids_buf,
                 &mut reframe_buf,
+                &mut group_ranges_scratch,
+                &mut scalar_fields_scratch,
+                &mut other_fields_scratch,
+                &mut new_id_packed_scratch,
+                &mut dense_out_scratch,
+                &mut group_out_scratch,
             )?;
             #[allow(clippy::cast_possible_truncation)]
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
@@ -2370,19 +2386,25 @@ fn pass1_worker(
 /// Returns the number of nodes in the block. `old_ids_out` is populated
 /// with the absolute old IDs (for bucket emission). `output` receives
 /// the reframed PrimitiveBlock bytes.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn reframe_dense_with_new_ids(
     decompressed: &[u8],
     base_new_id: i64,
     old_ids_out: &mut Vec<i64>,
     output: &mut Vec<u8>,
+    // Reusable scratch buffers — hoisted to worker level.
+    group_ranges_scratch: &mut Vec<(usize, usize)>,
+    scalar_fields_scratch: &mut Vec<u8>,
+    other_fields_scratch: &mut Vec<u8>,
+    new_id_packed_scratch: &mut Vec<u8>,
+    dense_out_scratch: &mut Vec<u8>,
+    group_out_scratch: &mut Vec<u8>,
 ) -> std::result::Result<u64, String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
-    // Phase 1: scan PrimitiveBlock top-level fields.
+    group_ranges_scratch.clear();
+    scalar_fields_scratch.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
-    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut scalar_fields: Vec<u8> = Vec::new();
 
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
@@ -2395,12 +2417,12 @@ fn reframe_dense_with_new_ids(
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                group_ranges.push((offset, data.len()));
+                group_ranges_scratch.push((offset, data.len()));
             }
             (17..=20, WIRE_VARINT) => {
                 let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
-                protohoggr::encode_tag(&mut scalar_fields, field, wire_type);
-                scalar_fields.extend_from_slice(raw);
+                protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
+                scalar_fields_scratch.extend_from_slice(raw);
             }
             _ => cursor.skip_field(wire_type).map_err(|e| e.to_string())?,
         }
@@ -2408,7 +2430,7 @@ fn reframe_dense_with_new_ids(
 
     let (st_offset, st_len) = stringtable_range
         .ok_or("reframe: no StringTable in PrimitiveBlock")?;
-    if group_ranges.is_empty() {
+    if group_ranges_scratch.is_empty() {
         return Err("reframe: no PrimitiveGroup in PrimitiveBlock".into());
     }
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
@@ -2422,12 +2444,8 @@ fn reframe_dense_with_new_ids(
     old_ids_out.clear();
     let mut total_nodes: u64 = 0;
     let mut current_new_id = base_new_id;
-    let mut other_fields_buf: Vec<u8> = Vec::new();
-    let mut new_id_packed: Vec<u8> = Vec::new();
-    let mut dense_out: Vec<u8> = Vec::new();
-    let mut group_out: Vec<u8> = Vec::new();
 
-    for &(gr_offset, gr_len) in &group_ranges {
+    for &(gr_offset, gr_len) in group_ranges_scratch.iter() {
         let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
 
         let mut dense_data: Option<&[u8]> = None;
@@ -2443,17 +2461,16 @@ fn reframe_dense_with_new_ids(
         let dense_bytes = dense_data.ok_or("reframe: no DenseNodes in PrimitiveGroup")?;
 
         let mut id_field: Option<&[u8]> = None;
-        other_fields_buf.clear();
+        other_fields_scratch.clear();
 
         let mut dn_cursor = Cursor::new(dense_bytes);
         while let Some((field, wire_type)) = dn_cursor.read_tag().map_err(|e| e.to_string())? {
             if field == 1 && wire_type == WIRE_LEN {
                 id_field = Some(dn_cursor.read_len_delimited().map_err(|e| e.to_string())?);
             } else {
-                // Copy this field verbatim: tag + raw value bytes.
                 let raw = dn_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
-                protohoggr::encode_tag(&mut other_fields_buf, field, wire_type);
-                other_fields_buf.extend_from_slice(raw);
+                protohoggr::encode_tag(other_fields_scratch, field, wire_type);
+                other_fields_scratch.extend_from_slice(raw);
             }
         }
 
@@ -2477,28 +2494,27 @@ fn reframe_dense_with_new_ids(
         // Build new packed ID field for this group.
         let gnc = usize::try_from(group_node_count)
             .map_err(|_| "group node count > usize")?;
-        new_id_packed.clear();
+        new_id_packed_scratch.clear();
         protohoggr::encode_varint(
-            &mut new_id_packed,
+            new_id_packed_scratch,
             protohoggr::zigzag_encode_64(current_new_id),
         );
-        new_id_packed.extend(std::iter::repeat_n(0x02u8, gnc.saturating_sub(1)));
+        new_id_packed_scratch.extend(std::iter::repeat_n(0x02u8, gnc.saturating_sub(1)));
         #[allow(clippy::cast_possible_wrap)]
         {
             current_new_id += group_node_count as i64;
         }
 
-        dense_out.clear();
-        protohoggr::encode_bytes_field(&mut dense_out, 1, &new_id_packed);
-        dense_out.extend_from_slice(&other_fields_buf);
+        dense_out_scratch.clear();
+        protohoggr::encode_bytes_field(dense_out_scratch, 1, new_id_packed_scratch);
+        dense_out_scratch.extend_from_slice(other_fields_scratch);
 
-        group_out.clear();
-        protohoggr::encode_bytes_field(&mut group_out, 2, &dense_out);
-        protohoggr::encode_bytes_field(output, 2, &group_out);
+        group_out_scratch.clear();
+        protohoggr::encode_bytes_field(group_out_scratch, 2, dense_out_scratch);
+        protohoggr::encode_bytes_field(output, 2, group_out_scratch);
     }
 
-    // PrimitiveBlock scalar fields (17-20, if any)
-    output.extend_from_slice(&scalar_fields);
+    output.extend_from_slice(scalar_fields_scratch);
 
     Ok(total_nodes)
 }
@@ -2523,13 +2539,14 @@ fn reframe_ways_with_new_ids(
     group_scratch: &mut Vec<u8>,
     mut reframed_way_scratch: &mut Vec<u8>,
     check_negative_ids: bool,
+    group_ranges_scratch: &mut Vec<(usize, usize)>,
+    scalar_fields_scratch: &mut Vec<u8>,
 ) -> std::result::Result<u64, String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
-    // Phase 1: scan PrimitiveBlock top-level fields.
+    group_ranges_scratch.clear();
+    scalar_fields_scratch.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
-    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
-    let mut scalar_fields: Vec<u8> = Vec::new();
 
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
@@ -2542,12 +2559,12 @@ fn reframe_ways_with_new_ids(
             (2, WIRE_LEN) => {
                 let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
                 let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
-                group_ranges.push((offset, data.len()));
+                group_ranges_scratch.push((offset, data.len()));
             }
             _ => {
                 let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
-                protohoggr::encode_tag(&mut scalar_fields, field, wire_type);
-                scalar_fields.extend_from_slice(raw);
+                protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
+                scalar_fields_scratch.extend_from_slice(raw);
             }
         }
     }
@@ -2564,7 +2581,7 @@ fn reframe_ways_with_new_ids(
     let mut current_new_id = base_new_way_id;
     let mut slot_cursor = blob_slot_start;
 
-    for &(gr_offset, gr_len) in &group_ranges {
+    for &(gr_offset, gr_len) in group_ranges_scratch.iter() {
         let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
         group_scratch.clear();
 
@@ -2689,7 +2706,7 @@ fn reframe_ways_with_new_ids(
         protohoggr::encode_bytes_field(output, 2, group_scratch);
     }
 
-    output.extend_from_slice(&scalar_fields);
+    output.extend_from_slice(scalar_fields_scratch);
 
     // Drift check
     if slot_cursor != expected_slot_end {

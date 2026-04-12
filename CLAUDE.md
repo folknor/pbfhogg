@@ -26,10 +26,11 @@ brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg bi
 brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg binary
 ```
 
-`--stop MARKER` can be combined with any measured mode (`--bench`, `--hotpath`,
-`--alloc`). Kills the pbfhogg process after the named marker is emitted in the
-sidecar stream. Sidecar data is stored on forced exit so `brokkr results <uuid>
---markers --phases` works normally. Use for fast iteration on individual stages:
+`--stop MARKER` requires a measured mode (`--bench`, `--hotpath`, or `--alloc`)
+because the sidecar profiler must be active to observe markers. Kills the pbfhogg
+process after the named marker is emitted. Sidecar data is stored on forced exit
+so `brokkr results --markers --phases` works normally. Use for fast iteration on
+individual stages:
 `brokkr renumber --dataset planet --bench 1 --stop RENUMBER_EXT_STAGE2D_END`.
 
 I/O mode flags (`--direct-io`, `--io-uring`) are passed through to the pbfhogg binary and
@@ -50,7 +51,11 @@ pbfhogg commands (every CLI command is a brokkr subcommand):
 
 Utility commands (unchanged):
 - `brokkr check [-- args]` — run clippy + tests. Supports `--features`, `--no-default-features`, `--package` / `-p`.
+  Output is minified by default: errors and warnings are shown as one-line summaries
+  with file:line locations. Use `--raw` for full unfiltered cargo output, or `--json`
+  for structured JSON (parseable via `jq` or similar).
 - `brokkr env` — show hostname, kernel, governor, memory, drives, tool versions, dataset status.
+- `brokkr results` — with no UUID, auto-resolves to the most recent stored result.
 - `brokkr results [UUID]` — look up specific result by UUID prefix (shows full detail + hotpath report + sidecar profile data).
 - `brokkr results [--commit X] [--compare A B] [--compare-last] [--command CMD] [--variant V] [--dataset D] [--meta K=V ...] [-n N] [--top N]` — query/compare benchmark results from SQLite. `--meta K=V` filters by metadata fields stored in the result row (e.g. `--meta strategy=smart`, `--meta format=osc`, `--meta merged_cache=miss`). Multiple `--meta` filters compose with AND semantics. Rows missing the requested key are silently excluded (so querying for a field that only post-fix runs record won't error on pre-fix rows, it'll just skip them). `--variant` and `--dataset` use substring match; `--meta` uses exact-match on key and value.
 - `brokkr results <UUID> --timeline` — raw JSONL samples (t in fractional seconds). Query flags compose:

@@ -19,7 +19,7 @@
 //! - **Fused relation scan (R1+R2A+R2B)**: sequential relation scan
 //!   that assigns new relation IDs and resolves node/way member refs
 //!   via rank() inline, writing flat files directly.
-//! - **R2d**: sequential full-decode + BlockBuilder relation assembly.
+//! - **R2d**: sequential wire-format splice rewriter for relations.
 //!
 //! Planet: 442 s (7m22s). Denmark cross-validated against in-memory mode.
 
@@ -28,11 +28,8 @@ use std::path::{Path, PathBuf};
 
 use super::external_radix::ScratchDir;
 use super::renumber::{RenumberOptions, RenumberStats};
-use super::{
-    element_metadata, ensure_relation_capacity, flush_block, require_sorted, writer_from_header,
-    HeaderOverrides, Result,
-};
-use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use super::{require_sorted, writer_from_header, HeaderOverrides, Result};
+use crate::block_builder::OwnedBlock;
 use crate::writer::Compression;
 use crate::{Element, MemberId};
 
@@ -117,8 +114,6 @@ pub fn renumber_external(
     let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| {
         hb.sorted()
     }, direct_io, false)?;
-    let mut bb = BlockBuilder::new();
-
     // ---- Scratch dir ----
     let scratch = ScratchDir::new(
         output.parent().unwrap_or(Path::new(".")),
@@ -315,7 +310,6 @@ pub fn renumber_external(
         input,
         direct_io,
         &mut writer,
-        &mut bb,
         &node_member_new_refs_path,
         &way_member_new_refs_path,
         total_node_members,
@@ -325,7 +319,6 @@ pub fn renumber_external(
     )?;
     crate::debug::emit_marker("RENUMBER_EXT_R2D_END");
 
-    flush_block(&mut bb, &mut writer)?;
     writer.flush()?;
 
     drop(scratch);
@@ -1401,7 +1394,7 @@ fn reframe_ways_with_new_ids(
     output: &mut Vec<u8>,
     refs_scratch: &mut Vec<u8>,
     group_scratch: &mut Vec<u8>,
-    mut reframed_way_scratch: &mut Vec<u8>,
+    reframed_way_scratch: &mut Vec<u8>,
     check_negative_ids: bool,
     group_ranges_scratch: &mut Vec<(usize, usize)>,
     scalar_fields_scratch: &mut Vec<u8>,
@@ -1583,6 +1576,301 @@ fn reframe_ways_with_new_ids(
     Ok(total_ways)
 }
 
+// ---------------------------------------------------------------------------
+// Wire-format relation rewriter
+// ---------------------------------------------------------------------------
+
+/// Wire-format splice rewriter for relations. Patches field 1 (id) and
+/// field 9 (memids) in each Relation submessage; copies all other fields
+/// (keys, vals, info, roles_sid, types) verbatim as raw bytes.
+///
+/// The memids field (packed sint64, delta-encoded) interleaves node, way,
+/// and relation member IDs in one stream. Field 10 (types, packed int32)
+/// tells us which lookup to use for each member:
+///   0 = node (read from node_mmap, advance node cursor)
+///   1 = way  (read from way_mmap, advance way cursor)
+///   2 = relation (look up in relation_map)
+///   other = unknown (preserve old absolute ID unchanged)
+///
+/// One `prev_new_id` accumulator tracks across ALL member types — the
+/// delta encoding is over the interleaved stream, not per-type.
+///
+/// Returns `(relation_count, min_new_id, max_new_id)`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines, clippy::cast_possible_truncation)]
+fn reframe_relations_with_new_ids(
+    decompressed: &[u8],
+    relation_map: &FxHashMap<i64, i64>,
+    node_mmap: &[u8],
+    way_mmap: &[u8],
+    node_slot_cursor: &mut u64,
+    way_slot_cursor: &mut u64,
+    total_node_members: u64,
+    total_way_members: u64,
+    output: &mut Vec<u8>,
+    memids_scratch: &mut Vec<u8>,
+    group_scratch: &mut Vec<u8>,
+    reframed_rel_scratch: &mut Vec<u8>,
+    group_ranges_scratch: &mut Vec<(usize, usize)>,
+    scalar_fields_scratch: &mut Vec<u8>,
+) -> std::result::Result<(u64, i64, i64), String> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+
+    // ---- Level 1: PrimitiveBlock ----
+    group_ranges_scratch.clear();
+    scalar_fields_scratch.clear();
+    let mut stringtable_range: Option<(usize, usize)> = None;
+
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                stringtable_range = Some((offset, data.len()));
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                group_ranges_scratch.push((offset, data.len()));
+            }
+            _ => {
+                let raw = cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+                protohoggr::encode_tag(scalar_fields_scratch, field, wire_type);
+                scalar_fields_scratch.extend_from_slice(raw);
+            }
+        }
+    }
+
+    let (st_offset, st_len) = stringtable_range
+        .ok_or("reframe_relations: no StringTable in PrimitiveBlock")?;
+    let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
+
+    output.clear();
+    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+
+    let mut total_relations: u64 = 0;
+    let mut min_new_id: i64 = i64::MAX;
+    let mut max_new_id: i64 = i64::MIN;
+
+    // ---- Level 2: PrimitiveGroup ----
+    for &(gr_offset, gr_len) in group_ranges_scratch.iter() {
+        let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+        group_scratch.clear();
+
+        let mut gr_cursor = Cursor::new(group_bytes);
+        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| e.to_string())? {
+            if field == 4 && wire_type == WIRE_LEN {
+                // Relation submessage — splice-reframe it.
+                let rel_bytes = gr_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+
+                // Scan relation fields to find byte ranges for id and memids.
+                let mut id_range: Option<(usize, usize)> = None;
+                let mut memids_range: Option<(usize, usize)> = None;
+                let mut old_rel_id: i64 = 0;
+                let mut old_memids_data: &[u8] = &[];
+                let mut types_data: &[u8] = &[];
+
+                let mut rel_cursor = Cursor::new(rel_bytes);
+                while let Some((rf, rt)) = rel_cursor.read_tag().map_err(|e| e.to_string())? {
+                    let val_start = rel_bytes.len() - rel_cursor.remaining();
+                    match (rf, rt) {
+                        (1, WIRE_VARINT) => {
+                            let tag_start = val_start - 1; // field 1 tag = 0x08, 1 byte
+                            old_rel_id = rel_cursor.read_varint_i64().map_err(|e| e.to_string())?;
+                            let val_end = rel_bytes.len() - rel_cursor.remaining();
+                            id_range = Some((tag_start, val_end));
+                        }
+                        (9, WIRE_LEN) => {
+                            let tag_start = val_start - 1; // field 9 tag = 0x4A, 1 byte
+                            old_memids_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                            let val_end = rel_bytes.len() - rel_cursor.remaining();
+                            memids_range = Some((tag_start, val_end));
+                        }
+                        (10, WIRE_LEN) => {
+                            types_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                            // Not patched — just captured for dispatch.
+                        }
+                        _ => {
+                            rel_cursor.read_raw_field(rt).map_err(|e| e.to_string())?;
+                        }
+                    }
+                }
+
+                // Look up new relation id.
+                let new_rel_id = relation_map.get(&old_rel_id).copied().ok_or_else(|| {
+                    format!("reframe_relations: relation id {old_rel_id} missing from relation_map")
+                })?;
+
+                if new_rel_id < min_new_id {
+                    min_new_id = new_rel_id;
+                }
+                if new_rel_id > max_new_id {
+                    max_new_id = new_rel_id;
+                }
+
+                // ---- Patch memids: decode old deltas + types, look up new ids, re-encode ----
+                memids_scratch.clear();
+
+                if !old_memids_data.is_empty() || !types_data.is_empty() {
+                    // Validate: both must have the same varint count.
+                    let memids_count = old_memids_data.iter().filter(|&&b| b & 0x80 == 0).count();
+                    let types_count = types_data.iter().filter(|&&b| b & 0x80 == 0).count();
+                    if memids_count != types_count {
+                        return Err(format!(
+                            "reframe_relations: relation {old_rel_id} has {memids_count} memids \
+                             but {types_count} types"
+                        ));
+                    }
+
+                    let mut memids_cursor = Cursor::new(old_memids_data);
+                    let mut types_cursor = Cursor::new(types_data);
+                    let mut prev_old_id: i64 = 0;
+                    let mut prev_new_id: i64 = 0;
+
+                    for _ in 0..memids_count {
+                        // Decode member type.
+                        let member_type = types_cursor
+                            .read_varint()
+                            .map_err(|e| format!("types varint: {e}"))?;
+
+                        // Decode old memid delta → absolute old id.
+                        let raw_delta = memids_cursor
+                            .read_varint()
+                            .map_err(|e| format!("memids varint: {e}"))?;
+                        let delta = protohoggr::zigzag_decode_64(raw_delta);
+                        prev_old_id += delta;
+                        let old_abs_id = prev_old_id;
+
+                        // Look up new absolute id by member type.
+                        let new_abs_id = match member_type {
+                            0 => {
+                                // Node member — read from node_mmap.
+                                let nc = *node_slot_cursor as usize;
+                                let offset = nc * NEW_REF_SIZE;
+                                if offset + NEW_REF_SIZE > node_mmap.len() {
+                                    return Err(format!(
+                                        "reframe_relations: node_mmap out of bounds: \
+                                         cursor {nc}, mmap len {}",
+                                        node_mmap.len()
+                                    ));
+                                }
+                                let bytes: [u8; NEW_REF_SIZE] = node_mmap
+                                    [offset..offset + NEW_REF_SIZE]
+                                    .try_into()
+                                    .unwrap_or_else(|_| unreachable!());
+                                *node_slot_cursor += 1;
+                                i64::from_le_bytes(bytes)
+                            }
+                            1 => {
+                                // Way member — read from way_mmap.
+                                let wc = *way_slot_cursor as usize;
+                                let offset = wc * NEW_REF_SIZE;
+                                if offset + NEW_REF_SIZE > way_mmap.len() {
+                                    return Err(format!(
+                                        "reframe_relations: way_mmap out of bounds: \
+                                         cursor {wc}, mmap len {}",
+                                        way_mmap.len()
+                                    ));
+                                }
+                                let bytes: [u8; NEW_REF_SIZE] = way_mmap
+                                    [offset..offset + NEW_REF_SIZE]
+                                    .try_into()
+                                    .unwrap_or_else(|_| unreachable!());
+                                *way_slot_cursor += 1;
+                                i64::from_le_bytes(bytes)
+                            }
+                            2 => {
+                                // Relation member — look up in relation_map.
+                                relation_map.get(&old_abs_id).copied().unwrap_or(old_abs_id)
+                            }
+                            _ => {
+                                // Unknown member type — preserve old id.
+                                old_abs_id
+                            }
+                        };
+
+                        // Delta-encode the new id.
+                        protohoggr::encode_varint(
+                            memids_scratch,
+                            protohoggr::zigzag_encode_64(new_abs_id - prev_new_id),
+                        );
+                        prev_new_id = new_abs_id;
+                    }
+                }
+
+                // ---- Splice: emit rel_bytes with id and memids replaced ----
+                let id_r = id_range.ok_or_else(|| {
+                    format!("reframe_relations: no id field in relation {old_rel_id}")
+                })?;
+
+                reframed_rel_scratch.clear();
+
+                if let Some(memids_r) = memids_range {
+                    // Two replacement fields — sort by position, splice.
+                    let (first, second) = if id_r.0 < memids_r.0 {
+                        (id_r, memids_r)
+                    } else {
+                        (memids_r, id_r)
+                    };
+
+                    // Bytes before first replaced field.
+                    reframed_rel_scratch.extend_from_slice(&rel_bytes[..first.0]);
+                    // First replacement.
+                    if first.0 == id_r.0 {
+                        protohoggr::encode_int64_field(reframed_rel_scratch, 1, new_rel_id);
+                    } else {
+                        protohoggr::encode_bytes_field(reframed_rel_scratch, 9, memids_scratch);
+                    }
+                    // Bytes between first and second replaced fields.
+                    reframed_rel_scratch.extend_from_slice(&rel_bytes[first.1..second.0]);
+                    // Second replacement.
+                    if second.0 == memids_r.0 {
+                        protohoggr::encode_bytes_field(reframed_rel_scratch, 9, memids_scratch);
+                    } else {
+                        protohoggr::encode_int64_field(reframed_rel_scratch, 1, new_rel_id);
+                    }
+                    // Bytes after second replaced field.
+                    reframed_rel_scratch.extend_from_slice(&rel_bytes[second.1..]);
+                } else {
+                    // No memids field (zero-member relation) — only patch id.
+                    reframed_rel_scratch.extend_from_slice(&rel_bytes[..id_r.0]);
+                    protohoggr::encode_int64_field(reframed_rel_scratch, 1, new_rel_id);
+                    reframed_rel_scratch.extend_from_slice(&rel_bytes[id_r.1..]);
+                }
+
+                protohoggr::encode_bytes_field(group_scratch, 4, reframed_rel_scratch);
+                total_relations += 1;
+            } else {
+                // Non-relation field in the group — drop it to match
+                // current R2d behavior (only relations are emitted).
+                gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
+            }
+        }
+
+        if !group_scratch.is_empty() {
+            protohoggr::encode_bytes_field(output, 2, group_scratch);
+        }
+    }
+
+    output.extend_from_slice(scalar_fields_scratch);
+
+    // Per-blob cursor drift check.
+    if *node_slot_cursor > total_node_members {
+        return Err(format!(
+            "reframe_relations: node cursor {} > total {total_node_members}",
+            *node_slot_cursor,
+        ));
+    }
+    if *way_slot_cursor > total_way_members {
+        return Err(format!(
+            "reframe_relations: way cursor {} > total {total_way_members}",
+            *way_slot_cursor,
+        ));
+    }
+
+    Ok((total_relations, min_new_id, max_new_id))
+}
+
 fn build_blob_schedule(
     input: &Path,
     kind: crate::blob_index::ElemKind,
@@ -1708,19 +1996,13 @@ fn fused_relation_resolve(
 }
 
 // ---------------------------------------------------------------------------
-// Relation pass R2d: rewrite member refs, write relations to output
+// Relation pass R2d: wire-format rewrite of member refs + write output
 // ---------------------------------------------------------------------------
 
-/// Third (and final) scan over relation blobs. For each relation, look
-/// up its new id from the in-memory relation_map, remap each member
-/// (node/way members via the flat resolved files, relation
-/// members via the in-memory relation_map), and write to output via
-/// `bb.add_relation`.
-///
-/// Walks members in the exact same order as R2a, advancing
-/// `node_slot_cursor` and `way_slot_cursor` in lockstep — so the n-th
-/// node member encountered reads slot n of `node_member_new_refs`, and
-/// likewise for ways. No per-relation index bookkeeping needed.
+/// Third (and final) scan over relation blobs. Wire-format splice
+/// rewriter: patches relation id (field 1) and member ids (field 9),
+/// copies all other fields verbatim. Writes each reframed blob via
+/// `write_primitive_block_owned` — no BlockBuilder, no full decode.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
@@ -1731,7 +2013,6 @@ fn relation_r2d_assembly(
     input: &Path,
     _direct_io: bool,
     writer: &mut crate::writer::PbfWriter<crate::write::file_writer::FileWriter>,
-    bb: &mut BlockBuilder,
     node_member_new_refs_path: &Path,
     way_member_new_refs_path: &Path,
     total_node_members: u64,
@@ -1748,11 +2029,17 @@ fn relation_r2d_assembly(
 
     let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
     let mut node_slot_cursor: u64 = 0;
     let mut way_slot_cursor: u64 = 0;
+
+    // Reusable scratch buffers for reframe_relations_with_new_ids.
+    let mut reframe_buf: Vec<u8> = Vec::new();
+    let mut memids_scratch: Vec<u8> = Vec::new();
+    let mut group_scratch: Vec<u8> = Vec::new();
+    let mut reframed_rel_scratch: Vec<u8> = Vec::new();
+    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
+    let mut scalar_fields: Vec<u8> = Vec::new();
 
     use std::os::unix::fs::FileExt;
     for &(data_offset, data_size) in &schedule {
@@ -1762,63 +2049,41 @@ fn relation_r2d_assembly(
             .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
         let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf,
-            &pool,
-            &mut st_scratch,
-            &mut gr_scratch,
-        )?;
-        // members_buf borrows role strings from the block so it must not
-        // outlive it — declare inside the blob loop.
-        let mut members_buf: Vec<MemberData<'_>> = Vec::new();
-        for element in block.elements() {
-            let Element::Relation(r) = &element else { continue };
-            ensure_relation_capacity(bb, writer)?;
-            let new_id = relation_map.get(&r.id()).copied().ok_or_else(|| {
-                format!(
-                    "internal error: relation id {} missing from relation_map in R2d",
-                    r.id()
-                )
-            })?;
 
-            members_buf.clear();
-            for m in r.members() {
-                let remapped_id = match m.id {
-                    MemberId::Node(_old_id) => {
-                        let offset = node_slot_cursor as usize * NEW_REF_SIZE;
-                        let bytes: [u8; NEW_REF_SIZE] = node_mmap
-                            [offset..offset + NEW_REF_SIZE]
-                            .try_into()
-                            .map_err(|_| "R2d node member slice")?;
-                        let new_node_id = i64::from_le_bytes(bytes);
-                        node_slot_cursor += 1;
-                        MemberId::Node(new_node_id)
-                    }
-                    MemberId::Way(_old_id) => {
-                        let offset = way_slot_cursor as usize * NEW_REF_SIZE;
-                        let bytes: [u8; NEW_REF_SIZE] = way_mmap
-                            [offset..offset + NEW_REF_SIZE]
-                            .try_into()
-                            .map_err(|_| "R2d way member slice")?;
-                        let new_way_id = i64::from_le_bytes(bytes);
-                        way_slot_cursor += 1;
-                        MemberId::Way(new_way_id)
-                    }
-                    MemberId::Relation(old_id) => MemberId::Relation(
-                        relation_map.get(&old_id).copied().unwrap_or(old_id),
-                    ),
-                    MemberId::Unknown(t, id) => MemberId::Unknown(t, id),
-                };
-                members_buf.push(MemberData {
-                    id: remapped_id,
-                    role: m.role().unwrap_or(""),
-                });
-            }
+        let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
+            &decompress_buf,
+            relation_map,
+            &node_mmap,
+            &way_mmap,
+            &mut node_slot_cursor,
+            &mut way_slot_cursor,
+            total_node_members,
+            total_way_members,
+            &mut reframe_buf,
+            &mut memids_scratch,
+            &mut group_scratch,
+            &mut reframed_rel_scratch,
+            &mut group_ranges,
+            &mut scalar_fields,
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-            let meta = element_metadata(&r.info());
-            bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
-            stats.relations_written += 1;
+        if blob_count > 0 {
+            let index = crate::blob_index::BlobIndex {
+                kind: crate::blob_index::ElemKind::Relation,
+                min_id,
+                max_id,
+                count: blob_count,
+                bbox: None,
+            };
+            writer.write_primitive_block_owned(
+                std::mem::take(&mut reframe_buf),
+                index,
+                None,
+            )?;
         }
+
+        stats.relations_written += blob_count;
     }
 
     // Sanity: the walk must have consumed every resolved ref.

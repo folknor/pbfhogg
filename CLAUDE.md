@@ -26,6 +26,12 @@ brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg bi
 brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg binary
 ```
 
+`--stop MARKER` can be combined with any measured mode (`--bench`, `--hotpath`,
+`--alloc`). Kills the pbfhogg process after the named marker is emitted in the
+sidecar stream. Sidecar data is stored on forced exit so `brokkr results <uuid>
+--markers --phases` works normally. Use for fast iteration on individual stages:
+`brokkr renumber --dataset planet --bench 1 --stop RENUMBER_EXT_STAGE2D_END`.
+
 I/O mode flags (`--direct-io`, `--io-uring`) are passed through to the pbfhogg binary and
 create named variants in results (e.g., `add-locations-to-ways+direct-io`). Combine with
 `--bench` for stored comparisons: `brokkr results --compare-last --variant add-locations-to-ways`.

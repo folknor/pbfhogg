@@ -474,7 +474,6 @@ fn stage2d_worker(
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut reframe_buf: Vec<u8> = Vec::new();
-    let mut old_ids_buf: Vec<i64> = Vec::new();
     let mut refs_scratch: Vec<u8> = Vec::new();
     let mut group_scratch: Vec<u8> = Vec::new();
     let mut reframed_way_scratch: Vec<u8> = Vec::new();
@@ -512,13 +511,12 @@ fn stage2d_worker(
 
             let t2 = std::time::Instant::now();
             reframe_buf.clear();
-            old_ids_buf.clear();
             let blob_way_count = reframe_ways_with_new_ids(
                 &decompress_buf,
                 base_way_id,
                 node_id_set,
                 start_node_id,
-                &mut old_ids_buf,
+                way_id_set,
                 &mut reframe_buf,
                 &mut refs_scratch,
                 &mut group_scratch,
@@ -529,16 +527,6 @@ fn stage2d_worker(
             )?;
             #[allow(clippy::cast_possible_truncation)]
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
-
-            let t3 = std::time::Instant::now();
-            // Set old_way_ids in the per-worker IdSetDense.
-            // No bucket files — way_id_set replaces the external
-            // way_map entirely for R2B rank lookup.
-            for &old_way_id in &old_ids_buf {
-                way_id_set.set(old_way_id);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            counters.bucket_emit_ms.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
             // Build the OwnedBlock from the reframed bytes.
             let index = crate::blob_index::BlobIndex {
@@ -827,7 +815,6 @@ fn pass1_worker(
     let mut read_buf: Vec<u8> = Vec::new();
     let mut decompress_buf: Vec<u8> = Vec::new();
     let mut reframe_buf: Vec<u8> = Vec::new();
-    let mut old_ids_buf: Vec<i64> = Vec::new();
     let mut output_blocks: Vec<OwnedBlock> = Vec::new();
     // Reusable scratch for reframe_dense_with_new_ids.
     let mut group_ranges_scratch: Vec<(usize, usize)> = Vec::new();
@@ -866,11 +853,11 @@ fn pass1_worker(
 
             let t2 = std::time::Instant::now();
             reframe_buf.clear();
-            old_ids_buf.clear();
             let blob_node_count = reframe_dense_with_new_ids(
                 &decompress_buf,
                 base_new_id,
-                &mut old_ids_buf,
+                id_set,
+                task.min_id < 0,
                 &mut reframe_buf,
                 &mut group_ranges_scratch,
                 &mut scalar_fields_scratch,
@@ -881,30 +868,6 @@ fn pass1_worker(
             )?;
             #[allow(clippy::cast_possible_truncation)]
             counters.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
-
-            // Per-block negative-id check: skip per-element scan when
-            // indexdata confirms min_id >= 0 (all planet blobs).
-            if task.min_id < 0 {
-                for &id in &old_ids_buf {
-                    if id < 0 {
-                        return Err(format!(
-                            "renumber --mode external requires non-negative input ids. \
-                             Input contains node id {id}. \
-                             Use --mode inmem for files with negative (editor-local) ids."
-                        ));
-                    }
-                }
-            }
-
-            let t3 = std::time::Instant::now();
-            // Set all old_ids in the per-worker IdSetDense bitset.
-            // No bucket files — the bitset + rank index replaces
-            // the external node_map entirely.
-            for &old_id in &old_ids_buf {
-                id_set.set(old_id);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            counters.bucket_emit_ms.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
             let index = crate::blob_index::BlobIndex {
                 kind: crate::blob_index::ElemKind::Node,
@@ -953,14 +916,14 @@ fn pass1_worker(
 /// cost drops from ~113 ns (HashMap lookups, delta arrays, metadata) to
 /// ~10-15 ns (varint decode of old ID + varint encode of new delta).
 ///
-/// Returns the number of nodes in the block. `old_ids_out` is populated
-/// with the absolute old IDs (for bucket emission). `output` receives
-/// the reframed PrimitiveBlock bytes.
+/// Returns the number of nodes in the block. Sets old node IDs
+/// directly in `id_set` as they are decoded.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn reframe_dense_with_new_ids(
     decompressed: &[u8],
     base_new_id: i64,
-    old_ids_out: &mut Vec<i64>,
+    id_set: &mut super::id_set_dense::IdSetDense,
+    check_negative_ids: bool,
     output: &mut Vec<u8>,
     // Reusable scratch buffers — hoisted to worker level.
     group_ranges_scratch: &mut Vec<(usize, usize)>,
@@ -1011,7 +974,6 @@ fn reframe_dense_with_new_ids(
     // PrimitiveBlock field 1: StringTable (copy verbatim)
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
-    old_ids_out.clear();
     let mut total_nodes: u64 = 0;
     let mut current_new_id = base_new_id;
 
@@ -1046,19 +1008,24 @@ fn reframe_dense_with_new_ids(
 
         let id_bytes = id_field.ok_or("reframe: no packed ID field in DenseNodes")?;
 
-        // Decode old ID deltas → absolute old IDs.
+        // Decode old ID deltas → absolute old IDs. Set bits in
+        // id_set inline — no intermediate Vec.
         let mut old_id: i64 = 0;
         let mut id_cursor = Cursor::new(id_bytes);
-        let group_start_idx = old_ids_out.len();
+        let mut group_node_count: u64 = 0;
         while id_cursor.remaining() > 0 {
             let delta = id_cursor.read_sint64().map_err(|e| e.to_string())?;
             old_id += delta;
-            old_ids_out.push(old_id);
+            if check_negative_ids && old_id < 0 {
+                return Err(format!(
+                    "renumber --mode external requires non-negative input ids. \
+                     Input contains node id {old_id}. \
+                     Use --mode inmem for files with negative (editor-local) ids."
+                ));
+            }
+            id_set.set(old_id);
+            group_node_count += 1;
         }
-        // Validate: reject negative IDs. Skip per-element checks when
-        // the blob's indexdata min_id >= 0 (true for all planet blobs).
-        // The min_id is passed in from the caller via the check_negatives flag.
-        let group_node_count = (old_ids_out.len() - group_start_idx) as u64;
         total_nodes += group_node_count;
 
         // Build new packed ID field for this group.
@@ -1102,7 +1069,7 @@ fn reframe_ways_with_new_ids(
     base_new_way_id: i64,
     node_id_set: &super::id_set_dense::IdSetDense,
     start_node_id: i64,
-    old_ids_out: &mut Vec<i64>,
+    way_id_set: &mut super::id_set_dense::IdSetDense,
     output: &mut Vec<u8>,
     refs_scratch: &mut Vec<u8>,
     group_scratch: &mut Vec<u8>,
@@ -1145,7 +1112,6 @@ fn reframe_ways_with_new_ids(
     output.clear();
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
-    old_ids_out.clear();
     let mut total_ways: u64 = 0;
     let mut current_new_id = base_new_way_id;
 
@@ -1194,7 +1160,7 @@ fn reframe_ways_with_new_ids(
                          Use --mode inmem for files with negative (editor-local) ids."
                     ));
                 }
-                old_ids_out.push(old_way_id);
+                way_id_set.set(old_way_id);
 
                 // Decode old ref deltas, resolve via rank(), delta-encode new refs.
                 refs_scratch.clear();

@@ -338,7 +338,7 @@ pub fn renumber_external(
     // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
     // single bitset with rank index for O(1) new_id lookup in the fused
     // way scan. Replaces the old node_map shard bucket files entirely.
-    const PASS1_WORKERS: usize = 6;
+    const PASS1_WORKERS: usize = 4;
     let mut worker_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..PASS1_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
@@ -2854,7 +2854,7 @@ fn build_blob_schedule(
 ///    buckets and R2B scatter)
 ///
 /// Returns `(total_node_members, total_way_members)`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn fused_relation_resolve(
     input: &Path,
     node_id_set: &super::id_set_dense::IdSetDense,
@@ -2867,77 +2867,183 @@ fn fused_relation_resolve(
     way_refs_path: &Path,
 ) -> Result<(u64, u64)> {
     let schedule = build_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
-    let shared_file = std::fs::File::open(input)
-        .map_err(|e| format!("failed to open {}: {e}", input.display()))?;
 
-    let pool = crate::blob::DecompressPool::new();
-    let mut raw_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    if schedule.is_empty() {
+        std::fs::write(node_refs_path, &[]).map_err(|e| format!("write: {e}"))?;
+        std::fs::write(way_refs_path, &[]).map_err(|e| format!("write: {e}"))?;
+        return Ok((0, 0));
+    }
 
-    let mut node_refs: Vec<u8> = Vec::new();
-    let mut way_refs: Vec<u8> = Vec::new();
+    // Pre-compute per-blob starting relation_id. Planet has ~14K
+    // relation blobs — the prefix-sum scan is negligible.
+    // We need per-blob relation counts from indexdata.
+    let rel_schedule = build_kind_blob_schedule(input, crate::blob_index::ElemKind::Relation)?;
+    let mut base_rel_ids: Vec<i64> = Vec::with_capacity(rel_schedule.len());
+    let mut cursor_id = *next_relation_id;
+    for task in &rel_schedule {
+        base_rel_ids.push(cursor_id);
+        #[allow(clippy::cast_possible_wrap)]
+        { cursor_id += task.element_count as i64; }
+    }
+    *next_relation_id = cursor_id;
 
-    use std::os::unix::fs::FileExt;
-    for &(data_offset, data_size) in &schedule {
-        raw_buf.resize(data_size, 0);
-        shared_file
-            .read_exact_at(&mut raw_buf, data_offset)
-            .map_err(|e| format!("failed to pread relation blob at {data_offset}: {e}"))?;
-        let mut decompress_buf = pool.get();
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf,
-            &pool,
-            &mut st_scratch,
-            &mut gr_scratch,
-        )?;
-        for element in block.elements() {
-            if let Element::Relation(r) = &element {
-                reject_negative_id(r.id(), "relation")?;
-                let new_id = *next_relation_id;
-                *next_relation_id += 1;
-                relation_map.insert(r.id(), new_id);
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
 
-                for m in r.members() {
-                    match m.id {
-                        MemberId::Node(old_id) => {
-                            reject_negative_id(old_id, "relation node member")?;
-                            #[allow(clippy::cast_possible_wrap)]
-                            let new_id = if node_id_set.get(old_id) {
-                                start_node_id + node_id_set.rank(old_id) as i64
-                            } else {
-                                old_id
-                            };
-                            node_refs.extend_from_slice(&new_id.to_le_bytes());
+    // Per-blob result: relation_map entries + resolved node/way refs.
+    struct BlobResult {
+        map_entries: Vec<(i64, i64)>,
+        node_refs: Vec<i64>,
+        way_refs: Vec<i64>,
+    }
+
+    type ScanItem = (usize, std::result::Result<BlobResult, String>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, &(u64, usize))>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (scan_tx, scan_rx) = std::sync::mpsc::sync_channel::<ScanItem>(32);
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(4);
+
+    let mut node_refs_out: Vec<u8> = Vec::new();
+    let mut way_refs_out: Vec<u8> = Vec::new();
+    let base_rel_ids_ref = &base_rel_ids;
+
+    std::thread::scope(|scope| -> Result<()> {
+        let schedule_ref = &schedule;
+        scope.spawn(move || {
+            for (i, task) in schedule_ref.iter().enumerate() {
+                if desc_tx.send((i, task)).is_err() {
+                    break;
+                }
+            }
+        });
+
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = scan_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::os::unix::fs::FileExt as _;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+
+                loop {
+                    let (seq, task) = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(t) => t,
+                            Err(_) => break,
                         }
-                        MemberId::Way(old_id) => {
-                            reject_negative_id(old_id, "relation way member")?;
-                            #[allow(clippy::cast_possible_wrap)]
-                            let new_id = if way_id_set.get(old_id) {
-                                start_way_id + way_id_set.rank(old_id) as i64
-                            } else {
-                                old_id
-                            };
-                            way_refs.extend_from_slice(&new_id.to_le_bytes());
+                    };
+
+                    let base_id = base_rel_ids_ref[seq];
+                    let result: std::result::Result<BlobResult, String> = (|| {
+                        read_buf.resize(task.1, 0);
+                        file.read_exact_at(&mut read_buf, task.0)
+                            .map_err(|e| format!("pread at {}: {e}", task.0))?;
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| e.to_string())?;
+                        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+                            std::mem::take(&mut decompress_buf),
+                            &mut st_scratch,
+                            &mut gr_scratch,
+                        )
+                        .map_err(|e| e.to_string())?;
+
+                        let mut map_entries = Vec::new();
+                        let mut node_refs = Vec::new();
+                        let mut way_refs = Vec::new();
+                        let mut cur_id = base_id;
+
+                        for element in block.elements() {
+                            if let Element::Relation(r) = &element {
+                                if r.id() < 0 {
+                                    return Err(format!(
+                                        "negative relation id {}. Use --mode inmem.", r.id()
+                                    ));
+                                }
+                                map_entries.push((r.id(), cur_id));
+                                cur_id += 1;
+
+                                for m in r.members() {
+                                    match m.id {
+                                        MemberId::Node(old_id) => {
+                                            #[allow(clippy::cast_possible_wrap)]
+                                            let new_id = if node_id_set.get(old_id) {
+                                                start_node_id + node_id_set.rank(old_id) as i64
+                                            } else {
+                                                old_id
+                                            };
+                                            node_refs.push(new_id);
+                                        }
+                                        MemberId::Way(old_id) => {
+                                            #[allow(clippy::cast_possible_wrap)]
+                                            let new_id = if way_id_set.get(old_id) {
+                                                start_way_id + way_id_set.rank(old_id) as i64
+                                            } else {
+                                                old_id
+                                            };
+                                            way_refs.push(new_id);
+                                        }
+                                        MemberId::Relation(_) | MemberId::Unknown(_, _) => {}
+                                    }
+                                }
+                            }
                         }
-                        MemberId::Relation(old_id) => {
-                            reject_negative_id(old_id, "relation relation member")?;
+
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
                         }
-                        MemberId::Unknown(_, _) => {}
+
+                        Ok(BlobResult { map_entries, node_refs, way_refs })
+                    })();
+
+                    if tx.send((seq, result)).is_err() {
+                        break;
                     }
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(scan_tx);
+
+        // Consumer: reorder by seq, merge results.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<BlobResult, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        for (seq_num, item) in scan_rx {
+            reorder.push(seq_num, item);
+            while let Some(result) = reorder.pop_ready() {
+                let br = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                for (old_id, new_id) in br.map_entries {
+                    relation_map.insert(old_id, new_id);
+                }
+                for new_id in br.node_refs {
+                    node_refs_out.extend_from_slice(&new_id.to_le_bytes());
+                }
+                for new_id in br.way_refs {
+                    way_refs_out.extend_from_slice(&new_id.to_le_bytes());
                 }
             }
         }
-    }
 
-    let total_node_members = (node_refs.len() / NEW_REF_SIZE) as u64;
-    let total_way_members = (way_refs.len() / NEW_REF_SIZE) as u64;
+        Ok(())
+    })?;
 
-    // Write flat files.
-    std::fs::write(node_refs_path, &node_refs)
+    let total_node_members = (node_refs_out.len() / NEW_REF_SIZE) as u64;
+    let total_way_members = (way_refs_out.len() / NEW_REF_SIZE) as u64;
+
+    std::fs::write(node_refs_path, &node_refs_out)
         .map_err(|e| format!("write node member refs: {e}"))?;
-    std::fs::write(way_refs_path, &way_refs)
+    std::fs::write(way_refs_path, &way_refs_out)
         .map_err(|e| format!("write way member refs: {e}"))?;
 
     Ok((total_node_members, total_way_members))

@@ -1774,9 +1774,8 @@ fn reframe_way_blob_with_locations(
 ///
 /// Bounded memory (<1 GB), all sequential I/O. Uses ~224 GB temp disk at
 /// planet scale. See module docs for the algorithm.
-#[allow(clippy::too_many_arguments)]
 #[hotpath::measure]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub fn external_join(
     input: &Path,
     output: &Path,
@@ -1785,6 +1784,8 @@ pub fn external_join(
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
+    _keep_scratch: bool,
+    _start_stage: Option<u8>,
 ) -> Result<Stats> {
     require_indexdata(
         input,

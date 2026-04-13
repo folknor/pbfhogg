@@ -44,8 +44,8 @@ use super::{
 /// 14B gives headroom above the current ~13B maximum.
 const MAX_NODE_ID: u64 = 14_000_000_000;
 
-/// Size of a rank-occurrence record: `(rank: u64, slot_pos: u64)` = 16 bytes.
-const RANK_RECORD_SIZE: usize = 16;
+/// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
+const RANK_RECORD_SIZE: usize = 12;
 
 /// Size of a resolved entry: `(slot_pos: u64, lat: i32, lon: i32)` = 16 bytes.
 const RESOLVED_ENTRY_SIZE: usize = 16;
@@ -57,32 +57,22 @@ const COORD_SLOT_SIZE: usize = 8;
 // Rank-occurrence record: (rank, slot_pos)
 // ---------------------------------------------------------------------------
 
-/// A rank-bucketed occurrence record. `rank` is the dense ordinal of the
-/// node_id in the `IdSetDense` bitset (computed via `rank(node_id)`).
+/// A rank-bucketed occurrence record. `local_rank` is the rank offset
+/// within the bucket (`global_rank - bucket_rank_start`), stored as u32
+/// (max ~40M entries per bucket at planet, well under u32::MAX).
 /// `slot_pos` is the final position in the coord_slots array.
 ///
-/// Rank order matches node-ID order by construction (IdSetDense::rank()
-/// counts set bits below the ID), so stage 2 can process rank buckets
-/// in ascending order with a single-pass node scan.
+/// 12 bytes instead of 16: 25% I/O reduction across stages 1B and 2.
 #[derive(Clone, Copy)]
 struct RankRecord {
-    rank: u64,
+    local_rank: u32,
     slot_pos: u64,
 }
 
 impl RankRecord {
     fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
-        buf[..8].copy_from_slice(&self.rank.to_le_bytes());
-        buf[8..16].copy_from_slice(&self.slot_pos.to_le_bytes());
-    }
-
-    /// Bucket index for rank partitioning.
-    #[allow(clippy::cast_possible_truncation)]
-    fn rank_bucket(&self, total_unique_nodes: u64) -> usize {
-        let range_size = total_unique_nodes.div_ceil(NUM_BUCKETS as u64);
-        if range_size == 0 { return 0; }
-        let bucket = self.rank / range_size;
-        (bucket as usize).min(NUM_BUCKETS - 1)
+        buf[..4].copy_from_slice(&self.local_rank.to_le_bytes());
+        buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
     }
 }
 
@@ -397,11 +387,17 @@ fn stage1_way_pass(
                                 |_way_id, refs| {
                                     if write_err.is_some() { return; }
                                     for &node_id in refs {
+                                        let global_rank = node_id_set_ref.rank(node_id);
+                                        let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
                                         #[allow(clippy::cast_possible_truncation)]
-                                        let rank = node_id_set_ref.rank(node_id);
+                                        let bucket = if rank_range == 0 { 0 } else {
+                                            (global_rank / rank_range) as usize
+                                        }.min(NUM_BUCKETS - 1);
+                                        let bucket_rank_start = bucket as u64 * rank_range;
+                                        #[allow(clippy::cast_possible_truncation)]
+                                        let local_rank = (global_rank - bucket_rank_start) as u32;
                                         let slot_pos = slot_start + local_ref_idx;
-                                        let rec = RankRecord { rank, slot_pos };
-                                        let bucket = rec.rank_bucket(unique_nodes_u64);
+                                        let rec = RankRecord { local_rank, slot_pos };
                                         rec.write_to(&mut rec_buf);
                                         if let Some(w) = shard_writers[bucket].as_mut() {
                                             if let Err(e) = w.write_all(&rec_buf) {
@@ -565,14 +561,12 @@ fn stage2_node_join(
             advise_dontneed_file(&file);
         }
 
-        // Count directly from raw bytes.
+        // Count directly from raw bytes (12-byte records: u32 local_rank + u64 slot_pos).
         for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
-            let rank = u64::from_le_bytes([
+            let local_rank = u32::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3],
-                chunk[4], chunk[5], chunk[6], chunk[7],
-            ]);
-            let local = (rank - bucket_rank_start) as usize;
-            loader.counts[local] += 1;
+            ]) as usize;
+            loader.counts[local_rank] += 1;
         }
 
         // Prefix sum → offsets.
@@ -587,18 +581,16 @@ fn stage2_node_join(
         loader.write_pos.clear();
         loader.write_pos.extend_from_slice(&group_offsets[..local_range]);
         for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
-            let rank = u64::from_le_bytes([
+            let local_rank = u32::from_le_bytes([
                 chunk[0], chunk[1], chunk[2], chunk[3],
-                chunk[4], chunk[5], chunk[6], chunk[7],
-            ]);
+            ]) as usize;
             let slot_pos = u64::from_le_bytes([
+                chunk[4], chunk[5], chunk[6], chunk[7],
                 chunk[8], chunk[9], chunk[10], chunk[11],
-                chunk[12], chunk[13], chunk[14], chunk[15],
             ]);
-            let local = (rank - bucket_rank_start) as usize;
-            let pos = loader.write_pos[local] as usize;
+            let pos = loader.write_pos[local_rank] as usize;
             grouped_slot_pos[pos] = slot_pos;
-            loader.write_pos[local] += 1;
+            loader.write_pos[local_rank] += 1;
         }
 
         Ok(PreparedBucket {

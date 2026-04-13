@@ -1082,6 +1082,7 @@ struct BlobDescriptor {
     data_offset: u64,
     data_size: usize,
     slot_start: u64,
+    is_way_blob: bool,
 }
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
@@ -1232,7 +1233,9 @@ fn stage4_assembly(
             0
         };
 
-        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start });
+        let is_way_blob = header_entry.index()
+            .is_some_and(|idx| matches!(idx.kind, crate::blob_index::ElemKind::Way));
+        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start, is_way_blob });
         seq += 1;
     }
 
@@ -1312,6 +1315,8 @@ fn stage4_assembly(
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
                 let mut refs_buf: Vec<i64> = Vec::new();
                 let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+                let mut way_reframe_scratch = WayReframeScratch::new();
+                let mut reframe_output: Vec<u8> = Vec::new();
 
                 loop {
                     let desc = {
@@ -1334,14 +1339,50 @@ fn stage4_assembly(
 
                         let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        let block = PrimitiveBlock::new(
-                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
-                        )?;
                         #[allow(clippy::cast_possible_truncation)]
                         s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
                         let t2 = std::time::Instant::now();
                         output_blocks.clear();
+
+                        if desc.is_way_blob {
+                            // Wire-format reframe: splice locations without
+                            // full PrimitiveBlock decode or BlockBuilder.
+                            let (way_count, _new_slot_pos, min_id, max_id, missing) =
+                                reframe_way_blob_with_locations(
+                                    &decompress_buf,
+                                    coord_slots,
+                                    desc.slot_start,
+                                    &mut reframe_output,
+                                    &mut way_reframe_scratch,
+                                ).map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
+                                ))?;
+
+                            let index = crate::blob_index::BlobIndex {
+                                kind: crate::blob_index::ElemKind::Way,
+                                min_id,
+                                max_id,
+                                count: way_count,
+                                bbox: None,
+                            };
+                            let taken = std::mem::take(&mut reframe_output);
+                            reframe_output.reserve(taken.len());
+                            output_blocks.push((taken, index, None));
+
+                            let mut block_stats = Stats::default();
+                            block_stats.ways_written = way_count;
+                            block_stats.missing_locations = missing;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s4_assemble_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                            s4_blobs_ref.fetch_add(1, Relaxed);
+                            return Ok((std::mem::take(&mut output_blocks), block_stats));
+                        }
+
+                        // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+                        let block = PrimitiveBlock::new(
+                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
+                        )?;
                         let block_stats = assemble_block(
                             &block,
                             &mut bb,
@@ -1528,6 +1569,201 @@ fn assemble_block(
     }
 
     Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format way reframe for stage 4
+// ---------------------------------------------------------------------------
+
+/// Reusable scratch buffers for the way reframe path.
+struct WayReframeScratch {
+    group_ranges: Vec<(usize, usize)>,
+    scalar_fields: Vec<u8>,
+    reframed_way: Vec<u8>,
+    packed_lats: Vec<u8>,
+    packed_lons: Vec<u8>,
+    group_out: Vec<u8>,
+}
+
+impl WayReframeScratch {
+    fn new() -> Self {
+        Self {
+            group_ranges: Vec::new(),
+            scalar_fields: Vec::new(),
+            reframed_way: Vec::new(),
+            packed_lats: Vec::new(),
+            packed_lons: Vec::new(),
+            group_out: Vec::new(),
+        }
+    }
+}
+
+/// Wire-format reframe: splice LocationsOnWays fields (9, 10) into way
+/// messages without full PrimitiveBlock decode. Copies string table, node
+/// groups, relation groups, and all non-ref way fields verbatim. Only
+/// decodes way refs (field 8) to count them and look up coords.
+///
+/// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn reframe_way_blob_with_locations(
+    decompressed: &[u8],
+    coord_slots: &CoordSlots,
+    mut way_slot_pos: u64,
+    output: &mut Vec<u8>,
+    scratch: &mut WayReframeScratch,
+) -> std::result::Result<(u64, u64, i64, i64, u64), String> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+
+    scratch.group_ranges.clear();
+    scratch.scalar_fields.clear();
+    let mut stringtable_range: Option<(usize, usize)> = None;
+
+    // Level 1: PrimitiveBlock — find string table + groups.
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block: {e}"))? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| format!("reframe st: {e}"))?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                stringtable_range = Some((offset, data.len()));
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| format!("reframe group: {e}"))?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                scratch.group_ranges.push((offset, data.len()));
+            }
+            (17..=20, WIRE_VARINT) => {
+                let raw = cursor.read_raw_field(wire_type).map_err(|e| format!("reframe scalar: {e}"))?;
+                protohoggr::encode_tag(&mut scratch.scalar_fields, field, wire_type);
+                scratch.scalar_fields.extend_from_slice(raw);
+            }
+            _ => cursor.skip_field(wire_type).map_err(|e| format!("reframe skip: {e}"))?,
+        }
+    }
+
+    let (st_offset, st_len) = stringtable_range
+        .ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
+
+    output.clear();
+    // Field 1: StringTable (verbatim).
+    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+
+    let mut total_ways: u64 = 0;
+    let mut min_way_id: i64 = i64::MAX;
+    let mut max_way_id: i64 = i64::MIN;
+    let mut missing_locations: u64 = 0;
+
+    // Level 2: process each PrimitiveGroup.
+    for &(gr_offset, gr_len) in &scratch.group_ranges {
+        let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+        scratch.group_out.clear();
+
+        let mut gr_cursor = Cursor::new(group_bytes);
+        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| format!("reframe gfield: {e}"))? {
+            if field == 3 && wire_type == WIRE_LEN {
+                // Way submessage — splice locations.
+                let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
+
+                // Parse way fields: extract id (field 1), find refs (field 8).
+                let mut way_id: i64 = 0;
+                let mut refs_data: &[u8] = &[];
+                let mut refs_range: Option<(usize, usize)> = None;
+
+                let mut way_cursor = Cursor::new(way_bytes);
+                while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| format!("reframe wfield: {e}"))? {
+                    if wf == 1 && wt == WIRE_VARINT {
+                        way_id = way_cursor.read_varint_i64().map_err(|e| format!("reframe id: {e}"))?;
+                    } else if wf == 8 && wt == WIRE_LEN {
+                        let val_start = way_bytes.len() - way_cursor.remaining();
+                        let tag_start = val_start - 1; // field 8 tag = 1 byte
+                        refs_data = way_cursor.read_len_delimited().map_err(|e| format!("reframe refs: {e}"))?;
+                        let val_end = way_bytes.len() - way_cursor.remaining();
+                        refs_range = Some((tag_start, val_end));
+                    } else {
+                        way_cursor.skip_field(wt).map_err(|e| format!("reframe wskip: {e}"))?;
+                    }
+                }
+
+                if way_id < min_way_id { min_way_id = way_id; }
+                if way_id > max_way_id { max_way_id = way_id; }
+
+                // Count refs and look up locations.
+                scratch.packed_lats.clear();
+                scratch.packed_lons.clear();
+                let mut last_lat: i64 = 0;
+                let mut last_lon: i64 = 0;
+                let mut ref_count: u64 = 0;
+
+                if !refs_data.is_empty() {
+                    let mut ref_cursor = Cursor::new(refs_data);
+                    while ref_cursor.remaining() > 0 {
+                        // Skip the ref delta — we don't need the node ID,
+                        // just need to count refs for slot_pos advancement.
+                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
+
+                        let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                            Some(loc) => loc,
+                            None => {
+                                missing_locations += 1;
+                                (0, 0)
+                            }
+                        };
+                        way_slot_pos += 1;
+                        ref_count += 1;
+
+                        let lat_i64 = i64::from(lat);
+                        let lon_i64 = i64::from(lon);
+                        protohoggr::encode_varint(
+                            &mut scratch.packed_lats,
+                            protohoggr::zigzag_encode_64(lat_i64 - last_lat),
+                        );
+                        protohoggr::encode_varint(
+                            &mut scratch.packed_lons,
+                            protohoggr::zigzag_encode_64(lon_i64 - last_lon),
+                        );
+                        last_lat = lat_i64;
+                        last_lon = lon_i64;
+                    }
+                }
+
+                // Build reframed way: original bytes + appended fields 9, 10.
+                scratch.reframed_way.clear();
+                if let Some((refs_start, refs_end)) = refs_range {
+                    // Copy everything before refs field.
+                    scratch.reframed_way.extend_from_slice(&way_bytes[..refs_start]);
+                    // Copy refs field verbatim.
+                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_start..refs_end]);
+                    // Copy everything after refs field (other fields like keys, vals, info
+                    // that appeared after refs — field order is not guaranteed).
+                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_end..]);
+                } else {
+                    // No refs field — copy way bytes verbatim.
+                    scratch.reframed_way.extend_from_slice(way_bytes);
+                }
+                // Append location fields.
+                if ref_count > 0 {
+                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
+                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
+                }
+
+                protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
+                total_ways += 1;
+            } else {
+                // Non-way field in the group — copy verbatim.
+                let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
+                protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
+                scratch.group_out.extend_from_slice(raw);
+            }
+        }
+
+        protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
+    }
+
+    // Append scalar fields (granularity, etc.).
+    output.extend_from_slice(&scratch.scalar_fields);
+
+    Ok((total_ways, way_slot_pos, min_way_id, max_way_id, missing_locations))
 }
 
 // ---------------------------------------------------------------------------

@@ -159,13 +159,22 @@ batch is still compressing.
 pipelined decode are justified and working well. Best-optimized of all
 pipelined paths.
 
-### 6. getparents — CONVERTED
+### 6. getparents
 
-Converted to sequential BlobReader with inline processing (commit
-`c912e4d`). Per-block work was lightweight — ID lookups + conditional
-writes — so the rayon par_iter overhead likely exceeded the actual work.
-Now uses the same pattern as node_stats/tags_count: sequential
-BlobReader + reusable decompress_buf + direct writer helpers.
+**Path:** `reader.into_blocks_pipelined()` at line 68
+**Impact:** Reads the entire PBF to find parent elements. Single-pass
+with `for_each_primitive_block_batch`.
+**Retention:** Solved — DecompressPool recycles buffers.
+**Performance (investigated April 2026):** Sequential conversion was
+attempted (commit `c912e4d`) and **reverted** — 4.7x regression on
+Denmark (1400ms vs 300ms baseline). The hypothesis that rayon par_iter
+overhead exceeded per-block work was wrong. Decompression is the
+dominant cost, not the ID lookups. The pipelined reader's parallel
+decode provides real throughput even when per-block processing is
+lightweight. This finding also rules out sequential conversion for
+getid pass 2 (same profile).
+**Priority:** No action — pipelined decode is justified even for
+lightweight per-block work.
 
 ## Commands already converted (no pipelined retention)
 
@@ -178,7 +187,6 @@ BlobReader + reusable decompress_buf + direct writer helpers.
 - **merge** — pread-based passthrough + sweep merge
 - **diff/derive_changes** — StreamingBlocks (sequential + DecompressPool)
 - **external_join** — pread workers + sequential BlobReader
-- **getparents** — sequential BlobReader + reusable decompress_buf (commit `c912e4d`)
 
 ## Recommendation
 
@@ -189,30 +197,22 @@ free churn, no RSS growth from freed-but-retained memory.
 
 **Thread oversubscription** (two concurrent rayon pools: decode + batch
 processing) is the remaining architectural concern. Per-command
-investigation (April 2026) classifies the 5 remaining paths into three
-tiers:
+investigation (April 2026) found that **sequential conversion is not
+beneficial** — even for lightweight per-block work (getparents), the
+pipelined reader's parallel decode provides real throughput because
+decompression dominates, not processing.
 
-**Pipelined decode justified (no conversion):**
-- **cat --type** — par_iter does compression + framing on rayon workers.
-  Heaviest batch work. Pipelined decode overlaps with compression,
-  genuine benefit.
-- **ALTW decode-all** — every element processed with location lookups +
-  full re-encode. Heavy per-block work justifies both par_iter and
-  decode overlap. Niche `--force` path.
+getparents sequential conversion was attempted (commit `c912e4d`) and
+reverted: 4.7x regression on Denmark (1400ms vs 300ms). This rules out
+sequential conversion for all remaining pipelined paths — if it doesn't
+help for the lightest workload, it won't help for heavier ones.
 
-**Par_iter justified, pipelined decode unproven:**
-- **tags_filter single-pass** — tag matching + BlockBuilder re-encode
-  for every element is meaningful work. par_iter helps. Whether the
-  decode/processing overlap offsets the oversubscription cost is
-  unproven. Convert to sequential decode + par_iter if measurement
-  shows benefit.
-
-**Lightweight per-block work (candidates for sequential):**
-- **getid pass 2** — O(1) `IdSetDense::get` per element, most elements
-  skipped. Same profile as getparents. Rayon scheduling overhead likely
-  exceeds the work. Convert to sequential BlobReader.
-- **getparents** — converted (commit `c912e4d`).
+**No conversions recommended.** All remaining pipelined paths (getid,
+tags_filter, cat --type, ALTW decode-all, getparents) are correctly
+using pipelined decode + par_iter batch processing. The thread
+oversubscription concern is real but the decode parallelism benefit
+outweighs it at every measured scale.
 
 **renumber** is being converted to an external join architecture in
-current work — not driven by retention concerns (which are solved) but
-by the need for planet-scale memory-bounded ID remapping.
+current work — not driven by retention or oversubscription concerns
+but by the need for planet-scale memory-bounded ID remapping.

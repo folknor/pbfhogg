@@ -19,6 +19,21 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
+## Next up (2026-04-13)
+
+- [ ] **Multi-extract way classify per-worker scratch** — line 868
+  uses `|| ()` init, allocates `vec![Vec::new(); n]` per block.
+  Node and relation phases already use per-worker state. Fix: change
+  init to `|| vec![Vec::<i64>::new(); n]`, clear between blocks.
+- [ ] **diff v3: non-overlapping block skip** — use indexdata min/max
+  ID to skip decode for blocks entirely OldOnly or NewOnly (misaligned
+  boundaries). Additive on shipped v1+v2. Low risk. Note:
+  derive_changes must still decode OldOnly (needs element IDs for
+  OSC XML delete output).
+- [ ] **`--allow-missing` for apply-changes** — the single prerequisite
+  for incremental extract (~10s vs 862s). Insert new elements that
+  don't exist in the base PBF, then re-extract to filter to bbox.
+
 ## Performance
 
 - [ ] **Rayon alternatives for slice-based parallelism** — Wild linker discussion
@@ -37,16 +52,12 @@ See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 See [notes/pipelined-reader-retention.md](notes/pipelined-reader-retention.md)
-for the April 2026 audit. Per-command investigation classified the
-remaining paths into three tiers:
-- **Pipelined decode justified:** cat --type (compression on rayon
-  workers), ALTW decode-all (heavy per-block work). No conversion.
-- **Par_iter justified, pipelined decode unproven:** tags_filter
-  single-pass. Measure before converting.
-- **Lightweight, convert to sequential:** getid pass 2 (same profile
-  as getparents — O(1) ID lookups, most elements skipped).
-  getparents already converted (`c912e4d`). Renumber converted
-  separately (external join architecture).
+for the April 2026 audit. Sequential conversion was attempted for
+getparents (commit `c912e4d`) and reverted — 4.7x regression on
+Denmark (1400ms vs 300ms). Decompression dominates, not per-block
+processing. **No remaining pipelined paths should be converted to
+sequential.** Renumber converted separately (external join
+architecture, not driven by retention/oversubscription).
 
 ## Milestone 1: Planet-safe production pipeline — COMPLETE
 
@@ -141,16 +152,6 @@ works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
 
 ### Smaller items
 
-- [ ] **diff/derive_changes: non-overlapping block skip (v3)** — use
-  indexdata min/max ID to skip decode for blocks that are entirely
-  OldOnly or NewOnly when block boundaries differ between old and new
-  PBFs. Blob-level byte comparison (v1) and borrowed element merge (v2)
-  are shipped. v3 handles the misaligned-boundary edge case: when
-  `old.max_id < new.min_id`, emit all old elements as OldOnly without
-  decoding (diff can use count from indexdata; derive_changes needs
-  element IDs so must still decode for delete output). Low priority —
-  v1+v2 handle the common case (same-source PBFs with identical block
-  boundaries).
 - [ ] **getid include: pread skip for non-matching blobs** — the include
   path now skips decompression via ID-range filtering (planet 71.5s →
   32.5s), but still sequentially reads the entire file to check each

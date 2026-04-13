@@ -274,7 +274,8 @@ single-pass, tag expression and bbox filtering.
     parse/lookup/encode/frame to identify which sub-step dominates.
 
 - [ ] **`add-locations-to-ways --index-type external` — optimization sprint.**
-  Europe: 608 s → 430 s (−29%, commit `e1ba970`). Planet pending overnight.
+  Planet: 1,462 s → 1,075 s (−26%, commit `abcc736`).
+  Europe: 608 s → 430 s (−29%). Peak anon: 16.7 GB → 8.7 GB (−48%).
 
   Done:
   - [x] Comprehensive instrumentation (all 4 stages)

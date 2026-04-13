@@ -90,7 +90,7 @@ Commands requiring indexdata: `apply-changes`, `sort`, `add-locations-to-ways`, 
 |------|--------|-----------|----------|
 | `dense` (default) | ~30+ GB mmap | none | RAM fits working set |
 | `sparse` | ~540 MB + 16 GB disk | ~16 GB | memory-constrained, batched lookups |
-| `external` | ~1.6 GB | ~112 GB (Europe) | memory-constrained, all sequential I/O. Planet: 1,462s, 3.9x faster than dense |
+| `external` | ~8.7 GB | ~112 GB (Europe) | rank-bucketed counting sort, parallel stages. Planet: 1,075s (18 min), 5.4x faster than dense |
 
 ## Benchmarking Rules
 - **NEVER run benchmark, profiling, or verify commands in parallel.** ONE AT A TIME. Always wait for each to fully complete before starting the next.

@@ -129,16 +129,19 @@ exceeds physical memory.
 | Stage 3 (slot reorder) | 91s | -- | Scatter buffer |
 | Stage 4 (assembly) | 136s | 7.3 GB | Pread-from-workers, parallel assembly |
 
-### Planet-validated (sidecar `98e71e2b`)
+### Planet-validated (commit `abcc736`)
 
-**1,462s (24.4 min), 16.7 GB peak anon. Dense planet: 5,773s (96 min). 3.9x faster.**
+**1,075s (17.9 min), 8.7 GB peak anon. Dense planet: 5,773s (96 min). 5.4x faster.**
 
-| Stage | Europe | Planet | Ratio |
-|-------|--------|--------|-------|
-| Stage 1 | 128s / 70 MB | 333s / 74 MB | 2.6x |
-| Stage 2 | 221s / 1.4 GB | 612s / 2.9 GB | 2.8x |
-| Stage 3 | 91s | 247s | 2.7x |
-| Stage 4 | 136s / 7.3 GB | 269s / 16.7 GB | 2.0x |
+| Stage | Baseline (planet) | Optimized (planet) | Improvement |
+|-------|------|------|------|
+| Stage 1 (two-pass: IdSetDense + rank-bucketed emission) | 333s | 136s | −59% |
+| Stage 2 (pipelined counting-sort merge) | 612s | 469s | −23% |
+| Stage 3 (parallel pwrite scatter) | 247s | 167s | −32% |
+| Stage 4 (parallel P2c assembly) | 269s | 280s | — |
+| **Total** | **1,462s** | **1,075s** | **−26%** |
+
+Previous planet result: 1,462s (24.4 min), 16.7 GB peak anon (sidecar `98e71e2b`).
 
 Temp disk: ~4.3 GB Denmark, ~112 GB Europe, ~300 GB planet.
 

@@ -164,7 +164,7 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 | Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
 | Japan (2.4 GB) | **42s** | — | — | `b3e8bf7` (node scanner) |
 | Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **577s (9.6m)** | `6b09796` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | **1,462s (24.4 min)**, 16.7 GB peak anon | `98e71e2b` (sidecar) |
+| Planet (87.7 GB) | 5,773s (96m)* | — | **1,075s (17.9 min)**, 8.7 GB peak anon | `abcc736` |
 
 *Dense at Europe scale thrashes on 30 GB host (mmap working set ~16 GB > available
 RAM). Japan 42s is with node-only scanner for pass 1 (commit `b3e8bf7`, previously

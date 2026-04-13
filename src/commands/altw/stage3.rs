@@ -55,6 +55,10 @@ pub(super) fn stage3_slot_reorder(
     let s3_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s3_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s3_scatter_stores = std::sync::atomic::AtomicU64::new(0);
+    let s3_pwrite_calls = std::sync::atomic::AtomicU64::new(0);
+    let s3_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
+    let s3_fadvise_calls = std::sync::atomic::AtomicU64::new(0);
+    let s3_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
     let s3_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     let next_ref = &next_idx;
@@ -67,6 +71,10 @@ pub(super) fn stage3_slot_reorder(
     let s3_bytes_read_ref = &s3_bytes_read;
     let s3_bytes_written_ref = &s3_bytes_written;
     let s3_scatter_stores_ref = &s3_scatter_stores;
+    let s3_pwrite_calls_ref = &s3_pwrite_calls;
+    let s3_max_worker_buf_ref = &s3_max_worker_buf_bytes;
+    let s3_fadvise_calls_ref = &s3_fadvise_calls;
+    let s3_fadvise_bytes_ref = &s3_fadvise_bytes;
     let err_ref = &s3_error;
     let entry_counts = &slot_buckets.entry_counts;
     let paths = &slot_buckets.paths;
@@ -115,7 +123,11 @@ pub(super) fn stage3_slot_reorder(
                         std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
                             .map_err(|e| format!("read slot bucket: {e}"))?;
                         #[cfg(feature = "linux-direct-io")]
-                        advise_dontneed_file(&bucket_file);
+                        {
+                            s3_fadvise_calls_ref.fetch_add(1, Relaxed);
+                            s3_fadvise_bytes_ref.fetch_add(data_buf.len() as u64, Relaxed);
+                            advise_dontneed_file(&bucket_file);
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         s3_read_ref.fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
                         s3_bytes_read_ref.fetch_add(data_buf.len() as u64, Relaxed);
@@ -147,6 +159,22 @@ pub(super) fn stage3_slot_reorder(
                             .map_err(|e| format!("pwrite coord_slots: {e}"))?;
                         s3_write_ref.fetch_add(t_write.elapsed().as_millis() as u64, Relaxed);
                         s3_bytes_written_ref.fetch_add(scatter_buf.len() as u64, Relaxed);
+                        s3_pwrite_calls_ref.fetch_add(1, Relaxed);
+
+                        // Track max live buffer bytes for this worker.
+                        {
+                            let worker_bytes = data_buf.capacity() as u64
+                                + scatter_buf.capacity() as u64;
+                            let mut current = s3_max_worker_buf_ref.load(Relaxed);
+                            while worker_bytes > current {
+                                match s3_max_worker_buf_ref.compare_exchange_weak(
+                                    current, worker_bytes, Relaxed, Relaxed,
+                                ) {
+                                    Ok(_) => break,
+                                    Err(actual) => current = actual,
+                                }
+                            }
+                        }
 
                         s3_loaded_ref.fetch_add(1, Relaxed);
                         Ok(())
@@ -179,6 +207,10 @@ pub(super) fn stage3_slot_reorder(
         crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s3_bytes_written", s3_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_pwrite_calls", s3_pwrite_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_max_worker_buf_bytes", s3_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_fadvise_calls", s3_fadvise_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_fadvise_bytes", s3_fadvise_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
     }
 
     Ok(())

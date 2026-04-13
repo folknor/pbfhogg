@@ -55,6 +55,26 @@ pub fn emit_mallinfo2(prefix: &str) {
 #[cfg(not(target_os = "linux"))]
 pub fn emit_mallinfo2(_prefix: &str) {}
 
+/// Read cumulative (minor, major) page faults from `/proc/self/stat`.
+/// Returns `(minflt, majflt)`. Returns `(0, 0)` on failure or non-Linux.
+#[cfg(target_os = "linux")]
+pub fn read_page_faults() -> (u64, u64) {
+    let Ok(stat) = std::fs::read_to_string("/proc/self/stat") else {
+        return (0, 0);
+    };
+    // Fields are space-separated. Field 10 = minflt, field 12 = majflt (1-indexed).
+    let mut fields = stat.split_whitespace();
+    let minflt = fields.nth(9).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    // Skip field 11 (cminflt) to get field 12 (majflt).
+    let majflt = fields.nth(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    (minflt, majflt)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn read_page_faults() -> (u64, u64) {
+    (0, 0)
+}
+
 /// Shared FIFO write logic for markers and counters.
 fn write_fifo(f: impl FnOnce(&std::fs::File, u128)) {
     use std::sync::OnceLock;

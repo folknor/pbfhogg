@@ -83,6 +83,8 @@ pub(super) fn stage1_way_pass(
     let s1a_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_scan_way_refs_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_idset_set_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1a_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s1a_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let mut total_refs: u64 = 0;
@@ -99,6 +101,8 @@ pub(super) fn stage1_way_pass(
         let s1a_decompress_ref = &s1a_decompress_ms;
         let s1a_scan_ref = &s1a_scan_way_refs_ms;
         let s1a_idset_ref = &s1a_idset_set_ms;
+        let s1a_bytes_ref = &s1a_bytes_read;
+        let s1a_pread_calls_ref = &s1a_pread_calls;
 
         std::thread::scope(|scope| -> Result<()> {
             for _ in 0..num_workers {
@@ -123,6 +127,8 @@ pub(super) fn stage1_way_pass(
                                 .map_err(|e| format!("pass A pread: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                            s1a_bytes_ref.fetch_add(task.data_size as u64, Relaxed);
+                            s1a_pread_calls_ref.fetch_add(1, Relaxed);
 
                             let t1 = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
@@ -197,6 +203,8 @@ pub(super) fn stage1_way_pass(
         crate::debug::emit_counter("s1a_decompress_ms", s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_idset_set_ms", s1a_idset_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_unique_nodes", unique_nodes as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
@@ -212,7 +220,9 @@ pub(super) fn stage1_way_pass(
     let s1b_flush_ms = std::sync::atomic::AtomicU64::new(0);
     let s1b_refs_total = std::sync::atomic::AtomicU64::new(0);
     let s1b_bytes_written = std::sync::atomic::AtomicU64::new(0);
+    let s1b_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1b_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
+    let s1b_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
     next_idx.store(0, std::sync::atomic::Ordering::Relaxed);
 
@@ -236,7 +246,9 @@ pub(super) fn stage1_way_pass(
         let s1b_flush_ref = &s1b_flush_ms;
         let s1b_refs_total_ref = &s1b_refs_total;
         let s1b_bytes_written_ref = &s1b_bytes_written;
+        let s1b_bytes_read_ref = &s1b_bytes_read;
         let s1b_shard_write_calls_ref = &s1b_shard_write_calls;
+        let s1b_pread_calls_ref = &s1b_pread_calls;
         let err_ref = &pass_b_error;
 
         std::thread::scope(|scope| -> Result<()> {
@@ -285,6 +297,8 @@ pub(super) fn stage1_way_pass(
                                 .map_err(|e| format!("pass B pread: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                            s1b_bytes_read_ref.fetch_add(task.data_size as u64, Relaxed);
+                            s1b_pread_calls_ref.fetch_add(1, Relaxed);
 
                             let t1 = std::time::Instant::now();
                             crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
@@ -421,7 +435,9 @@ pub(super) fn stage1_way_pass(
         crate::debug::emit_counter("s1b_flush_ms", s1b_flush_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_refs_total", s1b_refs_total.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_bytes_written", s1b_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_bytes_read", s1b_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_shard_write_calls", s1b_shard_write_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1b_pread_calls", s1b_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_blobs", schedule.len() as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
@@ -490,6 +506,8 @@ pub(super) fn build_coords_by_rank_file(
     let s_extents = std::sync::atomic::AtomicU64::new(0);
     let s_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s_pwrite_calls = std::sync::atomic::AtomicU64::new(0);
+    let s_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s_pread_calls = std::sync::atomic::AtomicU64::new(0);
     let s_zero_gap_bytes = std::sync::atomic::AtomicU64::new(0);
     let s_max_extents_per_blob = std::sync::atomic::AtomicU64::new(0);
     let coord_pass_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
@@ -512,6 +530,8 @@ pub(super) fn build_coords_by_rank_file(
             let extents_ref = &s_extents;
             let bytes_ref = &s_bytes_written;
             let pwrite_calls_ref = &s_pwrite_calls;
+            let bytes_read_ref = &s_bytes_read;
+            let pread_calls_ref = &s_pread_calls;
             let zero_gap_ref = &s_zero_gap_bytes;
             let max_extents_ref = &s_max_extents_per_blob;
             scope.spawn(move || {
@@ -535,6 +555,8 @@ pub(super) fn build_coords_by_rank_file(
                             .map_err(|e| format!("coord pass pread: {e}"))?;
                         #[allow(clippy::cast_possible_truncation)]
                         pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                        bytes_read_ref.fetch_add(task.data_size as u64, Relaxed);
+                        pread_calls_ref.fetch_add(1, Relaxed);
 
                         let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
@@ -664,6 +686,8 @@ pub(super) fn build_coords_by_rank_file(
         crate::debug::emit_counter("coord_pass_extents", total_extents as i64);
         crate::debug::emit_counter("coord_pass_bytes_written", total_bytes as i64);
         crate::debug::emit_counter("coord_pass_pwrite_calls", s_pwrite_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_bytes_read", s_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_pread_calls", s_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("coord_pass_zero_gap_bytes", s_zero_gap_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("coord_pass_max_extents_per_blob", s_max_extents_per_blob.load(std::sync::atomic::Ordering::Relaxed) as i64);
         #[allow(clippy::cast_possible_truncation)]

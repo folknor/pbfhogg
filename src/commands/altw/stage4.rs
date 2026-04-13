@@ -289,6 +289,9 @@ pub(super) fn stage4_assembly(
     let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
     let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s4_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s4_pread_calls = std::sync::atomic::AtomicU64::new(0);
+    let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
@@ -298,12 +301,17 @@ pub(super) fn stage4_assembly(
     let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
     let s4_send_ref = &s4_send_ms;
     let s4_blobs_ref = &s4_blobs;
+    let s4_bytes_read_ref = &s4_bytes_read;
+    let s4_pread_calls_ref = &s4_pread_calls;
+    let s4_max_worker_buf_ref = &s4_max_worker_buf_bytes;
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
     // Consumer-side counters.
     let mut s4_recv_ms: u64 = 0;
     let mut s4_write_ms: u64 = 0;
+    let mut s4_bytes_written: u64 = 0;
+    let mut s4_write_calls: u64 = 0;
 
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule into descriptor channel.
@@ -350,6 +358,8 @@ pub(super) fn stage4_assembly(
                             ))?;
                         #[allow(clippy::cast_possible_truncation)]
                         s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+                        s4_bytes_read_ref.fetch_add(desc.data_size as u64, Relaxed);
+                        s4_pread_calls_ref.fetch_add(1, Relaxed);
 
                         let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
@@ -438,6 +448,24 @@ pub(super) fn stage4_assembly(
                         Ok((std::mem::take(&mut output_blocks), block_stats))
                     })();
 
+                    // Track max live buffer bytes for this worker.
+                    {
+                        let worker_bytes = read_buf.capacity() as u64
+                            + decompress_buf.capacity() as u64
+                            + reframe_output.capacity() as u64;
+                        let mut current = s4_max_worker_buf_ref.load(std::sync::atomic::Ordering::Relaxed);
+                        while worker_bytes > current {
+                            match s4_max_worker_buf_ref.compare_exchange_weak(
+                                current, worker_bytes,
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => current = actual,
+                            }
+                        }
+                    }
+
                     let t3 = std::time::Instant::now();
                     if tx.send((desc.seq, result)).is_err() {
                         break;
@@ -472,6 +500,8 @@ pub(super) fn stage4_assembly(
                 total_stats.merge(&block_stats);
 
                 for (block_bytes, index, tagdata) in blocks {
+                    s4_bytes_written += block_bytes.len() as u64;
+                    s4_write_calls += 1;
                     let t_w = std::time::Instant::now();
                     writer.write_primitive_block_owned(
                         block_bytes, index, tagdata.as_deref(),
@@ -498,6 +528,11 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_bytes_read", s4_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_bytes_written", s4_bytes_written as i64);
+        crate::debug::emit_counter("s4_pread_calls", s4_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_write_calls", s4_write_calls as i64);
+        crate::debug::emit_counter("s4_max_worker_buf_bytes", s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
         crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);

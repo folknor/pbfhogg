@@ -235,14 +235,18 @@ pub fn external_join(
             (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set)
         } else {
             crate::debug::emit_marker("EXTJOIN_STAGE1_START");
+            let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
             let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
                 stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, Some(&coord_file_path))?;
+            let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
             let total_coo: u64 = rank_bucket_counts.iter().sum();
             #[allow(clippy::cast_possible_wrap)]
             {
                 crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
                 crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
                 crate::debug::emit_counter("extjoin_unique_nodes", unique_nodes as i64);
+                crate::debug::emit_counter("s1_minflt_delta", (s1_minflt_after - s1_minflt_before) as i64);
+                crate::debug::emit_counter("s1_majflt_delta", (s1_majflt_after - s1_majflt_before) as i64);
             }
             crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
@@ -256,10 +260,12 @@ pub fn external_join(
 
     if start <= 2 {
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
+        let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
         let slot_buckets = SlotBuckets::create(&scratch_dir)?;
         let resolved_count =
             stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &slot_buckets, total_slots, unique_nodes, &coord_file_path)?;
         slot_buckets.finish()?;
+        let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
             for worker_id in 0..num_shard_workers {
                 for bucket_idx in 0..NUM_BUCKETS {
@@ -269,12 +275,17 @@ pub fn external_join(
             }
         }
         #[allow(clippy::cast_possible_wrap)]
-        crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
+        {
+            crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
+            crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
+            crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
+        }
         crate::debug::emit_marker("EXTJOIN_STAGE2_END");
     }
 
     if start <= 3 {
         crate::debug::emit_marker("EXTJOIN_STAGE3_START");
+        let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
         let slot_entry_counts: Vec<u64> = (0..NUM_BUCKETS).map(|i| {
             let path = scratch_dir.bucket_path("slot", i);
             std::fs::metadata(&path).map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64).unwrap_or(0)
@@ -284,10 +295,16 @@ pub fn external_join(
             .collect();
         let slot_bucket_ref = SlotBucketRef { paths: slot_paths, entry_counts: slot_entry_counts };
         stage3_slot_reorder(&slot_bucket_ref, &coord_slots_path, total_slots)?;
+        let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
             for i in 0..NUM_BUCKETS {
                 drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
             }
+        }
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
+            crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
         }
         crate::debug::emit_marker("EXTJOIN_STAGE3_END");
     }
@@ -301,6 +318,7 @@ pub fn external_join(
     };
 
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
+    let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
     let stats = stage4_assembly(
         input,
@@ -314,6 +332,12 @@ pub fn external_join(
         &ref_count_sidecar,
         total_slots,
     )?;
+    let (s4_minflt_after, s4_majflt_after) = crate::debug::read_page_faults();
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s4_minflt_delta", (s4_minflt_after - s4_minflt_before) as i64);
+        crate::debug::emit_counter("s4_majflt_delta", (s4_majflt_after - s4_majflt_before) as i64);
+    }
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
 
     if !keep_scratch {

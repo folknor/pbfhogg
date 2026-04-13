@@ -147,6 +147,7 @@ pub fn external_join(
     let manifest_path = scratch_dir.file_path("manifest");
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
+    let coord_file_path = scratch_dir.file_path("coords_by_rank");
     let start = start_stage.unwrap_or(1);
 
     let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
@@ -235,7 +236,7 @@ pub fn external_join(
         } else {
             crate::debug::emit_marker("EXTJOIN_STAGE1_START");
             let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
-                stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar)?;
+                stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, Some(&coord_file_path))?;
             let total_coo: u64 = rank_bucket_counts.iter().sum();
             #[allow(clippy::cast_possible_wrap)]
             {
@@ -254,10 +255,6 @@ pub fn external_join(
         };
 
     if start <= 2 {
-        crate::debug::emit_marker("EXTJOIN_COORD_PASS_START");
-        let coord_file_path = scratch_dir.file_path("coords_by_rank");
-        build_coords_by_rank_file(input, &node_id_set, unique_nodes, &coord_file_path)?;
-        crate::debug::emit_marker("EXTJOIN_COORD_PASS_END");
 
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;

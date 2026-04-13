@@ -57,6 +57,7 @@ pub(super) fn stage1_way_pass(
     _direct_io: bool,
     scratch: &ScratchDir,
     ref_count_sidecar: &Path,
+    coord_file_path: Option<&Path>,
 ) -> Result<(u64, u64, Vec<u64>, usize, IdSetDense)> {
     use std::os::unix::fs::FileExt as _;
 
@@ -331,6 +332,22 @@ pub(super) fn stage1_way_pass(
                         .push(entry_counts);
                 });
             }
+            // Spawn coord pass concurrently with pass B workers.
+            // Both read from the same PBF via pread (different blob types),
+            // and share &node_id_set (read-only). No contention.
+            if let Some(cfp) = coord_file_path {
+                scope.spawn(move || {
+                    crate::debug::emit_marker("EXTJOIN_COORD_PASS_START");
+                    if let Err(e) = build_coords_by_rank_file(
+                        input, node_id_set_ref, unique_nodes_u64, cfp,
+                    ) {
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            Some(format!("coord pass: {e}"));
+                    }
+                    crate::debug::emit_marker("EXTJOIN_COORD_PASS_END");
+                });
+            }
+
             Ok(())
         })?;
     }

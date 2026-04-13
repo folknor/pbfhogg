@@ -260,7 +260,7 @@ pub fn external_join(
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
         let resolved_count =
-            stage2_node_join(input, direct_io, &scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &node_id_set)?;
+            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &coord_file_path)?;
         slot_buckets.finish()?;
         if !keep_scratch {
             for worker_id in 0..num_shard_workers {

@@ -273,14 +273,125 @@ single-pass, tag expression and bbox filtering.
   - [ ] **Finer stage 2d reframe breakdown.** Split `reframe_ms` into
     parse/lookup/encode/frame to identify which sub-step dominates.
 
-- [x] **`add-locations-to-ways --index-type external` — optimization sprint.**
+- [ ] **`add-locations-to-ways --index-type external` — next round.**
   Planet: 1,462 s → 1,075 s (−26%). Europe: 608 s → 422 s (−31%).
   Peak anon: 16.7 GB → 8.7 GB (−48%). See `notes/altw-optimization-history.md`.
 
-  Remaining stage 4 cost is the irreducible per-ref inner loop (~10.7 ns/ref):
-  varint decode + mmap coord fetch + zigzag encode. Structural overhead
-  eliminated by wire-format way reframe. Further gains require SIMD varint
-  or micro-optimization — not architectural changes.
+  Stage 4 per-ref floor is ~10.7 ns/ref (varint decode + mmap coord fetch +
+  zigzag encode). Wire-format way reframe eliminated structural overhead.
+
+  **Tried and failed**: in-memory `coords_by_rank` (`Vec<AtomicU64>`) — OOM'd
+  at 28.2 GB on Europe (3.6B unique referenced nodes × 8 bytes). Does not
+  fit on 30 GB host. See commit `2f41848` sidecar data.
+
+  **Reviewer projection (planet-claude)**: after file-backed coords_by_rank
+  + fused stage 2+3 + 12-byte records + varint skip: ~200 s Europe,
+  ~530 s planet. That's 2× from current, 10× from original baseline.
+
+  **Priority 1 — file-backed coords_by_rank (structural, biggest win):**
+
+  - [ ] **File-backed coords_by_rank.** Write dense `(lat, lon)` by rank
+    to temp file during a new parallel node pass ("pass 1.5"). Stage 2
+    reads one ~113 MB contiguous coord slice per bucket via pread.
+    Eliminates the streamed node merge entirely. Stage 2 becomes a
+    parallel-for over 256 independent buckets (no consumer thread, no
+    reorder buffer). Bounded memory. Temp disk: ~29 GB Europe, ~82 GB
+    planet. Reviewer consensus: 4/5 say do this first.
+
+    Implementation notes from reviewers:
+    - **Node pass write pattern**: prefer contiguous extent writes per blob
+      or range-partitioned shards, not per-node pwrite (arch-codex,
+      planet-codex). Referenced nodes within a blob occupy a contiguous
+      rank interval (rank order = node-ID order), so per-blob buffered
+      pwrite is naturally sequential.
+    - **No fsync needed** if stage 2 reads via pread (page cache serves
+      dirty pages directly). Skip fsync, save ~15 s (planet-claude).
+    - **fadvise(DONTNEED)** on the coord file after stage 2 reads each
+      slice to manage page cache pressure (perf-codex, arch-claude).
+    - **Stage 1B and node pass can run concurrently** — they read different
+      blob types from the same PBF via separate pread handles. Saves
+      ~min(stage1B, node_pass) ≈ ~45 s Europe (arch-claude).
+
+  - [ ] **Fuse stage 2 + 3.** Once coords_by_rank exists, stage 2 becomes
+    "load rank records + coord slice → resolve → emit." Instead of
+    emitting to slot buckets (stage 2) then scattering into coord_slots
+    (stage 3), each worker directly pwrite-scatters resolved `(lat, lon)`
+    at `slot_pos * 8` in the coord_slots file. Eliminates slot bucket
+    temp files and stage 3 entirely. Fused stage 2+3 est. ~50 s Europe.
+    (perf-codex: "mandatory for the win"; planet-claude: "trivial once
+    stage 2 is parallel-for")
+
+  **Priority 2 — representation changes (stack on top of Priority 1):**
+
+  - [ ] **Shrink rank record to 12 bytes.** `(u32 local_rank, u64 slot_pos)`
+    = 25% I/O reduction. Halves counting-sort passes (16-bit keys vs
+    40-bit). Est. ~50 s Europe (planet-claude). 4/5 reviewers say highest
+    payoff / lowest risk tier 1 item. Composes with coords_by_rank.
+  - [ ] **Postings-by-rank (CSR representation).** (planet-codex: "the
+    representation that actually matches the problem"). Replace flat
+    `(rank, slot_pos)` records with `offsets[rank] + slot_positions[...]`.
+    Stage 2 becomes trivial: load one coord, scatter to all slot positions
+    in its posting list. Eliminates counting-sort grouping entirely.
+    Higher design risk — changes both emission and loader. Do after
+    coords_by_rank proves out.
+  - [ ] **Grouped-by-local-rank emission in stage 1B.** Workers sort or
+    group output by local rank before flushing. Stage 2 counting sort
+    becomes k-way merge or free. Second-best tier 1 item (perf-codex).
+
+  **Priority 3 — stage 4 per-ref optimizations:**
+
+  - [ ] **Skip varint decode in way reframe.** (arch-claude, planet-claude).
+    Count terminal bytes (`b & 0x80 == 0`) instead of decoding ref varints.
+    Same trick used in renumber. Est. −1-3 ns/ref → ~14 s Europe, ~35 s
+    planet cumulative. Free win.
+  - [ ] **Batch coord reads per way.** (arch-claude, planet-claude). One
+    contiguous slice read `&mmap[slot_start..slot_start + ref_count * 8]`
+    per way instead of per-ref `CoordSlots::get()`. Eliminates per-ref
+    bounds check. Est. −1-2 ns/ref.
+  - [ ] **Software prefetch on coord_slots mmap.** (arch-claude).
+    `_mm_prefetch` 16 slots ahead. Hides TLB miss latency.
+    Est. −2-3 ns/ref if TLB misses are the bottleneck.
+  - [ ] **SIMD/AVX2 for way reframe inner loop.** (arch-codex, planet-codex).
+    Batched varint decode of refs, zigzag encode of lat/lon deltas.
+    The remaining 10.7 ns/ref is where SIMD starts to matter.
+
+  **Priority 4 — additional structural opportunities:**
+
+  - [ ] **Way-ordered payloads instead of flat coord_slots.** (perf-codex:
+    "biggest game-changing direction"). Produce per-way-blob coordinate
+    payloads directly. Stage 4 splices ready-made location fields instead
+    of per-ref mmap lookups. Attacks the stage 4 floor from the
+    representation side. Hard part: assembling way-ordered payloads
+    externally without exploding temp metadata.
+  - [ ] **Blob-local rank batching in stage 4.** (planet-codex r1). In
+    assembly, extract node IDs from way refs, compute ranks, gather coords
+    from coords_by_rank file, splice locations. Could collapse stages
+    1B+2+3 entirely. Risk: lookup locality. arch-claude estimates
+    ~282 s Europe total if random pread pattern is manageable.
+  - [ ] **Partition node stream for parallel stage 2.** (arch-codex r1).
+    Split node-ID space into K ranges aligned to rank bucket boundaries.
+    K independent merge consumers. Moot if coords_by_rank eliminates
+    the merge.
+  - [ ] **Collapse pass A + pass B into single way scan.** (planet-claude,
+    planet-codex r1). Only possible with a staging model that doesn't need
+    rank before emitting records. Postings representation might enable this.
+
+  **Priority 5 — tuning (apply after structural wins land):**
+
+  - [ ] **More than 256 buckets.** (arch-codex). Reduces per-bucket working
+    set. Tradeoff: more files, more metadata.
+  - [ ] **Deeper bucket loader pipeline queue.** Currently depth 2. Try 4-8.
+    (arch-codex). Moot if stage 2 becomes parallel-for.
+  - [ ] **Shrink ResolvedEntry.** (arch-codex). 16 bytes `(slot_pos, lat,
+    lon)`. Delta-coded slot_pos within a bucket. Moot if stage 2+3 fused.
+  - [ ] **Direct mmap of shard files in stage 2.** (arch-codex). Moot if
+    stage 2 changes to coord slice pread.
+  - [ ] **io_uring for stage 2 and stage 4 preads.** (planet-codex r1).
+  - [ ] **Output compression: Zstd(1).** (arch-claude). Consumer write may
+    be zlib-bottlenecked. Zstd(1) ~3× faster, similar ratio. Applies
+    regardless of architecture.
+  - [ ] **Reduce stage 4 decode workers by 1, give core to compression.**
+    (planet-claude). Check if consumer blocks on write_primitive_block_owned.
 
 ### Ecosystem
 

@@ -49,7 +49,11 @@ impl CoordSlots {
             .map_err(|e| format!("failed to mmap coord_slots: {e}"))?;
         #[cfg(unix)]
         {
-            mmap.advise(memmap2::Advice::Sequential).ok();
+            // MADV_RANDOM: 6 workers read different blob ranges concurrently,
+            // defeating sequential readahead. RANDOM tells the kernel not to
+            // speculatively read ahead, reducing wasted I/O from pages that
+            // get evicted by other workers before being accessed.
+            mmap.advise(memmap2::Advice::Random).ok();
         }
         Ok(Self { mmap, total_slots })
     }

@@ -1300,11 +1300,19 @@ fn stage4_assembly(
     let s4_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_way_reframe_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_way_blobs_processed = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
     let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_blobs = std::sync::atomic::AtomicU64::new(0);
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
+    let s4_way_reframe_ref = &s4_way_reframe_ms;
+    let s4_nonway_assemble_ref = &s4_nonway_assemble_ms;
+    let s4_way_blobs_ref = &s4_way_blobs_processed;
+    let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
     let s4_send_ref = &s4_send_ms;
     let s4_blobs_ref = &s4_blobs;
 
@@ -1395,8 +1403,13 @@ fn stage4_assembly(
                             block_stats.ways_written = way_count;
                             block_stats.missing_locations = missing;
                             #[allow(clippy::cast_possible_truncation)]
-                            s4_assemble_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                            {
+                                let elapsed = t2.elapsed().as_millis() as u64;
+                                s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                                s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
+                            }
                             s4_blobs_ref.fetch_add(1, Relaxed);
+                            s4_way_blobs_ref.fetch_add(1, Relaxed);
                             return Ok((std::mem::take(&mut output_blocks), block_stats));
                         }
 
@@ -1423,7 +1436,12 @@ fn stage4_assembly(
                             )
                         })?;
                         #[allow(clippy::cast_possible_truncation)]
-                        s4_assemble_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                        {
+                            let elapsed = t2.elapsed().as_millis() as u64;
+                            s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                            s4_nonway_assemble_ref.fetch_add(elapsed, Relaxed);
+                        }
+                        s4_nonway_blobs_ref.fetch_add(1, Relaxed);
 
                         if decompress_buf.capacity() == 0 {
                             decompress_buf = Vec::new();
@@ -1488,6 +1506,10 @@ fn stage4_assembly(
         crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_assemble_ms", s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_blobs_processed", s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);

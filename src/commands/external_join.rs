@@ -477,33 +477,191 @@ fn stage1_way_pass(
 }
 
 // ---------------------------------------------------------------------------
-// Stage 2: Node join — counting-sort per rank bucket, single-pass node merge
+// Node coord pass: build dense coords_by_rank array
 // ---------------------------------------------------------------------------
 
-/// For each rank bucket: load records, counting-sort by rank, single-pass
-/// node merge using rank order (= node-ID order by construction).
+/// Parallel node scan that populates a dense coord array indexed by
+/// IdSetDense rank. For each referenced node, stores `(lat, lon)` packed
+/// as a single `AtomicU64`. Zero = missing (sentinel, same as coord_slots).
+///
+/// Workers compute `rank_if_set(id)` and write directly — each rank
+/// position is written by exactly one worker (nodes have unique IDs),
+/// so atomic stores at distinct indices don't contend.
+#[hotpath::measure]
+fn build_coords_by_rank(
+    input: &Path,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    unique_nodes: u64,
+) -> Result<Vec<std::sync::atomic::AtomicU64>> {
+    use super::node_scanner::{NodeTuple, extract_node_tuples};
+    use std::os::unix::fs::FileExt as _;
+
+    // Pre-allocate dense coord array. Zero = missing sentinel.
+    let coords: Vec<std::sync::atomic::AtomicU64> = (0..unique_nodes)
+        .map(|_| std::sync::atomic::AtomicU64::new(0))
+        .collect();
+
+    // Header-only scan to build node blob schedule.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    struct NodeBlobTask {
+        data_offset: u64,
+        data_size: usize,
+    }
+    let mut schedule: Vec<NodeBlobTask> = Vec::new();
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
+        }
+        schedule.push(NodeBlobTask { data_offset, data_size });
+    }
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let s_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_scan_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_nodes_written = std::sync::atomic::AtomicU64::new(0);
+
+    let coord_pass_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    let schedule_ref = &schedule;
+    let next_ref = &next_idx;
+    let coords_ref = &coords;
+    let pread_ref = &s_pread_ms;
+    let decompress_ref = &s_decompress_ms;
+    let scan_ref = &s_scan_ms;
+    let written_ref = &s_nodes_written;
+    let err_ref = &coord_pass_error;
+
+    std::thread::scope(|scope| {
+        for _ in 0..num_workers {
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut tuples: Vec<NodeTuple> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+                loop {
+                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() { break; }
+                    let idx = next_ref.fetch_add(1, Relaxed);
+                    if idx >= schedule_ref.len() { break; }
+                    let task = &schedule_ref[idx];
+
+                    let blob_result: std::result::Result<(), String> = (|| {
+                    let t0 = std::time::Instant::now();
+                    read_buf.resize(task.data_size, 0);
+                    file.read_exact_at(&mut read_buf, task.data_offset)
+                        .map_err(|e| format!("coord pass pread: {e}"))?;
+                    #[allow(clippy::cast_possible_truncation)]
+                    pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+
+                    let t1 = std::time::Instant::now();
+                    crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                        .map_err(|e| format!("coord pass decompress: {e}"))?;
+                    #[allow(clippy::cast_possible_truncation)]
+                    decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+
+                    let t2 = std::time::Instant::now();
+                    tuples.clear();
+                    extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
+                        .map_err(|e| format!("coord pass extract: {e}"))?;
+
+                    let mut count: u64 = 0;
+                    for &NodeTuple { id, lat, lon } in &tuples {
+                        if let Some(rank) = node_id_set.rank_if_set(id) {
+                            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                            let packed = ((lat as u32 as u64) << 32) | (lon as u32 as u64);
+                            #[allow(clippy::cast_possible_truncation)]
+                            coords_ref[rank as usize].store(packed, Relaxed);
+                            count += 1;
+                        }
+                    }
+                    written_ref.fetch_add(count, Relaxed);
+                    #[allow(clippy::cast_possible_truncation)]
+                    scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                    Ok(())
+                    })();
+
+                    if let Err(e) = blob_result {
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = coord_pass_error.into_inner().unwrap_or(None) {
+        return Err(e.into());
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("coord_pass_pread_ms", s_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_decompress_ms", s_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_scan_ms", s_scan_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_nodes_written", s_nodes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_blobs", schedule.len() as i64);
+    }
+
+    Ok(coords)
+}
+
+/// Look up packed coords from the dense array. Returns `Some((lat, lon))`
+/// or `None` if the entry is the zero sentinel.
+#[inline]
+fn coord_from_packed(packed: u64) -> Option<(i32, i32)> {
+    if packed == 0 { return None; } // sentinel: missing
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let lat = (packed >> 32) as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+    let lon = packed as i32;
+    Some((lat, lon))
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: Node join — counting-sort per rank bucket, coord lookup
+// ---------------------------------------------------------------------------
+
+/// For each rank bucket: load records, counting-sort by rank, look up
+/// coords from the dense `coords_by_rank` array, emit resolved entries
+/// to slot buckets.
 ///
 /// Uses a pipelined loader thread: one thread loads and counting-sorts
-/// the next bucket while the consumer merges the current bucket against
-/// the node stream. Queue depth 2 to hide load latency.
+/// the next bucket while the consumer processes the current bucket.
+/// No node stream needed — coords are resolved by direct rank indexing.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn stage2_node_join(
-    input: &Path,
-    _direct_io: bool,
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
     num_shard_workers: usize,
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
     unique_nodes: u64,
-    node_id_set: &IdSetDense,
+    coords_by_rank: &[std::sync::atomic::AtomicU64],
 ) -> Result<u64> {
     let mut resolved_count: u64 = 0;
-    let rank_range_size = u64::from(unique_nodes).div_ceil(NUM_BUCKETS as u64);
+    let rank_range_size = unique_nodes.div_ceil(NUM_BUCKETS as u64);
 
     // A prepared rank bucket: loaded from disk, counting-sorted, ready
-    // for the consumer to merge against the node stream.
+    // for coord lookup.
     struct PreparedBucket {
         bucket_idx: usize,
         grouped_slot_pos: Vec<u64>,
@@ -616,54 +774,16 @@ fn stage2_node_join(
         std::result::Result<PreparedBucket, String>
     >(2);
 
-    // Parallel node scan (same P2b-v2 pattern as before).
-    use super::node_scanner::{NodeTuple, extract_node_tuples};
-    use std::os::unix::fs::FileExt;
-
-    let mut blob_reader = crate::blob::BlobReader::seekable_from_path(input)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    let shared_file = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
-    );
-
-    let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
-
-    type Descriptor = (usize, u64, usize);
-    type DecodedItem = (usize, crate::error::Result<Vec<NodeTuple>>);
-
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<Descriptor>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
-
-    let decode_threads = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-
-    let io_error: std::sync::Mutex<Option<crate::error::Error>> = std::sync::Mutex::new(None);
-
-    let s2_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_decompress_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_extract_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_blobs = std::sync::atomic::AtomicU64::new(0);
-    let s2_pread_ref = &s2_pread_ms;
-    let s2_decompress_ref = &s2_decompress_ms;
-    let s2_extract_ref = &s2_extract_ms;
-    let s2_blobs_ref = &s2_blobs;
-
-    let mut s2_recv_ms: u64 = 0;
-    let mut s2_merge_ms: u64 = 0;
-    let mut s2_bucket_load_ms: u64 = 0;
-    let mut s2_bucket_loads: u64 = 0;
-
     let s2_stop = std::sync::atomic::AtomicBool::new(false);
     let s2_stop_ref = &s2_stop;
 
+    let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
+    let mut s2_resolve_ms: u64 = 0;
+    let mut s2_bucket_load_ms: u64 = 0;
+    let mut s2_bucket_loads: u64 = 0;
+
     std::thread::scope(|scope| -> Result<()> {
-        // Bucket loader thread: prepares buckets ahead of the consumer.
+        // Bucket loader thread.
         {
             let tx = bucket_tx;
             scope.spawn(move || {
@@ -687,191 +807,68 @@ fn stage2_node_join(
             });
         }
 
-        let io_error_ref = &io_error;
-        scope.spawn(move || {
-            let mut seq: usize = 0;
-            while let Some(result) = blob_reader.next_header_with_data_offset() {
-                match result {
-                    Ok((header, _, data_offset, data_size)) => {
-                        if !matches!(header.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-                        if let Some(idx) = header.index() {
-                            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
-                        }
-                        if desc_tx.send((seq, data_offset, data_size)).is_err() { break; }
-                        seq += 1;
-                    }
-                    Err(e) => {
-                        if let Ok(mut guard) = io_error_ref.lock() { *guard = Some(e); }
-                        break;
-                    }
-                }
-            }
-        });
-
-        for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
-            let tx = decoded_tx.clone();
-            let file = std::sync::Arc::clone(&shared_file);
-            scope.spawn(move || {
-                use std::sync::atomic::Ordering::Relaxed;
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut tuples: Vec<NodeTuple> = Vec::new();
-                let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-                loop {
-                    let (seq, data_offset, data_size) = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(item) => item,
-                            Err(_) => break,
-                        }
-                    };
-                    let result = (|| -> crate::error::Result<Vec<NodeTuple>> {
-                        let t0 = std::time::Instant::now();
-                        read_buf.resize(data_size, 0);
-                        file.read_exact_at(&mut read_buf, data_offset)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s2_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
-
-                        #[cfg(target_os = "linux")]
-                        {
-                            use std::os::unix::io::AsRawFd;
-                            #[allow(clippy::cast_possible_wrap)]
-                            unsafe {
-                                libc::posix_fadvise(file.as_raw_fd(), data_offset as i64, data_size as i64, libc::POSIX_FADV_DONTNEED);
-                            }
-                        }
-
-                        let t1 = std::time::Instant::now();
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s2_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
-
-                        let t2 = std::time::Instant::now();
-                        tuples.clear();
-                        extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
-                            .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        s2_extract_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
-
-                        s2_blobs_ref.fetch_add(1, Relaxed);
-                        Ok(std::mem::take(&mut tuples))
-                    })();
-                    if tx.send((seq, result)).is_err() { break; }
-                }
-            });
-        }
-        drop(desc_rx);
-        drop(decoded_tx);
-
-        // Consumer: reorder node tuples + merge against pipelined prepared buckets.
-        // The bucket loader thread feeds PreparedBuckets via bucket_rx,
-        // overlapping load+sort with merge work.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<Vec<NodeTuple>>> =
-            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
-
-        // Receive the first prepared bucket.
-        let mut current_bucket: Option<PreparedBucket> = match bucket_rx.recv() {
-            Ok(Ok(b)) => Some(b),
-            Ok(Err(e)) => {
-                s2_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                return Err(e.into());
-            }
-            Err(_) => None,
-        };
-
+        // Consumer: receive prepared buckets, resolve coords by rank lookup.
         loop {
-            let t_recv = std::time::Instant::now();
-            let msg = decoded_rx.recv();
-            #[allow(clippy::cast_possible_truncation)]
-            { s2_recv_ms += t_recv.elapsed().as_millis() as u64; }
-            let (seq, item) = match msg {
-                Ok(v) => v,
+            let t_load = std::time::Instant::now();
+            let msg = bucket_rx.recv();
+            let bkt = match msg {
+                Ok(Ok(b)) => b,
+                Ok(Err(e)) => {
+                    s2_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(e.into());
+                }
                 Err(_) => break,
             };
+            #[allow(clippy::cast_possible_truncation)]
+            { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
+            s2_bucket_loads += 1;
 
-            reorder.push(seq, item);
-
-            while let Some(result) = reorder.pop_ready() {
-                let tuples = result?;
-
-                let t_merge = std::time::Instant::now();
-                for &NodeTuple { id, lat, lon } in &tuples {
-                    let rank = match node_id_set.rank_if_set(id) {
-                        Some(r) => r,
-                        None => continue,
-                    };
-
-                    // Advance to the rank bucket covering this rank.
-                    while current_bucket.as_ref().is_none_or(|b| rank >= b.max_rank) {
-                        let t_load = std::time::Instant::now();
-                        current_bucket = match bucket_rx.recv() {
-                            Ok(Ok(b)) => Some(b),
-                            Ok(Err(e)) => {
-                                s2_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
-                                return Err(e.into());
-                            }
-                            Err(_) => None,
-                        };
-                        #[allow(clippy::cast_possible_truncation)]
-                        { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
-                        s2_bucket_loads += 1;
-                        if current_bucket.is_none() {
-                            return Ok(());
-                        }
-                    }
-
-                    let bkt = current_bucket.as_ref()
-                        .ok_or("no bucket available for rank merge")?;
-
-                    #[allow(clippy::cast_possible_truncation)]
-                    let local_rank = (rank - bkt.bucket_rank_start) as usize;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let start = bkt.group_offsets[local_rank] as usize;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let end = bkt.group_offsets[local_rank + 1] as usize;
-
-                    for &slot_pos in &bkt.grouped_slot_pos[start..end] {
-                        let entry = ResolvedEntry { slot_pos, lat, lon };
-                        let bucket = entry.slot_bucket(total_slots);
-                        entry.write_to(&mut entry_buf);
-                        if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
-                            writer.write_all(&entry_buf)?;
-                        }
-                        slot_buckets.entry_counts[bucket] += 1;
-                        resolved_count += 1;
-                    }
-                }
+            let t_resolve = std::time::Instant::now();
+            let local_range = bkt.group_offsets.len() - 1;
+            for local_rank in 0..local_range {
                 #[allow(clippy::cast_possible_truncation)]
-                { s2_merge_ms += t_merge.elapsed().as_millis() as u64; }
+                let start = bkt.group_offsets[local_rank] as usize;
+                #[allow(clippy::cast_possible_truncation)]
+                let end = bkt.group_offsets[local_rank + 1] as usize;
+                if start == end { continue; }
 
-                drop(tuples);
+                let global_rank = bkt.bucket_rank_start + local_rank as u64;
+                #[allow(clippy::cast_possible_truncation)]
+                let packed = coords_by_rank[global_rank as usize]
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let (lat, lon) = match coord_from_packed(packed) {
+                    Some(c) => c,
+                    None => (0, 0),
+                };
+
+                for &slot_pos in &bkt.grouped_slot_pos[start..end] {
+                    let entry = ResolvedEntry { slot_pos, lat, lon };
+                    let bucket = entry.slot_bucket(total_slots);
+                    entry.write_to(&mut entry_buf);
+                    if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
+                        writer.write_all(&entry_buf)?;
+                    }
+                    slot_buckets.entry_counts[bucket] += 1;
+                    resolved_count += 1;
+                }
             }
+            #[allow(clippy::cast_possible_truncation)]
+            { s2_resolve_ms += t_resolve.elapsed().as_millis() as u64; }
         }
 
         Ok(())
     })?;
 
-    if let Some(e) = io_error.into_inner().unwrap_or(None) {
-        return Err(Box::new(e));
-    }
-
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s2_pread_ms", s2_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_decompress_ms", s2_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_extract_ms", s2_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_blobs", s2_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_consumer_recv_ms", s2_recv_ms as i64);
-        crate::debug::emit_counter("s2_consumer_merge_ms", s2_merge_ms as i64);
+        crate::debug::emit_counter("s2_resolve_ms", s2_resolve_ms as i64);
         crate::debug::emit_counter("s2_bucket_load_ms", s2_bucket_load_ms as i64);
         crate::debug::emit_counter("s2_bucket_loads", s2_bucket_loads as i64);
     }
 
     Ok(resolved_count)
 }
+
 
 // ---------------------------------------------------------------------------
 // Stage 3: Slot reorder — build final coord_slots file
@@ -2029,11 +2026,15 @@ pub fn external_join(
         };
 
     if start <= 2 {
-        // --- Stage 2: Node join ---
+        // --- Node coord pass: build dense coords_by_rank array ---
+        crate::debug::emit_marker("EXTJOIN_COORD_PASS_START");
+        let coords_by_rank = build_coords_by_rank(input, &node_id_set, unique_nodes)?;
+        crate::debug::emit_marker("EXTJOIN_COORD_PASS_END");
+        // --- Stage 2: Rank-to-coord resolution ---
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
         let resolved_count =
-            stage2_node_join(input, direct_io, &scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &node_id_set)?;
+            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &coords_by_rank)?;
         slot_buckets.finish()?;
         if !keep_scratch {
             for worker_id in 0..num_shard_workers {

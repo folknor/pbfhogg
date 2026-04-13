@@ -76,16 +76,6 @@ impl RankRecord {
         buf[8..16].copy_from_slice(&self.slot_pos.to_le_bytes());
     }
 
-    fn read_from(buf: &[u8; RANK_RECORD_SIZE]) -> Self {
-        let rank = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-        let slot_pos = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]);
-        Self { rank, slot_pos }
-    }
-
     /// Bucket index for rank partitioning.
     #[allow(clippy::cast_possible_truncation)]
     fn rank_bucket(&self, total_unique_nodes: u64) -> usize {
@@ -522,8 +512,16 @@ fn stage2_node_join(
         bucket_rank_start: u64,
     }
 
-    /// Load shard files for one rank bucket, counting-sort by local rank,
-    /// return a ready-to-consume PreparedBucket.
+    /// Reusable scratch buffers for the bucket loader thread.
+    struct LoaderScratch {
+        data_buf: Vec<u8>,
+        counts: Vec<u64>,
+        write_pos: Vec<u64>,
+    }
+
+    /// Load shard files for one rank bucket, counting-sort by local rank
+    /// directly from raw bytes (no intermediate RankRecord Vec), return
+    /// a ready-to-consume PreparedBucket.
     #[allow(clippy::cast_possible_truncation)]
     fn prepare_bucket(
         bucket_idx: usize,
@@ -531,6 +529,7 @@ fn stage2_node_join(
         num_shard_workers: usize,
         unique_nodes: u64,
         rank_range_size: u64,
+        loader: &mut LoaderScratch,
     ) -> std::result::Result<PreparedBucket, String> {
         let bucket_rank_start = bucket_idx as u64 * rank_range_size;
         let bucket_rank_end = if bucket_idx == NUM_BUCKETS - 1 {
@@ -540,10 +539,13 @@ fn stage2_node_join(
         };
         let local_range = (bucket_rank_end - bucket_rank_start) as usize;
 
-        // Load records from all worker shards.
-        let mut records: Vec<RankRecord> = Vec::new();
-        let mut data_buf: Vec<u8> = Vec::new();
-        let mut buf = [0u8; RANK_RECORD_SIZE];
+        // Pass 1: load shard bytes and count occurrences per local rank
+        // directly from raw bytes — no RankRecord materialization.
+        loader.counts.clear();
+        loader.counts.resize(local_range, 0);
+
+        // Collect all shard bytes into data_buf (concatenated).
+        loader.data_buf.clear();
         for worker_id in 0..num_shard_workers {
             let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
             let file = match std::fs::File::open(&path) {
@@ -555,36 +557,48 @@ fn stage2_node_join(
                 .map_err(|e| format!("stat rank shard: {e}"))?
                 .len() as usize;
             if len == 0 { continue; }
-            data_buf.clear();
-            data_buf.resize(len, 0);
-            std::io::Read::read_exact(&mut &file, &mut data_buf)
+            let start = loader.data_buf.len();
+            loader.data_buf.resize(start + len, 0);
+            std::io::Read::read_exact(&mut &file, &mut loader.data_buf[start..])
                 .map_err(|e| format!("read rank shard: {e}"))?;
             #[cfg(feature = "linux-direct-io")]
             advise_dontneed_file(&file);
-            for chunk in data_buf.chunks_exact(RANK_RECORD_SIZE) {
-                buf.copy_from_slice(chunk);
-                records.push(RankRecord::read_from(&buf));
-            }
         }
 
-        // Counting sort by local rank.
-        let mut counts = vec![0u64; local_range];
-        for rec in &records {
-            let local = (rec.rank - bucket_rank_start) as usize;
-            counts[local] += 1;
+        // Count directly from raw bytes.
+        for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
+            let rank = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            let local = (rank - bucket_rank_start) as usize;
+            loader.counts[local] += 1;
         }
+
+        // Prefix sum → offsets.
         let mut group_offsets = vec![0u64; local_range + 1];
-        for (i, count) in counts.iter().enumerate() {
+        for (i, count) in loader.counts.iter().enumerate() {
             group_offsets[i + 1] = group_offsets[i] + count;
         }
+
+        // Pass 2: scatter slot_pos values directly from raw bytes.
         let total = group_offsets[local_range] as usize;
         let mut grouped_slot_pos = vec![0u64; total];
-        let mut write_pos = group_offsets[..local_range].to_vec();
-        for rec in &records {
-            let local = (rec.rank - bucket_rank_start) as usize;
-            let pos = write_pos[local] as usize;
-            grouped_slot_pos[pos] = rec.slot_pos;
-            write_pos[local] += 1;
+        loader.write_pos.clear();
+        loader.write_pos.extend_from_slice(&group_offsets[..local_range]);
+        for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
+            let rank = u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+            ]);
+            let slot_pos = u64::from_le_bytes([
+                chunk[8], chunk[9], chunk[10], chunk[11],
+                chunk[12], chunk[13], chunk[14], chunk[15],
+            ]);
+            let local = (rank - bucket_rank_start) as usize;
+            let pos = loader.write_pos[local] as usize;
+            grouped_slot_pos[pos] = slot_pos;
+            loader.write_pos[local] += 1;
         }
 
         Ok(PreparedBucket {
@@ -653,12 +667,18 @@ fn stage2_node_join(
         {
             let tx = bucket_tx;
             scope.spawn(move || {
+                let mut loader = LoaderScratch {
+                    data_buf: Vec::new(),
+                    counts: Vec::new(),
+                    write_pos: Vec::new(),
+                };
                 for bucket_idx in 0..NUM_BUCKETS {
                     if s2_stop_ref.load(std::sync::atomic::Ordering::Relaxed) { break; }
                     if rank_bucket_counts[bucket_idx] == 0 { continue; }
                     let result = prepare_bucket(
                         bucket_idx, scratch, num_shard_workers,
                         unique_nodes, rank_range_size,
+                        &mut loader,
                     );
                     let is_err = result.is_err();
                     if tx.send(result).is_err() { break; }
@@ -779,11 +799,10 @@ fn stage2_node_join(
 
                 let t_merge = std::time::Instant::now();
                 for &NodeTuple { id, lat, lon } in &tuples {
-                    if !node_id_set.get(id) {
-                        continue;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    let rank = node_id_set.rank(id);
+                    let rank = match node_id_set.rank_if_set(id) {
+                        Some(r) => r,
+                        None => continue,
+                    };
 
                     // Advance to the rank bucket covering this rank.
                     while current_bucket.as_ref().is_none_or(|b| rank >= b.max_rank) {

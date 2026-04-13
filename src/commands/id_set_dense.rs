@@ -335,6 +335,62 @@ impl IdSetDense {
         start_id + r as i64
     }
 
+    /// Combined get + rank in a single lookup. Returns `Some(rank)` if `id`
+    /// is set, `None` if not. Avoids the double chunk/bit lookup of separate
+    /// `get()` + `rank()` calls. Requires `build_rank_index()`.
+    #[inline]
+    #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+    pub fn rank_if_set(&self, id: i64) -> Option<u64> {
+        const BLOCK_BYTES: usize = 64;
+        const WORDS_PER_BLOCK: usize = BLOCK_BYTES / 8;
+
+        let uid = id as u64;
+        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
+
+        if cid >= self.chunks.len() {
+            return None;
+        }
+        let chunk = self.chunks[cid].as_ref()?;
+
+        let bit_offset = (uid & (((CHUNK_SIZE as u64) << 3) - 1)) as usize;
+        let target_byte = bit_offset >> 3;
+        let target_bit = bit_offset & 7;
+        if (chunk[target_byte] & (1u8 << target_bit)) == 0 {
+            return None;
+        }
+
+        let chunk_prefix = self.rank_chunk_prefix.as_ref()?;
+        let block_prefix = self.rank_block_prefix.as_ref()?;
+
+        let mut r = chunk_prefix[cid];
+        let block_idx = target_byte / BLOCK_BYTES;
+
+        if let Some(bp) = &block_prefix[cid] {
+            r += u64::from(bp[block_idx]);
+        }
+
+        let words: &[u64] = unsafe {
+            std::slice::from_raw_parts(
+                chunk.as_ptr().cast::<u64>(),
+                CHUNK_SIZE / 8,
+            )
+        };
+        let block_start_word = block_idx * WORDS_PER_BLOCK;
+        let target_word = target_byte / 8;
+        for &w in &words[block_start_word..target_word] {
+            r += u64::from(w.count_ones());
+        }
+
+        let word = words[target_word];
+        let bit_in_word = ((target_byte & 7) << 3) + target_bit;
+        if bit_in_word > 0 {
+            let mask = (1u64 << bit_in_word) - 1;
+            r += u64::from((word & mask).count_ones());
+        }
+
+        Some(r)
+    }
+
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
         let prefix = self.rank_chunk_prefix.as_ref()
@@ -478,5 +534,37 @@ mod tests {
         let mut s = IdSetDense::new();
         s.set(42);
         assert!(s.has_any());
+    }
+
+    #[test]
+    fn rank_if_set_parity_with_get_rank() {
+        let mut s = IdSetDense::new();
+        let ids = [0, 1, 5, 10, 15, 20, 100, 1_000_000, 33_554_432];
+        for &id in &ids {
+            s.set(id);
+        }
+        s.build_rank_index();
+
+        // Set IDs: rank_if_set should return Some(rank) matching rank()
+        for &id in &ids {
+            let expected = s.rank(id);
+            assert_eq!(s.rank_if_set(id), Some(expected), "rank_if_set({id})");
+        }
+
+        // Unset IDs: rank_if_set should return None
+        let unset = [2, 3, 7, 11, 50, 999, 33_554_431];
+        for &id in &unset {
+            assert!(!s.get(id), "precondition: {id} should not be set");
+            assert_eq!(s.rank_if_set(id), None, "rank_if_set({id}) for unset");
+        }
+    }
+
+    #[test]
+    fn rank_if_set_without_rank_index_returns_none() {
+        let mut s = IdSetDense::new();
+        s.set(42);
+        // No build_rank_index() — rank_if_set returns None because
+        // rank prefix arrays are None.
+        assert_eq!(s.rank_if_set(42), None);
     }
 }

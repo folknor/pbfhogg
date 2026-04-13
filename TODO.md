@@ -273,32 +273,14 @@ single-pass, tag expression and bbox filtering.
   - [ ] **Finer stage 2d reframe breakdown.** Split `reframe_ms` into
     parse/lookup/encode/frame to identify which sub-step dominates.
 
-- [ ] **`add-locations-to-ways --index-type external` — optimization sprint.**
-  Planet: 1,462 s → 1,075 s (−26%, commit `abcc736`).
-  Europe: 608 s → 430 s (−29%). Peak anon: 16.7 GB → 8.7 GB (−48%).
+- [x] **`add-locations-to-ways --index-type external` — optimization sprint.**
+  Planet: 1,462 s → 1,075 s (−26%). Europe: 608 s → 422 s (−31%).
+  Peak anon: 16.7 GB → 8.7 GB (−48%). See `notes/altw-optimization-history.md`.
 
-  Done:
-  - [x] Comprehensive instrumentation (all 4 stages)
-  - [x] Parallelize stage 1 (per-worker bucket shards, AtomicUsize dispatch)
-  - [x] Rank-bucketed counting sort (O(n) on dense u32 rank replaces
-    O(n log n) comparison sort on sparse i64 node_id)
-  - [x] Parallelize stage 3 (pwrite to pre-sized coord_slots file)
-  - [x] Pipelined stage 2 bucket loader (overlaps load+sort with merge)
-
-  Europe phase breakdown (commit `e1ba970`):
-
-  | Stage | Time | % |
-  |-------|------|---|
-  | Stage 1 (two-pass: IdSetDense + rank-bucketed emission) | 46 s | 11% |
-  | Stage 2 (pipelined bucket load + counting-sort merge) | 181 s | 42% |
-  | Stage 3 (parallel pwrite scatter) | 64 s | 15% |
-  | Stage 4 (parallel P2c assembly) | 130 s | 30% |
-
-  Remaining opportunities:
-  - [ ] **Consolidate worker shards** between pass B and stage 2 to reduce
-    file-open overhead (N workers × 256 buckets = many small files).
-  - [ ] **Stage 4 wire-format assembly** — avoid full PrimitiveBlock decode
-    for node/relation passthrough blobs. High complexity, moderate gain.
+  Remaining stage 4 cost is the irreducible per-ref inner loop (~10.7 ns/ref):
+  varint decode + mmap coord fetch + zigzag encode. Structural overhead
+  eliminated by wire-format way reframe. Further gains require SIMD varint
+  or micro-optimization — not architectural changes.
 
 ### Ecosystem
 

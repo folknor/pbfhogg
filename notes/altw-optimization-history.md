@@ -138,23 +138,59 @@ exceeds physical memory.
 | Stage 1 (two-pass: IdSetDense + rank-bucketed emission) | 333s | 136s | −59% |
 | Stage 2 (pipelined counting-sort merge) | 612s | 469s | −23% |
 | Stage 3 (parallel pwrite scatter) | 247s | 167s | −32% |
-| Stage 4 (parallel P2c assembly) | 269s | 280s | — |
+| Stage 4 (parallel P2c assembly + wire-format way reframe) | 269s | 280s | — |
 | **Total** | **1,462s** | **1,075s** | **−26%** |
 
-Previous planet result: 1,462s (24.4 min), 16.7 GB peak anon (sidecar `98e71e2b`).
+### April 2026 optimization sprint
 
-Temp disk: ~4.3 GB Denmark, ~112 GB Europe, ~300 GB planet.
+Europe: **608s → 422s (−31%)**. Planet: **1,462s → 1,075s (−26%)**.
+Peak anon: 16.7 GB → 8.7 GB (planet, −48%).
 
-### Planet-scale sizing (theoretical)
+| Optimization | Commit | Impact (Europe) |
+|-------------|--------|----------------|
+| Parallel stage 1 (per-worker bucket shards, AtomicUsize dispatch) | `de75000` | 117s → 45s (−62%) |
+| Rank-bucketed counting sort (O(n) replaces O(n log n) comparison sort) | `df09a62` | stage 2: 262s → 218s |
+| Parallel stage 3 (pwrite to pre-sized coord_slots) | `74edbfd` | 108s → 64s (−41%) |
+| Pipelined stage 2 bucket loader | `e1ba970` | stage 2: 218s → 181s |
+| Fused rank_if_set + parse-free bucket prep | `06f2a30` | stage 2: 181s → 140s |
+| Wire-format way reframe (stage 4) | `a705fde` | stage 4 assemble: −40% CPU |
+| Shard consolidation (reverted — net loss) | — | +67s overhead |
+
+Key architectural changes:
+- **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank
+  space enables O(n) counting sort instead of O(n log n) comparison sort on
+  sparse i64 node IDs.
+- **Two-pass stage 1**: pass A builds shared atomic `IdSetDense` of referenced
+  node IDs; pass B emits rank-bucketed records with `slot_pos` pre-computed
+  from sidecar prefix sums. Workers are fully independent — no global
+  sequential allocator.
+- **Wire-format way reframe**: stage 4 way blobs skip full PrimitiveBlock
+  decode + BlockBuilder re-encode. Only decodes field 8 (refs) to count refs
+  and look up coords; appends fields 9+10 (lat/lon) directly. Saves ~40% of
+  way assembly CPU. Node/relation blobs stay on full decode path.
+- **IdSetDense::rank_if_set()**: fused get+rank in one lookup, eliminating
+  double chunk traversal in the merge loop.
+
+Stage 4 sub-phase profiling (Europe, commit `1313ead`):
+- `s4_way_coord_lookup_ms`: 504s cumulative (51% of way reframe)
+- `s4_way_parse_way_ms`: 6s (negligible)
+- `s4_way_reassemble_ms`: 6s (negligible)
+- `s4_way_parse_block_ms`: 0s (negligible)
+- Volume: 4.69B refs across 453M way messages
+
+The remaining stage 4 cost is the irreducible per-ref inner loop (~10.7 ns/ref):
+varint decode + mmap coord fetch + zigzag encode × 2. Structural overhead
+has been eliminated.
+
+### Temp disk (rank-bucketed architecture)
 
 | Structure | Count | Entry size | Total |
 |-----------|-------|------------|-------|
-| COO pairs | 8B | 16 bytes | ~128 GB |
-| Coord slots | 8B | 8 bytes | ~64 GB |
-| Node buckets (temp) | 256 | ~500 MB each | ~128 GB |
-| Slot buckets (temp) | 256 | ~375 MB each | ~96 GB |
+| Rank records | 4.69B (Europe) | 16 bytes | ~75 GB |
+| Coord slots | 4.69B | 8 bytes | ~37 GB |
+| Slot buckets (temp) | 256 | varies | ~37 GB |
 
-Peak temp disk: ~224 GB (node + slot buckets). After cleanup: 64 GB (coord slots only).
+Peak temp disk: ~112 GB (Europe). After cleanup: 37 GB (coord slots only).
 
 ## Implementation
 

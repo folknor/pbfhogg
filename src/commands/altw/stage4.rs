@@ -268,14 +268,16 @@ pub(super) fn stage4_assembly(
         false,
     )?;
 
+    // Fewer workers than other stages: stage 4 is I/O-bound on two files
+    // (input PBF + coord_slots mmap). More concurrent readers means more
+    // NVMe contention and page-cache thrashing. Contiguous partitioning
+    // keeps each worker's reads sequential.
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
+        .unwrap_or(4)
+        .min(3);
 
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
-    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
-    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
     let mut total_stats = Stats::default();
 
@@ -313,20 +315,29 @@ pub(super) fn stage4_assembly(
     let mut s4_bytes_written: u64 = 0;
     let mut s4_write_calls: u64 = 0;
 
-    std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed schedule into descriptor channel.
-        scope.spawn(move || {
-            for desc in schedule {
-                if desc_tx.send(desc).is_err() {
-                    break;
-                }
-            }
-        });
-
-        // Worker threads: pread → decompress → PrimitiveBlock → assemble.
-        // Dedicated threads, NOT global rayon (PbfWriter uses rayon for compression).
+    // Split schedule into contiguous per-worker slices.
+    let mut worker_schedules: Vec<Vec<BlobDescriptor>> = Vec::with_capacity(decode_threads);
+    {
+        let chunk_size = (schedule.len() + decode_threads - 1) / decode_threads;
+        let mut remaining = schedule;
         for _ in 0..decode_threads {
-            let rx = std::sync::Arc::clone(&desc_rx);
+            let split_at = chunk_size.min(remaining.len());
+            let rest = remaining.split_off(split_at);
+            worker_schedules.push(remaining);
+            remaining = rest;
+        }
+        // Any leftover (from rounding) goes to the last worker.
+        if !remaining.is_empty() {
+            if let Some(last) = worker_schedules.last_mut() {
+                last.extend(remaining);
+            }
+        }
+    }
+
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+
+    std::thread::scope(|scope| -> Result<()> {
+        for worker_schedule in worker_schedules {
             let tx = decoded_tx.clone();
             let file = std::sync::Arc::clone(&shared_file);
             scope.spawn(move || {
@@ -340,15 +351,7 @@ pub(super) fn stage4_assembly(
                 let mut way_reframe_scratch = WayReframeScratch::new();
                 let mut reframe_output: Vec<u8> = Vec::new();
 
-                loop {
-                    let desc = {
-                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                        match guard.recv() {
-                            Ok(d) => d,
-                            Err(_) => break,
-                        }
-                    };
-
+                for desc in worker_schedule {
                     let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
                         let t0 = std::time::Instant::now();
                         read_buf.resize(desc.data_size, 0);
@@ -475,7 +478,6 @@ pub(super) fn stage4_assembly(
                 }
             });
         }
-        drop(desc_rx);
         drop(decoded_tx);
 
         // Consumer: reorder + write to PbfWriter.

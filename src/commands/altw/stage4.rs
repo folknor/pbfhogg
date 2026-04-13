@@ -47,10 +47,8 @@ impl CoordSlots {
         }
         let mmap = unsafe { memmap2::Mmap::map(&file) }
             .map_err(|e| format!("failed to mmap coord_slots: {e}"))?;
-        #[cfg(unix)]
-        {
-            mmap.advise(memmap2::Advice::Sequential).ok();
-        }
+        // No madvise: tested MADV_SEQUENTIAL (baseline, 374K majflt) and
+        // MADV_RANDOM (9.2M majflt, 24x worse). Testing no advice.
         Ok(Self { mmap, total_slots })
     }
 

@@ -143,8 +143,8 @@ exceeds physical memory.
 
 ### April 2026 optimization sprint
 
-Europe: **608s → 422s (−31%)**. Planet: **1,462s → 1,075s (−26%)**.
-Peak anon: 16.7 GB → 8.7 GB (planet, −48%).
+Europe: **608s → 422s → ~391s (−36%)**. Planet: **1,462s → 1,075s (−26%)**.
+Peak anon: 16.7 GB → 8.7 GB → 5.9 GB (Europe, −65% from original).
 
 | Optimization | Commit | Impact (Europe) |
 |-------------|--------|----------------|
@@ -155,6 +155,32 @@ Peak anon: 16.7 GB → 8.7 GB (planet, −48%).
 | Fused rank_if_set + parse-free bucket prep | `06f2a30` | stage 2: 181s → 140s |
 | Wire-format way reframe (stage 4) | `a705fde` | stage 4 assemble: −40% CPU |
 | Shard consolidation (reverted — net loss) | — | +67s overhead |
+| Shrink rank record to 12 bytes | `cfa916f` | 25% I/O reduction stages 1B+2 |
+| File-backed coords_by_rank | `6293ade` | Eliminates streamed node merge |
+| Overlap stage 1B + coord pass | `b1bddd5` | Concurrent independent scans |
+| Parallel stage 2 (AtomicUsize dispatch, shared slot buckets) | `5e652f2`+`c7fdb4c` | stage 2: 124s → 91s (−27%) |
+| Stage 4 micro-opts (tried and reverted) | `70c87c1` → `3c59471` | flat — not arithmetic-bound |
+
+**Parallel stage 2 details** (`5e652f2`, `c7fdb4c`): replaced sequential
+producer/consumer (loader thread + sync_channel + single consumer) with N
+workers via AtomicUsize dispatch. Shared 256 slot bucket files with per-bucket
+Mutex<BufWriter> (256 FDs total, FD-safe). Worker-local per-slot-bucket buffers
+flush at 256 KB threshold — avoids both the OOM from unbounded buffering
+(28.2 GB peak anon before fix) and the contention from per-entry locking
+(`s2_resolve_ms` 409s → 62s summed across 6 workers).
+
+**Stage 4 micro-opts (tried and reverted)**: skip varint decode (terminal byte
+counting via `skip_varint`) and batch coord reads (one contiguous mmap slice
+per way). Measured flat: `s4_way_coord_lookup_ms` 538s → 550s (noise). Per-ref
+arithmetic (varint decode, bounds checks) is not the bottleneck — removing both
+had zero effect. Root cause undiagnosed; needs `perf stat` (dTLB-load-misses,
+cache-misses) to determine whether it's mmap access latency, memory bandwidth,
+or loop structure. Reverted as complexity without benefit.
+
+**Fuse stage 2+3 (evaluated, ruled out)**: direct pwrite-scatter from stage 2
+into coord_slots would require either billions of 8-byte pwrites (pathological
+syscall cost) or 37 GB of in-memory scatter buffers. Rank order and slot order
+are unrelated — stage 3 exists precisely to bridge this gap with sequential I/O.
 
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank
@@ -170,17 +196,22 @@ Key architectural changes:
   way assembly CPU. Node/relation blobs stay on full decode path.
 - **IdSetDense::rank_if_set()**: fused get+rank in one lookup, eliminating
   double chunk traversal in the merge loop.
+- **File-backed coords_by_rank**: dense `(lat, lon)` array written by rank
+  during a parallel node pass overlapped with stage 1B. Stage 2 reads one
+  contiguous coord slice per bucket via pread. Eliminates streamed node merge.
 
-Stage 4 sub-phase profiling (Europe, commit `1313ead`):
-- `s4_way_coord_lookup_ms`: 504s cumulative (51% of way reframe)
-- `s4_way_parse_way_ms`: 6s (negligible)
+Stage 4 sub-phase profiling (Europe, commit `c7fdb4c`):
+- `s4_way_coord_lookup_ms`: 538s cumulative (51% of way reframe)
+- `s4_way_parse_way_ms`: 5s (negligible)
 - `s4_way_reassemble_ms`: 6s (negligible)
 - `s4_way_parse_block_ms`: 0s (negligible)
 - Volume: 4.69B refs across 453M way messages
 
-The remaining stage 4 cost is the irreducible per-ref inner loop (~10.7 ns/ref):
-varint decode + mmap coord fetch + zigzag encode × 2. Structural overhead
-has been eliminated.
+The remaining stage 4 cost (~10.7 ns/ref) is not arithmetic-bound: per-ref
+micro-opts (skip varint decode, batch mmap reads) measured flat. Root cause
+undiagnosed — needs `perf stat` to determine whether mmap access latency,
+memory bandwidth, or loop structure dominates the `s4_way_coord_lookup_ms`
+counter.
 
 ### Temp disk (rank-bucketed architecture)
 

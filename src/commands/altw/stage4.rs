@@ -609,9 +609,18 @@ fn assemble_block(
 struct WayReframeCounters {
     parse_block_ms: std::sync::atomic::AtomicU64,
     parse_way_ms: std::sync::atomic::AtomicU64,
-    coord_lookup_ms: std::sync::atomic::AtomicU64,
+    ref_parse_ms: std::sync::atomic::AtomicU64,
+    coord_read_ms: std::sync::atomic::AtomicU64,
+    delta_encode_ms: std::sync::atomic::AtomicU64,
     reassemble_ms: std::sync::atomic::AtomicU64,
+    unknown_field_copy_ms: std::sync::atomic::AtomicU64,
+    group_reframe_ms: std::sync::atomic::AtomicU64,
     refs_total: std::sync::atomic::AtomicU64,
+    refs_missing: std::sync::atomic::AtomicU64,
+    refs_present: std::sync::atomic::AtomicU64,
+    max_refs_per_way: std::sync::atomic::AtomicU64,
+    lat_bytes: std::sync::atomic::AtomicU64,
+    lon_bytes: std::sync::atomic::AtomicU64,
     ways_total: std::sync::atomic::AtomicU64,
 }
 
@@ -620,9 +629,18 @@ impl WayReframeCounters {
         Self {
             parse_block_ms: std::sync::atomic::AtomicU64::new(0),
             parse_way_ms: std::sync::atomic::AtomicU64::new(0),
-            coord_lookup_ms: std::sync::atomic::AtomicU64::new(0),
+            ref_parse_ms: std::sync::atomic::AtomicU64::new(0),
+            coord_read_ms: std::sync::atomic::AtomicU64::new(0),
+            delta_encode_ms: std::sync::atomic::AtomicU64::new(0),
             reassemble_ms: std::sync::atomic::AtomicU64::new(0),
+            unknown_field_copy_ms: std::sync::atomic::AtomicU64::new(0),
+            group_reframe_ms: std::sync::atomic::AtomicU64::new(0),
             refs_total: std::sync::atomic::AtomicU64::new(0),
+            refs_missing: std::sync::atomic::AtomicU64::new(0),
+            refs_present: std::sync::atomic::AtomicU64::new(0),
+            max_refs_per_way: std::sync::atomic::AtomicU64::new(0),
+            lat_bytes: std::sync::atomic::AtomicU64::new(0),
+            lon_bytes: std::sync::atomic::AtomicU64::new(0),
             ways_total: std::sync::atomic::AtomicU64::new(0),
         }
     }
@@ -632,10 +650,24 @@ impl WayReframeCounters {
         use std::sync::atomic::Ordering::Relaxed;
         crate::debug::emit_counter("s4_way_parse_block_ms", self.parse_block_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_parse_way_ms", self.parse_way_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_coord_lookup_ms", self.coord_lookup_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_ref_parse_ms", self.ref_parse_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_coord_read_ms", self.coord_read_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_delta_encode_ms", self.delta_encode_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_reassemble_ms", self.reassemble_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_unknown_field_copy_ms", self.unknown_field_copy_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_group_reframe_ms", self.group_reframe_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_refs_missing", self.refs_missing.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_refs_present", self.refs_present.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_max_refs_per_way", self.max_refs_per_way.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_lat_bytes", self.lat_bytes.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_lon_bytes", self.lon_bytes.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_messages_total", self.ways_total.load(Relaxed) as i64);
+        let total_refs = self.refs_total.load(Relaxed);
+        let total_ways = self.ways_total.load(Relaxed);
+        if total_ways > 0 {
+            crate::debug::emit_counter("s4_way_avg_refs_per_way", (total_refs / total_ways) as i64);
+        }
     }
 }
 
@@ -647,6 +679,9 @@ struct WayReframeScratch {
     packed_lats: Vec<u8>,
     packed_lons: Vec<u8>,
     group_out: Vec<u8>,
+    /// Per-way coord scratch: (lat, lon) pairs read from mmap, consumed
+    /// by the delta-encode pass. Separates read from encode for timing.
+    coord_scratch: Vec<(i32, i32)>,
 }
 
 impl WayReframeScratch {
@@ -658,6 +693,7 @@ impl WayReframeScratch {
             packed_lats: Vec::new(),
             packed_lons: Vec::new(),
             group_out: Vec::new(),
+            coord_scratch: Vec::new(),
         }
     }
 }
@@ -761,66 +797,95 @@ fn reframe_way_blob_with_locations(
                 if way_id < min_way_id { min_way_id = way_id; }
                 if way_id > max_way_id { max_way_id = way_id; }
 
-                // Count refs and look up locations.
-                let t_coord = std::time::Instant::now();
+                // Pass 1a: count refs by skipping varints.
+                let t_ref_parse = std::time::Instant::now();
+                let mut ref_count: u64 = 0;
+                if !refs_data.is_empty() {
+                    let mut ref_cursor = Cursor::new(refs_data);
+                    while ref_cursor.remaining() > 0 {
+                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
+                        ref_count += 1;
+                    }
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                counters.ref_parse_ms.fetch_add(t_ref_parse.elapsed().as_millis() as u64, Relaxed);
+
+                // Pass 1b: read coords from mmap (sequential).
+                let t_read = std::time::Instant::now();
+                scratch.coord_scratch.clear();
+                let mut way_missing: u64 = 0;
+                let mut way_present: u64 = 0;
+                for _ in 0..ref_count {
+                    let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                        Some(loc) => {
+                            way_present += 1;
+                            loc
+                        }
+                        None => {
+                            missing_locations += 1;
+                            way_missing += 1;
+                            (0, 0)
+                        }
+                    };
+                    scratch.coord_scratch.push((lat, lon));
+                    way_slot_pos += 1;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                counters.coord_read_ms.fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
+                counters.refs_missing.fetch_add(way_missing, Relaxed);
+                counters.refs_present.fetch_add(way_present, Relaxed);
+
+                // Update max refs per way (relaxed CAS loop).
+                {
+                    let mut current = counters.max_refs_per_way.load(Relaxed);
+                    while ref_count > current {
+                        match counters.max_refs_per_way.compare_exchange_weak(
+                            current, ref_count, Relaxed, Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(actual) => current = actual,
+                        }
+                    }
+                }
+
+                // Pass 2: delta-encode coords into packed varint buffers.
+                let t_encode = std::time::Instant::now();
                 scratch.packed_lats.clear();
                 scratch.packed_lons.clear();
                 let mut last_lat: i64 = 0;
                 let mut last_lon: i64 = 0;
-                let mut ref_count: u64 = 0;
 
-                if !refs_data.is_empty() {
-                    let mut ref_cursor = Cursor::new(refs_data);
-                    while ref_cursor.remaining() > 0 {
-                        // Skip the ref delta — we don't need the node ID,
-                        // just need to count refs for slot_pos advancement.
-                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
-
-                        let (lat, lon) = match coord_slots.get(way_slot_pos) {
-                            Some(loc) => loc,
-                            None => {
-                                missing_locations += 1;
-                                (0, 0)
-                            }
-                        };
-                        way_slot_pos += 1;
-                        ref_count += 1;
-
-                        let lat_i64 = i64::from(lat);
-                        let lon_i64 = i64::from(lon);
-                        protohoggr::encode_varint(
-                            &mut scratch.packed_lats,
-                            protohoggr::zigzag_encode_64(lat_i64 - last_lat),
-                        );
-                        protohoggr::encode_varint(
-                            &mut scratch.packed_lons,
-                            protohoggr::zigzag_encode_64(lon_i64 - last_lon),
-                        );
-                        last_lat = lat_i64;
-                        last_lon = lon_i64;
-                    }
+                for &(lat, lon) in &scratch.coord_scratch {
+                    let lat_i64 = i64::from(lat);
+                    let lon_i64 = i64::from(lon);
+                    protohoggr::encode_varint(
+                        &mut scratch.packed_lats,
+                        protohoggr::zigzag_encode_64(lat_i64 - last_lat),
+                    );
+                    protohoggr::encode_varint(
+                        &mut scratch.packed_lons,
+                        protohoggr::zigzag_encode_64(lon_i64 - last_lon),
+                    );
+                    last_lat = lat_i64;
+                    last_lon = lon_i64;
                 }
 
                 #[allow(clippy::cast_possible_truncation)]
-                counters.coord_lookup_ms.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
+                counters.delta_encode_ms.fetch_add(t_encode.elapsed().as_millis() as u64, Relaxed);
+                counters.lat_bytes.fetch_add(scratch.packed_lats.len() as u64, Relaxed);
+                counters.lon_bytes.fetch_add(scratch.packed_lons.len() as u64, Relaxed);
                 blob_refs += ref_count;
 
                 // Build reframed way: original bytes + appended fields 9, 10.
                 let t_reassemble = std::time::Instant::now();
                 scratch.reframed_way.clear();
                 if let Some((refs_start, refs_end)) = refs_range {
-                    // Copy everything before refs field.
                     scratch.reframed_way.extend_from_slice(&way_bytes[..refs_start]);
-                    // Copy refs field verbatim.
                     scratch.reframed_way.extend_from_slice(&way_bytes[refs_start..refs_end]);
-                    // Copy everything after refs field (other fields like keys, vals, info
-                    // that appeared after refs — field order is not guaranteed).
                     scratch.reframed_way.extend_from_slice(&way_bytes[refs_end..]);
                 } else {
-                    // No refs field — copy way bytes verbatim.
                     scratch.reframed_way.extend_from_slice(way_bytes);
                 }
-                // Append location fields.
                 if ref_count > 0 {
                     protohoggr::encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
                     protohoggr::encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
@@ -832,13 +897,19 @@ fn reframe_way_blob_with_locations(
                 total_ways += 1;
             } else {
                 // Non-way field in the group — copy verbatim.
+                let t_copy = std::time::Instant::now();
                 let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
                 scratch.group_out.extend_from_slice(raw);
+                #[allow(clippy::cast_possible_truncation)]
+                counters.unknown_field_copy_ms.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
             }
         }
 
+        let t_group = std::time::Instant::now();
         protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
+        #[allow(clippy::cast_possible_truncation)]
+        counters.group_reframe_ms.fetch_add(t_group.elapsed().as_millis() as u64, Relaxed);
     }
 
     // Append scalar fields (granularity, etc.).

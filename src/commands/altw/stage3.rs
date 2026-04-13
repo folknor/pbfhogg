@@ -46,17 +46,27 @@ pub(super) fn stage3_slot_reorder(
         .min(6);
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let s3_load_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_open_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_read_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_parse_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_scatter_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_write_ms = std::sync::atomic::AtomicU64::new(0);
     let s3_buckets_loaded = std::sync::atomic::AtomicU64::new(0);
+    let s3_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s3_bytes_written = std::sync::atomic::AtomicU64::new(0);
+    let s3_scatter_stores = std::sync::atomic::AtomicU64::new(0);
     let s3_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     let next_ref = &next_idx;
-    let s3_load_ref = &s3_load_ms;
+    let s3_open_ref = &s3_open_ms;
+    let s3_read_ref = &s3_read_ms;
+    let s3_parse_ref = &s3_parse_ms;
     let s3_scatter_ref = &s3_scatter_ms;
     let s3_write_ref = &s3_write_ms;
     let s3_loaded_ref = &s3_buckets_loaded;
+    let s3_bytes_read_ref = &s3_bytes_read;
+    let s3_bytes_written_ref = &s3_bytes_written;
+    let s3_scatter_stores_ref = &s3_scatter_stores;
     let err_ref = &s3_error;
     let entry_counts = &slot_buckets.entry_counts;
     let paths = &slot_buckets.paths;
@@ -94,32 +104,49 @@ pub(super) fn stage3_slot_reorder(
                         scatter_buf.clear();
                         scatter_buf.resize(bucket_bytes, 0);
 
-                        let t_load = std::time::Instant::now();
+                        let t_open = std::time::Instant::now();
                         data_buf.clear();
                         let bucket_file = std::fs::File::open(&paths[bucket_idx])
                             .map_err(|e| format!("open slot bucket: {e}"))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s3_open_ref.fetch_add(t_open.elapsed().as_millis() as u64, Relaxed);
+
+                        let t_read = std::time::Instant::now();
                         std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
                             .map_err(|e| format!("read slot bucket: {e}"))?;
                         #[cfg(feature = "linux-direct-io")]
                         advise_dontneed_file(&bucket_file);
-                        s3_load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);
+                        #[allow(clippy::cast_possible_truncation)]
+                        s3_read_ref.fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
+                        s3_bytes_read_ref.fetch_add(data_buf.len() as u64, Relaxed);
 
-                        let t_scatter = std::time::Instant::now();
+                        // Parse entries from raw bytes, then scatter into coord buffer.
+                        let t_parse = std::time::Instant::now();
+                        let num_entries = data_buf.len() / RESOLVED_ENTRY_SIZE;
+                        let mut entries: Vec<ResolvedEntry> = Vec::with_capacity(num_entries);
                         for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
                             buf.copy_from_slice(chunk);
-                            let entry = ResolvedEntry::read_from(&buf);
+                            entries.push(ResolvedEntry::read_from(&buf));
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        s3_parse_ref.fetch_add(t_parse.elapsed().as_millis() as u64, Relaxed);
+
+                        let t_scatter = std::time::Instant::now();
+                        for entry in &entries {
                             let local_pos = (entry.slot_pos - bucket_start) as usize;
                             let offset = local_pos * COORD_SLOT_SIZE;
                             scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
                             scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
                         }
                         s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
+                        s3_scatter_stores_ref.fetch_add(entries.len() as u64, Relaxed);
 
                         let t_write = std::time::Instant::now();
                         let file_offset = bucket_start * COORD_SLOT_SIZE as u64;
                         file.write_all_at(&scatter_buf, file_offset)
                             .map_err(|e| format!("pwrite coord_slots: {e}"))?;
                         s3_write_ref.fetch_add(t_write.elapsed().as_millis() as u64, Relaxed);
+                        s3_bytes_written_ref.fetch_add(scatter_buf.len() as u64, Relaxed);
 
                         s3_loaded_ref.fetch_add(1, Relaxed);
                         Ok(())
@@ -143,10 +170,15 @@ pub(super) fn stage3_slot_reorder(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s3_load_ms", s3_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_open_ms", s3_open_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_read_ms", s3_read_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_parse_ms", s3_parse_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s3_write_ms", s3_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_bytes_written", s3_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(std::sync::atomic::Ordering::Relaxed) as i64);
     }
 
     Ok(())

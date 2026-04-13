@@ -24,6 +24,10 @@ struct PreparedBucket {
     group_offsets: Vec<u64>,
     bucket_rank_start: u64,
     local_range: usize,
+    /// Sub-phase timings (ms): counting pass, prefix sum, scatter pass.
+    prepare_count_ms: u64,
+    prepare_prefix_ms: u64,
+    prepare_scatter_ms: u64,
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -65,18 +69,26 @@ fn prepare_bucket(
         advise_dontneed_file(&file);
     }
 
+    // Count pass: histogram of local_rank frequencies.
+    let t_count = std::time::Instant::now();
     for chunk in loader.data_buf.chunks_exact(RANK_RECORD_SIZE) {
         let local_rank = u32::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
         ]) as usize;
         loader.counts[local_rank] += 1;
     }
+    let prepare_count_ms = t_count.elapsed().as_millis() as u64;
 
+    // Prefix sum: compute group offsets.
+    let t_prefix = std::time::Instant::now();
     let mut group_offsets = vec![0u64; local_range + 1];
     for (i, count) in loader.counts.iter().enumerate() {
         group_offsets[i + 1] = group_offsets[i] + count;
     }
+    let prepare_prefix_ms = t_prefix.elapsed().as_millis() as u64;
 
+    // Scatter pass: place slot_pos values into rank-grouped order.
+    let t_scatter = std::time::Instant::now();
     let total = group_offsets[local_range] as usize;
     let mut grouped_slot_pos = vec![0u64; total];
     loader.write_pos.clear();
@@ -93,8 +105,12 @@ fn prepare_bucket(
         grouped_slot_pos[pos] = slot_pos;
         loader.write_pos[local_rank] += 1;
     }
+    let prepare_scatter_ms = t_scatter.elapsed().as_millis() as u64;
 
-    Ok(PreparedBucket { grouped_slot_pos, group_offsets, bucket_rank_start, local_range })
+    Ok(PreparedBucket {
+        grouped_slot_pos, group_offsets, bucket_rank_start, local_range,
+        prepare_count_ms, prepare_prefix_ms, prepare_scatter_ms,
+    })
 }
 
 /// Shared slot bucket writers protected by per-bucket mutexes.
@@ -190,6 +206,16 @@ pub(super) fn stage2_node_join(
     let s2_resolve_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_bucket_load_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_bucket_loads = std::sync::atomic::AtomicU64::new(0);
+    let s2_prepare_count_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_prepare_prefix_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_prepare_scatter_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_slot_flush_lock_wait_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_slot_flush_write_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_coord_slice_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s2_slot_bytes_written = std::sync::atomic::AtomicU64::new(0);
+    let s2_slot_flush_calls = std::sync::atomic::AtomicU64::new(0);
+    let s2_nonempty_slot_buckets_total = std::sync::atomic::AtomicU64::new(0);
+    let s2_max_slot_buffer_bytes = std::sync::atomic::AtomicU64::new(0);
     let s2_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
     let next_ref = &next_idx;
@@ -198,6 +224,16 @@ pub(super) fn stage2_node_join(
     let resolve_ref = &s2_resolve_ms;
     let load_ref = &s2_bucket_load_ms;
     let loads_ref = &s2_bucket_loads;
+    let prepare_count_ref = &s2_prepare_count_ms;
+    let prepare_prefix_ref = &s2_prepare_prefix_ms;
+    let prepare_scatter_ref = &s2_prepare_scatter_ms;
+    let flush_lock_ref = &s2_slot_flush_lock_wait_ms;
+    let flush_write_ref = &s2_slot_flush_write_ms;
+    let coord_bytes_ref = &s2_coord_slice_bytes_read;
+    let slot_bytes_ref = &s2_slot_bytes_written;
+    let flush_calls_ref = &s2_slot_flush_calls;
+    let nonempty_ref = &s2_nonempty_slot_buckets_total;
+    let max_buf_ref = &s2_max_slot_buffer_bytes;
     let err_ref = &s2_error;
 
     std::thread::scope(|scope| {
@@ -238,6 +274,9 @@ pub(super) fn stage2_node_join(
                         #[allow(clippy::cast_possible_truncation)]
                         load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);
                         loads_ref.fetch_add(1, Relaxed);
+                        prepare_count_ref.fetch_add(bkt.prepare_count_ms, Relaxed);
+                        prepare_prefix_ref.fetch_add(bkt.prepare_prefix_ms, Relaxed);
+                        prepare_scatter_ref.fetch_add(bkt.prepare_scatter_ms, Relaxed);
 
                         // Pread this bucket's contiguous coord slice.
                         let t_coord = std::time::Instant::now();
@@ -248,6 +287,7 @@ pub(super) fn stage2_node_join(
                         ).map_err(|e| format!("pread coord slice: {e}"))?;
                         #[allow(clippy::cast_possible_truncation)]
                         coord_read_ref.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
+                        coord_bytes_ref.fetch_add(slice_bytes as u64, Relaxed);
 
                         // Resolve each rank group into worker-local slot buffers.
                         let t_resolve = std::time::Instant::now();
@@ -277,12 +317,34 @@ pub(super) fn stage2_node_join(
                                     local_resolved += 1;
                                 }
                                 if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {
+                                    let t_lock = std::time::Instant::now();
                                     let mut w = slot_buckets.writers[bucket]
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    flush_lock_ref.fetch_add(t_lock.elapsed().as_millis() as u64, Relaxed);
+                                    let t_wr = std::time::Instant::now();
+                                    let flush_bytes = slot_bufs[bucket].len() as u64;
                                     w.write_all(&slot_bufs[bucket])
                                         .map_err(|e| format!("write slot bucket: {e}"))?;
                                     drop(w);
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    flush_write_ref.fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
+                                    slot_bytes_ref.fetch_add(flush_bytes, Relaxed);
+                                    flush_calls_ref.fetch_add(1, Relaxed);
+                                    // Track max buffer size before flush.
+                                    {
+                                        let buf_sz = flush_bytes;
+                                        let mut current = max_buf_ref.load(Relaxed);
+                                        while buf_sz > current {
+                                            match max_buf_ref.compare_exchange_weak(
+                                                current, buf_sz, Relaxed, Relaxed,
+                                            ) {
+                                                Ok(_) => break,
+                                                Err(actual) => current = actual,
+                                            }
+                                        }
+                                    }
                                     slot_buckets.entry_counts[bucket]
                                         .fetch_add(slot_counts[bucket], Relaxed);
                                     slot_bufs[bucket].clear();
@@ -294,20 +356,31 @@ pub(super) fn stage2_node_join(
                         resolve_ref.fetch_add(t_resolve.elapsed().as_millis() as u64, Relaxed);
 
                         // Flush non-empty local buffers to shared writers.
+                        let mut nonempty_count: u64 = 0;
                         for sb in 0..NUM_BUCKETS {
                             if slot_bufs[sb].is_empty() { continue; }
-                            {
-                                let mut w = slot_buckets.writers[sb]
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                w.write_all(&slot_bufs[sb])
-                                    .map_err(|e| format!("write slot bucket: {e}"))?;
-                            }
+                            nonempty_count += 1;
+                            let t_lock = std::time::Instant::now();
+                            let mut w = slot_buckets.writers[sb]
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            #[allow(clippy::cast_possible_truncation)]
+                            flush_lock_ref.fetch_add(t_lock.elapsed().as_millis() as u64, Relaxed);
+                            let t_wr = std::time::Instant::now();
+                            let flush_bytes = slot_bufs[sb].len() as u64;
+                            w.write_all(&slot_bufs[sb])
+                                .map_err(|e| format!("write slot bucket: {e}"))?;
+                            drop(w);
+                            #[allow(clippy::cast_possible_truncation)]
+                            flush_write_ref.fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
+                            slot_bytes_ref.fetch_add(flush_bytes, Relaxed);
+                            flush_calls_ref.fetch_add(1, Relaxed);
                             slot_buckets.entry_counts[sb]
                                 .fetch_add(slot_counts[sb], Relaxed);
                             slot_bufs[sb].clear();
                             slot_counts[sb] = 0;
                         }
+                        nonempty_ref.fetch_add(nonempty_count, Relaxed);
 
                         Ok(())
                     })();
@@ -333,6 +406,16 @@ pub(super) fn stage2_node_join(
         crate::debug::emit_counter("s2_resolve_ms", s2_resolve_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_bucket_load_ms", s2_bucket_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_bucket_loads", s2_bucket_loads.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_prepare_count_ms", s2_prepare_count_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_prepare_prefix_ms", s2_prepare_prefix_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_prepare_scatter_ms", s2_prepare_scatter_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_slot_flush_lock_wait_ms", s2_slot_flush_lock_wait_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_slot_flush_write_ms", s2_slot_flush_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_coord_slice_bytes_read", s2_coord_slice_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_slot_bytes_written", s2_slot_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_slot_flush_calls", s2_slot_flush_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_nonempty_slot_buckets_total", s2_nonempty_slot_buckets_total.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_max_slot_buffer_bytes", s2_max_slot_buffer_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_num_workers", num_workers as i64);
     }
 

@@ -274,8 +274,9 @@ single-pass, tag expression and bbox filtering.
     parse/lookup/encode/frame to identify which sub-step dominates.
 
 - [ ] **`add-locations-to-ways --index-type external` — next round.**
-  Planet: 1,462 s → 1,075 s (−26%). Europe: 608 s → 422 s (−31%).
-  Peak anon: 16.7 GB → 8.7 GB (−48%). See `notes/altw-optimization-history.md`.
+  Planet: 1,462 s → 1,075 s (−26%). Europe: 608 s → 422 s → ~391 s (−36%).
+  Peak anon: 16.7 GB → 8.7 GB → 5.9 GB (−65%).
+  See `notes/altw-optimization-history.md`.
 
   Stage 4 per-ref floor is ~10.7 ns/ref (varint decode + mmap coord fetch +
   zigzag encode). Wire-format way reframe eliminated structural overhead.
@@ -288,45 +289,41 @@ single-pass, tag expression and bbox filtering.
   + fused stage 2+3 + 12-byte records + varint skip: ~200 s Europe,
   ~530 s planet. That's 2× from current, 10× from original baseline.
 
-  **Priority 1 — file-backed coords_by_rank (structural, biggest win):**
+  **Execution plan (ordered, each step validates before the next):**
 
-  - [ ] **File-backed coords_by_rank.** Write dense `(lat, lon)` by rank
-    to temp file during a new parallel node pass ("pass 1.5"). Stage 2
-    reads one ~113 MB contiguous coord slice per bucket via pread.
-    Eliminates the streamed node merge entirely. Stage 2 becomes a
-    parallel-for over 256 independent buckets (no consumer thread, no
-    reorder buffer). Bounded memory. Temp disk: ~29 GB Europe, ~82 GB
-    planet. Reviewer consensus: 4/5 say do this first.
+  - [x] **Step 1: Shrink rank record to 12 bytes.** `(u32 local_rank, u64
+    slot_pos)` = 25% I/O reduction. Shipped in `cfa916f`.
 
-    Implementation notes from reviewers:
-    - **Node pass write pattern**: prefer contiguous extent writes per blob
-      or range-partitioned shards, not per-node pwrite (arch-codex,
-      planet-codex). Referenced nodes within a blob occupy a contiguous
-      rank interval (rank order = node-ID order), so per-blob buffered
-      pwrite is naturally sequential.
-    - **No fsync needed** if stage 2 reads via pread (page cache serves
-      dirty pages directly). Skip fsync, save ~15 s (planet-claude).
-    - **fadvise(DONTNEED)** on the coord file after stage 2 reads each
-      slice to manage page cache pressure (perf-codex, arch-claude).
-    - **Stage 1B and node pass can run concurrently** — they read different
-      blob types from the same PBF via separate pread handles. Saves
-      ~min(stage1B, node_pass) ≈ ~45 s Europe (arch-claude).
+  - [x] **Step 2: File-backed coords_by_rank.** Dense `(lat, lon)` by rank
+    to temp file during parallel node pass. Shipped in `6293ade`.
 
-  - [ ] **Fuse stage 2 + 3.** Once coords_by_rank exists, stage 2 becomes
-    "load rank records + coord slice → resolve → emit." Instead of
-    emitting to slot buckets (stage 2) then scattering into coord_slots
-    (stage 3), each worker directly pwrite-scatters resolved `(lat, lon)`
-    at `slot_pos * 8` in the coord_slots file. Eliminates slot bucket
-    temp files and stage 3 entirely. Fused stage 2+3 est. ~50 s Europe.
-    (perf-codex: "mandatory for the win"; planet-claude: "trivial once
-    stage 2 is parallel-for")
+  - [x] **Step 3: Parallel stage 2.** AtomicUsize dispatch, N workers each
+    claim rank buckets, load + counting-sort + pread coord slice + resolve.
+    Shared slot bucket files with per-bucket mutexes (256 FDs total).
+    Worker-local per-slot-bucket buffers flushed at 256 KB threshold.
+    Europe: stage 2 124s → 91s (−27%), s2_resolve_ms 51s → 62s (summed
+    across 6 workers). Shipped in `5e652f2` + `c7fdb4c`.
 
-  **Priority 2 — representation changes (stack on top of Priority 1):**
+  - [x] **Step 4: Overlap stage 1B + node pass.** Shipped in `b1bddd5`.
 
-  - [ ] **Shrink rank record to 12 bytes.** `(u32 local_rank, u64 slot_pos)`
-    = 25% I/O reduction. Halves counting-sort passes (16-bit keys vs
-    40-bit). Est. ~50 s Europe (planet-claude). 4/5 reviewers say highest
-    payoff / lowest risk tier 1 item. Composes with coords_by_rank.
+  - [ ] ~~**Step 5: Fuse stage 2 + 3.**~~ **Ruled out.** Rank order and slot
+    order are unrelated — direct scatter into coord_slots requires either
+    billions of 8-byte pwrites (pathological syscall cost) or 37 GB of
+    in-memory scatter buffers. Stage 3 exists precisely to bridge this gap
+    with sequential I/O. The current architecture (slot bucket files +
+    parallel stage 3 scatter) is the right design.
+
+  - [ ] **Step 6: Stage 4 micro-opts — tried and reverted, low upside.**
+    Skip varint decode (terminal byte counting) and batch coord reads
+    (one mmap slice per way) shipped in `70c87c1`, measured flat on
+    Europe (`s4_way_coord_lookup_ms` 538s → 550s, noise), reverted in
+    `3c59471`. Per-ref arithmetic (varint decode, bounds checks) is not
+    the bottleneck — removing both had zero effect. Root cause unproven;
+    could be mmap access latency, memory bandwidth, or loop structure.
+    Needs `perf stat` (dTLB-load-misses, cache-misses) to diagnose
+    before further optimization attempts.
+
+  **Additional opportunities (stack after execution plan):**
   - [ ] **Postings-by-rank (CSR representation).** (planet-codex: "the
     representation that actually matches the problem"). Replace flat
     `(rank, slot_pos)` records with `offsets[rank] + slot_positions[...]`.
@@ -338,22 +335,24 @@ single-pass, tag expression and bbox filtering.
     group output by local rank before flushing. Stage 2 counting sort
     becomes k-way merge or free. Second-best tier 1 item (perf-codex).
 
-  **Priority 3 — stage 4 per-ref optimizations:**
+  **Priority 3 — stage 4 per-ref optimizations (low upside confirmed):**
 
-  - [ ] **Skip varint decode in way reframe.** (arch-claude, planet-claude).
-    Count terminal bytes (`b & 0x80 == 0`) instead of decoding ref varints.
-    Same trick used in renumber. Est. −1-3 ns/ref → ~14 s Europe, ~35 s
-    planet cumulative. Free win.
-  - [ ] **Batch coord reads per way.** (arch-claude, planet-claude). One
-    contiguous slice read `&mmap[slot_start..slot_start + ref_count * 8]`
-    per way instead of per-ref `CoordSlots::get()`. Eliminates per-ref
-    bounds check. Est. −1-2 ns/ref.
+  Per-ref arithmetic is not the stage 4 bottleneck. `s4_way_coord_lookup_ms`
+  dominates and is insensitive to removing varint decode and bounds checks.
+  Root cause undiagnosed — needs `perf stat` to determine whether it's mmap
+  access latency, memory bandwidth, or something else. Tried and reverted
+  (`70c87c1` → `3c59471`).
+
+  - [x] **Skip varint decode in way reframe.** Tried in `70c87c1`,
+    reverted. No measurable improvement — `read_varint` single-byte
+    fast path is already nearly free for typical OSM ref deltas.
+  - [x] **Batch coord reads per way.** Tried in `70c87c1`, reverted.
+    No measurable improvement — bounds check cost negligible.
   - [ ] **Software prefetch on coord_slots mmap.** (arch-claude).
-    `_mm_prefetch` 16 slots ahead. Hides TLB miss latency.
-    Est. −2-3 ns/ref if TLB misses are the bottleneck.
+    `_mm_prefetch` 16 slots ahead. Speculative — only worth trying
+    after `perf stat` confirms TLB misses are significant.
   - [ ] **SIMD/AVX2 for way reframe inner loop.** (arch-codex, planet-codex).
-    Batched varint decode of refs, zigzag encode of lat/lon deltas.
-    The remaining 10.7 ns/ref is where SIMD starts to matter.
+    Unlikely to help if arithmetic is not the bottleneck.
 
   **Priority 4 — additional structural opportunities:**
 

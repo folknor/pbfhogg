@@ -28,16 +28,17 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Cross-pipeline optimization
 
-PrimitiveBlock cross-thread alloc/free retention affects every command using
-the pipelined reader at 400K+ blocks (Europe/planet scale). The geocode builder
-is the predicted next victim (16 GB DenseMmapIndex + 25 GB retention = OOM).
+Cross-thread buffer retention is **solved** — `DecompressPool` (commit
+`8f6999b`) recycles decompression buffers in the pipelined reader. The
+remaining architectural concern is thread oversubscription (two concurrent
+rayon pools: decode + batch processing), not retention.
 
 See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 See [notes/pipelined-reader-retention.md](notes/pipelined-reader-retention.md)
-for the April 2026 audit: 6 remaining paths, renumber and cat --type are
-the production-relevant ones still using `into_blocks_pipelined`.
+for the April 2026 audit: 5 remaining pipelined paths (renumber being
+converted separately, getparents converted to sequential in `c912e4d`).
 
 ## Milestone 1: Planet-safe production pipeline — COMPLETE
 
@@ -242,209 +243,55 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **`renumber` external path — optimization roadmap (2026-04-11).** Six
-  commits landed the external renumber implementation (pass 1 + stages
-  2a-2d + relation R1/R2). First planet measurement on 2026-04-11
-  (commit `e156e97`, UUID `c5d00c22`): **3,456 s (57.6 min)**, peak
-  anon 2.79 GB, all element counts correct. That's 2.6× the design
-  estimate of ~1,300 s. Memory is well under the 4 GB target; wall time
-  is the outstanding issue.
+- [ ] **`renumber` — further optimization (current: 209 s / 3m29s, planet).**
+  Inmem path removed; external is the only implementation. Planet: 209 s,
+  7.0 GB peak anon, zero temp disk (commit `67c7960`).
 
-  Reviewer brief sent to planet+perf+arch after the first measurement
-  revised the optimization plan. Two new levers nobody had in the
-  original 3-item list, plus honest revisions of the parallelization
-  and radix-sort savings.
+  *Medium confidence (5-20 s):*
 
-  **Latest measurement: 209 s (3m29s)** on commit `67c7960`
-  (2026-04-12). **−94% vs the 3,456 s baseline.** IdSetDense rank
-  fusion (eliminates all CooPair/bucket infrastructure), wire-format
-  splice rewriters for all three element types (nodes, ways, relations),
-  fused stage 2d (way resolve + splice in one pass), relation_map
-  replaced by IdSetDense, zero temp disk, single shared input fd,
-  atomic dispatch, zlib:1 output. Peak anon 7.0 GB.
+  - [ ] **Wire-format scanner for R1** (est. −3 to −5 s). Full
+    PrimitiveBlock decode just to iterate relation IDs. A lightweight
+    scanner would skip string table parsing and UTF-8 validation.
+  - [ ] **Contiguous-range rank() fast path.** Cache last chunk/block;
+    skip prefix recomputation for consecutive refs in the same block.
+  - [ ] **`direct_io` flag honored in pread stages.** Shared input fd
+    uses plain `File::open`. Should use O_DIRECT when the flag is set.
 
-  **Sub-6 minute plan (round 6+7, 2026-04-12):**
+  *Smaller wins (2-5 s):*
 
-  Current: 401 s (6m42s). Target: 360 s (6 min). Need 41 s.
+  - [ ] **Varint encode lookup table.** 256-entry for single-byte varints.
+  - [ ] **Longest-job-first scheduling for pass 1.**
+  - [ ] **Shared `IdSetDense` with `AtomicU8::fetch_or` in pass 1.**
+    Eliminates 3-way merge, reduces peak memory 6 GB → 1.5 GB.
+  - [ ] **`posix_fadvise(SEQUENTIAL)` on the main input fd.**
+  - [ ] **Skip `way_id_set` if way rank derivable from schedule.**
 
-  - [ ] **Parallelize R1+R2A** (29 → ~8 s, save ~21 s). Pre-scan
-    relation blob headers for per-blob element counts, compute prefix
-    sums for starting relation IDs. TRIED in previous session and
-    regressed (30 → 37 s) — 14K relation blobs is too few. Don't retry
-    without a fundamentally different approach.
+  *Speculative / high effort:*
 
-  **Round 7 reviewer findings (2026-04-12, all 5 archetypes):**
+  - [ ] SIMD / table-driven varint decode (requires `protohoggr` changes)
+  - [ ] io_uring for pread (est. −6 s pass 1, −3 s stage 2d)
+  - [ ] mmap input instead of pread (uncertain net effect)
+  - [ ] Pipelined writer per phase + concatenate
+  - [ ] Dedicated allocator (jemalloc / mimalloc)
+  - [ ] Huge pages for IdSetDense chunks / rank index
+  - [ ] NUMA / affinity tuning (single-socket host = 0% gain)
 
-  Comprehensive sweep after reaching 401 s. Every actionable item from
-  bugs-claude, bugs-codex, perf-codex, arch-claude, arch-codex,
-  correctness-claude, correctness-codex, planet-codex.
+  *Instrumentation:*
 
-  *Tier 2 — medium confidence, 5-20 s:*
+  - [ ] Consumer drain-rate (rx.recv vs write time)
+  - [ ] Finer stage 2d reframe breakdown (parse/lookup/encode/frame)
 
-  - [x] **Output compression: zlib:1 default** — `dd3f477`. Default output is
-    now zlib:1 (fast compression), respects explicit `--compression` override.
-    Zlib level 1 is ~3× faster than level 6 with ~10% worse ratio.
-    (arch-claude, perf-codex)
-  - [x] **Output compression: lower zlib level** — `dd3f477`. Done via zlib:1 default. (arch-claude, correctness-claude)
-  - [ ] **Output compression: `--compression none` for benchmarking.**
-    Eliminates compression entirely. Output is ~3× larger on disk.
-    Useful as a zero-code-change diagnostic to confirm whether compression
-    is the dominant ceiling. (arch-claude, arch-codex)
-  - [ ] **Re-evaluate pass 1 worker count (4 → 5 or 6).** Previous
-    session tried 6 and regressed (pread contention on 1.3M node blobs).
-    But the current tree is much leaner. Measure again on current code.
-    Arch reviewer warns consumer/compression may be the ceiling — adding
-    workers only helps if compression keeps up. (correctness-claude,
-    planet-codex)
-  - [ ] **Re-evaluate stage 2d worker count (6 → 8).** decompress=152s,
-    reframe=389s CPU. Reframe dominates. 8 workers: reframe wall 389/8 ≈
-    49 s. But consumer write must keep up. Check `consumer_write_ms`.
-    (bugs-claude, arch-codex)
-  - [ ] **Wire-format scanner for R1** (est. −3 to −5 s). R1 currently
-    does full PrimitiveBlock decode to iterate relation IDs. A lightweight
-    scanner analogous to `scan_way_refs` would skip string table parsing
-    and UTF-8 validation. (bugs-claude, perf-codex, arch-codex)
-  - [ ] **Contiguous-range rank() fast path.** Cache last chunk_id and
-    block_id; skip prefix recomputation when consecutive refs land in
-    the same block. Marginal for ways (refs span full ID space), more
-    impactful for relation members with nearby IDs. (bugs-claude)
+  *Hardening:*
 
-  *Tier 3 — smaller wins, 2-5 s:*
+  - [ ] `relation_id_set` size warning if OSM grows past ~50M relations.
 
-  - [ ] **Varint encode lookup table.** 256-entry table for single-byte
-    varints (values 0-127) in the reframe functions. Eliminates the loop
-    for ~80% of varint encodes. Est. −2 to −3 s wall. (arch-claude)
-  - [ ] **Longest-job-first scheduling for pass 1.** Pre-sort the schedule
-    by decompressed size (descending) so the tail isn't dominated by one
-    slow large blob. Improvement depends on blob size variance. Est. 0-10 s.
-    (arch-claude)
-  - [ ] **Shared `IdSetDense` with atomic byte operations in pass 1.**
-    Instead of 4 independent bitsets merged after pass 1, have all workers
-    write into a single shared bitset using `AtomicU8::fetch_or`. Eliminates
-    the 3-way merge (~1-2 s) and reduces peak memory from 6 GB to 1.5 GB
-    during pass 1. Different workers hit different cache lines most of the
-    time (sorted PBF distributes node IDs). (correctness-claude)
-  - [ ] **`posix_fadvise(SEQUENTIAL)` / `WILLNEED` on the main input fd**
-    for the long pread phases. (arch-codex)
-  - [x] **Stream relation member flat files** — superseded: flat files
-    eliminated by IdSetDense rank fusion. R2d resolves inline via
-    `resolve()`. (correctness-codex)
-  - [ ] **Skip `way_id_set` IdSetDense if way rank derivable from schedule.**
-    If input is strictly sorted and every way is renumbered, new way ID is
-    `start_way_id + global_way_rank`. Build a cheaper index from
-    schedule/blob boundaries instead of a full bitset+rank. (bugs-codex)
+  *Test gaps:*
 
-  *Tier 4 — speculative / high effort:*
-
-  - [ ] **SIMD / table-driven varint decode in wire rewriters.** The
-    reframe functions are varint-heavy. Group Varint Encoding (GVE) from
-    Google's Procella paper shows 2-4× throughput but uses fixed-width
-    layout incompatible with protobuf continuation bits. Requires
-    `protohoggr` changes. (bugs-claude, bugs-codex, correctness-codex)
-  - [ ] **io_uring for pread.** Workers use synchronous `read_exact_at`.
-    io_uring batched pread could halve per-blob overhead. Est. −6 s pass 1,
-    −3 s stage 2d. (bugs-claude, bugs-codex)
-  - [ ] **Memory-map the input PBF instead of pread.** Eliminates pread
-    syscall overhead, lets kernel readahead prefetch. But 87 GB mmap on
-    32 GB host means heavy page faults. Concurrent worker access defeats
-    sequential readahead. Net effect uncertain. (bugs-claude, arch-claude)
-  - [x] **LZ4-compress the temp flat files** — superseded: zero temp disk.
-    All flat files eliminated by IdSetDense rank fusion. (bugs-claude)
-  - [ ] **Pipelined writer per phase + concatenate.** Run each phase with
-    its own PbfWriter and concatenate output files. Would overlap pass 1
-    compression with stage 2d decompress. Complex, uncertain benefit.
-    (bugs-claude)
-  - [ ] **Two-level parallelism: per-blob workers + per-element SIMD.**
-    SIMD varint decode in protohoggr. Research-level. (bugs-claude)
-  - [ ] **NUMA / affinity tuning.** Pin workers + scratch buffers to cores
-    on dual-socket or big-core hosts. (bugs-codex, planet-codex)
-  - [ ] **Dedicated allocator (jemalloc / mimalloc)** for this command.
-    Already had to call `mallopt`; a better allocator may help with
-    bounded cross-thread `Vec<u8>` traffic. (correctness-codex)
-  - [ ] **Huge pages for `IdSetDense` chunks / rank index.** TLB behavior
-    on dense rank bitsets. Low confidence. (planet-codex)
-  - [ ] **`preadv2` / io_uring multishot read batching.** Read-side
-    batching for pass1 and stage2d where many workers do smallish
-    independent preads. (bugs-codex)
-
-  *Instrumentation (non-blocking, informs further optimization):*
-
-  - [x] **Sub-phase counters for `fused_way_resolve`** — superseded:
-    `fused_way_resolve` fused into stage 2d. Stage 2d already has
-    pread/decompress/reframe/send/consumer_write counters. (bugs-codex)
-  - [ ] **Consumer drain-rate instrumentation.** Measure time blocking on
-    `rx.recv()` vs time in `write_primitive_block_owned`. Distinguishes
-    worker-bound vs consumer-bound. (planet-claude, bugs-codex)
-  - [ ] **Finer stage 2d reframe instrumentation.** Split `reframe_ms`
-    into `way_parse_ms`, `ref_lookup_ms`, `ref_encode_ms`, `frame_ms`.
-    (perf-codex)
-  - [ ] **Benchmark `--compression none` to isolate compression ceiling.**
-    (arch-claude, arch-codex)
-
-  **Next-round optimization levers (round 2 reviewer consensus, 2026-04-12):**
-
-  - [ ] **`direct_io` flag honored in pread stages.** The shared input fd
-    in `renumber_external` is opened with plain `File::open`. Should use
-    O_DIRECT when the flag is set, for cache discipline on planet-scale
-    hosts. (arch-codex)
-
-  **Smaller / defensive followups (non-blocking for planet bench):**
-
-  - [ ] **Add `scan_relation_members` fast-path** for R1/R2d, analogous
-    to `scan_way_refs`. R1 currently does full PrimitiveBlock decode
-    just to iterate relation IDs. A wire-format scanner would skip
-    string table parsing and UTF-8 validation. Moderate win.
-  - [x] **`MADV_DONTNEED` on mmap'd `new_refs` files** — superseded:
-    `new_refs` files eliminated by IdSetDense rank fusion. No mmaps
-    remain in renumber_external.
-  - [x] **Clean up stale comments** — updated module doc, pass 1 / stage 2d /
-    R1 / R2d doc comments, section headers, removed dead `bucket_emit_ms`
-    from `StageCounters`, renamed `R1_R2A` markers to `R1`. (perf-codex)
-
-  **Round 4 reviewer findings (2026-04-12, perf-codex + planet-claude):**
-
-  (Consumer drain-rate instrumentation deduplicated — see above.)
-
-  **Defensive asserts / hardening:**
-
-  - [ ] **`relation_map.len()` upper-bound warning.** At planet we see
-    ~14M relations; design doc targets `<4 GB` peak RSS. If OSM grows
-    past ~50M relations, log a warning at R1 completion.
-  - [x] **Scratch dir concurrent-from-same-process collision risk** —
-    superseded: `renumber_external` no longer uses `ScratchDir` or temp
-    files. All resolved inline via IdSetDense rank. Still applies to
-    `external_join.rs` (ALTW external), but not a renumber concern.
-
-  **Ergonomics / architecture:**
-
-  - [x] **`BucketWriters::write_pair` helper** — superseded: renumber no
-    longer uses BucketWriters. Only `external_join.rs` (ALTW) remains
-    as a user. One caller doesn't justify the abstraction.
-  - [x] **`RenumberStats.orphan_refs: u64` counter.** Both in-memory and
-    external paths now count orphan refs (way refs and relation members
-    whose old_id isn't in the corresponding ID set). `print_summary()`
-    emits a warning when non-zero. Tracked via `AtomicU64` in parallel
-    stages, `IdSetDense::get()` membership check.
-  - [x] **Document orphan-ref policy** in `renumber_external.rs` module
-    docs. Orphan refs pass through with their old ID, matching in-memory
-    behavior and osmium's semantics.
-
-  **Test gaps:**
-
-  - [ ] **Non-indexed input test.** All current test PBFs are indexed
-    (written via `write_test_pbf_sorted` which emits indexdata). Add a
-    test that strips indexdata from the input so stage 2a / stage 2d /
-    R2a / R2d hit the full-decode fallback path.
-  - [ ] **Non-dense `Element::Node` element path.** Current test helpers
-    always use DenseNode via `BlockBuilder::add_node`. Pass 1's
-    `Element::Node(n)` branch (non-dense) is only reachable via
-    externally-produced PBFs. Either construct such an input or
-    document that the branch is dead-ish outside real-world inputs.
-
-- [x] **`renumber` planet-scale refactor — COMPLETE.** External path
-  Shipped with IdSetDense rank-based lookup for all
-  three element types. Planet: 209 s (3m29s), 7.0 GB peak anon, zero
-  temp disk.
+  - [ ] **Non-indexed input test.** Renumber errors on non-indexed PBFs;
+    verify the error message fires correctly.
+  - [ ] **Non-dense `Element::Node` path.** Pass 1 only handles DenseNodes
+    via wire-format rewriter. Document that the non-dense branch is
+    unreachable with modern PBFs.
 
 ### Ecosystem
 

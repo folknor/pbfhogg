@@ -140,6 +140,14 @@ pub fn renumber_external(
     );
 
     crate::debug::emit_marker("RENUMBER_EXT_START");
+
+    // ---- Blob schedule scan ----
+    let t_sched = std::time::Instant::now();
+    let (pass1_schedule, way_schedule, relation_schedule) =
+        build_all_blob_schedules(input)?;
+    #[allow(clippy::cast_possible_truncation)]
+    crate::debug::emit_counter("renumber_ext_schedule_ms", t_sched.elapsed().as_millis() as i64);
+
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_START");
 
     // ---- Pass 1: parallel node scan ----
@@ -149,11 +157,6 @@ pub fn renumber_external(
     // pread → decompress → wire-format reframe (replace only ID deltas,
     // copy everything else verbatim) → send Vec<OwnedBlock> through a
     // bounded channel. Main thread reorders by seq and writes output.
-    //
-    // Scan all blob headers once — builds node/way/relation schedules
-    // in a single pass.
-    let (pass1_schedule, way_schedule, relation_schedule) =
-        build_all_blob_schedules(input)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
     // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
@@ -191,15 +194,15 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
     // ---- Merge per-worker IdSetDense bitsets and build rank index ----
-    // Workers each built an independent bitset. Merge via bitwise OR,
-    // then build the rank prefix sums for O(1) rank() lookup.
+    let t_merge = std::time::Instant::now();
     let mut node_id_set = worker_id_sets.remove(0);
     for other in worker_id_sets {
         node_id_set.merge(other);
     }
     node_id_set.build_rank_index();
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
+        crate::debug::emit_counter("renumber_ext_node_merge_rank_ms", t_merge.elapsed().as_millis() as i64);
         crate::debug::emit_counter(
             "renumber_ext_node_map_entries",
             node_id_set.total_count() as i64,
@@ -235,11 +238,17 @@ pub fn renumber_external(
     crate::debug::emit_marker("RENUMBER_EXT_R1_START");
 
     // Merge per-worker way_id_sets built during stage 2d.
+    let t_way_merge = std::time::Instant::now();
     let mut way_id_set = way_id_sets.remove(0);
     for other in way_id_sets {
         way_id_set.merge(other);
     }
     way_id_set.build_rank_index();
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    {
+        crate::debug::emit_counter("renumber_ext_way_merge_rank_ms", t_way_merge.elapsed().as_millis() as i64);
+        crate::debug::emit_counter("renumber_ext_way_map_entries", way_id_set.total_count() as i64);
+    }
 
     let mut relation_id_set = super::id_set_dense::IdSetDense::new();
     relation_r1_collect_ids(
@@ -247,9 +256,11 @@ pub fn renumber_external(
         &relation_schedule,
         &mut relation_id_set,
     )?;
+    let t_rel_rank = std::time::Instant::now();
     relation_id_set.build_rank_index();
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
+        crate::debug::emit_counter("renumber_ext_rel_rank_ms", t_rel_rank.elapsed().as_millis() as i64);
         crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_id_set.total_count() as i64);
     }
     crate::debug::emit_marker("RENUMBER_EXT_R1_END");
@@ -371,7 +382,18 @@ fn stage2d_parallel_way_assembly(
             std::result::Result<Vec<OwnedBlock>, String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
-        for (seq_num, item) in decoded_rx {
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            stage2d_cref.consumer_recv_ms.fetch_add(
+                t_recv.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
                 let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -659,7 +681,18 @@ fn pass1_parallel_scan(
             std::result::Result<Vec<OwnedBlock>, String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
-        for (seq_num, item) in decoded_rx {
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            pass1_cref.consumer_recv_ms.fetch_add(
+                t_recv.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
                 let blocks = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -694,6 +727,7 @@ struct StageCounters {
     decompress_ms: std::sync::atomic::AtomicU64,
     reframe_ms: std::sync::atomic::AtomicU64,
     send_ms: std::sync::atomic::AtomicU64,
+    consumer_recv_ms: std::sync::atomic::AtomicU64,
     consumer_write_ms: std::sync::atomic::AtomicU64,
     blobs: std::sync::atomic::AtomicU64,
 }
@@ -705,6 +739,7 @@ impl StageCounters {
             decompress_ms: std::sync::atomic::AtomicU64::new(0),
             reframe_ms: std::sync::atomic::AtomicU64::new(0),
             send_ms: std::sync::atomic::AtomicU64::new(0),
+            consumer_recv_ms: std::sync::atomic::AtomicU64::new(0),
             consumer_write_ms: std::sync::atomic::AtomicU64::new(0),
             blobs: std::sync::atomic::AtomicU64::new(0),
         }
@@ -717,6 +752,7 @@ impl StageCounters {
         crate::debug::emit_counter(&format!("{prefix}_decompress_ms"), self.decompress_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_reframe_ms"), self.reframe_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_send_ms"), self.send_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter(&format!("{prefix}_consumer_recv_ms"), self.consumer_recv_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_consumer_write_ms"), self.consumer_write_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_blobs"), self.blobs.load(Relaxed) as i64);
     }
@@ -1426,14 +1462,27 @@ fn relation_r1_collect_ids(
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
+    let mut pread_ms: u64 = 0;
+    let mut decompress_ms: u64 = 0;
+    let mut decode_ms: u64 = 0;
+
     use std::os::unix::fs::FileExt;
     for task in relation_schedule {
+        let t0 = std::time::Instant::now();
         raw_buf.resize(task.data_size, 0);
         shared_file
             .read_exact_at(&mut raw_buf, task.data_offset)
             .map_err(|e| format!("failed to pread relation blob at {}: {e}", task.data_offset))?;
+        #[allow(clippy::cast_possible_truncation)]
+        { pread_ms += t0.elapsed().as_millis() as u64; }
+
+        let t1 = std::time::Instant::now();
         let mut decompress_buf = pool.get();
         crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
+        #[allow(clippy::cast_possible_truncation)]
+        { decompress_ms += t1.elapsed().as_millis() as u64; }
+
+        let t2 = std::time::Instant::now();
         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
             decompress_buf,
             &pool,
@@ -1446,7 +1495,18 @@ fn relation_r1_collect_ids(
                 relation_id_set.set(r.id());
             }
         }
+        #[allow(clippy::cast_possible_truncation)]
+        { decode_ms += t2.elapsed().as_millis() as u64; }
     }
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("r1_pread_ms", pread_ms as i64);
+        crate::debug::emit_counter("r1_decompress_ms", decompress_ms as i64);
+        crate::debug::emit_counter("r1_decode_ms", decode_ms as i64);
+        crate::debug::emit_counter("r1_blobs", relation_schedule.len() as i64);
+    }
+
     Ok(())
 }
 
@@ -1494,6 +1554,8 @@ fn relation_r2d_assembly(
     let r2d_orphans = std::sync::atomic::AtomicU64::new(0);
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let next_ref = &next_idx;
+    let r2d_counters = StageCounters::new();
+    let r2d_cref = &r2d_counters;
 
     std::thread::scope(|scope| -> Result<()> {
         for _ in 0..decode_threads {
@@ -1504,6 +1566,7 @@ fn relation_r2d_assembly(
             let rw = &rels_written;
             scope.spawn(move || {
                 use std::os::unix::fs::FileExt as _;
+                use std::sync::atomic::Ordering::Relaxed;
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut reframe_buf: Vec<u8> = Vec::new();
@@ -1514,19 +1577,27 @@ fn relation_r2d_assembly(
                 let mut scalar_fields: Vec<u8> = Vec::new();
 
                 loop {
-                    let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let idx = next_ref.fetch_add(1, Relaxed);
                     if idx >= relation_schedule.len() {
                         break;
                     }
                     let task = &relation_schedule[idx];
 
                     let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String> = (|| {
+                        let t0 = std::time::Instant::now();
                         read_buf.resize(task.data_size, 0);
                         file.read_exact_at(&mut read_buf, task.data_offset)
                             .map_err(|e| format!("pread at {}: {e}", task.data_offset))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        r2d_cref.pread_ms.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+
+                        let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                             .map_err(|e| e.to_string())?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        r2d_cref.decompress_ms.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
+                        let t2 = std::time::Instant::now();
                         let (blob_count, min_id, max_id, blob_orphans) = reframe_relations_with_new_ids(
                             &decompress_buf,
                             rid_set,
@@ -1542,8 +1613,11 @@ fn relation_r2d_assembly(
                             &mut group_ranges,
                             &mut scalar_fields,
                         )?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        r2d_cref.reframe_ms.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                        rw.fetch_add(blob_count, std::sync::atomic::Ordering::Relaxed);
+                        rw.fetch_add(blob_count, Relaxed);
+                        r2d_cref.blobs.fetch_add(1, Relaxed);
 
                         let index = crate::blob_index::BlobIndex {
                             kind: crate::blob_index::ElemKind::Relation,
@@ -1557,9 +1631,12 @@ fn relation_r2d_assembly(
                         Ok((taken, index, blob_count, blob_orphans))
                     })();
 
+                    let t4 = std::time::Instant::now();
                     if tx.send((idx, result)).is_err() {
                         break;
                     }
+                    #[allow(clippy::cast_possible_truncation)]
+                    r2d_cref.send_ms.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
                 }
             });
         }
@@ -1571,20 +1648,38 @@ fn relation_r2d_assembly(
             std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
-        for (seq_num, item) in decoded_rx {
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            r2d_cref.consumer_recv_ms.fetch_add(
+                t_recv.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
                 let (block_bytes, index, _count, blob_orphans) =
                     result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 r2d_orphans.fetch_add(blob_orphans, std::sync::atomic::Ordering::Relaxed);
                 if index.count > 0 {
+                    let t0 = std::time::Instant::now();
                     writer.write_primitive_block_owned(block_bytes, index, None)?;
+                    #[allow(clippy::cast_possible_truncation)]
+                    r2d_cref.consumer_write_ms.fetch_add(
+                        t0.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
         }
         Ok(())
     })?;
 
+    r2d_counters.emit("r2d");
     stats.relations_written += rels_written.load(std::sync::atomic::Ordering::Relaxed);
     stats.orphan_refs += r2d_orphans.load(std::sync::atomic::Ordering::Relaxed);
 

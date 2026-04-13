@@ -1,0 +1,851 @@
+//! Stage 4: Assembly — emit enriched PBF.
+//!
+//! Re-reads the PBF, attaches coordinates from coord_slots to ways.
+//! P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
+//! Way blobs use wire-format reframe (no full decode); non-way blobs use BlockBuilder.
+
+use std::path::Path;
+
+use crate::block_builder::{BlockBuilder, MemberData, OwnedBlock};
+use crate::writer::Compression;
+use crate::{Element, PrimitiveBlock};
+
+use super::super::add_locations_to_ways::Stats;
+use super::super::id_set_dense::IdSetDense;
+use super::super::{
+    dense_node_metadata, element_metadata,
+    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    flush_local, HeaderOverrides, Result, writer_from_header,
+};
+use super::COORD_SLOT_SIZE;
+
+// ---------------------------------------------------------------------------
+// CoordSlots: memory-mapped coordinate lookup
+// ---------------------------------------------------------------------------
+
+/// Memory-mapped coord_slots file for zero-syscall coordinate lookup.
+/// Access is sequential (slot_pos advances monotonically during assembly),
+/// so MADV_SEQUENTIAL enables kernel readahead. Replaces the previous
+/// per-ref pread approach (8B syscalls at planet scale).
+pub(super) struct CoordSlots {
+    mmap: memmap2::Mmap,
+    total_slots: u64,
+}
+
+impl CoordSlots {
+    pub(super) fn open(path: &Path, total_slots: u64) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .map_err(|e| format!("failed to open coord_slots: {e}"))?;
+        let len = file.metadata()
+            .map_err(|e| format!("failed to stat coord_slots: {e}"))?
+            .len();
+        if len == 0 {
+            return Ok(Self {
+                mmap: memmap2::MmapOptions::new().map_anon()?.make_read_only()?,
+                total_slots: 0,
+            });
+        }
+        let mmap = unsafe { memmap2::Mmap::map(&file) }
+            .map_err(|e| format!("failed to mmap coord_slots: {e}"))?;
+        #[cfg(unix)]
+        {
+            mmap.advise(memmap2::Advice::Sequential).ok();
+        }
+        Ok(Self { mmap, total_slots })
+    }
+
+    /// Read a coordinate at the given slot position. Zero syscalls — direct
+    /// mmap byte access.
+    #[allow(clippy::cast_possible_truncation)]
+    fn get(&self, slot_pos: u64) -> Option<(i32, i32)> {
+        if slot_pos >= self.total_slots {
+            return None;
+        }
+        let offset = slot_pos as usize * COORD_SLOT_SIZE;
+        let bytes = self.mmap.get(offset..offset + COORD_SLOT_SIZE)?;
+        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        if lat == 0 && lon == 0 {
+            return None; // sentinel
+        }
+        Some((lat, lon))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Blob descriptor for the stage 4 pre-scan schedule.
+struct BlobDescriptor {
+    seq: usize,
+    data_offset: u64,
+    data_size: usize,
+    slot_start: u64,
+    is_way_blob: bool,
+}
+
+/// Load the ref-count sidecar and compute prefix sums for slot_start values.
+pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Vec<u64>> {
+    let data = std::fs::read(path)
+        .map_err(|e| format!("failed to read ref count sidecar: {e}"))?;
+    if data.len() < 8 {
+        return Err("ref count sidecar is too small".into());
+    }
+    // Last 8 bytes are the trailer (total ref count).
+    let trailer_bytes: [u8; 8] = data[data.len() - 8..].try_into()
+        .map_err(|_| "ref count sidecar trailer read failed")?;
+    let trailer_total = u64::from_le_bytes(trailer_bytes);
+    if trailer_total != total_slots {
+        return Err(format!(
+            "ref count sidecar total ({trailer_total}) != stage 1 total_slots ({total_slots})"
+        ).into());
+    }
+
+    let entry_bytes = &data[..data.len() - 8];
+    if entry_bytes.len() % 8 != 0 {
+        return Err("ref count sidecar has non-aligned entries".into());
+    }
+    let num_entries = entry_bytes.len() / 8;
+    let mut slot_starts = Vec::with_capacity(num_entries);
+    let mut cumulative: u64 = 0;
+    for chunk in entry_bytes.chunks_exact(8) {
+        slot_starts.push(cumulative);
+        let count = u64::from_le_bytes(chunk.try_into()
+            .map_err(|_| "ref count sidecar entry read failed")?);
+        cumulative += count;
+    }
+    if cumulative != total_slots {
+        return Err(format!(
+            "ref count sidecar cumulative ({cumulative}) != total_slots ({total_slots})"
+        ).into());
+    }
+    Ok(slot_starts)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: Assembly
+// ---------------------------------------------------------------------------
+
+/// Assembly pass: re-read the PBF, attach coordinates from coord_slots to ways.
+/// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
+/// See notes/p2c-parallel-assembly-spec.md.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub(super) fn stage4_assembly(
+    input: &Path,
+    output: &Path,
+    coord_slots: &CoordSlots,
+    keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
+    compression: Compression,
+    direct_io: bool,
+    overrides: &HeaderOverrides,
+    ref_count_sidecar: &Path,
+    total_slots: u64,
+) -> Result<Stats> {
+    use std::os::unix::fs::FileExt;
+
+    // Load sidecar and compute slot_start prefix sums.
+    let way_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
+    // Header-only pre-scan: build the blob schedule.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.set_parse_tagdata(true);
+    // Skip OsmHeader.
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    // Also read the header for the writer (need a regular BlobReader for this).
+    let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
+    let header_blob = header_reader.next()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    let header = header_blob.to_headerblock()?;
+    drop(header_reader);
+
+    let mut schedule: Vec<BlobDescriptor> = Vec::new();
+    let mut way_sidecar_idx: usize = 0;
+    let mut skipped_node_blobs: u64 = 0;
+    let mut seq: usize = 0;
+
+    // Stage 4 schedule diagnostics.
+    let mut s4_node_blobs_total: u64 = 0;
+    let mut s4_node_blobs_no_tagindex: u64 = 0;
+    let mut s4_node_blobs_empty_tags: u64 = 0;
+    let mut s4_node_blobs_kept_by_members: u64 = 0;
+    let mut s4_node_blobs_kept_by_tags: u64 = 0;
+    let mut s4_way_blobs: u64 = 0;
+    let mut s4_relation_blobs: u64 = 0;
+
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (header_entry, _, data_offset, data_size) = result?;
+        if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
+            continue;
+        }
+
+        // Count blob types for diagnostics.
+        if let Some(idx) = header_entry.index() {
+            match idx.kind {
+                crate::blob_index::ElemKind::Node => s4_node_blobs_total += 1,
+                crate::blob_index::ElemKind::Way => s4_way_blobs += 1,
+                crate::blob_index::ElemKind::Relation => s4_relation_blobs += 1,
+            }
+        }
+
+        // P1b: skip node blobs with only untagged non-member nodes.
+        if !keep_untagged_nodes {
+            if let Some(idx) = header_entry.index() {
+                if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
+                    let tag_index = header_entry.tag_index();
+                    let has_tagindex = tag_index.is_some();
+                    let has_tags = tag_index.is_none_or(|ti| !ti.keys_empty());
+                    if !has_tagindex {
+                        s4_node_blobs_no_tagindex += 1;
+                    } else if !has_tags {
+                        s4_node_blobs_empty_tags += 1;
+                    }
+                    if has_tags {
+                        s4_node_blobs_kept_by_tags += 1;
+                    } else {
+                        let has_members = relation_member_node_ids
+                            .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
+                        if has_members {
+                            s4_node_blobs_kept_by_members += 1;
+                        }
+                        if !has_members {
+                            skipped_node_blobs += 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Way blobs consume sidecar entries for slot_start.
+        let slot_start = if let Some(idx) = header_entry.index() {
+            if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
+                if way_sidecar_idx >= way_slot_starts.len() {
+                    return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
+                }
+                let start = way_slot_starts[way_sidecar_idx];
+                way_sidecar_idx += 1;
+                start
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let is_way_blob = header_entry.index()
+            .is_some_and(|idx| matches!(idx.kind, crate::blob_index::ElemKind::Way));
+        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start, is_way_blob });
+        seq += 1;
+    }
+
+    // Verify all sidecar entries were consumed.
+    if way_sidecar_idx != way_slot_starts.len() {
+        return Err(format!(
+            "ref count sidecar has {} entries but only {} way blobs seen in PBF",
+            way_slot_starts.len(), way_sidecar_idx,
+        ).into());
+    }
+
+    // Open shared file for worker pread.
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+
+    let mut writer = writer_from_header(
+        output,
+        compression,
+        &header,
+        true,
+        overrides,
+        |hb| hb.optional_feature("LocationsOnWays"),
+        direct_io,
+        false,
+    )?;
+
+    let decode_threads = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
+    let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
+    let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+
+    let mut total_stats = Stats::default();
+
+    // Worker-side cumulative counters.
+    let s4_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_way_reframe_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_way_blobs_processed = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
+    let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s4_pread_ref = &s4_pread_ms;
+    let s4_decompress_ref = &s4_decompress_ms;
+    let s4_assemble_ref = &s4_assemble_ms;
+    let s4_way_reframe_ref = &s4_way_reframe_ms;
+    let s4_nonway_assemble_ref = &s4_nonway_assemble_ms;
+    let s4_way_blobs_ref = &s4_way_blobs_processed;
+    let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
+    let s4_send_ref = &s4_send_ms;
+    let s4_blobs_ref = &s4_blobs;
+    let way_reframe_counters = WayReframeCounters::new();
+    let way_reframe_cref = &way_reframe_counters;
+
+    // Consumer-side counters.
+    let mut s4_recv_ms: u64 = 0;
+    let mut s4_write_ms: u64 = 0;
+
+    std::thread::scope(|scope| -> Result<()> {
+        // Dispatcher: feed schedule into descriptor channel.
+        scope.spawn(move || {
+            for desc in schedule {
+                if desc_tx.send(desc).is_err() {
+                    break;
+                }
+            }
+        });
+
+        // Worker threads: pread → decompress → PrimitiveBlock → assemble.
+        // Dedicated threads, NOT global rayon (PbfWriter uses rayon for compression).
+        for _ in 0..decode_threads {
+            let rx = std::sync::Arc::clone(&desc_rx);
+            let tx = decoded_tx.clone();
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut bb = BlockBuilder::new();
+                let mut output_blocks: Vec<OwnedBlock> = Vec::new();
+                let mut refs_buf: Vec<i64> = Vec::new();
+                let mut locations_buf: Vec<(i32, i32)> = Vec::new();
+                let mut way_reframe_scratch = WayReframeScratch::new();
+                let mut reframe_output: Vec<u8> = Vec::new();
+
+                loop {
+                    let desc = {
+                        let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        match guard.recv() {
+                            Ok(d) => d,
+                            Err(_) => break,
+                        }
+                    };
+
+                    let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
+                        let t0 = std::time::Instant::now();
+                        read_buf.resize(desc.data_size, 0);
+                        file.read_exact_at(&mut read_buf, desc.data_offset)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(e)
+                            ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+
+                        let t1 = std::time::Instant::now();
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+
+                        let t2 = std::time::Instant::now();
+                        output_blocks.clear();
+
+                        if desc.is_way_blob {
+                            // Wire-format reframe: splice locations without
+                            // full PrimitiveBlock decode or BlockBuilder.
+                            let (way_count, _new_slot_pos, min_id, max_id, missing) =
+                                reframe_way_blob_with_locations(
+                                    &decompress_buf,
+                                    coord_slots,
+                                    desc.slot_start,
+                                    &mut reframe_output,
+                                    &mut way_reframe_scratch,
+                                    way_reframe_cref,
+                                ).map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
+                                ))?;
+
+                            let index = crate::blob_index::BlobIndex {
+                                kind: crate::blob_index::ElemKind::Way,
+                                min_id,
+                                max_id,
+                                count: way_count,
+                                bbox: None,
+                            };
+                            let taken = std::mem::take(&mut reframe_output);
+                            reframe_output.reserve(taken.len());
+                            output_blocks.push((taken, index, None));
+
+                            let mut block_stats = Stats::default();
+                            block_stats.ways_written = way_count;
+                            block_stats.missing_locations = missing;
+                            #[allow(clippy::cast_possible_truncation)]
+                            {
+                                let elapsed = t2.elapsed().as_millis() as u64;
+                                s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                                s4_way_reframe_ref.fetch_add(elapsed, Relaxed);
+                            }
+                            s4_blobs_ref.fetch_add(1, Relaxed);
+                            s4_way_blobs_ref.fetch_add(1, Relaxed);
+                            return Ok((std::mem::take(&mut output_blocks), block_stats));
+                        }
+
+                        // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+                        let block = PrimitiveBlock::new(
+                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
+                        )?;
+                        let block_stats = assemble_block(
+                            &block,
+                            &mut bb,
+                            &mut output_blocks,
+                            coord_slots,
+                            desc.slot_start,
+                            keep_untagged_nodes,
+                            relation_member_node_ids,
+                            &mut refs_buf,
+                            &mut locations_buf,
+                        ).map_err(|e| crate::error::new_error(
+                            crate::error::ErrorKind::Io(std::io::Error::other(e))
+                        ))?;
+                        flush_local(&mut bb, &mut output_blocks).map_err(|e| {
+                            crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            )
+                        })?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        {
+                            let elapsed = t2.elapsed().as_millis() as u64;
+                            s4_assemble_ref.fetch_add(elapsed, Relaxed);
+                            s4_nonway_assemble_ref.fetch_add(elapsed, Relaxed);
+                        }
+                        s4_nonway_blobs_ref.fetch_add(1, Relaxed);
+
+                        if decompress_buf.capacity() == 0 {
+                            decompress_buf = Vec::new();
+                        }
+
+                        s4_blobs_ref.fetch_add(1, Relaxed);
+
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
+                    })();
+
+                    let t3 = std::time::Instant::now();
+                    if tx.send((desc.seq, result)).is_err() {
+                        break;
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    s4_send_ref.fetch_add(t3.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+            });
+        }
+        drop(desc_rx);
+        drop(decoded_tx);
+
+        // Consumer: reorder + write to PbfWriter.
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            crate::error::Result<(Vec<OwnedBlock>, Stats)>
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            { s4_recv_ms += t_recv.elapsed().as_millis() as u64; }
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
+            reorder.push(seq_num, item);
+
+            while let Some(result) = reorder.pop_ready() {
+                let (blocks, block_stats) = result?;
+                total_stats.merge(&block_stats);
+
+                for (block_bytes, index, tagdata) in blocks {
+                    let t_w = std::time::Instant::now();
+                    writer.write_primitive_block_owned(
+                        block_bytes, index, tagdata.as_deref(),
+                    )?;
+                    #[allow(clippy::cast_possible_truncation)]
+                    { s4_write_ms += t_w.elapsed().as_millis() as u64; }
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+
+    writer.flush()?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_assemble_ms", s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_blobs_processed", s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
+        crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
+        crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
+        crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
+        crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex as i64);
+        crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags as i64);
+        crate::debug::emit_counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags as i64);
+        crate::debug::emit_counter("s4_node_blobs_kept_by_members", s4_node_blobs_kept_by_members as i64);
+        crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
+        crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
+    }
+    way_reframe_counters.emit();
+
+    Ok(total_stats)
+}
+
+
+/// Process a single block for assembly.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn assemble_block(
+    block: &PrimitiveBlock,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    coord_slots: &CoordSlots,
+    mut way_slot_pos: u64,
+    keep_untagged_nodes: bool,
+    relation_member_node_ids: Option<&IdSetDense>,
+    refs_buf: &mut Vec<i64>,
+    locations_buf: &mut Vec<(i32, i32)>,
+) -> std::result::Result<Stats, String> {
+    let mut stats = Stats::default();
+
+    let mut members_buf: Vec<MemberData<'_>> = Vec::new();
+
+    for element in block.elements() {
+        match &element {
+            Element::DenseNode(dn) => {
+                stats.nodes_read += 1;
+                let has_tags = dn.tags().next().is_some();
+                if keep_untagged_nodes
+                    || has_tags
+                    || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()))
+                {
+                    ensure_node_capacity_local(bb, output)?;
+                    let meta = dense_node_metadata(dn);
+                    bb.add_node(dn.id(), dn.decimicro_lat(), dn.decimicro_lon(), dn.tags(), meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            Element::Node(n) => {
+                stats.nodes_read += 1;
+                let has_tags = n.tags().next().is_some();
+                if keep_untagged_nodes
+                    || has_tags
+                    || relation_member_node_ids.is_some_and(|ids| ids.get(n.id()))
+                {
+                    ensure_node_capacity_local(bb, output)?;
+                    let meta = element_metadata(&n.info());
+                    bb.add_node(n.id(), n.decimicro_lat(), n.decimicro_lon(), n.tags(), meta.as_ref());
+                    stats.nodes_written += 1;
+                } else {
+                    stats.nodes_dropped += 1;
+                }
+            }
+            Element::Way(w) => {
+                ensure_way_capacity_local(bb, output)?;
+                refs_buf.clear();
+                refs_buf.extend(w.refs());
+                locations_buf.clear();
+                for _node_id in refs_buf.iter() {
+                    match coord_slots.get(way_slot_pos) {
+                        Some(loc) => locations_buf.push(loc),
+                        None => {
+                            stats.missing_locations += 1;
+                            locations_buf.push((0, 0));
+                        }
+                    }
+                    way_slot_pos += 1;
+                }
+                let meta = element_metadata(&w.info());
+                bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
+                stats.ways_written += 1;
+            }
+            Element::Relation(r) => {
+                ensure_relation_capacity_local(bb, output)?;
+                members_buf.clear();
+                members_buf.extend(r.members().map(|m| MemberData {
+                    id: m.id,
+                    role: m.role().unwrap_or(""),
+                }));
+                let meta = element_metadata(&r.info());
+                bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
+                stats.relations_written += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+// ---------------------------------------------------------------------------
+// Wire-format way reframe for stage 4
+// ---------------------------------------------------------------------------
+
+/// Sub-phase counters for the way reframe hot path.
+struct WayReframeCounters {
+    parse_block_ms: std::sync::atomic::AtomicU64,
+    parse_way_ms: std::sync::atomic::AtomicU64,
+    coord_lookup_ms: std::sync::atomic::AtomicU64,
+    reassemble_ms: std::sync::atomic::AtomicU64,
+    refs_total: std::sync::atomic::AtomicU64,
+    ways_total: std::sync::atomic::AtomicU64,
+}
+
+impl WayReframeCounters {
+    fn new() -> Self {
+        Self {
+            parse_block_ms: std::sync::atomic::AtomicU64::new(0),
+            parse_way_ms: std::sync::atomic::AtomicU64::new(0),
+            coord_lookup_ms: std::sync::atomic::AtomicU64::new(0),
+            reassemble_ms: std::sync::atomic::AtomicU64::new(0),
+            refs_total: std::sync::atomic::AtomicU64::new(0),
+            ways_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn emit(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::debug::emit_counter("s4_way_parse_block_ms", self.parse_block_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_parse_way_ms", self.parse_way_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_coord_lookup_ms", self.coord_lookup_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_reassemble_ms", self.reassemble_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_messages_total", self.ways_total.load(Relaxed) as i64);
+    }
+}
+
+/// Reusable scratch buffers for the way reframe path.
+struct WayReframeScratch {
+    group_ranges: Vec<(usize, usize)>,
+    scalar_fields: Vec<u8>,
+    reframed_way: Vec<u8>,
+    packed_lats: Vec<u8>,
+    packed_lons: Vec<u8>,
+    group_out: Vec<u8>,
+}
+
+impl WayReframeScratch {
+    fn new() -> Self {
+        Self {
+            group_ranges: Vec::new(),
+            scalar_fields: Vec::new(),
+            reframed_way: Vec::new(),
+            packed_lats: Vec::new(),
+            packed_lons: Vec::new(),
+            group_out: Vec::new(),
+        }
+    }
+}
+
+/// Wire-format reframe: splice LocationsOnWays fields (9, 10) into way
+/// messages without full PrimitiveBlock decode. Copies string table, node
+/// groups, relation groups, and all non-ref way fields verbatim. Only
+/// decodes way refs (field 8) to count them and look up coords.
+///
+/// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn reframe_way_blob_with_locations(
+    decompressed: &[u8],
+    coord_slots: &CoordSlots,
+    mut way_slot_pos: u64,
+    output: &mut Vec<u8>,
+    scratch: &mut WayReframeScratch,
+    counters: &WayReframeCounters,
+) -> std::result::Result<(u64, u64, i64, i64, u64), String> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    scratch.group_ranges.clear();
+    scratch.scalar_fields.clear();
+    let mut stringtable_range: Option<(usize, usize)> = None;
+
+    // Level 1: PrimitiveBlock — find string table + groups.
+    let t_block = std::time::Instant::now();
+    let mut cursor = Cursor::new(decompressed);
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block: {e}"))? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| format!("reframe st: {e}"))?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                stringtable_range = Some((offset, data.len()));
+            }
+            (2, WIRE_LEN) => {
+                let data = cursor.read_len_delimited().map_err(|e| format!("reframe group: {e}"))?;
+                let offset = data.as_ptr() as usize - decompressed.as_ptr() as usize;
+                scratch.group_ranges.push((offset, data.len()));
+            }
+            (17..=20, WIRE_VARINT) => {
+                let raw = cursor.read_raw_field(wire_type).map_err(|e| format!("reframe scalar: {e}"))?;
+                protohoggr::encode_tag(&mut scratch.scalar_fields, field, wire_type);
+                scratch.scalar_fields.extend_from_slice(raw);
+            }
+            _ => cursor.skip_field(wire_type).map_err(|e| format!("reframe skip: {e}"))?,
+        }
+    }
+
+    let (st_offset, st_len) = stringtable_range
+        .ok_or("reframe: no StringTable in PrimitiveBlock")?;
+    let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
+
+    #[allow(clippy::cast_possible_truncation)]
+    counters.parse_block_ms.fetch_add(t_block.elapsed().as_millis() as u64, Relaxed);
+
+    output.clear();
+    protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
+
+    let mut total_ways: u64 = 0;
+    let mut min_way_id: i64 = i64::MAX;
+    let mut max_way_id: i64 = i64::MIN;
+    let mut missing_locations: u64 = 0;
+    let mut blob_refs: u64 = 0;
+
+    // Level 2: process each PrimitiveGroup.
+    for &(gr_offset, gr_len) in &scratch.group_ranges {
+        let group_bytes = &decompressed[gr_offset..gr_offset + gr_len];
+        scratch.group_out.clear();
+
+        let mut gr_cursor = Cursor::new(group_bytes);
+        while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| format!("reframe gfield: {e}"))? {
+            if field == 3 && wire_type == WIRE_LEN {
+                // Way submessage — splice locations.
+                let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
+
+                let t_way = std::time::Instant::now();
+                let mut way_id: i64 = 0;
+                let mut refs_data: &[u8] = &[];
+                let mut refs_range: Option<(usize, usize)> = None;
+
+                let mut way_cursor = Cursor::new(way_bytes);
+                while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| format!("reframe wfield: {e}"))? {
+                    if wf == 1 && wt == WIRE_VARINT {
+                        way_id = way_cursor.read_varint_i64().map_err(|e| format!("reframe id: {e}"))?;
+                    } else if wf == 8 && wt == WIRE_LEN {
+                        let val_start = way_bytes.len() - way_cursor.remaining();
+                        let tag_start = val_start - 1; // field 8 tag = 1 byte
+                        refs_data = way_cursor.read_len_delimited().map_err(|e| format!("reframe refs: {e}"))?;
+                        let val_end = way_bytes.len() - way_cursor.remaining();
+                        refs_range = Some((tag_start, val_end));
+                    } else {
+                        way_cursor.skip_field(wt).map_err(|e| format!("reframe wskip: {e}"))?;
+                    }
+                }
+
+                #[allow(clippy::cast_possible_truncation)]
+                counters.parse_way_ms.fetch_add(t_way.elapsed().as_millis() as u64, Relaxed);
+
+                if way_id < min_way_id { min_way_id = way_id; }
+                if way_id > max_way_id { max_way_id = way_id; }
+
+                // Count refs and look up locations.
+                let t_coord = std::time::Instant::now();
+                scratch.packed_lats.clear();
+                scratch.packed_lons.clear();
+                let mut last_lat: i64 = 0;
+                let mut last_lon: i64 = 0;
+                let mut ref_count: u64 = 0;
+
+                if !refs_data.is_empty() {
+                    let mut ref_cursor = Cursor::new(refs_data);
+                    while ref_cursor.remaining() > 0 {
+                        // Skip the ref delta — we don't need the node ID,
+                        // just need to count refs for slot_pos advancement.
+                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
+
+                        let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                            Some(loc) => loc,
+                            None => {
+                                missing_locations += 1;
+                                (0, 0)
+                            }
+                        };
+                        way_slot_pos += 1;
+                        ref_count += 1;
+
+                        let lat_i64 = i64::from(lat);
+                        let lon_i64 = i64::from(lon);
+                        protohoggr::encode_varint(
+                            &mut scratch.packed_lats,
+                            protohoggr::zigzag_encode_64(lat_i64 - last_lat),
+                        );
+                        protohoggr::encode_varint(
+                            &mut scratch.packed_lons,
+                            protohoggr::zigzag_encode_64(lon_i64 - last_lon),
+                        );
+                        last_lat = lat_i64;
+                        last_lon = lon_i64;
+                    }
+                }
+
+                #[allow(clippy::cast_possible_truncation)]
+                counters.coord_lookup_ms.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
+                blob_refs += ref_count;
+
+                // Build reframed way: original bytes + appended fields 9, 10.
+                let t_reassemble = std::time::Instant::now();
+                scratch.reframed_way.clear();
+                if let Some((refs_start, refs_end)) = refs_range {
+                    // Copy everything before refs field.
+                    scratch.reframed_way.extend_from_slice(&way_bytes[..refs_start]);
+                    // Copy refs field verbatim.
+                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_start..refs_end]);
+                    // Copy everything after refs field (other fields like keys, vals, info
+                    // that appeared after refs — field order is not guaranteed).
+                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_end..]);
+                } else {
+                    // No refs field — copy way bytes verbatim.
+                    scratch.reframed_way.extend_from_slice(way_bytes);
+                }
+                // Append location fields.
+                if ref_count > 0 {
+                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
+                    protohoggr::encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
+                }
+
+                protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
+                #[allow(clippy::cast_possible_truncation)]
+                counters.reassemble_ms.fetch_add(t_reassemble.elapsed().as_millis() as u64, Relaxed);
+                total_ways += 1;
+            } else {
+                // Non-way field in the group — copy verbatim.
+                let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
+                protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
+                scratch.group_out.extend_from_slice(raw);
+            }
+        }
+
+        protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
+    }
+
+    // Append scalar fields (granularity, etc.).
+    output.extend_from_slice(&scratch.scalar_fields);
+
+    counters.refs_total.fetch_add(blob_refs, Relaxed);
+    counters.ways_total.fetch_add(total_ways, Relaxed);
+
+    Ok((total_ways, way_slot_pos, min_way_id, max_way_id, missing_locations))
+}

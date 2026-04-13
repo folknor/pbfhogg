@@ -756,7 +756,7 @@ pub fn add_locations_to_ways(
 
     // External join has its own pipeline — dispatch early.
     if index_type == IndexType::External {
-        return super::external_join::external_join(
+        return super::altw::external_join(
             input,
             output,
             keep_untagged_nodes,

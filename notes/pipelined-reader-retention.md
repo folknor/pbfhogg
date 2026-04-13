@@ -64,18 +64,28 @@ so pipelined decode only helps overlap decompression with encoding.
 **Status:** Being converted to external join architecture in current work
 (separate from this audit). See `src/commands/renumber_external.rs`.
 
-### 2. getid (one-pass batch path)
+### 2. getid (pass 2 write phase)
 
 **Path:** `reader.into_blocks_pipelined()` at line 452
-**Impact:** Pass 2 write phase for `--add-referenced`. Classification
-passes already use `parallel_classify_phase` (converted). The batch path
-processes one batch of blocks at a time via `for_each_primitive_block_batch`.
+**Impact:** Pass 2 write phase for `--add-referenced` only. The single-pass
+path (`getid` without `--add-referenced` and `removeid`) uses `filter_by_id`
+which reads raw frames directly — no pipelined decode at all. Classification
+passes already use `parallel_classify_phase` (converted).
 **Retention:** Solved — DecompressPool recycles buffers. Batch bounding
 (BATCH_SIZE=64) limits live blocks. No retention concern.
-**Performance:** Parallel batch processing is valuable — per-block work
-includes ID filtering + BlockBuilder re-encode. The decode/process
-overlap from pipelining helps here.
-**Priority:** Low — no action needed.
+**Performance (investigated April 2026):** Per-block work is lightweight,
+same profile as getparents. The ID set is small (requested IDs + their
+referenced nodes). Most blobs are already skipped via `BlobFilter` (type
+filtering on the requested ID types). Within non-skipped blobs, per-element
+work is an `IdSetDense::get` check (O(1) bitset lookup) — most elements
+are skipped. Only matching elements go through BlockBuilder re-encode.
+The `par_iter` batch processing dispatches 64 blocks to rayon workers
+where each worker does mostly skip-skip-skip with occasional writes.
+Same analysis as getparents: rayon scheduling overhead likely exceeds
+the actual per-block work. Candidate for sequential conversion.
+**Priority:** Low — niche path (`--add-referenced` only), lightweight
+per-block work. Convert to sequential BlobReader + par_iter or fully
+sequential if measurement shows benefit.
 
 ### 3. tags_filter (single-pass `-R` path)
 
@@ -83,11 +93,28 @@ overlap from pipelining helps here.
 **Impact:** The single-pass path (no `--add-referenced-ways`). Processes
 elements via `for_each_primitive_block_batch`.
 **Retention:** Solved — DecompressPool recycles buffers.
-**Performance:** Parallel batch processing is valuable — tag expression
-matching + BlockBuilder re-encode is meaningful per-block CPU work. The
-two-pass path (the planet-scale production path) already uses pread
-workers; this single-pass path is for simple tag filters.
-**Priority:** Low — no action needed.
+**Performance (investigated April 2026):** Per-block work is substantially
+heavier than getparents — every element's tags are collected into a buffer
+and matched against N expressions via `element_matches`, then matching
+elements go through full BlockBuilder re-encode (string table construction,
+varint encoding, delta packing). Most elements are touched, not skipped.
+The `par_iter` batch processing is genuinely valuable for this workload.
+
+The open question is whether the **pipelined decode** (concurrent with
+batch processing) helps or hurts on top of the parallel batch. Two rayon
+pools run simultaneously: the decode pool (N-2 threads) produces blocks
+into a channel while the global pool processes the previous batch. On an
+8-core host this means ~14 threads on 8 cores. Converting to sequential
+decode + par_iter batches would eliminate the oversubscription but lose
+the decode/processing overlap.
+
+The two-pass path (the planet-scale production path with
+`--add-referenced-ways`) already uses pread workers and doesn't go
+through this code. This single-pass path is for simple tag filters
+without dependency expansion.
+**Priority:** Low — par_iter is justified, pipelined decode benefit is
+unproven but plausible for this workload. Convert to sequential decode
++ par_iter if measurement shows oversubscription hurts.
 
 ### 4. add_locations_to_ways (decode-all fallback)
 
@@ -96,11 +123,22 @@ workers; this single-pass path is for simple tag filters.
 **Retention:** Solved — DecompressPool recycles buffers even though
 this path uses manual batching (same pool, same recycling). The pool's
 64-buffer cap bounds live allocations regardless of batch size.
-**Performance:** Parallel batch processing is valuable — location
-enrichment + BlockBuilder re-encode is the heaviest per-block work of
-any command here.
-**Priority:** Low — niche path, retention solved, parallel processing
-valuable.
+**Performance (investigated April 2026):** Heaviest per-block work of
+any pipelined path. Every element is processed — no skip path:
+- Nodes: tag check + conditional BlockBuilder write (most nodes written)
+- Ways: collect all refs, look up every node location from index
+  (random access into dense mmap or pre-resolved map), then
+  `add_way_with_locations` (larger than regular `add_way`)
+- Relations: full member collection + BlockBuilder write
+- For sparse index: `resolve_batch_locations` pre-resolves all way
+  node coordinates via sorted sequential scan before par_iter
+
+The par_iter is doing real work here — location lookups + BlockBuilder
+re-encode for every element in the batch. The pipelined decode overlap
+is also most valuable here because decode time is a smaller fraction of
+total per-block processing time (processing dominates).
+**Priority:** Low — niche `--force` path. Both par_iter and pipelined
+decode are justified. No conversion recommended.
 
 ### 5. cat (type-filtered path)
 
@@ -109,28 +147,25 @@ valuable.
 `for_each_primitive_block_batch_budgeted` with BATCH_SIZE=64 and 32 MB
 byte budget, so retention was already bounded pre-pool. With the pool,
 no retention concern at all.
-**Performance:** Well-tuned. Dual-bounded batches prevent memory spikes
-on large blocks. Parallel batch processing (`process_batch`) does
-parallel encode+compress — the heaviest batch work in the codebase.
-**Priority:** Low — no action needed. Best-optimized of all pipelined
-paths.
+**Performance (investigated April 2026):** Heaviest batch work in the
+codebase. Each rayon worker does type filtering + BlockBuilder re-encode
+AND zlib compression + blob framing (`frame_blob_pipelined`) — all
+inside the par_iter. Compression is genuinely CPU-heavy, making the
+par_iter essential. The pipelined decode overlap is also most valuable
+here because batch processing (with compression) takes longer than
+decode — the decode pool produces the next batch while the current
+batch is still compressing.
+**Priority:** Low — no conversion recommended. Both par_iter and
+pipelined decode are justified and working well. Best-optimized of all
+pipelined paths.
 
-### 6. getparents
+### 6. getparents — CONVERTED
 
-**Path:** `reader.into_blocks_pipelined()` at line 68
-**Impact:** Reads the entire PBF to find parent elements. Single-pass
-with `for_each_primitive_block_batch`.
-**Retention:** Solved — DecompressPool recycles buffers.
-**Performance:** `process_batch` uses `par_iter`, but per-block work is
-lightweight — just ID lookups (`IdSetDense::get`) and conditional writes
-to BlockBuilder. Most elements are skipped (only parents of a small ID
-set are emitted). The rayon `par_iter` overhead (task scheduling, work
-stealing) may exceed the actual per-block work. This is the one command
-where sequential processing might outperform the current parallel batch
-pattern.
-**Priority:** Low — niche diagnostic command. If optimizing, try
-sequential BlobReader first to eliminate both the decode pool overhead
-and the par_iter overhead. Measure before converting.
+Converted to sequential BlobReader with inline processing (commit
+`c912e4d`). Per-block work was lightweight — ID lookups + conditional
+writes — so the rayon par_iter overhead likely exceeded the actual work.
+Now uses the same pattern as node_stats/tags_count: sequential
+BlobReader + reusable decompress_buf + direct writer helpers.
 
 ## Commands already converted (no pipelined retention)
 
@@ -143,6 +178,7 @@ and the par_iter overhead. Measure before converting.
 - **merge** — pread-based passthrough + sweep merge
 - **diff/derive_changes** — StreamingBlocks (sequential + DecompressPool)
 - **external_join** — pread workers + sequential BlobReader
+- **getparents** — sequential BlobReader + reusable decompress_buf (commit `c912e4d`)
 
 ## Recommendation
 
@@ -151,21 +187,31 @@ pipelined reader paths. The `DecompressPool` (commit `8f6999b`) recycles
 decompression buffers via `PooledBuffer::drop` — no cumulative cross-thread
 free churn, no RSS growth from freed-but-retained memory.
 
-No urgent conversions are needed. The remaining paths are either
-well-optimized (cat --type), benefit from parallel batch processing
-(tags_filter, getid, ALTW), or are niche (getparents).
-
 **Thread oversubscription** (two concurrent rayon pools: decode + batch
-processing) is the remaining architectural concern. It is not a proven
-bottleneck — the decode pool provides I/O-decode overlap that benefits
-commands with heavy per-block processing. Measure before converting any
-path to sequential decode.
+processing) is the remaining architectural concern. Per-command
+investigation (April 2026) classifies the 5 remaining paths into three
+tiers:
 
-**getparents** is the only command where the pipelined + parallel batch
-pattern may be net-negative: per-block work is so lightweight that rayon
-overhead likely dominates. A sequential BlobReader with inline processing
-would be simpler and potentially faster. Measure on a real workload before
-converting.
+**Pipelined decode justified (no conversion):**
+- **cat --type** — par_iter does compression + framing on rayon workers.
+  Heaviest batch work. Pipelined decode overlaps with compression,
+  genuine benefit.
+- **ALTW decode-all** — every element processed with location lookups +
+  full re-encode. Heavy per-block work justifies both par_iter and
+  decode overlap. Niche `--force` path.
+
+**Par_iter justified, pipelined decode unproven:**
+- **tags_filter single-pass** — tag matching + BlockBuilder re-encode
+  for every element is meaningful work. par_iter helps. Whether the
+  decode/processing overlap offsets the oversubscription cost is
+  unproven. Convert to sequential decode + par_iter if measurement
+  shows benefit.
+
+**Lightweight per-block work (candidates for sequential):**
+- **getid pass 2** — O(1) `IdSetDense::get` per element, most elements
+  skipped. Same profile as getparents. Rayon scheduling overhead likely
+  exceeds the work. Convert to sequential BlobReader.
+- **getparents** — converted (commit `c912e4d`).
 
 **renumber** is being converted to an external join architecture in
 current work — not driven by retention concerns (which are solved) but

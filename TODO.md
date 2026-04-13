@@ -37,8 +37,16 @@ See [notes/altw-optimization-history.md](notes/altw-optimization-history.md)
 for the complete plan: 20 items across 5 priority groups, covering infrastructure
 fixes, planet blockers, external join P2b/P2c, and all affected commands.
 See [notes/pipelined-reader-retention.md](notes/pipelined-reader-retention.md)
-for the April 2026 audit: 5 remaining pipelined paths (renumber being
-converted separately, getparents converted to sequential in `c912e4d`).
+for the April 2026 audit. Per-command investigation classified the
+remaining paths into three tiers:
+- **Pipelined decode justified:** cat --type (compression on rayon
+  workers), ALTW decode-all (heavy per-block work). No conversion.
+- **Par_iter justified, pipelined decode unproven:** tags_filter
+  single-pass. Measure before converting.
+- **Lightweight, convert to sequential:** getid pass 2 (same profile
+  as getparents — O(1) ID lookups, most elements skipped).
+  getparents already converted (`c912e4d`). Renumber converted
+  separately (external join architecture).
 
 ## Milestone 1: Planet-safe production pipeline — COMPLETE
 
@@ -133,6 +141,16 @@ works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
 
 ### Smaller items
 
+- [ ] **diff/derive_changes: non-overlapping block skip (v3)** — use
+  indexdata min/max ID to skip decode for blocks that are entirely
+  OldOnly or NewOnly when block boundaries differ between old and new
+  PBFs. Blob-level byte comparison (v1) and borrowed element merge (v2)
+  are shipped. v3 handles the misaligned-boundary edge case: when
+  `old.max_id < new.min_id`, emit all old elements as OldOnly without
+  decoding (diff can use count from indexdata; derive_changes needs
+  element IDs so must still decode for delete output). Low priority —
+  v1+v2 handle the common case (same-source PBFs with identical block
+  boundaries).
 - [ ] **getid include: pread skip for non-matching blobs** — the include
   path now skips decompression via ID-range filtering (planet 71.5s →
   32.5s), but still sequentially reads the entire file to check each
@@ -145,9 +163,10 @@ works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
   unfiltered `inspect tags` on planet. Low priority.
 - [ ] ALTW dense pass 2 decode-all fallback (`write_output_decode_all` in
   `src/commands/add_locations_to_ways.rs` ~line 1045) — uses
-  `into_blocks_pipelined` processing all blobs. 25+ GB retention at planet.
-  Only triggers with `--force` on non-indexed PBFs. Niche but the last
-  unmitigated retention path.
+  `into_blocks_pipelined` processing all blobs. Retention solved by
+  DecompressPool. Only triggers with `--force` on non-indexed PBFs.
+  Pipelined decode + par_iter justified (heaviest per-block work).
+  See retention audit for details.
 
 ## Milestone 3: Beyond the benchmark
 
@@ -458,10 +477,12 @@ per-iteration allocations remain across the codebase, ordered by impact:
   rebuild (better query perf, proportional to diff size).
 - [ ] Incremental extract update (`extract --apply-changes` — base extract + OSC +
   region → updated extract without re-reading planet).
-  See [notes/incremental-extract.md](notes/incremental-extract.md)
-  for 4 approaches. Recommended: apply-changes on region extract +
-  re-extract to filter (approach 3). ~10s vs 862s. Needs
-  `--allow-missing` flag for apply-changes.
+  Recommended: compose two existing commands — `apply-changes` on
+  the region extract (with `--allow-missing` for new elements not in
+  the base), then `extract` to re-filter to the bbox. ~10s vs 862s
+  for the full-planet pipeline. Works for simple strategy immediately.
+  Complete/smart strategies need planet access for newly referenced
+  elements outside the bbox.
 - [ ] Spatial indexing in PBF format (R-tree over blob offsets for
   O(log N) spatial queries on planet files).
   See [notes/spatial-index-in-pbf.md](notes/spatial-index-in-pbf.md)
@@ -486,8 +507,7 @@ per-iteration allocations remain across the codebase, ordered by impact:
 
 ### Testing
 
-See `notes/test-plan.md` for the full pre-release test matrix (feature permutations,
-I/O modes, CLI commands) and `reference/performance.md` for consolidated baselines.
+See `reference/performance.md` for consolidated baselines.
 
 - [ ] **Diff element_stream fallback path untested** — all test PBFs are
   indexed because `PbfWriter::write_primitive_block` unconditionally adds

@@ -9,7 +9,8 @@ detailed analysis documents where available.
 
 **Result:** Japan diff: 86.4s → 52.9s (39% faster), 80.7 GB → 40.6 GB
 cumulative alloc (50% less). Commit `66990c3`.
-**Document:** [fill-buffer-optimization.md](fill-buffer-optimization.md)
+**Documents:** fill-buffer-optimization.md and block-pair-merge-join-plan.md
+(deleted — v1+v2 shipped, v3 tracked in TODO.md)
 **What:** Replaced element-level merge-join with block-level comparison.
 Non-overlapping blocks skip via indexdata min/max ID ranges.
 Overlapping blocks use borrowed elements (no String allocation for the

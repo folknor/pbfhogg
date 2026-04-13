@@ -9,108 +9,76 @@ Three-phase barrier: nodes → ways → relations.
 Each phase has two sub-steps:
 1. **Classification** — `parallel_classify_phase` with pread workers
    (parallel decode, per-region ID collection)
-2. **Write** — sequential BlobReader (single-threaded decode), write
-   matching elements to N sync-mode PbfWriters
+2. **Write** — `multi_extract_pread_write` with pread workers (parallel
+   decode, N BlockBuilders per worker, reorder buffer for ordering)
 
-## Performance profile
+## Performance profile (current)
 
-Classification is fast (parallel pread workers). The write phase is
-the bottleneck — sequential single-threaded decode for every element.
+Both classification and write phases use parallel pread workers.
+Denmark 5-region: 2.1s. Japan 5-region: 8.1s. Single-pass is now
+2.7x faster than 5 sequential extracts at Japan scale (8.1s vs 22s).
 
-Japan timing (commit `542aad0`): 34.9s single-pass vs 5 × 4.4s = 22s
-sequential. Single-pass is slower at small scale because sequential
-extract gets parallel decode per-region, while multi-extract uses
-single-threaded decode in the write phase.
+Original bottleneck (sequential write phase) was resolved by converting
+to `multi_extract_pread_write` (commit `9f72bcf`).
 
-At planet scale with 10+ regions, I/O savings (1× vs 10× file reads)
-should dominate. But the single-threaded write phase limits throughput.
+## Investigated items
 
-## Identified issues (code audit)
+### 1. Scratch buffer reuse in write phases — DONE
 
-### 1. Missing scratch buffer reuse in write phases
+Commit `19f8bc9`. `new_with_scratch` in all 3 write phases.
 
-Lines 788, 867, 936: `PrimitiveBlock::new(decompressed)` instead of
-`new_with_scratch(decompressed, &mut st_scratch, &mut gr_scratch)`.
+### 2. Per-block Vec allocation in way classify closure — OPEN
 
-The classification phases use `parallel_classify_phase` which handles
-scratch internally. The write phases use manual BlobReader loops that
-don't reuse scratch buffers. Fix: add `st_scratch`/`gr_scratch` Vecs
-before the write loop and use `new_with_scratch`.
+Line 868: `vec![Vec::new(); n]` allocates N empty Vecs per block per
+worker inside the classify closure, with `|| ()` init (no per-worker
+state).
 
-**Impact:** Mechanical fix. Eliminates ~829 MB alloc churn per phase
-at Japan scale (same pattern as the `parse_and_inline` scratch win).
+**Current state (investigated April 2026):** Node classification (line
+764) uses proper per-worker init with `DenseNodeColumns` + scratch Vecs
+that are cleared between blocks — no per-block allocation. Relation
+classification (line 922) uses `parallel_classify_accumulate` with
+per-worker `IdSetDense` accumulation — also no per-block allocation.
 
-### 2. Per-block Vec<Vec<i64>> allocation in classify closures
+Only way classification still allocates per-block. Fix: change the init
+from `|| ()` to `|| vec![Vec::<i64>::new(); n]`, pass as `&mut S`,
+clear inner Vecs between blocks (same pattern as node classification).
 
-Lines 738, 832, 897: `vec![Vec::new(); n]` allocates N empty Vecs per
-worker per block. For N=10 regions and 30K blocks with 8 workers, that's
-~240K Vec allocations (small but unnecessary).
+**Impact:** Minor — Vec<Vec<i64>> is small. But it's an inconsistency
+with the other two phases. Mechanical fix.
 
-Fix: use `thread_local!` storage for the `region_ids` Vec<Vec<i64>>,
-clearing inner Vecs between blocks (same pattern as `COLUMNS` in the
-single-extract columnar path).
+### 3. Columnar node classification — DONE
 
-**Impact:** Minor — Vec<Vec<i64>> is small. But eliminates allocator
-churn in the hot classification loop.
+Shipped for multi-extract (line 764). `DenseNodeColumns::new()` +
+`collect_matching_ids_multi_bbox`. Measured: multi-extract Japan node
+classify 1081ms → 748ms (-31%). See `notes/columnar-integration.md`.
 
-### 3. Node classification doesn't use columnar decode
+### 4. Parallel decode in write phases — DONE
 
-The single-extract path uses `DenseNodeColumns` for bbox classification
-(line 2216), but multi-extract uses element-by-element iteration
-(line 739). With columnar decode, the classification loop operates on
-contiguous i32 arrays — better cache utilization and potential
-autovectorization for the N-region inner loop.
+Commit `9f72bcf`. `multi_extract_pread_write` replaces sequential
+BlobReader in all 3 write phases. Denmark 5-region: 6.7s → 2.1s (3.2x).
+Japan 5-region: 32.5s → 8.1s (4.0x).
 
-For multi-extract with bbox regions, columnar decode is even more
-valuable: the inner loop tests each node against N regions. With
-columnar layout, this becomes N passes over the same contiguous
-lat/lon arrays, or a single pass with N bbox tests per element.
+### 5. Raw passthrough for fully-contained node blobs — OPEN
 
-**Impact:** Moderate. Depends on N (number of regions) and whether
-the classify loop is a significant fraction of total time. At planet
-scale with 10+ regions, this could be substantial.
+Infrastructure is in place: `NodeBlobInfo` tracks per-region containment,
+`multi_extract_pread_write_nodes` handles passthrough via ReorderBuffer
+interleaving. Currently only fires when a blob is contained in ALL N
+regions (useful for N=1 or fully-overlapping regions).
 
-### 4. Sequential write phases (the main bottleneck)
+Per-region passthrough for disjoint strips needs a hybrid decode+raw
+consumer path: decode once, write raw to contained regions, route
+elements to non-contained regions.
 
-The write phases use sequential `BlobReader` with single-threaded
-decode. Converting to pread-from-workers is complex because the
-write side needs to maintain N BlockBuilders and N PbfWriters, and
-the ordering must be preserved (nodes written in ascending ID order
-per region).
+**Impact:** High at planet scale. 90%+ of node blobs are interior to at
+least one region in a typical multi-extract configuration.
 
-Architecture options:
+**Known issue from TODO.md reviewer findings (2026-04-09):** Raw
+passthrough is unsafe for polygon regions — `contained_in` is computed
+from each slot's bbox, not polygon geometry. For polygon or
+multipolygon extracts, "blob bbox contained in region bbox" does not
+prove every node is inside the polygon. Pre-existing issue.
 
-**Option A: Parallel decode, sequential write**
-Workers pread + decompress + PrimitiveBlock, send to consumer.
-Consumer iterates elements, routes to N BlockBuilders/writers.
-Similar to `pread_execute` in single-extract.
-
-Pros: straightforward, reuses existing pread infrastructure.
-Cons: consumer is still single-threaded (BlockBuilder encoding +
-N-way routing). The decode is parallel but the encode is serial.
-
-**Option B: Per-region parallel writers**
-Each region gets a pipelined PbfWriter (rayon compression).
-Consumer routes elements to N pipelined writers. Compression
-happens in parallel across regions.
-
-Pros: compression parallelism scales with N regions.
-Cons: N × rayon pool contention. Sync-mode writers were chosen
-to avoid this. Memory: N × WRITE_AHEAD × blob_size in-flight.
-
-**Option C: Batch-parallel encode**
-Decode blocks into a batch, parallel-encode N regions per batch.
-Each rayon task encodes one region's matching elements for one block.
-
-Pros: fine-grained parallelism. No ordering issues within a batch.
-Cons: complex. Elements from one block may not fill a BlockBuilder
-(8000 element limit), so cross-block state is needed.
-
-**Recommendation: Option A** for simplicity. The decode is the main
-cost (~70% of write phase time). Parallel decode alone would recover
-most of the throughput gap vs sequential per-region extract.
-
-### 5. Spatial index for large N
+### 6. Spatial index for large N — OPEN
 
 Currently O(N) per element for region classification (linear scan
 through N bboxes). For N > 50, a grid index would be better:
@@ -121,38 +89,20 @@ regions in that cell.
 **Impact:** Only matters for large N (50+ regions). For typical
 multi-extract (5-20 regions), linear scan is fine.
 
-### 6. Raw passthrough for fully-contained node blobs
-
-If a node blob's bbox is fully contained within region R's bbox,
-all nodes in that blob match region R. The blob can be written as
-a raw compressed frame to region R's writer, skipping decode +
-re-encode entirely.
-
-This is the same optimization as single-extract's raw passthrough
-(`raw_passthrough` flag on `BlobDesc`), extended to per-region
-decisions: for each blob, for each region, check containment.
-
-**Impact:** High at planet scale. 90%+ of node blobs are interior
-to at least one region in a typical multi-extract configuration.
-
 ## Priority order
 
-1. ~~**Scratch buffer reuse**~~ — DONE (commit `19f8bc9`). `new_with_scratch`
-   in all 3 write phases.
-2. **Raw passthrough for contained blobs** (high impact, moderate effort)
-3. ~~**Parallel decode in write phase**~~ — DONE (commit `9f72bcf`).
-   `multi_extract_pread_write` replaces sequential BlobReader in all 3
-   write phases. Denmark 5-region: 6.7s → 2.1s (3.2x). Japan 5-region:
-   32.5s → 8.1s (4.0x).
-4. **Columnar node classification** (moderate impact, low effort)
-5. **Thread-local region_ids** (low impact, mechanical)
+1. ~~**Scratch buffer reuse**~~ — DONE (commit `19f8bc9`)
+2. ~~**Parallel decode in write phases**~~ — DONE (commit `9f72bcf`)
+3. ~~**Columnar node classification**~~ — DONE (line 764)
+4. **Raw passthrough for contained blobs** (high impact, moderate effort,
+   polygon safety issue needs resolution first)
+5. **Per-worker way classify scratch** (mechanical fix, minor impact)
 6. **Spatial index** (only for N > 50, future)
 
-## Relationship to other TODO items
+## Relationship to other documents
 
-- Scratch buffer reuse connects to the arena allocator research
-  (notes/arena-allocator-research.md, step 1)
-- Columnar node classification connects to columnar decode stabilization
-  (TODO.md Milestone A, item 2)
-- Raw passthrough connects to the per-group raw passthrough scaffolding
-  (notes/raw-group-passthrough.md) but operates at blob level
+- Columnar node classification → `notes/columnar-integration.md`
+- Raw passthrough → `notes/raw-group-passthrough.md` (blob-level, not
+  per-group; the per-group primitives are unused scaffolding)
+- Known issues (strip-4 verify failure, polygon passthrough safety,
+  O(workers × regions) scaling) → TODO.md multi-extract section

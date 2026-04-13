@@ -473,6 +473,202 @@ fn stage1_way_pass(
 }
 
 // ---------------------------------------------------------------------------
+// Node coord pass: populate dense coords_by_rank temp file
+// ---------------------------------------------------------------------------
+
+/// Parallel node scan that writes dense (lat, lon) to a temp file indexed
+/// by IdSetDense rank. Workers decompress node blobs, compute rank_if_set
+/// for each node, coalesce adjacent ranks into contiguous pwrite extents.
+///
+/// Pre-sizes the file to `unique_nodes * 8` bytes (zeroed = missing sentinel).
+#[hotpath::measure]
+fn build_coords_by_rank_file(
+    input: &Path,
+    node_id_set: &super::id_set_dense::IdSetDense,
+    unique_nodes: u64,
+    coord_file_path: &Path,
+) -> Result<()> {
+    use super::node_scanner::{NodeTuple, extract_node_tuples};
+    use std::os::unix::fs::FileExt as _;
+
+    let coord_file = std::fs::OpenOptions::new()
+        .read(true).write(true).create(true).truncate(true)
+        .open(coord_file_path)
+        .map_err(|e| format!("create coords_by_rank: {e}"))?;
+    let total_bytes = unique_nodes * COORD_SLOT_SIZE as u64;
+    coord_file.set_len(total_bytes)
+        .map_err(|e| format!("ftruncate coords_by_rank to {total_bytes}: {e}"))?;
+    let coord_file = std::sync::Arc::new(coord_file);
+
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    struct NodeBlobTask { data_offset: u64, data_size: usize }
+    let mut schedule: Vec<NodeBlobTask> = Vec::new();
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        if let Some(idx) = hdr.index() {
+            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
+        }
+        schedule.push(NodeBlobTask { data_offset, data_size });
+    }
+
+    let shared_input = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("open input for coord pass: {e}"))?
+    );
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let s_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_scan_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_write_ms = std::sync::atomic::AtomicU64::new(0);
+    let s_nodes_written = std::sync::atomic::AtomicU64::new(0);
+    let s_extents = std::sync::atomic::AtomicU64::new(0);
+    let s_bytes_written = std::sync::atomic::AtomicU64::new(0);
+    let coord_pass_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+    let schedule_ref = &schedule;
+    let next_ref = &next_idx;
+    let err_ref = &coord_pass_error;
+
+    std::thread::scope(|scope| {
+        for _ in 0..num_workers {
+            let input_file = std::sync::Arc::clone(&shared_input);
+            let out_file = std::sync::Arc::clone(&coord_file);
+            let pread_ref = &s_pread_ms;
+            let decompress_ref = &s_decompress_ms;
+            let scan_ref = &s_scan_ms;
+            let write_ref = &s_write_ms;
+            let written_ref = &s_nodes_written;
+            let extents_ref = &s_extents;
+            let bytes_ref = &s_bytes_written;
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut tuples: Vec<NodeTuple> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
+                let mut extent_buf: Vec<u8> = Vec::new();
+
+                loop {
+                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() { break; }
+                    let idx = next_ref.fetch_add(1, Relaxed);
+                    if idx >= schedule_ref.len() { break; }
+                    let task = &schedule_ref[idx];
+
+                    let blob_result: std::result::Result<(), String> = (|| {
+                        let t0 = std::time::Instant::now();
+                        read_buf.resize(task.data_size, 0);
+                        input_file.read_exact_at(&mut read_buf, task.data_offset)
+                            .map_err(|e| format!("coord pass pread: {e}"))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+
+                        let t1 = std::time::Instant::now();
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| format!("coord pass decompress: {e}"))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+
+                        let t2 = std::time::Instant::now();
+                        tuples.clear();
+                        extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
+                            .map_err(|e| format!("coord pass extract: {e}"))?;
+
+                        // Collect referenced nodes and coalesce adjacent ranks into
+                        // contiguous pwrite extents. Nodes within a blob are sorted
+                        // by ID, and rank is monotonic with ID, so referenced nodes
+                        // produce ascending ranks with gaps for unreferenced nodes.
+                        let mut extent_start_rank: Option<u64> = None;
+                        let mut prev_rank: u64 = 0;
+                        let mut blob_nodes: u64 = 0;
+                        let mut blob_extents: u64 = 0;
+                        let mut blob_bytes: u64 = 0;
+                        extent_buf.clear();
+
+                        for &NodeTuple { id, lat, lon } in &tuples {
+                            if let Some(rank) = node_id_set.rank_if_set(id) {
+                                let continues = extent_start_rank.is_some() && rank == prev_rank + 1;
+                                if !continues && !extent_buf.is_empty() {
+                                    // Flush current extent.
+                                    let start = extent_start_rank.unwrap_or(0);
+                                    let t_w = std::time::Instant::now();
+                                    out_file.write_all_at(&extent_buf, start * COORD_SLOT_SIZE as u64)
+                                        .map_err(|e| format!("coord pass pwrite: {e}"))?;
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    write_ref.fetch_add(t_w.elapsed().as_millis() as u64, Relaxed);
+                                    blob_extents += 1;
+                                    blob_bytes += extent_buf.len() as u64;
+                                    extent_buf.clear();
+                                }
+                                if !continues {
+                                    extent_start_rank = Some(rank);
+                                }
+                                extent_buf.extend_from_slice(&lat.to_le_bytes());
+                                extent_buf.extend_from_slice(&lon.to_le_bytes());
+                                prev_rank = rank;
+                                blob_nodes += 1;
+                            }
+                        }
+
+                        // Flush final extent.
+                        if !extent_buf.is_empty() {
+                            let start = extent_start_rank.unwrap_or(0);
+                            let t_w = std::time::Instant::now();
+                            out_file.write_all_at(&extent_buf, start * COORD_SLOT_SIZE as u64)
+                                .map_err(|e| format!("coord pass pwrite final: {e}"))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            write_ref.fetch_add(t_w.elapsed().as_millis() as u64, Relaxed);
+                            blob_extents += 1;
+                            blob_bytes += extent_buf.len() as u64;
+                            extent_buf.clear();
+                        }
+
+                        written_ref.fetch_add(blob_nodes, Relaxed);
+                        extents_ref.fetch_add(blob_extents, Relaxed);
+                        bytes_ref.fetch_add(blob_bytes, Relaxed);
+                        #[allow(clippy::cast_possible_truncation)]
+                        scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+                        Ok(())
+                    })();
+
+                    if let Err(e) = blob_result {
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+
+    if let Some(e) = coord_pass_error.into_inner().unwrap_or(None) {
+        return Err(e.into());
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("coord_pass_pread_ms", s_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_decompress_ms", s_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_scan_ms", s_scan_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_write_ms", s_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_nodes_written", s_nodes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_extents", s_extents.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_bytes_written", s_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("coord_pass_blobs", schedule.len() as i64);
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Stage 2: Node join — counting-sort per rank bucket, single-pass node merge
 // ---------------------------------------------------------------------------
 
@@ -2022,6 +2218,12 @@ pub fn external_join(
 
     if start <= 2 {
         // --- Stage 2: Node join ---
+        // --- Node coord pass: build dense coords_by_rank file ---
+        crate::debug::emit_marker("EXTJOIN_COORD_PASS_START");
+        let coord_file_path = scratch_dir.file_path("coords_by_rank");
+        build_coords_by_rank_file(input, &node_id_set, unique_nodes, &coord_file_path)?;
+        crate::debug::emit_marker("EXTJOIN_COORD_PASS_END");
+
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
         let resolved_count =

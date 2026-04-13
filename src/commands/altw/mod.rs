@@ -29,10 +29,12 @@ use super::{require_indexdata, HeaderOverrides, Result};
 
 mod stage1;
 mod stage2;
+mod stage3;
 mod stage4;
 
 use stage1::{build_coords_by_rank_file, build_way_schedule, stage1_way_pass};
-use stage2::{stage2_node_join, stage3_slot_reorder_from_ref, SlotBucketRef};
+use stage2::stage2_node_join;
+use stage3::{stage3_slot_reorder_from_ref, SlotBucketRef};
 use stage4::{stage4_assembly, CoordSlots};
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.

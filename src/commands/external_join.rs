@@ -58,27 +58,30 @@ const COORD_SLOT_SIZE: usize = 8;
 // ---------------------------------------------------------------------------
 
 /// A coordinate-list (COO) pair linking a node ID to a position in the
-/// way-ref stream where its coordinates should be placed.
+/// way-ref stream. `blob_seq` + `local_ref_idx` identify the ref's
+/// position; stage 2 reconstructs the global `slot_pos` from the sidecar
+/// prefix sums: `slot_pos = slot_starts[blob_seq] + local_ref_idx`.
 #[derive(Clone, Copy)]
 struct CooPair {
     node_id: i64,
-    slot_pos: u64,
+    blob_seq: u32,
+    local_ref_idx: u32,
 }
 
 impl CooPair {
     fn write_to(&self, buf: &mut [u8; COO_PAIR_SIZE]) {
         buf[..8].copy_from_slice(&self.node_id.to_le_bytes());
-        buf[8..].copy_from_slice(&self.slot_pos.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.blob_seq.to_le_bytes());
+        buf[12..16].copy_from_slice(&self.local_ref_idx.to_le_bytes());
     }
 
     fn read_from(buf: &[u8; COO_PAIR_SIZE]) -> Self {
         let node_id = i64::from_le_bytes([
             buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
         ]);
-        let slot_pos = u64::from_le_bytes([
-            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
-        ]);
-        Self { node_id, slot_pos }
+        let blob_seq = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+        let local_ref_idx = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
+        Self { node_id, blob_seq, local_ref_idx }
     }
 
     /// Bucket index for node-id partitioning.
@@ -135,103 +138,249 @@ impl ResolvedEntry {
 // Stage 1: Way pass — emit COO pairs into node buckets
 // ---------------------------------------------------------------------------
 
-/// Scan all way blobs and emit `(node_id, slot_pos)` pairs into node buckets.
+/// Parallel way scan: pread-from-workers with per-worker bucket shards.
 ///
-/// Returns the total number of way-node refs (= total coord slots needed).
+/// Workers claim blobs via `AtomicUsize::fetch_add`, pread → decompress →
+/// `scan_way_refs`, and write COO pairs `(node_id, blob_seq, local_ref_idx)`
+/// directly to per-worker bucket shard files. Each worker owns 256 BufWriters.
+/// The consumer only handles the sidecar (blob-order ref counts) — no COO
+/// data flows through it.
+///
+/// Returns `(total_refs, per_bucket_entry_counts)`.
 #[hotpath::measure]
+#[allow(clippy::too_many_lines)]
 fn stage1_way_pass(
     input: &Path,
-    direct_io: bool,
-    node_buckets: &mut BucketWriters,
+    _direct_io: bool,
+    scratch: &ScratchDir,
     ref_count_sidecar: &Path,
-) -> Result<u64> {
-    // Sequential reader to avoid PrimitiveBlock cross-thread retention.
-    // Pipelined reader retains ~11 GB anon at Europe scale (360K way blobs),
-    // which carries into stage 2 and pushes peak to 20 GB.
-    let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
+) -> Result<(u64, Vec<u64>)> {
+    use std::os::unix::fs::FileExt as _;
+
+    // Header-only pre-scan to build way-blob schedule.
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-    let mut decompress_buf: Vec<u8> = Vec::new();
-    let mut slot_pos: u64 = 0;
-    let mut pair_buf = [0u8; COO_PAIR_SIZE];
-    let mut refs_buf: Vec<i64> = Vec::new();
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-    let mut s1_decompress_ms: u64 = 0;
-    let mut s1_scan_ms: u64 = 0;
-    let mut s1_blobs: u64 = 0;
-
-    // P2c sidecar: per-way-blob ref counts for stage 4 slot_pos pre-computation.
-    // Stage 1 and stage 4 must see way blobs in the same file order (both filter
-    // by ElemKind::Way from the same indexdata). Changing blob ordering without
-    // updating both stages would silently corrupt the sidecar alignment.
-    let mut sidecar_writer = BufWriter::with_capacity(
-        64 * 1024,
-        std::fs::File::create(ref_count_sidecar)
-            .map_err(|e| format!("failed to create ref count sidecar: {e}"))?,
-    );
-
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+    struct WayBlobTask {
+        seq: u32,
+        data_offset: u64,
+        data_size: usize,
+    }
+    let mut schedule: Vec<WayBlobTask> = Vec::new();
+    let mut seq: u32 = 0;
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
-        if let Some(idx) = blob.index() {
+        if let Some(idx) = hdr.index() {
             if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
                 continue;
             }
         }
-
-        let t0 = std::time::Instant::now();
-        blob.decompress_into(&mut decompress_buf)?;
-        #[allow(clippy::cast_possible_truncation)]
-        { s1_decompress_ms += t0.elapsed().as_millis() as u64; }
-
-        let t1 = std::time::Instant::now();
-        let blob_start_pos = slot_pos;
-        let mut write_err: Option<std::io::Error> = None;
-        super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
-            if write_err.is_some() { return; }
-            for &node_id in refs {
-                let pair = CooPair { node_id, slot_pos };
-                let bucket = pair.node_bucket();
-                pair.write_to(&mut pair_buf);
-                if let Some(writer) = node_buckets.writers[bucket].as_mut() {
-                    if let Err(e) = writer.write_all(&pair_buf) {
-                        write_err = Some(e);
-                        return;
-                    }
-                }
-                node_buckets.entry_counts[bucket] += 1;
-                slot_pos += 1;
-            }
-        })?;
-        #[allow(clippy::cast_possible_truncation)]
-        { s1_scan_ms += t1.elapsed().as_millis() as u64; }
-
-        if let Some(e) = write_err {
-            return Err(e.into());
-        }
-        // Write per-blob ref count to sidecar.
-        let blob_ref_count = slot_pos - blob_start_pos;
-        sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
-        s1_blobs += 1;
+        schedule.push(WayBlobTask { seq, data_offset, data_size });
+        seq += 1;
     }
 
-    // Trailer: total ref count for alignment verification in stage 4.
-    sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
-    sidecar_writer.flush()?;
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    // Worker-side counters.
+    let s1_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1_scan_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1_blobs_counter = std::sync::atomic::AtomicU64::new(0);
+    let s1_pread_ref = &s1_pread_ms;
+    let s1_decompress_ref = &s1_decompress_ms;
+    let s1_scan_ref = &s1_scan_ms;
+    let s1_blobs_ref = &s1_blobs_counter;
+
+    // Consumer-side sidecar counter.
+    let mut s1_recv_ms: u64 = 0;
+
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let next_ref = &next_idx;
+    let schedule_ref = &schedule;
+
+    // (seq, Result<ref_count>) — workers send errors through the channel.
+    type SidecarItem = (u32, std::result::Result<u64, String>);
+    let (sidecar_tx, sidecar_rx) = std::sync::mpsc::sync_channel::<SidecarItem>(32);
+
+    // Per-worker bucket entry counts, collected after join.
+    let worker_counts: std::sync::Mutex<Vec<Vec<u64>>> = std::sync::Mutex::new(Vec::new());
+    let worker_counts_ref = &worker_counts;
+
+    let mut total_refs: u64 = 0;
+
+    std::thread::scope(|scope| -> Result<()> {
+        for worker_id in 0..num_workers {
+            let file = std::sync::Arc::clone(&shared_file);
+            let tx = sidecar_tx.clone();
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+
+                // Per-worker bucket shard files.
+                let mut shard_writers: Vec<Option<BufWriter<std::fs::File>>> = Vec::with_capacity(NUM_BUCKETS);
+                let mut entry_counts = vec![0u64; NUM_BUCKETS];
+                for bucket_idx in 0..NUM_BUCKETS {
+                    let path = scratch.path.join(format!("node-W{worker_id}-{bucket_idx:03}"));
+                    let f = match std::fs::File::create(&path) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            drop(tx.send((0, Err(format!("create shard {}: {e}", path.display())))));
+                            return;
+                        }
+                    };
+                    shard_writers.push(Some(BufWriter::with_capacity(super::external_radix::BUCKET_BUF_SIZE, f)));
+                }
+
+                let mut read_buf: Vec<u8> = Vec::new();
+                let mut decompress_buf: Vec<u8> = Vec::new();
+                let mut refs_buf: Vec<i64> = Vec::new();
+                let mut group_starts: Vec<(usize, usize)> = Vec::new();
+                let mut pair_buf = [0u8; COO_PAIR_SIZE];
+
+                loop {
+                    let idx = next_ref.fetch_add(1, Relaxed);
+                    if idx >= schedule_ref.len() {
+                        break;
+                    }
+                    let task = &schedule_ref[idx];
+
+                    let result: std::result::Result<u64, String> = (|| {
+                        let t0 = std::time::Instant::now();
+                        read_buf.resize(task.data_size, 0);
+                        file.read_exact_at(&mut read_buf, task.data_offset)
+                            .map_err(|e| format!("pread way blob at {}: {e}", task.data_offset))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s1_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
+
+                        let t1 = std::time::Instant::now();
+                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                            .map_err(|e| format!("decompress way blob: {e}"))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s1_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
+
+                        let t2 = std::time::Instant::now();
+                        let mut local_ref_idx: u32 = 0;
+                        let mut write_err: Option<String> = None;
+                        super::way_scanner::scan_way_refs(
+                            &decompress_buf, &mut refs_buf, &mut group_starts,
+                            |_way_id, refs| {
+                                if write_err.is_some() { return; }
+                                for &node_id in refs {
+                                    let pair = CooPair { node_id, blob_seq: task.seq, local_ref_idx };
+                                    let bucket = pair.node_bucket();
+                                    pair.write_to(&mut pair_buf);
+                                    if let Some(w) = shard_writers[bucket].as_mut() {
+                                        if let Err(e) = w.write_all(&pair_buf) {
+                                            write_err = Some(format!("write shard: {e}"));
+                                            return;
+                                        }
+                                    }
+                                    entry_counts[bucket] += 1;
+                                    local_ref_idx += 1;
+                                }
+                            },
+                        ).map_err(|e| e.to_string())?;
+                        if let Some(e) = write_err {
+                            return Err(e);
+                        }
+                        #[allow(clippy::cast_possible_truncation)]
+                        s1_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
+
+                        s1_blobs_ref.fetch_add(1, Relaxed);
+                        Ok(u64::from(local_ref_idx))
+                    })();
+
+                    if tx.send((task.seq, result)).is_err() {
+                        break;
+                    }
+                }
+
+                // Flush all shard writers.
+                for w in &mut shard_writers {
+                    if let Some(writer) = w.as_mut() {
+                        if let Err(e) = writer.flush() {
+                            drop(tx.send((0, Err(format!("flush shard: {e}")))));
+                        }
+                    }
+                    *w = None;
+                }
+
+                // Collect entry counts for later merging.
+                worker_counts_ref.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(entry_counts);
+            });
+        }
+
+        drop(sidecar_tx);
+
+        // Consumer: write sidecar in blob order.
+        let mut sidecar_writer = BufWriter::with_capacity(
+            64 * 1024,
+            std::fs::File::create(ref_count_sidecar)
+                .map_err(|e| format!("failed to create ref count sidecar: {e}"))?,
+        );
+
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<
+            std::result::Result<u64, String>,
+        > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
+
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = sidecar_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            { s1_recv_ms += t_recv.elapsed().as_millis() as u64; }
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            reorder.push(seq_num as usize, item);
+            while let Some(result) = reorder.pop_ready() {
+                let ref_count = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                sidecar_writer.write_all(&ref_count.to_le_bytes())?;
+                total_refs += ref_count;
+            }
+        }
+
+        // Trailer: total ref count for alignment verification in stage 4.
+        sidecar_writer.write_all(&total_refs.to_le_bytes())?;
+        sidecar_writer.flush()?;
+
+        Ok(())
+    })?;
+
+    // Merge per-worker entry counts.
+    let all_counts = worker_counts.into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut merged_counts = vec![0u64; NUM_BUCKETS];
+    for counts in &all_counts {
+        for (i, &c) in counts.iter().enumerate() {
+            merged_counts[i] += c;
+        }
+    }
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s1_decompress_ms", s1_decompress_ms as i64);
-        crate::debug::emit_counter("s1_scan_emit_ms", s1_scan_ms as i64);
-        crate::debug::emit_counter("s1_blobs", s1_blobs as i64);
+        crate::debug::emit_counter("s1_pread_ms", s1_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1_decompress_ms", s1_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1_scan_emit_ms", s1_scan_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1_blobs", s1_blobs_counter.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1_consumer_recv_ms", s1_recv_ms as i64);
+        crate::debug::emit_counter("s1_workers", all_counts.len() as i64);
     }
 
-    Ok(slot_pos)
+    Ok((total_refs, merged_counts))
 }
 
 // ---------------------------------------------------------------------------
@@ -242,13 +391,16 @@ fn stage1_way_pass(
 /// the matching node stream, emit resolved `(slot_pos, lat, lon)` entries
 /// into slot buckets.
 #[hotpath::measure]
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn stage2_node_join(
     input: &Path,
     _direct_io: bool,
-    node_buckets: &BucketWriters,
+    scratch: &ScratchDir,
+    node_entry_counts: &[u64],
+    num_shard_workers: usize,
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
+    slot_starts: &[u64],
 ) -> Result<u64> {
     let mut resolved_count: u64 = 0;
     let range_size = MAX_NODE_ID.div_ceil(NUM_BUCKETS as u64);
@@ -281,13 +433,17 @@ fn stage2_node_join(
 
         fn load_next(
             &mut self,
-            node_buckets: &BucketWriters,
+            scratch: &ScratchDir,
+            node_entry_counts: &[u64],
+            num_shard_workers: usize,
             range_size: u64,
         ) -> Result<bool> {
             while self.idx < NUM_BUCKETS {
-                if node_buckets.entry_counts[self.idx] > 0 {
-                    load_coo_bucket_into(
-                        &node_buckets.paths[self.idx],
+                if node_entry_counts[self.idx] > 0 {
+                    load_coo_bucket_shards(
+                        scratch,
+                        self.idx,
+                        num_shard_workers,
                         &mut self.data_buf,
                         &mut self.sorted_pairs,
                     )?;
@@ -310,7 +466,7 @@ fn stage2_node_join(
     }
 
     let mut bstate = BucketState::new();
-    let has_bucket = bstate.load_next(node_buckets, range_size)?;
+    let has_bucket = bstate.load_next(scratch, node_entry_counts, num_shard_workers, range_size)?;
 
     if !has_bucket {
         return Ok(0); // No COO pairs at all
@@ -502,7 +658,7 @@ fn stage2_node_join(
                     while id >= bstate.max_id {
                         let t_load = std::time::Instant::now();
                         bstate.idx += 1;
-                        if !bstate.load_next(node_buckets, range_size)? {
+                        if !bstate.load_next(scratch, node_entry_counts, num_shard_workers, range_size)? {
                             #[allow(clippy::cast_possible_truncation)]
                             { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
                             s2_bucket_loads += 1;
@@ -522,8 +678,11 @@ fn stage2_node_join(
                     while bstate.pair_cursor < bstate.sorted_pairs.len()
                         && bstate.sorted_pairs[bstate.pair_cursor].node_id == id
                     {
+                        let pair = &bstate.sorted_pairs[bstate.pair_cursor];
+                        let slot_pos = slot_starts[pair.blob_seq as usize]
+                            + u64::from(pair.local_ref_idx);
                         let entry = ResolvedEntry {
-                            slot_pos: bstate.sorted_pairs[bstate.pair_cursor].slot_pos,
+                            slot_pos,
                             lat,
                             lon,
                         };
@@ -567,34 +726,47 @@ fn stage2_node_join(
     Ok(resolved_count)
 }
 
-/// Load a COO bucket file into reusable buffers. Both `data_buf` and `pairs`
-/// are cleared and refilled — their backing allocations are retained across
-/// bucket loads, preventing heap accumulation from the allocator holding
-/// freed blocks.
+/// Load all worker shards for a given bucket into reusable buffers.
+/// Each worker wrote to `node-W{worker_id}-{bucket_idx:03}`. This function
+/// reads and concatenates all shards, parsing COO pairs from each.
+/// Both `data_buf` and `pairs` are cleared and refilled — their backing
+/// allocations are retained across bucket loads.
 #[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
-fn load_coo_bucket_into(path: &Path, data_buf: &mut Vec<u8>, pairs: &mut Vec<CooPair>) -> Result<()> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| format!("failed to open bucket {}: {e}", path.display()))?;
-    let len = file.metadata()
-        .map_err(|e| format!("failed to stat bucket {}: {e}", path.display()))?
-        .len() as usize;
-    data_buf.clear();
-    data_buf.resize(len, 0);
-    std::io::Read::read_exact(&mut &file, data_buf)
-        .map_err(|e| format!("failed to read bucket {}: {e}", path.display()))?;
-    #[cfg(feature = "linux-direct-io")]
-    advise_dontneed_file(&file);
-
+fn load_coo_bucket_shards(
+    scratch: &ScratchDir,
+    bucket_idx: usize,
+    num_workers: usize,
+    data_buf: &mut Vec<u8>,
+    pairs: &mut Vec<CooPair>,
+) -> Result<()> {
     pairs.clear();
-    let count = data_buf.len() / COO_PAIR_SIZE;
-    if count > pairs.capacity() {
-        pairs.reserve(count - pairs.capacity());
-    }
     let mut buf = [0u8; COO_PAIR_SIZE];
-    for chunk in data_buf.chunks_exact(COO_PAIR_SIZE) {
-        buf.copy_from_slice(chunk);
-        pairs.push(CooPair::read_from(&buf));
+
+    for worker_id in 0..num_workers {
+        let path = scratch.path.join(format!("node-W{worker_id}-{bucket_idx:03}"));
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(format!("failed to open shard {}: {e}", path.display()).into()),
+        };
+        let len = file.metadata()
+            .map_err(|e| format!("failed to stat shard {}: {e}", path.display()))?
+            .len() as usize;
+        if len == 0 {
+            continue;
+        }
+        data_buf.clear();
+        data_buf.resize(len, 0);
+        std::io::Read::read_exact(&mut &file, data_buf)
+            .map_err(|e| format!("failed to read shard {}: {e}", path.display()))?;
+        #[cfg(feature = "linux-direct-io")]
+        advise_dontneed_file(&file);
+
+        for chunk in data_buf.chunks_exact(COO_PAIR_SIZE) {
+            buf.copy_from_slice(chunk);
+            pairs.push(CooPair::read_from(&buf));
+        }
     }
     Ok(())
 }
@@ -1222,11 +1394,10 @@ pub fn external_join(
 
     // --- Stage 1: Way pass ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
-    let mut node_buckets = BucketWriters::create(&scratch_dir, "node")?;
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
-    let total_slots = stage1_way_pass(input, direct_io, &mut node_buckets, &ref_count_sidecar)?;
-    let node_counts = node_buckets.finish()?;
-    let total_coo: u64 = node_counts.iter().sum();
+    let (total_slots, node_entry_counts) =
+        stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar)?;
+    let total_coo: u64 = node_entry_counts.iter().sum();
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
@@ -1236,11 +1407,33 @@ pub fn external_join(
     // --- Stage 2: Node join ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_END");
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
+    // Load sidecar prefix sums so stage 2 can reconstruct slot_pos from
+    // (blob_seq, local_ref_idx) in the new COO pair format.
+    let slot_starts = load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+    // Count actual workers from shard files.
+    let num_shard_workers = {
+        let mut count = 0;
+        loop {
+            let path = scratch_dir.path.join(format!("node-W{count}-000"));
+            if path.exists() {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        count.max(1)
+    };
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
     let resolved_count =
-        stage2_node_join(input, direct_io, &node_buckets, &mut slot_buckets, total_slots)?;
+        stage2_node_join(input, direct_io, &scratch_dir, &node_entry_counts, num_shard_workers, &mut slot_buckets, total_slots, &slot_starts)?;
     slot_buckets.finish()?;
-    node_buckets.cleanup();
+    // Clean up per-worker shard files.
+    for worker_id in 0..num_shard_workers {
+        for bucket_idx in 0..NUM_BUCKETS {
+            let path = scratch_dir.path.join(format!("node-W{worker_id}-{bucket_idx:03}"));
+            drop(std::fs::remove_file(&path));
+        }
+    }
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
 

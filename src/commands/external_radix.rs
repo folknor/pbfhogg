@@ -36,7 +36,7 @@ pub(crate) const BUCKET_BUF_SIZE: usize = 256 * 1024;
 /// commands don't collide, and so stale directories left behind by a crash
 /// are attributable.
 pub(crate) struct ScratchDir {
-    path: PathBuf,
+    pub(crate) path: PathBuf,
 }
 
 impl ScratchDir {

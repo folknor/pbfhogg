@@ -23,13 +23,13 @@ use super::COORD_SLOT_SIZE;
 // CoordSlots: memory-mapped coordinate lookup
 // ---------------------------------------------------------------------------
 
-/// Memory-mapped coord_slots file for coordinate lookup.
-/// The mmap is used for the `assemble_block` fallback path (non-indexed PBFs).
-/// Way blobs in the hot path use per-blob pread into a worker-local buffer instead.
+/// Memory-mapped coord_slots file for zero-syscall coordinate lookup.
+/// Access is sequential (slot_pos advances monotonically during assembly),
+/// so MADV_SEQUENTIAL enables kernel readahead. Replaces the previous
+/// per-ref pread approach (8B syscalls at planet scale).
 pub(super) struct CoordSlots {
     mmap: memmap2::Mmap,
     total_slots: u64,
-    file: std::fs::File,
 }
 
 impl CoordSlots {
@@ -40,12 +40,9 @@ impl CoordSlots {
             .map_err(|e| format!("failed to stat coord_slots: {e}"))?
             .len();
         if len == 0 {
-            let file2 = std::fs::File::open(path)
-                .map_err(|e| format!("failed to open coord_slots (2nd): {e}"))?;
             return Ok(Self {
                 mmap: memmap2::MmapOptions::new().map_anon()?.make_read_only()?,
                 total_slots: 0,
-                file: file2,
             });
         }
         let mmap = unsafe { memmap2::Mmap::map(&file) }
@@ -54,18 +51,11 @@ impl CoordSlots {
         {
             mmap.advise(memmap2::Advice::Sequential).ok();
         }
-        let file2 = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open coord_slots (pread): {e}"))?;
-        Ok(Self { mmap, total_slots, file: file2 })
+        Ok(Self { mmap, total_slots })
     }
 
-    /// Expose the file handle for worker pread (way blob hot path).
-    pub(super) fn file(&self) -> &std::fs::File {
-        &self.file
-    }
-
-    /// Read a coordinate at the given slot position via mmap. Used by the
-    /// `assemble_block` fallback path only.
+    /// Read a coordinate at the given slot position. Zero syscalls — direct
+    /// mmap byte access.
     #[allow(clippy::cast_possible_truncation)]
     fn get(&self, slot_pos: u64) -> Option<(i32, i32)> {
         if slot_pos >= self.total_slots {
@@ -93,7 +83,6 @@ struct BlobDescriptor {
     data_size: usize,
     slot_start: u64,
     is_way_blob: bool,
-    blob_ref_count: u64,
 }
 
 /// Load the ref-count sidecar and compute prefix sums for slot_start values.
@@ -233,29 +222,24 @@ pub(super) fn stage4_assembly(
         }
 
         // Way blobs consume sidecar entries for slot_start.
-        let (slot_start, blob_ref_count) = if let Some(idx) = header_entry.index() {
+        let slot_start = if let Some(idx) = header_entry.index() {
             if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
                 if way_sidecar_idx >= way_slot_starts.len() {
                     return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
                 }
                 let start = way_slot_starts[way_sidecar_idx];
-                let ref_count = if way_sidecar_idx + 1 < way_slot_starts.len() {
-                    way_slot_starts[way_sidecar_idx + 1] - way_slot_starts[way_sidecar_idx]
-                } else {
-                    total_slots - way_slot_starts[way_sidecar_idx]
-                };
                 way_sidecar_idx += 1;
-                (start, ref_count)
+                start
             } else {
-                (0, 0)
+                0
             }
         } else {
-            (0, 0)
+            0
         };
 
         let is_way_blob = header_entry.index()
             .is_some_and(|idx| matches!(idx.kind, crate::blob_index::ElemKind::Way));
-        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start, is_way_blob, blob_ref_count });
+        schedule.push(BlobDescriptor { seq, data_offset, data_size, slot_start, is_way_blob });
         seq += 1;
     }
 
@@ -308,7 +292,6 @@ pub(super) fn stage4_assembly(
     let s4_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s4_pread_calls = std::sync::atomic::AtomicU64::new(0);
     let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s4_coord_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
@@ -321,7 +304,6 @@ pub(super) fn stage4_assembly(
     let s4_bytes_read_ref = &s4_bytes_read;
     let s4_pread_calls_ref = &s4_pread_calls;
     let s4_max_worker_buf_ref = &s4_max_worker_buf_bytes;
-    let s4_coord_pread_ref = &s4_coord_pread_ms;
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
@@ -357,7 +339,6 @@ pub(super) fn stage4_assembly(
                 let mut locations_buf: Vec<(i32, i32)> = Vec::new();
                 let mut way_reframe_scratch = WayReframeScratch::new();
                 let mut reframe_output: Vec<u8> = Vec::new();
-                let mut coord_buf: Vec<u8> = Vec::new();
 
                 loop {
                     let desc = {
@@ -389,28 +370,12 @@ pub(super) fn stage4_assembly(
                         output_blocks.clear();
 
                         if desc.is_way_blob {
-                            // Pre-read this blob's coord range into worker-local buffer.
-                            #[allow(clippy::cast_possible_truncation)]
-                            let coord_byte_len = desc.blob_ref_count as usize * COORD_SLOT_SIZE;
-                            coord_buf.resize(coord_byte_len, 0);
-                            if coord_byte_len > 0 {
-                                let t_cpread = std::time::Instant::now();
-                                coord_slots.file().read_exact_at(
-                                    &mut coord_buf,
-                                    desc.slot_start * COORD_SLOT_SIZE as u64,
-                                ).map_err(|e| crate::error::new_error(
-                                    crate::error::ErrorKind::Io(e)
-                                ))?;
-                                #[allow(clippy::cast_possible_truncation)]
-                                s4_coord_pread_ref.fetch_add(t_cpread.elapsed().as_millis() as u64, Relaxed);
-                            }
-
                             // Wire-format reframe: splice locations without
                             // full PrimitiveBlock decode or BlockBuilder.
                             let (way_count, _new_slot_pos, min_id, max_id, missing) =
                                 reframe_way_blob_with_locations(
                                     &decompress_buf,
-                                    &coord_buf,
+                                    coord_slots,
                                     desc.slot_start,
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
@@ -555,7 +520,6 @@ pub(super) fn stage4_assembly(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s4_coord_pread_ms", s4_coord_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -774,15 +738,11 @@ impl WayReframeScratch {
 /// groups, relation groups, and all non-ref way fields verbatim. Only
 /// decodes way refs (field 8) to count them and look up coords.
 ///
-/// `coord_buf` is a pre-read worker-local buffer containing all coord slots
-/// for this blob, starting at slot index `way_slot_pos`. Each slot is
-/// `COORD_SLOT_SIZE` bytes (lat i32 LE, lon i32 LE). Zero sentinel = missing.
-///
 /// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],
-    coord_buf: &[u8],
+    coord_slots: &CoordSlots,
     mut way_slot_pos: u64,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
@@ -834,8 +794,6 @@ fn reframe_way_blob_with_locations(
     let mut max_way_id: i64 = i64::MIN;
     let mut missing_locations: u64 = 0;
     let mut blob_refs: u64 = 0;
-    // Byte offset into coord_buf; advances in sync with way_slot_pos.
-    let mut buf_offset: usize = 0;
 
     // Level 2: process each PrimitiveGroup.
     for &(gr_offset, gr_len) in &scratch.group_ranges {
@@ -887,34 +845,24 @@ fn reframe_way_blob_with_locations(
                 #[allow(clippy::cast_possible_truncation)]
                 counters.ref_parse_ms.fetch_add(t_ref_parse.elapsed().as_millis() as u64, Relaxed);
 
-                // Pass 1b: read coords from worker-local buffer (pre-read via pread).
+                // Pass 1b: read coords from mmap (sequential).
                 let t_read = std::time::Instant::now();
                 scratch.coord_scratch.clear();
                 let mut way_missing: u64 = 0;
                 let mut way_present: u64 = 0;
                 for _ in 0..ref_count {
-                    let co = buf_offset;
-                    buf_offset += COORD_SLOT_SIZE;
-                    if co + COORD_SLOT_SIZE <= coord_buf.len() {
-                        let lat = i32::from_le_bytes([
-                            coord_buf[co], coord_buf[co+1], coord_buf[co+2], coord_buf[co+3],
-                        ]);
-                        let lon = i32::from_le_bytes([
-                            coord_buf[co+4], coord_buf[co+5], coord_buf[co+6], coord_buf[co+7],
-                        ]);
-                        if lat == 0 && lon == 0 {
+                    let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                        Some(loc) => {
+                            way_present += 1;
+                            loc
+                        }
+                        None => {
                             missing_locations += 1;
                             way_missing += 1;
-                            scratch.coord_scratch.push((0, 0));
-                        } else {
-                            way_present += 1;
-                            scratch.coord_scratch.push((lat, lon));
+                            (0, 0)
                         }
-                    } else {
-                        missing_locations += 1;
-                        way_missing += 1;
-                        scratch.coord_scratch.push((0, 0));
-                    }
+                    };
+                    scratch.coord_scratch.push((lat, lon));
                     way_slot_pos += 1;
                 }
                 #[allow(clippy::cast_possible_truncation)]

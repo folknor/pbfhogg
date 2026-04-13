@@ -29,7 +29,7 @@
 //! assume new IDs are dense starting at `start_*_id` must tolerate
 //! mixed old/new ID spaces in the output.
 //!
-//! Planet: 209 s (3m29s), 7.0 GB peak anon (commit `67c7960`).
+//! Planet: 194 s (3m14s), 3.3 GB peak anon (commit `cb99106`).
 //! Denmark cross-validated against in-memory mode on every commit.
 
 use std::path::Path;

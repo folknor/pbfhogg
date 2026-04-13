@@ -393,8 +393,9 @@ baseline (`c5d00c22`) exactly.
 | `6acb9eb` | Replace relation_map FxHashMap with IdSetDense (~500 MB → ~20 MB) | — |
 | `db49c92` | Open input file once, reuse fd across all phases | — |
 | `67c7960` | Atomic index dispatch + reframe_buf pre-reserve | **209 s (3m29s)** |
+| `cb99106` | Shared atomic IdSetDense (−54% memory), wire-format R1 scanner | **194 s (3m14s)** |
 
-**−3,247 s (−94%)** from baseline. Each commit verified on Denmark
+**−3,262 s (−94%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS due to
 reorder-buffer backlog from range-split dispatch and glibc arena
@@ -402,23 +403,22 @@ fragmentation — resolved by work-stealing dispatch + `MALLOC_ARENA_MAX=2`.
 
 ### Memory
 
-Peak anon 7.0 GB (commit `67c7960`). Dominated by IdSetDense bitsets
-(node_id_set ~1.6 GB + rank index ~1 GB, way_id_set ~200 MB + rank,
-relation_id_set ~20 MB). No FxHashMap relation_map — replaced by
-IdSetDense. Zero temp disk (all flat files eliminated). `mallopt
-(M_ARENA_MAX, 2)` inside `renumber_external()` caps glibc arena growth
-from cross-thread OwnedBlock `Vec<u8>` frees. Well under the 30 GB
-host limit.
+Peak anon 3.3 GB (commit `cb99106`). Single shared `IdSetDense` with
+`AtomicU8::fetch_or` for concurrent pass 1 writes (~1.5 GB node bitset
++ rank index, ~200 MB way bitset + rank, ~20 MB relation bitset).
+Zero temp disk. `mallopt(M_ARENA_MAX, 2)` inside `renumber_external()`
+caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
 
-### Phase breakdown (commit `67c7960`, planet, `--bench 1`)
+### Phase breakdown (commit `cb99106`, planet, `--bench 1`, UUID `f9098cab`)
 
 | Phase | Duration | Peak Anon | Share |
 |---|---:|---:|---:|
-| PASS1 (4 workers, wire-format nodes) | **124 s** | — | 59% |
-| STAGE2D (6 workers, fused way resolve + wire-format ways) | **77 s** | — | 37% |
-| R1+R2A (sequential relation ID assignment) | **4.4 s** | — | 2% |
-| R2D (parallel wire-format relations, inline rank()) | **2.0 s** | — | 1% |
-| **TOTAL** | **209 s (3m29s)** | **7.0 GB** | — |
+| Schedule scan | **16.6 s** | — | 9% |
+| PASS1 (4 workers, wire-format nodes) | **95.3 s** | 2.1 GB | 49% |
+| STAGE2D (6 workers, fused way resolve + wire-format ways) | **76.8 s** | 3.3 GB | 40% |
+| R1 (sequential wire-format relation ID scan) | **3.2 s** | — | 2% |
+| R2D (parallel wire-format relations, inline rank()) | **1.9 s** | — | 1% |
+| **TOTAL** | **194 s (3m14s)** | **3.3 GB** | — |
 
 ## Extract
 

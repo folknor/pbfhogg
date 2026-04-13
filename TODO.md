@@ -263,55 +263,15 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools — command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **`renumber` — further optimization (current: 209 s / 3m29s, planet).**
-  Inmem path removed; external is the only implementation. Planet: 209 s,
-  7.0 GB peak anon, zero temp disk (commit `67c7960`).
-
-  *Medium confidence (5-20 s):*
-
-  - [ ] **Wire-format scanner for R1** (est. −3 to −5 s). Full
-    PrimitiveBlock decode just to iterate relation IDs. A lightweight
-    scanner would skip string table parsing and UTF-8 validation.
-  - [ ] **Contiguous-range rank() fast path.** Cache last chunk/block;
-    skip prefix recomputation for consecutive refs in the same block.
-  - [ ] **`direct_io` flag honored in pread stages.** Shared input fd
-    uses plain `File::open`. Should use O_DIRECT when the flag is set.
-
-  *Smaller wins (2-5 s):*
-
-  - [ ] **Varint encode lookup table.** 256-entry for single-byte varints.
-  - [ ] **Longest-job-first scheduling for pass 1.**
-  - [ ] **Shared `IdSetDense` with `AtomicU8::fetch_or` in pass 1.**
-    Eliminates 3-way merge, reduces peak memory 6 GB → 1.5 GB.
-  - [ ] **`posix_fadvise(SEQUENTIAL)` on the main input fd.**
-  - [ ] **Skip `way_id_set` if way rank derivable from schedule.**
-
-  *Speculative / high effort:*
-
-  - [ ] SIMD / table-driven varint decode (requires `protohoggr` changes)
-  - [ ] io_uring for pread (est. −6 s pass 1, −3 s stage 2d)
-  - [ ] mmap input instead of pread (uncertain net effect)
-  - [ ] Pipelined writer per phase + concatenate
-  - [ ] Dedicated allocator (jemalloc / mimalloc)
-  - [ ] Huge pages for IdSetDense chunks / rank index
-  - [ ] NUMA / affinity tuning (single-socket host = 0% gain)
-
-  *Instrumentation:*
-
-  - [ ] Consumer drain-rate (rx.recv vs write time)
-  - [ ] Finer stage 2d reframe breakdown (parse/lookup/encode/frame)
-
-  *Hardening:*
-
-  - [ ] `relation_id_set` size warning if OSM grows past ~50M relations.
-
-  *Test gaps:*
-
-  - [ ] **Non-indexed input test.** Renumber errors on non-indexed PBFs;
-    verify the error message fires correctly.
-  - [ ] **Non-dense `Element::Node` path.** Pass 1 only handles DenseNodes
-    via wire-format rewriter. Document that the non-dense branch is
-    unreachable with modern PBFs.
+- [ ] **`renumber` — minor optimization (current: 194 s / 3m14s, planet).**
+  Planet: 194 s, 3.3 GB peak anon, zero temp disk (commit `cb99106`).
+  - [ ] **Varint encode lookup table.** 256-entry for single-byte varints
+    in the reframe functions. Est. −2 to −3 s wall.
+  - [ ] **Skip `way_id_set` if way rank derivable from schedule.** Sorted
+    input means new way ID = `start_way_id + global_position`. Derive from
+    schedule prefix sums instead of building a full IdSetDense. Saves ~160 MB.
+  - [ ] **Finer stage 2d reframe breakdown.** Split `reframe_ms` into
+    parse/lookup/encode/frame to identify which sub-step dominates.
 
 ### Ecosystem
 

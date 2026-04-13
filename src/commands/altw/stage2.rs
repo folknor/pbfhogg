@@ -201,6 +201,7 @@ pub(super) fn stage2_node_join(
                 let lon = i32::from_le_bytes([
                     coord_slice[co+4], coord_slice[co+5], coord_slice[co+6], coord_slice[co+7],
                 ]);
+                let is_resolved = lat != 0 || lon != 0;
 
                 for &slot_pos in &bkt.grouped_slot_pos[start..end] {
                     let entry = ResolvedEntry { slot_pos, lat, lon };
@@ -210,7 +211,9 @@ pub(super) fn stage2_node_join(
                         writer.write_all(&entry_buf)?;
                     }
                     slot_buckets.entry_counts[bucket] += 1;
-                    resolved_count += 1;
+                    if is_resolved {
+                        resolved_count += 1;
+                    }
                 }
             }
             #[allow(clippy::cast_possible_truncation)]

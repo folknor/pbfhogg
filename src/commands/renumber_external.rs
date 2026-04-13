@@ -559,6 +559,7 @@ struct BlobTask {
 /// `brokkr cat` / indexed datasets.
 /// Scan all blob headers once and build per-kind schedules.
 /// Returns `(node_schedule, way_schedule, relation_schedule)`.
+#[hotpath::measure]
 fn build_all_blob_schedules(
     input: &Path,
 ) -> Result<(Vec<BlobTask>, Vec<BlobTask>, Vec<BlobTask>)> {
@@ -615,6 +616,7 @@ fn build_all_blob_schedules(
 /// `Vec<OwnedBlock>` via bounded channel. Main thread reorders by
 /// seq and writes output. Per-worker IdSetDense bitsets are merged
 /// after pass 1 via bitwise OR.
+#[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_parallel_scan(
     schedule: &[BlobTask],
@@ -1451,6 +1453,7 @@ fn reframe_relations_with_new_ids(
 /// R1 pass: collect relation IDs into an `IdSetDense` bitset.
 /// New IDs are derived via `start_relation_id + rank(old_id)` —
 /// no explicit mapping needed.
+#[hotpath::measure]
 fn relation_r1_collect_ids(
     shared_file: &std::fs::File,
     relation_schedule: &[BlobTask],

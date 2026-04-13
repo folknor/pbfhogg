@@ -175,7 +175,7 @@ fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
 /// **Pass B**: rescan ways with rank index available. Emit `(rank, slot_pos)`
 /// records into rank-bucketed per-worker shard files.
 ///
-/// Returns `(total_refs, unique_nodes, rank_bucket_entry_counts, node_id_set)`.
+/// Returns `(total_refs, unique_nodes, rank_bucket_entry_counts, num_workers, node_id_set)`.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 fn stage1_way_pass(
@@ -183,7 +183,7 @@ fn stage1_way_pass(
     _direct_io: bool,
     scratch: &ScratchDir,
     ref_count_sidecar: &Path,
-) -> Result<(u64, u32, Vec<u64>, IdSetDense)> {
+) -> Result<(u64, u32, Vec<u64>, usize, IdSetDense)> {
     use std::os::unix::fs::FileExt as _;
 
     let schedule = build_way_schedule(input)?;
@@ -481,38 +481,7 @@ fn stage1_way_pass(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 
-    // Consolidate per-worker shards into one file per rank bucket.
-    // Reduces stage 2 from N×256 file opens to 256.
-    let t_consolidate = std::time::Instant::now();
-    let num_actual = num_actual_workers;
-    for bucket_idx in 0..NUM_BUCKETS {
-        if merged_counts[bucket_idx] == 0 { continue; }
-        let consolidated_path = scratch.path.join(format!("rank-{bucket_idx:03}"));
-        let mut out = std::fs::File::create(&consolidated_path)
-            .map_err(|e| format!("create consolidated rank bucket: {e}"))?;
-        for worker_id in 0..num_actual {
-            let shard_path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-            let mut shard = match std::fs::File::open(&shard_path) {
-                Ok(f) => f,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(format!("open shard for consolidation: {e}").into()),
-            };
-            std::io::copy(&mut shard, &mut out)
-                .map_err(|e| format!("copy shard to consolidated: {e}"))?;
-            drop(std::fs::remove_file(&shard_path));
-        }
-    }
-    // Remove any remaining empty shard files.
-    for worker_id in 0..num_actual {
-        for bucket_idx in 0..NUM_BUCKETS {
-            let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-            drop(std::fs::remove_file(&path));
-        }
-    }
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("s1_consolidate_ms", t_consolidate.elapsed().as_millis() as i64);
-
-    Ok((total_refs, unique_nodes_u32, merged_counts, node_id_set))
+    Ok((total_refs, unique_nodes_u32, merged_counts, num_actual_workers, node_id_set))
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +501,7 @@ fn stage2_node_join(
     _direct_io: bool,
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
+    num_shard_workers: usize,
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
     unique_nodes: u32,
@@ -556,6 +526,7 @@ fn stage2_node_join(
     fn prepare_bucket(
         bucket_idx: usize,
         scratch: &ScratchDir,
+        num_shard_workers: usize,
         unique_nodes: u32,
         rank_range_size: u64,
     ) -> std::result::Result<PreparedBucket, String> {
@@ -567,25 +538,31 @@ fn stage2_node_join(
         };
         let local_range = (bucket_rank_end - bucket_rank_start) as usize;
 
-        // Load records from consolidated rank bucket file.
-        let path = scratch.path.join(format!("rank-{bucket_idx:03}"));
+        // Load records from all worker shards.
+        let mut records: Vec<RankRecord> = Vec::new();
         let mut data_buf: Vec<u8> = Vec::new();
-        let file = std::fs::File::open(&path)
-            .map_err(|e| format!("open rank bucket {bucket_idx}: {e}"))?;
-        let len = file.metadata()
-            .map_err(|e| format!("stat rank bucket: {e}"))?
-            .len() as usize;
-        data_buf.resize(len, 0);
-        std::io::Read::read_exact(&mut &file, &mut data_buf)
-            .map_err(|e| format!("read rank bucket: {e}"))?;
-        #[cfg(feature = "linux-direct-io")]
-        advise_dontneed_file(&file);
-
-        let mut records: Vec<RankRecord> = Vec::with_capacity(len / RANK_RECORD_SIZE);
         let mut buf = [0u8; RANK_RECORD_SIZE];
-        for chunk in data_buf.chunks_exact(RANK_RECORD_SIZE) {
-            buf.copy_from_slice(chunk);
-            records.push(RankRecord::read_from(&buf));
+        for worker_id in 0..num_shard_workers {
+            let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("open rank shard: {e}")),
+            };
+            let len = file.metadata()
+                .map_err(|e| format!("stat rank shard: {e}"))?
+                .len() as usize;
+            if len == 0 { continue; }
+            data_buf.clear();
+            data_buf.resize(len, 0);
+            std::io::Read::read_exact(&mut &file, &mut data_buf)
+                .map_err(|e| format!("read rank shard: {e}"))?;
+            #[cfg(feature = "linux-direct-io")]
+            advise_dontneed_file(&file);
+            for chunk in data_buf.chunks_exact(RANK_RECORD_SIZE) {
+                buf.copy_from_slice(chunk);
+                records.push(RankRecord::read_from(&buf));
+            }
         }
 
         // Counting sort by local rank.
@@ -678,7 +655,7 @@ fn stage2_node_join(
                     if s2_stop_ref.load(std::sync::atomic::Ordering::Relaxed) { break; }
                     if rank_bucket_counts[bucket_idx] == 0 { continue; }
                     let result = prepare_bucket(
-                        bucket_idx, scratch,
+                        bucket_idx, scratch, num_shard_workers,
                         unique_nodes, rank_range_size,
                     );
                     let is_err = result.is_err();
@@ -1538,7 +1515,7 @@ pub fn external_join(
     // --- Stage 1: Two-pass way scan ---
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
-    let (total_slots, unique_nodes, rank_bucket_counts, node_id_set) =
+    let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
         stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar)?;
     let total_coo: u64 = rank_bucket_counts.iter().sum();
     #[allow(clippy::cast_possible_wrap)]
@@ -1553,12 +1530,14 @@ pub fn external_join(
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
     let resolved_count =
-        stage2_node_join(input, direct_io, &scratch_dir, &rank_bucket_counts, &mut slot_buckets, total_slots, unique_nodes, &node_id_set)?;
+        stage2_node_join(input, direct_io, &scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &node_id_set)?;
     slot_buckets.finish()?;
-    // Clean up consolidated rank bucket files.
-    for bucket_idx in 0..NUM_BUCKETS {
-        let path = scratch_dir.path.join(format!("rank-{bucket_idx:03}"));
-        drop(std::fs::remove_file(&path));
+    // Clean up per-worker rank shard files.
+    for worker_id in 0..num_shard_workers {
+        for bucket_idx in 0..NUM_BUCKETS {
+            let path = scratch_dir.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+            drop(std::fs::remove_file(&path));
+        }
     }
     #[allow(clippy::cast_possible_wrap)]
     crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);

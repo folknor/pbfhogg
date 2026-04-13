@@ -48,6 +48,46 @@ impl IdSetDense {
         chunk[offset] |= 1u8 << (id & 7);
     }
 
+    /// Pre-allocate all chunks needed to hold IDs up to `max_id`.
+    /// Call before `set_atomic` to avoid dynamic resizing during
+    /// concurrent access.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn pre_allocate(&mut self, max_id: i64) {
+        if max_id < 0 { return; }
+        let max_cid = (max_id as u64 >> (CHUNK_BITS + 3)) as usize;
+        if max_cid >= self.chunks.len() {
+            self.chunks.resize_with(max_cid + 1, || None);
+        }
+        for slot in &mut self.chunks {
+            if slot.is_none() {
+                *slot = Some(Box::new([0u8; CHUNK_SIZE]));
+            }
+        }
+    }
+
+    /// Atomically set a bit. Requires `pre_allocate()` to have been called
+    /// with a `max_id` >= `id`. Safe for concurrent use from multiple threads
+    /// via `&self` (no `&mut` needed). Uses `Relaxed` ordering — callers must
+    /// synchronize (e.g. thread join) before reading via `get()` or `rank()`.
+    ///
+    /// # Safety
+    /// The caller must ensure that chunks are pre-allocated via `pre_allocate()`.
+    /// Panics if `id` falls outside the pre-allocated range.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_atomic(&self, id: i64) {
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        let chunk = self.chunks[cid].as_ref().expect("set_atomic: chunk not pre-allocated");
+        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
+        let bit = 1u8 << (id & 7);
+        // SAFETY: AtomicU8 and u8 have identical size/alignment. The chunk
+        // is pre-allocated and lives for the duration of the parallel phase.
+        // Relaxed ordering is sufficient — we only need visibility after
+        // the thread::scope join barrier.
+        let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
+        atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    }
+
     #[allow(clippy::cast_sign_loss)]
     pub fn get(&self, id: i64) -> bool {
         let id = id as u64;

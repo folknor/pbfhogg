@@ -38,12 +38,14 @@ use super::renumber::{RenumberOptions, RenumberStats};
 use super::{require_sorted, writer_from_header, HeaderOverrides, Result};
 use crate::block_builder::OwnedBlock;
 use crate::writer::Compression;
-use crate::Element;
 
 
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
+
+const PASS1_WORKERS: usize = 4;
+const STAGE2D_WORKERS: usize = 6;
 
 /// Reject negative ids at the entry of the external path.
 ///
@@ -152,20 +154,18 @@ pub fn renumber_external(
 
     // ---- Pass 1: parallel node scan ----
     //
-    // Work-stealing dispatch: 4 workers claim blobs via AtomicUsize,
-    // each owning an IdSetDense bitset and scratch buffers. Workers
+    // Work-stealing dispatch: workers claim blobs via AtomicUsize,
+    // write into a shared IdSetDense via AtomicU8::fetch_or. Workers
     // pread → decompress → wire-format reframe (replace only ID deltas,
     // copy everything else verbatim) → send Vec<OwnedBlock> through a
     // bounded channel. Main thread reorders by seq and writes output.
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
-    // Per-worker IdSetDense bitsets. Merged after pass 1 to produce a
-    // single bitset with rank index for O(1) new_id lookup in the fused
-    // way scan. Replaces the old node_map shard bucket files entirely.
-    const PASS1_WORKERS: usize = 4;
-    let mut worker_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..PASS1_WORKERS)
-        .map(|_| super::id_set_dense::IdSetDense::new())
-        .collect();
+    // Single shared IdSetDense — pre-allocate all chunks for the max
+    // node ID so workers can use set_atomic(&self) concurrently.
+    let max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id);
+    let mut node_id_set = super::id_set_dense::IdSetDense::new();
+    node_id_set.pre_allocate(max_node_id);
 
     let nodes_written_atomic = std::sync::atomic::AtomicU64::new(0);
 
@@ -173,15 +173,12 @@ pub fn renumber_external(
         &pass1_schedule,
         opts.start_node_id,
         &shared_file,
-        &mut worker_id_sets,
+        &node_id_set,
         &nodes_written_atomic,
         &mut writer,
     )?;
 
     stats.nodes_written += nodes_written_atomic.load(std::sync::atomic::Ordering::Relaxed);
-    // Sanity check: the two-worker prefix sum must match the actual
-    // atomic count. If not, either the schedule's indexdata count
-    // diverged from the decoded node count or a worker dropped work.
     if stats.nodes_written != pass1_total_nodes {
         return Err(format!(
             "pass1 node count mismatch: schedule reported {pass1_total_nodes}, \
@@ -193,16 +190,12 @@ pub fn renumber_external(
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
-    // ---- Merge per-worker IdSetDense bitsets and build rank index ----
-    let t_merge = std::time::Instant::now();
-    let mut node_id_set = worker_id_sets.remove(0);
-    for other in worker_id_sets {
-        node_id_set.merge(other);
-    }
+    // ---- Build rank index (no merge needed — single shared bitset) ----
+    let t_rank = std::time::Instant::now();
     node_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
-        crate::debug::emit_counter("renumber_ext_node_merge_rank_ms", t_merge.elapsed().as_millis() as i64);
+        crate::debug::emit_counter("renumber_ext_node_rank_ms", t_rank.elapsed().as_millis() as i64);
         crate::debug::emit_counter(
             "renumber_ext_node_map_entries",
             node_id_set.total_count() as i64,
@@ -213,7 +206,6 @@ pub fn renumber_external(
     // Resolves way refs inline via node_id_set.rank() during
     // wire-format splice. No intermediate flat file or sidecar.
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_START");
-    const STAGE2D_WORKERS: usize = 6;
     let mut way_id_sets: Vec<super::id_set_dense::IdSetDense> = (0..STAGE2D_WORKERS)
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
@@ -547,6 +539,8 @@ struct BlobTask {
     /// Source blob's min element ID from indexdata. Used for per-block
     /// negative-id skip: if min_id >= 0, all IDs are non-negative.
     min_id: i64,
+    /// Source blob's max element ID from indexdata.
+    max_id: i64,
     /// Source blob's spatial bbox (node blobs only).
     bbox: Option<crate::blob_index::BlobBbox>,
 }
@@ -597,6 +591,7 @@ fn build_all_blob_schedules(
             data_size,
             element_count: idx.count,
             min_id: idx.min_id,
+            max_id: idx.max_id,
             bbox: idx.bbox,
         });
         *seq += 1;
@@ -607,22 +602,21 @@ fn build_all_blob_schedules(
 /// Parallel pass 1: wire-format node rewriter with work-stealing dispatch.
 ///
 /// Workers (PASS1_WORKERS) claim blobs via `AtomicUsize::fetch_add`
-/// over the schedule. Each worker owns an `IdSetDense` bitset shard
-/// and scratch buffers. Per-blob base new_id is pre-computed in a
+/// over the schedule. All workers share a single pre-allocated `IdSetDense`
+/// via `set_atomic()`. Per-blob base new_id is pre-computed in a
 /// prefix-sum array so workers process blobs in any order.
 ///
 /// Workers pread → decompress → `reframe_dense_with_new_ids` (splice
 /// new ID deltas, copy lat/lon/tags/metadata verbatim) → send
 /// `Vec<OwnedBlock>` via bounded channel. Main thread reorders by
-/// seq and writes output. Per-worker IdSetDense bitsets are merged
-/// after pass 1 via bitwise OR.
+/// seq and writes output.
 #[hotpath::measure]
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_parallel_scan(
     schedule: &[BlobTask],
     start_node_id: i64,
     shared_file: &std::sync::Arc<std::fs::File>,
-    id_sets: &mut [super::id_set_dense::IdSetDense],
+    node_id_set: &super::id_set_dense::IdSetDense,
     nodes_written: &std::sync::atomic::AtomicU64,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
 ) -> Result<()> {
@@ -654,27 +648,21 @@ fn pass1_parallel_scan(
     let next_ref = &next_idx;
 
     std::thread::scope(|scope| -> Result<()> {
-        {
-            let mut remaining: &mut [super::id_set_dense::IdSetDense] = id_sets;
-            for _ in 0..remaining.len() {
-                let (head, tail) = remaining.split_at_mut(1);
-                remaining = tail;
-                let shard = &mut head[0];
-                let file = std::sync::Arc::clone(shared_file);
-                let tx = decoded_tx.clone();
-                scope.spawn(move || {
-                    pass1_worker(
-                        schedule,
-                        next_ref,
-                        base_ids_ref,
-                        &file,
-                        shard,
-                        nodes_written,
-                        pass1_cref,
-                        &tx,
-                    );
-                });
-            }
+        for _ in 0..PASS1_WORKERS {
+            let file = std::sync::Arc::clone(shared_file);
+            let tx = decoded_tx.clone();
+            scope.spawn(move || {
+                pass1_worker(
+                    schedule,
+                    next_ref,
+                    base_ids_ref,
+                    &file,
+                    node_id_set,
+                    nodes_written,
+                    pass1_cref,
+                    &tx,
+                );
+            });
         }
 
         drop(decoded_tx);
@@ -766,7 +754,7 @@ fn pass1_worker(
     next_idx: &std::sync::atomic::AtomicUsize,
     base_new_ids: &[i64],
     shared_file: &std::sync::Arc<std::fs::File>,
-    id_set: &mut super::id_set_dense::IdSetDense,
+    id_set: &super::id_set_dense::IdSetDense,
     nodes_written: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
     tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
@@ -881,7 +869,7 @@ fn pass1_worker(
 fn reframe_dense_with_new_ids(
     decompressed: &[u8],
     base_new_id: i64,
-    id_set: &mut super::id_set_dense::IdSetDense,
+    id_set: &super::id_set_dense::IdSetDense,
     check_negative_ids: bool,
     output: &mut Vec<u8>,
     // Reusable scratch buffers — hoisted to worker level.
@@ -983,7 +971,7 @@ fn reframe_dense_with_new_ids(
                      that should be resolved before processing."
                 ));
             }
-            id_set.set(old_id);
+            id_set.set_atomic(old_id);
             group_node_count += 1;
         }
         total_nodes += group_node_count;
@@ -1459,15 +1447,15 @@ fn relation_r1_collect_ids(
     relation_schedule: &[BlobTask],
     relation_id_set: &mut super::id_set_dense::IdSetDense,
 ) -> Result<()> {
+    use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
-    let pool = crate::blob::DecompressPool::new();
     let mut raw_buf: Vec<u8> = Vec::new();
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
+    let mut decompress_buf: Vec<u8> = Vec::new();
+    let mut group_ranges: Vec<(usize, usize)> = Vec::new();
 
     let mut pread_ms: u64 = 0;
     let mut decompress_ms: u64 = 0;
-    let mut decode_ms: u64 = 0;
+    let mut scan_ms: u64 = 0;
 
     use std::os::unix::fs::FileExt;
     for task in relation_schedule {
@@ -1480,33 +1468,59 @@ fn relation_r1_collect_ids(
         { pread_ms += t0.elapsed().as_millis() as u64; }
 
         let t1 = std::time::Instant::now();
-        let mut decompress_buf = pool.get();
-        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)?;
+        crate::blob::decompress_blob_raw(&raw_buf, &mut decompress_buf)
+            .map_err(|e| format!("R1 decompress: {e}"))?;
         #[allow(clippy::cast_possible_truncation)]
         { decompress_ms += t1.elapsed().as_millis() as u64; }
 
+        // Wire-format scan: extract relation IDs without full
+        // PrimitiveBlock decode. Skip string table, skip all fields
+        // except PrimitiveGroup (field 2) → Relation (field 4) → id (field 1).
         let t2 = std::time::Instant::now();
-        let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
-            decompress_buf,
-            &pool,
-            &mut st_scratch,
-            &mut gr_scratch,
-        )?;
-        for element in block.elements() {
-            if let Element::Relation(r) = &element {
-                reject_negative_id(r.id(), "relation")?;
-                relation_id_set.set(r.id());
+        group_ranges.clear();
+        let mut cursor = Cursor::new(&decompress_buf);
+        while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("R1 block: {e}"))? {
+            if field == 2 && wire_type == WIRE_LEN {
+                let data = cursor.read_len_delimited().map_err(|e| format!("R1 group: {e}"))?;
+                let offset = data.as_ptr() as usize - decompress_buf.as_ptr() as usize;
+                group_ranges.push((offset, data.len()));
+            } else {
+                cursor.skip_field(wire_type).map_err(|e| format!("R1 skip: {e}"))?;
+            }
+        }
+
+        for &(off, len) in &group_ranges {
+            let group_bytes = &decompress_buf[off..off + len];
+            let mut gcursor = Cursor::new(group_bytes);
+            while let Some((field, wire_type)) = gcursor.read_tag().map_err(|e| format!("R1 gfield: {e}"))? {
+                if field == 4 && wire_type == WIRE_LEN {
+                    // Relation submessage — extract field 1 (id).
+                    let rel_bytes = gcursor.read_len_delimited().map_err(|e| format!("R1 rel: {e}"))?;
+                    let mut rcursor = Cursor::new(rel_bytes);
+                    while let Some((rf, rt)) = rcursor.read_tag().map_err(|e| format!("R1 rfield: {e}"))? {
+                        if rf == 1 && rt == WIRE_VARINT {
+                            let rel_id = rcursor.read_varint_i64().map_err(|e| format!("R1 id: {e}"))?;
+                            reject_negative_id(rel_id, "relation")?;
+                            relation_id_set.set(rel_id);
+                            // id is always field 1, first in the message — skip the rest.
+                            break;
+                        }
+                        rcursor.skip_field(rt).map_err(|e| format!("R1 rskip: {e}"))?;
+                    }
+                } else {
+                    gcursor.skip_field(wire_type).map_err(|e| format!("R1 gskip: {e}"))?;
+                }
             }
         }
         #[allow(clippy::cast_possible_truncation)]
-        { decode_ms += t2.elapsed().as_millis() as u64; }
+        { scan_ms += t2.elapsed().as_millis() as u64; }
     }
 
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("r1_pread_ms", pread_ms as i64);
         crate::debug::emit_counter("r1_decompress_ms", decompress_ms as i64);
-        crate::debug::emit_counter("r1_decode_ms", decode_ms as i64);
+        crate::debug::emit_counter("r1_scan_ms", scan_ms as i64);
         crate::debug::emit_counter("r1_blobs", relation_schedule.len() as i64);
     }
 

@@ -213,6 +213,13 @@ pub(super) fn stage2_node_join(
                 let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
                 let mut local_resolved: u64 = 0;
 
+                // Per-slot-bucket local buffers. Flushed when any buffer
+                // exceeds FLUSH_THRESHOLD, and at the end of each rank bucket.
+                // 256 KB per buffer × 256 = 64 MB max per worker.
+                const FLUSH_THRESHOLD: usize = 256 * 1024;
+                let mut slot_bufs: Vec<Vec<u8>> = (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
+                let mut slot_counts: Vec<u64> = vec![0; NUM_BUCKETS];
+
                 loop {
                     if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
                         break;
@@ -242,7 +249,7 @@ pub(super) fn stage2_node_join(
                         #[allow(clippy::cast_possible_truncation)]
                         coord_read_ref.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
 
-                        // Resolve each rank group against the local coord slice.
+                        // Resolve each rank group into worker-local slot buffers.
                         let t_resolve = std::time::Instant::now();
                         for local_rank in 0..bkt.local_range {
                             #[allow(clippy::cast_possible_truncation)]
@@ -264,22 +271,43 @@ pub(super) fn stage2_node_join(
                                 let entry = ResolvedEntry { slot_pos, lat, lon };
                                 let bucket = entry.slot_bucket(total_slots);
                                 entry.write_to(&mut entry_buf);
-                                {
+                                slot_bufs[bucket].extend_from_slice(&entry_buf);
+                                slot_counts[bucket] += 1;
+                                if is_resolved {
+                                    local_resolved += 1;
+                                }
+                                if slot_bufs[bucket].len() >= FLUSH_THRESHOLD {
                                     let mut w = slot_buckets.writers[bucket]
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                    w.write_all(&entry_buf)
+                                    w.write_all(&slot_bufs[bucket])
                                         .map_err(|e| format!("write slot bucket: {e}"))?;
-                                }
-                                slot_buckets.entry_counts[bucket]
-                                    .fetch_add(1, Relaxed);
-                                if is_resolved {
-                                    local_resolved += 1;
+                                    drop(w);
+                                    slot_buckets.entry_counts[bucket]
+                                        .fetch_add(slot_counts[bucket], Relaxed);
+                                    slot_bufs[bucket].clear();
+                                    slot_counts[bucket] = 0;
                                 }
                             }
                         }
                         #[allow(clippy::cast_possible_truncation)]
                         resolve_ref.fetch_add(t_resolve.elapsed().as_millis() as u64, Relaxed);
+
+                        // Flush non-empty local buffers to shared writers.
+                        for sb in 0..NUM_BUCKETS {
+                            if slot_bufs[sb].is_empty() { continue; }
+                            {
+                                let mut w = slot_buckets.writers[sb]
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                w.write_all(&slot_bufs[sb])
+                                    .map_err(|e| format!("write slot bucket: {e}"))?;
+                            }
+                            slot_buckets.entry_counts[sb]
+                                .fetch_add(slot_counts[sb], Relaxed);
+                            slot_bufs[sb].clear();
+                            slot_counts[sb] = 0;
+                        }
 
                         Ok(())
                     })();

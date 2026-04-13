@@ -9,12 +9,8 @@ use super::super::Result;
 use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
-/// Each bucket may have multiple files (one per stage-2 worker).
 pub(super) struct SlotBucketRef {
-    /// Per-bucket list of worker files. `paths[bucket_idx]` is a Vec of
-    /// all worker files for that bucket.
-    pub(super) paths: Vec<Vec<std::path::PathBuf>>,
-    /// Total entry count per bucket (summed across all workers).
+    pub(super) paths: Vec<std::path::PathBuf>,
     pub(super) entry_counts: Vec<u64>,
 }
 
@@ -98,20 +94,14 @@ pub(super) fn stage3_slot_reorder(
                         scatter_buf.clear();
                         scatter_buf.resize(bucket_bytes, 0);
 
-                        // Load from all worker files for this bucket.
                         let t_load = std::time::Instant::now();
                         data_buf.clear();
-                        for path in &paths[bucket_idx] {
-                            let bucket_file = match std::fs::File::open(path) {
-                                Ok(f) => f,
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                                Err(e) => return Err(format!("open slot bucket: {e}")),
-                            };
-                            std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
-                                .map_err(|e| format!("read slot bucket: {e}"))?;
-                            #[cfg(feature = "linux-direct-io")]
-                            advise_dontneed_file(&bucket_file);
-                        }
+                        let bucket_file = std::fs::File::open(&paths[bucket_idx])
+                            .map_err(|e| format!("open slot bucket: {e}"))?;
+                        std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
+                            .map_err(|e| format!("read slot bucket: {e}"))?;
+                        #[cfg(feature = "linux-direct-io")]
+                        advise_dontneed_file(&bucket_file);
                         s3_load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);
 
                         let t_scatter = std::time::Instant::now();

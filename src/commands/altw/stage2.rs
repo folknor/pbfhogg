@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::path::Path;
 
-use super::super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
+use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use super::super::Result;
@@ -97,22 +97,80 @@ fn prepare_bucket(
     Ok(PreparedBucket { grouped_slot_pos, group_offsets, bucket_rank_start, local_range })
 }
 
+/// Shared slot bucket writers protected by per-bucket mutexes.
+/// 256 files total regardless of worker count.
+pub(super) struct SharedSlotBuckets {
+    writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+    entry_counts: Vec<std::sync::atomic::AtomicU64>,
+    paths: Vec<std::path::PathBuf>,
+}
+
+const BUCKET_BUF_SIZE: usize = 256 * 1024;
+
+impl SharedSlotBuckets {
+    pub(super) fn create(scratch: &ScratchDir) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let mut writers = Vec::with_capacity(NUM_BUCKETS);
+        let mut paths = Vec::with_capacity(NUM_BUCKETS);
+        let mut entry_counts = Vec::with_capacity(NUM_BUCKETS);
+
+        for i in 0..NUM_BUCKETS {
+            let path = scratch.bucket_path("slot", i);
+            let file = std::fs::File::create(&path)
+                .map_err(|e| format!("failed to create slot bucket {}: {e}", path.display()))?;
+            writers.push(std::sync::Mutex::new(
+                std::io::BufWriter::with_capacity(BUCKET_BUF_SIZE, file),
+            ));
+            paths.push(path);
+            entry_counts.push(std::sync::atomic::AtomicU64::new(0));
+        }
+
+        Ok(Self { writers, entry_counts, paths })
+    }
+
+    pub(super) fn finish(&self) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        for writer_mutex in &self.writers {
+            let mut w = writer_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            w.flush()?;
+            #[cfg(feature = "linux-direct-io")]
+            {
+                use std::os::unix::io::AsRawFd;
+                drop(w.get_ref().sync_data());
+                unsafe {
+                    libc::posix_fadvise(
+                        w.get_ref().as_raw_fd(),
+                        0,
+                        0,
+                        libc::POSIX_FADV_DONTNEED,
+                    )
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn entry_counts_snapshot(&self) -> Vec<u64> {
+        self.entry_counts.iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect()
+    }
+}
+
 /// Parallel stage 2: N workers each claim rank buckets via atomic dispatch,
 /// load rank records, counting-sort, pread coord slice, resolve to (lat, lon),
-/// write to per-worker slot bucket files.
+/// write to shared slot bucket files (256 files total, per-bucket mutex).
 ///
-/// Returns (resolved_count, num_workers) — num_workers needed by stage 3 to
-/// know how many slot file sets exist.
+/// Returns resolved_count.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub(super) fn stage2_node_join(
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
     num_shard_workers: usize,
+    slot_buckets: &SharedSlotBuckets,
     total_slots: u64,
     unique_nodes: u64,
     coord_file_path: &Path,
-) -> Result<(u64, usize)> {
+) -> Result<u64> {
     let rank_range_size = unique_nodes.div_ceil(NUM_BUCKETS as u64);
 
     let num_workers = std::thread::available_parallelism()
@@ -142,32 +200,11 @@ pub(super) fn stage2_node_join(
     let loads_ref = &s2_bucket_loads;
     let err_ref = &s2_error;
 
-    // Per-worker slot bucket writers. Worker i writes to "slotW{i}-{bucket:03}".
-    // Created eagerly, wrapped in Mutex so workers can take() their own instance.
-    let writer_slots: Vec<std::sync::Mutex<Option<BucketWriters>>> = {
-        let mut v = Vec::with_capacity(num_workers);
-        for i in 0..num_workers {
-            let prefix = format!("slotW{i}");
-            let bw = BucketWriters::create(scratch, &prefix)?;
-            v.push(std::sync::Mutex::new(Some(bw)));
-        }
-        v
-    };
-    let writer_slots_ref = &writer_slots;
-
     std::thread::scope(|scope| {
-
-        for worker_id in 0..num_workers {
+        for _ in 0..num_workers {
             let cf = std::sync::Arc::clone(&coord_file);
             scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
-
-                // Take our BucketWriters out of the mutex — only we use it.
-                let mut slot_buckets = writer_slots_ref[worker_id]
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .take()
-                    .expect("worker slot writers missing");
 
                 let mut loader = LoaderScratch {
                     data_buf: Vec::new(), counts: Vec::new(), write_pos: Vec::new(),
@@ -227,11 +264,15 @@ pub(super) fn stage2_node_join(
                                 let entry = ResolvedEntry { slot_pos, lat, lon };
                                 let bucket = entry.slot_bucket(total_slots);
                                 entry.write_to(&mut entry_buf);
-                                if let Some(writer) = slot_buckets.writers[bucket].as_mut() {
-                                    writer.write_all(&entry_buf)
+                                {
+                                    let mut w = slot_buckets.writers[bucket]
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                    w.write_all(&entry_buf)
                                         .map_err(|e| format!("write slot bucket: {e}"))?;
                                 }
-                                slot_buckets.entry_counts[bucket] += 1;
+                                slot_buckets.entry_counts[bucket]
+                                    .fetch_add(1, Relaxed);
                                 if is_resolved {
                                     local_resolved += 1;
                                 }
@@ -250,24 +291,8 @@ pub(super) fn stage2_node_join(
                 }
 
                 resolved_ref.fetch_add(local_resolved, Relaxed);
-
-                // Finish our slot bucket writers.
-                let finish_result = slot_buckets.finish();
-
-                // Put it back so entry_counts survive.
-                *writer_slots_ref[worker_id]
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(slot_buckets);
-
-                if let Err(e) = finish_result {
-                    *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        Some(format!("finish slot buckets: {e}"));
-                }
             });
         }
-
-        // Collect entry counts from all workers after scope completes.
-        // (scope.spawn joins here)
     });
 
     if let Some(e) = s2_error.into_inner().unwrap_or(None) {
@@ -284,5 +309,7 @@ pub(super) fn stage2_node_join(
     }
 
     let resolved_count = resolved_total.load(std::sync::atomic::Ordering::Relaxed);
-    Ok((resolved_count, num_workers))
+    Ok(resolved_count)
 }
+
+pub(super) type SlotBuckets = SharedSlotBuckets;

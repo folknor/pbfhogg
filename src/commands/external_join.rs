@@ -1163,21 +1163,50 @@ fn stage4_assembly(
     let mut skipped_node_blobs: u64 = 0;
     let mut seq: usize = 0;
 
+    // Stage 4 schedule diagnostics.
+    let mut s4_node_blobs_total: u64 = 0;
+    let mut s4_node_blobs_no_tagindex: u64 = 0;
+    let mut s4_node_blobs_empty_tags: u64 = 0;
+    let mut s4_node_blobs_kept_by_members: u64 = 0;
+    let mut s4_node_blobs_kept_by_tags: u64 = 0;
+    let mut s4_way_blobs: u64 = 0;
+    let mut s4_relation_blobs: u64 = 0;
+
     while let Some(result) = scanner.next_header_with_data_offset() {
         let (header_entry, _, data_offset, data_size) = result?;
         if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
 
+        // Count blob types for diagnostics.
+        if let Some(idx) = header_entry.index() {
+            match idx.kind {
+                crate::blob_index::ElemKind::Node => s4_node_blobs_total += 1,
+                crate::blob_index::ElemKind::Way => s4_way_blobs += 1,
+                crate::blob_index::ElemKind::Relation => s4_relation_blobs += 1,
+            }
+        }
+
         // P1b: skip node blobs with only untagged non-member nodes.
         if !keep_untagged_nodes {
             if let Some(idx) = header_entry.index() {
                 if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                    let has_tags = header_entry.tag_index()
-                        .is_none_or(|ti| !ti.keys_empty());
-                    if !has_tags {
+                    let tag_index = header_entry.tag_index();
+                    let has_tagindex = tag_index.is_some();
+                    let has_tags = tag_index.is_none_or(|ti| !ti.keys_empty());
+                    if !has_tagindex {
+                        s4_node_blobs_no_tagindex += 1;
+                    } else if !has_tags {
+                        s4_node_blobs_empty_tags += 1;
+                    }
+                    if has_tags {
+                        s4_node_blobs_kept_by_tags += 1;
+                    } else {
                         let has_members = relation_member_node_ids
                             .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
+                        if has_members {
+                            s4_node_blobs_kept_by_members += 1;
+                        }
                         if !has_members {
                             skipped_node_blobs += 1;
                             continue;
@@ -1402,6 +1431,13 @@ fn stage4_assembly(
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
         crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
+        crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
+        crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex as i64);
+        crate::debug::emit_counter("s4_node_blobs_empty_tags", s4_node_blobs_empty_tags as i64);
+        crate::debug::emit_counter("s4_node_blobs_kept_by_tags", s4_node_blobs_kept_by_tags as i64);
+        crate::debug::emit_counter("s4_node_blobs_kept_by_members", s4_node_blobs_kept_by_members as i64);
+        crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
+        crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
     }
 
     Ok(total_stats)

@@ -94,12 +94,9 @@ orphan way refs as 6,616,527, 6,616,528, ... in the order they're first
 encountered. Guarantees contiguous new-space output, at the cost of assigning
 ids to "phantom" objects that don't exist in the output.
 
-**pbfhogg behavior:** Orphan refs pass through with their old id
-(`resolved_id = old_id` in both the in-memory `unwrap_or(old)` path and the
-external-join merge-join path). The output contains a mix of new-space ids
-(for in-input targets) and old-space ids (for orphans). Both the in-memory
-and external modes agree — they produce byte-identical outputs for any
-given input.
+**pbfhogg behavior:** Orphan refs pass through with their old id. The output
+contains a mix of new-space ids (for in-input targets) and old-space ids
+(for orphans).
 
 **Cross-validation:** Denmark: 306 relations differ, all in their `member`
 list only. No nodes, ways, or other relation fields differ. The 306 affected

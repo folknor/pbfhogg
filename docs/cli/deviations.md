@@ -99,3 +99,36 @@ presentational — pbfhogg distinguishes "how many distinct IDs are missing" fro
 "how many references point to missing IDs." Users comparing numeric output between
 the two tools should be aware that osmium's count corresponds to pbfhogg's
 occurrence (parenthesized) count, not the primary count.
+
+## renumber: orphan-reference handling
+
+**osmium behavior:** When a way ref or relation member points to an object not
+present in the input, osmium assigns a **new** sequential id to the orphan
+target via its `id_map::m_extra_ids` overflow table. These ids continue past
+the last in-input id for each type. Guarantees contiguous new-space output,
+at the cost of assigning ids to "phantom" objects that don't exist in the output.
+
+**pbfhogg behavior:** Orphan refs pass through with their old id. The output
+contains a mix of new-space ids (for in-input targets) and old-space ids
+(for orphans).
+
+**Cross-validation:** Denmark: 306 relations differ, all in their `member`
+list only. Total match: 59,151,976 / 59,152,282 elements (99.9995%).
+
+**Impact:** Downstream tools that assume output ids are contiguous in
+`[start_id, start_id + N)` must tolerate orphan refs outside that range.
+Tools that only chase live references don't hit the orphan ids at all.
+
+## renumber: negative input IDs rejected
+
+**osmium behavior:** Handles negative IDs (JOSM editor-local staging
+identifiers) transparently, assigning them new sequential IDs like any
+other element.
+
+**pbfhogg behavior:** Rejects negative input IDs with an error. Negative
+IDs are JOSM editor-local staging identifiers that are resolved before
+upload to OSM — they never appear in production planet extracts or
+Geofabrik downloads.
+
+**Impact:** Users with JOSM-local staging data must resolve negative IDs
+before renumbering.

@@ -1315,6 +1315,8 @@ fn stage4_assembly(
     let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
     let s4_send_ref = &s4_send_ms;
     let s4_blobs_ref = &s4_blobs;
+    let way_reframe_counters = WayReframeCounters::new();
+    let way_reframe_cref = &way_reframe_counters;
 
     // Consumer-side counters.
     let mut s4_recv_ms: u64 = 0;
@@ -1384,6 +1386,7 @@ fn stage4_assembly(
                                     desc.slot_start,
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
+                                    way_reframe_cref,
                                 ).map_err(|e| crate::error::new_error(
                                     crate::error::ErrorKind::Io(std::io::Error::other(e))
                                 ))?;
@@ -1523,6 +1526,7 @@ fn stage4_assembly(
         crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
         crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
     }
+    way_reframe_counters.emit();
 
     Ok(total_stats)
 }
@@ -1618,6 +1622,40 @@ fn assemble_block(
 // Wire-format way reframe for stage 4
 // ---------------------------------------------------------------------------
 
+/// Sub-phase counters for the way reframe hot path.
+struct WayReframeCounters {
+    parse_block_ms: std::sync::atomic::AtomicU64,
+    parse_way_ms: std::sync::atomic::AtomicU64,
+    coord_lookup_ms: std::sync::atomic::AtomicU64,
+    reassemble_ms: std::sync::atomic::AtomicU64,
+    refs_total: std::sync::atomic::AtomicU64,
+    ways_total: std::sync::atomic::AtomicU64,
+}
+
+impl WayReframeCounters {
+    fn new() -> Self {
+        Self {
+            parse_block_ms: std::sync::atomic::AtomicU64::new(0),
+            parse_way_ms: std::sync::atomic::AtomicU64::new(0),
+            coord_lookup_ms: std::sync::atomic::AtomicU64::new(0),
+            reassemble_ms: std::sync::atomic::AtomicU64::new(0),
+            refs_total: std::sync::atomic::AtomicU64::new(0),
+            ways_total: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    fn emit(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::debug::emit_counter("s4_way_parse_block_ms", self.parse_block_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_parse_way_ms", self.parse_way_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_coord_lookup_ms", self.coord_lookup_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_reassemble_ms", self.reassemble_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
+        crate::debug::emit_counter("s4_way_messages_total", self.ways_total.load(Relaxed) as i64);
+    }
+}
+
 /// Reusable scratch buffers for the way reframe path.
 struct WayReframeScratch {
     group_ranges: Vec<(usize, usize)>,
@@ -1654,14 +1692,17 @@ fn reframe_way_blob_with_locations(
     mut way_slot_pos: u64,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
+    counters: &WayReframeCounters,
 ) -> std::result::Result<(u64, u64, i64, i64, u64), String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
+    use std::sync::atomic::Ordering::Relaxed;
 
     scratch.group_ranges.clear();
     scratch.scalar_fields.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
 
     // Level 1: PrimitiveBlock — find string table + groups.
+    let t_block = std::time::Instant::now();
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block: {e}"))? {
         match (field, wire_type) {
@@ -1688,14 +1729,17 @@ fn reframe_way_blob_with_locations(
         .ok_or("reframe: no StringTable in PrimitiveBlock")?;
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
+    #[allow(clippy::cast_possible_truncation)]
+    counters.parse_block_ms.fetch_add(t_block.elapsed().as_millis() as u64, Relaxed);
+
     output.clear();
-    // Field 1: StringTable (verbatim).
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
     let mut total_ways: u64 = 0;
     let mut min_way_id: i64 = i64::MAX;
     let mut max_way_id: i64 = i64::MIN;
     let mut missing_locations: u64 = 0;
+    let mut blob_refs: u64 = 0;
 
     // Level 2: process each PrimitiveGroup.
     for &(gr_offset, gr_len) in &scratch.group_ranges {
@@ -1708,7 +1752,7 @@ fn reframe_way_blob_with_locations(
                 // Way submessage — splice locations.
                 let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
 
-                // Parse way fields: extract id (field 1), find refs (field 8).
+                let t_way = std::time::Instant::now();
                 let mut way_id: i64 = 0;
                 let mut refs_data: &[u8] = &[];
                 let mut refs_range: Option<(usize, usize)> = None;
@@ -1728,10 +1772,14 @@ fn reframe_way_blob_with_locations(
                     }
                 }
 
+                #[allow(clippy::cast_possible_truncation)]
+                counters.parse_way_ms.fetch_add(t_way.elapsed().as_millis() as u64, Relaxed);
+
                 if way_id < min_way_id { min_way_id = way_id; }
                 if way_id > max_way_id { max_way_id = way_id; }
 
                 // Count refs and look up locations.
+                let t_coord = std::time::Instant::now();
                 scratch.packed_lats.clear();
                 scratch.packed_lons.clear();
                 let mut last_lat: i64 = 0;
@@ -1770,7 +1818,12 @@ fn reframe_way_blob_with_locations(
                     }
                 }
 
+                #[allow(clippy::cast_possible_truncation)]
+                counters.coord_lookup_ms.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
+                blob_refs += ref_count;
+
                 // Build reframed way: original bytes + appended fields 9, 10.
+                let t_reassemble = std::time::Instant::now();
                 scratch.reframed_way.clear();
                 if let Some((refs_start, refs_end)) = refs_range {
                     // Copy everything before refs field.
@@ -1791,6 +1844,8 @@ fn reframe_way_blob_with_locations(
                 }
 
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
+                #[allow(clippy::cast_possible_truncation)]
+                counters.reassemble_ms.fetch_add(t_reassemble.elapsed().as_millis() as u64, Relaxed);
                 total_ways += 1;
             } else {
                 // Non-way field in the group — copy verbatim.
@@ -1805,6 +1860,9 @@ fn reframe_way_blob_with_locations(
 
     // Append scalar fields (granularity, etc.).
     output.extend_from_slice(&scratch.scalar_fields);
+
+    counters.refs_total.fetch_add(blob_refs, Relaxed);
+    counters.ways_total.fetch_add(total_ways, Relaxed);
 
     Ok((total_ways, way_slot_pos, min_way_id, max_way_id, missing_locations))
 }

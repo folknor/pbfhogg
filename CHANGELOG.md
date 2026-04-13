@@ -1,5 +1,78 @@
 # Changelog
 
+## Unreleased
+
+### Renumber — external join rewrite
+
+Complete rewrite of the `renumber` command using an external-join architecture. The in-memory path has been removed; external is now the only implementation.
+
+- **Wire-format rewriters** for DenseNodes, ways, and relations — rewrite IDs directly in the protobuf wire format, avoiding full PrimitiveBlock decode/re-encode.
+- **Fused scan passes** — R1+R2A+R2B merged into a single relation scan; way resolve fused into stage 2d; relation resolve fused into R2d.
+- **Parallel workers** — 4–6 pread workers for pass 1 and stage 2d, parallel R2d relation rewriter, parallel stage 2b radix sort.
+- **IdSetDense throughout** — replaced FxHashMap relation map and BTreeSet ID sets with chunked sparse bitsets. Rank-indexed lookup eliminates shard files and mmap scatter for way maps.
+- **Shared blob schedules** — cached across all phases, eliminating redundant index scans.
+- **zlib:1 output compression** — faster recompression with minimal size impact.
+- Planet: **194s (3m14s)**, down from 3,456s at first measurement — **94% reduction** over the optimization arc.
+
+### Commands
+
+- **renumber**: dropped in-memory path; external is now the only implementation. `--mode` flag removed. Negative input IDs rejected with clear error.
+- **renumber**: orphan-ref tracking — `RenumberStats.orphan_refs` counts way refs and relation members not found in the input. `print_summary()` warns when non-zero.
+- **renumber**: comprehensive per-phase instrumentation (consumer drain-rate, sub-phase counters for all 4 phases).
+- **add-locations-to-ways**: comprehensive per-stage instrumentation for external join (sub-phase counters for all 4 stages, consumer drain-rate, bucket load/scatter/write breakdown).
+- **extract** (smart/complete): reuse PASS1 blob schedule in subsequent passes, reducing redundant index scans. PASS2 way deps converted to per-blob send.
+- **derive-changes**: stream output to temp files instead of buffering all changes in memory.
+- **renumber**: forward-ref relation bug fixed via two-pass structure. Negative ID guard added.
+
+### Documentation
+
+- **DEVIATIONS.md**: added renumber negative-ID rejection and orphan-ref handling sections. Synced to `docs/cli/deviations.md`.
+
+### Library
+
+- `IdSetDense`: rank-indexed lookup (`resolve()`), denser 64B rank blocks, atomic set support, negative-ID guard. Migrated all `IdSet` (BTreeSet) call sites to `IdSetDense` for O(1) lookups.
+- `PbfWriter`: rayon dispatch bounded by permit pool to prevent unbounded in-flight blob accumulation.
+- `external_radix`: shared `ScratchDir` + `BucketWriters` module extracted for reuse across external-join commands.
+- `elements_xml`: borrowed element XML writers (zero-copy OSC output).
+- `merge.rs` split into submodules: `classify`, `diff_ranges`, `node_locations`, `rewrite`, `stats`.
+- Eliminated `Bytes→Vec` copies in all 16 sequential decode paths (Phase A + Phase B).
+- Removed dead `Blob::decompress_pooled` method.
+- Element-equivalence test helper for PBF cross-checks.
+
+### Bug fixes
+
+- 19 bugs fixed from post-release code review (F1–F22, F23–F32, F33–F40).
+- `dp_count_range`: use clamped segment distance matching `dp_mark`.
+- `decompress_blob_raw` lifetime bound, `RelMember` error type.
+- Dead `loc_missing` increments removed from merge way writers.
+- Geocode builder pass 2 extraction + merge locations pre-scan.
+- Geocode `FORMAT_VERSION` bumped to 2, `cover_segment` steps capped.
+
+### Testing
+
+- Integration tests for 6 previously untested production pipeline surfaces.
+- Tests for renumber remapping, `BlobFilter` composition, `merge_pbf` overlap.
+- `IdSetDense` unit tests, sortedness tests for external renumber.
+
+### Code quality
+
+- 9 duplicated patterns consolidated (F76–F99).
+- 36 minor cleanups (F101–F136).
+- Shared OSC XML writers, unified getid filter, generic `sweep_merge`.
+- `DenseNodeIter` batch `kv_pos` reverted after +8.7% regression.
+
+### Dependencies
+
+- `protohoggr` 0.2.1 → 0.4.0 (`read_raw_field` for wire-format rewriters).
+- `hotpath` 0.14.1 → 0.15.
+
+### Performance highlights
+
+| Operation | Dataset | Time | vs 0.2.0 |
+|-----------|---------|------|----------|
+| renumber (external) | Planet 87 GB | 194s | new |
+| derive-changes | — | streaming | constant memory |
+
 ## 0.2.0 — 2026-04-09
 
 First public release.

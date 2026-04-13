@@ -159,6 +159,10 @@ fn stage1_way_pass(
     let mut refs_buf: Vec<i64> = Vec::new();
     let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
+    let mut s1_decompress_ms: u64 = 0;
+    let mut s1_scan_ms: u64 = 0;
+    let mut s1_blobs: u64 = 0;
+
     // P2c sidecar: per-way-blob ref counts for stage 4 slot_pos pre-computation.
     // Stage 1 and stage 4 must see way blobs in the same file order (both filter
     // by ElemKind::Way from the same indexdata). Changing blob ordering without
@@ -180,7 +184,12 @@ fn stage1_way_pass(
             }
         }
 
+        let t0 = std::time::Instant::now();
         blob.decompress_into(&mut decompress_buf)?;
+        #[allow(clippy::cast_possible_truncation)]
+        { s1_decompress_ms += t0.elapsed().as_millis() as u64; }
+
+        let t1 = std::time::Instant::now();
         let blob_start_pos = slot_pos;
         let mut write_err: Option<std::io::Error> = None;
         super::way_scanner::scan_way_refs(&decompress_buf, &mut refs_buf, &mut group_starts, |_way_id, refs| {
@@ -199,17 +208,28 @@ fn stage1_way_pass(
                 slot_pos += 1;
             }
         })?;
+        #[allow(clippy::cast_possible_truncation)]
+        { s1_scan_ms += t1.elapsed().as_millis() as u64; }
+
         if let Some(e) = write_err {
             return Err(e.into());
         }
         // Write per-blob ref count to sidecar.
         let blob_ref_count = slot_pos - blob_start_pos;
         sidecar_writer.write_all(&blob_ref_count.to_le_bytes())?;
+        s1_blobs += 1;
     }
 
     // Trailer: total ref count for alignment verification in stage 4.
     sidecar_writer.write_all(&slot_pos.to_le_bytes())?;
     sidecar_writer.flush()?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s1_decompress_ms", s1_decompress_ms as i64);
+        crate::debug::emit_counter("s1_scan_emit_ms", s1_scan_ms as i64);
+        crate::debug::emit_counter("s1_blobs", s1_blobs as i64);
+    }
 
     Ok(slot_pos)
 }
@@ -333,6 +353,24 @@ fn stage2_node_join(
 
     let io_error: std::sync::Mutex<Option<crate::error::Error>> = std::sync::Mutex::new(None);
 
+    // Worker-side cumulative counters.
+    let s2_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_extract_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_send_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s2_pread_ref = &s2_pread_ms;
+    let s2_decompress_ref = &s2_decompress_ms;
+    let s2_extract_ref = &s2_extract_ms;
+    let s2_send_ref = &s2_send_ms;
+    let s2_blobs_ref = &s2_blobs;
+
+    // Consumer-side counters (single-threaded, no atomics needed).
+    let mut s2_recv_ms: u64 = 0;
+    let mut s2_merge_ms: u64 = 0;
+    let mut s2_bucket_load_ms: u64 = 0;
+    let mut s2_bucket_loads: u64 = 0;
+
     std::thread::scope(|scope| -> Result<()> {
         // IO thread: read headers only, filter to node blobs, send descriptors.
         let io_error_ref = &io_error;
@@ -371,6 +409,7 @@ fn stage2_node_join(
             let tx = decoded_tx.clone();
             let file = std::sync::Arc::clone(&shared_file);
             scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut tuples: Vec<NodeTuple> = Vec::new();
@@ -381,18 +420,19 @@ fn stage2_node_join(
                         let guard = rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                         match guard.recv() {
                             Ok(item) => item,
-                            Err(_) => break, // channel closed
+                            Err(_) => break,
                         }
                     };
                     let result = (|| -> crate::error::Result<Vec<NodeTuple>> {
-                        // pread blob data — no shared file offset mutation.
+                        let t0 = std::time::Instant::now();
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(e)
                             ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s2_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
 
-                        // Evict pages we just read (worker-side, safe from races).
                         #[cfg(target_os = "linux")]
                         {
                             use std::os::unix::io::AsRawFd;
@@ -407,47 +447,70 @@ fn stage2_node_join(
                             }
                         }
 
-                        // Parse wire blob + decompress into thread-local buffer.
+                        let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s2_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                        // Extract node tuples into thread-local Vec.
+                        let t2 = std::time::Instant::now();
                         tuples.clear();
                         extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e.to_string()))
                             ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s2_extract_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                        // Move tuples out, replace with empty Vec. The consumer
-                        // drops the Vec — but only ~32 are in flight (channel
-                        // capacity), so this is bounded cross-thread churn.
+                        s2_blobs_ref.fetch_add(1, Relaxed);
+
                         Ok(std::mem::take(&mut tuples))
                     })();
+                    let t3 = std::time::Instant::now();
                     if tx.send((seq, result)).is_err() {
                         break;
                     }
+                    #[allow(clippy::cast_possible_truncation)]
+                    s2_send_ref.fetch_add(t3.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             });
         }
-        drop(desc_rx); // allow workers to see channel close
+        drop(desc_rx);
         drop(decoded_tx);
 
         // Consumer: reorder + merge-join.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<Vec<NodeTuple>>> =
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
-        for (seq, item) in decoded_rx {
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            { s2_recv_ms += t_recv.elapsed().as_millis() as u64; }
+            let (seq, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
             reorder.push(seq, item);
 
             while let Some(result) = reorder.pop_ready() {
                 let tuples = result?;
 
+                let t_merge = std::time::Instant::now();
                 for &NodeTuple { id, lat, lon } in &tuples {
                     // Advance to the bucket that covers this node ID.
                     while id >= bstate.max_id {
+                        let t_load = std::time::Instant::now();
                         bstate.idx += 1;
                         if !bstate.load_next(node_buckets, range_size)? {
+                            #[allow(clippy::cast_possible_truncation)]
+                            { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
+                            s2_bucket_loads += 1;
                             return Ok(());
                         }
+                        #[allow(clippy::cast_possible_truncation)]
+                        { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
+                        s2_bucket_loads += 1;
                     }
 
                     while bstate.pair_cursor < bstate.sorted_pairs.len()
@@ -474,6 +537,8 @@ fn stage2_node_join(
                         bstate.pair_cursor += 1;
                     }
                 }
+                #[allow(clippy::cast_possible_truncation)]
+                { s2_merge_ms += t_merge.elapsed().as_millis() as u64; }
 
                 drop(tuples);
             }
@@ -484,6 +549,19 @@ fn stage2_node_join(
 
     if let Some(e) = io_error.into_inner().unwrap_or(None) {
         return Err(Box::new(e));
+    }
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s2_pread_ms", s2_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_decompress_ms", s2_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_extract_ms", s2_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_send_ms", s2_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_blobs", s2_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_consumer_recv_ms", s2_recv_ms as i64);
+        crate::debug::emit_counter("s2_consumer_merge_ms", s2_merge_ms as i64);
+        crate::debug::emit_counter("s2_bucket_load_ms", s2_bucket_load_ms as i64);
+        crate::debug::emit_counter("s2_bucket_loads", s2_bucket_loads as i64);
     }
 
     Ok(resolved_count)
@@ -548,8 +626,12 @@ fn stage3_slot_reorder(
     let mut scatter_buf: Vec<u8> = Vec::new();
     let mut next_slot: u64 = 0;
 
+    let mut s3_load_ms: u64 = 0;
+    let mut s3_scatter_ms: u64 = 0;
+    let mut s3_write_ms: u64 = 0;
+    let mut s3_buckets_loaded: u64 = 0;
+
     for bucket_idx in 0..NUM_BUCKETS {
-        // Compute this bucket's slot range.
         let bucket_start = bucket_idx as u64 * range_size;
         let bucket_end = if bucket_idx == NUM_BUCKETS - 1 {
             total_slots
@@ -559,21 +641,22 @@ fn stage3_slot_reorder(
         let bucket_slots = bucket_end - bucket_start;
 
         if slot_buckets.entry_counts[bucket_idx] == 0 {
-            // Empty bucket — write zero sentinels for its entire range.
             let zero_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
             scatter_buf.clear();
             scatter_buf.resize(zero_bytes, 0);
+            let t_w = std::time::Instant::now();
             out.write_all(&scatter_buf)?;
+            #[allow(clippy::cast_possible_truncation)]
+            { s3_write_ms += t_w.elapsed().as_millis() as u64; }
             next_slot = bucket_end;
             continue;
         }
 
-        // Load entries and scatter into position-indexed buffer.
-        // No sort needed — position is computed directly from slot_pos.
         let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
         scatter_buf.clear();
         scatter_buf.resize(bucket_bytes, 0);
 
+        let t_load = std::time::Instant::now();
         data_buf.clear();
         let file = std::fs::File::open(&slot_buckets.paths[bucket_idx])
             .map_err(|e| format!("failed to open slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
@@ -581,7 +664,10 @@ fn stage3_slot_reorder(
             .map_err(|e| format!("failed to read slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
         #[cfg(feature = "linux-direct-io")]
         advise_dontneed_file(&file);
+        #[allow(clippy::cast_possible_truncation)]
+        { s3_load_ms += t_load.elapsed().as_millis() as u64; }
 
+        let t_scatter = std::time::Instant::now();
         let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
         for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
             buf.copy_from_slice(chunk);
@@ -591,13 +677,17 @@ fn stage3_slot_reorder(
             scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
             scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
         }
+        #[allow(clippy::cast_possible_truncation)]
+        { s3_scatter_ms += t_scatter.elapsed().as_millis() as u64; }
 
+        let t_write = std::time::Instant::now();
         out.write_all(&scatter_buf)?;
+        #[allow(clippy::cast_possible_truncation)]
+        { s3_write_ms += t_write.elapsed().as_millis() as u64; }
         next_slot = bucket_end;
-
+        s3_buckets_loaded += 1;
     }
 
-    // Write any trailing slots if total_slots doesn't align to bucket boundaries.
     if next_slot < total_slots {
         let remaining = (total_slots - next_slot) as usize * COORD_SLOT_SIZE;
         scatter_buf.clear();
@@ -606,6 +696,15 @@ fn stage3_slot_reorder(
     }
 
     out.flush()?;
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s3_load_ms", s3_load_ms as i64);
+        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms as i64);
+        crate::debug::emit_counter("s3_write_ms", s3_write_ms as i64);
+        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded as i64);
+    }
+
     Ok(())
 }
 
@@ -830,6 +929,22 @@ fn stage4_assembly(
 
     let mut total_stats = Stats::default();
 
+    // Worker-side cumulative counters.
+    let s4_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s4_pread_ref = &s4_pread_ms;
+    let s4_decompress_ref = &s4_decompress_ms;
+    let s4_assemble_ref = &s4_assemble_ms;
+    let s4_send_ref = &s4_send_ms;
+    let s4_blobs_ref = &s4_blobs;
+
+    // Consumer-side counters.
+    let mut s4_recv_ms: u64 = 0;
+    let mut s4_write_ms: u64 = 0;
+
     std::thread::scope(|scope| -> Result<()> {
         // Dispatcher: feed schedule into descriptor channel.
         scope.spawn(move || {
@@ -847,6 +962,7 @@ fn stage4_assembly(
             let tx = decoded_tx.clone();
             let file = std::sync::Arc::clone(&shared_file);
             scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
                 let mut read_buf: Vec<u8> = Vec::new();
                 let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut bb = BlockBuilder::new();
@@ -864,20 +980,24 @@ fn stage4_assembly(
                     };
 
                     let result: crate::error::Result<(Vec<OwnedBlock>, Stats)> = (|| {
-                        // Pread blob data.
+                        let t0 = std::time::Instant::now();
                         read_buf.resize(desc.data_size, 0);
                         file.read_exact_at(&mut read_buf, desc.data_offset)
                             .map_err(|e| crate::error::new_error(
                                 crate::error::ErrorKind::Io(e)
                             ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s4_pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
 
-                        // Decompress + parse into PrimitiveBlock.
+                        let t1 = std::time::Instant::now();
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)?;
                         let block = PrimitiveBlock::new(
                             bytes::Bytes::from(std::mem::take(&mut decompress_buf))
                         )?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s4_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                        // Assemble.
+                        let t2 = std::time::Instant::now();
                         output_blocks.clear();
                         let block_stats = assemble_block(
                             &block,
@@ -897,20 +1017,24 @@ fn stage4_assembly(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
                             )
                         })?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        s4_assemble_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                        // Reclaim the decompress buffer for reuse.
-                        // PrimitiveBlock took ownership via Bytes::from(take()),
-                        // but it's dropped now so we just need a fresh Vec.
                         if decompress_buf.capacity() == 0 {
                             decompress_buf = Vec::new();
                         }
 
+                        s4_blobs_ref.fetch_add(1, Relaxed);
+
                         Ok((std::mem::take(&mut output_blocks), block_stats))
                     })();
 
+                    let t3 = std::time::Instant::now();
                     if tx.send((desc.seq, result)).is_err() {
                         break;
                     }
+                    #[allow(clippy::cast_possible_truncation)]
+                    s4_send_ref.fetch_add(t3.elapsed().as_millis() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             });
         }
@@ -922,7 +1046,16 @@ fn stage4_assembly(
             crate::error::Result<(Vec<OwnedBlock>, Stats)>
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
-        for (seq_num, item) in decoded_rx {
+        loop {
+            let t_recv = std::time::Instant::now();
+            let msg = decoded_rx.recv();
+            #[allow(clippy::cast_possible_truncation)]
+            { s4_recv_ms += t_recv.elapsed().as_millis() as u64; }
+            let (seq_num, item) = match msg {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+
             reorder.push(seq_num, item);
 
             while let Some(result) = reorder.pop_ready() {
@@ -930,9 +1063,12 @@ fn stage4_assembly(
                 total_stats.merge(&block_stats);
 
                 for (block_bytes, index, tagdata) in blocks {
+                    let t_w = std::time::Instant::now();
                     writer.write_primitive_block_owned(
                         block_bytes, index, tagdata.as_deref(),
                     )?;
+                    #[allow(clippy::cast_possible_truncation)]
+                    { s4_write_ms += t_w.elapsed().as_millis() as u64; }
                 }
             }
         }
@@ -941,8 +1077,19 @@ fn stage4_assembly(
     })?;
 
     writer.flush()?;
+
     #[allow(clippy::cast_possible_wrap)]
-    crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
+    {
+        crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
+        crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
+        crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
+    }
+
     Ok(total_stats)
 }
 

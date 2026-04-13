@@ -55,7 +55,7 @@ impl CoordSlots {
     }
 
     /// Read a coordinate at the given slot position. Zero syscalls — direct
-    /// mmap byte access. Used by the decode-all fallback path.
+    /// mmap byte access.
     #[allow(clippy::cast_possible_truncation)]
     fn get(&self, slot_pos: u64) -> Option<(i32, i32)> {
         if slot_pos >= self.total_slots {
@@ -69,12 +69,6 @@ impl CoordSlots {
             return None; // sentinel
         }
         Some((lat, lon))
-    }
-
-    /// Contiguous byte slice for a range of slots. Returns None if the
-    /// range exceeds the mmap. Used for batch coord reads per way.
-    fn get_slice(&self, byte_start: usize, byte_end: usize) -> Option<&[u8]> {
-        self.mmap.get(byte_start..byte_end)
     }
 }
 
@@ -773,51 +767,24 @@ fn reframe_way_blob_with_locations(
                 scratch.packed_lons.clear();
                 let mut last_lat: i64 = 0;
                 let mut last_lon: i64 = 0;
+                let mut ref_count: u64 = 0;
 
-                // Count refs by counting varint terminal bytes (MSB=0).
-                // Each varint has exactly one terminal byte, so this gives
-                // the number of packed sint64 deltas without decoding.
-                #[allow(clippy::cast_possible_truncation)]
-                let ref_count = refs_data.iter().filter(|b| *b & 0x80 == 0).count() as u64;
-
-                if ref_count > 0 {
-                    // Batch coord read: one contiguous slice for all refs
-                    // in this way, eliminating per-ref bounds checks.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let slot_start = way_slot_pos as usize * COORD_SLOT_SIZE;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let slot_end = slot_start + ref_count as usize * COORD_SLOT_SIZE;
-                    let coord_batch = coord_slots.get_slice(slot_start, slot_end);
-
+                if !refs_data.is_empty() {
                     let mut ref_cursor = Cursor::new(refs_data);
-                    let mut ref_idx: usize = 0;
                     while ref_cursor.remaining() > 0 {
-                        // Skip the ref delta varint — we only need to
-                        // advance the cursor past it.
-                        ref_cursor.skip_varint().map_err(|e| format!("reframe ref skip: {e}"))?;
+                        // Skip the ref delta — we don't need the node ID,
+                        // just need to count refs for slot_pos advancement.
+                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
 
-                        let (lat, lon) = match coord_batch {
-                            Some(batch) => {
-                                let co = ref_idx * COORD_SLOT_SIZE;
-                                let lat = i32::from_le_bytes([
-                                    batch[co], batch[co+1], batch[co+2], batch[co+3],
-                                ]);
-                                let lon = i32::from_le_bytes([
-                                    batch[co+4], batch[co+5], batch[co+6], batch[co+7],
-                                ]);
-                                if lat == 0 && lon == 0 {
-                                    missing_locations += 1;
-                                    (0, 0)
-                                } else {
-                                    (lat, lon)
-                                }
-                            }
+                        let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                            Some(loc) => loc,
                             None => {
                                 missing_locations += 1;
                                 (0, 0)
                             }
                         };
-                        ref_idx += 1;
+                        way_slot_pos += 1;
+                        ref_count += 1;
 
                         let lat_i64 = i64::from(lat);
                         let lon_i64 = i64::from(lon);
@@ -832,7 +799,6 @@ fn reframe_way_blob_with_locations(
                         last_lat = lat_i64;
                         last_lon = lon_i64;
                     }
-                    way_slot_pos += ref_count;
                 }
 
                 #[allow(clippy::cast_possible_truncation)]

@@ -48,15 +48,15 @@ use crate::Element;
 /// Reject negative ids at the entry of the external path.
 ///
 /// Production OSM planet extracts don't contain negative ids (they're
-/// JOSM-local editor staging identifiers resolved before upload);
-/// `renumber --mode inmem` handles them via the in-memory FxHashMap path.
-/// The external path rejects them with a clear error.
+/// JOSM-local editor staging identifiers resolved before upload).
+/// Renumber rejects them with a clear error.
 fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
     if id < 0 {
         return Err(format!(
-            "renumber --mode external requires non-negative input ids. \
+            "renumber requires non-negative input ids. \
              Input contains {kind} id {id}. \
-             Use --mode inmem for files with negative (editor-local) ids."
+             Negative ids are JOSM editor-local staging identifiers \
+             that should be resolved before processing."
         )
         .into());
     }
@@ -558,7 +558,7 @@ fn build_all_blob_schedules(
         }
         let Some(idx) = hdr.index() else {
             return Err(
-                "renumber --mode external requires an indexed PBF — run `brokkr cat` to add \
+                "renumber requires an indexed PBF — run `pbfhogg cat` to add \
                  indexdata or use the indexed variant"
                     .into(),
             );
@@ -939,9 +939,10 @@ fn reframe_dense_with_new_ids(
             old_id += delta;
             if check_negative_ids && old_id < 0 {
                 return Err(format!(
-                    "renumber --mode external requires non-negative input ids. \
+                    "renumber requires non-negative input ids. \
                      Input contains node id {old_id}. \
-                     Use --mode inmem for files with negative (editor-local) ids."
+                     Negative ids are JOSM editor-local staging identifiers \
+                     that should be resolved before processing."
                 ));
             }
             id_set.set(old_id);
@@ -1076,9 +1077,10 @@ fn reframe_ways_with_new_ids(
 
                 if check_negative_ids && old_way_id < 0 {
                     return Err(format!(
-                        "renumber --mode external requires non-negative input ids. \
+                        "renumber requires non-negative input ids. \
                          Input contains way id {old_way_id}. \
-                         Use --mode inmem for files with negative (editor-local) ids."
+                         Negative ids are JOSM editor-local staging identifiers \
+                         that should be resolved before processing."
                     ));
                 }
                 way_id_set.set(old_way_id);
@@ -1095,10 +1097,11 @@ fn reframe_ways_with_new_ids(
                     let old_node_id = prev_old_ref;
                     if old_node_id < 0 {
                         return Err(format!(
-                            "renumber --mode external requires non-negative \
-                             input ids. Way references negative node id \
-                             {old_node_id}. Use --mode inmem for files with \
-                             negative (editor-local) ids."
+                            "renumber requires non-negative input ids. \
+                             Way references negative node id {old_node_id}. \
+                             Negative ids are JOSM editor-local staging \
+                             identifiers that should be resolved before \
+                             processing."
                         ));
                     }
                     let new_ref = node_id_set.resolve(old_node_id, start_node_id);

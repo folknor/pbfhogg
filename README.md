@@ -50,12 +50,12 @@ Sorted by peak memory — the hardest operations still fit in 32 GB with room to
 | `extract --smart` (Europe bbox) | 4m39s | 11.17 GB † | three-pass, multipolygon-complete |
 | `build-geocode-index` | 22m26s | 14.59 GB | reverse geocoding index, S2 cells |
 | `add-locations-to-ways --index-type external` | 24m22s | **16.67 GB** | double-radix permutation, ~112 GB temp disk |
-| `renumber --mode external`       | 3m29s | **7.0 GB** | IdSetDense rank fusion, wire-format rewriters (all 3 types), zero temp disk, single shared fd, atomic dispatch |
+| `renumber`                       | 3m29s | **7.0 GB** | IdSetDense rank fusion, wire-format rewriters (all 3 types), zero temp disk, single shared fd, atomic dispatch |
 
 † Single-sample `--bench 1` measurement with Europe bbox. See [notes/parallel-classify-regression.md](notes/parallel-classify-regression.md) for the investigation that validated the 32 GB host ceiling. \
 ‡ Older runs without sidecar profiler; peak RSS stated from investigation notes.
 
-Not yet measured on planet, all pending tonight's overnight bench suite: `sort`, `inspect`, `getparents`, `extract --simple` / `--complete`, `multi-extract`, `diff`, `diff --format osc`, `merge-changes` (multi-OSC, 7-file range), and fresh sidecar-profiled runs for `cat` indexdata generation and `apply-changes`. `time-filter` stays unmeasured — it needs a history PBF we don't have. `add-locations-to-ways --index-type dense` is expected to thrash on ≤32 GB hosts (~30+ GB mmap working set) — use `external` instead. **`renumber --mode inmem`** (the default) remains **not planet-safe** — the in-memory `FxHashMap` architecture requires ~278 GB at planet scale. Users needing planet-scale renumber should pass `--mode external`.
+Not yet measured on planet, all pending tonight's overnight bench suite: `sort`, `inspect`, `getparents`, `extract --simple` / `--complete`, `multi-extract`, `diff`, `diff --format osc`, `merge-changes` (multi-OSC, 7-file range), and fresh sidecar-profiled runs for `cat` indexdata generation and `apply-changes`. `time-filter` stays unmeasured — it needs a history PBF we don't have. `add-locations-to-ways --index-type dense` is expected to thrash on ≤32 GB hosts (~30+ GB mmap working set) — use `external` instead.
 
 Full commit hashes, sidecar UUIDs, and phase breakdowns are in [reference/performance.md](reference/performance.md).
 

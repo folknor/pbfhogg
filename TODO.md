@@ -442,7 +442,7 @@ single-pass, tag expression and bbox filtering.
     document that the branch is dead-ish outside real-world inputs.
 
 - [x] **`renumber` planet-scale refactor — COMPLETE.** External path
-  (`--mode external`) shipped with IdSetDense rank-based lookup for all
+  Shipped with IdSetDense rank-based lookup for all
   three element types. Planet: 209 s (3m29s), 7.0 GB peak anon, zero
   temp disk.
 

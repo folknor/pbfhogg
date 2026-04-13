@@ -137,3 +137,23 @@ presentational — pbfhogg distinguishes "how many distinct IDs are missing" fro
 "how many references point to missing IDs." Users comparing numeric output between
 the two tools should be aware that osmium's count corresponds to pbfhogg's
 occurrence (parenthesized) count, not the primary count.
+
+## renumber: negative input IDs rejected
+
+**osmium behavior:** Handles negative IDs (JOSM editor-local staging
+identifiers) transparently, assigning them new sequential IDs like any
+other element.
+
+**pbfhogg behavior:** Rejects negative input IDs with an error. Negative
+IDs are JOSM editor-local staging identifiers that are resolved before
+upload to OSM — they never appear in production planet extracts or
+Geofabrik downloads.
+
+**Rationale:** The renumber implementation uses `IdSetDense` bitsets indexed
+by unsigned ID for O(1) rank-based lookup. Negative IDs would require
+either a separate data structure or offset mapping. Since negative IDs
+are never present in real-world inputs, the complexity isn't justified.
+
+**Impact:** Users with JOSM-local staging data must resolve negative IDs
+before renumbering. This affects only hand-edited files that haven't been
+uploaded.

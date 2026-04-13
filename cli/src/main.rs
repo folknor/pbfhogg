@@ -78,19 +78,6 @@ enum DefaultTypeArg {
     Relation,
 }
 
-/// Implementation selector for the `renumber` command.
-///
-/// - `inmem`: single binary scan, three `FxHashMap<i64, i64>` tables in RAM.
-///   Simple and fast on small-to-Europe-scale input. OOMs on planet (~278 GB
-///   of hashmap state).
-/// - `external`: parallel wire-format splice rewriters with `IdSetDense`
-///   rank-based O(1) lookup. Planet: 209 s (3m29s), 7.0 GB peak anon,
-///   zero temp disk.
-#[derive(Clone, Copy, ValueEnum)]
-enum RenumberMode {
-    Inmem,
-    External,
-}
 
 #[derive(Subcommand)]
 enum Command {
@@ -139,7 +126,10 @@ enum Command {
         #[command(flatten)]
         header: HeaderOverrideArg,
     },
-    /// Renumber all element IDs sequentially, remapping cross-references
+    /// Renumber all element IDs sequentially, remapping cross-references.
+    ///
+    /// Input must be sorted. Negative IDs (JOSM editor-local staging
+    /// identifiers) are rejected — they must be resolved before renumbering.
     Renumber {
         /// Input PBF file (must be sorted)
         file: PathBuf,
@@ -148,10 +138,6 @@ enum Command {
         /// Starting ID(s): single value or comma-separated node,way,relation
         #[arg(short = 's', long, default_value = "1")]
         start_id: String,
-        /// Implementation to use: `inmem` (fast, Europe-safe) or `external`
-        /// (planet-safe, bucket-based, rejects negative input IDs).
-        #[arg(long, value_enum, default_value = "inmem")]
-        mode: RenumberMode,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -731,7 +717,6 @@ fn main() {
             file,
             output,
             start_id,
-            mode,
             compression,
             io,
             header,
@@ -739,7 +724,6 @@ fn main() {
             &file,
             &output.output,
             &start_id,
-            mode,
             &compression.compression,
             io.direct_io,
             &HeaderOverrides::parse(header.generator, &header.output_headers)?,
@@ -1445,7 +1429,6 @@ fn run_renumber(
     file: &std::path::Path,
     output: &std::path::Path,
     start_id: &str,
-    mode: RenumberMode,
     compression: &str,
     direct_io: bool,
     overrides: &HeaderOverrides,
@@ -1477,14 +1460,9 @@ fn run_renumber(
         }
         _ => return Err("--start-id must be a single value or 3 comma-separated values (node,way,relation)".into()),
     };
-    let stats = match mode {
-        RenumberMode::Inmem => {
-            pbfhogg::renumber::renumber(file, output, &opts, compression, direct_io, overrides)?
-        }
-        RenumberMode::External => pbfhogg::renumber_external::renumber_external(
-            file, output, &opts, compression, direct_io, overrides,
-        )?,
-    };
+    let stats = pbfhogg::renumber_external::renumber_external(
+        file, output, &opts, compression, direct_io, overrides,
+    )?;
     stats.print_summary();
     Ok(())
 }

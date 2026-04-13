@@ -1,12 +1,9 @@
 //! End-to-end tests for the planet-safe external renumber implementation.
 //!
 //! These tests exercise `pbfhogg::renumber_external::renumber_external`,
-//! which lives alongside the in-memory `renumber` module. The external
-//! path builds out progressively: pass 1 (this file's initial coverage)
-//! handles node renumbering and node_map bucket emission, pass 2 adds
-//! way refs, and the relation two-pass rounds it out. See
-//! `notes/renumber-planet-scale.md` for the design and the task
-//! breakdown in TODO.md.
+//! which lives alongside the in-memory `renumber` module. Every test
+//! cross-checks the external path against the in-memory path via
+//! `assert_elements_equivalent`.
 
 mod common;
 
@@ -34,10 +31,8 @@ fn default_opts() -> RenumberOptions {
 
 #[test]
 fn external_pass1_renumbers_nodes_sequentially() {
-    // Pass 1 reads nodes, assigns new sequential ids, writes renumbered
-    // nodes to output, and emits (old_id, new_id) tuples into bucket
-    // files (which we don't inspect directly from tests — bucket contents
-    // are verified indirectly when pass 2 lands).
+    // Nodes-only input: verifies pass 1 wire-format rewriter assigns
+    // sequential ids and preserves coords + tags.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
@@ -248,10 +243,9 @@ fn external_relations_basic_end_to_end() {
 
 #[test]
 fn external_relation_forward_ref() {
-    // Regression test mirroring the in-memory forward-ref bug fix from
-    // task #8. Rel 500 references rel 600, which isn't assigned yet at
-    // scan time. The in-memory two-pass resolves this; the external
-    // R1→R2 structure must do the same.
+    // Rel 500 references rel 600 (forward ref — target appears later
+    // in sort order). R1 collects all IDs before R2d resolves, so this
+    // works. Cross-checked against in-memory two-pass path.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output_ext = dir.path().join("output_ext.osm.pbf");
@@ -346,11 +340,9 @@ fn external_relation_self_reference() {
 
 #[test]
 fn external_relation_mixed_member_types_interleaved() {
-    // Relation with members in non-type-sorted order to stress the
-    // lockstep slot_cursor walk between R2a and R2d. If the cursors
-    // drift (e.g. because one stage counts all node members in one
-    // relation before moving to the next while the other interleaves
-    // per file order), the node and way slot indices diverge.
+    // Relation with members in non-type-sorted order (node, way, node,
+    // relation, way, node) to stress the interleaved types + memids
+    // cursor walk in the wire-format splice rewriter.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output_ext = dir.path().join("output_ext.osm.pbf");
@@ -406,31 +398,15 @@ fn external_relation_mixed_member_types_interleaved() {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2 stage 2a: way-ref COO pair emission
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Pass 2: full end-to-end (nodes + ways)
+// Nodes + ways end-to-end
 // ---------------------------------------------------------------------------
 
 #[test]
 fn external_nodes_and_ways_end_to_end() {
-    // With stages 2a-2d landed, renumber_external now produces a complete
-    // nodes + ways output (relations still deferred to task #4). The
-    // element-equivalence cross-check against the in-memory renumber is
-    // the acceptance test for the external path.
-    //
     // Input deliberately includes:
-    //
-    // - 3 ways with overlapping refs that span bucket partition lines
-    //   (bucket 0 vs bucket N boundaries are small here since test ids
-    //   are tiny, but the test still exercises the end-to-end pipeline
-    //   structure).
-    // - A duplicate ref (way 100 refs [1, 2, 2]) to exercise scatter-
-    //   back position preservation, the correctness-review trap from
-    //   notes/renumber-planet-scale.md section 2.
-    // - A way with refs in non-sorted order (way 300 [3, 4, 1]) so the
-    //   per-way ref order check catches any incorrect sorting.
+    // - A duplicate ref (way 100 refs [1, 2, 2])
+    // - A way with refs in non-sorted order (way 300 [3, 4, 1])
+    // Cross-checked against in-memory path.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");
     let output_ext = dir.path().join("output_ext.osm.pbf");
@@ -472,8 +448,7 @@ fn external_nodes_and_ways_end_to_end() {
 
     // Element-equivalence cross-check: the two outputs must contain
     // semantically identical elements (same ids, tags, refs, members,
-    // metadata) even if their byte representations differ. This is the
-    // comparison harness designed in task #9.
+    // metadata) even if their byte representations differ.
     assert_elements_equivalent(&output_ext, &output_inmem);
 
     // Sortedness invariant: both outputs must have the sorted header

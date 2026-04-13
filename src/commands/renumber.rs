@@ -13,8 +13,7 @@
 //! implementation falls through to `unwrap_or(old_id)` on forward relation→
 //! relation references (target not yet assigned), silently writing the OLD
 //! id into the new output. osmium-tool uses the same two-pass structure in
-//! `command_renumber.cpp:380-403` for the same reason. See
-//! `notes/renumber-planet-scale.md` for the full correctness analysis.
+//! `command_renumber.cpp:380-403` for the same reason.
 
 use std::path::Path;
 
@@ -39,6 +38,10 @@ pub struct RenumberStats {
     pub nodes_written: u64,
     pub ways_written: u64,
     pub relations_written: u64,
+    /// Way refs and relation members whose old ID was not found in the
+    /// corresponding ID set. These pass through with their old ID
+    /// unchanged (orphan passthrough).
+    pub orphan_refs: u64,
 }
 
 impl RenumberStats {
@@ -48,6 +51,13 @@ impl RenumberStats {
             "Renumbered {total} elements: {} nodes, {} ways, {} relations",
             self.nodes_written, self.ways_written, self.relations_written,
         );
+        if self.orphan_refs > 0 {
+            eprintln!(
+                "Warning: {} orphan refs preserved with old IDs (referenced \
+                 elements not present in input)",
+                self.orphan_refs,
+            );
+        }
     }
 }
 
@@ -89,6 +99,7 @@ pub fn renumber(
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
+        orphan_refs: 0,
     };
 
     let mut refs_buf: Vec<i64> = Vec::new();
@@ -136,7 +147,14 @@ pub fn renumber(
                     next_way_id += 1;
                     way_map.insert(w.id(), new_id);
                     refs_buf.clear();
-                    refs_buf.extend(w.refs().map(|r| node_map.get(&r).copied().unwrap_or(r)));
+                    for r in w.refs() {
+                        if let Some(&new_ref) = node_map.get(&r) {
+                            refs_buf.push(new_ref);
+                        } else {
+                            refs_buf.push(r);
+                            stats.orphan_refs += 1;
+                        }
+                    }
                     let meta = element_metadata(&w.info());
                     bb.add_way(new_id, w.tags(), &refs_buf, meta.as_ref());
                     stats.ways_written += 1;
@@ -191,15 +209,27 @@ pub fn renumber(
                 )
             })?;
             members_buf.clear();
-            members_buf.extend(r.members().map(|m| {
-                let remapped_id = match m.id {
-                    MemberId::Node(id) => MemberId::Node(node_map.get(&id).copied().unwrap_or(id)),
-                    MemberId::Way(id) => MemberId::Way(way_map.get(&id).copied().unwrap_or(id)),
-                    MemberId::Relation(id) => MemberId::Relation(relation_map.get(&id).copied().unwrap_or(id)),
-                    MemberId::Unknown(t, id) => MemberId::Unknown(t, id),
+            for m in r.members() {
+                let (remapped_id, is_orphan) = match m.id {
+                    MemberId::Node(id) => match node_map.get(&id) {
+                        Some(&new_id) => (MemberId::Node(new_id), false),
+                        None => (MemberId::Node(id), true),
+                    },
+                    MemberId::Way(id) => match way_map.get(&id) {
+                        Some(&new_id) => (MemberId::Way(new_id), false),
+                        None => (MemberId::Way(id), true),
+                    },
+                    MemberId::Relation(id) => match relation_map.get(&id) {
+                        Some(&new_id) => (MemberId::Relation(new_id), false),
+                        None => (MemberId::Relation(id), true),
+                    },
+                    MemberId::Unknown(t, id) => (MemberId::Unknown(t, id), false),
                 };
-                MemberData { id: remapped_id, role: m.role().unwrap_or("") }
-            }));
+                if is_orphan {
+                    stats.orphan_refs += 1;
+                }
+                members_buf.push(MemberData { id: remapped_id, role: m.role().unwrap_or("") });
+            }
             let meta = element_metadata(&r.info());
             bb.add_relation(new_id, r.tags(), &members_buf, meta.as_ref());
             stats.relations_written += 1;

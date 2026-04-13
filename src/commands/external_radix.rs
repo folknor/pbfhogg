@@ -1,8 +1,6 @@
 //! Shared scaffolding for 256-bucket radix-partitioned external joins.
 //!
-//! Used by:
-//! - `external_join` (ALTW coordinate resolution)
-//! - `renumber_external` (planet-scale renumber — see `notes/renumber-planet-scale.md`)
+//! Used by `external_join` (ALTW coordinate resolution).
 //!
 //! Provides a managed scratch directory (auto-cleanup on drop) and a set of
 //! buffered bucket writers with flush-sync-fadvise-close semantics. Payload

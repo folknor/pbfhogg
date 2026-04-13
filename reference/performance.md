@@ -396,9 +396,9 @@ baseline (`c5d00c22`) exactly.
 
 **−3,247 s (−94%)** from baseline. Each commit verified on Denmark
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
-Two intermediate planet runs OOM-killed at ~26 GB anon RSS — see
-[notes/renumber-planet-scale.md](../notes/renumber-planet-scale.md) for
-the reorder-buffer forensic and the glibc arena fragmentation analysis.
+Two intermediate planet runs OOM-killed at ~26 GB anon RSS due to
+reorder-buffer backlog from range-split dispatch and glibc arena
+fragmentation — resolved by work-stealing dispatch + `MALLOC_ARENA_MAX=2`.
 
 ### Memory
 

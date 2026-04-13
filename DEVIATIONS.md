@@ -115,9 +115,7 @@ reference nothing. pbfhogg's choice is the lower-surprise default: the
 output never contains ids for objects that aren't in the output.
 
 Users who need osmium-compatible orphan handling can add a followup
-`--orphan-policy {preserve,assign}` flag — see
-[notes/renumber-planet-scale.md](notes/renumber-planet-scale.md) correctness
-review section 5b for the full analysis.
+`--orphan-policy {preserve,assign}` flag.
 
 **Impact:** Downstream tools that assume output ids are contiguous in
 `[start_id, start_id + N)` must tolerate orphan refs outside that range.

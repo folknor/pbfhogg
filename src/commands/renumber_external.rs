@@ -1,27 +1,36 @@
-//! External-join implementation of renumber for planet-scale input.
+//! External renumber for planet-scale input.
 //!
 //! The in-memory `renumber` module allocates three `FxHashMap<i64, i64>`
-//! tables whose combined size on planet is ~278 GB (node_map ~250 GB,
-//! way_map ~28 GB, relation_map ~340 MB), which OOM-kills any host
-//! that isn't already oversized. This module replaces `node_map` and
-//! `way_map` with IdSetDense bitsets + rank-based O(1) lookup, keeping
-//! only the small `relation_map` in RAM.
+//! tables whose combined size on planet is ~278 GB, which OOM-kills any
+//! host under ~300 GB RAM. This module uses `IdSetDense` bitsets with
+//! rank-based O(1) lookup for all three element types — no hash maps,
+//! no temp files, no mmaps.
 //!
 //! ## Architecture
 //!
 //! - **Pass 1**: parallel wire-format node rewriter (4 work-stealing
-//!   workers). Per-worker IdSetDense bitsets merged after pass 1 for
-//!   O(1) rank-based node ID lookup.
-//! - **Fused way scan**: resolve each way ref via `node_id_set.rank()`,
-//!   write resolved refs to a flat file sequentially.
+//!   workers). Each worker builds a per-shard `IdSetDense`; shards are
+//!   merged after pass 1 and a rank index built for O(1) new-id lookup.
 //! - **Stage 2d**: parallel wire-format way splice rewriter (6
-//!   work-stealing workers). Per-worker IdSetDense for way_id_set.
-//! - **Fused relation scan (R1+R2A+R2B)**: sequential relation scan
-//!   that assigns new relation IDs and resolves node/way member refs
-//!   via rank() inline, writing flat files directly.
-//! - **R2d**: sequential wire-format splice rewriter for relations.
+//!   work-stealing workers). Resolves way refs inline via
+//!   `node_id_set.rank()` during the splice — no intermediate files.
+//!   Per-worker `IdSetDense` for `way_id_set`, merged after stage 2d.
+//! - **R1**: sequential relation scan to collect all relation IDs into
+//!   a third `IdSetDense` bitset + rank index.
+//! - **R2d**: parallel wire-format splice rewriter for relations.
+//!   Resolves node/way/relation member refs inline via `resolve()`.
 //!
-//! Planet: 442 s (7m22s). Denmark cross-validated against in-memory mode.
+//! ## Orphan references
+//!
+//! Way refs and relation members whose old ID is not present in the
+//! corresponding `IdSetDense` (i.e. not seen in the input) pass through
+//! with their old ID unchanged, matching the in-memory path's
+//! `unwrap_or(old_id)` behavior and osmium's semantics. Consumers that
+//! assume new IDs are dense starting at `start_*_id` must tolerate
+//! mixed old/new ID spaces in the output.
+//!
+//! Planet: 209 s (3m29s), 7.0 GB peak anon (commit `67c7960`).
+//! Denmark cross-validated against in-memory mode on every commit.
 
 use std::path::Path;
 
@@ -60,10 +69,11 @@ fn reject_negative_id(id: i64, kind: &str) -> Result<()> {
 
 /// Run the planet-safe external renumber.
 ///
-/// Architecture: pass 1 rewrites nodes (parallel wire-format rewriter),
-/// fused way scan resolves refs via IdSetDense rank, stage 2d rewrites
-/// ways (parallel wire-format rewriter), fused relation scan resolves
-/// member refs via rank, R2d assembles relations via full decode.
+/// Four phases: pass 1 rewrites nodes (parallel wire-format rewriter),
+/// stage 2d rewrites ways with resolved refs (parallel wire-format
+/// splice), R1 collects relation IDs into IdSetDense, R2d rewrites
+/// relations with resolved member refs (parallel wire-format splice).
+/// All ID lookups are O(1) via `IdSetDense::resolve()`. No temp files.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn renumber_external(
@@ -120,6 +130,7 @@ pub fn renumber_external(
         nodes_written: 0,
         ways_written: 0,
         relations_written: 0,
+        orphan_refs: 0,
     };
 
     // Single shared input fd for all phases — pread is concurrent-safe.
@@ -133,40 +144,14 @@ pub fn renumber_external(
 
     // ---- Pass 1: parallel node scan ----
     //
-    // Architecture ports external_join.rs stage 4 (assembly) pattern:
+    // Work-stealing dispatch: 4 workers claim blobs via AtomicUsize,
+    // each owning an IdSetDense bitset and scratch buffers. Workers
+    // pread → decompress → wire-format reframe (replace only ID deltas,
+    // copy everything else verbatim) → send Vec<OwnedBlock> through a
+    // bounded channel. Main thread reorders by seq and writes output.
     //
-    // 1. Pre-scan blob headers to build a schedule filtered to node
-    //    blobs, with each blob's element count. Compute prefix sums so
-    //    each blob's base new_id is known before any decode work runs.
-    // 2. Range-split the schedule in half by blob index. Worker 0 gets
-    //    the first half, worker 1 gets the second. Range-based (not
-    //    work-stealing) dispatch preserves per-shard bucket-file sort:
-    //    each shard's bucket N contains old_ids in strictly ascending
-    //    order, and the two shards are disjoint (shard 0's old_ids are
-    //    all less than shard 1's). Stage 2b reads them as a concatenated
-    //    sorted run.
-    // 3. Each worker owns: its IdSetDense bitset,
-    //    its BlockBuilder, its read_buf + decompress_buf + scratch Vecs,
-    //    its output_blocks Vec<OwnedBlock>. All allocations stay worker-
-    //    local — no cross-thread malloc/free churn.
-    // 4. Workers send (seq, Result<Vec<OwnedBlock>>) via a bounded
-    //    channel. The OwnedBlock's Vec<u8> IS cross-thread-transferred to
-    //    the consumer, but bounded at ~32 items × ~1.4 MB = ~45 MB
-    //    in flight. Matches the external_join stage 4 pattern which
-    //    runs planet-scale without OOM.
-    // 5. Main thread consumer drains the channel, uses ReorderBuffer to
-    //    deliver (seq, blocks) in file order, pushes each OwnedBlock via
-    //    writer.write_primitive_block_owned.
-    //
-    // The for_each_block_pipelined path was attempted first and OOMed at
-    // 26 GB anon RSS on planet — cross-thread PrimitiveBlock retention
-    // via glibc arena accumulation, exactly as notes/parallel-classify-
-    // regression.md predicted. This pattern avoids that by extracting
-    // per-blob OwnedBlock output on the worker thread (so PrimitiveBlocks
-    // drop on the worker) and only crossing the Vec<u8> of already-encoded
-    // output bytes.
     // Scan all blob headers once — builds node/way/relation schedules
-    // in a single pass instead of scanning 3-4 times.
+    // in a single pass.
     let (pass1_schedule, way_schedule, relation_schedule) =
         build_all_blob_schedules(input)?;
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
@@ -230,6 +215,7 @@ pub fn renumber_external(
         .map(|_| super::id_set_dense::IdSetDense::new())
         .collect();
     let stage2d_ways_atomic = std::sync::atomic::AtomicU64::new(0);
+    let orphan_refs_atomic = std::sync::atomic::AtomicU64::new(0);
     stage2d_parallel_way_assembly(
         &shared_file,
         &mut writer,
@@ -239,20 +225,14 @@ pub fn renumber_external(
         opts.start_node_id,
         opts.start_way_id,
         &stage2d_ways_atomic,
+        &orphan_refs_atomic,
     )?;
     stats.ways_written += stage2d_ways_atomic.load(std::sync::atomic::Ordering::Relaxed);
+    stats.orphan_refs += orphan_refs_atomic.load(std::sync::atomic::Ordering::Relaxed);
     crate::debug::emit_marker("RENUMBER_EXT_STAGE2D_END");
 
-    // ---- Relation passes R1 + R2a (fused): assign ids + emit member refs ----
-    // Single scan over relation blobs. R1 assigns new_relation_ids and
-    // builds the in-memory relation_map. R2a emits (old_id, slot_pos)
-    // COO pairs for node and way members into their respective bucket
-    // sets. Both halves operate on each relation in isolation — R2a
-    // does not consult relation_map (relation members are resolved in
-    // R2d directly), so the two passes can share a single decoded
-    // block.
-    // ---- R1: assign relation IDs + build relation_map ----
-    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_START");
+    // ---- R1: collect relation IDs into IdSetDense ----
+    crate::debug::emit_marker("RENUMBER_EXT_R1_START");
 
     // Merge per-worker way_id_sets built during stage 2d.
     let mut way_id_set = way_id_sets.remove(0);
@@ -272,7 +252,7 @@ pub fn renumber_external(
     {
         crate::debug::emit_counter("renumber_ext_relation_map_entries", relation_id_set.total_count() as i64);
     }
-    crate::debug::emit_marker("RENUMBER_EXT_R1_R2A_END");
+    crate::debug::emit_marker("RENUMBER_EXT_R1_END");
 
     // ---- R2d: parallel wire-format rewrite of relations ----
     // Resolves node/way member refs inline via resolve().
@@ -301,7 +281,7 @@ pub fn renumber_external(
 
 
 // ---------------------------------------------------------------------------
-// Pass 2 stage D: way assembly — re-scan ways, rewrite refs, write output
+// Stage 2d: parallel way rewrite — fused ref resolve + wire-format splice
 // ---------------------------------------------------------------------------
 
 /// Parallel stage 2d: fused way resolve + wire-format rewrite.
@@ -310,13 +290,11 @@ pub fn renumber_external(
 /// `node_id_set.rank()` and splices new IDs into the wire format.
 /// No intermediate flat file, no sidecar, no mmap.
 ///
-/// Mirrors the pass-1 worker-pool pattern: two range-partitioned
-/// workers, each owning a way_map shard, a `BlockBuilder`, its own
-/// scratch buffers, and an `output_blocks: Vec<OwnedBlock>` staging
-/// vec. Workers pread way blobs, decompress, resolve refs inline via
-/// `node_id_set.rank()`, wire-format splice new IDs, and send
-/// `(seq, Vec<OwnedBlock>)` via a bounded channel. The main thread
-/// reorders by seq and writes via `write_primitive_block_owned`.
+/// Workers (STAGE2D_WORKERS) claim blobs via `AtomicUsize::fetch_add`.
+/// Each worker owns an `IdSetDense` shard for `way_id_set` and scratch
+/// buffers. Workers pread → decompress → `reframe_ways_with_new_ids`
+/// (splice new way IDs + resolved refs) → send `Vec<OwnedBlock>` via
+/// bounded channel. Main thread reorders by seq and writes output.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,
@@ -332,6 +310,7 @@ fn stage2d_parallel_way_assembly(
     start_node_id: i64,
     start_way_id: i64,
     ways_written: &std::sync::atomic::AtomicU64,
+    orphan_refs: &std::sync::atomic::AtomicU64,
 ) -> Result<()> {
     if way_schedule.is_empty() {
         return Ok(());
@@ -378,6 +357,7 @@ fn stage2d_parallel_way_assembly(
                         start_node_id,
                         id_set,
                         ways_written,
+                        orphan_refs,
                         stage2d_cref,
                         &tx,
                     );
@@ -417,10 +397,9 @@ fn stage2d_parallel_way_assembly(
     Ok(())
 }
 
-/// Stage 2d per-worker loop. Claims blobs from a shared FIFO queue
+/// Stage 2d per-worker loop. Claims blobs via `AtomicUsize::fetch_add`
 /// and emits one owned-block batch per blob through the channel.
-/// Resolves way refs inline via `node_id_set.rank()` — no flat file
-/// or mmap needed.
+/// Resolves way refs inline via `node_id_set.rank()`.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn stage2d_worker(
     schedule: &[BlobTask],
@@ -431,6 +410,7 @@ fn stage2d_worker(
     start_node_id: i64,
     way_id_set: &mut super::id_set_dense::IdSetDense,
     ways_written: &std::sync::atomic::AtomicU64,
+    orphan_refs: &std::sync::atomic::AtomicU64,
     counters: &StageCounters,
     tx: &std::sync::mpsc::SyncSender<(usize, std::result::Result<Vec<OwnedBlock>, String>)>,
 ) {
@@ -473,7 +453,7 @@ fn stage2d_worker(
 
             let t2 = std::time::Instant::now();
             reframe_buf.clear();
-            let blob_way_count = reframe_ways_with_new_ids(
+            let (blob_way_count, blob_orphans) = reframe_ways_with_new_ids(
                 &decompress_buf,
                 base_way_id,
                 node_id_set,
@@ -513,6 +493,7 @@ fn stage2d_worker(
             }
 
             ways_written.fetch_add(blob_way_count, Relaxed);
+            orphan_refs.fetch_add(blob_orphans, Relaxed);
             counters.blobs.fetch_add(1, Relaxed);
 
             Ok(std::mem::take(&mut output_blocks))
@@ -600,33 +581,18 @@ fn build_all_blob_schedules(
     Ok((nodes, ways, relations))
 }
 
-/// Two-worker parallel pass 1 via **work-stealing** dispatch.
+/// Parallel pass 1: wire-format node rewriter with work-stealing dispatch.
 ///
-/// Both workers pull blob tasks from a shared `Arc<Mutex<Receiver>>`
-/// queue fed in monotonic file order by a dispatcher thread. This is a
-/// deliberate departure from the original range-based split: range
-/// splitting produced disjoint seq ranges `[0..split)` and
-/// `[split..n)` which could *never* be interleaved in a single
-/// `ReorderBuffer`, so the buffer accumulated worker B's entire
-/// backlog (up to ~200k `Vec<OwnedBlock>`s at ~400 KB each = ~80 GB)
-/// while worker A's range drained. Measured on planet as linear
-/// ~118 MB/s anon-RSS growth, OOM-kill at 26 GB by t=295 s — see
-/// commits `9695ad5` / `e7219f0` and `notes/renumber-planet-scale.md`
-/// "Pass 1 memory blowup" for the full forensic.
+/// Workers (PASS1_WORKERS) claim blobs via `AtomicUsize::fetch_add`
+/// over the schedule. Each worker owns an `IdSetDense` bitset shard
+/// and scratch buffers. Per-blob base new_id is pre-computed in a
+/// prefix-sum array so workers process blobs in any order.
 ///
-/// Work-stealing keeps the reorder-buffer gap bounded by
-/// `num_workers × channel_capacity` ≈ O(64) slots instead of
-/// O(schedule_len / 2). Each worker owns its own IdSetDense bitset;
-/// bitsets are merged after the scan via bitwise OR.
-///
-/// Each worker owns: its node_map bucket shard, a local
-/// `BlockBuilder`, read_buf + decompress_buf scratch Vecs, and an
-/// `output_blocks: Vec<OwnedBlock>` staging buffer. All allocations
-/// stay worker-local — PrimitiveBlocks drop on the worker thread,
-/// only `Vec<OwnedBlock>` crosses the channel bounded at ~32 items.
-/// The per-blob starting `new_id` is pre-computed in a prefix-sum
-/// array so workers can process any blob out of FIFO order and still
-/// know which `new_id` slice to assign.
+/// Workers pread → decompress → `reframe_dense_with_new_ids` (splice
+/// new ID deltas, copy lat/lon/tags/metadata verbatim) → send
+/// `Vec<OwnedBlock>` via bounded channel. Main thread reorders by
+/// seq and writes output. Per-worker IdSetDense bitsets are merged
+/// after pass 1 via bitwise OR.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn pass1_parallel_scan(
     schedule: &[BlobTask],
@@ -727,7 +693,6 @@ struct StageCounters {
     pread_ms: std::sync::atomic::AtomicU64,
     decompress_ms: std::sync::atomic::AtomicU64,
     reframe_ms: std::sync::atomic::AtomicU64,
-    bucket_emit_ms: std::sync::atomic::AtomicU64,
     send_ms: std::sync::atomic::AtomicU64,
     consumer_write_ms: std::sync::atomic::AtomicU64,
     blobs: std::sync::atomic::AtomicU64,
@@ -739,7 +704,6 @@ impl StageCounters {
             pread_ms: std::sync::atomic::AtomicU64::new(0),
             decompress_ms: std::sync::atomic::AtomicU64::new(0),
             reframe_ms: std::sync::atomic::AtomicU64::new(0),
-            bucket_emit_ms: std::sync::atomic::AtomicU64::new(0),
             send_ms: std::sync::atomic::AtomicU64::new(0),
             consumer_write_ms: std::sync::atomic::AtomicU64::new(0),
             blobs: std::sync::atomic::AtomicU64::new(0),
@@ -752,7 +716,6 @@ impl StageCounters {
         crate::debug::emit_counter(&format!("{prefix}_pread_ms"), self.pread_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_decompress_ms"), self.decompress_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_reframe_ms"), self.reframe_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter(&format!("{prefix}_bucket_emit_ms"), self.bucket_emit_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_send_ms"), self.send_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_consumer_write_ms"), self.consumer_write_ms.load(Relaxed) as i64);
         crate::debug::emit_counter(&format!("{prefix}_blobs"), self.blobs.load(Relaxed) as i64);
@@ -1017,10 +980,9 @@ fn reframe_dense_with_new_ids(
 /// Reframe a decompressed way-blob PrimitiveBlock by replacing way IDs
 /// and node refs while copying everything else verbatim.
 ///
-/// For each way: decode old way id (for bucket emission), assign new
-/// sequential way id, look up each ref's new node id from the new_refs
-/// mmap at the appropriate slot position, delta-encode the new refs,
-/// and copy keys/vals/info/lat/lon raw bytes verbatim.
+/// For each way: decode old way id, assign new sequential way id,
+/// resolve each ref's new node id via `node_id_set.rank()`, delta-encode
+/// the new refs, and copy keys/vals/info raw bytes verbatim.
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn reframe_ways_with_new_ids(
     decompressed: &[u8],
@@ -1035,7 +997,7 @@ fn reframe_ways_with_new_ids(
     check_negative_ids: bool,
     group_ranges_scratch: &mut Vec<(usize, usize)>,
     scalar_fields_scratch: &mut Vec<u8>,
-) -> std::result::Result<u64, String> {
+) -> std::result::Result<(u64, u64), String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
     group_ranges_scratch.clear();
@@ -1071,6 +1033,7 @@ fn reframe_ways_with_new_ids(
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
     let mut total_ways: u64 = 0;
+    let mut orphan_refs: u64 = 0;
     let mut current_new_id = base_new_way_id;
 
     for &(gr_offset, gr_len) in group_ranges_scratch.iter() {
@@ -1139,6 +1102,9 @@ fn reframe_ways_with_new_ids(
                         ));
                     }
                     let new_ref = node_id_set.resolve(old_node_id, start_node_id);
+                    if !node_id_set.get(old_node_id) {
+                        orphan_refs += 1;
+                    }
                     protohoggr::encode_varint(
                         refs_scratch,
                         protohoggr::zigzag_encode_64(new_ref - prev_new_ref),
@@ -1194,7 +1160,7 @@ fn reframe_ways_with_new_ids(
 
     output.extend_from_slice(scalar_fields_scratch);
 
-    Ok(total_ways)
+    Ok((total_ways, orphan_refs))
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,9 +1174,9 @@ fn reframe_ways_with_new_ids(
 /// The memids field (packed sint64, delta-encoded) interleaves node, way,
 /// and relation member IDs in one stream. Field 10 (types, packed int32)
 /// tells us which lookup to use for each member:
-///   0 = node (read from node_mmap, advance node cursor)
-///   1 = way  (read from way_mmap, advance way cursor)
-///   2 = relation (look up in relation_map)
+///   0 = node  → `node_id_set.resolve(old_id, start_node_id)`
+///   1 = way   → `way_id_set.resolve(old_id, start_way_id)`
+///   2 = relation → `relation_id_set.resolve(old_id, start_relation_id)`
 ///   other = unknown (preserve old absolute ID unchanged)
 ///
 /// One `prev_new_id` accumulator tracks across ALL member types — the
@@ -1232,7 +1198,7 @@ fn reframe_relations_with_new_ids(
     reframed_rel_scratch: &mut Vec<u8>,
     group_ranges_scratch: &mut Vec<(usize, usize)>,
     scalar_fields_scratch: &mut Vec<u8>,
-) -> std::result::Result<(u64, i64, i64), String> {
+) -> std::result::Result<(u64, i64, i64, u64), String> {
     use protohoggr::{Cursor, WIRE_LEN, WIRE_VARINT};
 
     // ---- Level 1: PrimitiveBlock ----
@@ -1269,6 +1235,7 @@ fn reframe_relations_with_new_ids(
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
     let mut total_relations: u64 = 0;
+    let mut orphan_refs: u64 = 0;
     let mut min_new_id: i64 = i64::MAX;
     let mut max_new_id: i64 = i64::MIN;
 
@@ -1360,12 +1327,15 @@ fn reframe_relations_with_new_ids(
                         let old_abs_id = prev_old_id;
 
                         // Look up new absolute id by member type.
-                        let new_abs_id = match member_type {
-                            0 => node_id_set.resolve(old_abs_id, start_node_id),
-                            1 => way_id_set.resolve(old_abs_id, start_way_id),
-                            2 => relation_id_set.resolve(old_abs_id, start_relation_id),
-                            _ => old_abs_id, // unknown type — preserve
+                        let (new_abs_id, is_orphan) = match member_type {
+                            0 => (node_id_set.resolve(old_abs_id, start_node_id), !node_id_set.get(old_abs_id)),
+                            1 => (way_id_set.resolve(old_abs_id, start_way_id), !way_id_set.get(old_abs_id)),
+                            2 => (relation_id_set.resolve(old_abs_id, start_relation_id), !relation_id_set.get(old_abs_id)),
+                            _ => (old_abs_id, false), // unknown type — preserve
                         };
+                        if is_orphan {
+                            orphan_refs += 1;
+                        }
 
                         // Delta-encode the new id.
                         protohoggr::encode_varint(
@@ -1432,14 +1402,14 @@ fn reframe_relations_with_new_ids(
 
     output.extend_from_slice(scalar_fields_scratch);
 
-    Ok((total_relations, min_new_id, max_new_id))
+    Ok((total_relations, min_new_id, max_new_id, orphan_refs))
 }
 
 // ---------------------------------------------------------------------------
-// Fused relation resolve: R1 + R2A + R2B in one pass
+// R1: collect relation IDs
 // ---------------------------------------------------------------------------
 
-/// R1 pass: collect relation IDs into an IdSetDense bitset.
+/// R1 pass: collect relation IDs into an `IdSetDense` bitset.
 /// New IDs are derived via `start_relation_id + rank(old_id)` —
 /// no explicit mapping needed.
 fn relation_r1_collect_ids(
@@ -1513,11 +1483,12 @@ fn relation_r2d_assembly(
         .unwrap_or(4)
         .min(6);
 
-    // Each blob produces one OwnedBlock tuple.
-    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>);
+    // Each blob produces one OwnedBlock tuple + orphan count.
+    type R2dItem = (usize, std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>);
     let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<R2dItem>(32);
 
     let rels_written = std::sync::atomic::AtomicU64::new(0);
+    let r2d_orphans = std::sync::atomic::AtomicU64::new(0);
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let next_ref = &next_idx;
 
@@ -1546,14 +1517,14 @@ fn relation_r2d_assembly(
                     }
                     let task = &relation_schedule[idx];
 
-                    let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String> = (|| {
+                    let result: std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String> = (|| {
                         read_buf.resize(task.data_size, 0);
                         file.read_exact_at(&mut read_buf, task.data_offset)
                             .map_err(|e| format!("pread at {}: {e}", task.data_offset))?;
                         crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
                             .map_err(|e| e.to_string())?;
 
-                        let (blob_count, min_id, max_id) = reframe_relations_with_new_ids(
+                        let (blob_count, min_id, max_id, blob_orphans) = reframe_relations_with_new_ids(
                             &decompress_buf,
                             rid_set,
                             start_rid,
@@ -1580,7 +1551,7 @@ fn relation_r2d_assembly(
                         };
                         let taken = std::mem::take(&mut reframe_buf);
                         reframe_buf.reserve(taken.len());
-                        Ok((taken, index, blob_count))
+                        Ok((taken, index, blob_count, blob_orphans))
                     })();
 
                     if tx.send((idx, result)).is_err() {
@@ -1594,14 +1565,15 @@ fn relation_r2d_assembly(
 
         // Consumer: reorder by seq, write to output in file order.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64), String>,
+            std::result::Result<(Vec<u8>, crate::blob_index::BlobIndex, u64, u64), String>,
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
         for (seq_num, item) in decoded_rx {
             reorder.push(seq_num, item);
             while let Some(result) = reorder.pop_ready() {
-                let (block_bytes, index, _count) =
+                let (block_bytes, index, _count, blob_orphans) =
                     result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                r2d_orphans.fetch_add(blob_orphans, std::sync::atomic::Ordering::Relaxed);
                 if index.count > 0 {
                     writer.write_primitive_block_owned(block_bytes, index, None)?;
                 }
@@ -1611,6 +1583,7 @@ fn relation_r2d_assembly(
     })?;
 
     stats.relations_written += rels_written.load(std::sync::atomic::Ordering::Relaxed);
+    stats.orphan_refs += r2d_orphans.load(std::sync::atomic::Ordering::Relaxed);
 
     Ok(())
 }

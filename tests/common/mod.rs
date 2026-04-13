@@ -386,9 +386,8 @@ pub fn relation_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
 //   metadata per element.
 //
 // Each type section is sorted by id so two PBFs with the same element set but
-// different file orderings compare equal. This is the element-equivalence
-// cross-check called for in the renumber refactor — see
-// notes/renumber-planet-scale.md "Correctness review findings" #1.
+// different file orderings compare equal. Used by the renumber external tests
+// to cross-check against the in-memory path.
 
 /// Normalized element metadata. Matches `pbfhogg::block_builder::Metadata`
 /// shape with owned strings. `None` means the element has no metadata.

@@ -83,14 +83,9 @@ enum DefaultTypeArg {
 /// - `inmem`: single binary scan, three `FxHashMap<i64, i64>` tables in RAM.
 ///   Simple and fast on small-to-Europe-scale input. OOMs on planet (~278 GB
 ///   of hashmap state).
-/// - `external`: 256-bucket radix-partitioned external join with disk-backed
-///   `node_map` and `way_map` files plus an in-memory `relation_map`. Peak
-///   RSS stays under ~4 GB even at planet scale, at the cost of ~385 GB of
-///   scratch temp disk. Slightly slower than `inmem` on sub-Europe inputs
-///   due to bucket write + merge-join overhead.
-///
-/// See `notes/renumber-planet-scale.md` for the full design and memory
-/// budget breakdown.
+/// - `external`: parallel wire-format splice rewriters with `IdSetDense`
+///   rank-based O(1) lookup. Planet: 209 s (3m29s), 7.0 GB peak anon,
+///   zero temp disk.
 #[derive(Clone, Copy, ValueEnum)]
 enum RenumberMode {
     Inmem,

@@ -850,13 +850,13 @@ fn stage2_node_join(
 // Stage 3: Slot reorder — build final coord_slots file
 // ---------------------------------------------------------------------------
 
-/// Read slot buckets in order, scatter entries into a dense buffer per bucket,
-/// write the coord_slots file sequentially.
+/// Parallel slot reorder: workers claim buckets via AtomicUsize, load
+/// slot bucket file, scatter entries into a local buffer, pwrite to
+/// the pre-sized coord_slots file at each bucket's disjoint byte range.
 ///
-/// Each bucket covers a contiguous range of slot positions. Instead of sorting
-/// entries and issuing 4.69B individual pwrite calls (which was 72% of total
-/// time at Europe scale), we scatter entries by position into a zeroed buffer
-/// and write the entire buffer once per bucket.
+/// Pre-allocates the output file to `total_slots * 8` bytes (zero-filled
+/// by the OS). Empty buckets need no explicit zero-write — the file is
+/// already zeroed.
 #[hotpath::measure]
 #[allow(clippy::cast_possible_truncation)]
 fn stage3_slot_reorder(
@@ -864,92 +864,132 @@ fn stage3_slot_reorder(
     coord_slots_path: &Path,
     total_slots: u64,
 ) -> Result<()> {
-    let file = std::fs::File::create(coord_slots_path)
-        .map_err(|e| format!("failed to create coord_slots file {}: {e}", coord_slots_path.display()))?;
-    let mut out = BufWriter::with_capacity(256 * 1024, file);
+    use std::os::unix::fs::FileExt as _;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(coord_slots_path)
+        .map_err(|e| format!("create coord_slots: {e}"))?;
+    let total_bytes = total_slots * COORD_SLOT_SIZE as u64;
+    file.set_len(total_bytes)
+        .map_err(|e| format!("ftruncate coord_slots to {total_bytes}: {e}"))?;
+    let shared_file = std::sync::Arc::new(file);
 
     let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
-    let mut data_buf: Vec<u8> = Vec::new();
-    let mut scatter_buf: Vec<u8> = Vec::new();
-    let mut next_slot: u64 = 0;
 
-    let mut s3_load_ms: u64 = 0;
-    let mut s3_scatter_ms: u64 = 0;
-    let mut s3_write_ms: u64 = 0;
-    let mut s3_buckets_loaded: u64 = 0;
+    // Cap workers for I/O-heavy stage — too many workers thrash the disk.
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(6);
 
-    for bucket_idx in 0..NUM_BUCKETS {
-        let bucket_start = bucket_idx as u64 * range_size;
-        let bucket_end = if bucket_idx == NUM_BUCKETS - 1 {
-            total_slots
-        } else {
-            ((bucket_idx as u64 + 1) * range_size).min(total_slots)
-        };
-        let bucket_slots = bucket_end - bucket_start;
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
+    let s3_load_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_scatter_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_write_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_buckets_loaded = std::sync::atomic::AtomicU64::new(0);
+    let s3_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
-        if slot_buckets.entry_counts[bucket_idx] == 0 {
-            let zero_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
-            scatter_buf.clear();
-            scatter_buf.resize(zero_bytes, 0);
-            let t_w = std::time::Instant::now();
-            out.write_all(&scatter_buf)?;
-            #[allow(clippy::cast_possible_truncation)]
-            { s3_write_ms += t_w.elapsed().as_millis() as u64; }
-            next_slot = bucket_end;
-            continue;
+    let next_ref = &next_idx;
+    let s3_load_ref = &s3_load_ms;
+    let s3_scatter_ref = &s3_scatter_ms;
+    let s3_write_ref = &s3_write_ms;
+    let s3_loaded_ref = &s3_buckets_loaded;
+    let err_ref = &s3_error;
+    let entry_counts = &slot_buckets.entry_counts;
+    let paths = &slot_buckets.paths;
+
+    std::thread::scope(|scope| {
+        for _ in 0..num_workers {
+            let file = std::sync::Arc::clone(&shared_file);
+            scope.spawn(move || {
+                use std::sync::atomic::Ordering::Relaxed;
+                let mut data_buf: Vec<u8> = Vec::new();
+                let mut scatter_buf: Vec<u8> = Vec::new();
+                let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
+
+                loop {
+                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
+                        break;
+                    }
+                    let bucket_idx = next_ref.fetch_add(1, Relaxed);
+                    if bucket_idx >= NUM_BUCKETS { break; }
+
+                    let bucket_start = bucket_idx as u64 * range_size;
+                    let bucket_end = if bucket_idx == NUM_BUCKETS - 1 {
+                        total_slots
+                    } else {
+                        ((bucket_idx as u64 + 1) * range_size).min(total_slots)
+                    };
+                    let bucket_slots = bucket_end - bucket_start;
+
+                    if entry_counts[bucket_idx] == 0 {
+                        // Pre-sized file is already zeroed — nothing to write.
+                        continue;
+                    }
+
+                    let result: std::result::Result<(), String> = (|| {
+                        let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+                        scatter_buf.clear();
+                        scatter_buf.resize(bucket_bytes, 0);
+
+                        let t_load = std::time::Instant::now();
+                        data_buf.clear();
+                        let bucket_file = std::fs::File::open(&paths[bucket_idx])
+                            .map_err(|e| format!("open slot bucket: {e}"))?;
+                        std::io::Read::read_to_end(&mut &bucket_file, &mut data_buf)
+                            .map_err(|e| format!("read slot bucket: {e}"))?;
+                        #[cfg(feature = "linux-direct-io")]
+                        advise_dontneed_file(&bucket_file);
+                        s3_load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);
+
+                        let t_scatter = std::time::Instant::now();
+                        for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
+                            buf.copy_from_slice(chunk);
+                            let entry = ResolvedEntry::read_from(&buf);
+                            let local_pos = (entry.slot_pos - bucket_start) as usize;
+                            let offset = local_pos * COORD_SLOT_SIZE;
+                            scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
+                            scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
+                        }
+                        s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
+
+                        let t_write = std::time::Instant::now();
+                        let file_offset = bucket_start * COORD_SLOT_SIZE as u64;
+                        file.write_all_at(&scatter_buf, file_offset)
+                            .map_err(|e| format!("pwrite coord_slots: {e}"))?;
+                        s3_write_ref.fetch_add(t_write.elapsed().as_millis() as u64, Relaxed);
+
+                        s3_loaded_ref.fetch_add(1, Relaxed);
+                        Ok(())
+                    })();
+
+                    if let Err(e) = result {
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+                        break;
+                    }
+                }
+            });
         }
+    });
 
-        let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
-        scatter_buf.clear();
-        scatter_buf.resize(bucket_bytes, 0);
-
-        let t_load = std::time::Instant::now();
-        data_buf.clear();
-        let file = std::fs::File::open(&slot_buckets.paths[bucket_idx])
-            .map_err(|e| format!("failed to open slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
-        std::io::Read::read_to_end(&mut &file, &mut data_buf)
-            .map_err(|e| format!("failed to read slot bucket {}: {e}", slot_buckets.paths[bucket_idx].display()))?;
-        #[cfg(feature = "linux-direct-io")]
-        advise_dontneed_file(&file);
-        #[allow(clippy::cast_possible_truncation)]
-        { s3_load_ms += t_load.elapsed().as_millis() as u64; }
-
-        let t_scatter = std::time::Instant::now();
-        let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
-        for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
-            buf.copy_from_slice(chunk);
-            let entry = ResolvedEntry::read_from(&buf);
-            let local_pos = (entry.slot_pos - bucket_start) as usize;
-            let offset = local_pos * COORD_SLOT_SIZE;
-            scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
-            scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
-        }
-        #[allow(clippy::cast_possible_truncation)]
-        { s3_scatter_ms += t_scatter.elapsed().as_millis() as u64; }
-
-        let t_write = std::time::Instant::now();
-        out.write_all(&scatter_buf)?;
-        #[allow(clippy::cast_possible_truncation)]
-        { s3_write_ms += t_write.elapsed().as_millis() as u64; }
-        next_slot = bucket_end;
-        s3_buckets_loaded += 1;
+    if let Some(e) = s3_error.into_inner().unwrap_or(None) {
+        return Err(e.into());
     }
 
-    if next_slot < total_slots {
-        let remaining = (total_slots - next_slot) as usize * COORD_SLOT_SIZE;
-        scatter_buf.clear();
-        scatter_buf.resize(remaining, 0);
-        out.write_all(&scatter_buf)?;
-    }
-
-    out.flush()?;
+    // Sync to ensure all pwrite data is flushed before mmap in stage 4.
+    shared_file.sync_data()
+        .map_err(|e| format!("sync coord_slots: {e}"))?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s3_load_ms", s3_load_ms as i64);
-        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms as i64);
-        crate::debug::emit_counter("s3_write_ms", s3_write_ms as i64);
-        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded as i64);
+        crate::debug::emit_counter("s3_load_ms", s3_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_write_ms", s3_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(std::sync::atomic::Ordering::Relaxed) as i64);
     }
 
     Ok(())

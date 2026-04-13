@@ -23,7 +23,7 @@ use crate::writer::Compression;
 use crate::ElementReader;
 
 use super::add_locations_to_ways::Stats;
-use super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
+use super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::id_set_dense::IdSetDense;
 use super::{require_indexdata, HeaderOverrides, Result};
 
@@ -34,7 +34,7 @@ mod stage4;
 
 use stage1::{build_coords_by_rank_file, build_way_schedule, stage1_way_pass};
 use stage2::stage2_node_join;
-use stage3::{stage3_slot_reorder_from_ref, SlotBucketRef};
+use stage3::{stage3_slot_reorder, SlotBucketRef};
 use stage4::{stage4_assembly, CoordSlots};
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
@@ -254,13 +254,16 @@ pub fn external_join(
             (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set)
         };
 
+    // num_slot_workers tracks how many per-worker slot file sets exist.
+    // Set by stage 2, or discovered from scratch files when resuming.
+    let num_slot_workers;
+
     if start <= 2 {
 
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-        let mut slot_buckets = BucketWriters::create(&scratch_dir, "slot")?;
-        let resolved_count =
-            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &mut slot_buckets, total_slots, unique_nodes, &coord_file_path)?;
-        slot_buckets.finish()?;
+        let (resolved_count, nsw) =
+            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, total_slots, unique_nodes, &coord_file_path)?;
+        num_slot_workers = nsw;
         if !keep_scratch {
             for worker_id in 0..num_shard_workers {
                 for bucket_idx in 0..NUM_BUCKETS {
@@ -272,22 +275,47 @@ pub fn external_join(
         #[allow(clippy::cast_possible_wrap)]
         crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
         crate::debug::emit_marker("EXTJOIN_STAGE2_END");
+    } else {
+        // Discover num_slot_workers from scratch files when resuming at stage 3+.
+        num_slot_workers = {
+            let mut n = 0usize;
+            loop {
+                let path = scratch_dir.path.join(format!("slotW{n}-000"));
+                if path.exists() {
+                    n += 1;
+                } else {
+                    break n.max(1);
+                }
+            }
+        };
     }
 
     if start <= 3 {
         crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-        let slot_entry_counts: Vec<u64> = (0..NUM_BUCKETS).map(|i| {
-            let path = scratch_dir.bucket_path("slot", i);
-            std::fs::metadata(&path).map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64).unwrap_or(0)
-        }).collect();
-        let slot_paths: Vec<std::path::PathBuf> = (0..NUM_BUCKETS)
-            .map(|i| scratch_dir.bucket_path("slot", i))
+        // Build per-bucket paths and entry counts from all worker file sets.
+        let mut slot_entry_counts = vec![0u64; NUM_BUCKETS];
+        let mut slot_paths: Vec<Vec<std::path::PathBuf>> = (0..NUM_BUCKETS)
+            .map(|_| Vec::with_capacity(num_slot_workers))
             .collect();
+        for worker_id in 0..num_slot_workers {
+            let prefix = format!("slotW{worker_id}");
+            for bucket_idx in 0..NUM_BUCKETS {
+                let path = scratch_dir.bucket_path(&prefix, bucket_idx);
+                let count = std::fs::metadata(&path)
+                    .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
+                    .unwrap_or(0);
+                slot_entry_counts[bucket_idx] += count;
+                slot_paths[bucket_idx].push(path);
+            }
+        }
         let slot_bucket_ref = SlotBucketRef { paths: slot_paths, entry_counts: slot_entry_counts };
-        stage3_slot_reorder_from_ref(&slot_bucket_ref, &coord_slots_path, total_slots)?;
+        stage3_slot_reorder(&slot_bucket_ref, &coord_slots_path, total_slots)?;
         if !keep_scratch {
-            for i in 0..NUM_BUCKETS {
-                drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
+            for worker_id in 0..num_slot_workers {
+                let prefix = format!("slotW{worker_id}");
+                for bucket_idx in 0..NUM_BUCKETS {
+                    drop(std::fs::remove_file(&scratch_dir.bucket_path(&prefix, bucket_idx)));
+                }
             }
         }
         crate::debug::emit_marker("EXTJOIN_STAGE3_END");

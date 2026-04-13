@@ -44,8 +44,8 @@ use super::{
 /// 14B gives headroom above the current ~13B maximum.
 const MAX_NODE_ID: u64 = 14_000_000_000;
 
-/// Size of a rank-occurrence record: `(rank: u32, slot_pos: u64)` = 12 bytes.
-const RANK_RECORD_SIZE: usize = 12;
+/// Size of a rank-occurrence record: `(rank: u64, slot_pos: u64)` = 16 bytes.
+const RANK_RECORD_SIZE: usize = 16;
 
 /// Size of a resolved entry: `(slot_pos: u64, lat: i32, lon: i32)` = 16 bytes.
 const RESOLVED_ENTRY_SIZE: usize = 16;
@@ -66,30 +66,32 @@ const COORD_SLOT_SIZE: usize = 8;
 /// in ascending order with a single-pass node scan.
 #[derive(Clone, Copy)]
 struct RankRecord {
-    rank: u32,
+    rank: u64,
     slot_pos: u64,
 }
 
 impl RankRecord {
     fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
-        buf[..4].copy_from_slice(&self.rank.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
+        buf[..8].copy_from_slice(&self.rank.to_le_bytes());
+        buf[8..16].copy_from_slice(&self.slot_pos.to_le_bytes());
     }
 
     fn read_from(buf: &[u8; RANK_RECORD_SIZE]) -> Self {
-        let rank = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let rank = u64::from_le_bytes([
+            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+        ]);
         let slot_pos = u64::from_le_bytes([
-            buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+            buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15],
         ]);
         Self { rank, slot_pos }
     }
 
     /// Bucket index for rank partitioning.
     #[allow(clippy::cast_possible_truncation)]
-    fn rank_bucket(&self, total_unique_nodes: u32) -> usize {
-        let range_size = (total_unique_nodes as u64).div_ceil(NUM_BUCKETS as u64);
+    fn rank_bucket(&self, total_unique_nodes: u64) -> usize {
+        let range_size = total_unique_nodes.div_ceil(NUM_BUCKETS as u64);
         if range_size == 0 { return 0; }
-        let bucket = u64::from(self.rank) / range_size;
+        let bucket = self.rank / range_size;
         (bucket as usize).min(NUM_BUCKETS - 1)
     }
 }
@@ -183,7 +185,7 @@ fn stage1_way_pass(
     _direct_io: bool,
     scratch: &ScratchDir,
     ref_count_sidecar: &Path,
-) -> Result<(u64, u32, Vec<u64>, usize, IdSetDense)> {
+) -> Result<(u64, u64, Vec<u64>, usize, IdSetDense)> {
     use std::os::unix::fs::FileExt as _;
 
     let schedule = build_way_schedule(input)?;
@@ -303,8 +305,7 @@ fn stage1_way_pass(
     // Build rank index.
     node_id_set.build_rank_index();
     let unique_nodes = node_id_set.total_count();
-    let unique_nodes_u32 = u32::try_from(unique_nodes)
-        .map_err(|_| format!("unique referenced nodes ({unique_nodes}) exceeds u32::MAX"))?;
+    let unique_nodes_u64 = unique_nodes;
 
     // Load sidecar prefix sums for slot_pos computation in pass B.
     let slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_refs)?;
@@ -407,10 +408,10 @@ fn stage1_way_pass(
                                     if write_err.is_some() { return; }
                                     for &node_id in refs {
                                         #[allow(clippy::cast_possible_truncation)]
-                                        let rank = node_id_set_ref.rank(node_id) as u32;
+                                        let rank = node_id_set_ref.rank(node_id);
                                         let slot_pos = slot_start + local_ref_idx;
                                         let rec = RankRecord { rank, slot_pos };
-                                        let bucket = rec.rank_bucket(unique_nodes_u32);
+                                        let bucket = rec.rank_bucket(unique_nodes_u64);
                                         rec.write_to(&mut rec_buf);
                                         if let Some(w) = shard_writers[bucket].as_mut() {
                                             if let Err(e) = w.write_all(&rec_buf) {
@@ -481,7 +482,8 @@ fn stage1_way_pass(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 
-    Ok((total_refs, unique_nodes_u32, merged_counts, num_actual_workers, node_id_set))
+    let num_actual = num_actual_workers;
+    Ok((total_refs, unique_nodes_u64, merged_counts, num_actual, node_id_set))
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +506,7 @@ fn stage2_node_join(
     num_shard_workers: usize,
     slot_buckets: &mut BucketWriters,
     total_slots: u64,
-    unique_nodes: u32,
+    unique_nodes: u64,
     node_id_set: &IdSetDense,
 ) -> Result<u64> {
     let mut resolved_count: u64 = 0;
@@ -516,8 +518,8 @@ fn stage2_node_join(
         bucket_idx: usize,
         grouped_slot_pos: Vec<u64>,
         group_offsets: Vec<u64>,
-        max_rank: u32,
-        bucket_rank_start: u32,
+        max_rank: u64,
+        bucket_rank_start: u64,
     }
 
     /// Load shard files for one rank bucket, counting-sort by local rank,
@@ -527,14 +529,14 @@ fn stage2_node_join(
         bucket_idx: usize,
         scratch: &ScratchDir,
         num_shard_workers: usize,
-        unique_nodes: u32,
+        unique_nodes: u64,
         rank_range_size: u64,
     ) -> std::result::Result<PreparedBucket, String> {
-        let bucket_rank_start = (bucket_idx as u64 * rank_range_size) as u32;
+        let bucket_rank_start = bucket_idx as u64 * rank_range_size;
         let bucket_rank_end = if bucket_idx == NUM_BUCKETS - 1 {
             unique_nodes
         } else {
-            (((bucket_idx as u64 + 1) * rank_range_size) as u32).min(unique_nodes)
+            ((bucket_idx as u64 + 1) * rank_range_size).min(unique_nodes)
         };
         let local_range = (bucket_rank_end - bucket_rank_start) as usize;
 
@@ -781,7 +783,7 @@ fn stage2_node_join(
                         continue;
                     }
                     #[allow(clippy::cast_possible_truncation)]
-                    let rank = node_id_set.rank(id) as u32;
+                    let rank = node_id_set.rank(id);
 
                     // Advance to the rank bucket covering this rank.
                     while current_bucket.as_ref().is_none_or(|b| rank >= b.max_rank) {
@@ -805,6 +807,7 @@ fn stage2_node_join(
                     let bkt = current_bucket.as_ref()
                         .ok_or("no bucket available for rank merge")?;
 
+                    #[allow(clippy::cast_possible_truncation)]
                     let local_rank = (rank - bkt.bucket_rank_start) as usize;
                     #[allow(clippy::cast_possible_truncation)]
                     let start = bkt.group_offsets[local_rank] as usize;
@@ -1522,7 +1525,7 @@ pub fn external_join(
     {
         crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
         crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
-        crate::debug::emit_counter("extjoin_unique_nodes", i64::from(unique_nodes));
+        crate::debug::emit_counter("extjoin_unique_nodes", unique_nodes as i64);
     }
 
     // --- Stage 2: Node join (rank-bucketed, counting sort) ---

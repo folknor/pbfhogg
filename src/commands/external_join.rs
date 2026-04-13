@@ -491,8 +491,9 @@ fn stage1_way_pass(
 /// For each rank bucket: load records, counting-sort by rank, single-pass
 /// node merge using rank order (= node-ID order by construction).
 ///
-/// Replaces the old comparison-sort-on-sparse-node_id approach with O(n)
-/// counting sort on dense u32 rank space.
+/// Uses a pipelined loader thread: one thread loads and counting-sorts
+/// the next bucket while the consumer merges the current bucket against
+/// the node stream. Queue depth 2 to hide load latency.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 fn stage2_node_join(
@@ -509,123 +510,95 @@ fn stage2_node_join(
     let mut resolved_count: u64 = 0;
     let rank_range_size = u64::from(unique_nodes).div_ceil(NUM_BUCKETS as u64);
 
-    // Rank-bucketed stage 2: for each rank bucket, load records from
-    // per-worker shards, counting-sort by local rank (O(n) instead of
-    // O(n log n) comparison sort on sparse node_id), then single-pass
-    // node merge. Rank order matches node-ID order by construction
-    // (IdSetDense::rank() counts set bits below the ID).
-
-    // Reusable per-bucket state.
-    struct RankBucketState {
-        idx: usize,
-        records: Vec<RankRecord>,
-        data_buf: Vec<u8>,
-        // After counting sort: grouped_slot_pos[i] holds slot_pos values
-        // for the record group starting at group_offsets[i].
+    // A prepared rank bucket: loaded from disk, counting-sorted, ready
+    // for the consumer to merge against the node stream.
+    struct PreparedBucket {
+        bucket_idx: usize,
         grouped_slot_pos: Vec<u64>,
         group_offsets: Vec<u64>,
-        group_cursor: usize,
         max_rank: u32,
+        bucket_rank_start: u32,
     }
 
-    impl RankBucketState {
-        fn new() -> Self {
-            Self {
-                idx: 0, records: Vec::new(), data_buf: Vec::new(),
-                grouped_slot_pos: Vec::new(), group_offsets: Vec::new(),
-                group_cursor: 0, max_rank: 0,
+    /// Load shard files for one rank bucket, counting-sort by local rank,
+    /// return a ready-to-consume PreparedBucket.
+    #[allow(clippy::cast_possible_truncation)]
+    fn prepare_bucket(
+        bucket_idx: usize,
+        scratch: &ScratchDir,
+        num_shard_workers: usize,
+        unique_nodes: u32,
+        rank_range_size: u64,
+    ) -> std::result::Result<PreparedBucket, String> {
+        let bucket_rank_start = (bucket_idx as u64 * rank_range_size) as u32;
+        let bucket_rank_end = if bucket_idx == NUM_BUCKETS - 1 {
+            unique_nodes
+        } else {
+            (((bucket_idx as u64 + 1) * rank_range_size) as u32).min(unique_nodes)
+        };
+        let local_range = (bucket_rank_end - bucket_rank_start) as usize;
+
+        // Load records from all worker shards.
+        let mut records: Vec<RankRecord> = Vec::new();
+        let mut data_buf: Vec<u8> = Vec::new();
+        let mut buf = [0u8; RANK_RECORD_SIZE];
+        for worker_id in 0..num_shard_workers {
+            let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(format!("open rank shard: {e}")),
+            };
+            let len = file.metadata()
+                .map_err(|e| format!("stat rank shard: {e}"))?
+                .len() as usize;
+            if len == 0 { continue; }
+            data_buf.clear();
+            data_buf.resize(len, 0);
+            std::io::Read::read_exact(&mut &file, &mut data_buf)
+                .map_err(|e| format!("read rank shard: {e}"))?;
+            #[cfg(feature = "linux-direct-io")]
+            advise_dontneed_file(&file);
+            for chunk in data_buf.chunks_exact(RANK_RECORD_SIZE) {
+                buf.copy_from_slice(chunk);
+                records.push(RankRecord::read_from(&buf));
             }
         }
 
-        #[allow(clippy::cast_possible_truncation)]
-        fn load_next(
-            &mut self,
-            scratch: &ScratchDir,
-            rank_bucket_counts: &[u64],
-            num_shard_workers: usize,
-            unique_nodes: u32,
-            rank_range_size: u64,
-        ) -> Result<bool> {
-            while self.idx < NUM_BUCKETS {
-                if rank_bucket_counts[self.idx] > 0 {
-                    // Load records from all worker shards.
-                    self.records.clear();
-                    let mut buf = [0u8; RANK_RECORD_SIZE];
-                    for worker_id in 0..num_shard_workers {
-                        let path = scratch.path.join(
-                            format!("rank-W{worker_id}-{:03}", self.idx),
-                        );
-                        let file = match std::fs::File::open(&path) {
-                            Ok(f) => f,
-                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                            Err(e) => return Err(format!("open rank shard: {e}").into()),
-                        };
-                        let len = file.metadata()
-                            .map_err(|e| format!("stat rank shard: {e}"))?
-                            .len() as usize;
-                        if len == 0 { continue; }
-                        self.data_buf.clear();
-                        self.data_buf.resize(len, 0);
-                        std::io::Read::read_exact(&mut &file, &mut self.data_buf)
-                            .map_err(|e| format!("read rank shard: {e}"))?;
-                        #[cfg(feature = "linux-direct-io")]
-                        advise_dontneed_file(&file);
-                        for chunk in self.data_buf.chunks_exact(RANK_RECORD_SIZE) {
-                            buf.copy_from_slice(chunk);
-                            self.records.push(RankRecord::read_from(&buf));
-                        }
-                    }
-
-                    // Counting sort by local rank within this bucket.
-                    let bucket_rank_start = (self.idx as u64 * rank_range_size) as u32;
-                    let bucket_rank_end = if self.idx == NUM_BUCKETS - 1 {
-                        unique_nodes
-                    } else {
-                        (((self.idx as u64 + 1) * rank_range_size) as u32).min(unique_nodes)
-                    };
-                    let local_range = (bucket_rank_end - bucket_rank_start) as usize;
-
-                    // Pass 1: count occurrences per local rank.
-                    let mut counts = vec![0u64; local_range];
-                    for rec in &self.records {
-                        let local = (rec.rank - bucket_rank_start) as usize;
-                        counts[local] += 1;
-                    }
-
-                    // Prefix sum → offsets (u64 to handle skewed distributions).
-                    self.group_offsets.clear();
-                    self.group_offsets.resize(local_range + 1, 0);
-                    for (i, count) in counts.iter().enumerate() {
-                        self.group_offsets[i + 1] = self.group_offsets[i] + count;
-                    }
-
-                    // Pass 2: scatter slot_pos values into grouped array.
-                    let total = self.group_offsets[local_range] as usize;
-                    self.grouped_slot_pos.clear();
-                    self.grouped_slot_pos.resize(total, 0);
-                    let mut write_pos = self.group_offsets[..local_range].to_vec();
-                    for rec in &self.records {
-                        let local = (rec.rank - bucket_rank_start) as usize;
-                        let pos = write_pos[local] as usize;
-                        self.grouped_slot_pos[pos] = rec.slot_pos;
-                        write_pos[local] += 1;
-                    }
-
-                    self.group_cursor = 0;
-                    self.max_rank = bucket_rank_end;
-                    return Ok(true);
-                }
-                self.idx += 1;
-            }
-            Ok(false)
+        // Counting sort by local rank.
+        let mut counts = vec![0u64; local_range];
+        for rec in &records {
+            let local = (rec.rank - bucket_rank_start) as usize;
+            counts[local] += 1;
         }
+        let mut group_offsets = vec![0u64; local_range + 1];
+        for (i, count) in counts.iter().enumerate() {
+            group_offsets[i + 1] = group_offsets[i] + count;
+        }
+        let total = group_offsets[local_range] as usize;
+        let mut grouped_slot_pos = vec![0u64; total];
+        let mut write_pos = group_offsets[..local_range].to_vec();
+        for rec in &records {
+            let local = (rec.rank - bucket_rank_start) as usize;
+            let pos = write_pos[local] as usize;
+            grouped_slot_pos[pos] = rec.slot_pos;
+            write_pos[local] += 1;
+        }
+
+        Ok(PreparedBucket {
+            bucket_idx,
+            grouped_slot_pos,
+            group_offsets,
+            max_rank: bucket_rank_end,
+            bucket_rank_start,
+        })
     }
 
-    let mut bstate = RankBucketState::new();
-    let has_bucket = bstate.load_next(scratch, rank_bucket_counts, num_shard_workers, unique_nodes, rank_range_size)?;
-    if !has_bucket {
-        return Ok(0);
-    }
+    // Pipelined bucket loader: one thread prepares buckets ahead of the
+    // consumer. Queue depth 2 to hide load latency behind merge work.
+    let (bucket_tx, bucket_rx) = std::sync::mpsc::sync_channel::<
+        std::result::Result<PreparedBucket, String>
+    >(2);
 
     // Parallel node scan (same P2b-v2 pattern as before).
     use super::node_scanner::{NodeTuple, extract_node_tuples};
@@ -670,12 +643,28 @@ fn stage2_node_join(
     let mut s2_bucket_load_ms: u64 = 0;
     let mut s2_bucket_loads: u64 = 0;
 
-    // Need the node_id_set for rank computation during node scan.
-    // It was returned from stage1 and passed via the entry point.
-    // For now, stage2 receives it indirectly — we'll add it as a parameter.
-    // TODO: this is handled by the caller passing node_id_set.
+    let s2_stop = std::sync::atomic::AtomicBool::new(false);
+    let s2_stop_ref = &s2_stop;
 
     std::thread::scope(|scope| -> Result<()> {
+        // Bucket loader thread: prepares buckets ahead of the consumer.
+        {
+            let tx = bucket_tx;
+            scope.spawn(move || {
+                for bucket_idx in 0..NUM_BUCKETS {
+                    if s2_stop_ref.load(std::sync::atomic::Ordering::Relaxed) { break; }
+                    if rank_bucket_counts[bucket_idx] == 0 { continue; }
+                    let result = prepare_bucket(
+                        bucket_idx, scratch, num_shard_workers,
+                        unique_nodes, rank_range_size,
+                    );
+                    let is_err = result.is_err();
+                    if tx.send(result).is_err() { break; }
+                    if is_err { break; }
+                }
+            });
+        }
+
         let io_error_ref = &io_error;
         scope.spawn(move || {
             let mut seq: usize = 0;
@@ -755,9 +744,21 @@ fn stage2_node_join(
         drop(desc_rx);
         drop(decoded_tx);
 
-        // Consumer: reorder + rank-based merge.
+        // Consumer: reorder node tuples + merge against pipelined prepared buckets.
+        // The bucket loader thread feeds PreparedBuckets via bucket_rx,
+        // overlapping load+sort with merge work.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<crate::error::Result<Vec<NodeTuple>>> =
             crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        // Receive the first prepared bucket.
+        let mut current_bucket: Option<PreparedBucket> = match bucket_rx.recv() {
+            Ok(Ok(b)) => Some(b),
+            Ok(Err(e)) => {
+                s2_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                return Err(e.into());
+            }
+            Err(_) => None,
+        };
 
         loop {
             let t_recv = std::time::Instant::now();
@@ -777,36 +778,40 @@ fn stage2_node_join(
                 let t_merge = std::time::Instant::now();
                 for &NodeTuple { id, lat, lon } in &tuples {
                     if !node_id_set.get(id) {
-                        continue; // Not referenced by any way.
+                        continue;
                     }
                     #[allow(clippy::cast_possible_truncation)]
                     let rank = node_id_set.rank(id) as u32;
 
                     // Advance to the rank bucket covering this rank.
-                    while rank >= bstate.max_rank {
+                    while current_bucket.as_ref().is_none_or(|b| rank >= b.max_rank) {
                         let t_load = std::time::Instant::now();
-                        bstate.idx += 1;
-                        if !bstate.load_next(scratch, rank_bucket_counts, num_shard_workers, unique_nodes, rank_range_size)? {
-                            #[allow(clippy::cast_possible_truncation)]
-                            { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
-                            s2_bucket_loads += 1;
-                            return Ok(());
-                        }
+                        current_bucket = match bucket_rx.recv() {
+                            Ok(Ok(b)) => Some(b),
+                            Ok(Err(e)) => {
+                                s2_stop_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                                return Err(e.into());
+                            }
+                            Err(_) => None,
+                        };
                         #[allow(clippy::cast_possible_truncation)]
                         { s2_bucket_load_ms += t_load.elapsed().as_millis() as u64; }
                         s2_bucket_loads += 1;
+                        if current_bucket.is_none() {
+                            return Ok(());
+                        }
                     }
 
-                    // Look up this rank's occurrence group via counting-sort offsets.
-                    #[allow(clippy::cast_possible_truncation)]
-                    let bucket_rank_start = (bstate.idx as u64 * rank_range_size) as u32;
-                    let local_rank = (rank - bucket_rank_start) as usize;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let start = bstate.group_offsets[local_rank] as usize;
-                    #[allow(clippy::cast_possible_truncation)]
-                    let end = bstate.group_offsets[local_rank + 1] as usize;
+                    let bkt = current_bucket.as_ref()
+                        .ok_or("no bucket available for rank merge")?;
 
-                    for &slot_pos in &bstate.grouped_slot_pos[start..end] {
+                    let local_rank = (rank - bkt.bucket_rank_start) as usize;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let start = bkt.group_offsets[local_rank] as usize;
+                    #[allow(clippy::cast_possible_truncation)]
+                    let end = bkt.group_offsets[local_rank + 1] as usize;
+
+                    for &slot_pos in &bkt.grouped_slot_pos[start..end] {
                         let entry = ResolvedEntry { slot_pos, lat, lon };
                         let bucket = entry.slot_bucket(total_slots);
                         entry.write_to(&mut entry_buf);

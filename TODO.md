@@ -274,51 +274,30 @@ single-pass, tag expression and bbox filtering.
     parse/lookup/encode/frame to identify which sub-step dominates.
 
 - [ ] **`add-locations-to-ways --index-type external` — optimization sprint.**
-  Current: 1,462 s (24.4 min), 16.7 GB peak anon, ~300 GB temp disk
-  (commit `6b09796`, planet). Four-stage double radix permutation.
+  Europe: 608 s → 430 s (−29%, commit `e1ba970`). Planet pending overnight.
 
-  Phase breakdown (planet):
+  Done:
+  - [x] Comprehensive instrumentation (all 4 stages)
+  - [x] Parallelize stage 1 (per-worker bucket shards, AtomicUsize dispatch)
+  - [x] Rank-bucketed counting sort (O(n) on dense u32 rank replaces
+    O(n log n) comparison sort on sparse i64 node_id)
+  - [x] Parallelize stage 3 (pwrite to pre-sized coord_slots file)
+  - [x] Pipelined stage 2 bucket loader (overlaps load+sort with merge)
 
-  | Stage | Time | % | Current state |
-  |-------|------|---|---------------|
-  | Stage 1 (way pass: refs → COO buckets) | 333 s | 22% | sequential |
-  | Stage 2 (node join: merge-join → slot buckets) | 612 s | 41% | parallel pread, serial merge |
-  | Stage 3 (slot reorder: scatter buffer) | 247 s | 17% | sequential |
-  | Stage 4 (assembly: attach coords to ways) | 269 s | 18% | parallel P2c |
+  Europe phase breakdown (commit `e1ba970`):
 
-  **Priority 1 — IdSetDense rank fusion (eliminate COO pair pipeline).**
-  Same pattern as the renumber optimization. Stage 1 currently writes
-  16-byte `(node_id, slot_pos)` COO pairs into 256 buckets (128 GB temp
-  disk). Stage 2 loads each bucket, sorts by node_id, merge-joins with
-  the node stream to resolve `(slot_pos, lat, lon)`.
+  | Stage | Time | % |
+  |-------|------|---|
+  | Stage 1 (two-pass: IdSetDense + rank-bucketed emission) | 46 s | 11% |
+  | Stage 2 (pipelined bucket load + counting-sort merge) | 181 s | 42% |
+  | Stage 3 (parallel pwrite scatter) | 64 s | 15% |
+  | Stage 4 (parallel P2c assembly) | 130 s | 30% |
 
-  Replace with: stage 1 builds an `IdSetDense` of all referenced node
-  IDs (shared atomic, ~1.5 GB). Stage 2 resolves `slot_pos = rank(node_id)`
-  inline during the node scan — no COO buckets, no bucket sort, no
-  merge-join. Eliminates 128 GB node bucket temp disk and the 612 s
-  stage 2 merge-join overhead. The slot bucket output (96 GB) may also
-  be replaceable if we can scatter coords directly into the output
-  coord_slots file via pwrite.
-
-  **Priority 2 — Parallelize stage 1 (way scanning).**
-  Currently sequential because the pipelined reader used to cause 11 GB
-  retention. `DecompressPool` (commit `8f6999b`) solved retention. Use
-  pread-from-workers pattern (same as renumber pass 1). Way scanning is
-  embarrassingly parallel — each blob is independent. Constraint: sidecar
-  ref counts must maintain blob file order (attach seq number).
-  Estimated: 333 s → ~100-150 s.
-
-  **Priority 3 — Parallelize stage 3 (scatter buffer).**
-  Each of 256 buckets is independent: load → scatter → write. Pre-allocate
-  output file via `ftruncate`, each worker writes its bucket range via
-  `pwrite`. No inter-bucket state. Estimated: 247 s → ~80-100 s.
-
-  **Priority 4 — Comprehensive instrumentation.**
-  Add per-stage sub-phase counters (pread/decompress/scan/emit/recv/write)
-  and consumer drain-rate, matching renumber's coverage. Needed before
-  measuring any optimization.
-
-  **Target: ~8-10 min wall, <4 GB peak anon, <80 GB temp disk.**
+  Remaining opportunities:
+  - [ ] **Consolidate worker shards** between pass B and stage 2 to reduce
+    file-open overhead (N workers × 256 buckets = many small files).
+  - [ ] **Stage 4 wire-format assembly** — avoid full PrimitiveBlock decode
+    for node/relation passthrough blobs. High complexity, moderate gain.
 
 ### Ecosystem
 

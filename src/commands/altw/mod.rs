@@ -50,25 +50,6 @@ pub(super) const RESOLVED_ENTRY_SIZE: usize = 16;
 /// Size of a coordinate slot: `(lat: i32, lon: i32)` = 8 bytes.
 pub(super) const COORD_SLOT_SIZE: usize = 8;
 
-/// A rank-bucketed occurrence record. `local_rank` is the rank offset
-/// within the bucket (`global_rank - bucket_rank_start`), stored as u32
-/// (max ~40M entries per bucket at planet, well under u32::MAX).
-/// `slot_pos` is the final position in the coord_slots array.
-///
-/// 12 bytes instead of 16: 25% I/O reduction across stages 1B and 2.
-#[derive(Clone, Copy)]
-pub(super) struct RankRecord {
-    local_rank: u32,
-    slot_pos: u64,
-}
-
-impl RankRecord {
-    fn write_to(&self, buf: &mut [u8; RANK_RECORD_SIZE]) {
-        buf[..4].copy_from_slice(&self.local_rank.to_le_bytes());
-        buf[4..12].copy_from_slice(&self.slot_pos.to_le_bytes());
-    }
-}
-
 /// A resolved coordinate ready to be placed into the final coord_slots file.
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedEntry {

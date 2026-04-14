@@ -12,7 +12,7 @@ use super::super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
 use super::super::external_radix::advise_dontneed_file;
 use super::super::id_set_dense::IdSetDense;
 use super::super::Result;
-use super::{MAX_NODE_ID, RANK_RECORD_SIZE, COORD_SLOT_SIZE, RankRecord};
+use super::{MAX_NODE_ID, RANK_RECORD_SIZE, COORD_SLOT_SIZE};
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
@@ -279,7 +279,10 @@ pub(super) fn stage1_way_pass(
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
                     let mut group_starts: Vec<(usize, usize)> = Vec::new();
-                    let mut rec_buf = [0u8; RANK_RECORD_SIZE];
+                    // Per-bucket staging buffers reused across blobs. One write_all
+                    // per non-empty bucket per blob replaces per-ref write_all calls.
+                    let mut bucket_staging: Vec<Vec<u8>> =
+                        (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
 
                     loop {
                         // Stop if another worker hit an error.
@@ -341,20 +344,30 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 3: batch encode + write.
+                            // Phase 3: stage per-bucket then one write_all per
+                            // non-empty bucket per blob.
                             let t4 = std::time::Instant::now();
+                            for buf in &mut bucket_staging {
+                                buf.clear();
+                            }
+                            for &(local_rank, bucket, slot_pos) in &ranked {
+                                let buf = &mut bucket_staging[bucket];
+                                buf.extend_from_slice(&local_rank.to_le_bytes());
+                                buf.extend_from_slice(&slot_pos.to_le_bytes());
+                            }
                             let mut blob_bytes: u64 = 0;
                             let mut blob_writes: u64 = 0;
-                            for &(local_rank, bucket, slot_pos) in &ranked {
-                                let rec = RankRecord { local_rank, slot_pos };
-                                rec.write_to(&mut rec_buf);
+                            for (bucket, buf) in bucket_staging.iter().enumerate() {
+                                if buf.is_empty() {
+                                    continue;
+                                }
                                 if let Some(w) = shard_writers[bucket].as_mut() {
-                                    w.write_all(&rec_buf)
+                                    w.write_all(buf)
                                         .map_err(|e| format!("write rank shard: {e}"))?;
-                                    blob_bytes += RANK_RECORD_SIZE as u64;
+                                    blob_bytes += buf.len() as u64;
                                     blob_writes += 1;
                                 }
-                                entry_counts[bucket] += 1;
+                                entry_counts[bucket] += (buf.len() / RANK_RECORD_SIZE) as u64;
                             }
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_encode_write_ref.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);

@@ -313,84 +313,134 @@ single-pass, tag expression and bbox filtering.
     with sequential I/O. The current architecture (slot bucket files +
     parallel stage 3 scatter) is the right design.
 
-  - [ ] **Step 6: Stage 4 micro-opts — tried and reverted, low upside.**
-    Skip varint decode (terminal byte counting) and batch coord reads
-    (one mmap slice per way) shipped in `70c87c1`, measured flat on
-    Europe (`s4_way_coord_lookup_ms` 538s → 550s, noise), reverted in
-    `3c59471`. Per-ref arithmetic (varint decode, bounds checks) is not
-    the bottleneck — removing both had zero effect. Root cause unproven;
-    could be mmap access latency, memory bandwidth, or loop structure.
-    Needs `perf stat` (dTLB-load-misses, cache-misses) to diagnose
-    before further optimization attempts.
+  - [x] **Step 6: Stage 4 — memory-fault bound, not arithmetic.
+    Extensively tested, ~141s appears to be the floor for this
+    architecture on this hardware.**
 
-  **Additional opportunities (stack after execution plan):**
-  - [ ] **Postings-by-rank (CSR representation).** (planet-codex: "the
-    representation that actually matches the problem"). Replace flat
-    `(rank, slot_pos)` records with `offsets[rank] + slot_positions[...]`.
-    Stage 2 becomes trivial: load one coord, scatter to all slot positions
-    in its posting list. Eliminates counting-sort grouping entirely.
-    Higher design risk — changes both emission and loader. Do after
-    coords_by_rank proves out.
+    Split timer (commit `b99af0c`, UUID `d7a08d2f`) proves coord mmap
+    access is 25× more expensive than encode: `s4_way_coord_read_ms`=532s,
+    `s4_way_delta_encode_ms`=21s. 374K major faults + 1.05M minor faults.
+
+    **Experiments tried and reverted (all flat or worse on Europe):**
+
+    | Experiment | Stage 4 | majflt | Result |
+    |-----------|---------|--------|--------|
+    | Baseline (MADV_SEQUENTIAL, 6 workers, work-stealing) | 141s | 374K | — |
+    | Per-ref micro-opts: varint skip + batch reads (`70c87c1`) | ~141s | — | Flat, reverted |
+    | Per-blob pread replacing mmap (`0330a9b`) | 145s | 19K | Flat — traded faults for syscall overhead |
+    | Contiguous partitioning + 3 workers (`b26a172`) | 405s | 466K | 3× regression — starved consumer |
+    | MADV_RANDOM (`0860164`) | 157s | 9,167K | Worse — killed readahead |
+    | No madvise (`74ceba0`) | 143s | 197K | Tied — fewest faults, kept |
+
+    **Conclusions:**
+    - Per-ref arithmetic is negligible (encode 21s vs read 532s)
+    - Per-blob pread eliminates faults but adds equivalent syscall overhead
+    - Fewer workers starves the decompress/reframe pipeline
+    - madvise tuning doesn't move wall time; no-advice has fewest faults
+    - The ~141s floor is structural: 6 workers need CPU parallelism for
+      decompress+reframe, but 6 concurrent mmap readers on 37 GB inevitably
+      thrash. Reducing workers fixes thrashing but starves the pipeline.
+    - TLB misses are irreducible with mmap at this scale (37 GB / 4 KB =
+      9.5M pages, TLB has ~2K entries)
+    - Breaking this floor requires a fundamentally different coord
+      representation, not a different read primitive or scheduling tweak
+
+  **Reviewer round 2026-04-13 (arch, perf, planet — commit `b99af0c`):**
+
+  Instrumented run UUID `d7a08d2f`. Stage timings: S1 87s, S2 88s, S3 51s,
+  S4 141s. Total 398s. All 5 reviewers recommended per-blob pread as the
+  single next step — tested and found flat (see table above). The reviewer
+  consensus was correct about the diagnosis (memory-fault bound, not
+  arithmetic) but the recommended fix (pread) didn't help because it
+  traded one I/O bottleneck for another.
+
+  **Still open — stage 1B write batching:**
+
+  - [ ] **Batch rank record writes per way or per blob.** Currently
+    4.69B individual write_all calls (one per ref, 12 bytes each).
+    `s1b_encode_write_ms`=137s cumulative. Accumulate per-way (~10 refs)
+    or per-blob per-bucket records, write_all once per batch. Reduces
+    call count from 4.69B to ~453M (per-way) or ~5M (per-blob).
+    Estimated save: ~6s wall (87s → ~81s). (arch-claude, planet-claude,
+    perf-codex).
+
   - [ ] **Grouped-by-local-rank emission in stage 1B.** Workers sort or
     group output by local rank before flushing. Stage 2 counting sort
-    becomes k-way merge or free. Second-best tier 1 item (perf-codex).
+    becomes k-way merge or free. Second-best tier 1 item (perf-codex r1).
 
-  **Priority 3 — stage 4 per-ref optimizations (low upside confirmed):**
+  **Still open — fuse stages 2+3 (planet-claude sketch):**
 
-  Per-ref arithmetic is not the stage 4 bottleneck. `s4_way_coord_lookup_ms`
-  dominates and is insensitive to removing varint decode and bounds checks.
-  Root cause undiagnosed — needs `perf stat` to determine whether it's mmap
-  access latency, memory bandwidth, or something else. Tried and reverted
-  (`70c87c1` → `3c59471`).
+  - [ ] **Fuse stage 2+3 via sort-then-coalesced-pwrite.** Each stage 2
+    worker resolves a rank bucket, sorts resolved entries by slot_pos,
+    coalesces consecutive entries into larger pwrites directly into the
+    coord_slots file. Eliminates slot bucket files + stage 3 I/O entirely.
+    With ~10 consecutive slots per way: 1.4M pwrite calls per bucket,
+    256 buckets / 4 workers = ~9s. Sort: radix sort 14M records × 16 bytes
+    = ~70ms/bucket, ~4.5s total. Estimated: 88s + 14s = ~102s vs current
+    88 + 51 = 139s. Saves ~37s + eliminates 75 GB temp disk.
+    (planet-claude). Higher complexity.
 
-  - [x] **Skip varint decode in way reframe.** Tried in `70c87c1`,
-    reverted. No measurable improvement — `read_varint` single-byte
-    fast path is already nearly free for typical OSM ref deltas.
-  - [x] **Batch coord reads per way.** Tried in `70c87c1`, reverted.
-    No measurable improvement — bounds check cost negligible.
-  - [ ] **Software prefetch on coord_slots mmap.** (arch-claude).
-    `_mm_prefetch` 16 slots ahead. Speculative — only worth trying
-    after `perf stat` confirms TLB misses are significant.
-  - [ ] **SIMD/AVX2 for way reframe inner loop.** (arch-codex, planet-codex).
-    Unlikely to help if arithmetic is not the bottleneck.
+  **Still open — structural opportunities (fundamentally different coord
+  representation needed to break the stage 4 floor):**
 
-  **Priority 4 — additional structural opportunities:**
+  - [ ] **Postings-by-rank (CSR representation).** Replace flat
+    `(rank, slot_pos)` records with `offsets[rank] + slot_positions[...]`.
+    Stage 2 becomes trivial: load one coord, scatter to all slot positions
+    in its posting list. Eliminates counting-sort. Higher design risk.
+    (planet-codex r1).
+  - [ ] **Way-ordered payloads instead of flat coord_slots.** Produce
+    per-way-blob coordinate payloads directly. Stage 4 splices ready-made
+    location fields instead of per-ref lookups. Hard part: assembling
+    way-ordered payloads externally. (perf-codex r1). This is the only
+    approach that could break the stage 4 floor — it eliminates the
+    37 GB mmap entirely by producing coords in consumption order.
+  - [ ] **Blob-local rank batching in stage 4.** In assembly, extract
+    node IDs from way refs, compute ranks, gather coords from
+    coords_by_rank file, splice locations. Could collapse stages 1B+2+3
+    entirely. Risk: lookup locality. (planet-codex r1).
+  - [ ] **Collapse pass A + pass B into single way scan.** Only possible
+    with a staging model that doesn't need rank before emitting records.
+    Postings representation might enable this. (planet-claude r1,
+    planet-codex r1).
 
-  - [ ] **Way-ordered payloads instead of flat coord_slots.** (perf-codex:
-    "biggest game-changing direction"). Produce per-way-blob coordinate
-    payloads directly. Stage 4 splices ready-made location fields instead
-    of per-ref mmap lookups. Attacks the stage 4 floor from the
-    representation side. Hard part: assembling way-ordered payloads
-    externally without exploding temp metadata.
-  - [ ] **Blob-local rank batching in stage 4.** (planet-codex r1). In
-    assembly, extract node IDs from way refs, compute ranks, gather coords
-    from coords_by_rank file, splice locations. Could collapse stages
-    1B+2+3 entirely. Risk: lookup locality. arch-claude estimates
-    ~282 s Europe total if random pread pattern is manageable.
-  - [ ] **Partition node stream for parallel stage 2.** (arch-codex r1).
-    Split node-ID space into K ranges aligned to rank bucket boundaries.
-    K independent merge consumers. Moot if coords_by_rank eliminates
-    the merge.
-  - [ ] **Collapse pass A + pass B into single way scan.** (planet-claude,
-    planet-codex r1). Only possible with a staging model that doesn't need
-    rank before emitting records. Postings representation might enable this.
+  **Still open — tuning:**
 
-  **Priority 5 — tuning (apply after structural wins land):**
-
-  - [ ] **More than 256 buckets.** (arch-codex). Reduces per-bucket working
-    set. Tradeoff: more files, more metadata.
-  - [ ] **Deeper bucket loader pipeline queue.** Currently depth 2. Try 4-8.
-    (arch-codex). Moot if stage 2 becomes parallel-for.
-  - [ ] **Shrink ResolvedEntry.** (arch-codex). 16 bytes `(slot_pos, lat,
-    lon)`. Delta-coded slot_pos within a bucket. Moot if stage 2+3 fused.
-  - [ ] **Direct mmap of shard files in stage 2.** (arch-codex). Moot if
-    stage 2 changes to coord slice pread.
-  - [ ] **io_uring for stage 2 and stage 4 preads.** (planet-codex r1).
-  - [ ] **Output compression: Zstd(1).** (arch-claude). Consumer write may
-    be zlib-bottlenecked. Zstd(1) ~3× faster, similar ratio. Applies
-    regardless of architecture.
+  - [ ] **More than 256 buckets.** Reduces per-bucket working set.
+    Tradeoff: more files, more metadata. (arch-codex r1).
+  - [ ] **io_uring for stage 2 and stage 4 preads.** (planet-codex r1,
+    planet-claude).
+  - [ ] **Output compression: Zstd(1).** Consumer write may be
+    zlib-bottlenecked. Zstd(1) ~3× faster, similar ratio. (arch-claude r1).
   - [ ] **Reduce stage 4 decode workers by 1, give core to compression.**
-    (planet-claude). Check if consumer blocks on write_primitive_block_owned.
+    Check if consumer blocks on write_primitive_block_owned.
+    (planet-claude r1).
+  - [ ] **Stage 3 parse-and-scatter directly from raw bytes.** Currently
+    parses all resolved entries into `Vec<ResolvedEntry>` before
+    scattering. Could parse and scatter inline. Moot if stage 3 is fused
+    into stage 2. (perf-codex).
+
+  **Moot or resolved:**
+
+  - [x] ~~Deeper bucket loader pipeline queue~~ — moot, stage 2 is parallel-for.
+  - [x] ~~Direct mmap of shard files in stage 2~~ — moot, using coord slice pread.
+  - [x] ~~Shrink ResolvedEntry~~ — was contingent on fused 2+3.
+  - [x] ~~Partition node stream for parallel stage 2~~ — moot, coords_by_rank
+    eliminated the merge.
+  - [x] ~~Per-blob pread for coord_slots~~ — tried, flat (syscall overhead
+    replaced fault overhead).
+  - [x] ~~Contiguous range partitioning + fewer workers~~ — tried, 3×
+    regression (starves decompress pipeline).
+  - [x] ~~MADV_RANDOM~~ — tried, 24× more faults, 11% slower.
+  - [x] ~~MADV_SEQUENTIAL~~ — replaced by no-advice (fewer faults, same wall).
+  - [x] ~~Software prefetch~~ — irrelevant, bottleneck is disk faults not TLB.
+  - [x] ~~SIMD/AVX2 for way reframe~~ — encode is 21s (1.5%), not worth it.
+
+  **Correctness:**
+
+  - [ ] **`(0, 0)` sentinel in `CoordSlots::get` is a latent bug.** Conflates
+    "unresolved coord" with "coords happen to be (0°, 0°)." Should use
+    a separate resolved/unresolved flag or a sentinel outside the valid
+    coordinate range. (planet-codex).
 
 ### Ecosystem
 

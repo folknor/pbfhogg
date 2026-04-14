@@ -169,13 +169,29 @@ flush at 256 KB threshold — avoids both the OOM from unbounded buffering
 (28.2 GB peak anon before fix) and the contention from per-entry locking
 (`s2_resolve_ms` 409s → 62s summed across 6 workers).
 
-**Stage 4 micro-opts (tried and reverted)**: skip varint decode (terminal byte
-counting via `skip_varint`) and batch coord reads (one contiguous mmap slice
-per way). Measured flat: `s4_way_coord_lookup_ms` 538s → 550s (noise). Per-ref
-arithmetic (varint decode, bounds checks) is not the bottleneck — removing both
-had zero effect. Root cause undiagnosed; needs `perf stat` (dTLB-load-misses,
-cache-misses) to determine whether it's mmap access latency, memory bandwidth,
-or loop structure. Reverted as complexity without benefit.
+**Stage 4 optimization experiments (all tried and reverted or flat):**
+
+Split timer (commit `b99af0c`, UUID `d7a08d2f`) proves the bottleneck:
+`s4_way_coord_read_ms`=532s vs `s4_way_delta_encode_ms`=21s (25× ratio).
+374K major page faults during stage 4 vs 44 in stage 2.
+
+| Experiment | Stage 4 | majflt | Result |
+|-----------|---------|--------|--------|
+| Baseline (MADV_SEQUENTIAL, 6 workers, work-stealing) | 141s | 374K | — |
+| Per-ref micro-opts: varint skip + batch reads | ~141s | — | Flat, reverted |
+| Per-blob pread replacing mmap | 145s | 19K | Flat — syscall overhead replaced fault overhead |
+| Contiguous partitioning + 3 workers | 405s | 466K | 3× regression — starved consumer |
+| MADV_RANDOM | 157s | 9,167K | Worse — killed readahead |
+| No madvise | 143s | 197K | Tied — fewest faults, kept as new default |
+
+**Conclusions**: stage 4 at ~141s is a structural floor for this architecture.
+6 workers are needed for CPU parallelism (decompress+reframe); fewer workers
+starve the consumer pipeline. But 6 concurrent mmap readers on 37 GB inevitably
+thrash the page cache. Per-blob pread eliminates faults but replaces them with
+equivalent syscall overhead. madvise tuning doesn't move wall time. TLB misses
+are irreducible with mmap at this scale (37 GB / 4 KB = 9.5M pages). Breaking
+this floor requires a fundamentally different coord representation (e.g.,
+way-ordered payloads that eliminate the 37 GB mmap entirely).
 
 **Fuse stage 2+3 (evaluated, ruled out)**: direct pwrite-scatter from stage 2
 into coord_slots would require either billions of 8-byte pwrites (pathological
@@ -200,18 +216,21 @@ Key architectural changes:
   during a parallel node pass overlapped with stage 1B. Stage 2 reads one
   contiguous coord slice per bucket via pread. Eliminates streamed node merge.
 
-Stage 4 sub-phase profiling (Europe, commit `c7fdb4c`):
-- `s4_way_coord_lookup_ms`: 538s cumulative (51% of way reframe)
-- `s4_way_parse_way_ms`: 5s (negligible)
-- `s4_way_reassemble_ms`: 6s (negligible)
-- `s4_way_parse_block_ms`: 0s (negligible)
+Stage 4 sub-phase profiling (Europe, commit `b99af0c`, UUID `d7a08d2f`):
+- `s4_way_coord_read_ms`: 532s cumulative (mmap access)
+- `s4_way_delta_encode_ms`: 21s (zigzag + varint encode + Vec push)
+- `s4_way_ref_parse_ms`: 12s (varint skip to count refs)
+- `s4_way_reassemble_ms`: 11s
+- `s4_way_parse_way_ms`: 11s
+- `s4_majflt_delta`: 374K major faults (MADV_SEQUENTIAL), 197K (no advice)
 - Volume: 4.69B refs across 453M way messages
 
-The remaining stage 4 cost (~10.7 ns/ref) is not arithmetic-bound: per-ref
-micro-opts (skip varint decode, batch mmap reads) measured flat. Root cause
-undiagnosed — needs `perf stat` to determine whether mmap access latency,
-memory bandwidth, or loop structure dominates the `s4_way_coord_lookup_ms`
-counter.
+The remaining stage 4 cost is memory-fault bound at ~141s on this hardware.
+Extensively tested: per-blob pread, contiguous partitioning, MADV_RANDOM,
+no-advice — none moved wall time. The coord_slots mmap access pattern (6
+workers × 37 GB × scattered reads) is a structural bottleneck. Breaking it
+requires a fundamentally different coord representation, not read-primitive
+or scheduling changes.
 
 ### Temp disk (rank-bucketed architecture)
 

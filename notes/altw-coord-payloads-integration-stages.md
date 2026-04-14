@@ -1,13 +1,13 @@
 # coord_payloads integration — staged implementation plan
 
-**Status: shipped 2026-04-14.** Stages 1-5 landed at commits
-`77490b7` → `c96566f` → `c12a642` → `3d977a0`. Final measurements:
+**Status: shipped 2026-04-14, all stages.** Stages 1-5 landed at
+commits `77490b7` → `c96566f` → `c12a642` → `3d977a0`. Stage 6
+cleanup landed same-day (escape hatch removed, `CoordSlots` deleted,
+markers/counters renamed, −271 source lines). Final measurements:
 Europe 392 s → 400 s (+1.8%), planet 982 s → 953 s (**−3%**), plus
 −44 GB scratch peak and −99.4% stage-4 major page faults. See
 `notes/altw-optimization-history.md` "Resolved 2026-04-14" for the
 complete measurement table.
-
-Stage 6 (conditional cleanup) is still open — see TODO.md.
 
 The historical plan follows. Each stage was a self-contained task
 ending in one commit; main conversation reviewed between stages.

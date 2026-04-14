@@ -593,24 +593,24 @@ single-pass, tag expression and bbox filtering.
   copy (no zigzag-decode + re-encode, because the varint encoding
   matches PBF's wire format 1:1).
 
-  **Escape hatch:** `PBFHOGG_COORD_SLOTS=1` reverts to the
-  pre-integration path (stage 3 writes coord_slots, stage 4 mmaps
-  it). Verified Denmark-bit-identical against default on
-  2026-04-14 via `brokkr verify add-locations-to-ways --mode
-  external`. To be removed in Stage 6 after stability window.
+  **Stage 6 cleanup shipped 2026-04-14** (same day as Stage 5; the
+  stability-window gate was waived):
 
-  **Stage 6 (conditional cleanup, after stability window):**
+  - [x] ~~Drop the `PBFHOGG_COORD_SLOTS=1` escape hatch.~~ Done.
+  - [x] ~~Replace stage 3's `/dev/null` dummy `Arc<File>` with a proper
+    Option-based handling.~~ Done — `shared_file` removed entirely
+    along with the coord_slots writes.
+  - [x] ~~Rename `EXTJOIN_STAGE3_INTEGRATED_*` markers.~~ Done —
+    inner markers dropped; outer `EXTJOIN_STAGE3_START/END` cover it.
+    Counters renamed `s3_integrated_*` → `s3_*`.
+  - [x] ~~Remove `CoordSlots` from the external path entirely.~~ Done
+    — `CoordSlots` struct deleted; external path consumes
+    `coord_payloads` exclusively. Dense/sparse paths don't share that
+    type; `--force` non-indexed fallback would now hard-error on
+    out-of-band ways instead of silently emitting (0,0).
 
-  - [ ] Drop the `PBFHOGG_COORD_SLOTS=1` escape hatch.
-  - [ ] Replace stage 3's `/dev/null` dummy `Arc<File>` with a proper
-    `Option<Arc<File>>` once the escape hatch is gone.
-  - [ ] Rename `EXTJOIN_STAGE3_INTEGRATED_*` markers to drop the now-
-    redundant suffix.
-  - [ ] Remove `CoordSlots` from the external path entirely (retain
-    only for dense/sparse/`--force` fallback).
-
-  Trigger: ≥ 1 week of stable integrated-path use with no regression
-  reports, or at our discretion.
+  Net: −271 source lines. `brokkr verify --mode external` Denmark log
+  bit-identical to pre-Stage-6.
 
   **Permanently closed (rank-bucketing architecture makes these
   structurally unachievable):**

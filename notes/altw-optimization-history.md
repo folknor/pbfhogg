@@ -461,12 +461,20 @@ output PBFs.
    and `PBFHOGG_COORD_PAYLOADS_INTEGRATED` / `PBFHOGG_COORD_PAYLOADS_PROTOTYPE`
    env vars, add `PBFHOGG_COORD_SLOTS=1` pre-integration escape hatch
    (Stage 5).
+5. **Stage 6 cleanup (same-day):** dropped the `PBFHOGG_COORD_SLOTS`
+   escape hatch and the entire `CoordSlots` struct + mmap path. Stage
+   3's `shared_file`/`/dev/null` dummy gone — the function no longer
+   touches coord_slots at all. Stage 4's `assemble_block` Way branch
+   becomes a hard error (it was already unreachable under the
+   sorted-PBF + indexed-PBF requirement). Counters renamed
+   `s3_integrated_*` → `s3_*`. Inner `EXTJOIN_STAGE3_INTEGRATED_*`
+   markers dropped (outer `EXTJOIN_STAGE3_START/END` cover it). Net
+   −271 source lines; `brokkr verify --mode external` Denmark log
+   bit-identical to pre-Stage-6.
 
-**Stage 6 (conditional cleanup, pending stability window):** drop the
-`PBFHOGG_COORD_SLOTS=1` escape hatch, replace the `/dev/null` dummy
-`Arc<File>` in stage 3 with a proper `Option<Arc<File>>`, rename the
-`EXTJOIN_STAGE3_INTEGRATED_*` markers, remove the `CoordSlots`
-external path entirely.
+The stability-window gate was waived: same-day cleanup felt safer
+than carrying a months-long escape hatch through unrelated changes,
+and the implementation is fully covered by the verify diff.
 
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank

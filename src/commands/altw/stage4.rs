@@ -20,60 +20,6 @@ use super::super::{
 use super::COORD_SLOT_SIZE;
 
 // ---------------------------------------------------------------------------
-// CoordSlots: memory-mapped coordinate lookup
-// ---------------------------------------------------------------------------
-
-/// Memory-mapped coord_slots file for zero-syscall coordinate lookup.
-/// Access is sequential (slot_pos advances monotonically during assembly),
-/// so MADV_SEQUENTIAL enables kernel readahead. Replaces the previous
-/// per-ref pread approach (8B syscalls at planet scale).
-pub(super) struct CoordSlots {
-    mmap: memmap2::Mmap,
-    total_slots: u64,
-}
-
-impl CoordSlots {
-    pub(super) fn open(path: &Path, total_slots: u64) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| format!("failed to open coord_slots: {e}"))?;
-        let len = file.metadata()
-            .map_err(|e| format!("failed to stat coord_slots: {e}"))?
-            .len();
-        if len == 0 {
-            return Ok(Self {
-                mmap: memmap2::MmapOptions::new().map_anon()?.make_read_only()?,
-                total_slots: 0,
-            });
-        }
-        let mmap = unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| format!("failed to mmap coord_slots: {e}"))?;
-        // No madvise. Tested on Europe (6 workers, 37 GB coord_slots):
-        // MADV_SEQUENTIAL: 374K majflt, 141s wall.
-        // MADV_RANDOM: 9.2M majflt, 157s wall.
-        // No advice: 197K majflt, 143s wall.
-        // Wall time ties; no advice has fewest faults.
-        Ok(Self { mmap, total_slots })
-    }
-
-    /// Read a coordinate at the given slot position. Zero syscalls — direct
-    /// mmap byte access.
-    #[allow(clippy::cast_possible_truncation)]
-    fn get(&self, slot_pos: u64) -> Option<(i32, i32)> {
-        if slot_pos >= self.total_slots {
-            return None;
-        }
-        let offset = slot_pos as usize * COORD_SLOT_SIZE;
-        let bytes = self.mmap.get(offset..offset + COORD_SLOT_SIZE)?;
-        let lat = i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-        let lon = i32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        if lat == 0 && lon == 0 {
-            return None; // sentinel
-        }
-        Some((lat, lon))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -139,8 +85,7 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
-    coord_slots: Option<&CoordSlots>,
-    coord_payloads_reader: Option<&super::coord_payloads::CoordPayloadsReader>,
+    coord_payloads_reader: &super::coord_payloads::CoordPayloadsReader,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
@@ -390,38 +335,32 @@ pub(super) fn stage4_assembly(
                         output_blocks.clear();
 
                         if desc.is_way_blob {
-                            // Prototype: read this blob's coord_payloads payload
-                            // into a worker-local buffer before reframe.
-                            let payload_slice = if let Some(reader) = coord_payloads_reader {
-                                let t_cpread = std::time::Instant::now();
-                                reader
-                                    .pread_blob_payload(desc.way_blob_idx, &mut coord_payload_buf)
-                                    .map_err(|e| crate::error::new_error(
-                                        crate::error::ErrorKind::Io(std::io::Error::other(
-                                            e.to_string(),
-                                        )),
-                                    ))?;
-                                #[allow(clippy::cast_possible_truncation)]
-                                s4_coord_payload_pread_ref.fetch_add(
-                                    t_cpread.elapsed().as_millis() as u64,
-                                    Relaxed,
-                                );
-                                s4_coord_payload_bytes_ref.fetch_add(
-                                    coord_payload_buf.len() as u64,
-                                    Relaxed,
-                                );
-                                Some(coord_payload_buf.as_slice())
-                            } else {
-                                None
-                            };
+                            // Read this blob's coord_payloads payload into a
+                            // worker-local buffer before reframe.
+                            let t_cpread = std::time::Instant::now();
+                            coord_payloads_reader
+                                .pread_blob_payload(desc.way_blob_idx, &mut coord_payload_buf)
+                                .map_err(|e| crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(
+                                        e.to_string(),
+                                    )),
+                                ))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s4_coord_payload_pread_ref.fetch_add(
+                                t_cpread.elapsed().as_millis() as u64,
+                                Relaxed,
+                            );
+                            s4_coord_payload_bytes_ref.fetch_add(
+                                coord_payload_buf.len() as u64,
+                                Relaxed,
+                            );
 
                             // Wire-format reframe: splice locations without
                             // full PrimitiveBlock decode or BlockBuilder.
                             let (way_count, _new_slot_pos, min_id, max_id, missing) =
                                 reframe_way_blob_with_locations(
                                     &decompress_buf,
-                                    coord_slots,
-                                    payload_slice,
+                                    &coord_payload_buf,
                                     desc.slot_start,
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
@@ -463,12 +402,8 @@ pub(super) fn stage4_assembly(
                             &block,
                             &mut bb,
                             &mut output_blocks,
-                            coord_slots,
-                            desc.slot_start,
                             keep_untagged_nodes,
                             relation_member_node_ids,
-                            &mut refs_buf,
-                            &mut locations_buf,
                         ).map_err(|e| crate::error::new_error(
                             crate::error::ErrorKind::Io(std::io::Error::other(e))
                         ))?;
@@ -605,12 +540,8 @@ fn assemble_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    coord_slots: Option<&CoordSlots>,
-    mut way_slot_pos: u64,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
-    refs_buf: &mut Vec<i64>,
-    locations_buf: &mut Vec<(i32, i32)>,
 ) -> std::result::Result<Stats, String> {
     let mut stats = Stats::default();
 
@@ -649,39 +580,20 @@ fn assemble_block(
                 }
             }
             Element::Way(w) => {
-                ensure_way_capacity_local(bb, output)?;
-                refs_buf.clear();
-                refs_buf.extend(w.refs());
-                locations_buf.clear();
-                for _node_id in refs_buf.iter() {
-                    // `require_indexdata` guarantees every blob has an index,
-                    // and sorted PBF confines ways to blobs indexed as Way
-                    // (which are routed through reframe_way_blob_with_locations).
-                    // So reaching this branch means the input violates one of
-                    // those invariants — e.g. a way inside a non-Way-indexed
-                    // blob. In the integrated default path coord_slots is None
-                    // and we'd have no source of truth for these coordinates;
-                    // silently emitting (0,0) would be a stealth regression, so
-                    // error out instead.
-                    let cs = coord_slots.ok_or_else(|| format!(
-                        "way {} appeared in a non-way-indexed blob; coord_slots \
-                         is unavailable in the default (integrated) path. Set \
-                         PBFHOGG_COORD_SLOTS=1 to fall back, or re-run with a \
-                         sorted + indexed PBF",
-                        w.id(),
-                    ))?;
-                    match cs.get(way_slot_pos) {
-                        Some(loc) => locations_buf.push(loc),
-                        None => {
-                            stats.missing_locations += 1;
-                            locations_buf.push((0, 0));
-                        }
-                    }
-                    way_slot_pos += 1;
-                }
-                let meta = element_metadata(&w.info());
-                bb.add_way_with_locations(w.id(), w.tags(), refs_buf, locations_buf, meta.as_ref());
-                stats.ways_written += 1;
+                // `require_indexdata` guarantees every blob has an index,
+                // and sorted PBF confines ways to blobs indexed as Way
+                // (routed through reframe_way_blob_with_locations). Reaching
+                // here means the input violates one of those invariants
+                // (e.g. a way inside a non-Way-indexed blob). The integrated
+                // path produces coord_payloads keyed by way-blob index only,
+                // so there is no coordinate source for an out-of-band way —
+                // error out rather than silently emit (0,0).
+                return Err(format!(
+                    "way {} appeared in a non-way-indexed blob; ALTW external \
+                     index requires sorted + indexed PBF where ways are confined \
+                     to Way-indexed blobs",
+                    w.id(),
+                ));
             }
             Element::Relation(r) => {
                 ensure_relation_capacity_local(bb, output)?;
@@ -710,12 +622,10 @@ struct WayReframeCounters {
     parse_way_ms: std::sync::atomic::AtomicU64,
     ref_parse_ms: std::sync::atomic::AtomicU64,
     coord_read_ms: std::sync::atomic::AtomicU64,
-    delta_encode_ms: std::sync::atomic::AtomicU64,
     reassemble_ms: std::sync::atomic::AtomicU64,
     unknown_field_copy_ms: std::sync::atomic::AtomicU64,
     group_reframe_ms: std::sync::atomic::AtomicU64,
     refs_total: std::sync::atomic::AtomicU64,
-    refs_missing: std::sync::atomic::AtomicU64,
     refs_present: std::sync::atomic::AtomicU64,
     max_refs_per_way: std::sync::atomic::AtomicU64,
     lat_bytes: std::sync::atomic::AtomicU64,
@@ -730,12 +640,10 @@ impl WayReframeCounters {
             parse_way_ms: std::sync::atomic::AtomicU64::new(0),
             ref_parse_ms: std::sync::atomic::AtomicU64::new(0),
             coord_read_ms: std::sync::atomic::AtomicU64::new(0),
-            delta_encode_ms: std::sync::atomic::AtomicU64::new(0),
             reassemble_ms: std::sync::atomic::AtomicU64::new(0),
             unknown_field_copy_ms: std::sync::atomic::AtomicU64::new(0),
             group_reframe_ms: std::sync::atomic::AtomicU64::new(0),
             refs_total: std::sync::atomic::AtomicU64::new(0),
-            refs_missing: std::sync::atomic::AtomicU64::new(0),
             refs_present: std::sync::atomic::AtomicU64::new(0),
             max_refs_per_way: std::sync::atomic::AtomicU64::new(0),
             lat_bytes: std::sync::atomic::AtomicU64::new(0),
@@ -751,12 +659,10 @@ impl WayReframeCounters {
         crate::debug::emit_counter("s4_way_parse_way_ms", self.parse_way_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_ref_parse_ms", self.ref_parse_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_coord_read_ms", self.coord_read_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_delta_encode_ms", self.delta_encode_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_reassemble_ms", self.reassemble_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_unknown_field_copy_ms", self.unknown_field_copy_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_group_reframe_ms", self.group_reframe_ms.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_refs_missing", self.refs_missing.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_refs_present", self.refs_present.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_max_refs_per_way", self.max_refs_per_way.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_lat_bytes", self.lat_bytes.load(Relaxed) as i64);
@@ -778,9 +684,6 @@ struct WayReframeScratch {
     packed_lats: Vec<u8>,
     packed_lons: Vec<u8>,
     group_out: Vec<u8>,
-    /// Per-way coord scratch: (lat, lon) pairs read from mmap, consumed
-    /// by the delta-encode pass. Separates read from encode for timing.
-    coord_scratch: Vec<(i32, i32)>,
 }
 
 impl WayReframeScratch {
@@ -792,7 +695,6 @@ impl WayReframeScratch {
             packed_lats: Vec::new(),
             packed_lons: Vec::new(),
             group_out: Vec::new(),
-            coord_scratch: Vec::new(),
         }
     }
 }
@@ -804,26 +706,19 @@ impl WayReframeScratch {
 ///
 /// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
 ///
-/// When `coord_payload` is `Some`, the payload is a pre-delta-encoded
-/// zigzag-varint stream produced by the `coord_payloads` transform
-/// (prototype). Each way consumes `2*ref_count` varints, interleaved
-/// (lat, lon, lat, lon, ...) with deltas reset per way. Because the raw
-/// varint encoding matches PBF's packed field 9/10 byte-for-byte, we
-/// de-interleave by copying raw varint bytes into `packed_lats` and
-/// `packed_lons` without zigzag-decoding or re-encoding. `missing_locations`
-/// is not tracked in the prototype path (all coords assumed present; the
-/// (0,0) sentinel is accepted as a valid Null Island coordinate).
+/// `coord_payload` is the per-blob delta-varint payload produced by stage 3.
+/// Each way consumes `2*ref_count` varints, interleaved (lat, lon, lat,
+/// lon, ...) with deltas reset per way. Because the raw varint encoding
+/// matches PBF's packed field 9/10 byte-for-byte, we de-interleave by
+/// copying raw varint bytes into `packed_lats` and `packed_lons` without
+/// zigzag-decoding or re-encoding.
 ///
-/// When `coord_payload` is `None`, use the mmap path via `coord_slots`
-/// (`coord_slots` must be `Some` in that case — the caller's wiring guarantees
-/// this invariant because the escape-hatch supplies coord_slots and the default
-/// path supplies coord_payload).
-/// and track missing_locations via the `(0,0)` sentinel.
+/// `missing_locations` is not tracked: the (0,0) sentinel — Null Island
+/// in decimicrodegrees — is accepted as a valid coordinate.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],
-    coord_slots: Option<&CoordSlots>,
-    coord_payload: Option<&[u8]>,
+    coord_payload: &[u8],
     mut way_slot_pos: u64,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
@@ -930,100 +825,43 @@ fn reframe_way_blob_with_locations(
                 #[allow(clippy::cast_possible_truncation)]
                 counters.ref_parse_ms.fetch_add(t_ref_parse.elapsed().as_millis() as u64, Relaxed);
 
-                // Pass 1b + Pass 2: either read+delta-encode via mmap
-                // (baseline) or de-interleave pre-encoded varints from
-                // coord_payload (prototype). In the prototype the raw varint
-                // bytes match PBF's packed sint32 wire format 1:1, so we
-                // copy bytes without decoding.
-                let (way_missing, way_present) = if let Some(payload) = coord_payload {
-                    let t_read = std::time::Instant::now();
-                    scratch.packed_lats.clear();
-                    scratch.packed_lons.clear();
-                    for _ in 0..ref_count {
-                        let lat_start = payload_pos;
-                        while payload_pos < payload.len()
-                            && (payload[payload_pos] & 0x80) != 0
-                        {
-                            payload_pos += 1;
-                        }
-                        if payload_pos >= payload.len() {
-                            return Err("coord_payload: truncated lat varint".into());
-                        }
+                // De-interleave pre-encoded varints from coord_payload into
+                // PBF packed fields 9/10. The raw varint bytes match PBF's
+                // packed sint32 wire format 1:1, so we copy bytes without
+                // zigzag decode + re-encode.
+                let t_read = std::time::Instant::now();
+                scratch.packed_lats.clear();
+                scratch.packed_lons.clear();
+                for _ in 0..ref_count {
+                    let lat_start = payload_pos;
+                    while payload_pos < coord_payload.len()
+                        && (coord_payload[payload_pos] & 0x80) != 0
+                    {
                         payload_pos += 1;
-                        scratch.packed_lats.extend_from_slice(&payload[lat_start..payload_pos]);
-                        let lon_start = payload_pos;
-                        while payload_pos < payload.len()
-                            && (payload[payload_pos] & 0x80) != 0
-                        {
-                            payload_pos += 1;
-                        }
-                        if payload_pos >= payload.len() {
-                            return Err("coord_payload: truncated lon varint".into());
-                        }
+                    }
+                    if payload_pos >= coord_payload.len() {
+                        return Err("coord_payload: truncated lat varint".into());
+                    }
+                    payload_pos += 1;
+                    scratch.packed_lats.extend_from_slice(&coord_payload[lat_start..payload_pos]);
+                    let lon_start = payload_pos;
+                    while payload_pos < coord_payload.len()
+                        && (coord_payload[payload_pos] & 0x80) != 0
+                    {
                         payload_pos += 1;
-                        scratch.packed_lons.extend_from_slice(&payload[lon_start..payload_pos]);
                     }
-                    way_slot_pos += ref_count;
-                    #[allow(clippy::cast_possible_truncation)]
-                    counters
-                        .coord_read_ms
-                        .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
-                    (0u64, ref_count)
-                } else {
-                    let t_read = std::time::Instant::now();
-                    scratch.coord_scratch.clear();
-                    let mut way_missing: u64 = 0;
-                    let mut way_present: u64 = 0;
-                    let cs = coord_slots.expect(
-                        "coord_slots required when no coord_payload (escape-hatch wiring invariant)"
-                    );
-                    for _ in 0..ref_count {
-                        let (lat, lon) = match cs.get(way_slot_pos) {
-                            Some(loc) => {
-                                way_present += 1;
-                                loc
-                            }
-                            None => {
-                                missing_locations += 1;
-                                way_missing += 1;
-                                (0, 0)
-                            }
-                        };
-                        scratch.coord_scratch.push((lat, lon));
-                        way_slot_pos += 1;
+                    if payload_pos >= coord_payload.len() {
+                        return Err("coord_payload: truncated lon varint".into());
                     }
-                    #[allow(clippy::cast_possible_truncation)]
-                    counters
-                        .coord_read_ms
-                        .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
-
-                    let t_encode = std::time::Instant::now();
-                    scratch.packed_lats.clear();
-                    scratch.packed_lons.clear();
-                    let mut last_lat: i64 = 0;
-                    let mut last_lon: i64 = 0;
-                    for &(lat, lon) in &scratch.coord_scratch {
-                        let lat_i64 = i64::from(lat);
-                        let lon_i64 = i64::from(lon);
-                        protohoggr::encode_varint(
-                            &mut scratch.packed_lats,
-                            protohoggr::zigzag_encode_64(lat_i64 - last_lat),
-                        );
-                        protohoggr::encode_varint(
-                            &mut scratch.packed_lons,
-                            protohoggr::zigzag_encode_64(lon_i64 - last_lon),
-                        );
-                        last_lat = lat_i64;
-                        last_lon = lon_i64;
-                    }
-                    #[allow(clippy::cast_possible_truncation)]
-                    counters
-                        .delta_encode_ms
-                        .fetch_add(t_encode.elapsed().as_millis() as u64, Relaxed);
-                    (way_missing, way_present)
-                };
-                counters.refs_missing.fetch_add(way_missing, Relaxed);
-                counters.refs_present.fetch_add(way_present, Relaxed);
+                    payload_pos += 1;
+                    scratch.packed_lons.extend_from_slice(&coord_payload[lon_start..payload_pos]);
+                }
+                way_slot_pos += ref_count;
+                #[allow(clippy::cast_possible_truncation)]
+                counters
+                    .coord_read_ms
+                    .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
+                counters.refs_present.fetch_add(ref_count, Relaxed);
 
                 // Update max refs per way (relaxed CAS loop).
                 {

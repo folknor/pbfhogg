@@ -10,9 +10,6 @@
 //! The integration is pursued primarily for its non-wall benefits
 //! (scratch footprint, page faults, memory pressure), not raw compression.
 //!
-//! Escape hatch: set `PBFHOGG_COORD_SLOTS=1` to revert to the pre-integration
-//! path (stage 3 writes coord_slots, stage 4 reads via mmap).
-//!
 //! # File format
 //!
 //! ```text
@@ -29,7 +26,7 @@
 //!
 //! Walk the blob's ways in PBF order (order recorded in the per-way refcount
 //! sidecar). For each way with N refs, read N coord slots sequentially from
-//! coord_slots starting at `slot_start + cursor`. Emit `2*N` zigzag-varints:
+//! the bucket's dense scatter buffer in stage 3. Emit `2*N` zigzag-varints:
 //! (lat_delta_0, lon_delta_0, ..., lat_delta_N-1, lon_delta_N-1) where
 //! delta_0 is the absolute value (delta from 0) and deltas reset per way.
 //!

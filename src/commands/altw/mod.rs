@@ -37,7 +37,7 @@ mod stage4;
 use stage1::{build_coords_by_rank_file, build_way_schedule, stage1_way_pass};
 use stage2::{stage2_node_join, SlotBuckets};
 use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
-use stage4::{stage4_assembly, CoordSlots};
+use stage4::stage4_assembly;
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
 /// 14B gives headroom above the current ~13B maximum.
@@ -140,13 +140,6 @@ pub fn external_join(
         }
     }
 
-    // Default: integrated coord_payloads path (no coord_slots file produced).
-    // Escape hatch: PBFHOGG_COORD_SLOTS=1 reverts to the pre-integration path
-    // (coord_slots written by stage 3, read via mmap in stage 4).
-    let coord_slots_escape = std::env::var("PBFHOGG_COORD_SLOTS")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-
     let scratch_dir = if keep_scratch || start_stage.is_some() {
         ScratchDir::new_stable(output.parent().unwrap_or(Path::new(".")), "external-join")?
     } else {
@@ -156,7 +149,6 @@ pub fn external_join(
     let manifest_path = scratch_dir.file_path("manifest");
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
-    let coord_slots_path = scratch_dir.file_path("coord_slots");
     let coord_file_path = scratch_dir.file_path("coords_by_rank");
     let start = start_stage.unwrap_or(1);
 
@@ -293,14 +285,14 @@ pub fn external_join(
         crate::debug::emit_marker("EXTJOIN_STAGE2_END");
     }
 
-    // Integrated path: prepare artifacts before stage 3 if needed.
+    // Prepare integrated coord_payloads artifacts before stage 3.
     let coord_payloads_path = scratch_dir.file_path("coord_payloads");
     let integrated_artifacts: Option<(
         Vec<u64>,                                                       // way_slot_starts
         coord_payloads::PerWayRcs,                                      // per_way_rcs
         Vec<std::path::PathBuf>,                                        // worker_tmp_paths
         Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>>,  // straddler_slots
-    )> = if !coord_slots_escape && start <= 3 {
+    )> = if start <= 3 {
         let way_slot_starts =
             stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
         let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_flat(
@@ -369,16 +361,15 @@ pub fn external_join(
             .map(|i| scratch_dir.bucket_path("slot", i))
             .collect();
         let slot_bucket_ref = SlotBucketRef { paths: slot_paths, entry_counts: slot_entry_counts };
-        let integrated_inputs = integrated_artifacts.as_ref().map(
-            |(wss, pwr, tmp_paths, ss)| IntegratedInputs {
-                way_slot_starts: wss.as_slice(),
-                per_way_rcs: pwr,
-                worker_tmp_paths: tmp_paths.as_slice(),
-                straddler_slots: ss.as_slice(),
-            },
-        );
-        let s3_result =
-            stage3_slot_reorder(&slot_bucket_ref, &coord_slots_path, total_slots, integrated_inputs)?;
+        let (way_slot_starts, per_way_rcs, worker_tmp_paths, straddler_slots) =
+            integrated_artifacts.expect("integrated_artifacts present when start <= 3");
+        let integrated_inputs = IntegratedInputs {
+            way_slot_starts: way_slot_starts.as_slice(),
+            per_way_rcs: &per_way_rcs,
+            worker_tmp_paths: worker_tmp_paths.as_slice(),
+            straddler_slots: straddler_slots.as_slice(),
+        };
+        let s3_result = stage3_slot_reorder(&slot_bucket_ref, total_slots, integrated_inputs)?;
         let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
             for i in 0..NUM_BUCKETS {
@@ -392,20 +383,19 @@ pub fn external_join(
         }
         crate::debug::emit_marker("EXTJOIN_STAGE3_END");
 
-        // Finalize integrated coord_payloads right after stage 3.
-        if let (Some(result), Some((_, per_way_rcs, worker_tmp_paths, straddler_slots))) =
-            (s3_result, integrated_artifacts)
+        // Finalize coord_payloads right after stage 3.
         {
             let finalize_stats = coord_payloads::finalize_coord_payloads(
                 &coord_payloads_path,
                 &per_way_rcs,
-                result.worker_manifests,
+                s3_result.worker_manifests,
                 &worker_tmp_paths,
                 straddler_slots,
             )?;
             drop(per_way_rcs); // Free ~4.7 GB before stage 4.
+            drop(way_slot_starts);
             eprintln!(
-                "[coord_payloads integrated] finalize {} ms (enc {} rd {} wr {}), \
+                "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
                  output {} MB, straddlers {}, blobs {}",
                 finalize_stats.finalize_ms,
                 finalize_stats.encode_ms,
@@ -416,13 +406,12 @@ pub fn external_join(
                 finalize_stats.num_way_blobs,
             );
         }
-    } else if !coord_slots_escape {
-        // start >= 4, default integrated path: coord_payloads must already exist.
+    } else {
+        // start >= 4: coord_payloads must already exist from a prior keep-scratch run.
         if !coord_payloads_path.exists() {
             return Err(format!(
-                "default (integrated) path with --start-stage {start} requires existing \
-                 coord_payloads in scratch; run from an earlier stage, or set \
-                 PBFHOGG_COORD_SLOTS=1 to use the pre-integration escape hatch"
+                "--start-stage {start} requires existing coord_payloads in scratch; \
+                 run from an earlier stage with --keep-scratch first"
             )
             .into());
         }
@@ -436,31 +425,19 @@ pub fn external_join(
         )?)
     };
 
-    // Default path: open CoordPayloadsReader; no CoordSlots.
-    // Escape-hatch path: open CoordSlots; no CoordPayloadsReader.
-    let coord_payloads_reader = if !coord_slots_escape {
-        let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
-        Some(coord_payloads::CoordPayloadsReader::open(
-            &coord_payloads_path,
-            way_slot_starts.len(),
-        )?)
-    } else {
-        None
-    };
-
-    let coord_slots = if coord_slots_escape {
-        Some(CoordSlots::open(&coord_slots_path, total_slots)?)
-    } else {
-        None
-    };
+    let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+    let coord_payloads_reader = coord_payloads::CoordPayloadsReader::open(
+        &coord_payloads_path,
+        way_slot_starts.len(),
+    )?;
+    drop(way_slot_starts);
 
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
     let stats = stage4_assembly(
         input,
         output,
-        coord_slots.as_ref(),
-        coord_payloads_reader.as_ref(),
+        &coord_payloads_reader,
         keep_untagged_nodes,
         relation_member_node_ids.as_ref(),
         compression,

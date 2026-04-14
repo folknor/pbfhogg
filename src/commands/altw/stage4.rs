@@ -953,6 +953,15 @@ fn reframe_way_blob_with_locations(
     let mut max_way_id: i64 = i64::MIN;
     let mut missing_locations: u64 = 0;
     let mut blob_refs: u64 = 0;
+    // Blob-local accumulators for the previously-per-way shared atomics.
+    // Published once at function exit so 453M+ way iterations produce
+    // ~57K atomic publishes instead of 4× that per way × 6 contending
+    // workers. The atomics were previously a real chunk of the
+    // "unaccounted" time inside s4_way_reframe_ms.
+    let mut blob_refs_present: u64 = 0;
+    let mut blob_max_refs_per_way: u64 = 0;
+    let mut blob_lat_bytes: u64 = 0;
+    let mut blob_lon_bytes: u64 = 0;
 
     // Payload cursor: position in `coord_payload` for the current way.
     // Advances as we consume varints across ways within this blob.
@@ -1044,23 +1053,12 @@ fn reframe_way_blob_with_locations(
                 counters
                     .coord_read_ns
                     .fetch_add(t_read.elapsed().as_nanos() as u64, Relaxed);
-                counters.refs_present.fetch_add(ref_count, Relaxed);
-
-                // Update max refs per way (relaxed CAS loop).
-                {
-                    let mut current = counters.max_refs_per_way.load(Relaxed);
-                    while ref_count > current {
-                        match counters.max_refs_per_way.compare_exchange_weak(
-                            current, ref_count, Relaxed, Relaxed,
-                        ) {
-                            Ok(_) => break,
-                            Err(actual) => current = actual,
-                        }
-                    }
+                blob_refs_present += ref_count;
+                if ref_count > blob_max_refs_per_way {
+                    blob_max_refs_per_way = ref_count;
                 }
-
-                counters.lat_bytes.fetch_add(scratch.packed_lats.len() as u64, Relaxed);
-                counters.lon_bytes.fetch_add(scratch.packed_lons.len() as u64, Relaxed);
+                blob_lat_bytes += scratch.packed_lats.len() as u64;
+                blob_lon_bytes += scratch.packed_lons.len() as u64;
                 blob_refs += ref_count;
 
                 // Build reframed way: original bytes + appended fields 9, 10.
@@ -1102,8 +1100,26 @@ fn reframe_way_blob_with_locations(
     // Append scalar fields (granularity, etc.).
     output.extend_from_slice(&scratch.scalar_fields);
 
+    // Publish blob-local counter accumulators (one fetch_add each
+    // instead of per-way). The shared-atomic `max_refs_per_way` still
+    // needs a CAS loop because multiple blobs publish concurrently,
+    // but now only once per blob.
     counters.refs_total.fetch_add(blob_refs, Relaxed);
+    counters.refs_present.fetch_add(blob_refs_present, Relaxed);
+    counters.lat_bytes.fetch_add(blob_lat_bytes, Relaxed);
+    counters.lon_bytes.fetch_add(blob_lon_bytes, Relaxed);
     counters.ways_total.fetch_add(total_ways, Relaxed);
+    if blob_max_refs_per_way > 0 {
+        let mut current = counters.max_refs_per_way.load(Relaxed);
+        while blob_max_refs_per_way > current {
+            match counters.max_refs_per_way.compare_exchange_weak(
+                current, blob_max_refs_per_way, Relaxed, Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
+    }
 
     if payload_pos != coord_payload.len() {
         return Err(format!(

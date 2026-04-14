@@ -319,6 +319,43 @@ pub fn external_join(
         )?)
     };
 
+    // Prototype: when PBFHOGG_COORD_PAYLOADS_PROTOTYPE is set, run the
+    // coord_slots -> coord_payloads transform and have stage 4 read the
+    // compressed per-blob payloads instead of the 37 GB mmap.
+    let prototype_enabled = std::env::var("PBFHOGG_COORD_PAYLOADS_PROTOTYPE")
+        .map(|v| v != "0" && !v.is_empty())
+        .unwrap_or(false);
+    let coord_payloads_path = scratch_dir.file_path("coord_payloads");
+    let coord_payloads_reader = if prototype_enabled {
+        let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+        let stats = coord_payloads::transform_coord_slots_to_payloads(
+            &coord_slots_path,
+            &per_way_refcount_sidecar,
+            &coord_payloads_path,
+            &way_slot_starts,
+            total_slots,
+        )?;
+        #[allow(clippy::cast_precision_loss)]
+        let ratio = if stats.output_bytes == 0 {
+            0.0
+        } else {
+            stats.input_bytes as f64 / stats.output_bytes as f64
+        };
+        eprintln!(
+            "[coord_payloads] transform {} ms, input {} MB → output {} MB, ratio {:.2}×",
+            stats.transform_ms,
+            stats.input_bytes / 1_000_000,
+            stats.output_bytes / 1_000_000,
+            ratio,
+        );
+        Some(coord_payloads::CoordPayloadsReader::open(
+            &coord_payloads_path,
+            way_slot_starts.len(),
+        )?)
+    } else {
+        None
+    };
+
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
     let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
@@ -326,6 +363,7 @@ pub fn external_join(
         input,
         output,
         &coord_slots,
+        coord_payloads_reader.as_ref(),
         keep_untagged_nodes,
         relation_member_node_ids.as_ref(),
         compression,

@@ -296,3 +296,78 @@ pub(super) fn transform_coord_slots_to_payloads(
 
     Ok(stats)
 }
+
+/// Reader for `coord_payloads`. Holds the file handle + offset table in
+/// memory (`~ 140 KB` at planet scale; trivial).
+pub(super) struct CoordPayloadsReader {
+    file: std::fs::File,
+    /// Byte offset of blob i's payload within the file. blob_offsets.len()
+    /// == num_way_blobs + 1; blob i's payload spans
+    /// `[blob_offsets[i], blob_offsets[i+1])`.
+    blob_offsets: Vec<u64>,
+    payload_base: u64,
+}
+
+impl CoordPayloadsReader {
+    pub(super) fn open(path: &Path, expected_num_blobs: usize) -> Result<Self> {
+        use std::io::Read as _;
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| format!("open coord_payloads: {e}"))?;
+        let mut hdr = [0u8; 16];
+        file.read_exact(&mut hdr)
+            .map_err(|e| format!("read coord_payloads header: {e}"))?;
+        let num_way_blobs = u64::from_le_bytes([
+            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
+        ]);
+        let total_payload_bytes = u64::from_le_bytes([
+            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
+        ]);
+        #[allow(clippy::cast_possible_truncation)]
+        let n = num_way_blobs as usize;
+        if n != expected_num_blobs {
+            return Err(format!(
+                "coord_payloads num_way_blobs={n} != expected {expected_num_blobs}"
+            )
+            .into());
+        }
+        let mut offsets_bytes = vec![0u8; (n + 1) * 8];
+        file.read_exact(&mut offsets_bytes)
+            .map_err(|e| format!("read coord_payloads offsets: {e}"))?;
+        let mut blob_offsets: Vec<u64> = Vec::with_capacity(n + 1);
+        for chunk in offsets_bytes.chunks_exact(8) {
+            blob_offsets.push(u64::from_le_bytes([
+                chunk[0], chunk[1], chunk[2], chunk[3],
+                chunk[4], chunk[5], chunk[6], chunk[7],
+            ]));
+        }
+        if blob_offsets[n] != total_payload_bytes {
+            return Err(format!(
+                "coord_payloads trailing offset {} != total_payload_bytes {}",
+                blob_offsets[n], total_payload_bytes
+            )
+            .into());
+        }
+        let payload_base: u64 = 16 + ((n as u64) + 1) * 8;
+        Ok(Self {
+            file,
+            blob_offsets,
+            payload_base,
+        })
+    }
+
+    /// Read blob `blob_idx`'s payload into `buf` (resized to exact length).
+    pub(super) fn pread_blob_payload(&self, blob_idx: usize, buf: &mut Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        let start = self.blob_offsets[blob_idx];
+        let end = self.blob_offsets[blob_idx + 1];
+        #[allow(clippy::cast_possible_truncation)]
+        let len = (end - start) as usize;
+        buf.resize(len, 0);
+        if len > 0 {
+            self.file
+                .read_exact_at(buf, self.payload_base + start)
+                .map_err(|e| format!("pread coord_payloads blob {blob_idx}: {e}"))?;
+        }
+        Ok(())
+    }
+}

@@ -630,6 +630,18 @@ Milestone A, SIMD as Milestone B, huge pages and NUMA as Milestone C.
   arena/scratch work is complete and the remaining alloc profile is
   clearer. Measure RSS and wall time on planet add-locations-to-ways,
   merge, and build-geocode-index.
+    - **jemalloc 5.3.1 (released 2026-04)** — wait for `tikv-jemallocator`
+      to tag a release pointing at 5.3.1, then rerun the bench.
+      Specifically relevant to the pipelined reader's cross-thread free
+      pattern (`src/read/pipeline.rs:70` — decode workers allocate
+      `PrimitiveBlock`s dropped on the consumer thread, the exact reason
+      the prior jemalloc bench only saved RSS and not wall time):
+        - tcache for deallocation-only threads (most on-point)
+        - locality-aware tcache GC (`experimental_tcache_gc`, default on)
+        - `calloc_madvise_threshold`, `process_madvise_max_batch`,
+          `tcache_ncached_max` for ~MB-sized block allocations
+      Check tikv-jemallocator releases; when 5.3.1 lands, run planet read
+      + ALTW external + merge.
 
 - [ ] **1. Custom allocators (per-block arena)** — 4/6 reviewers ranked 1st.
   See [notes/arena-allocator-research.md](notes/arena-allocator-research.md)

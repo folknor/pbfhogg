@@ -329,7 +329,6 @@ pub fn external_join(
     // Prepare integrated coord_payloads artifacts before stage 3.
     let coord_payloads_path = scratch_dir.file_path("coord_payloads");
     let integrated_artifacts: Option<(
-        Vec<u64>,                                                       // way_slot_starts
         coord_payloads::PerWayRcs,                                      // per_way_rcs
         Vec<std::path::PathBuf>,                                        // worker_tmp_paths
         Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>>,  // straddler_slots
@@ -351,10 +350,12 @@ pub fn external_join(
                 .map(|_| std::sync::Mutex::new(None))
                 .collect();
 
-        Some((way_slot_starts, per_way_rcs, worker_tmp_paths, straddler_slots))
+        Some((per_way_rcs, worker_tmp_paths, straddler_slots))
     } else {
         None
     };
+
+    let mut stage4_per_way_rcs: Option<coord_payloads::PerWayRcs> = None;
 
     if start <= 3 {
         crate::debug::emit_marker("EXTJOIN_STAGE3_START");
@@ -367,7 +368,7 @@ pub fn external_join(
             .map(|i| scratch_dir.bucket_path("slot", i))
             .collect();
         let slot_bucket_ref = SlotBucketRef { paths: slot_paths, entry_counts: slot_entry_counts };
-        let (way_slot_starts, per_way_rcs, worker_tmp_paths, straddler_slots) =
+        let (per_way_rcs, worker_tmp_paths, straddler_slots) =
             integrated_artifacts.expect("integrated_artifacts present when start <= 3");
         let integrated_inputs = IntegratedInputs {
             way_slot_starts: way_slot_starts.as_slice(),
@@ -398,8 +399,6 @@ pub fn external_join(
                 &worker_tmp_paths,
                 straddler_slots,
             )?;
-            drop(per_way_rcs); // Free the indexed per-way sidecar before stage 4.
-            drop(way_slot_starts);
             eprintln!(
                 "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
                  output {} MB, straddlers {}, blobs {}",
@@ -412,6 +411,7 @@ pub fn external_join(
                 finalize_stats.num_way_blobs,
             );
         }
+        stage4_per_way_rcs = Some(per_way_rcs);
     } else {
         // start >= 4: coord_payloads must already exist from a prior keep-scratch run.
         if !coord_payloads_path.exists() {
@@ -431,10 +431,14 @@ pub fn external_join(
         )?)
     };
 
-    // Re-load way_slot_starts to pass num_way_blobs to the reader. We
-    // only need the count; an integration follow-up could persist this
-    // in a manifest to avoid the re-load.
-    let num_way_blobs = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?.len();
+    let stage4_per_way_rcs = match stage4_per_way_rcs {
+        Some(per_way_rcs) => per_way_rcs,
+        None => coord_payloads::load_per_way_refcount_sidecar_indexed(
+            &per_way_refcount_sidecar,
+            way_slot_starts.len(),
+        )?,
+    };
+    let num_way_blobs = way_slot_starts.len();
     let coord_payloads_reader = coord_payloads::CoordPayloadsReader::open(
         &coord_payloads_path,
         num_way_blobs,
@@ -446,13 +450,13 @@ pub fn external_join(
         input,
         output,
         &coord_payloads_reader,
+        &stage4_per_way_rcs,
+        way_slot_starts.as_slice(),
         keep_untagged_nodes,
         relation_member_node_ids.as_ref(),
         compression,
         direct_io,
         overrides,
-        &ref_count_sidecar,
-        total_slots,
     )?;
     let (s4_minflt_after, s4_majflt_after) = crate::debug::read_page_faults();
     #[allow(clippy::cast_possible_wrap)]

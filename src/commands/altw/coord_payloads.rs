@@ -32,7 +32,7 @@
 //!
 //! # Decoder contract (stage 4)
 //!
-//! Stage 4 knows ref_count per way from parsing the way blob's refs.
+//! Stage 4 knows ref_count per way from the per-way refcount sidecar.
 //! For each way, consume `2*ref_count` varints, unzigzag, accumulate running
 //! lat/lon. No per-way framing bytes.
 

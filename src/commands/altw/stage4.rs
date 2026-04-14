@@ -108,18 +108,15 @@ pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
     coord_payloads_reader: &super::coord_payloads::CoordPayloadsReader,
+    per_way_rcs: &super::coord_payloads::PerWayRcs,
+    way_slot_starts: &[u64],
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
     compression: Compression,
     direct_io: bool,
     overrides: &HeaderOverrides,
-    ref_count_sidecar: &Path,
-    total_slots: u64,
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
-
-    // Load sidecar and compute slot_start prefix sums.
-    let way_slot_starts = load_ref_count_sidecar(ref_count_sidecar, total_slots)?;
     // Header-only pre-scan: build the blob schedule.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -370,8 +367,6 @@ pub(super) fn stage4_assembly(
                 let mut decompress_buf: Vec<u8> = Vec::new();
                 let mut bb = BlockBuilder::new();
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
-                let mut refs_buf: Vec<i64> = Vec::new();
-                let mut locations_buf: Vec<(i32, i32)> = Vec::new();
                 let mut way_reframe_scratch = WayReframeScratch::new();
                 let mut reframe_output: Vec<u8> = Vec::new();
                 // Per-blob coord payload buffer (prototype path only). Reused
@@ -434,6 +429,8 @@ pub(super) fn stage4_assembly(
                                 reframe_way_blob_with_locations(
                                     &decompress_buf,
                                     &coord_payload_buf,
+                                    per_way_rcs.blob_record(desc.way_blob_idx),
+                                    desc.way_blob_idx,
                                     desc.slot_start,
                                     &mut reframe_output,
                                     &mut way_reframe_scratch,
@@ -924,8 +921,10 @@ impl WayReframeScratch {
 
 /// Wire-format reframe: splice LocationsOnWays fields (9, 10) into way
 /// messages without full PrimitiveBlock decode. Copies string table, node
-/// groups, relation groups, and all non-ref way fields verbatim. Only
-/// decodes way refs (field 8) to count them and look up coords.
+/// groups, relation groups, and all way fields verbatim. Per-way refcounts
+/// come from the stage-1 sidecar record for this blob, so the hot path no
+/// longer re-counts field-8 ref varints just to know how many coordinate
+/// pairs to splice.
 ///
 /// Returns `(way_count, way_slot_pos_after, min_way_id, max_way_id, missing_locations)`.
 ///
@@ -944,6 +943,8 @@ impl WayReframeScratch {
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],
     coord_payload: &[u8],
+    per_way_refcount_record: &[u8],
+    way_blob_idx: usize,
     mut way_slot_pos: u64,
     output: &mut Vec<u8>,
     scratch: &mut WayReframeScratch,
@@ -987,13 +988,21 @@ fn reframe_way_blob_with_locations(
     #[allow(clippy::cast_possible_truncation)]
     counters.parse_block_ns.fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
 
+    let mut refcount_cursor = Cursor::new(per_way_refcount_record);
+    let expected_ways = refcount_cursor
+        .read_varint()
+        .map_err(|e| format!("per-way sidecar blob {way_blob_idx} num_ways: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let expected_ways_usize = expected_ways as usize;
+    let mut sidecar_way_idx: usize = 0;
+
     output.clear();
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
 
     let mut total_ways: u64 = 0;
     let mut min_way_id: i64 = i64::MAX;
     let mut max_way_id: i64 = i64::MIN;
-    let mut missing_locations: u64 = 0;
+    let missing_locations: u64 = 0;
     let mut blob_refs: u64 = 0;
     // Blob-local accumulators for the previously-per-way shared atomics.
     // Published once at function exit so 453M+ way iterations produce
@@ -1020,20 +1029,24 @@ fn reframe_way_blob_with_locations(
                 // Way submessage — splice locations.
                 let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
 
+                if sidecar_way_idx >= expected_ways_usize {
+                    return Err(format!(
+                        "blob {way_blob_idx}: encountered more way messages than the per-way sidecar record declares ({expected_ways_usize})"
+                    ));
+                }
+                let ref_count = refcount_cursor
+                    .read_varint()
+                    .map_err(|e| format!(
+                        "per-way sidecar blob {way_blob_idx} way {sidecar_way_idx}: {e}"
+                    ))?;
+                sidecar_way_idx += 1;
+
                 let mut way_id: i64 = 0;
-                let mut refs_data: &[u8] = &[];
-                let mut refs_range: Option<(usize, usize)> = None;
 
                 let mut way_cursor = Cursor::new(way_bytes);
                 while let Some((wf, wt)) = way_cursor.read_tag().map_err(|e| format!("reframe wfield: {e}"))? {
                     if wf == 1 && wt == WIRE_VARINT {
                         way_id = way_cursor.read_varint_i64().map_err(|e| format!("reframe id: {e}"))?;
-                    } else if wf == 8 && wt == WIRE_LEN {
-                        let val_start = way_bytes.len() - way_cursor.remaining();
-                        let tag_start = val_start - 1; // field 8 tag = 1 byte
-                        refs_data = way_cursor.read_len_delimited().map_err(|e| format!("reframe refs: {e}"))?;
-                        let val_end = way_bytes.len() - way_cursor.remaining();
-                        refs_range = Some((tag_start, val_end));
                     } else {
                         way_cursor.skip_field(wt).map_err(|e| format!("reframe wskip: {e}"))?;
                     }
@@ -1041,16 +1054,6 @@ fn reframe_way_blob_with_locations(
 
                 if way_id < min_way_id { min_way_id = way_id; }
                 if way_id > max_way_id { max_way_id = way_id; }
-
-                // Pass 1a: count refs by skipping varints.
-                let mut ref_count: u64 = 0;
-                if !refs_data.is_empty() {
-                    let mut ref_cursor = Cursor::new(refs_data);
-                    while ref_cursor.remaining() > 0 {
-                        ref_cursor.read_varint().map_err(|e| format!("reframe ref varint: {e}"))?;
-                        ref_count += 1;
-                    }
-                }
 
                 // De-interleave pre-encoded varints from coord_payload into
                 // PBF packed fields 9/10. The raw varint bytes match PBF's
@@ -1093,13 +1096,7 @@ fn reframe_way_blob_with_locations(
 
                 // Build reframed way: original bytes + appended fields 9, 10.
                 scratch.reframed_way.clear();
-                if let Some((refs_start, refs_end)) = refs_range {
-                    scratch.reframed_way.extend_from_slice(&way_bytes[..refs_start]);
-                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_start..refs_end]);
-                    scratch.reframed_way.extend_from_slice(&way_bytes[refs_end..]);
-                } else {
-                    scratch.reframed_way.extend_from_slice(way_bytes);
-                }
+                scratch.reframed_way.extend_from_slice(way_bytes);
                 if ref_count > 0 {
                     protohoggr::encode_bytes_field(&mut scratch.reframed_way, 9, &scratch.packed_lats);
                     protohoggr::encode_bytes_field(&mut scratch.reframed_way, 10, &scratch.packed_lons);
@@ -1126,6 +1123,18 @@ fn reframe_way_blob_with_locations(
 
     // Append scalar fields (granularity, etc.).
     output.extend_from_slice(&scratch.scalar_fields);
+
+    if sidecar_way_idx != expected_ways_usize {
+        return Err(format!(
+            "blob {way_blob_idx}: per-way sidecar record declared {expected_ways_usize} ways but the blob contained {sidecar_way_idx}"
+        ));
+    }
+    if refcount_cursor.remaining() != 0 {
+        return Err(format!(
+            "per-way sidecar blob {way_blob_idx} has {} trailing bytes",
+            refcount_cursor.remaining()
+        ));
+    }
 
     // Publish blob-local counter accumulators (one fetch_add each
     // instead of per-way). The shared-atomic `max_refs_per_way` still

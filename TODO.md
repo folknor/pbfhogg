@@ -301,13 +301,24 @@ single-pass, tag expression and bbox filtering.
     by construction. Out-of-range high `slot_pos` values get clamped
     to the last-bucket index. (External review 2026-04-14 #2 + #3
     followup.)
-  - [x] ~~External `Stats.missing_locations` always reports 0.~~ Fixed.
-    Computed once in `external_join` after stage 4 as
-    `total_slots − stage2_resolved_count` (stage 2 already
-    discriminates resolved-vs-(0,0)-sentinel during the node join).
-    Matches dense semantics without a per-ref decode in the stage-4
-    hot loop. `--start-stage >= 3` skips stage 2, so the field stays
-    at 0 with a one-time eprintln. (External review 2026-04-14 #2.)
+  - [x] ~~External `Stats.missing_locations` always reports 0.~~ Fixed
+    in three commits (`25031a1` + manifest-persistence followup).
+    Computed in `external_join` after stage 4 as
+    `total_slots − resolved_count`, where `resolved_count` comes from
+    stage 2's `is_resolved = lat != 0 || lon != 0` aggregation. When
+    stage 2 was skipped via `--start-stage >= 3`, `resolved_count` is
+    recovered from the manifest (extended to 16 bytes:
+    `[u64 total_slots][u64 resolved_count]`) — so resume runs populate
+    the field consistently with fresh runs.
+
+    **Caveat (acknowledged tradeoff, not parity with dense):** this
+    counts a real OSM node at exact (0,0) decimicrodegrees as missing,
+    while dense doesn't. The closed "Null Island" item accepted that
+    tradeoff because (0°, 0°) is in the Atlantic and no real OSM node
+    has those exact coords; the count is correct in practice but the
+    semantics differ in principle. Remove this caveat only if a
+    user-visible (0,0)-sentinel collision is observed. (External review
+    2026-04-14 #2 + #3 followup.)
 
   **Bugs (lower priority, dev-time only):**
 

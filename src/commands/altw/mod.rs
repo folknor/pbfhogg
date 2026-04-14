@@ -161,6 +161,15 @@ pub fn external_join(
     let coord_file_path = scratch_dir.file_path("coords_by_rank");
     let start = start_stage.unwrap_or(1);
 
+    // Manifest layout (LE): [u64 total_slots][u64 resolved_count?]
+    //   - 8 bytes: only stage 1 completed in the prior keep-scratch run.
+    //   - 16 bytes: stage 2 also completed; resolved_count is the value
+    //     stage 2 returned for this dataset.
+    // Used by --start-stage >= 2 resumes to recover what stage 2 would
+    // have produced. resolved_count is needed by Stats.missing_locations
+    // when stage 2 is skipped.
+    let mut manifest_resolved_count: Option<u64> = None;
+
     let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
         if start >= 2 {
             let manifest = std::fs::read(&manifest_path)
@@ -170,6 +179,12 @@ pub fn external_join(
             }
             let total_slots = u64::from_le_bytes(manifest[..8].try_into()
                 .map_err(|_| "manifest read failed")?);
+            if manifest.len() >= 16 {
+                manifest_resolved_count = Some(
+                    u64::from_le_bytes(manifest[8..16].try_into()
+                        .map_err(|_| "manifest resolved_count read failed")?),
+                );
+            }
 
             let schedule = build_way_schedule(input)?;
             let shared_file = std::sync::Arc::new(
@@ -306,10 +321,10 @@ pub fn external_join(
     };
 
     // Captured if stage 2 runs this invocation; used at the end to fill
-    // Stats.missing_locations consistently with the dense path. None means
-    // stage 2 was skipped (--start-stage >= 3); the field stays 0 in that
-    // case, with a one-time eprintln so users aren't silently misled.
-    let mut stage2_resolved_count: Option<u64> = None;
+    // Stats.missing_locations. When stage 2 is skipped (--start-stage
+    // >= 3) we fall back to the manifest-persisted resolved_count from
+    // a prior keep-scratch run, so resumes match fresh runs.
+    let mut stage2_resolved_count: Option<u64> = manifest_resolved_count;
 
     if start <= 2 {
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
@@ -319,6 +334,16 @@ pub fn external_join(
             stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &slot_buckets, slot_bucket_count, total_slots, unique_nodes, &coord_file_path)?;
         stage2_resolved_count = Some(resolved_count);
         slot_buckets.finish()?;
+        if keep_scratch {
+            // Extend the manifest with resolved_count so a future
+            // --start-stage >= 3 resume can populate
+            // Stats.missing_locations.
+            let mut buf = Vec::with_capacity(16);
+            buf.extend_from_slice(&total_slots.to_le_bytes());
+            buf.extend_from_slice(&resolved_count.to_le_bytes());
+            std::fs::write(&manifest_path, &buf)
+                .map_err(|e| format!("write manifest with resolved_count: {e}"))?;
+        }
         let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
             for worker_id in 0..num_shard_workers {
@@ -482,8 +507,10 @@ pub fn external_join(
         stats.missing_locations = total_slots.saturating_sub(resolved);
     } else {
         eprintln!(
-            "[altw] note: --start-stage skipped stage 2; \
-             Stats.missing_locations is not populated (left at 0)"
+            "[altw] note: --start-stage skipped stage 2 and the keep-scratch \
+             manifest predates the resolved_count extension; \
+             Stats.missing_locations left at 0. Re-run from stage 1 to \
+             populate it."
         );
     }
 

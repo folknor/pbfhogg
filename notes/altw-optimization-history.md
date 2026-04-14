@@ -198,6 +198,30 @@ into coord_slots would require either billions of 8-byte pwrites (pathological
 syscall cost) or 37 GB of in-memory scatter buffers. Rank order and slot order
 are unrelated — stage 3 exists precisely to bridge this gap with sequential I/O.
 
+**Stage 1B write batching (tried and reverted 2026-04-14, commit `e16674b`)**:
+Replaced per-ref `write_all(12 bytes)` to `BufWriter` with per-bucket blob-local
+byte staging (`Vec<Vec<u8>>` sized 256), one `write_all` per non-empty bucket
+per blob. Call count reduced 4.69B → 14.16M (-331×) as designed.
+
+| Metric (Europe) | Baseline `091fc5b` | Batched `e16674b` | Δ |
+|---|---|---|---|
+| `EXTJOIN_STAGE1` wall | 76,977 ms | 99,887 ms | **+22.9 s (+30%)** |
+| `s1b_shard_write_calls` | 4,690,095,140 | 14,158,764 | -331× |
+| `s1b_encode_write_ms` | 136,465 | 157,788 | +21.3 s |
+| `s1b_scan_ms` | 9,990 | 35,490 | +25.5 s |
+| `s1b_rank_ms` | 113,625 | 134,535 | +20.9 s |
+
+BufWriter (256 KB capacity) was already the right batching layer — each
+per-ref `write_all` was a cheap 12-byte memcpy into the buffer, not a syscall.
+The staging layer added an extra memcpy (ref → `bucket_staging[bucket]` →
+BufWriter) and scattered writes across 256 `Vec<u8>` tails per blob, thrashing
+L1/TLB. All CPU-bound counters regressed simultaneously — consistent with
+shared-resource contention, not write-call reduction. The TODO estimate
+(−6s wall) and multi-reviewer consensus (arch-claude, planet-claude,
+perf-codex) were both wrong because they extrapolated from cumulative
+`s1b_encode_write_ms` without accounting for BufWriter already amortizing
+the syscall cost.
+
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank
   space enables O(n) counting sort instead of O(n log n) comparison sort on

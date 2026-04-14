@@ -354,15 +354,33 @@ single-pass, tag expression and bbox filtering.
   arithmetic) but the recommended fix (pread) didn't help because it
   traded one I/O bottleneck for another.
 
-  **Still open — stage 1B write batching:**
+  **Stage 1B write batching — tried and reverted (2026-04-14):**
 
-  - [ ] **Batch rank record writes per way or per blob.** Currently
-    4.69B individual write_all calls (one per ref, 12 bytes each).
-    `s1b_encode_write_ms`=137s cumulative. Accumulate per-way (~10 refs)
-    or per-blob per-bucket records, write_all once per batch. Reduces
-    call count from 4.69B to ~453M (per-way) or ~5M (per-blob).
-    Estimated save: ~6s wall (87s → ~81s). (arch-claude, planet-claude,
-    perf-codex).
+  - [x] ~~Batch rank record writes per way or per blob.~~ Implemented
+    as per-bucket blob-local byte staging (`bucket_staging: Vec<Vec<u8>>`),
+    one `write_all` per non-empty bucket per blob. Reduced write_all
+    call count 4.69B → 14.16M (-331×) as designed, but **stage 1 wall
+    regressed +22.9s (76.977s → 99.887s, +30%) on Europe**, clean
+    same-day comparison (baseline UUID `4acf4ed8` commit `091fc5b`, test
+    UUID `4733d6b2` commit `e16674b`). Reverted.
+
+    **Why it didn't work:** `BufWriter` (256 KB capacity) was already
+    the right batching layer — each per-ref `write_all` was a cheap
+    12-byte memcpy into the buffer, not a syscall. The staging layer
+    added an extra memcpy (ref → `bucket_staging[bucket]` → BufWriter)
+    and scattered writes across 256 `Vec<u8>` tails per blob, thrashing
+    L1/TLB. Every CPU-bound counter regressed simultaneously:
+    `s1b_scan_ms` +25.5s, `s1b_rank_ms` +20.9s, `s1b_encode_write_ms`
+    +21.3s — consistent with shared-resource contention, not with the
+    intended write-call reduction.
+
+    **Lesson:** before batching on top of a buffered writer, confirm
+    the per-call cost is actually a bottleneck. The TODO estimate
+    (−6s wall) and multi-reviewer consensus (arch-claude, planet-claude,
+    perf-codex) were both wrong here because they extrapolated from
+    `s1b_encode_write_ms=137s cumulative` without accounting for
+    BufWriter already amortizing the syscall cost. Reviewers and call
+    counts don't prove a bottleneck; measurement does.
 
   - [ ] **Grouped-by-local-rank emission in stage 1B.** Workers sort or
     group output by local rank before flushing. Stage 2 counting sort

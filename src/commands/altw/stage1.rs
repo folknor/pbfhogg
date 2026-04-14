@@ -57,6 +57,7 @@ pub(super) fn stage1_way_pass(
     _direct_io: bool,
     scratch: &ScratchDir,
     ref_count_sidecar: &Path,
+    per_way_refcount_sidecar: &Path,
     coord_file_path: Option<&Path>,
 ) -> Result<(u64, u64, Vec<u64>, usize, IdSetDense)> {
     use std::os::unix::fs::FileExt as _;
@@ -90,9 +91,17 @@ pub(super) fn stage1_way_pass(
     let mut total_refs: u64 = 0;
 
     // Workers scan way refs and set bits in the shared IdSetDense.
-    // Consumer writes sidecar ref counts in blob order.
+    // Consumer writes two sidecars:
+    //   - ref_count_sidecar: per-blob total ref count (u64 LE, plus trailer).
+    //   - per_way_refcount_sidecar: per-blob varint stream
+    //     `[varint num_ways][varint rc0][varint rc1]...[varint rcN-1]`,
+    //     needed by the blob-ordered coord_payloads prototype.
+    let s1a_per_way_sidecar_bytes = std::sync::atomic::AtomicU64::new(0);
     {
-        type PassAItem = (u32, std::result::Result<u64, String>);
+        // Channel item carries (total_refs, per_way_refcounts). The per-way
+        // Vec is small (avg ~25K ways per blob at planet scale) so the
+        // allocation cost per blob is negligible vs the scan itself.
+        type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
         let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(32);
         let schedule_ref = &schedule;
         let next_ref = &next_idx;
@@ -103,6 +112,7 @@ pub(super) fn stage1_way_pass(
         let s1a_idset_ref = &s1a_idset_set_ms;
         let s1a_bytes_ref = &s1a_bytes_read;
         let s1a_pread_calls_ref = &s1a_pread_calls;
+        let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
 
         std::thread::scope(|scope| -> Result<()> {
             for _ in 0..num_workers {
@@ -120,7 +130,7 @@ pub(super) fn stage1_way_pass(
                         if idx >= schedule_ref.len() { break; }
                         let task = &schedule_ref[idx];
 
-                        let result: std::result::Result<u64, String> = (|| {
+                        let result: std::result::Result<(u64, Vec<u32>), String> = (|| {
                             let t0 = std::time::Instant::now();
                             read_buf.resize(task.data_size, 0);
                             file.read_exact_at(&mut read_buf, task.data_offset)
@@ -139,10 +149,13 @@ pub(super) fn stage1_way_pass(
                             // Phase 1: scan way refs (proto parsing only).
                             let t2 = std::time::Instant::now();
                             let mut blob_node_ids: Vec<i64> = Vec::new();
+                            let mut per_way_rcs: Vec<u32> = Vec::new();
                             super::super::way_scanner::scan_way_refs(
                                 &decompress_buf, &mut refs_buf, &mut group_starts,
                                 |_way_id, refs| {
                                     blob_node_ids.extend_from_slice(refs);
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    per_way_rcs.push(refs.len() as u32);
                                 },
                             ).map_err(|e| e.to_string())?;
                             #[allow(clippy::cast_possible_truncation)]
@@ -156,7 +169,7 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
-                            Ok(blob_node_ids.len() as u64)
+                            Ok((blob_node_ids.len() as u64, per_way_rcs))
                         })();
 
                         if tx.send((task.seq, result)).is_err() { break; }
@@ -165,26 +178,46 @@ pub(super) fn stage1_way_pass(
             }
             drop(tx);
 
-            // Consumer: write sidecar in blob order.
+            // Consumer: write both sidecars in blob order.
             let mut sidecar_writer = BufWriter::with_capacity(
                 64 * 1024,
                 std::fs::File::create(ref_count_sidecar)
                     .map_err(|e| format!("create sidecar: {e}"))?,
             );
+            let mut per_way_writer = BufWriter::with_capacity(
+                256 * 1024,
+                std::fs::File::create(per_way_refcount_sidecar)
+                    .map_err(|e| format!("create per-way sidecar: {e}"))?,
+            );
+            let mut varint_buf: Vec<u8> = Vec::with_capacity(1024);
             let mut reorder: crate::reorder_buffer::ReorderBuffer<
-                std::result::Result<u64, String>,
+                std::result::Result<(u64, Vec<u32>), String>,
             > = crate::reorder_buffer::ReorderBuffer::with_capacity(64);
 
             for (seq_num, item) in rx {
                 reorder.push(seq_num as usize, item);
                 while let Some(result) = reorder.pop_ready() {
-                    let ref_count = result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    let (ref_count, per_way_rcs) =
+                        result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                     sidecar_writer.write_all(&ref_count.to_le_bytes())?;
                     total_refs += ref_count;
+
+                    // Per-way sidecar: [varint num_ways][varint rc0][varint rc1]...
+                    varint_buf.clear();
+                    protohoggr::encode_varint(&mut varint_buf, per_way_rcs.len() as u64);
+                    for rc in &per_way_rcs {
+                        protohoggr::encode_varint(&mut varint_buf, u64::from(*rc));
+                    }
+                    per_way_writer.write_all(&varint_buf)?;
+                    s1a_per_way_bytes_ref.fetch_add(
+                        varint_buf.len() as u64,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                 }
             }
             sidecar_writer.write_all(&total_refs.to_le_bytes())?;
             sidecar_writer.flush()?;
+            per_way_writer.flush()?;
             Ok(())
         })?;
     }
@@ -206,6 +239,7 @@ pub(super) fn stage1_way_pass(
         crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_unique_nodes", unique_nodes as i64);
+        crate::debug::emit_counter("s1a_per_way_sidecar_bytes", s1a_per_way_sidecar_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 

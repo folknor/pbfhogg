@@ -382,44 +382,182 @@ single-pass, tag expression and bbox filtering.
     BufWriter already amortizing the syscall cost. Reviewers and call
     counts don't prove a bottleneck; measurement does.
 
+  **Stage 1B grouped-by-local-rank emission — analyzed 2026-04-14, not measured.**
+
+  > **Status: theoretical only.** No benchmark run. The analysis below
+  > is a desk design; estimates are from reasoning about memory sizing,
+  > cache access patterns, and counter cumulative values, not from
+  > measurement.
+
   - [ ] **Grouped-by-local-rank emission in stage 1B.** Workers sort or
-    group output by local rank before flushing. Stage 2 counting sort
-    becomes k-way merge or free. Second-best tier 1 item (perf-codex r1).
+    group output by local rank before flushing. Originally proposed by
+    perf-codex r1.
 
-  **Still open — fuse stages 2+3 (planet-claude sketch):**
+    **Naive version doesn't win.** Just reordering per-worker bucket
+    output requires buffering the whole bucket's records: `4.69B × 12B
+    / 6 workers / 256 buckets = 36 MB per bucket-worker × 256 buckets
+    = 9.2 GB per worker × 6 workers = 55 GB` — doesn't fit in 27 GB.
 
-  - [ ] **Fuse stage 2+3 via sort-then-coalesced-pwrite.** Each stage 2
-    worker resolves a rank bucket, sorts resolved entries by slot_pos,
-    coalesces consecutive entries into larger pwrites directly into the
-    coord_slots file. Eliminates slot bucket files + stage 3 I/O entirely.
-    With ~10 consecutive slots per way: 1.4M pwrite calls per bucket,
-    256 buckets / 4 workers = ~9s. Sort: radix sort 14M records × 16 bytes
-    = ~70ms/bucket, ~4.5s total. Estimated: 88s + 14s = ~102s vs current
-    88 + 51 = 139s. Saves ~37s + eliminates 75 GB temp disk.
-    (planet-claude). Higher complexity.
+    **Version that could win (segmented sort + k-way merge).** Each
+    worker buffers ~10 blobs' worth of bucket records (~920 MB/worker),
+    counting-sorts the in-memory segment by local_rank, flushes the
+    sorted segment. Stage 2 then does a k-way merge across 6×N sorted
+    streams per bucket instead of the random-scatter counting sort,
+    skipping `s2_prepare_scatter_ms` (11.7s wall) and maybe half of
+    `s2_prepare_count_ms` (4.2s) / `s2_prepare_prefix_ms` (2.6s).
 
-  **Still open — structural opportunities (fundamentally different coord
-  representation needed to break the stage 4 floor):**
+    **Desk estimate: ~9s wall saved** on Europe — but this is a theory
+    estimate, not benchmarked. Given the 2026-04-14 stage 1B batching
+    experiment measured a 30% *regression* where theory predicted a 6s
+    improvement, trust this number only after running it.
 
-  - [ ] **Postings-by-rank (CSR representation).** Replace flat
-    `(rank, slot_pos)` records with `offsets[rank] + slot_positions[...]`.
-    Stage 2 becomes trivial: load one coord, scatter to all slot positions
-    in its posting list. Eliminates counting-sort. Higher design risk.
-    (planet-codex r1).
-  - [ ] **Way-ordered payloads instead of flat coord_slots.** Produce
-    per-way-blob coordinate payloads directly. Stage 4 splices ready-made
-    location fields instead of per-ref lookups. Hard part: assembling
-    way-ordered payloads externally. (perf-codex r1). This is the only
-    approach that could break the stage 4 floor — it eliminates the
-    37 GB mmap entirely by producing coords in consumption order.
-  - [ ] **Blob-local rank batching in stage 4.** In assembly, extract
-    node IDs from way refs, compute ranks, gather coords from
-    coords_by_rank file, splice locations. Could collapse stages 1B+2+3
-    entirely. Risk: lookup locality. (planet-codex r1).
-  - [ ] **Collapse pass A + pass B into single way scan.** Only possible
-    with a staging model that doesn't need rank before emitting records.
-    Postings representation might enable this. (planet-claude r1,
-    planet-codex r1).
+    **Complexity: moderate-high.** New segmented on-disk format, k-way
+    merge in stage 2, bucket-buffer memory management across worker
+    blob processing.
+
+  **Stage 2+3 fuse via sort-then-coalesced-pwrite — analyzed 2026-04-14, rejected without measurement.**
+
+  > **Status: structurally rejected, not benchmarked.** The analysis
+  > below is desk math about coalescing ratios under rank-bucketed
+  > sorting. Measurement not pursued because the structural argument
+  > is decisive.
+
+  - [x] ~~Fuse stage 2+3 via sort-then-coalesced-pwrite.~~ Rejected.
+    Original sketch (planet-claude): each stage-2 worker sorts its
+    rank bucket's resolved entries by `slot_pos`, coalesces consecutive
+    entries into pwrites directly to coord_slots; estimate "1.4M pwrite
+    calls per bucket" → ~14s total.
+
+    **Why the estimate is structurally wrong:**
+
+    1. **Stage 3 already hits the pwrite floor** — 256 pwrites total,
+       one per slot bucket, each ~150 MB of a contiguous slot range.
+       That's the theoretical minimum for filling a 37.5 GB file via
+       positioned writes.
+
+    2. **Rank buckets don't preserve slot adjacency.** A rank bucket
+       has ~18M entries drawn from 4.69B total slot positions → average
+       gap between sorted `slot_pos` values ≈ **260 slots**. A way's
+       ~10 refs have consecutive `slot_pos` but different ranks (each
+       ref targets a different node), so they land in 10 different
+       rank buckets. A popular node (intersection) appears in one rank
+       bucket with many refs from scattered ways, also at scattered
+       `slot_pos`. Realistic coalescing ratio within a rank bucket: ~1×.
+
+    3. **Budget check.** Saving the 75 GB slot-bucket read (~37.5s at
+       2 GB/s) gives a fused-pwrite budget of ~40s wall ≈ 240M pwrites
+       across workers at ~1µs/pwrite. With realistic 1–1.5× coalescing,
+       the fuse would need **~3B+ pwrites** — 13× over budget.
+
+    Coalesced pwrite cannot beat stage 3's 256 consolidated pwrites
+    unless we break the rank-bucketing (which is what the counting-sort
+    architecture is built on).
+
+  **pwritev / scatter-gather write — evaluated 2026-04-14, not applicable.**
+
+  > **Status: theoretical evaluation, no implementation attempted.**
+
+  - [x] ~~pwritev into coord_slots.~~ Not applicable to current
+    architecture. `pwritev(fd, iovec[], offset)` does scatter-gather
+    from multiple source buffers into a single **contiguous** file
+    range starting at `offset`. Stage 3 already has one contiguous
+    150 MB buffer per bucket → `pwritev` reduces to `pwrite`. Would
+    only help a design that has many small discontinuous writes (i.e.,
+    the rejected sort-then-coalesce fuse).
+
+  **io_uring batched pwrites — evaluated 2026-04-14, filed as future option.**
+
+  > **Status: theoretical evaluation only.**
+
+  - [ ] **io_uring submission-queue-polled pwrites for stage 3 (or
+    fused stage 2+3).** With `IORING_SETUP_SQPOLL`, userspace writes
+    SQEs to the shared ring and a kernel thread submits them — zero
+    `io_uring_enter()` syscalls on the submit path. Companion flags
+    `IORING_SETUP_IOPOLL` (poll-mode completions, requires `O_DIRECT`),
+    `IORING_SETUP_DEFER_TASKRUN`, and registered buffers/files further
+    reduce per-op overhead. Relevant only for a design that legitimately
+    has many small pwrites; stage 3's current 256-pwrite floor does not
+    qualify. Low priority until a design surfaces that needs it.
+
+  **Stage 4 diagnostic finding — 2026-04-14, from 0330a9b sidecar data:**
+
+  > **Status: measurement-backed, not yet estimated.** The data below
+  > comes from the existing 0330a9b run (UUID `44135291`) which already
+  > split `s4_way_coord_read_ms` into pread I/O vs inner-loop copy.
+
+  Stage 4 coord work cost breakdown on Europe:
+
+  | Variant | `s4_coord_pread_ms` cumul | `s4_way_coord_read_ms` cumul | Combined wall | Stage 4 wall |
+  |---|---|---|---|---|
+  | Baseline mmap (`e151e5e8`) | n/a | 370,200 | ~62 s | 141 s |
+  | Per-blob pread (`44135291`) | 306,999 | 42,507 | 58 s (51 + 7) | 145 s |
+
+  **Implications:**
+
+  1. Inner-loop byte copy is already fast (7 s wall). The inner-loop
+     work pattern is NOT the bottleneck.
+  2. Pread I/O takes 51 s wall to read 37 GB at 6 concurrent streams
+     = **720 MB/s aggregate NVMe bandwidth**. That's the floor.
+  3. Mmap's 62 s ≈ pread's 58 s — same underlying I/O cost.
+  4. Mmap is 4 s *faster* overall (141 vs 145 s stage wall) because
+     async fault handling overlaps with worker-thread other work;
+     sync preads don't overlap as cleanly.
+  5. **The 141 s stage 4 floor is the NVMe sequential read cost for
+     37 GB across 6 workers. It's not mmap mechanics, not fault count,
+     not inner-loop work.**
+
+  This disproves the mental model behind "attack the stage 4 floor via
+  pread/way-ordered-payloads." Those designs rearrange bytes but don't
+  reduce bytes-read — they can't beat 720 MB/s × 37 GB.
+
+  **The only remaining lever: read fewer bytes.**
+
+  - [ ] **Delta-encoded varint coords in per-blob payload file
+    (option 1).** Replace flat 8-byte-per-slot coord_slots with
+    variable-length per-way delta-encoded varints. Typical way has refs
+    within ~1 km → deltas are small. Zigzag-varint of values < 16K
+    takes 2 bytes. Projected average: 2–3 bytes per ref vs 8 bytes =
+    3–4× size reduction. File size 37 GB → ~10–12 GB.
+    - Projected read time at 720 MB/s: 17 s wall (vs 51 s).
+    - Varint decode cost: ~7 s wall (4.69B × 2 decodes at 2 GB/s
+      decode × 6 workers).
+    - **Projected net save: ~27 s wall on stage 4.**
+    - Complexity: moderate. New on-disk format for coord_slots, new
+      decode path in stage 4 reframe, stage 2 output changes to
+      emit delta-encoded per-way.
+    - Risk: medium. Desk estimates today have been off by 5–10×, so
+      don't trust the 27 s projection without a Denmark-scale prototype.
+
+  - [ ] **Wire-format-ready payloads (option 2).** Stage 2 produces
+    the exact PBF wire bytes for lat/lon fields, so stage 4 only
+    splices bytes into the way blob's output.
+    - Eliminates `s4_way_delta_encode_ms` (52 s cumul = 8.5 s wall),
+      `s4_way_reassemble_ms` (30 s cumul = 5 s wall),
+      `s4_way_group_reframe_ms` (16 s cumul = 2.5 s wall).
+    - **Projected net save: ~8–10 s wall** (the savings are already
+      parallelized with I/O, so wall-time impact is sub-linear).
+    - Complexity: high. Stage 2 must know PBF wire format details
+      (packed sint32 varint encoding). Breaks separation of concerns.
+    - Probably not worth on its own.
+
+  - [ ] **Both combined (option 1 + option 2).** ~30–40 s wall save
+    on Europe. Stage 4: 141 → ~100–110 s. Europe total: 392 → ~350–360 s
+    (~10% total improvement). Planet: 1,075 → ~950–1,000 s.
+
+  **Decision: pending user direction.** The win is bounded at ~10%
+  total for a multi-day rewrite of stages 2–4. Reasonable either to
+  ship or defer.
+
+  **Permanently closed (rank-bucketing architecture makes these
+  structurally unachievable):**
+
+  - [x] ~~Postings-by-rank CSR representation.~~ Still rearranges
+    bytes, doesn't reduce bytes. Same NVMe-floor conclusion applies.
+  - [x] ~~Blob-local rank batching in stage 4.~~ Trades one mmap
+    (coord_slots, 37 GB) for another (coords_by_rank, 29 GB) plus
+    rank-lookup CPU cost. Strictly worse.
+  - [x] ~~Collapse pass A + pass B into single way scan.~~ Requires
+    postings-rep which we've now closed.
 
   **Still open — tuning:**
 
@@ -455,10 +593,10 @@ single-pass, tag expression and bbox filtering.
 
   **Correctness:**
 
-  - [ ] **`(0, 0)` sentinel in `CoordSlots::get` is a latent bug.** Conflates
-    "unresolved coord" with "coords happen to be (0°, 0°)." Should use
-    a separate resolved/unresolved flag or a sentinel outside the valid
-    coordinate range. (planet-codex).
+  - [x] ~~`(0, 0)` sentinel in `CoordSlots::get` conflates unresolved
+    with Null Island.~~ Accepted. (0°, 0°) is in the Atlantic; no real
+    OSM nodes have those exact decimicrodegrees. The collision is
+    theoretical, not observed.
 
 ### Ecosystem
 

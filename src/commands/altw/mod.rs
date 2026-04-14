@@ -146,6 +146,7 @@ pub fn external_join(
 
     let manifest_path = scratch_dir.file_path("manifest");
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
+    let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
     let coord_slots_path = scratch_dir.file_path("coord_slots");
     let coord_file_path = scratch_dir.file_path("coords_by_rank");
     let start = start_stage.unwrap_or(1);
@@ -237,7 +238,7 @@ pub fn external_join(
             crate::debug::emit_marker("EXTJOIN_STAGE1_START");
             let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
             let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
-                stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, Some(&coord_file_path))?;
+                stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, &per_way_refcount_sidecar, Some(&coord_file_path))?;
             let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
             let total_coo: u64 = rank_bucket_counts.iter().sum();
             #[allow(clippy::cast_possible_wrap)]

@@ -222,6 +222,91 @@ perf-codex) were both wrong because they extrapolated from cumulative
 `s1b_encode_write_ms` without accounting for BufWriter already amortizing
 the syscall cost.
 
+**Stage 2+3 fuse ideas evaluated 2026-04-14 (desk analysis only, not
+measured)**: after the stage 1B batching regression, three stage 2+3
+ideas were analyzed on paper and either rejected or downgraded. No
+benchmarks were run; the reasoning below is desk math about memory,
+coalescing ratios, and syscall primitives.
+
+1. **sort-then-coalesced-pwrite fuse** (`planet-claude` sketch) —
+   rejected structurally. Stage 3 already does 256 pwrites, each
+   150 MB, hitting the pwrite floor for a 37.5 GB positioned-write
+   output. A rank bucket holds ~18M entries drawn from 4.69B slot
+   positions → average gap 260 slots; a way's ~10 refs land in 10
+   different rank buckets, so within-bucket slot adjacency is near
+   zero. Realistic coalescing ratio ~1×, giving ~3B+ pwrites vs a
+   budget of ~240M. Cannot win under rank-bucketing.
+
+2. **grouped-by-local-rank emission in stage 1B** (`perf-codex` r1) —
+   deferred, design drafted but not implemented. Naive version requires
+   55 GB of per-worker per-bucket buffering (doesn't fit). Segmented
+   version (~10 blobs buffered per worker, local counting-sort, k-way
+   merge in stage 2) is feasible with ~920 MB/worker and estimated
+   ~9s wall savings by eliminating `s2_prepare_scatter_ms`. Estimate
+   is theoretical; given that the last stage-1B "improvement" theory
+   predicted −6s and measured +22.9s, this number is not trustworthy
+   without a run. Complexity is moderate-high.
+
+3. **pwritev scatter-gather** — not applicable. `pwritev` writes from
+   multiple source buffers into a **contiguous** file range; stage 3's
+   one contiguous 150 MB buffer per bucket degenerates to `pwrite`.
+   Would only help a design with many small discontinuous writes,
+   which is exactly the design #1 rejected for other reasons.
+
+4. **io_uring SQPOLL + registered buffers + IOPOLL** — filed as future
+   option. Only relevant for a design that legitimately has many small
+   pwrites. Stage 3's current 256-pwrite floor doesn't qualify. Noted
+   for completeness if a future structural change (e.g., way-ordered
+   payloads) changes the write pattern.
+
+**Meta-lesson:** desk estimates on this code path have been
+systematically optimistic. Both the stage 1B batching (measured: 30%
+regression vs −6s estimate) and the proposed fuse (desk analysis
+contradicts original sketch by an order of magnitude) suggest the
+bottleneck mental model for external_join is unreliable. Future
+estimates should be bounded by micro-benchmarks or skipped in favor
+of direct measurement on a small dataset.
+
+**Stage 4 bottleneck isolated 2026-04-14 — measurement-backed.**
+The 0330a9b per-blob-pread experiment already carried the diagnostic
+we needed. Its sidecar (UUID `44135291`) split `s4_way_coord_read_ms`
+into two counters:
+
+| Variant | `s4_coord_pread_ms` cumul | `s4_way_coord_read_ms` cumul | Combined wall | Stage 4 wall |
+|---|---|---|---|---|
+| mmap (`e151e5e8`) | n/a | 370,200 | ~62 s (fused) | 141 s |
+| pread (`44135291`) | 306,999 | 42,507 | 58 s (51 + 7) | 145 s |
+
+Interpretation:
+
+- Inner-loop byte copy: 7 s wall. Already cheap.
+- Pread I/O: 51 s wall for 37 GB = **720 MB/s aggregate**. 6 concurrent
+  workers on disjoint regions of a 37 GB file on consumer NVMe.
+- Mmap ≈ pread on total coord work (62 s vs 58 s). Mmap stage 4 wall
+  is 4 s better because async fault handling overlaps with worker
+  thread other work; sync preads don't.
+- **The 141 s stage 4 floor is NVMe sequential read cost for 37 GB
+  across 6 workers.** Not mmap mechanics, not fault count, not
+  inner-loop work.
+
+This closes the large family of "change the coord access mechanism"
+designs: per-blob pread, way-ordered payload layouts, postings-by-rank
+CSR, blob-local rank batching. None of these reduce bytes-read, so
+none can beat 720 MB/s × 37 GB ≈ 51 s I/O alone.
+
+**The only remaining lever is reading fewer bytes.** Two options
+sketched (not measured, ~10% total improvement ceiling):
+
+1. Delta-encoded varint coords (3–4× smaller file). Projected stage 4
+   save ~27 s wall. New on-disk format, new decode path in stage 4,
+   stage 2 emits per-way deltas.
+2. Wire-format-ready payloads (stage 4 splices bytes, no per-ref
+   encode/reassemble). Projected save ~8–10 s wall. Couples stage 2
+   to PBF wire format.
+
+Combined: Europe 392 → ~350–360 s; planet 1,075 → ~950–1,000 s.
+Reasonable to ship or defer.
+
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank
   space enables O(n) counting sort instead of O(n log n) comparison sort on

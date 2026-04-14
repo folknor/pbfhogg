@@ -97,6 +97,58 @@ pub(super) fn load_per_way_refcount_sidecar(
     Ok(result)
 }
 
+/// Delta-encode one blob's coord slice into `output`.
+///
+/// `coord_bytes.len() == 8 * sum(per_way_rcs)`. Within `coord_bytes`
+/// each 8-byte slot is `[i32 LE lat][i32 LE lon]`. For each way
+/// (refcount `rc` from `per_way_rcs`), consume `rc` consecutive slots
+/// and emit `2*rc` zigzag-varints into `output`: `lat_delta_0`,
+/// `lon_delta_0`, `lat_delta_1`, `lon_delta_1`, ... where
+/// `delta_0` is absolute (delta from 0), deltas reset per way.
+/// Bytes already in `output` are preserved; encoder appends.
+pub(super) fn encode_blob_payload(
+    coord_bytes: &[u8],
+    per_way_rcs: &[u32],
+    output: &mut Vec<u8>,
+) -> std::result::Result<(), String> {
+    let expected_bytes: u64 = per_way_rcs.iter().map(|&r| u64::from(r)).sum::<u64>() * 8;
+    if coord_bytes.len() as u64 != expected_bytes {
+        return Err(format!(
+            "coord_bytes length mismatch: got {} bytes, expected {} (8 * sum(per_way_rcs))",
+            coord_bytes.len(),
+            expected_bytes
+        ));
+    }
+    let mut cursor: usize = 0;
+    for &rc in per_way_rcs {
+        let mut last_lat: i32 = 0;
+        let mut last_lon: i32 = 0;
+        for _ in 0..rc {
+            let off = cursor;
+            cursor += COORD_SLOT_SIZE;
+            let lat = i32::from_le_bytes([
+                coord_bytes[off],
+                coord_bytes[off + 1],
+                coord_bytes[off + 2],
+                coord_bytes[off + 3],
+            ]);
+            let lon = i32::from_le_bytes([
+                coord_bytes[off + 4],
+                coord_bytes[off + 5],
+                coord_bytes[off + 6],
+                coord_bytes[off + 7],
+            ]);
+            let dlat = i64::from(lat) - i64::from(last_lat);
+            let dlon = i64::from(lon) - i64::from(last_lon);
+            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlat));
+            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlon));
+            last_lat = lat;
+            last_lon = lon;
+        }
+    }
+    Ok(())
+}
+
 /// Transform `coord_slots` → `coord_payloads`.
 ///
 /// `way_slot_starts[blob_idx]` is the starting slot position for way blob
@@ -207,43 +259,15 @@ pub(super) fn transform_coord_slots_to_payloads(
         }
         stats.read_ms += t_read.elapsed().as_millis() as u64;
 
-        let t_enc = std::time::Instant::now();
-        payload_buf.clear();
-        let mut cursor: usize = 0;
         for &rc in rcs {
-            let mut last_lat: i32 = 0;
-            let mut last_lon: i32 = 0;
-            for _ in 0..rc {
-                let off = cursor;
-                cursor += COORD_SLOT_SIZE;
-                let lat = i32::from_le_bytes([
-                    coord_buf[off],
-                    coord_buf[off + 1],
-                    coord_buf[off + 2],
-                    coord_buf[off + 3],
-                ]);
-                let lon = i32::from_le_bytes([
-                    coord_buf[off + 4],
-                    coord_buf[off + 5],
-                    coord_buf[off + 6],
-                    coord_buf[off + 7],
-                ]);
-                let dlat = i64::from(lat) - i64::from(last_lat);
-                let dlon = i64::from(lon) - i64::from(last_lon);
-                protohoggr::encode_varint(&mut payload_buf, protohoggr::zigzag_encode_64(dlat));
-                protohoggr::encode_varint(&mut payload_buf, protohoggr::zigzag_encode_64(dlon));
-                last_lat = lat;
-                last_lon = lon;
-            }
             stats.num_ways += 1;
             stats.num_refs += u64::from(rc);
         }
-        if cursor != coord_byte_len {
-            return Err(format!(
-                "blob {blob_idx} encoded {cursor} bytes from coord_buf of {coord_byte_len}"
-            )
-            .into());
-        }
+
+        let t_enc = std::time::Instant::now();
+        payload_buf.clear();
+        encode_blob_payload(&coord_buf, rcs, &mut payload_buf)
+            .map_err(|e| format!("blob {blob_idx}: {e}"))?;
         stats.encode_ms += t_enc.elapsed().as_millis() as u64;
 
         let t_wr = std::time::Instant::now();
@@ -369,5 +393,132 @@ impl CoordPayloadsReader {
                 .map_err(|e| format!("pread coord_payloads blob {blob_idx}: {e}"))?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // In tests we use .expect() liberally; clippy::unwrap_used covers .unwrap()
+    // but .expect() is always fine.
+
+    fn make_coord_bytes(coords: &[(i32, i32)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(coords.len() * 8);
+        for &(lat, lon) in coords {
+            buf.extend_from_slice(&lat.to_le_bytes());
+            buf.extend_from_slice(&lon.to_le_bytes());
+        }
+        buf
+    }
+
+    fn decode_zigzag_varints(data: &[u8], count: usize) -> Vec<i64> {
+        let mut cursor = protohoggr::Cursor::new(data);
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            let v = cursor.read_varint().expect("read varint");
+            out.push(protohoggr::zigzag_decode_64(v));
+        }
+        out
+    }
+
+    fn reconstruct_coords(output: &[u8], per_way_rcs: &[u32]) -> Vec<(i32, i32)> {
+        let total_refs: usize = per_way_rcs.iter().map(|&r| r as usize).sum();
+        let deltas = decode_zigzag_varints(output, total_refs * 2);
+        let mut result = Vec::with_capacity(total_refs);
+        let mut delta_idx = 0;
+        for &rc in per_way_rcs {
+            let mut last_lat: i64 = 0;
+            let mut last_lon: i64 = 0;
+            for _ in 0..rc {
+                let lat = last_lat + deltas[delta_idx];
+                let lon = last_lon + deltas[delta_idx + 1];
+                delta_idx += 2;
+                #[allow(clippy::cast_possible_truncation)]
+                result.push((lat as i32, lon as i32));
+                last_lat = lat;
+                last_lon = lon;
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn encode_blob_payload_single_way_single_ref() {
+        let coords = [(12345_i32, 67890_i32)];
+        let cb = make_coord_bytes(&coords);
+        let rcs = [1u32];
+        let mut out = Vec::new();
+        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+        let reconstructed = reconstruct_coords(&out, &rcs);
+        assert_eq!(reconstructed, coords);
+    }
+
+    #[test]
+    fn encode_blob_payload_single_way_multi_ref() {
+        let coords = [(100_i32, 200_i32), (150_i32, 250_i32), (90_i32, 180_i32)];
+        let cb = make_coord_bytes(&coords);
+        let rcs = [3u32];
+        let mut out = Vec::new();
+        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+        let reconstructed = reconstruct_coords(&out, &rcs);
+        assert_eq!(reconstructed, coords);
+    }
+
+    #[test]
+    fn encode_blob_payload_multiple_ways() {
+        // Three ways of 2/3/1 refs; deltas reset at way boundaries.
+        let coords = [
+            (10_i32, 20_i32), (30_i32, 40_i32),           // way 0
+            (500_i32, 600_i32), (510_i32, 610_i32), (490_i32, 590_i32), // way 1
+            (9999_i32, -9999_i32),                          // way 2
+        ];
+        let cb = make_coord_bytes(&coords);
+        let rcs = [2u32, 3u32, 1u32];
+        let mut out = Vec::new();
+        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+        let reconstructed = reconstruct_coords(&out, &rcs);
+        assert_eq!(reconstructed, coords);
+    }
+
+    #[test]
+    fn encode_blob_payload_empty_blob() {
+        let cb: Vec<u8> = Vec::new();
+        let rcs: &[u32] = &[];
+        let mut out = vec![0xAAu8, 0xBBu8];
+        encode_blob_payload(&cb, rcs, &mut out).expect("encode");
+        // Output unchanged — only the sentinel bytes we put in.
+        assert_eq!(out, [0xAAu8, 0xBBu8]);
+    }
+
+    #[test]
+    fn encode_blob_payload_zero_coords() {
+        let coords = [(0_i32, 0_i32), (0_i32, 0_i32)];
+        let cb = make_coord_bytes(&coords);
+        let rcs = [2u32];
+        let mut out = Vec::new();
+        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+        let reconstructed = reconstruct_coords(&out, &rcs);
+        assert_eq!(reconstructed, coords);
+    }
+
+    #[test]
+    fn encode_blob_payload_negative_coords() {
+        let coords = [(-1_000_000_i32, -1_000_000_i32), (0_i32, 0_i32)];
+        let cb = make_coord_bytes(&coords);
+        let rcs = [2u32];
+        let mut out = Vec::new();
+        encode_blob_payload(&cb, &rcs, &mut out).expect("encode");
+        let reconstructed = reconstruct_coords(&out, &rcs);
+        assert_eq!(reconstructed, coords);
+    }
+
+    #[test]
+    fn encode_blob_payload_length_mismatch() {
+        // per_way_rcs = [2] expects 16 bytes; we pass 15.
+        let cb = vec![0u8; 15];
+        let rcs = [2u32];
+        let result = encode_blob_payload(&cb, &rcs, &mut Vec::new());
+        assert!(result.is_err(), "expected Err for length mismatch");
     }
 }

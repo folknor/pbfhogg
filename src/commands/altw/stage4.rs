@@ -139,7 +139,7 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
-    coord_slots: &CoordSlots,
+    coord_slots: Option<&CoordSlots>,
     coord_payloads_reader: Option<&super::coord_payloads::CoordPayloadsReader>,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
@@ -605,7 +605,7 @@ fn assemble_block(
     block: &PrimitiveBlock,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlock>,
-    coord_slots: &CoordSlots,
+    coord_slots: Option<&CoordSlots>,
     mut way_slot_pos: u64,
     keep_untagged_nodes: bool,
     relation_member_node_ids: Option<&IdSetDense>,
@@ -654,7 +654,23 @@ fn assemble_block(
                 refs_buf.extend(w.refs());
                 locations_buf.clear();
                 for _node_id in refs_buf.iter() {
-                    match coord_slots.get(way_slot_pos) {
+                    // `require_indexdata` guarantees every blob has an index,
+                    // and sorted PBF confines ways to blobs indexed as Way
+                    // (which are routed through reframe_way_blob_with_locations).
+                    // So reaching this branch means the input violates one of
+                    // those invariants — e.g. a way inside a non-Way-indexed
+                    // blob. In the integrated default path coord_slots is None
+                    // and we'd have no source of truth for these coordinates;
+                    // silently emitting (0,0) would be a stealth regression, so
+                    // error out instead.
+                    let cs = coord_slots.ok_or_else(|| format!(
+                        "way {} appeared in a non-way-indexed blob; coord_slots \
+                         is unavailable in the default (integrated) path. Set \
+                         PBFHOGG_COORD_SLOTS=1 to fall back, or re-run with a \
+                         sorted + indexed PBF",
+                        w.id(),
+                    ))?;
+                    match cs.get(way_slot_pos) {
                         Some(loc) => locations_buf.push(loc),
                         None => {
                             stats.missing_locations += 1;
@@ -799,11 +815,14 @@ impl WayReframeScratch {
 /// (0,0) sentinel is accepted as a valid Null Island coordinate).
 ///
 /// When `coord_payload` is `None`, use the mmap path via `coord_slots`
+/// (`coord_slots` must be `Some` in that case — the caller's wiring guarantees
+/// this invariant because the escape-hatch supplies coord_slots and the default
+/// path supplies coord_payload).
 /// and track missing_locations via the `(0,0)` sentinel.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],
-    coord_slots: &CoordSlots,
+    coord_slots: Option<&CoordSlots>,
     coord_payload: Option<&[u8]>,
     mut way_slot_pos: u64,
     output: &mut Vec<u8>,
@@ -955,8 +974,11 @@ fn reframe_way_blob_with_locations(
                     scratch.coord_scratch.clear();
                     let mut way_missing: u64 = 0;
                     let mut way_present: u64 = 0;
+                    let cs = coord_slots.expect(
+                        "coord_slots required when no coord_payload (escape-hatch wiring invariant)"
+                    );
                     for _ in 0..ref_count {
-                        let (lat, lon) = match coord_slots.get(way_slot_pos) {
+                        let (lat, lon) = match cs.get(way_slot_pos) {
                             Some(loc) => {
                                 way_present += 1;
                                 loc

@@ -140,19 +140,12 @@ pub fn external_join(
         }
     }
 
-    let integrated_enabled = std::env::var("PBFHOGG_COORD_PAYLOADS_INTEGRATED")
+    // Default: integrated coord_payloads path (no coord_slots file produced).
+    // Escape hatch: PBFHOGG_COORD_SLOTS=1 reverts to the pre-integration path
+    // (coord_slots written by stage 3, read via mmap in stage 4).
+    let coord_slots_escape = std::env::var("PBFHOGG_COORD_SLOTS")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(false);
-    let prototype_enabled = std::env::var("PBFHOGG_COORD_PAYLOADS_PROTOTYPE")
-        .map(|v| v != "0" && !v.is_empty())
-        .unwrap_or(false);
-    if integrated_enabled && prototype_enabled {
-        return Err(
-            "PBFHOGG_COORD_PAYLOADS_INTEGRATED and PBFHOGG_COORD_PAYLOADS_PROTOTYPE \
-             are mutually exclusive"
-                .into(),
-        );
-    }
 
     let scratch_dir = if keep_scratch || start_stage.is_some() {
         ScratchDir::new_stable(output.parent().unwrap_or(Path::new(".")), "external-join")?
@@ -307,7 +300,7 @@ pub fn external_join(
         coord_payloads::PerWayRcs,                                      // per_way_rcs
         Vec<std::path::PathBuf>,                                        // worker_tmp_paths
         Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>>,  // straddler_slots
-    )> = if integrated_enabled && start <= 3 {
+    )> = if !coord_slots_escape && start <= 3 {
         let way_slot_starts =
             stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
         let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_flat(
@@ -423,20 +416,13 @@ pub fn external_join(
                 finalize_stats.num_way_blobs,
             );
         }
-    } else if integrated_enabled {
-        // start >= 4 with integrated: coord_payloads must already exist.
-        if coord_slots_path.exists() && !coord_payloads_path.exists() {
-            return Err(format!(
-                "coord_slots present but coord_payloads missing — stale pre-integrated scratch; \
-                 re-run from earlier stage"
-            )
-            .into());
-        }
+    } else if !coord_slots_escape {
+        // start >= 4, default integrated path: coord_payloads must already exist.
         if !coord_payloads_path.exists() {
             return Err(format!(
-                "integrated mode with --start-stage {start} requires existing coord_payloads \
-                 in scratch; prior run must have used PBFHOGG_COORD_PAYLOADS_INTEGRATED=1 \
-                 with --keep-scratch"
+                "default (integrated) path with --start-stage {start} requires existing \
+                 coord_payloads in scratch; run from an earlier stage, or set \
+                 PBFHOGG_COORD_SLOTS=1 to use the pre-integration escape hatch"
             )
             .into());
         }
@@ -450,33 +436,9 @@ pub fn external_join(
         )?)
     };
 
-    let coord_payloads_reader = if prototype_enabled {
-        let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
-        let stats = coord_payloads::transform_coord_slots_to_payloads(
-            &coord_slots_path,
-            &per_way_refcount_sidecar,
-            &coord_payloads_path,
-            &way_slot_starts,
-            total_slots,
-        )?;
-        #[allow(clippy::cast_precision_loss)]
-        let ratio = if stats.output_bytes == 0 {
-            0.0
-        } else {
-            stats.input_bytes as f64 / stats.output_bytes as f64
-        };
-        eprintln!(
-            "[coord_payloads] transform {} ms, input {} MB → output {} MB, ratio {:.2}×",
-            stats.transform_ms,
-            stats.input_bytes / 1_000_000,
-            stats.output_bytes / 1_000_000,
-            ratio,
-        );
-        Some(coord_payloads::CoordPayloadsReader::open(
-            &coord_payloads_path,
-            way_slot_starts.len(),
-        )?)
-    } else if integrated_enabled {
+    // Default path: open CoordPayloadsReader; no CoordSlots.
+    // Escape-hatch path: open CoordSlots; no CoordPayloadsReader.
+    let coord_payloads_reader = if !coord_slots_escape {
         let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
         Some(coord_payloads::CoordPayloadsReader::open(
             &coord_payloads_path,
@@ -486,13 +448,18 @@ pub fn external_join(
         None
     };
 
+    let coord_slots = if coord_slots_escape {
+        Some(CoordSlots::open(&coord_slots_path, total_slots)?)
+    } else {
+        None
+    };
+
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
-    let coord_slots = CoordSlots::open(&coord_slots_path, total_slots)?;
     let stats = stage4_assembly(
         input,
         output,
-        &coord_slots,
+        coord_slots.as_ref(),
         coord_payloads_reader.as_ref(),
         keep_untagged_nodes,
         relation_member_node_ids.as_ref(),

@@ -83,17 +83,28 @@ pub(super) fn stage3_slot_reorder(
 ) -> Result<Option<IntegratedResult>> {
     use std::os::unix::fs::FileExt as _;
 
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(coord_slots_path)
-        .map_err(|e| format!("create coord_slots: {e}"))?;
-    let total_bytes = total_slots * COORD_SLOT_SIZE as u64;
-    file.set_len(total_bytes)
-        .map_err(|e| format!("ftruncate coord_slots to {total_bytes}: {e}"))?;
-    let shared_file = std::sync::Arc::new(file);
+    // Escape-hatch path: create and pre-allocate coord_slots.
+    // Integrated path: coord_slots is not written; the file is never created.
+    let shared_file: std::sync::Arc<std::fs::File> = if integrated.is_none() {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(coord_slots_path)
+            .map_err(|e| format!("create coord_slots: {e}"))?;
+        let total_bytes = total_slots * COORD_SLOT_SIZE as u64;
+        file.set_len(total_bytes)
+            .map_err(|e| format!("ftruncate coord_slots to {total_bytes}: {e}"))?;
+        std::sync::Arc::new(file)
+    } else {
+        // Dummy file handle: open /dev/null so the Arc<File> type is
+        // satisfied. Workers in integrated mode never call write_all_at.
+        std::sync::Arc::new(
+            std::fs::File::open("/dev/null")
+                .map_err(|e| format!("open /dev/null for integrated stage 3: {e}"))?,
+        )
+    };
 
     let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
 
@@ -275,13 +286,18 @@ pub(super) fn stage3_slot_reorder(
                         s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
                         s3_scatter_stores_ref.fetch_add(entries.len() as u64, Relaxed);
 
-                        let t_write = std::time::Instant::now();
-                        let file_offset = bucket_start * COORD_SLOT_SIZE as u64;
-                        file.write_all_at(&scatter_buf, file_offset)
-                            .map_err(|e| format!("pwrite coord_slots: {e}"))?;
-                        s3_write_ref.fetch_add(t_write.elapsed().as_millis() as u64, Relaxed);
-                        s3_bytes_written_ref.fetch_add(scatter_buf.len() as u64, Relaxed);
-                        s3_pwrite_calls_ref.fetch_add(1, Relaxed);
+                        // Escape-hatch path: pwrite scatter_buf to coord_slots.
+                        // Integrated path: scatter_buf is built in RAM as input to
+                        // emit_integrated_intersections; no coord_slots file is written.
+                        if ctx_ref.is_none() {
+                            let t_write = std::time::Instant::now();
+                            let file_offset = bucket_start * COORD_SLOT_SIZE as u64;
+                            file.write_all_at(&scatter_buf, file_offset)
+                                .map_err(|e| format!("pwrite coord_slots: {e}"))?;
+                            s3_write_ref.fetch_add(t_write.elapsed().as_millis() as u64, Relaxed);
+                            s3_bytes_written_ref.fetch_add(scatter_buf.len() as u64, Relaxed);
+                            s3_pwrite_calls_ref.fetch_add(1, Relaxed);
+                        }
 
                         // Track max live buffer bytes for this worker.
                         {
@@ -378,8 +394,11 @@ pub(super) fn stage3_slot_reorder(
         crate::debug::emit_marker("EXTJOIN_STAGE3_INTEGRATED_END");
     }
 
-    shared_file.sync_data()
-        .map_err(|e| format!("sync coord_slots: {e}"))?;
+    // Only sync coord_slots in escape-hatch mode; integrated mode never writes it.
+    if !is_integrated {
+        shared_file.sync_data()
+            .map_err(|e| format!("sync coord_slots: {e}"))?;
+    }
 
     #[allow(clippy::cast_possible_wrap)]
     {

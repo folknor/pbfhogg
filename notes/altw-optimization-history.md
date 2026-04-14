@@ -383,84 +383,90 @@ same-day regression lesson.
    wire-format-ready payloads.
 5. Best-case integrated win is ~8% on planet, not ~15%.
 
-**Resolved 2026-04-14: integrate despite wall-time parity.** After
-walking the architectural option table (dense, sparse,
-LocationsOnWays input, streaming, spatial partition, chunk-parallel,
-hybrid), coord_payloads is the only candidate that is measured,
-credible, and uncontested under the (27 GB RAM, consumer NVMe,
-standard-format PBF) envelope. The rank-bucketed external join is
-the local architectural optimum; this is the last remaining
-incremental direction inside that architecture.
+**Resolved 2026-04-14: integrated as default.** After walking the
+architectural option table (dense, sparse, LocationsOnWays input,
+streaming, spatial partition, chunk-parallel, hybrid), coord_payloads
+was the only candidate that was measured, credible, and uncontested
+under the (27 GB RAM, consumer NVMe, standard-format PBF) envelope.
+Rank-bucketed external join is the local architectural optimum;
+coord_payloads is the last remaining incremental direction inside
+that architecture.
 
-**Integrated implementation measurement (2026-04-14, commits
-`77490b7` / `c96566f` / `c12a642`).**
+**Shipping measurement (commit `3d977a0`).**
 
-Europe bench (UUID `237c7e81`, commit `c12a642`) with
-`PBFHOGG_COORD_PAYLOADS_INTEGRATED=1`:
+Final integrated-as-default results on plantasjen, same-day baseline
+comparisons:
 
-| | Baseline `e151e5e8` | Prototype `99f6b8bc` | Integrated `237c7e81` |
+| | Baseline | Integrated default | Δ |
 |---|---|---|---|
-| Total wall | 392.7 s | 465 s | **429 s** |
-| Stage 1 | 81 s | 94 s | 80 s |
-| Stage 2 | 87 s | 88 s | 87 s |
-| Stage 3 | 51 s | 52 s | 64 s |
-| Transform/Finalize | — | 65 s | 27 s |
-| Stage 4 | 141 s | 130 s | 132 s |
+| Europe `e151e5e8` / `768d3d4e` | 392.7 s | **400 s** | **+7 s (+1.8%)** |
+| Planet `b55b5605` / `c021dd91` | 982 s | **953 s** | **−29 s (−3.0%)** |
+
+Planet scale delivered an unexpected wall-time *win*, not just parity.
+Reason: at planet scale the 99 GB coord_slots mmap thrashes harder
+than at Europe (37 GB), so eliminating it gives back real wall time
+on top of the CPU and I/O wins.
+
+**Europe stage breakdown (UUID `768d3d4e`, commit `3d977a0`):**
+
+| Stage | Baseline | Integrated | Δ |
+|---|---|---|---|
+| Stage 1 | 81 s | 79 s | −2 s |
+| Stage 2 | 87 s | 90 s | +3 s |
+| Stage 3 | 51 s | 42.5 s | **−8.5 s** (no coord_slots pwrite) |
+| Finalize | — | 26.5 s | +26.5 s (new) |
+| Stage 4 | 141 s | 129 s | **−12 s** (smaller coord read, no delta-encode) |
+
+**Planet stage breakdown (UUID `c021dd91`, commit `3d977a0`):**
+
+| Stage | Baseline | Integrated | Δ |
+|---|---|---|---|
+| Stage 1 | 231 s | 232 s | +1 s |
+| Stage 2 | 235 s | 212 s | −23 s |
+| Stage 3 | 154 s | 108 s | **−46 s** (no coord_slots pwrite) |
+| Finalize | — | 68 s | +68 s (new) |
+| Stage 4 | 291 s | 259 s | **−32 s** |
+
+**Non-wall-time benefits (all measured on planet, UUID `c021dd91`):**
+
+| Metric | Baseline planet | Integrated planet | Δ |
+|---|---|---|---|
+| coord_slots file | 99 GB | 0 (not created) | eliminated |
+| coord_payloads file | — | 54.8 GB | (replaces coord_slots) |
+| Scratch peak | ~300 GB | ~256 GB | **−44 GB** |
+| `s3_bytes_written` (coord_slots pwrite) | 99 GB | 0 | eliminated |
+| `s4_majflt_delta` | 555,141 | 3,256 | **−99.4%** |
+| `s4_minflt_delta` | 3,170,288 | 1,026,905 | −68% |
+| `s4_way_delta_encode_ms` cumul | 68,582 | 0 | eliminated |
+| Stage 4 mmap virtual | 99 GB | — | eliminated |
+
+The 99 GB coord_slots mmap across 6 workers was the dominant cause
+of cross-workload page-cache disruption in the baseline; integrated
+replaces it with bounded per-blob preads into ~6 MB worker buffers.
+Stage 4's major-fault count dropped by two orders of magnitude.
 
 **Verification**: `brokkr verify add-locations-to-ways --dataset
-denmark --mode external` with and without
-`PBFHOGG_COORD_PAYLOADS_INTEGRATED=1` produce **bit-identical verify
-logs** — integrated path output matches baseline external path
-byte-for-byte. (Both exhibit a pre-existing pbfhogg-vs-osmium diff,
-unrelated to this change.)
+denmark --mode external` with and without `PBFHOGG_COORD_SLOTS=1`
+(the escape hatch) produce bit-identical verify logs — integrated
+default and pre-integration paths yield byte-for-byte identical
+output PBFs.
 
-**Honest wall-time reality**: integrated Europe is +37 s (+9%) vs
-baseline, not the −5% I projected. Finalize costs ~27 s sequential
-NVMe write; stage 4's coord-read saves ~9 s wall (not the ~20 s
-projected). Stage 5 (dropping coord_slots pwrite) may recover
-~5–15 s on Europe and ~20–30 s on planet, bringing planet roughly to
-parity with baseline (~970–1020 s vs 982 s baseline).
+**Ship structure (commits):**
 
-**The real rationale: non-wall-time benefits.**
+1. `77490b7` — extract per-blob delta-encode helper (Stage 1 of plan).
+2. `c96566f` — blob↔slot-bucket classification helper (Stage 2).
+3. `c12a642` — dual-emit stage 3 + finalize pass behind
+   `PBFHOGG_COORD_PAYLOADS_INTEGRATED=1` env var (Stage 3).
+4. `3d977a0` — default flip to integrated, remove prototype transform
+   and `PBFHOGG_COORD_PAYLOADS_INTEGRATED` / `PBFHOGG_COORD_PAYLOADS_PROTOTYPE`
+   env vars, add `PBFHOGG_COORD_SLOTS=1` pre-integration escape hatch
+   (Stage 5).
 
-| Metric | Baseline planet | Integrated (fully developed) | Δ |
-|---|---|---|---|
-| Scratch peak | ~300 GB | ~256 GB (`coord_slots` → `coord_payloads` = 99→55 GB) | **−44 GB** |
-| Total disk writes | ~680 GB | ~636 GB | −44 GB |
-| Total disk reads | ~711 GB | ~667 GB | −44 GB |
-| Stage 4 major faults | 555,141 | ~0 | −100% |
-| Stage 4 mmap virtual | 99 GB | 0 | eliminated |
-| Stage 4 delta-encode CPU | ~68 s cumul | 0 | eliminated |
-
-Even at wall-time parity, the memory-pressure and scratch-footprint
-gains are real product improvements. The 99 GB coord_slots mmap
-across 6 workers is the dominant cause of cross-workload page-cache
-disruption in the baseline; integrated replaces that with bounded
-per-blob preads into ~6 MB worker buffers.
-
-**The bet behind integration:** after the cleaner memory profile +
-absence of mmap thrashing + freed stage-4 CPU land, fresh
-optimization opportunities will surface (io_uring on pread-only
-paths becomes newly attractive, for example; stage 4 worker-count
-tuning changes meaning without the mmap fault storm; compression
-knobs on coord_payloads open up). The explicit wager is that these
-second-order wins restore wall-time parity or better within a
-follow-up cycle.
-
-**Integration plan** (see TODO.md for the current spec):
-
-- Stage 3 per-bucket processing gains a post-scatter step that
-  delta-encodes fully-contained blobs into worker-local temp files
-  and stashes raw slot bytes for straddler blobs. After the barrier,
-  a sequential finalization pass writes coord_payloads in blob order.
-- Worst-case straddler staging: ~1.5 GB on planet. Fits.
-- A-B gated by `PBFHOGG_COORD_PAYLOADS_INTEGRATED=1` env var
-  (stages 3–4 of plan); Stage 5 flips default and drops the
-  prototype transform; Stage 6 drops coord_slots production entirely.
-- Correctness validated via `brokkr verify --mode external` with and
-  without the env var producing identical logs. SHA256 byte-equality
-  is prevented by brokkr's post-run cleanup of the output PBF, but
-  `brokkr verify`'s diff against osmium serves as the semantic check.
+**Stage 6 (conditional cleanup, pending stability window):** drop the
+`PBFHOGG_COORD_SLOTS=1` escape hatch, replace the `/dev/null` dummy
+`Arc<File>` in stage 3 with a proper `Option<Arc<File>>`, rename the
+`EXTJOIN_STAGE3_INTEGRATED_*` markers, remove the `CoordSlots`
+external path entirely.
 
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank

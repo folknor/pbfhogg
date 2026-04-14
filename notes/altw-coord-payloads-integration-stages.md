@@ -1,21 +1,30 @@
 # coord_payloads integration — staged implementation plan
 
+**Status: shipped 2026-04-14.** Stages 1-5 landed at commits
+`77490b7` → `c96566f` → `c12a642` → `3d977a0`. Final measurements:
+Europe 392 s → 400 s (+1.8%), planet 982 s → 953 s (**−3%**), plus
+−44 GB scratch peak and −99.4% stage-4 major page faults. See
+`notes/altw-optimization-history.md` "Resolved 2026-04-14" for the
+complete measurement table.
+
+Stage 6 (conditional cleanup) is still open — see TODO.md.
+
+The historical plan follows. Each stage was a self-contained task
+ending in one commit; main conversation reviewed between stages.
+**Subagent did NOT build, test, commit, bench, or run any shell
+commands — code changes only.**
+
+---
+
 Target: replace `coord_slots` (99 GB at planet, flat 8B-per-slot) with
 `coord_payloads` (~55 GB at planet, per-way delta-varint, per-blob
 offset-indexed) in the `external_join` ALTW pipeline.
 
-Measured savings (see `notes/altw-optimization-history.md`): planet
-982 s → ~900 s (−8%), scratch ~300 GB → ~256 GB.
-
-Prototype in-tree at commits `a13a6a8` / `e9e1d77` / `7738642` defines
-the format, the stage-4 reader (`CoordPayloadsReader`), and a
-throwaway transform pass (`transform_coord_slots_to_payloads`). This
-plan integrates the coord_payloads emission into stage 3 and retires
-the prototype transform.
-
-Each stage below is a self-contained task ending in one commit. Main
-conversation reviews between stages. **Subagent must NOT build, test,
-commit, bench, or run any shell commands — code changes only.**
+Prototype in-tree at commits `a13a6a8` / `e9e1d77` / `7738642`
+defined the format, the stage-4 reader (`CoordPayloadsReader`), and
+a throwaway transform pass (`transform_coord_slots_to_payloads`).
+This plan integrated the coord_payloads emission into stage 3 and
+retired the prototype transform.
 
 ---
 

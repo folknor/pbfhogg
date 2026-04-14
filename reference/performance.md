@@ -163,8 +163,8 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 |---------|-------|--------|----------|--------|
 | Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
 | Japan (2.4 GB) | **42s** | — | — | `b3e8bf7` (node scanner) |
-| Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **577s (9.6m)** | `6b09796` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | **1,075s (17.9 min)**, 8.7 GB peak anon | `abcc736` |
+| Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **400s (6.7 min)** | `3d977a0` |
+| Planet (87.7 GB) | 5,773s (96m)* | — | **953s (15.9 min)**, 8.7 GB peak anon | `3d977a0` |
 
 *Dense at Europe scale thrashes on 30 GB host (mmap working set ~16 GB > available
 RAM). Japan 42s is with node-only scanner for pass 1 (commit `b3e8bf7`, previously
@@ -179,37 +179,52 @@ scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
-(33.6 GB, external 2.8x faster). At Europe scale, dense's mmap working set
+(33.6 GB, external 7.4x faster). At Europe scale, dense's mmap working set
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
 I/O stays bounded.
 
-### External join stage breakdown (Europe, commit `6b09796`, plantasjen)
+### External join stage breakdown (Europe, commit `3d977a0`, plantasjen)
 
 | Stage | Time | RSS (anon) | Description |
 |-------|------|-----------|-------------|
-| Stage 1 (way pass) | 81s | 69 MB post | Pipelined reader + BufWriter buckets |
-| Stage 2 (node join) | 216s | 69 MB post | Node-only sequential scanner + merge-join |
-| Stage 3 (slot reorder) | 78s | 69 MB post | Scatter buffer (was 1079s with pwrite) |
-| Stage 4 (assembly) | 136s | 1.6 GB flat | Sequential reader + batch parallel assembly |
-| **Total** | **577s** | | With `--compression none`: ~754s |
+| Stage 1 (way pass) | 79s | 3.6 GB peak | Pass A (per-way refcount sidecar) + pass B (rank records) + coord pass |
+| Stage 2 (node join) | 90s | 7.1 GB peak | Parallel counting-sort per rank bucket, coord slice pread |
+| Stage 3 (slot reorder) | 42.5s | 7.8 GB peak | Delta-varint encodes per-blob coord_payloads; no coord_slots written |
+| Finalize | 26.5s | 7.9 GB peak | Sequential concat of worker temps + encoded straddlers |
+| Stage 4 (assembly) | 129s | 3.1 GB peak | Per-blob pread of coord_payloads; de-interleave into PBF wire format |
+| **Total** | **400s** | | |
 
 ### External join optimization history
 
-| Version | Denmark | Europe | Commit |
-|---------|---------|--------|--------|
-| Original (256x re-read) | 302s | — | `034422c` |
-| Single-pass merge | 25s | 2,060s | `a334c72` |
-| + fadvise + mmap coord_slots | 22s | 1,824s | `165cbb2` |
-| Node-only scanner + scatter buffer | 14s | 921s | `ee9b19f` |
-| + blob skip + pool reuse | 14s | ~901s | `d272b49` |
+| Version | Denmark | Europe | Planet | Commit |
+|---------|---------|--------|--------|--------|
+| Original (256x re-read) | 302s | — | — | `034422c` |
+| Single-pass merge | 25s | 2,060s | — | `a334c72` |
+| + fadvise + mmap coord_slots | 22s | 1,824s | — | `165cbb2` |
+| Node-only scanner + scatter buffer | 14s | 921s | — | `ee9b19f` |
+| + blob skip + pool reuse | 14s | ~901s | — | `d272b49` |
+| P2b/P2c parallel assembly | — | 608s | — | `6b09796` |
+| External radix permutation (full) | 14s | 422s | 1,462s | `b0a5fb8` |
+| Stage 1B overlap + misc | — | 392s | 1,075s | `091fc5b` |
+| **coord_payloads integrated** | **7.4s** | **400s** | **953s** | **`3d977a0`** |
 
-Key optimizations: node-only wire scanner (bypasses PrimitiveBlock, eliminates
-25 GB heap retention), scatter buffer (eliminates sort + 4.69B pwrite calls,
-15x speedup), BlobReader fadvise(DONTNEED) (general infrastructure), deferred
-IdSetDense, buffer reuse in bucket loads.
+The coord_payloads integration (2026-04-14) was pursued primarily for
+non-wall benefits. Planet measured −29 s wall as a pleasant surprise;
+Europe +7 s. The structural wins are: scratch peak 300 GB → 256 GB
+(−44 GB), stage-4 major faults 555K → 3.2K (−99.4%), stage-4
+delta-encode CPU 68 s cumulative → 0, no more 99 GB `coord_slots`
+mmap thrashing across 6 workers. See
+[altw-coord-payloads-integration-stages.md](../notes/altw-coord-payloads-integration-stages.md)
+for the staged plan.
 
-See [altw-optimization-history.md](altw-optimization-history.md) for the
-full investigation and memory optimization research log.
+Key earlier optimizations: node-only wire scanner (bypasses
+PrimitiveBlock, eliminates 25 GB heap retention), scatter buffer
+(eliminates sort + 4.69B pwrite calls, 15x speedup), BlobReader
+fadvise(DONTNEED) (general infrastructure), deferred IdSetDense,
+buffer reuse in bucket loads.
+
+See [altw-optimization-history.md](../notes/altw-optimization-history.md)
+for the full investigation and memory optimization research log.
 
 ## CLI commands
 
@@ -239,7 +254,7 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | extract --complete | 2.40s |
 | tags-filter two-pass | 2.62s |
 | extract --smart | 2.65s |
-| add-locations-to-ways | 5.59s |
+| add-locations-to-ways (external) | 7.4s |
 | check --refs | 6.83s |
 | time-filter | 9.39s |
 | cat --dedupe | 22.4s |
@@ -510,21 +525,21 @@ Full journey: 366.7s → 107.5s (3.4x total improvement).
 Bootstrap (one-time): `cat` → `add-locations-to-ways` → enriched PBF.
 Steady state: `apply-changes --locations-on-ways` (daily diffs).
 
-### Planet bootstrap (plantasjen, commit `69a127f`)
+### Planet bootstrap (plantasjen, commit `3d977a0`)
 
 | Step | Time | Output |
 |------|------|--------|
 | cat (indexdata generation) | 497s (8m) | 87.7 GB |
-| add-locations-to-ways | 5773s (96m) | 88.4 GB |
-| **Total bootstrap** | **~104m** | — |
+| add-locations-to-ways (external) | 953s (15.9m) | 88.4 GB |
+| **Total bootstrap** | **~24m** | — |
 
-### Europe bootstrap (plantasjen, commit `69a127f`)
+### Europe bootstrap (plantasjen, commit `3d977a0`)
 
 | Step | Time | Output |
 |------|------|--------|
 | cat (indexdata, `--type` filtered) | 112s | 33.6 GB |
-| add-locations-to-ways | 2565s (43m) | — |
-| **Total bootstrap** | **~45m** | — |
+| add-locations-to-ways (external) | 400s (6.7m) | — |
+| **Total bootstrap** | **~8.5m** | — |
 
 ## build-geocode-index
 

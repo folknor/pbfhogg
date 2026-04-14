@@ -557,104 +557,60 @@ single-pass, tag expression and bbox filtering.
   the ~15% I projected when assuming 3–4× compression, ~10% better
   than my worst-case "±0%" prediction of a risky redesign.
 
-  **Decision (2026-04-14): integrate despite measured wall-time
-  parity/slight regression.** The wall-time argument turned out
-  weaker than the prototype suggested, but the non-wall benefits make
-  this the right move regardless.
+  **Shipped 2026-04-14 (commits `77490b7` → `3d977a0`): integrated
+  coord_payloads as the default external path.** Better than the
+  "parity" pessimism — planet gained a measured wall-time win.
 
-  **Integrated Europe bench (UUID `237c7e81`, commit `c12a642`):**
-  429 s wall vs baseline 392.7 s (`e151e5e8`). That's +37 s (+9%).
-  Projected planet: roughly 982 s → ~1000-1050 s under dual-emit;
-  Stage 5 (drop coord_slots pwrite) may recover ~20-30 s bringing
-  planet to ~970-1020 s — **parity with baseline within measurement
-  noise, possibly a small regression**.
+  **Final measurements (commit `3d977a0`):**
 
-  **Non-wall-time benefits (the real rationale for integration):**
-
-  | Metric | Baseline planet | Integrated (fully developed) | Δ |
+  | | Baseline | Integrated | Δ |
   |---|---|---|---|
-  | Scratch peak | ~300 GB (99 GB `coord_slots` dominant) | ~256 GB (55 GB `coord_payloads`) | **−44 GB (−15%)** |
-  | Total disk writes | ~680 GB | ~636 GB | −44 GB |
-  | Total disk reads | ~711 GB | ~667 GB | −44 GB |
-  | Stage 4 major faults | 555,141 | ~0 (bounded per-blob preads) | **−100%** |
-  | Stage 4 minor faults | 3,170,288 | small (worker buffer reuse) | ≈−95% |
-  | Stage 4 mmap virtual | **99 GB** (cross-worker thrash) | — (no mmap) | eliminated |
-  | Stage 4 delta-encode CPU | ~68 s cumulative | 0 | eliminated |
-  | Concurrent-workload friendliness | poor (page-cache storm) | good | qualitative win |
+  | Europe `768d3d4e` | 392.7 s (`e151e5e8`) | **400 s** | **+7 s (+1.8%)** |
+  | Planet `c021dd91` | 982 s (`b55b5605`) | **953 s** | **−29 s (−3.0%)** |
 
-  **The bet:** once the integration is complete and we take a fresh
-  look, new optimization opportunities — enabled by the cleaner
-  memory profile, the absence of mmap thrashing, and the freed CPU —
-  will surface and should at minimum restore wall-time parity.
+  **Non-wall benefits (all measured on planet):**
 
-  - [ ] **Integrate blob-ordered coord_payloads into stage 3.**
-    Prototype answered the design questions; integration is the
-    measured-reality follow-through. Scope is ~1 week including A-B
-    validation. Wall-time target is **parity with baseline ± a few
-    percent**, not a speedup.
+  | Metric | Baseline planet | Integrated planet | Δ |
+  |---|---|---|---|
+  | coord_slots file | 99 GB | 0 (not created) | eliminated |
+  | coord_payloads file | — | 54.8 GB | (replaces coord_slots) |
+  | Scratch peak | ~300 GB | ~256 GB | **−44 GB** |
+  | `s3_bytes_written` | 99 GB | 0 | −99 GB writes |
+  | `s4_majflt_delta` | 555,141 | 3,256 | **−99.4%** |
+  | `s4_minflt_delta` | 3,170,288 | 1,026,905 | −68% |
+  | `s4_way_delta_encode_ms` cumul | 68,582 | 0 | eliminated |
+  | Stage 4 mmap virtual | 99 GB | — | eliminated |
 
-    **Plan** (inside stage 3, per slot bucket, after the existing
-    scatter into the 388 MB dense `scatter_buf`):
+  **Architecture:** stage 1A emits a per-way ref count sidecar
+  alongside the existing per-blob sidecar. Stage 3 runs the existing
+  slot-bucket scatter then delta-varint-encodes fully-contained blobs
+  into per-worker temp files, staging straddler blobs (~255 at
+  planet) in a shared `Vec<Mutex<Option<StraddlerSlot>>>`. A
+  sequential finalize pass concatenates worker temps + encoded
+  straddlers into `coord_payloads` in blob-index order. Stage 4
+  preads one blob's compressed varint payload per worker and
+  de-interleaves it into PBF's packed-sint32 wire format via byte
+  copy (no zigzag-decode + re-encode, because the varint encoding
+  matches PBF's wire format 1:1).
 
-    1. Binary-search `way_slot_starts` for blobs intersecting
-       `[bucket_start_slot, bucket_end_slot)`. ~68 blobs/bucket
-       at planet.
-    2. **Fully-contained blobs** (slot range ⊆ bucket range):
-       delta-encode from `scatter_buf` using the per-way refcount
-       sidecar. Emit `(blob_idx, bytes)` to a worker-local temp
-       file + manifest entry `{blob_idx, byte_length}`.
-    3. **Straddler blobs** (slot range crosses a bucket boundary):
-       emit raw bucket-local slot bytes (NOT delta-encoded yet) to
-       a shared per-blob staging area keyed by `blob_idx`, one mutex
-       per straddler. Track which slot subrange has arrived.
-    4. **Barrier across buckets.** For each straddler blob, concatenate
-       its two slot-range halves → delta-encode the full blob → emit
-       to a finalization temp file.
-    5. **Finalize `coord_payloads` sequentially.** Walk blobs in
-       blob-index order; for each blob read its bytes from its source
-       temp file and append to `coord_payloads`, computing offsets
-       as we go. One sequential NVMe write (~55 GB at planet).
+  **Escape hatch:** `PBFHOGG_COORD_SLOTS=1` reverts to the
+  pre-integration path (stage 3 writes coord_slots, stage 4 mmaps
+  it). Verified Denmark-bit-identical against default on
+  2026-04-14 via `brokkr verify add-locations-to-ways --mode
+  external`. To be removed in Stage 6 after stability window.
 
-    **Straddler memory bound** (planet): ≤ 2 straddlers per bucket ×
-    256 buckets = ≤ 255 straddler blobs × ~5.8 MB avg = **~1.5 GB
-    worst-case staging**. Fits comfortably in 27 GB.
+  **Stage 6 (conditional cleanup, after stability window):**
 
-    **A-B fallback switch.** Default the new path ON; keep
-    `PBFHOGG_COORD_SLOTS=1` as the escape hatch that runs the current
-    stage 3 + coord_slots + prototype transform + stage 4 read
-    coord_payloads. After stable (Europe + planet both pass
-    verification), delete the prototype transform pass and the
-    `CoordSlots` external path (keep `CoordSlots` only for the
-    `--force`/dense fallback path).
+  - [ ] Drop the `PBFHOGG_COORD_SLOTS=1` escape hatch.
+  - [ ] Replace stage 3's `/dev/null` dummy `Arc<File>` with a proper
+    `Option<Arc<File>>` once the escape hatch is gone.
+  - [ ] Rename `EXTJOIN_STAGE3_INTEGRATED_*` markers to drop the now-
+    redundant suffix.
+  - [ ] Remove `CoordSlots` from the external path entirely (retain
+    only for dense/sparse/`--force` fallback).
 
-    **Correctness plan:**
-    - Unit tests on a fabricated 3-bucket dataset hitting every
-      straddler boundary configuration (blob spans 2, blob on first/
-      last bucket edge, empty blob, single-way blob).
-    - Europe bench comparing SHA256 of output PBF between integrated
-      path and baseline (bit-identical expected — same property the
-      prototype already verified on Denmark).
-    - Planet bench with output PBF verified against the known-good
-      UUID `b55b5605` output via `brokkr verify add-locations-to-ways`.
-
-    **Main risk**: straddler synchronization. Mitigation: the straddler
-    data path is write-only during stage 3 (no ordering requirements
-    other than "both halves present before finalization"), so a simple
-    AtomicU64 counter per straddler blob (bit-mask for "left" and
-    "right" received) plus a per-blob Mutex<Vec<u8>> is sufficient.
-    Finalization waits for all buckets complete (existing barrier),
-    then processes straddlers sequentially.
-
-    **What gets deleted after stable:**
-    - `transform_coord_slots_to_payloads` in `coord_payloads.rs`
-    - Stage 3's `scatter_buf → pwrite(coord_slots)` path
-    - `CoordSlots::open` calls in the external path
-
-    **What stays:**
-    - `coord_payloads.rs::CoordPayloadsReader` (stage 4 consumer)
-    - Stage 3's per-bucket slot-bucket read + scatter into dense
-      bucket buffer (unchanged)
-    - `CoordSlots` for dense/sparse/--force fallback (unchanged)
+  Trigger: ≥ 1 week of stable integrated-path use with no regression
+  reports, or at our discretion.
 
   **Permanently closed (rank-bucketing architecture makes these
   structurally unachievable):**

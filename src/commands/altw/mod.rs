@@ -27,6 +27,7 @@ use super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::id_set_dense::IdSetDense;
 use super::{require_indexdata, HeaderOverrides, Result};
 
+mod blob_bucket_index;
 mod coord_payloads;
 mod stage1;
 mod stage2;

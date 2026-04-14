@@ -6,12 +6,68 @@ use super::super::external_radix::NUM_BUCKETS;
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use super::super::Result;
+use super::coord_payloads::{
+    encode_blob_payload, ManifestEntry, PerWayRcs, StraddlerSlot,
+};
+use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection};
 use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
 pub(super) struct SlotBucketRef {
     pub(super) paths: Vec<std::path::PathBuf>,
     pub(super) entry_counts: Vec<u64>,
+}
+
+/// Inputs needed for the integrated dual-emit path.
+pub(super) struct IntegratedInputs<'a> {
+    pub way_slot_starts: &'a [u64],
+    pub per_way_rcs: &'a PerWayRcs,
+    pub worker_tmp_paths: &'a [std::path::PathBuf],
+    pub straddler_slots: &'a [std::sync::Mutex<Option<StraddlerSlot>>],
+}
+
+/// Manifests produced by stage 3 workers in the integrated path.
+pub(super) struct IntegratedResult {
+    pub worker_manifests: Vec<Vec<ManifestEntry>>,
+}
+
+/// Left or right half of a straddler blob.
+enum HalfSide {
+    Left,
+    Right,
+}
+
+/// Update the straddler staging for `blob_idx` with one raw-byte half.
+fn merge_straddler(
+    straddler_slots: &[std::sync::Mutex<Option<StraddlerSlot>>],
+    blob_idx: usize,
+    side: HalfSide,
+    bytes: Vec<u8>,
+) -> std::result::Result<(), String> {
+    let mut guard = straddler_slots[blob_idx]
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let new = match (guard.take(), side) {
+        (None, HalfSide::Left) => StraddlerSlot::Left(bytes),
+        (None, HalfSide::Right) => StraddlerSlot::Right(bytes),
+        (Some(StraddlerSlot::Left(left)), HalfSide::Right) => {
+            StraddlerSlot::Both { left, right: bytes }
+        }
+        (Some(StraddlerSlot::Right(right)), HalfSide::Left) => {
+            StraddlerSlot::Both { left: bytes, right }
+        }
+        (Some(StraddlerSlot::Left(_)), HalfSide::Left) => {
+            return Err(format!("blob {blob_idx}: duplicate left half"));
+        }
+        (Some(StraddlerSlot::Right(_)), HalfSide::Right) => {
+            return Err(format!("blob {blob_idx}: duplicate right half"));
+        }
+        (Some(StraddlerSlot::Both { .. }), _) => {
+            return Err(format!("blob {blob_idx}: third straddler half impossible"));
+        }
+    };
+    *guard = Some(new);
+    Ok(())
 }
 
 /// Pre-allocates the output file to `total_slots * 8` bytes (zero-filled
@@ -23,7 +79,8 @@ pub(super) fn stage3_slot_reorder(
     slot_buckets: &SlotBucketRef,
     coord_slots_path: &Path,
     total_slots: u64,
-) -> Result<()> {
+    integrated: Option<IntegratedInputs<'_>>,
+) -> Result<Option<IntegratedResult>> {
     use std::os::unix::fs::FileExt as _;
 
     let file = std::fs::OpenOptions::new()
@@ -61,6 +118,11 @@ pub(super) fn stage3_slot_reorder(
     let s3_fadvise_bytes = std::sync::atomic::AtomicU64::new(0);
     let s3_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
+    // Integrated path counters.
+    let s3_integ_encode_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_integ_straddler_copy_ms = std::sync::atomic::AtomicU64::new(0);
+    let s3_integ_worker_tmp_bytes = std::sync::atomic::AtomicU64::new(0);
+
     let next_ref = &next_idx;
     let s3_open_ref = &s3_open_ms;
     let s3_read_ref = &s3_read_ms;
@@ -78,15 +140,45 @@ pub(super) fn stage3_slot_reorder(
     let err_ref = &s3_error;
     let entry_counts = &slot_buckets.entry_counts;
     let paths = &slot_buckets.paths;
+    let s3_integ_encode_ref = &s3_integ_encode_ms;
+    let s3_integ_straddler_copy_ref = &s3_integ_straddler_copy_ms;
+    let s3_integ_worker_tmp_bytes_ref = &s3_integ_worker_tmp_bytes;
 
-    std::thread::scope(|scope| {
-        for _ in 0..num_workers {
+    let is_integrated = integrated.is_some();
+
+    if is_integrated {
+        crate::debug::emit_marker("EXTJOIN_STAGE3_INTEGRATED_START");
+    }
+
+    let worker_manifests: Vec<Vec<ManifestEntry>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(num_workers);
+        for worker_id in 0..num_workers {
             let file = std::sync::Arc::clone(&shared_file);
-            scope.spawn(move || {
+            let ctx_ref = integrated.as_ref();
+            let handle = scope.spawn(move || -> std::result::Result<Vec<ManifestEntry>, String> {
+                use std::io::Write as _;
                 use std::sync::atomic::Ordering::Relaxed;
+
                 let mut data_buf: Vec<u8> = Vec::new();
                 let mut scatter_buf: Vec<u8> = Vec::new();
                 let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
+                let mut encode_scratch: Vec<u8> = Vec::new();
+                let mut manifest: Vec<ManifestEntry> = Vec::new();
+                let mut tmp_byte_pos: u64 = 0;
+
+                // Open worker tmp file if integrated.
+                let mut tmp_writer: Option<std::io::BufWriter<std::fs::File>> =
+                    if let Some(ctx) = ctx_ref {
+                        let tmp_file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create(true)
+                            .truncate(true)
+                            .open(&ctx.worker_tmp_paths[worker_id])
+                            .map_err(|e| format!("create worker tmp {worker_id}: {e}"))?;
+                        Some(std::io::BufWriter::with_capacity(512 * 1024, tmp_file))
+                    } else {
+                        None
+                    };
 
                 loop {
                     if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
@@ -104,6 +196,36 @@ pub(super) fn stage3_slot_reorder(
                     let bucket_slots = bucket_end - bucket_start;
 
                     if entry_counts[bucket_idx] == 0 {
+                        // No resolved entries landed in this bucket, but blobs
+                        // can still overlap its slot range (all-zero coords).
+                        // Classify intersections and emit matching zero-coord
+                        // bytes so FullyContained and straddler paths stay
+                        // consistent with the prototype, which reads zeros
+                        // from coord_slots for unresolved slot positions.
+                        if ctx_ref.is_some() {
+                            let result: std::result::Result<(), String> = (|| {
+                                let ctx = ctx_ref.expect("is_some checked");
+                                let intersections = classify_blobs_in_bucket(
+                                    bucket_start, bucket_end,
+                                    ctx.way_slot_starts, total_slots,
+                                ).map_err(|e| format!("classify bucket {bucket_idx}: {e}"))?;
+                                let bucket_bytes = bucket_slots as usize * COORD_SLOT_SIZE;
+                                scatter_buf.clear();
+                                scatter_buf.resize(bucket_bytes, 0);
+                                emit_integrated_intersections(
+                                    &intersections, &scatter_buf, bucket_start,
+                                    total_slots, ctx, &mut encode_scratch, &mut manifest,
+                                    &mut tmp_byte_pos, &mut tmp_writer,
+                                    s3_integ_encode_ref, s3_integ_straddler_copy_ref,
+                                    s3_integ_worker_tmp_bytes_ref,
+                                )?;
+                                Ok(())
+                            })();
+                            if let Err(e) = result {
+                                *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                                return Err(e);
+                            }
+                        }
                         continue;
                     }
 
@@ -177,20 +299,83 @@ pub(super) fn stage3_slot_reorder(
                         }
 
                         s3_loaded_ref.fetch_add(1, Relaxed);
+
+                        // Integrated dual-emit: classify blobs in this bucket and
+                        // encode/stage them into worker temp files + straddler staging.
+                        if let Some(ctx) = ctx_ref {
+                            let intersections = classify_blobs_in_bucket(
+                                bucket_start, bucket_end,
+                                ctx.way_slot_starts, total_slots,
+                            ).map_err(|e| format!("classify bucket {bucket_idx}: {e}"))?;
+                            emit_integrated_intersections(
+                                &intersections, &scatter_buf, bucket_start,
+                                total_slots, ctx, &mut encode_scratch, &mut manifest,
+                                &mut tmp_byte_pos, &mut tmp_writer,
+                                s3_integ_encode_ref, s3_integ_straddler_copy_ref,
+                                s3_integ_worker_tmp_bytes_ref,
+                            )?;
+                        }
+
                         Ok(())
                     })();
 
                     if let Err(e) = result {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
-                        break;
+                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                        return Err(e);
                     }
                 }
+
+                if let Some(mut w) = tmp_writer {
+                    w.flush().map_err(|e| format!("flush worker {worker_id} tmp: {e}"))?;
+                }
+
+                Ok(manifest)
             });
+            handles.push(handle);
         }
+
+        // Collect all manifests; if any worker returned Err or panicked,
+        // propagate the first such failure as a normal command error (do not
+        // abort the process).
+        let mut all_manifests: Vec<Vec<ManifestEntry>> = Vec::with_capacity(num_workers);
+        let mut first_err: Option<String> = None;
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(m)) => all_manifests.push(m),
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    all_manifests.push(Vec::new());
+                }
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        format!("worker thread panicked: {s}")
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        format!("worker thread panicked: {s}")
+                    } else {
+                        "worker thread panicked (unknown payload)".to_string()
+                    };
+                    if first_err.is_none() {
+                        first_err = Some(msg);
+                    }
+                    all_manifests.push(Vec::new());
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            // Overwrite shared error so the outer check picks it up.
+            *s3_error.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
+        }
+        all_manifests
     });
 
     if let Some(e) = s3_error.into_inner().unwrap_or(None) {
         return Err(e.into());
+    }
+
+    if is_integrated {
+        crate::debug::emit_marker("EXTJOIN_STAGE3_INTEGRATED_END");
     }
 
     shared_file.sync_data()
@@ -198,20 +383,116 @@ pub(super) fn stage3_slot_reorder(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s3_open_ms", s3_open_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_read_ms", s3_read_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_parse_ms", s3_parse_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_write_ms", s3_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_bytes_written", s3_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_pwrite_calls", s3_pwrite_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_max_worker_buf_bytes", s3_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_fadvise_calls", s3_fadvise_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s3_fadvise_bytes", s3_fadvise_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        use std::sync::atomic::Ordering::Relaxed;
+        crate::debug::emit_counter("s3_open_ms", s3_open_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_read_ms", s3_read_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_parse_ms", s3_parse_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_scatter_ms", s3_scatter_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_write_ms", s3_write_ms.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_buckets_loaded", s3_buckets_loaded.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_bytes_read", s3_bytes_read.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_bytes_written", s3_bytes_written.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_scatter_stores", s3_scatter_stores.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_pwrite_calls", s3_pwrite_calls.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_max_worker_buf_bytes", s3_max_worker_buf_bytes.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_fadvise_calls", s3_fadvise_calls.load(Relaxed) as i64);
+        crate::debug::emit_counter("s3_fadvise_bytes", s3_fadvise_bytes.load(Relaxed) as i64);
+        if is_integrated {
+            crate::debug::emit_counter("s3_integrated_encode_ms", s3_integ_encode_ms.load(Relaxed) as i64);
+            crate::debug::emit_counter("s3_integrated_straddler_copy_ms", s3_integ_straddler_copy_ms.load(Relaxed) as i64);
+            crate::debug::emit_counter("s3_integrated_worker_tmp_bytes", s3_integ_worker_tmp_bytes.load(Relaxed) as i64);
+        }
     }
 
+    if is_integrated {
+        Ok(Some(IntegratedResult { worker_manifests }))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Emit integrated intersections for one bucket into the worker's temp file
+/// and straddler staging.
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+fn emit_integrated_intersections(
+    intersections: &[BlobBucketIntersection],
+    scatter_buf: &[u8],
+    bucket_start: u64,
+    total_slots: u64,
+    ctx: &IntegratedInputs<'_>,
+    encode_scratch: &mut Vec<u8>,
+    manifest: &mut Vec<ManifestEntry>,
+    tmp_byte_pos: &mut u64,
+    tmp_writer: &mut Option<std::io::BufWriter<std::fs::File>>,
+    s3_integ_encode_ref: &std::sync::atomic::AtomicU64,
+    s3_integ_straddler_copy_ref: &std::sync::atomic::AtomicU64,
+    s3_integ_worker_tmp_bytes_ref: &std::sync::atomic::AtomicU64,
+) -> std::result::Result<(), String> {
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    let bucket_bytes = scatter_buf.len();
+    let writer = tmp_writer.as_mut().expect("tmp_writer must be Some in integrated mode");
+
+    for intersection in intersections {
+        match intersection {
+            BlobBucketIntersection::FullyContained { blob_idx } => {
+                let blob_idx = *blob_idx;
+                let blob_start = ctx.way_slot_starts[blob_idx];
+                let blob_end = ctx.way_slot_starts.get(blob_idx + 1).copied().unwrap_or(total_slots);
+                #[allow(clippy::cast_possible_truncation)]
+                let local_start = ((blob_start - bucket_start) as usize) * COORD_SLOT_SIZE;
+                #[allow(clippy::cast_possible_truncation)]
+                let local_end = ((blob_end - bucket_start) as usize) * COORD_SLOT_SIZE;
+                let slice = &scatter_buf[local_start..local_end];
+
+                let t_enc = std::time::Instant::now();
+                encode_scratch.clear();
+                encode_blob_payload(slice, ctx.per_way_rcs.blob(blob_idx), encode_scratch)
+                    .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
+                #[allow(clippy::cast_possible_truncation)]
+                s3_integ_encode_ref.fetch_add(t_enc.elapsed().as_millis() as u64, Relaxed);
+
+                let byte_offset = *tmp_byte_pos;
+                let byte_length = encode_scratch.len() as u64;
+                writer
+                    .write_all(encode_scratch)
+                    .map_err(|e| format!("write worker tmp blob {blob_idx}: {e}"))?;
+                *tmp_byte_pos += byte_length;
+                s3_integ_worker_tmp_bytes_ref.fetch_add(byte_length, Relaxed);
+                manifest.push(ManifestEntry {
+                    blob_idx: blob_idx as u32,
+                    byte_offset,
+                    byte_length,
+                });
+            }
+            BlobBucketIntersection::LeftHalf { blob_idx } => {
+                let blob_idx = *blob_idx;
+                let blob_start = ctx.way_slot_starts[blob_idx];
+                #[allow(clippy::cast_possible_truncation)]
+                let local_start = ((blob_start - bucket_start) as usize) * COORD_SLOT_SIZE;
+                let slice = &scatter_buf[local_start..bucket_bytes];
+
+                let t_copy = std::time::Instant::now();
+                let bytes = slice.to_vec();
+                #[allow(clippy::cast_possible_truncation)]
+                s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
+                merge_straddler(ctx.straddler_slots, blob_idx, HalfSide::Left, bytes)?;
+            }
+            BlobBucketIntersection::RightHalf { blob_idx } => {
+                let blob_idx = *blob_idx;
+                let blob_end = ctx.way_slot_starts.get(blob_idx + 1).copied().unwrap_or(total_slots);
+                #[allow(clippy::cast_possible_truncation)]
+                let local_end = ((blob_end - bucket_start) as usize) * COORD_SLOT_SIZE;
+                let slice = &scatter_buf[..local_end];
+
+                let t_copy = std::time::Instant::now();
+                let bytes = slice.to_vec();
+                #[allow(clippy::cast_possible_truncation)]
+                s3_integ_straddler_copy_ref.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
+                merge_straddler(ctx.straddler_slots, blob_idx, HalfSide::Right, bytes)?;
+            }
+        }
+    }
     Ok(())
 }

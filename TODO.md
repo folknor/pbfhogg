@@ -285,13 +285,22 @@ single-pass, tag expression and bbox filtering.
 
   **Bugs (must fix soon):**
 
-  - [x] ~~Small-input external mode is structurally rejected.~~ Fixed.
-    `slot_bucket_count` is now computed at runtime as
-    `min(NUM_BUCKETS, max(1, total_slots / max_blob_slots))` and
-    plumbed through stages 2 and 3. The hard-error startup assertion
-    is gone. Small inputs scale down to fewer slot buckets; the
-    2-piece straddler invariant remains by construction.
-    (External review 2026-04-14 #2.)
+  - [x] ~~Small-input external mode is structurally rejected.~~ Fixed
+    in two commits. First commit (`cdb97e7`) introduced
+    `slot_bucket_count = min(NUM_BUCKETS, max(1, total_slots / max_blob_slots))`
+    and plumbed it through stages 2/3, but kept `range_size =
+    total_slots.div_ceil(slot_bucket_count)` — which makes the LAST
+    bucket smaller, not larger, so the smallest bucket could still be
+    narrower than `max_blob_slots`. Reviewer counterexample
+    (`total_slots=10, max_blob_slots=3` → buckets [0,4)[4,8)[8,10),
+    last is 2 wide) caught it. Followup: switched `range_size` to
+    floor division (in both `ResolvedEntry::slot_bucket` and
+    `stage3_slot_reorder`), making the LAST bucket *absorb the
+    remainder* (and be wider, not narrower). Smallest bucket = floor
+    `range_size` = `total_slots / slot_bucket_count` ≥ `max_blob_slots`
+    by construction. Out-of-range high `slot_pos` values get clamped
+    to the last-bucket index. (External review 2026-04-14 #2 + #3
+    followup.)
   - [x] ~~External `Stats.missing_locations` always reports 0.~~ Fixed.
     Computed once in `external_join` after stage 4 as
     `total_slots − stage2_resolved_count` (stage 2 already

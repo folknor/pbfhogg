@@ -96,9 +96,18 @@ impl ResolvedEntry {
     }
 
     /// Bucket index for slot-pos partitioning.
+    ///
+    /// Uses floor division for `range_size` so the last bucket *absorbs*
+    /// the remainder (and is wider than the others) instead of being
+    /// truncated. This keeps every bucket's width ≥ `range_size`, which
+    /// — together with the `slot_bucket_count = total_slots / max_blob_slots`
+    /// floor in `external_join` — preserves the 2-piece straddler
+    /// invariant for all input sizes. Out-of-range high slot_pos values
+    /// (that would land past the nominal last bucket because the last
+    /// is wider) get clamped to `slot_bucket_count - 1`.
     #[allow(clippy::cast_possible_truncation)]
     fn slot_bucket(&self, total_slots: u64, slot_bucket_count: usize) -> usize {
-        let range_size = total_slots.div_ceil(slot_bucket_count as u64);
+        let range_size = total_slots / slot_bucket_count as u64;
         if range_size == 0 {
             return 0;
         }

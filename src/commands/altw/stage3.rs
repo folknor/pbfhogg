@@ -81,7 +81,13 @@ pub(super) fn stage3_slot_reorder(
     total_slots: u64,
     integrated: IntegratedInputs<'_>,
 ) -> Result<IntegratedResult> {
-    let range_size = total_slots.div_ceil(slot_bucket_count as u64);
+    // Floor division: every bucket is `range_size` slots wide except
+    // the LAST, which extends to `total_slots` and may be wider. This
+    // keeps the smallest-bucket-width = range_size, which the caller
+    // sized so that range_size ≥ max_blob_slots — preserving the
+    // 2-piece straddler invariant for small inputs. (See
+    // `ResolvedEntry::slot_bucket` for the matching routing logic.)
+    let range_size = total_slots / slot_bucket_count as u64;
 
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))

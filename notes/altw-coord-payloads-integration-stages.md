@@ -453,30 +453,46 @@ Not a subagent task. Main conversation:
 6. `PBFHOGG_COORD_PAYLOADS_INTEGRATED=1 brokkr ... --bench 1 --force`
    (integrated Europe; `--force` because env var doesn't show in git
    state and results won't store without an associated commit).
-7. Compare stage timings and confirm:
-   - Stage 3 wall rises modestly (new encode work + temp file writes).
-     Expected delta: ≤ 10 s cumulative (encode + straddler copy +
-     finalize).
-   - Stage 4 wall matches prototype (~130 s), not baseline (141 s).
-   - Total ≈ 373 s. Transform tax (65 s) is absent.
-8. If feasible (Europe output PBF is ~60 GB — disk budget
-   permitting): save integrated + prototype Europe outputs, SHA256-
-   compare them as a second cross-check on the larger dataset.
+7. Expected timings (from 2026-04-14 measurement, UUID `237c7e81`):
+   - Total ~429 s (+37 s vs baseline 392.7 s).
+   - Stage 3 ~64 s (+13 s vs baseline, new encode/tmp work).
+   - New finalize phase ~27 s.
+   - Stage 4 ~132 s (−9 s vs baseline).
+   - The +37 s regression under dual-emit is expected. Stage 5
+     removes the coord_slots pwrite from stage 3 and should recover
+     5-15 s of that on Europe.
 
-### Planet (production target)
+### Planet (product-level confirmation)
 
-9. `brokkr add-locations-to-ways --dataset planet --index-type external
+8. `brokkr add-locations-to-ways --dataset planet --index-type external
    --bench 1 --force` with `PBFHOGG_COORD_PAYLOADS_INTEGRATED=1`.
-10. Target: ≤ 910 s (baseline 982 s − ~80 s). Confirm output via
-    `brokkr verify`.
+9. Wall-time expectation: **parity with baseline within noise**,
+   NOT a ~10% speedup as originally projected. Baseline planet =
+   982 s; integrated expected ~970–1050 s under dual-emit. Stage 5
+   brings this closer to baseline.
+10. Confirm correctness via `brokkr verify add-locations-to-ways
+    --dataset planet --mode external` with and without the env var;
+    logs must match (same as Denmark validation).
+11. Confirm non-wall benefits from sidecar counters:
+    - `s4_majflt_delta` ≪ 555K (baseline's stage-4 major faults).
+    - `s3_integrated_output_bytes` ≈ 55 GB (vs 99 GB coord_slots).
 
 ### Pass / fail
 
-- All Denmark assertions pass → Stage 5 is unblocked.
-- Europe / planet numbers are directional (report and compare) but
-  not gating for Stage 5.
-- If any Denmark assertion fails, return to subagent with a concrete
-  bug report (diverging byte range + the `blob_idx` it belongs to).
+- Denmark `brokkr verify` with and without env var produce bit-identical
+  logs → Stage 5 is unblocked on correctness.
+- Europe wall within expected range (+30 to +50 s vs baseline under
+  dual-emit) → Stage 5 is unblocked on performance.
+- Planet `brokkr verify` logs match and `s4_majflt_delta` dropped
+  ~3 orders of magnitude → non-wall benefits confirmed.
+- If any correctness check fails, return to subagent with a concrete
+  bug report.
+
+**Note on wall-time framing:** the integration is pursued for
+non-wall benefits (scratch footprint, memory pressure, fault
+elimination, freed CPU). Wall regression within ~5% is acceptable.
+The path forward bets on post-integration second-order wins to
+restore or improve wall time.
 
 ---
 

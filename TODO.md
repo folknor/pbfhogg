@@ -557,20 +557,41 @@ single-pass, tag expression and bbox filtering.
   the ~15% I projected when assuming 3–4× compression, ~10% better
   than my worst-case "±0%" prediction of a risky redesign.
 
-  **Decision (2026-04-14): integrate.** Rationale: the architectural
-  table was exhausted — every alternative (dense, sparse,
-  LocationsOnWays-input, streaming, spatial partitioning,
-  chunk-parallel, hybrid) is either already shipped, already tested
-  and rejected, or strictly worse under the (27 GB RAM, consumer NVMe,
-  standard-format PBF) envelope. Rank-bucketed external join is the
-  local optimum; coord_payloads is the one remaining measured win.
-  The ~44 GB scratch reduction at planet is a real product
-  improvement beyond the wall-time number.
+  **Decision (2026-04-14): integrate despite measured wall-time
+  parity/slight regression.** The wall-time argument turned out
+  weaker than the prototype suggested, but the non-wall benefits make
+  this the right move regardless.
 
-  - [ ] **Integrate blob-ordered coord_payloads into stage 3
-    (target: planet ~982 s → ~900 s, scratch ~300 GB → ~256 GB).**
-    Prototype already answers the design questions; integration is
-    ~1 week of careful stage-3 work plus A-B validation.
+  **Integrated Europe bench (UUID `237c7e81`, commit `c12a642`):**
+  429 s wall vs baseline 392.7 s (`e151e5e8`). That's +37 s (+9%).
+  Projected planet: roughly 982 s → ~1000-1050 s under dual-emit;
+  Stage 5 (drop coord_slots pwrite) may recover ~20-30 s bringing
+  planet to ~970-1020 s — **parity with baseline within measurement
+  noise, possibly a small regression**.
+
+  **Non-wall-time benefits (the real rationale for integration):**
+
+  | Metric | Baseline planet | Integrated (fully developed) | Δ |
+  |---|---|---|---|
+  | Scratch peak | ~300 GB (99 GB `coord_slots` dominant) | ~256 GB (55 GB `coord_payloads`) | **−44 GB (−15%)** |
+  | Total disk writes | ~680 GB | ~636 GB | −44 GB |
+  | Total disk reads | ~711 GB | ~667 GB | −44 GB |
+  | Stage 4 major faults | 555,141 | ~0 (bounded per-blob preads) | **−100%** |
+  | Stage 4 minor faults | 3,170,288 | small (worker buffer reuse) | ≈−95% |
+  | Stage 4 mmap virtual | **99 GB** (cross-worker thrash) | — (no mmap) | eliminated |
+  | Stage 4 delta-encode CPU | ~68 s cumulative | 0 | eliminated |
+  | Concurrent-workload friendliness | poor (page-cache storm) | good | qualitative win |
+
+  **The bet:** once the integration is complete and we take a fresh
+  look, new optimization opportunities — enabled by the cleaner
+  memory profile, the absence of mmap thrashing, and the freed CPU —
+  will surface and should at minimum restore wall-time parity.
+
+  - [ ] **Integrate blob-ordered coord_payloads into stage 3.**
+    Prototype answered the design questions; integration is the
+    measured-reality follow-through. Scope is ~1 week including A-B
+    validation. Wall-time target is **parity with baseline ± a few
+    percent**, not a speedup.
 
     **Plan** (inside stage 3, per slot bucket, after the existing
     scatter into the 388 MB dense `scatter_buf`):

@@ -114,7 +114,6 @@ pub(super) fn stage1_way_pass(
         let s1a_pread_ref = &s1a_pread_ms;
         let s1a_decompress_ref = &s1a_decompress_ms;
         let s1a_scan_ref = &s1a_scan_way_refs_ms;
-        let s1a_idset_ref = &s1a_idset_set_ms;
         let s1a_bytes_ref = &s1a_bytes_read;
         let s1a_pread_calls_ref = &s1a_pread_calls;
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
@@ -151,30 +150,28 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 1: scan way refs (proto parsing only).
+                            // Phase 1: scan way refs and set bits in the
+                            // shared IdSetDense directly. This removes the
+                            // blob-local `blob_node_ids` staging vector; the
+                            // fused cost now lives under s1a_scan_way_refs_ms.
                             let t2 = std::time::Instant::now();
-                            let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
+                            let mut blob_ref_count: u64 = 0;
                             super::super::way_scanner::scan_way_refs(
                                 &decompress_buf, &mut refs_buf, &mut group_starts,
                                 |_way_id, refs| {
-                                    blob_node_ids.extend_from_slice(refs);
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
+                                    blob_ref_count += refs.len() as u64;
+                                    for &node_id in refs {
+                                        node_id_set_ref.set_atomic(node_id);
+                                    }
                                 },
                             ).map_err(|e| e.to_string())?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 2: batch set_atomic into IdSetDense.
-                            let t3 = std::time::Instant::now();
-                            for &node_id in &blob_node_ids {
-                                node_id_set_ref.set_atomic(node_id);
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
-
-                            Ok((blob_node_ids.len() as u64, per_way_rcs))
+                            Ok((blob_ref_count, per_way_rcs))
                         })();
 
                         if tx.send((task.seq, result)).is_err() { break; }

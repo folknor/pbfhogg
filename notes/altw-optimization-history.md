@@ -307,6 +307,113 @@ sketched (not measured, ~10% total improvement ceiling):
 Combined: Europe 392 → ~350–360 s; planet 1,075 → ~950–1,000 s.
 Reasonable to ship or defer.
 
+**Blob-ordered coord payload prototype 2026-04-14 (commits a13a6a8,
+e9e1d77, 7738642).** Built as a measurement-first prototype before
+committing to a stage-3 integration, per the lesson that desk
+estimates on this code path over-predict by 5–10×.
+
+Scope — three commits:
+
+1. **Per-way refcount sidecar** (stage 1A). Captures `refs.len()` per
+   way during the existing `scan_way_refs` pass. Emits varint stream
+   per blob: `[varint num_ways][varint rc0][varint rc1]...`. Europe
+   sidecar size: 455 MB.
+
+2. **`coord_slots → coord_payloads` transform pass** (`coord_payloads.rs`).
+   Reads coord_slots + per-way refcount sidecar, emits per-blob
+   delta-varint payloads. File format:
+   `[u64 num_way_blobs][u64 total_payload_bytes][u64*(N+1) blob_offsets][payloads]`.
+   Within each blob: for each way, 2×ref_count zigzag-varints
+   interleaved (lat, lon, lat, lon, ...) with deltas reset per way.
+
+3. **Stage 4 alternate path** (gated by `PBFHOGG_COORD_PAYLOADS_PROTOTYPE`
+   env var). When enabled, each way-blob worker preads its blob's
+   payload into a worker-local buffer and de-interleaves raw varint
+   bytes into PBF's `packed_lats` / `packed_lons` fields — no zigzag
+   decode, no re-encode, because the payload byte layout matches PBF
+   wire format 1:1. Combines "fewer bytes to read" (option 1) with
+   "skip delta encode" (option 2) in a single format.
+
+Measured results (Europe, commit `7738642`, UUID `99f6b8bc`):
+
+| | Baseline `e151e5e8` | Prototype `99f6b8bc` | Δ |
+|---|---|---|---|
+| Total wall | 392.7 s | 465 s | **+72 s (regression)** |
+| Stage 1 | 81 s | 94 s | +13 s |
+| Stage 2 | 87 s | 88 s | +1 s |
+| Stage 3 | 51 s | 52 s | +1 s |
+| Transform pass | — | 65 s | — |
+| Stage 4 | 141 s | 130 s | **−11 s** |
+| `s4_way_coord_read_ms` cumul | 370,200 | 77,316 | −5× |
+| `s4_way_delta_encode_ms` cumul | 52,000 | 0 | eliminated |
+
+**Compression ratio: 1.81× (37.5 GB → 20.8 GB).** Confirmed at both
+Denmark (486 MB → 268 MB, same ratio) and Europe. The 3–4× estimate
+was wrong: absolute lat/lon values (first ref per way) remain 5-byte
+varints, and typical 1-km-scale deltas are 2–3 bytes. This format's
+ceiling is ~1.8×, not higher.
+
+**Correctness: SHA256 match** between baseline and prototype output
+PBFs on Denmark. The byte-copy de-interleave in stage 4 is exactly
+equivalent to the mmap-read + delta-encode path.
+
+**Interpretation of the −72 s Europe regression.** Stage 4 genuinely
+saves ~11 s wall (coord_read 62 s → 13 s, plus zero delta_encode).
+The transform pass costs 65 s wall end-to-end, dominated by the
+20.8 GB sequential output write to NVMe. This is the prototype tax
+— if stage 3 emitted coord_payloads directly (integrated design),
+this pass goes away.
+
+**Net projection if integrated:**
+
+- Europe: 392 s → ~373 s (−5%). Marginal.
+- Planet (scaling the measured stage-4 coord-work saving):
+  982 s → **~900 s (−8%)**.
+
+Substantially less than the 15% I projected when assuming 3–4×
+compression. Closer to my worst-case "might be ±0" from the
+same-day regression lesson.
+
+**What the prototype answered:**
+
+1. Format is sound; bit-identical output.
+2. Compression ratio is 1.81×, not 3–4×.
+3. Stage 4 I/O reduction works: coord read cumul dropped 5×.
+4. `s4_way_delta_encode_ms` can be eliminated entirely via
+   wire-format-ready payloads.
+5. Best-case integrated win is ~8% on planet, not ~15%.
+
+**Resolved 2026-04-14: integrate.** After walking the architectural
+option table (dense, sparse, LocationsOnWays input, streaming,
+spatial partition, chunk-parallel, hybrid), coord_payloads is the
+only candidate that is measured, credible, and uncontested under
+the (27 GB RAM, consumer NVMe, standard-format PBF) envelope. The
+rank-bucketed external join is the local architectural optimum;
+this is the last remaining incremental win inside that architecture.
+
+**Product-level gain beyond wall time:** coord_slots (99 GB at
+planet) → coord_payloads (~55 GB at planet) cuts external-join
+scratch by ~44 GB. This matters on tighter-scratch hosts
+independent of runtime.
+
+**Integration plan** (see TODO.md "add-locations-to-ways
+--index-type external — next round" for the full spec):
+
+- Stage 3 per-bucket processing adds a post-scatter step that
+  delta-encodes fully-contained blobs and stashes raw slot bytes
+  for the ~255 straddler blobs at planet. After the barrier, a
+  sequential finalization pass writes coord_payloads in blob order.
+- Worst-case straddler staging: ~1.5 GB. Fits.
+- A-B fallback via `PBFHOGG_COORD_SLOTS=1` env var until stable.
+- Post-stable deletion: `transform_coord_slots_to_payloads`, the
+  `scatter_buf → coord_slots` path, and `CoordSlots::open` in the
+  external path. Retain `CoordPayloadsReader` (already shipped) and
+  `CoordSlots` for dense/sparse/--force fallback.
+
+Scope: ~1 week. Correctness validated via SHA256 bit-equality
+against baseline on Denmark + Europe, then `brokkr verify
+add-locations-to-ways` on planet.
+
 Key architectural changes:
 - **COO pair format**: `(node_id, slot_pos)` → `(rank, slot_pos)`. Dense rank
   space enables O(n) counting sort instead of O(n log n) comparison sort on

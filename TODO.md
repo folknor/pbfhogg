@@ -512,41 +512,128 @@ single-pass, tag expression and bbox filtering.
 
   **The only remaining lever: read fewer bytes.**
 
-  - [ ] **Delta-encoded varint coords in per-blob payload file
-    (option 1).** Replace flat 8-byte-per-slot coord_slots with
-    variable-length per-way delta-encoded varints. Typical way has refs
-    within ~1 km → deltas are small. Zigzag-varint of values < 16K
-    takes 2 bytes. Projected average: 2–3 bytes per ref vs 8 bytes =
-    3–4× size reduction. File size 37 GB → ~10–12 GB.
-    - Projected read time at 720 MB/s: 17 s wall (vs 51 s).
-    - Varint decode cost: ~7 s wall (4.69B × 2 decodes at 2 GB/s
-      decode × 6 workers).
-    - **Projected net save: ~27 s wall on stage 4.**
-    - Complexity: moderate. New on-disk format for coord_slots, new
-      decode path in stage 4 reframe, stage 2 output changes to
-      emit delta-encoded per-way.
-    - Risk: medium. Desk estimates today have been off by 5–10×, so
-      don't trust the 27 s projection without a Denmark-scale prototype.
+  **Prototype built and measured 2026-04-14 (commits a13a6a8, e9e1d77,
+  7738642). Result: 8% planet win, not the projected 15%.**
 
-  - [ ] **Wire-format-ready payloads (option 2).** Stage 2 produces
-    the exact PBF wire bytes for lat/lon fields, so stage 4 only
-    splices bytes into the way blob's output.
-    - Eliminates `s4_way_delta_encode_ms` (52 s cumul = 8.5 s wall),
-      `s4_way_reassemble_ms` (30 s cumul = 5 s wall),
-      `s4_way_group_reframe_ms` (16 s cumul = 2.5 s wall).
-    - **Projected net save: ~8–10 s wall** (the savings are already
-      parallelized with I/O, so wall-time impact is sub-linear).
-    - Complexity: high. Stage 2 must know PBF wire format details
-      (packed sint32 varint encoding). Breaks separation of concerns.
-    - Probably not worth on its own.
+  See `notes/altw-optimization-history.md` "Blob-ordered coord payload
+  prototype 2026-04-14" for the full design + measured results.
 
-  - [ ] **Both combined (option 1 + option 2).** ~30–40 s wall save
-    on Europe. Stage 4: 141 → ~100–110 s. Europe total: 392 → ~350–360 s
-    (~10% total improvement). Planet: 1,075 → ~950–1,000 s.
+  Format shipped in the prototype:
+  - Per-way refcount sidecar (stage 1A): varint stream per blob,
+    455 MB on Europe (commit a13a6a8).
+  - `coord_payloads` file: header + blob offset table + concatenated
+    per-blob delta-varint payloads. Bytes match PBF's packed
+    sint32 wire format 1:1, so stage 4 de-interleaves via byte copy
+    (no zigzag decode + re-encode). Effectively combines option 1
+    (fewer bytes) + option 2 (wire-format-ready) in one format.
+  - Prototype path: transform runs after stage 3, stage 4 preads
+    per-blob payload. Gated by `PBFHOGG_COORD_PAYLOADS_PROTOTYPE=1`.
 
-  **Decision: pending user direction.** The win is bounded at ~10%
-  total for a multi-day rewrite of stages 2–4. Reasonable either to
-  ship or defer.
+  **Measured results on Europe (commit 7738642, UUID 99f6b8bc):**
+
+  | | Baseline (e151e5e8) | Prototype (99f6b8bc) | Δ |
+  |---|---|---|---|
+  | Total wall | 392.7 s | 465 s | +72 s (regression) |
+  | Stage 1 | 81 s | 94 s | +13 s (per-way sidecar) |
+  | Stage 2 | 87 s | 88 s | +1 s |
+  | Stage 3 | 51 s | 52 s | +1 s |
+  | **Transform pass** | — | **65 s** | (new) |
+  | Stage 4 | 141 s | 130 s | **−11 s** |
+  | s4_way_coord_read_ms cumul | 370,200 | 77,316 | −5× |
+  | s4_way_delta_encode_ms cumul | 52,000 | 0 | eliminated |
+
+  **Compression ratio: 1.81× (37.5 GB → 20.8 GB).** Not the 3–4×
+  projected — absolute first-ref lat/lon per way are 5-byte varints,
+  deltas at ~1 km scale are still 2–3 bytes. Denmark confirms the
+  same ratio (486 MB → 268 MB). This is the ceiling for this format.
+
+  **Correctness: bit-identical output PBF at Denmark scale** (SHA256
+  match). The varint bytes from the prototype payload splice directly
+  into PBF wire format, proving the format is sound.
+
+  **Net win if integrated (stage 3 emits coord_payloads directly,
+  no transform pass):** Europe 465 s → ~400 s (−5 s vs baseline at
+  392 s, within noise). Planet 982 s → **~900 s (−8%)**. Less than
+  the ~15% I projected when assuming 3–4× compression, ~10% better
+  than my worst-case "±0%" prediction of a risky redesign.
+
+  **Decision (2026-04-14): integrate.** Rationale: the architectural
+  table was exhausted — every alternative (dense, sparse,
+  LocationsOnWays-input, streaming, spatial partitioning,
+  chunk-parallel, hybrid) is either already shipped, already tested
+  and rejected, or strictly worse under the (27 GB RAM, consumer NVMe,
+  standard-format PBF) envelope. Rank-bucketed external join is the
+  local optimum; coord_payloads is the one remaining measured win.
+  The ~44 GB scratch reduction at planet is a real product
+  improvement beyond the wall-time number.
+
+  - [ ] **Integrate blob-ordered coord_payloads into stage 3
+    (target: planet ~982 s → ~900 s, scratch ~300 GB → ~256 GB).**
+    Prototype already answers the design questions; integration is
+    ~1 week of careful stage-3 work plus A-B validation.
+
+    **Plan** (inside stage 3, per slot bucket, after the existing
+    scatter into the 388 MB dense `scatter_buf`):
+
+    1. Binary-search `way_slot_starts` for blobs intersecting
+       `[bucket_start_slot, bucket_end_slot)`. ~68 blobs/bucket
+       at planet.
+    2. **Fully-contained blobs** (slot range ⊆ bucket range):
+       delta-encode from `scatter_buf` using the per-way refcount
+       sidecar. Emit `(blob_idx, bytes)` to a worker-local temp
+       file + manifest entry `{blob_idx, byte_length}`.
+    3. **Straddler blobs** (slot range crosses a bucket boundary):
+       emit raw bucket-local slot bytes (NOT delta-encoded yet) to
+       a shared per-blob staging area keyed by `blob_idx`, one mutex
+       per straddler. Track which slot subrange has arrived.
+    4. **Barrier across buckets.** For each straddler blob, concatenate
+       its two slot-range halves → delta-encode the full blob → emit
+       to a finalization temp file.
+    5. **Finalize `coord_payloads` sequentially.** Walk blobs in
+       blob-index order; for each blob read its bytes from its source
+       temp file and append to `coord_payloads`, computing offsets
+       as we go. One sequential NVMe write (~55 GB at planet).
+
+    **Straddler memory bound** (planet): ≤ 2 straddlers per bucket ×
+    256 buckets = ≤ 255 straddler blobs × ~5.8 MB avg = **~1.5 GB
+    worst-case staging**. Fits comfortably in 27 GB.
+
+    **A-B fallback switch.** Default the new path ON; keep
+    `PBFHOGG_COORD_SLOTS=1` as the escape hatch that runs the current
+    stage 3 + coord_slots + prototype transform + stage 4 read
+    coord_payloads. After stable (Europe + planet both pass
+    verification), delete the prototype transform pass and the
+    `CoordSlots` external path (keep `CoordSlots` only for the
+    `--force`/dense fallback path).
+
+    **Correctness plan:**
+    - Unit tests on a fabricated 3-bucket dataset hitting every
+      straddler boundary configuration (blob spans 2, blob on first/
+      last bucket edge, empty blob, single-way blob).
+    - Europe bench comparing SHA256 of output PBF between integrated
+      path and baseline (bit-identical expected — same property the
+      prototype already verified on Denmark).
+    - Planet bench with output PBF verified against the known-good
+      UUID `b55b5605` output via `brokkr verify add-locations-to-ways`.
+
+    **Main risk**: straddler synchronization. Mitigation: the straddler
+    data path is write-only during stage 3 (no ordering requirements
+    other than "both halves present before finalization"), so a simple
+    AtomicU64 counter per straddler blob (bit-mask for "left" and
+    "right" received) plus a per-blob Mutex<Vec<u8>> is sufficient.
+    Finalization waits for all buckets complete (existing barrier),
+    then processes straddlers sequentially.
+
+    **What gets deleted after stable:**
+    - `transform_coord_slots_to_payloads` in `coord_payloads.rs`
+    - Stage 3's `scatter_buf → pwrite(coord_slots)` path
+    - `CoordSlots::open` calls in the external path
+
+    **What stays:**
+    - `coord_payloads.rs::CoordPayloadsReader` (stage 4 consumer)
+    - Stage 3's per-bucket slot-bucket read + scatter into dense
+      bucket buffer (unchanged)
+    - `CoordSlots` for dense/sparse/--force fallback (unchanged)
 
   **Permanently closed (rank-bucketing architecture makes these
   structurally unachievable):**

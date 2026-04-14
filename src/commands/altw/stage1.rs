@@ -49,7 +49,12 @@ pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
 /// **Pass B**: rescan ways with rank index available. Emit `(rank, slot_pos)`
 /// records into rank-bucketed per-worker shard files.
 ///
-/// Returns `(total_refs, unique_nodes, rank_bucket_entry_counts, num_workers, node_id_set)`.
+/// Returns `(total_refs, unique_nodes, rank_bucket_entry_counts, num_workers)`.
+///
+/// The internal `IdSetDense` (~2 GB RSS at planet) is dropped at end of
+/// stage 1 — nothing downstream reads it. `unique_nodes` is the only
+/// scalar downstream needs, and it's persisted in the keep-scratch
+/// manifest so `--start-stage >= 2` resumes don't rebuild the set.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 pub(super) fn stage1_way_pass(
@@ -59,7 +64,7 @@ pub(super) fn stage1_way_pass(
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
     coord_file_path: Option<&Path>,
-) -> Result<(u64, u64, Vec<u64>, usize, IdSetDense)> {
+) -> Result<(u64, u64, Vec<u64>, usize)> {
     use std::os::unix::fs::FileExt as _;
 
     let schedule = build_way_schedule(input)?;
@@ -477,7 +482,10 @@ pub(super) fn stage1_way_pass(
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 
     let num_actual = num_actual_workers;
-    Ok((total_refs, unique_nodes_u64, merged_counts, num_actual, node_id_set))
+    // Drop ~2 GB of IdSetDense bitset + rank index before the caller
+    // proceeds to stages 2/3/4. Nothing downstream reads it.
+    drop(node_id_set);
+    Ok((total_refs, unique_nodes_u64, merged_counts, num_actual))
 }
 
 /// Parallel node scan that writes dense (lat, lon) to a temp file indexed

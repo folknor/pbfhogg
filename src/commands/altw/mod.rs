@@ -10,9 +10,11 @@
 //! 2. **Node join**: per bucket, sort pairs by node_id in RAM (~500 MB),
 //!    merge-join with matching node stream, emit `(slot_pos, lat, lon)` into
 //!    256 slot buckets partitioned by high bits of slot_pos.
-//! 3. **Slot reorder**: per bucket, sort by slot_pos, write final coord_slots
-//!    file sequentially.
-//! 4. **Assembly**: stream original PBF + coord_slots, emit enriched ways.
+//! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
+//!    delta-varint `coord_payloads` (see `coord_payloads.rs`). The flat
+//!    `coord_slots` array is a historical intermediate, retired in 2026-04.
+//! 4. **Assembly**: stream original PBF + per-blob coord_payloads preads,
+//!    emit enriched ways.
 //!
 //! Memory at every stage: <1 GB. All I/O sequential. No mmap, no random access.
 //! See `notes/altw-partitioned.md` for the full design.
@@ -24,7 +26,6 @@ use crate::ElementReader;
 
 use super::add_locations_to_ways::Stats;
 use super::external_radix::{ScratchDir, NUM_BUCKETS};
-use super::id_set_dense::IdSetDense;
 use super::{require_indexdata, HeaderOverrides, Result};
 
 mod blob_bucket_index;
@@ -55,7 +56,9 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 /// A rank-bucketed occurrence record. `local_rank` is the rank offset
 /// within the bucket (`global_rank - bucket_rank_start`), stored as u32
 /// (max ~40M entries per bucket at planet, well under u32::MAX).
-/// `slot_pos` is the final position in the coord_slots array.
+/// `slot_pos` is the linear position within the conceptual flat coord
+/// stream (way_order × ref_order); stage 3 emits these as per-blob
+/// delta-varint payloads in `coord_payloads` rather than a flat array.
 ///
 /// 12 bytes instead of 16: 25% I/O reduction across stages 1B and 2.
 #[derive(Clone, Copy)]
@@ -71,7 +74,8 @@ impl RankRecord {
     }
 }
 
-/// A resolved coordinate ready to be placed into the final coord_slots file.
+/// A resolved coordinate ready to be scattered into a slot bucket for
+/// stage 3's coord_payloads emission.
 #[derive(Clone, Copy)]
 pub(super) struct ResolvedEntry {
     slot_pos: u64,
@@ -161,128 +165,87 @@ pub fn external_join(
     let coord_file_path = scratch_dir.file_path("coords_by_rank");
     let start = start_stage.unwrap_or(1);
 
-    // Manifest layout (LE): [u64 total_slots][u64 resolved_count?]
-    //   - 8 bytes: only stage 1 completed in the prior keep-scratch run.
-    //   - 16 bytes: stage 2 also completed; resolved_count is the value
+    // Manifest layout (LE): [u64 total_slots][u64 unique_nodes][u64 resolved_count?]
+    //   - 16 bytes: only stage 1 completed in the prior keep-scratch run.
+    //   - 24 bytes: stage 2 also completed; resolved_count is the value
     //     stage 2 returned for this dataset.
-    // Used by --start-stage >= 2 resumes to recover what stage 2 would
-    // have produced. resolved_count is needed by Stats.missing_locations
-    // when stage 2 is skipped.
+    // Used by --start-stage >= 2 resumes to recover the scalars stage 1
+    // and stage 2 produced, avoiding a ~2 GB IdSetDense rebuild.
+    // resolved_count is needed by Stats.missing_locations when stage 2
+    // is skipped.
     let mut manifest_resolved_count: Option<u64> = None;
 
-    let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
-        if start >= 2 {
-            let manifest = std::fs::read(&manifest_path)
-                .map_err(|e| format!("read manifest for --start-stage: {e}. Run with --keep-scratch first."))?;
-            if manifest.len() < 8 {
-                return Err("manifest too small".into());
-            }
-            let total_slots = u64::from_le_bytes(manifest[..8].try_into()
-                .map_err(|_| "manifest read failed")?);
-            if manifest.len() >= 16 {
-                manifest_resolved_count = Some(
-                    u64::from_le_bytes(manifest[8..16].try_into()
-                        .map_err(|_| "manifest resolved_count read failed")?),
-                );
-            }
-
-            let schedule = build_way_schedule(input)?;
-            let shared_file = std::sync::Arc::new(
-                std::fs::File::open(input)
-                    .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers) = if start >= 2 {
+        let manifest = std::fs::read(&manifest_path)
+            .map_err(|e| format!("read manifest for --start-stage: {e}. Run with --keep-scratch first."))?;
+        if manifest.len() < 16 {
+            return Err("manifest too small: expected >=16 bytes (total_slots + unique_nodes). \
+                        Re-run with --keep-scratch from stage 1; the manifest layout changed."
+                .into());
+        }
+        let total_slots = u64::from_le_bytes(manifest[..8].try_into()
+            .map_err(|_| "manifest total_slots read failed")?);
+        let unique_nodes = u64::from_le_bytes(manifest[8..16].try_into()
+            .map_err(|_| "manifest unique_nodes read failed")?);
+        if manifest.len() >= 24 {
+            manifest_resolved_count = Some(
+                u64::from_le_bytes(manifest[16..24].try_into()
+                    .map_err(|_| "manifest resolved_count read failed")?),
             );
-            let num_workers = std::thread::available_parallelism()
-                .map(|n| n.get().saturating_sub(2).max(1))
-                .unwrap_or(4);
+        }
 
-            let mut node_id_set = IdSetDense::new();
-            #[allow(clippy::cast_possible_wrap)]
-            node_id_set.pre_allocate(MAX_NODE_ID as i64);
-
-            let next_idx = std::sync::atomic::AtomicUsize::new(0);
-            {
-                let schedule_ref = &schedule;
-                let next_ref = &next_idx;
-                let node_id_set_ref = &node_id_set;
-
-                std::thread::scope(|scope| {
-                    for _ in 0..num_workers {
-                        let file = std::sync::Arc::clone(&shared_file);
-                        scope.spawn(move || {
-                            use std::os::unix::fs::FileExt as _;
-                            let mut read_buf: Vec<u8> = Vec::new();
-                            let mut decompress_buf: Vec<u8> = Vec::new();
-                            let mut refs_buf: Vec<i64> = Vec::new();
-                            let mut group_starts: Vec<(usize, usize)> = Vec::new();
-
-                            loop {
-                                let idx = next_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if idx >= schedule_ref.len() { break; }
-                                let task = &schedule_ref[idx];
-                                read_buf.resize(task.data_size, 0);
-                                if file.read_exact_at(&mut read_buf, task.data_offset).is_err() { break; }
-                                if crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf).is_err() { break; }
-                                drop(super::way_scanner::scan_way_refs(
-                                    &decompress_buf, &mut refs_buf, &mut group_starts,
-                                    |_way_id, refs| {
-                                        for &node_id in refs {
-                                            node_id_set_ref.set_atomic(node_id);
-                                        }
-                                    },
-                                ));
-                            }
-                        });
-                    }
-                });
+        // Recover rank_bucket_counts and num_shard_workers from scratch
+        // file metadata. No IdSetDense rebuild needed — unique_nodes
+        // came from the manifest, and downstream stages never read the
+        // set itself.
+        let mut rank_bucket_counts = vec![0u64; NUM_BUCKETS];
+        let mut num_shard_workers = 0usize;
+        loop {
+            let path = scratch_dir.path.join(format!("rank-W{num_shard_workers}-000"));
+            if path.exists() {
+                num_shard_workers += 1;
+            } else {
+                break;
             }
-            node_id_set.build_rank_index();
-            let unique_nodes = node_id_set.total_count();
-
-            let mut rank_bucket_counts = vec![0u64; NUM_BUCKETS];
-            let mut num_shard_workers = 0usize;
-            loop {
-                let path = scratch_dir.path.join(format!("rank-W{num_shard_workers}-000"));
-                if path.exists() {
-                    num_shard_workers += 1;
-                } else {
-                    break;
+        }
+        num_shard_workers = num_shard_workers.max(1);
+        for bucket_idx in 0..NUM_BUCKETS {
+            for worker_id in 0..num_shard_workers {
+                let path = scratch_dir.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+                if let Ok(meta) = std::fs::metadata(&path) {
+                    rank_bucket_counts[bucket_idx] += meta.len() / RANK_RECORD_SIZE as u64;
                 }
             }
-            num_shard_workers = num_shard_workers.max(1);
-            for bucket_idx in 0..NUM_BUCKETS {
-                for worker_id in 0..num_shard_workers {
-                    let path = scratch_dir.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-                    if let Ok(meta) = std::fs::metadata(&path) {
-                        rank_bucket_counts[bucket_idx] += meta.len() / RANK_RECORD_SIZE as u64;
-                    }
-                }
-            }
+        }
 
-            (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set)
-        } else {
-            crate::debug::emit_marker("EXTJOIN_STAGE1_START");
-            let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
-            let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set) =
-                stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, &per_way_refcount_sidecar, Some(&coord_file_path))?;
-            let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
-            let total_coo: u64 = rank_bucket_counts.iter().sum();
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
-                crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
-                crate::debug::emit_counter("extjoin_unique_nodes", unique_nodes as i64);
-                crate::debug::emit_counter("s1_minflt_delta", (s1_minflt_after - s1_minflt_before) as i64);
-                crate::debug::emit_counter("s1_majflt_delta", (s1_majflt_after - s1_majflt_before) as i64);
-            }
-            crate::debug::emit_marker("EXTJOIN_STAGE1_END");
+        (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers)
+    } else {
+        crate::debug::emit_marker("EXTJOIN_STAGE1_START");
+        let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
+        let (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers) =
+            stage1_way_pass(input, direct_io, &scratch_dir, &ref_count_sidecar, &per_way_refcount_sidecar, Some(&coord_file_path))?;
+        let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
+        let total_coo: u64 = rank_bucket_counts.iter().sum();
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("extjoin_total_slots", total_slots as i64);
+            crate::debug::emit_counter("extjoin_total_coo", total_coo as i64);
+            crate::debug::emit_counter("extjoin_unique_nodes", unique_nodes as i64);
+            crate::debug::emit_counter("s1_minflt_delta", (s1_minflt_after - s1_minflt_before) as i64);
+            crate::debug::emit_counter("s1_majflt_delta", (s1_majflt_after - s1_majflt_before) as i64);
+        }
+        crate::debug::emit_marker("EXTJOIN_STAGE1_END");
 
-            if keep_scratch {
-                std::fs::write(&manifest_path, total_slots.to_le_bytes())
-                    .map_err(|e| format!("write manifest: {e}"))?;
-            }
+        if keep_scratch {
+            let mut buf = Vec::with_capacity(16);
+            buf.extend_from_slice(&total_slots.to_le_bytes());
+            buf.extend_from_slice(&unique_nodes.to_le_bytes());
+            std::fs::write(&manifest_path, &buf)
+                .map_err(|e| format!("write manifest: {e}"))?;
+        }
 
-            (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set)
-        };
+        (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers)
+    };
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
     // every bucket can fit at least one full blob's slot range. This
@@ -338,8 +301,9 @@ pub fn external_join(
             // Extend the manifest with resolved_count so a future
             // --start-stage >= 3 resume can populate
             // Stats.missing_locations.
-            let mut buf = Vec::with_capacity(16);
+            let mut buf = Vec::with_capacity(24);
             buf.extend_from_slice(&total_slots.to_le_bytes());
+            buf.extend_from_slice(&unique_nodes.to_le_bytes());
             buf.extend_from_slice(&resolved_count.to_le_bytes());
             std::fs::write(&manifest_path, &buf)
                 .map_err(|e| format!("write manifest with resolved_count: {e}"))?;

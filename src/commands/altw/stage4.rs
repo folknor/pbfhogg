@@ -1,6 +1,7 @@
 //! Stage 4: Assembly — emit enriched PBF.
 //!
-//! Re-reads the PBF, attaches coordinates from coord_slots to ways.
+//! Re-reads the PBF, attaches coordinates from per-blob coord_payloads preads
+//! to ways.
 //! P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
 //! Way blobs use wire-format reframe (no full decode); non-way blobs use BlockBuilder.
 
@@ -77,7 +78,8 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 // Stage 4: Assembly
 // ---------------------------------------------------------------------------
 
-/// Assembly pass: re-read the PBF, attach coordinates from coord_slots to ways.
+/// Assembly pass: re-read the PBF, attach coordinates from per-blob
+/// coord_payloads preads to ways.
 /// P2c: pread-from-workers with pre-scan schedule for parallel decompress + assembly.
 /// See notes/p2c-parallel-assembly-spec.md.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -923,6 +925,13 @@ fn reframe_way_blob_with_locations(
 
     counters.refs_total.fetch_add(blob_refs, Relaxed);
     counters.ways_total.fetch_add(total_ways, Relaxed);
+
+    if payload_pos != coord_payload.len() {
+        return Err(format!(
+            "coord_payload: consumed {payload_pos} of {} bytes (trailing bytes indicate stage 3 over-production or version skew)",
+            coord_payload.len()
+        ));
+    }
 
     Ok((total_ways, way_slot_pos, min_way_id, max_way_id, missing_locations))
 }

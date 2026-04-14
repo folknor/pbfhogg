@@ -278,7 +278,13 @@ pub(super) fn stage2_node_join(
                 let mut loader = LoaderScratch {
                     data_buf: Vec::new(), counts: Vec::new(), write_pos: Vec::new(),
                 };
-                let mut coord_slice: Vec<u8> = Vec::new();
+                // Pre-size once to the per-bucket worst case (the nominal
+                // rank_range_size; the last bucket may be smaller but
+                // never larger). Every pread slices the prefix it needs,
+                // avoiding any per-bucket resize + zero-fill work.
+                #[allow(clippy::cast_possible_truncation)]
+                let max_slice_bytes = (rank_range_size as usize) * COORD_SLOT_SIZE;
+                let mut coord_slice: Vec<u8> = vec![0u8; max_slice_bytes];
                 let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
                 let mut local_resolved: u64 = 0;
 
@@ -319,9 +325,8 @@ pub(super) fn stage2_node_join(
                         // Pread this bucket's contiguous coord slice.
                         let t_coord = std::time::Instant::now();
                         let slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
-                        coord_slice.resize(slice_bytes, 0);
                         cf.read_exact_at(
-                            &mut coord_slice, bkt.bucket_rank_start * COORD_SLOT_SIZE as u64,
+                            &mut coord_slice[..slice_bytes], bkt.bucket_rank_start * COORD_SLOT_SIZE as u64,
                         ).map_err(|e| format!("pread coord slice: {e}"))?;
                         #[allow(clippy::cast_possible_truncation)]
                         coord_read_ref.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);

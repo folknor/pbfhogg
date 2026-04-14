@@ -340,31 +340,51 @@ single-pass, tag expression and bbox filtering.
 
   **Still open — small / quick:**
 
-  - [ ] **Stage 4 `coord_payload` trailing-bytes assert.** One-line
-    defensive check after the de-interleave loop:
-    `payload_pos == coord_payload.len()`. Catches stage 3 bugs,
-    truncated payloads, and version skew at the boundary. (External
-    review 2026-04-14 #1.)
-  - [ ] **Drop `IdSetDense` after stage 1.** `stage1_way_pass` returns
-    the full set; downstream stages never read it. Holding it costs
-    ~2+ GB RSS through stage 2/3/4 unnecessarily. Resume path rebuilds
-    it for nothing — only `unique_nodes` is needed and that can be
-    persisted in the manifest (see `--start-stage` fix above).
-    (External review 2026-04-14 #2.)
-  - [ ] **Sparse stage 2 slot buffers.** `stage2.rs:285` allocates
-    `Vec<Vec<u8>>` of 256 entries × 6 workers eagerly. Worst-case
-    capacity at 256 KB threshold = 384 MB. Use a sparse map (or
-    `Vec<Option<Vec<u8>>>` with lazy init) so unused buckets cost
-    nothing. (External review 2026-04-14 #1.)
-  - [ ] **`coord_slice` resize moved out of per-bucket loop**
-    (`stage2.rs:317`) — pre-size once per worker; trivial.
-    (External review 2026-04-14 #1.)
+  - [x] ~~Stage 4 `coord_payload` trailing-bytes assert.~~ Shipped
+    2026-04-14. One-line defensive check `payload_pos ==
+    coord_payload.len()` after the de-interleave loop (stage4.rs);
+    returns a descriptive Err on mismatch. Catches stage 3 bugs,
+    truncated payloads, version skew. (External review 2026-04-14 #1.)
+  - [x] ~~Drop `IdSetDense` after stage 1.~~ Shipped 2026-04-14.
+    `stage1_way_pass` no longer returns the set; it's dropped
+    internally at end-of-stage, saving ~2 GB RSS through stages
+    2/3/4. Manifest layout extended to
+    `[u64 total_slots][u64 unique_nodes][u64 resolved_count?]`
+    (16/24 bytes); `--start-stage >= 2` reads `unique_nodes` from
+    manifest instead of rebuilding the set. (External review
+    2026-04-14 #2.)
+  - [ ] ~~Sparse stage 2 slot buffers.~~ Investigated 2026-04-14,
+    not applied. `Vec::new()` is zero-allocation, so the eager
+    256-entry vector itself costs nothing. The 384 MB worst-case
+    only materializes when every worker touches every bucket — and
+    at planet scale that's exactly what happens (slot_pos
+    distribution scatters across all 256 buckets for every rank
+    bucket a worker processes). At small scales,
+    `slot_bucket_count` is already clamped dynamically by the
+    small-input fix. Revisit only if per-worker scratch becomes a
+    constraint for a different reason.
+  - [x] ~~`coord_slice` resize moved out of per-bucket loop~~
+    (`stage2.rs`). Shipped 2026-04-14. Pre-sized once per worker
+    to `rank_range_size * COORD_SLOT_SIZE`; per-bucket preads slice
+    the needed prefix. Eliminates the per-bucket `resize(.., 0)`
+    zero-fill. (External review 2026-04-14 #1.)
   - [ ] **Per-way refcounts threaded into stage 4** so
     `reframe_way_blob_with_locations` can stop re-counting refs from
-    field 8 varints. Modest CPU win, not transformative. (External
-    review 2026-04-14 #2 hypothetical.)
-  - [ ] **Stale "coord_slots" comment sweep** across `altw/*` after
-    the rename. Cosmetic. (External review 2026-04-14 #1.)
+    field 8 varints. Modest CPU win, not transformative. **Deferred:**
+    standalone, this requires keeping `PerWayRcs` (~4.7 GB planet)
+    alive through stage 4 (the peak-RSS stage), trading modest CPU
+    for a big RSS squeeze on 32 GB hosts. Bundle with the
+    `PerWayRcs` lazy per-blob decode item below, which saves
+    ~3.5 GB RSS AND enables refcount threading at lower peak.
+    (External review 2026-04-14 #2 hypothetical.)
+  - [x] ~~Stale "coord_slots" comment sweep~~ across `altw/*`.
+    Shipped 2026-04-14. Updated the module-level pipeline description
+    in `mod.rs`, the slot_pos/ResolvedEntry docstrings, and the
+    top-of-file comments in `stage3.rs` / `stage4.rs`. Left intact the
+    intentional historical references in `coord_payloads.rs` (ratio
+    comparison to the retired format) and `stage3.rs:178`
+    (explicit "pre-integration" context). (External review
+    2026-04-14 #1.)
 
   **Still open — measurable wins inside the current architecture:**
 

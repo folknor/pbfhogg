@@ -1,4 +1,5 @@
-//! Stage 3: Slot reorder — build final coord_slots file.
+//! Stage 3: Slot reorder — emit per-blob coord_payloads via the integrated
+//! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
 use std::path::Path;
 

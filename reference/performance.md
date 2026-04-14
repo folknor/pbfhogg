@@ -213,9 +213,7 @@ non-wall benefits. Planet measured −29 s wall as a pleasant surprise;
 Europe +7 s. The structural wins are: scratch peak 300 GB → 256 GB
 (−44 GB), stage-4 major faults 555K → 3.2K (−99.4%), stage-4
 delta-encode CPU 68 s cumulative → 0, no more 99 GB `coord_slots`
-mmap thrashing across 6 workers. See
-[altw-coord-payloads-integration-stages.md](../notes/altw-coord-payloads-integration-stages.md)
-for the staged plan.
+mmap thrashing across 6 workers.
 
 Key earlier optimizations: node-only wire scanner (bypasses
 PrimitiveBlock, eliminates 25 GB heap retention), scatter buffer

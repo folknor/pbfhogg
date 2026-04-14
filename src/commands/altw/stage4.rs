@@ -287,12 +287,11 @@ pub(super) fn stage4_assembly(
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    // A/B probe: bumped from 32 to 256 to test whether `s4_send_ms`
-    // backpressure is burst-absorption (helped by a deeper queue) or
-    // steady-state writer/compression saturation (a deeper queue just
-    // moves the wait into the writer pipeline, surfaced via the new
-    // `s4_flush_ms` counter at the end of stage 4).
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(256);
+    // Channel capacity 32 — the 256-depth A/B probe confirmed that
+    // `s4_send_ms` pressure is steady-state consumer/compression
+    // saturation, not burst absorption. A deeper channel just moves
+    // the wait into the writer pipeline with no wall change.
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
 
     let mut total_stats = Stats::default();
 
@@ -322,9 +321,6 @@ pub(super) fn stage4_assembly(
     let mut s4_passthrough_blobs: u64 = 0;
     let mut s4_passthrough_pread_ms: u64 = 0;
     let mut s4_passthrough_bytes: u64 = 0;
-    // Reorder-buffer high-water (consumer-only). Tracks how out-of-order
-    // workers ran ahead of the head item the consumer was waiting on.
-    let mut s4_reorder_high_water: usize = 0;
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
@@ -687,11 +683,6 @@ pub(super) fn stage4_assembly(
             };
 
             reorder.push(seq_num, ConsumerItem::Decoded(item));
-            // Track reorder-buffer high-water (single-thread consumer
-            // owns this — no atomics needed).
-            if reorder.len() > s4_reorder_high_water {
-                s4_reorder_high_water = reorder.len();
-            }
             drain(
                 &mut reorder, &mut total_stats,
                 &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
@@ -753,7 +744,6 @@ pub(super) fn stage4_assembly(
             "s4_channel_high_water",
             s4_channel_high_water.load(std::sync::atomic::Ordering::Relaxed) as i64,
         );
-        crate::debug::emit_counter("s4_reorder_high_water", s4_reorder_high_water as i64);
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
         crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
         crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex as i64);
@@ -854,17 +844,13 @@ fn assemble_block(
 
 /// Sub-phase counters for the way reframe hot path.
 ///
-/// Timing fields accumulate **nanoseconds** internally — `.as_millis()` per
-/// operation truncates every < 1 ms sample to zero, which under planet/
-/// Europe load (hundreds of millions of ways, each a few hundred ns of
-/// work) erases the majority of the signal. The emit path converts back
-/// to milliseconds so downstream counter names stay stable.
+/// Timing is captured **per-blob** only (parse_block, group_reframe,
+/// unknown_field_copy). The earlier per-way timers were stripped after
+/// they confirmed the way path is not the wall-critical segment; per-way
+/// `Instant::now()` samples were a measurable cost at 1.16B ways/planet
+/// and provided no actionable signal beyond the blob-level attribution.
 struct WayReframeCounters {
     parse_block_ns: std::sync::atomic::AtomicU64,
-    parse_way_ns: std::sync::atomic::AtomicU64,
-    ref_parse_ns: std::sync::atomic::AtomicU64,
-    coord_read_ns: std::sync::atomic::AtomicU64,
-    reassemble_ns: std::sync::atomic::AtomicU64,
     unknown_field_copy_ns: std::sync::atomic::AtomicU64,
     group_reframe_ns: std::sync::atomic::AtomicU64,
     refs_total: std::sync::atomic::AtomicU64,
@@ -879,10 +865,6 @@ impl WayReframeCounters {
     fn new() -> Self {
         Self {
             parse_block_ns: std::sync::atomic::AtomicU64::new(0),
-            parse_way_ns: std::sync::atomic::AtomicU64::new(0),
-            ref_parse_ns: std::sync::atomic::AtomicU64::new(0),
-            coord_read_ns: std::sync::atomic::AtomicU64::new(0),
-            reassemble_ns: std::sync::atomic::AtomicU64::new(0),
             unknown_field_copy_ns: std::sync::atomic::AtomicU64::new(0),
             group_reframe_ns: std::sync::atomic::AtomicU64::new(0),
             refs_total: std::sync::atomic::AtomicU64::new(0),
@@ -901,10 +883,6 @@ impl WayReframeCounters {
         // counter names and downstream comparisons stay on the same unit.
         let ns_to_ms = |ns: u64| (ns / 1_000_000) as i64;
         crate::debug::emit_counter("s4_way_parse_block_ms", ns_to_ms(self.parse_block_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_parse_way_ms", ns_to_ms(self.parse_way_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_ref_parse_ms", ns_to_ms(self.ref_parse_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_coord_read_ms", ns_to_ms(self.coord_read_ns.load(Relaxed)));
-        crate::debug::emit_counter("s4_way_reassemble_ms", ns_to_ms(self.reassemble_ns.load(Relaxed)));
         crate::debug::emit_counter("s4_way_unknown_field_copy_ms", ns_to_ms(self.unknown_field_copy_ns.load(Relaxed)));
         crate::debug::emit_counter("s4_way_group_reframe_ms", ns_to_ms(self.group_reframe_ns.load(Relaxed)));
         crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
@@ -1042,7 +1020,6 @@ fn reframe_way_blob_with_locations(
                 // Way submessage — splice locations.
                 let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
 
-                let t_way = std::time::Instant::now();
                 let mut way_id: i64 = 0;
                 let mut refs_data: &[u8] = &[];
                 let mut refs_range: Option<(usize, usize)> = None;
@@ -1062,14 +1039,10 @@ fn reframe_way_blob_with_locations(
                     }
                 }
 
-                #[allow(clippy::cast_possible_truncation)]
-                counters.parse_way_ns.fetch_add(t_way.elapsed().as_nanos() as u64, Relaxed);
-
                 if way_id < min_way_id { min_way_id = way_id; }
                 if way_id > max_way_id { max_way_id = way_id; }
 
                 // Pass 1a: count refs by skipping varints.
-                let t_ref_parse = std::time::Instant::now();
                 let mut ref_count: u64 = 0;
                 if !refs_data.is_empty() {
                     let mut ref_cursor = Cursor::new(refs_data);
@@ -1078,14 +1051,11 @@ fn reframe_way_blob_with_locations(
                         ref_count += 1;
                     }
                 }
-                #[allow(clippy::cast_possible_truncation)]
-                counters.ref_parse_ns.fetch_add(t_ref_parse.elapsed().as_nanos() as u64, Relaxed);
 
                 // De-interleave pre-encoded varints from coord_payload into
                 // PBF packed fields 9/10. The raw varint bytes match PBF's
                 // packed sint32 wire format 1:1, so we copy bytes without
                 // zigzag decode + re-encode.
-                let t_read = std::time::Instant::now();
                 scratch.packed_lats.clear();
                 scratch.packed_lons.clear();
                 for _ in 0..ref_count {
@@ -1113,10 +1083,6 @@ fn reframe_way_blob_with_locations(
                     scratch.packed_lons.extend_from_slice(&coord_payload[lon_start..payload_pos]);
                 }
                 way_slot_pos += ref_count;
-                #[allow(clippy::cast_possible_truncation)]
-                counters
-                    .coord_read_ns
-                    .fetch_add(t_read.elapsed().as_nanos() as u64, Relaxed);
                 blob_refs_present += ref_count;
                 if ref_count > blob_max_refs_per_way {
                     blob_max_refs_per_way = ref_count;
@@ -1126,7 +1092,6 @@ fn reframe_way_blob_with_locations(
                 blob_refs += ref_count;
 
                 // Build reframed way: original bytes + appended fields 9, 10.
-                let t_reassemble = std::time::Instant::now();
                 scratch.reframed_way.clear();
                 if let Some((refs_start, refs_end)) = refs_range {
                     scratch.reframed_way.extend_from_slice(&way_bytes[..refs_start]);
@@ -1141,8 +1106,6 @@ fn reframe_way_blob_with_locations(
                 }
 
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
-                #[allow(clippy::cast_possible_truncation)]
-                counters.reassemble_ns.fetch_add(t_reassemble.elapsed().as_nanos() as u64, Relaxed);
                 total_ways += 1;
             } else {
                 // Non-way field in the group — copy verbatim.

@@ -36,7 +36,6 @@
 //! For each way, consume `2*ref_count` varints, unzigzag, accumulate running
 //! lat/lon. No per-way framing bytes.
 
-use std::io::{Seek as _, Write as _};
 use std::path::Path;
 
 use super::super::Result;
@@ -61,6 +60,13 @@ pub(super) struct ManifestEntry {
     pub blob_idx: u32,
     pub byte_offset: u64,
     pub byte_length: u64,
+}
+
+struct WorkerCopyTask {
+    blob_idx: usize,
+    src_offset: u64,
+    dst_offset: u64,
+    len: usize,
 }
 
 /// Stats from `finalize_coord_payloads`.
@@ -225,10 +231,11 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
 
 /// Finalize the integrated coord_payloads file after stage 3 workers complete.
 ///
-/// Walks blobs 0..num_way_blobs in order. Straddler blobs are encoded from
-/// their two raw-slot-byte halves; fully-contained blobs are pread from the
-/// worker's temp file and written verbatim (already encoded by the worker).
-/// Blobs with no manifest and no straddler must have zero ref count.
+/// Walks blobs 0..num_way_blobs once to compute final payload offsets.
+/// Straddler blobs are still encoded by the coordinator, but fully-contained
+/// blobs are copied in parallel from worker temp files directly into their
+/// final offsets via `pwrite`. Blobs with no manifest and no straddler must
+/// have zero ref count.
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
 pub(super) fn finalize_coord_payloads(
     output_path: &Path,
@@ -278,38 +285,14 @@ pub(super) fn finalize_coord_payloads(
         }
     }
 
-    // Open worker temp files for pread.
-    let mut worker_files: Vec<std::fs::File> = Vec::with_capacity(worker_tmp_paths.len());
-    for path in worker_tmp_paths {
-        let f = std::fs::File::open(path)
-            .map_err(|e| format!("open worker tmp {}: {e}", path.display()))?;
-        worker_files.push(f);
-    }
-
-    let output_file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open(output_path)
-        .map_err(|e| format!("create coord_payloads: {e}"))?;
-
     let header_size: u64 = 16 + (num_way_blobs as u64 + 1) * 8;
     let mut blob_offsets: Vec<u64> = Vec::with_capacity(num_way_blobs + 1);
     blob_offsets.push(0);
-
-    let mut output_writer = std::io::BufWriter::with_capacity(
-        1024 * 1024,
-        output_file
-            .try_clone()
-            .map_err(|e| format!("clone coord_payloads handle: {e}"))?,
-    );
-    output_writer
-        .seek(std::io::SeekFrom::Start(header_size))
-        .map_err(|e| format!("seek past header in coord_payloads: {e}"))?;
+    let mut worker_tasks: Vec<Vec<WorkerCopyTask>> =
+        (0..worker_tmp_paths.len()).map(|_| Vec::new()).collect();
+    let mut straddler_writes: Vec<(usize, u64, Vec<u8>)> = Vec::new();
 
     let mut encode_scratch: Vec<u8> = Vec::with_capacity(1024 * 1024);
-    let mut read_scratch: Vec<u8> = Vec::new();
     let mut payload_pos: u64 = 0;
     let mut stats = FinalizeStats {
         output_bytes: 0,
@@ -343,16 +326,12 @@ pub(super) fn finalize_coord_payloads(
                     .map_err(|e| format!("finalize straddler blob {blob_idx}: {e}"))?;
                 #[allow(clippy::cast_possible_truncation)]
                 { stats.encode_ms += t_enc.elapsed().as_millis() as u64; }
-
-                let t_wr = Instant::now();
-                output_writer
-                    .write_all(&encode_scratch)
-                    .map_err(|e| format!("write coord_payloads blob {blob_idx}: {e}"))?;
-                #[allow(clippy::cast_possible_truncation)]
-                { stats.write_ms += t_wr.elapsed().as_millis() as u64; }
-
                 stats.num_straddlers += 1;
-                encode_scratch.len()
+                let mut bytes = Vec::new();
+                std::mem::swap(&mut bytes, &mut encode_scratch);
+                let len = bytes.len();
+                straddler_writes.push((blob_idx, header_size + payload_pos, bytes));
+                len
             }
             Some(StraddlerSlot::Left(_)) => {
                 return Err(format!(
@@ -371,24 +350,12 @@ pub(super) fn finalize_coord_payloads(
                     Some((worker_id, byte_offset, byte_length)) => {
                         #[allow(clippy::cast_possible_truncation)]
                         let len = byte_length as usize;
-                        read_scratch.resize(len, 0);
-
-                        let t_rd = Instant::now();
-                        if len > 0 {
-                            worker_files[worker_id]
-                                .read_exact_at(&mut read_scratch, byte_offset)
-                                .map_err(|e| format!("pread worker {worker_id} blob {blob_idx}: {e}"))?;
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        { stats.read_ms += t_rd.elapsed().as_millis() as u64; }
-
-                        let t_wr = Instant::now();
-                        output_writer
-                            .write_all(&read_scratch)
-                            .map_err(|e| format!("write coord_payloads blob {blob_idx}: {e}"))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        { stats.write_ms += t_wr.elapsed().as_millis() as u64; }
-
+                        worker_tasks[worker_id].push(WorkerCopyTask {
+                            blob_idx,
+                            src_offset: byte_offset,
+                            dst_offset: header_size + payload_pos,
+                            len,
+                        });
                         len
                     }
                     None => {
@@ -401,23 +368,7 @@ pub(super) fn finalize_coord_payloads(
                                  entry and no straddler staging — upstream bug"
                             ).into());
                         }
-                        encode_scratch.clear();
-                        encode_blob_payload_from_record(
-                            &[],
-                            per_way_rcs.blob_record(blob_idx),
-                            blob_idx,
-                            &mut encode_scratch,
-                        )
-                            .map_err(|e| format!("encode zero-ref blob {blob_idx}: {e}"))?;
-
-                        let t_wr = Instant::now();
-                        output_writer
-                            .write_all(&encode_scratch)
-                            .map_err(|e| format!("write coord_payloads blob {blob_idx}: {e}"))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        { stats.write_ms += t_wr.elapsed().as_millis() as u64; }
-
-                        encode_scratch.len()
+                        0
                     }
                 }
             }
@@ -427,12 +378,106 @@ pub(super) fn finalize_coord_payloads(
         blob_offsets.push(payload_pos);
     }
 
-    output_writer
-        .flush()
-        .map_err(|e| format!("flush coord_payloads: {e}"))?;
-    drop(output_writer);
-
     stats.output_bytes = header_size + payload_pos;
+
+    let output_file = std::sync::Arc::new(
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(output_path)
+            .map_err(|e| format!("create coord_payloads: {e}"))?
+    );
+    output_file
+        .set_len(stats.output_bytes)
+        .map_err(|e| format!("preallocate coord_payloads: {e}"))?;
+
+    let read_ms = std::sync::atomic::AtomicU64::new(0);
+    let write_ms = std::sync::atomic::AtomicU64::new(0);
+
+    std::thread::scope(|scope| -> Result<()> {
+        let mut handles = Vec::new();
+        for (worker_id, tasks) in worker_tasks.into_iter().enumerate() {
+            if tasks.is_empty() {
+                continue;
+            }
+            let output_file = std::sync::Arc::clone(&output_file);
+            let worker_tmp_path = worker_tmp_paths[worker_id].clone();
+            let read_ms_ref = &read_ms;
+            let write_ms_ref = &write_ms;
+            let handle = scope.spawn(move || -> std::result::Result<(), String> {
+                use std::os::unix::fs::FileExt as _;
+                use std::sync::atomic::Ordering::Relaxed;
+
+                let worker_file = std::fs::File::open(&worker_tmp_path)
+                    .map_err(|e| format!("open worker tmp {}: {e}", worker_tmp_path.display()))?;
+                let mut read_scratch: Vec<u8> = Vec::new();
+
+                for task in tasks {
+                    read_scratch.resize(task.len, 0);
+
+                    let t_rd = Instant::now();
+                    if task.len > 0 {
+                        worker_file
+                            .read_exact_at(&mut read_scratch, task.src_offset)
+                            .map_err(|e| format!(
+                                "pread worker {worker_id} blob {}: {e}",
+                                task.blob_idx,
+                            ))?;
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    read_ms_ref.fetch_add(t_rd.elapsed().as_millis() as u64, Relaxed);
+
+                    let t_wr = Instant::now();
+                    if task.len > 0 {
+                        output_file
+                            .write_all_at(&read_scratch, task.dst_offset)
+                            .map_err(|e| format!(
+                                "pwrite coord_payloads blob {} from worker {worker_id}: {e}",
+                                task.blob_idx,
+                            ))?;
+                    }
+                    #[allow(clippy::cast_possible_truncation)]
+                    write_ms_ref.fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
+                }
+                Ok(())
+            });
+            handles.push(handle);
+        }
+
+        for handle in handles {
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => return Err(e.into()),
+                Err(payload) => {
+                    let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                        format!("finalize worker thread panicked: {s}")
+                    } else if let Some(s) = payload.downcast_ref::<String>() {
+                        format!("finalize worker thread panicked: {s}")
+                    } else {
+                        "finalize worker thread panicked (unknown payload)".to_string()
+                    };
+                    return Err(msg.into());
+                }
+            }
+        }
+        Ok(())
+    })?;
+
+    for (blob_idx, dst_offset, bytes) in straddler_writes {
+        let t_wr = Instant::now();
+        output_file
+            .write_all_at(&bytes, dst_offset)
+            .map_err(|e| format!("pwrite coord_payloads straddler blob {blob_idx}: {e}"))?;
+        #[allow(clippy::cast_possible_truncation)]
+        {
+            stats.write_ms += t_wr.elapsed().as_millis() as u64;
+        }
+    }
+
+    stats.read_ms = read_ms.load(std::sync::atomic::Ordering::Relaxed);
+    stats.write_ms += write_ms.load(std::sync::atomic::Ordering::Relaxed);
 
     let mut header_buf: Vec<u8> = Vec::with_capacity(header_size as usize);
     header_buf.extend_from_slice(&(num_way_blobs as u64).to_le_bytes());

@@ -292,13 +292,13 @@ single-pass, tag expression and bbox filtering.
     is gone. Small inputs scale down to fewer slot buckets; the
     2-piece straddler invariant remains by construction.
     (External review 2026-04-14 #2.)
-  - [ ] **External `Stats.missing_locations` always reports 0.** Dense
-    path increments on lookup failure (`add_locations_to_ways.rs:1241`);
-    external returns the static initial 0 (`stage4.rs:771,925`). Stats
-    inconsistency between modes. Either: (a) track missing in stage 4
-    by checking decoded coords against (0,0) sentinel; or (b) document
-    the difference and remove the field from external Stats output.
-    (External review 2026-04-14 #2.)
+  - [x] ~~External `Stats.missing_locations` always reports 0.~~ Fixed.
+    Computed once in `external_join` after stage 4 as
+    `total_slots − stage2_resolved_count` (stage 2 already
+    discriminates resolved-vs-(0,0)-sentinel during the node join).
+    Matches dense semantics without a per-ref decode in the stage-4
+    hot loop. `--start-stage >= 3` skips stage 2, so the field stays
+    at 0 with a one-time eprintln. (External review 2026-04-14 #2.)
 
   **Bugs (lower priority, dev-time only):**
 

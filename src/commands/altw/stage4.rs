@@ -713,8 +713,10 @@ impl WayReframeScratch {
 /// copying raw varint bytes into `packed_lats` and `packed_lons` without
 /// zigzag-decoding or re-encoding.
 ///
-/// `missing_locations` is not tracked: the (0,0) sentinel — Null Island
-/// in decimicrodegrees — is accepted as a valid coordinate.
+/// `missing_locations` is left at 0 here. The whole-pipeline value is
+/// computed once in `external_join` as `total_slots - stage2_resolved_count`
+/// so it matches the dense path's per-ref counter without paying a per-ref
+/// decode in this hot loop.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn reframe_way_blob_with_locations(
     decompressed: &[u8],

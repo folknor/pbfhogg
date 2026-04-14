@@ -296,12 +296,19 @@ pub fn external_join(
         max_useful
     };
 
+    // Captured if stage 2 runs this invocation; used at the end to fill
+    // Stats.missing_locations consistently with the dense path. None means
+    // stage 2 was skipped (--start-stage >= 3); the field stays 0 in that
+    // case, with a one-time eprintln so users aren't silently misled.
+    let mut stage2_resolved_count: Option<u64> = None;
+
     if start <= 2 {
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
         let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
         let resolved_count =
             stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &slot_buckets, slot_bucket_count, total_slots, unique_nodes, &coord_file_path)?;
+        stage2_resolved_count = Some(resolved_count);
         slot_buckets.finish()?;
         let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
@@ -437,7 +444,7 @@ pub fn external_join(
 
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
-    let stats = stage4_assembly(
+    let mut stats = stage4_assembly(
         input,
         output,
         &coord_payloads_reader,
@@ -456,6 +463,20 @@ pub fn external_join(
         crate::debug::emit_counter("s4_majflt_delta", (s4_majflt_after - s4_majflt_before) as i64);
     }
     crate::debug::emit_marker("EXTJOIN_STAGE4_END");
+
+    // Stats.missing_locations: derived from stage 2's resolved_count
+    // (which already discriminates resolved-vs-(0,0)-sentinel during the
+    // node join) so the field matches the dense path's semantics. When
+    // stage 2 was skipped via --start-stage >= 3 we have no fresh
+    // resolved_count and the field stays at 0 with a one-time notice.
+    if let Some(resolved) = stage2_resolved_count {
+        stats.missing_locations = total_slots.saturating_sub(resolved);
+    } else {
+        eprintln!(
+            "[altw] note: --start-stage skipped stage 2; \
+             Stats.missing_locations is not populated (left at 0)"
+        );
+    }
 
     if !keep_scratch {
         drop(scratch_dir);

@@ -8,7 +8,7 @@ use super::super::external_radix::NUM_BUCKETS;
 use super::super::external_radix::advise_dontneed_file;
 use super::super::Result;
 use super::coord_payloads::{
-    encode_blob_payload, ManifestEntry, PerWayRcs, StraddlerSlot,
+    encode_blob_payload_from_record, ManifestEntry, PerWayRcs, StraddlerSlot,
 };
 use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection};
 use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
@@ -392,7 +392,12 @@ fn emit_integrated_intersections(
 
                 let t_enc = std::time::Instant::now();
                 encode_scratch.clear();
-                encode_blob_payload(slice, ctx.per_way_rcs.blob(blob_idx), encode_scratch)
+                encode_blob_payload_from_record(
+                    slice,
+                    ctx.per_way_rcs.blob_record(blob_idx),
+                    blob_idx,
+                    encode_scratch,
+                )
                     .map_err(|e| format!("encode blob {blob_idx}: {e}"))?;
                 #[allow(clippy::cast_possible_truncation)]
                 s3_integ_encode_ref.fetch_add(t_enc.elapsed().as_millis() as u64, Relaxed);

@@ -334,7 +334,7 @@ pub fn external_join(
         Vec<std::path::PathBuf>,                                        // worker_tmp_paths
         Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>>,  // straddler_slots
     )> = if start <= 3 {
-        let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_flat(
+        let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
             &per_way_refcount_sidecar,
             way_slot_starts.len(),
         )?;
@@ -398,7 +398,7 @@ pub fn external_join(
                 &worker_tmp_paths,
                 straddler_slots,
             )?;
-            drop(per_way_rcs); // Free ~4.7 GB before stage 4.
+            drop(per_way_rcs); // Free the indexed per-way sidecar before stage 4.
             drop(way_slot_starts);
             eprintln!(
                 "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \

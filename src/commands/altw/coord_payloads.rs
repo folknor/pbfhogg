@@ -75,51 +75,118 @@ pub(super) struct FinalizeStats {
     pub write_ms: u64,
 }
 
-/// Flat per-way ref-count table.
+/// Indexed per-way ref-count sidecar.
 ///
-/// Uses a single allocation instead of `Vec<Vec<u32>>` to avoid allocator
-/// fragmentation at planet scale (~5 GB → 4.7 GB flat, cleaner cache access).
+/// Retains the original varint-encoded sidecar bytes and records only the
+/// per-blob byte offsets. Callers decode one blob's refcounts on demand,
+/// avoiding the planet-scale flat `Vec<u32>` residency that stage 3/finalize
+/// used to keep alive simultaneously.
 pub(super) struct PerWayRcs {
-    flat: Vec<u32>,
-    offsets: Vec<usize>, // len == num_blobs + 1; offsets[num_blobs] == flat.len()
+    data: Vec<u8>,
+    offsets: Vec<usize>, // len == num_blobs + 1; offsets[num_blobs] == data.len()
 }
 
 impl PerWayRcs {
-    pub(super) fn blob(&self, blob_idx: usize) -> &[u32] {
-        &self.flat[self.offsets[blob_idx]..self.offsets[blob_idx + 1]]
+    pub(super) fn blob_record(&self, blob_idx: usize) -> &[u8] {
+        &self.data[self.offsets[blob_idx]..self.offsets[blob_idx + 1]]
     }
 
     pub(super) fn num_blobs(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }
+
+    pub(super) fn decode_blob_into<'a>(
+        &self,
+        blob_idx: usize,
+        scratch: &'a mut Vec<u32>,
+    ) -> Result<&'a [u32]> {
+        decode_blob_record_into(self.blob_record(blob_idx), blob_idx, scratch)?;
+        Ok(scratch.as_slice())
+    }
+
+    pub(super) fn blob_has_nonzero_refs(&self, blob_idx: usize) -> Result<bool> {
+        blob_record_has_nonzero_refs(self.blob_record(blob_idx), blob_idx)
+    }
 }
 
-/// Parse the per-way refcount sidecar bytes into a flat `PerWayRcs`.
-///
-/// Extracted as a pure function so both the file loader and tests can call it.
-pub(super) fn parse_per_way_refcount_sidecar_bytes(
-    data: &[u8],
-    num_way_blobs: usize,
-) -> Result<PerWayRcs> {
-    let mut cursor = protohoggr::Cursor::new(data);
-    let mut flat: Vec<u32> = Vec::new();
+fn scan_blob_record(cursor: &mut protohoggr::Cursor<'_>, blob_idx: usize) -> Result<()> {
+    let num_ways = cursor
+        .read_varint()
+        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let num_ways_usize = num_ways as usize;
+    for way_idx in 0..num_ways_usize {
+        cursor
+            .read_varint()
+            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+    }
+    Ok(())
+}
+
+fn decode_blob_record_into(
+    record: &[u8],
+    blob_idx: usize,
+    scratch: &mut Vec<u32>,
+) -> Result<()> {
+    let mut cursor = protohoggr::Cursor::new(record);
+    let num_ways = cursor
+        .read_varint()
+        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let num_ways_usize = num_ways as usize;
+    scratch.clear();
+    scratch.reserve(num_ways_usize);
+    for way_idx in 0..num_ways_usize {
+        let rc = cursor
+            .read_varint()
+            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        #[allow(clippy::cast_possible_truncation)]
+        scratch.push(rc as u32);
+    }
+    if cursor.remaining() != 0 {
+        return Err(format!(
+            "per-way sidecar blob {blob_idx} has {} trailing bytes",
+            cursor.remaining()
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn blob_record_has_nonzero_refs(record: &[u8], blob_idx: usize) -> Result<bool> {
+    let mut cursor = protohoggr::Cursor::new(record);
+    let num_ways = cursor
+        .read_varint()
+        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let num_ways_usize = num_ways as usize;
+    for way_idx in 0..num_ways_usize {
+        let rc = cursor
+            .read_varint()
+            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        if rc != 0 {
+            return Ok(true);
+        }
+    }
+    if cursor.remaining() != 0 {
+        return Err(format!(
+            "per-way sidecar blob {blob_idx} has {} trailing bytes",
+            cursor.remaining()
+        )
+        .into());
+    }
+    Ok(false)
+}
+
+fn build_per_way_refcount_index(data: Vec<u8>, num_way_blobs: usize) -> Result<PerWayRcs> {
+    let mut cursor = protohoggr::Cursor::new(&data);
     let mut offsets: Vec<usize> = Vec::with_capacity(num_way_blobs + 1);
     offsets.push(0);
+    let data_len = data.len();
 
     for blob_idx in 0..num_way_blobs {
-        let num_ways = cursor
-            .read_varint()
-            .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
-        #[allow(clippy::cast_possible_truncation)]
-        let num_ways_usize = num_ways as usize;
-        for way_idx in 0..num_ways_usize {
-            let rc = cursor
-                .read_varint()
-                .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
-            #[allow(clippy::cast_possible_truncation)]
-            flat.push(rc as u32);
-        }
-        offsets.push(flat.len());
+        scan_blob_record(&mut cursor, blob_idx)?;
+        offsets.push(data_len - cursor.remaining());
     }
 
     if cursor.remaining() != 0 {
@@ -130,19 +197,30 @@ pub(super) fn parse_per_way_refcount_sidecar_bytes(
         .into());
     }
 
-    Ok(PerWayRcs { flat, offsets })
+    Ok(PerWayRcs {
+        data,
+        offsets,
+    })
 }
 
-/// Load the per-way refcount sidecar into a flat `PerWayRcs`.
+/// Parse the per-way refcount sidecar bytes into an indexed `PerWayRcs`.
 ///
-/// Avoids `Vec<Vec<u32>>` allocator fragmentation at planet scale.
-pub(super) fn load_per_way_refcount_sidecar_flat(
+/// Extracted as a pure function so both the file loader and tests can call it.
+pub(super) fn parse_per_way_refcount_sidecar_bytes(
+    data: &[u8],
+    num_way_blobs: usize,
+) -> Result<PerWayRcs> {
+    build_per_way_refcount_index(data.to_vec(), num_way_blobs)
+}
+
+/// Load the per-way refcount sidecar into an indexed `PerWayRcs`.
+pub(super) fn load_per_way_refcount_sidecar_indexed(
     path: &Path,
     num_way_blobs: usize,
 ) -> Result<PerWayRcs> {
     let data = std::fs::read(path)
         .map_err(|e| format!("read per-way refcount sidecar: {e}"))?;
-    parse_per_way_refcount_sidecar_bytes(&data, num_way_blobs)
+    build_per_way_refcount_index(data, num_way_blobs)
 }
 
 /// Finalize the integrated coord_payloads file after stage 3 workers complete.
@@ -256,7 +334,12 @@ pub(super) fn finalize_coord_payloads(
 
                 let t_enc = Instant::now();
                 encode_scratch.clear();
-                encode_blob_payload(&coord_bytes, per_way_rcs.blob(blob_idx), &mut encode_scratch)
+                encode_blob_payload_from_record(
+                    &coord_bytes,
+                    per_way_rcs.blob_record(blob_idx),
+                    blob_idx,
+                    &mut encode_scratch,
+                )
                     .map_err(|e| format!("finalize straddler blob {blob_idx}: {e}"))?;
                 #[allow(clippy::cast_possible_truncation)]
                 { stats.encode_ms += t_enc.elapsed().as_millis() as u64; }
@@ -312,15 +395,19 @@ pub(super) fn finalize_coord_payloads(
                         // No manifest entry and no straddler staging. Valid
                         // only for a zero-ref blob; any non-zero rc here means
                         // stage 3 lost this blob (upstream bug).
-                        let rcs = per_way_rcs.blob(blob_idx);
-                        if rcs.iter().any(|&r| r != 0) {
+                        if per_way_rcs.blob_has_nonzero_refs(blob_idx)? {
                             return Err(format!(
                                 "blob {blob_idx} has non-zero ref counts but no worker manifest \
                                  entry and no straddler staging — upstream bug"
                             ).into());
                         }
                         encode_scratch.clear();
-                        encode_blob_payload(&[], rcs, &mut encode_scratch)
+                        encode_blob_payload_from_record(
+                            &[],
+                            per_way_rcs.blob_record(blob_idx),
+                            blob_idx,
+                            &mut encode_scratch,
+                        )
                             .map_err(|e| format!("encode zero-ref blob {blob_idx}: {e}"))?;
 
                         let t_wr = Instant::now();
@@ -433,6 +520,81 @@ pub(super) fn encode_blob_payload(
             last_lat = lat;
             last_lon = lon;
         }
+    }
+    Ok(())
+}
+
+/// Delta-encode one blob's coord slice using the raw sidecar record for that
+/// blob instead of a pre-decoded `&[u32]`.
+pub(super) fn encode_blob_payload_from_record(
+    coord_bytes: &[u8],
+    record: &[u8],
+    blob_idx: usize,
+    output: &mut Vec<u8>,
+) -> std::result::Result<(), String> {
+    let mut cursor = protohoggr::Cursor::new(record);
+    let num_ways = cursor
+        .read_varint()
+        .map_err(|e| format!("per-way sidecar blob {blob_idx} num_ways: {e}"))?;
+    #[allow(clippy::cast_possible_truncation)]
+    let num_ways_usize = num_ways as usize;
+
+    let mut coord_cursor: usize = 0;
+    for way_idx in 0..num_ways_usize {
+        let rc = cursor
+            .read_varint()
+            .map_err(|e| format!("per-way sidecar blob {blob_idx} way {way_idx}: {e}"))?;
+        #[allow(clippy::cast_possible_truncation)]
+        let rc_usize = rc as usize;
+        let way_bytes = rc_usize
+            .checked_mul(COORD_SLOT_SIZE)
+            .ok_or_else(|| format!("blob {blob_idx} way {way_idx}: refcount byte size overflow"))?;
+        if coord_cursor + way_bytes > coord_bytes.len() {
+            return Err(format!(
+                "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, \
+                 need at least {} bytes by way {way_idx}",
+                coord_bytes.len(),
+                coord_cursor + way_bytes,
+            ));
+        }
+
+        let mut last_lat: i32 = 0;
+        let mut last_lon: i32 = 0;
+        for _ in 0..rc_usize {
+            let off = coord_cursor;
+            coord_cursor += COORD_SLOT_SIZE;
+            let lat = i32::from_le_bytes([
+                coord_bytes[off],
+                coord_bytes[off + 1],
+                coord_bytes[off + 2],
+                coord_bytes[off + 3],
+            ]);
+            let lon = i32::from_le_bytes([
+                coord_bytes[off + 4],
+                coord_bytes[off + 5],
+                coord_bytes[off + 6],
+                coord_bytes[off + 7],
+            ]);
+            let dlat = i64::from(lat) - i64::from(last_lat);
+            let dlon = i64::from(lon) - i64::from(last_lon);
+            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlat));
+            protohoggr::encode_varint(output, protohoggr::zigzag_encode_64(dlon));
+            last_lat = lat;
+            last_lon = lon;
+        }
+    }
+    if cursor.remaining() != 0 {
+        return Err(format!(
+            "per-way sidecar blob {blob_idx} has {} trailing bytes",
+            cursor.remaining()
+        ));
+    }
+    if coord_cursor != coord_bytes.len() {
+        return Err(format!(
+            "coord_bytes length mismatch for blob {blob_idx}: got {} bytes, expected {}",
+            coord_bytes.len(),
+            coord_cursor,
+        ));
     }
     Ok(())
 }
@@ -657,9 +819,10 @@ mod tests {
         // blob 1: 1 way with ref count [2]
         let sidecar = make_sidecar_bytes(&[&[3, 1], &[2]]);
         let pwr = parse_per_way_refcount_sidecar_bytes(&sidecar, 2).expect("parse");
+        let mut scratch: Vec<u32> = Vec::new();
         assert_eq!(pwr.num_blobs(), 2);
-        assert_eq!(pwr.blob(0), &[3u32, 1u32]);
-        assert_eq!(pwr.blob(1), &[2u32]);
+        assert_eq!(pwr.decode_blob_into(0, &mut scratch).expect("decode 0"), &[3u32, 1u32]);
+        assert_eq!(pwr.decode_blob_into(1, &mut scratch).expect("decode 1"), &[2u32]);
     }
 
     #[test]
@@ -667,8 +830,30 @@ mod tests {
         // blob 0: 0 ways; blob 1: 1 way with 1 ref
         let sidecar = make_sidecar_bytes(&[&[], &[1]]);
         let pwr = parse_per_way_refcount_sidecar_bytes(&sidecar, 2).expect("parse");
-        assert_eq!(pwr.blob(0), &[] as &[u32]);
-        assert_eq!(pwr.blob(1), &[1u32]);
+        let mut scratch: Vec<u32> = Vec::new();
+        assert_eq!(pwr.decode_blob_into(0, &mut scratch).expect("decode 0"), &[] as &[u32]);
+        assert_eq!(pwr.decode_blob_into(1, &mut scratch).expect("decode 1"), &[1u32]);
+    }
+
+    #[test]
+    fn encode_blob_payload_from_record_matches_decoded_path() {
+        let coords = [
+            (10_i32, 20_i32), (30_i32, 40_i32),
+            (500_i32, 600_i32), (510_i32, 610_i32), (490_i32, 590_i32),
+            (9999_i32, -9999_i32),
+        ];
+        let cb = make_coord_bytes(&coords);
+        let pwr = make_per_way_rcs(&[&[2u32, 3u32, 1u32]]);
+        let mut from_record = Vec::new();
+        let mut from_decoded = Vec::new();
+        let mut scratch: Vec<u32> = Vec::new();
+
+        encode_blob_payload_from_record(&cb, pwr.blob_record(0), 0, &mut from_record)
+            .expect("encode from record");
+        let decoded = pwr.decode_blob_into(0, &mut scratch).expect("decode 0").to_vec();
+        encode_blob_payload(&cb, &decoded, &mut from_decoded).expect("encode decoded");
+
+        assert_eq!(from_record, from_decoded);
     }
 
     // Helper: build a PerWayRcs directly from slice-of-slices.

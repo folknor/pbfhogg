@@ -789,14 +789,20 @@ fn assemble_block(
 // ---------------------------------------------------------------------------
 
 /// Sub-phase counters for the way reframe hot path.
+///
+/// Timing fields accumulate **nanoseconds** internally — `.as_millis()` per
+/// operation truncates every < 1 ms sample to zero, which under planet/
+/// Europe load (hundreds of millions of ways, each a few hundred ns of
+/// work) erases the majority of the signal. The emit path converts back
+/// to milliseconds so downstream counter names stay stable.
 struct WayReframeCounters {
-    parse_block_ms: std::sync::atomic::AtomicU64,
-    parse_way_ms: std::sync::atomic::AtomicU64,
-    ref_parse_ms: std::sync::atomic::AtomicU64,
-    coord_read_ms: std::sync::atomic::AtomicU64,
-    reassemble_ms: std::sync::atomic::AtomicU64,
-    unknown_field_copy_ms: std::sync::atomic::AtomicU64,
-    group_reframe_ms: std::sync::atomic::AtomicU64,
+    parse_block_ns: std::sync::atomic::AtomicU64,
+    parse_way_ns: std::sync::atomic::AtomicU64,
+    ref_parse_ns: std::sync::atomic::AtomicU64,
+    coord_read_ns: std::sync::atomic::AtomicU64,
+    reassemble_ns: std::sync::atomic::AtomicU64,
+    unknown_field_copy_ns: std::sync::atomic::AtomicU64,
+    group_reframe_ns: std::sync::atomic::AtomicU64,
     refs_total: std::sync::atomic::AtomicU64,
     refs_present: std::sync::atomic::AtomicU64,
     max_refs_per_way: std::sync::atomic::AtomicU64,
@@ -808,13 +814,13 @@ struct WayReframeCounters {
 impl WayReframeCounters {
     fn new() -> Self {
         Self {
-            parse_block_ms: std::sync::atomic::AtomicU64::new(0),
-            parse_way_ms: std::sync::atomic::AtomicU64::new(0),
-            ref_parse_ms: std::sync::atomic::AtomicU64::new(0),
-            coord_read_ms: std::sync::atomic::AtomicU64::new(0),
-            reassemble_ms: std::sync::atomic::AtomicU64::new(0),
-            unknown_field_copy_ms: std::sync::atomic::AtomicU64::new(0),
-            group_reframe_ms: std::sync::atomic::AtomicU64::new(0),
+            parse_block_ns: std::sync::atomic::AtomicU64::new(0),
+            parse_way_ns: std::sync::atomic::AtomicU64::new(0),
+            ref_parse_ns: std::sync::atomic::AtomicU64::new(0),
+            coord_read_ns: std::sync::atomic::AtomicU64::new(0),
+            reassemble_ns: std::sync::atomic::AtomicU64::new(0),
+            unknown_field_copy_ns: std::sync::atomic::AtomicU64::new(0),
+            group_reframe_ns: std::sync::atomic::AtomicU64::new(0),
             refs_total: std::sync::atomic::AtomicU64::new(0),
             refs_present: std::sync::atomic::AtomicU64::new(0),
             max_refs_per_way: std::sync::atomic::AtomicU64::new(0),
@@ -827,13 +833,16 @@ impl WayReframeCounters {
     #[allow(clippy::cast_possible_wrap)]
     fn emit(&self) {
         use std::sync::atomic::Ordering::Relaxed;
-        crate::debug::emit_counter("s4_way_parse_block_ms", self.parse_block_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_parse_way_ms", self.parse_way_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_ref_parse_ms", self.ref_parse_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_coord_read_ms", self.coord_read_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_reassemble_ms", self.reassemble_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_unknown_field_copy_ms", self.unknown_field_copy_ms.load(Relaxed) as i64);
-        crate::debug::emit_counter("s4_way_group_reframe_ms", self.group_reframe_ms.load(Relaxed) as i64);
+        // Convert nanosecond accumulators to milliseconds at emit time so
+        // counter names and downstream comparisons stay on the same unit.
+        let ns_to_ms = |ns: u64| (ns / 1_000_000) as i64;
+        crate::debug::emit_counter("s4_way_parse_block_ms", ns_to_ms(self.parse_block_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_parse_way_ms", ns_to_ms(self.parse_way_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_ref_parse_ms", ns_to_ms(self.ref_parse_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_coord_read_ms", ns_to_ms(self.coord_read_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_reassemble_ms", ns_to_ms(self.reassemble_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_unknown_field_copy_ms", ns_to_ms(self.unknown_field_copy_ns.load(Relaxed)));
+        crate::debug::emit_counter("s4_way_group_reframe_ms", ns_to_ms(self.group_reframe_ns.load(Relaxed)));
         crate::debug::emit_counter("s4_way_refs_total", self.refs_total.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_refs_present", self.refs_present.load(Relaxed) as i64);
         crate::debug::emit_counter("s4_way_max_refs_per_way", self.max_refs_per_way.load(Relaxed) as i64);
@@ -934,7 +943,7 @@ fn reframe_way_blob_with_locations(
     let stringtable_bytes = &decompressed[st_offset..st_offset + st_len];
 
     #[allow(clippy::cast_possible_truncation)]
-    counters.parse_block_ms.fetch_add(t_block.elapsed().as_millis() as u64, Relaxed);
+    counters.parse_block_ns.fetch_add(t_block.elapsed().as_nanos() as u64, Relaxed);
 
     output.clear();
     protohoggr::encode_bytes_field(output, 1, stringtable_bytes);
@@ -981,7 +990,7 @@ fn reframe_way_blob_with_locations(
                 }
 
                 #[allow(clippy::cast_possible_truncation)]
-                counters.parse_way_ms.fetch_add(t_way.elapsed().as_millis() as u64, Relaxed);
+                counters.parse_way_ns.fetch_add(t_way.elapsed().as_nanos() as u64, Relaxed);
 
                 if way_id < min_way_id { min_way_id = way_id; }
                 if way_id > max_way_id { max_way_id = way_id; }
@@ -997,7 +1006,7 @@ fn reframe_way_blob_with_locations(
                     }
                 }
                 #[allow(clippy::cast_possible_truncation)]
-                counters.ref_parse_ms.fetch_add(t_ref_parse.elapsed().as_millis() as u64, Relaxed);
+                counters.ref_parse_ns.fetch_add(t_ref_parse.elapsed().as_nanos() as u64, Relaxed);
 
                 // De-interleave pre-encoded varints from coord_payload into
                 // PBF packed fields 9/10. The raw varint bytes match PBF's
@@ -1033,8 +1042,8 @@ fn reframe_way_blob_with_locations(
                 way_slot_pos += ref_count;
                 #[allow(clippy::cast_possible_truncation)]
                 counters
-                    .coord_read_ms
-                    .fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
+                    .coord_read_ns
+                    .fetch_add(t_read.elapsed().as_nanos() as u64, Relaxed);
                 counters.refs_present.fetch_add(ref_count, Relaxed);
 
                 // Update max refs per way (relaxed CAS loop).
@@ -1071,7 +1080,7 @@ fn reframe_way_blob_with_locations(
 
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
                 #[allow(clippy::cast_possible_truncation)]
-                counters.reassemble_ms.fetch_add(t_reassemble.elapsed().as_millis() as u64, Relaxed);
+                counters.reassemble_ns.fetch_add(t_reassemble.elapsed().as_nanos() as u64, Relaxed);
                 total_ways += 1;
             } else {
                 // Non-way field in the group — copy verbatim.
@@ -1080,14 +1089,14 @@ fn reframe_way_blob_with_locations(
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);
                 scratch.group_out.extend_from_slice(raw);
                 #[allow(clippy::cast_possible_truncation)]
-                counters.unknown_field_copy_ms.fetch_add(t_copy.elapsed().as_millis() as u64, Relaxed);
+                counters.unknown_field_copy_ns.fetch_add(t_copy.elapsed().as_nanos() as u64, Relaxed);
             }
         }
 
         let t_group = std::time::Instant::now();
         protohoggr::encode_bytes_field(output, 2, &scratch.group_out);
         #[allow(clippy::cast_possible_truncation)]
-        counters.group_reframe_ms.fetch_add(t_group.elapsed().as_millis() as u64, Relaxed);
+        counters.group_reframe_ns.fetch_add(t_group.elapsed().as_nanos() as u64, Relaxed);
     }
 
     // Append scalar fields (granularity, etc.).

@@ -1,9 +1,6 @@
 //! Stage 3: Slot reorder — emit per-blob coord_payloads via the integrated
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
-use std::path::Path;
-
-use super::super::external_radix::NUM_BUCKETS;
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use super::super::Result;
@@ -11,7 +8,7 @@ use super::coord_payloads::{
     encode_blob_payload_from_record, ManifestEntry, PerWayRcs, StraddlerSlot,
 };
 use super::blob_bucket_index::{classify_blobs_in_bucket, BlobBucketIntersection};
-use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
+use super::{RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE};
 
 /// Lightweight reference to slot bucket paths + counts for stage 3.
 pub(super) struct SlotBucketRef {
@@ -71,6 +68,49 @@ fn merge_straddler(
     Ok(())
 }
 
+fn scatter_bucket_entries(
+    data_buf: &[u8],
+    bucket_idx: usize,
+    bucket_start: u64,
+    bucket_end: u64,
+    scatter_buf: &mut [u8],
+) -> std::result::Result<u64, String> {
+    if data_buf.len() % RESOLVED_ENTRY_SIZE != 0 {
+        return Err(format!(
+            "slot bucket {bucket_idx} has {} trailing bytes (entry size {})",
+            data_buf.len() % RESOLVED_ENTRY_SIZE,
+            RESOLVED_ENTRY_SIZE,
+        ));
+    }
+
+    let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
+    let mut stores: u64 = 0;
+    for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
+        let slot_pos = u64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3],
+            chunk[4], chunk[5], chunk[6], chunk[7],
+        ]);
+        if slot_pos < bucket_start || slot_pos >= bucket_end {
+            return Err(format!(
+                "slot bucket {bucket_idx} contains slot_pos {slot_pos} outside [{bucket_start}, {bucket_end})"
+            ));
+        }
+        #[allow(clippy::cast_possible_truncation)]
+        let local_pos = (slot_pos - bucket_start) as usize;
+        if local_pos >= bucket_slots {
+            return Err(format!(
+                "slot bucket {bucket_idx} local_pos {local_pos} outside bucket slot span {bucket_slots}"
+            ));
+        }
+        let offset = local_pos * COORD_SLOT_SIZE;
+        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[8..12]);
+        scatter_buf[offset + 4..offset + 8].copy_from_slice(&chunk[12..16]);
+        stores += 1;
+    }
+
+    Ok(stores)
+}
+
 /// Pre-allocates the output file to `total_slots * 8` bytes (zero-filled
 /// by the OS). Empty buckets need no explicit zero-write — the file is
 /// already zeroed.
@@ -116,7 +156,6 @@ pub(super) fn stage3_slot_reorder(
     let next_ref = &next_idx;
     let s3_open_ref = &s3_open_ms;
     let s3_read_ref = &s3_read_ms;
-    let s3_parse_ref = &s3_parse_ms;
     let s3_scatter_ref = &s3_scatter_ms;
     let s3_loaded_ref = &s3_buckets_loaded;
     let s3_bytes_read_ref = &s3_bytes_read;
@@ -142,7 +181,6 @@ pub(super) fn stage3_slot_reorder(
 
                 let mut data_buf: Vec<u8> = Vec::new();
                 let mut scatter_buf: Vec<u8> = Vec::new();
-                let mut buf = [0u8; RESOLVED_ENTRY_SIZE];
                 let mut encode_scratch: Vec<u8> = Vec::new();
                 let mut manifest: Vec<ManifestEntry> = Vec::new();
                 let mut tmp_byte_pos: u64 = 0;
@@ -226,26 +264,21 @@ pub(super) fn stage3_slot_reorder(
                         s3_read_ref.fetch_add(t_read.elapsed().as_millis() as u64, Relaxed);
                         s3_bytes_read_ref.fetch_add(data_buf.len() as u64, Relaxed);
 
-                        // Parse entries from raw bytes, then scatter into coord buffer.
-                        let t_parse = std::time::Instant::now();
-                        let num_entries = data_buf.len() / RESOLVED_ENTRY_SIZE;
-                        let mut entries: Vec<ResolvedEntry> = Vec::with_capacity(num_entries);
-                        for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
-                            buf.copy_from_slice(chunk);
-                            entries.push(ResolvedEntry::read_from(&buf));
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        s3_parse_ref.fetch_add(t_parse.elapsed().as_millis() as u64, Relaxed);
-
+                        // Direct scatter from raw bytes. This removes the
+                        // bucket-local Vec<ResolvedEntry> materialization and
+                        // its extra memory traffic; parsing happens in lockstep
+                        // with the scatter stores.
                         let t_scatter = std::time::Instant::now();
-                        for entry in &entries {
-                            let local_pos = (entry.slot_pos - bucket_start) as usize;
-                            let offset = local_pos * COORD_SLOT_SIZE;
-                            scatter_buf[offset..offset + 4].copy_from_slice(&entry.lat.to_le_bytes());
-                            scatter_buf[offset + 4..offset + 8].copy_from_slice(&entry.lon.to_le_bytes());
-                        }
+                        let stores = scatter_bucket_entries(
+                            &data_buf,
+                            bucket_idx,
+                            bucket_start,
+                            bucket_end,
+                            &mut scatter_buf,
+                        )?;
+                        #[allow(clippy::cast_possible_truncation)]
                         s3_scatter_ref.fetch_add(t_scatter.elapsed().as_millis() as u64, Relaxed);
-                        s3_scatter_stores_ref.fetch_add(entries.len() as u64, Relaxed);
+                        s3_scatter_stores_ref.fetch_add(stores, Relaxed);
 
                         // Track max live buffer bytes for this worker.
                         {

@@ -114,6 +114,7 @@ pub(super) fn stage1_way_pass(
         let s1a_pread_ref = &s1a_pread_ms;
         let s1a_decompress_ref = &s1a_decompress_ms;
         let s1a_scan_ref = &s1a_scan_way_refs_ms;
+        let s1a_idset_ref = &s1a_idset_set_ms;
         let s1a_bytes_ref = &s1a_bytes_read;
         let s1a_pread_calls_ref = &s1a_pread_calls;
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
@@ -150,28 +151,30 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 1: scan way refs and set bits in the
-                            // shared IdSetDense directly. This removes the
-                            // blob-local `blob_node_ids` staging vector; the
-                            // fused cost now lives under s1a_scan_way_refs_ms.
+                            // Phase 1: scan way refs (proto parsing only).
                             let t2 = std::time::Instant::now();
+                            let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
-                            let mut blob_ref_count: u64 = 0;
                             super::super::way_scanner::scan_way_refs(
                                 &decompress_buf, &mut refs_buf, &mut group_starts,
                                 |_way_id, refs| {
+                                    blob_node_ids.extend_from_slice(refs);
                                     #[allow(clippy::cast_possible_truncation)]
                                     per_way_rcs.push(refs.len() as u32);
-                                    blob_ref_count += refs.len() as u64;
-                                    for &node_id in refs {
-                                        node_id_set_ref.set_atomic(node_id);
-                                    }
                                 },
                             ).map_err(|e| e.to_string())?;
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                            Ok((blob_ref_count, per_way_rcs))
+                            // Phase 2: batch set_atomic into IdSetDense.
+                            let t3 = std::time::Instant::now();
+                            for &node_id in &blob_node_ids {
+                                node_id_set_ref.set_atomic(node_id);
+                            }
+                            #[allow(clippy::cast_possible_truncation)]
+                            s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
+
+                            Ok((blob_node_ids.len() as u64, per_way_rcs))
                         })();
 
                         if tx.send((task.seq, result)).is_err() { break; }
@@ -277,7 +280,6 @@ pub(super) fn stage1_way_pass(
         let s1b_pread_ref = &s1b_pread_ms;
         let s1b_decompress_ref = &s1b_decompress_ms;
         let s1b_scan_ref = &s1b_scan_ms;
-        let s1b_rank_ref = &s1b_rank_ms;
         let s1b_encode_write_ref = &s1b_encode_write_ms;
         let s1b_flush_ref = &s1b_flush_ms;
         let s1b_refs_total_ref = &s1b_refs_total;
@@ -357,11 +359,14 @@ pub(super) fn stage1_way_pass(
                             let blob_ref_count = blob_node_ids.len() as u64;
                             s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
 
-                            // Phase 2: batch rank lookups + bucket selection.
+                            // Phase 2: fuse rank lookup, bucket selection,
+                            // record encode, and write. This removes the
+                            // per-blob `ranked` staging vector; the fused
+                            // cost now lives under s1b_encode_write_ms.
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
-                            // (local_rank, bucket, slot_pos) per ref.
-                            let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
+                            let mut blob_bytes: u64 = 0;
+                            let mut blob_writes: u64 = 0;
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
                                 #[allow(clippy::cast_possible_truncation)]
@@ -372,16 +377,6 @@ pub(super) fn stage1_way_pass(
                                 #[allow(clippy::cast_possible_truncation)]
                                 let local_rank = (global_rank - bucket_rank_start) as u32;
                                 let slot_pos = slot_start + i as u64;
-                                ranked.push((local_rank, bucket, slot_pos));
-                            }
-                            #[allow(clippy::cast_possible_truncation)]
-                            s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
-
-                            // Phase 3: batch encode + write.
-                            let t4 = std::time::Instant::now();
-                            let mut blob_bytes: u64 = 0;
-                            let mut blob_writes: u64 = 0;
-                            for &(local_rank, bucket, slot_pos) in &ranked {
                                 let rec = RankRecord { local_rank, slot_pos };
                                 rec.write_to(&mut rec_buf);
                                 if let Some(w) = shard_writers[bucket].as_mut() {
@@ -393,7 +388,7 @@ pub(super) fn stage1_way_pass(
                                 entry_counts[bucket] += 1;
                             }
                             #[allow(clippy::cast_possible_truncation)]
-                            s1b_encode_write_ref.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
+                            s1b_encode_write_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
                             s1b_bytes_written_ref.fetch_add(blob_bytes, Relaxed);
                             s1b_shard_write_calls_ref.fetch_add(blob_writes, Relaxed);
                             Ok(())

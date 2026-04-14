@@ -77,10 +77,11 @@ fn merge_straddler(
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
 pub(super) fn stage3_slot_reorder(
     slot_buckets: &SlotBucketRef,
+    slot_bucket_count: usize,
     total_slots: u64,
     integrated: IntegratedInputs<'_>,
 ) -> Result<IntegratedResult> {
-    let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
+    let range_size = total_slots.div_ceil(slot_bucket_count as u64);
 
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -152,10 +153,10 @@ pub(super) fn stage3_slot_reorder(
                         break;
                     }
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
-                    if bucket_idx >= NUM_BUCKETS { break; }
+                    if bucket_idx >= slot_bucket_count { break; }
 
                     let bucket_start = bucket_idx as u64 * range_size;
-                    let bucket_end = if bucket_idx == NUM_BUCKETS - 1 {
+                    let bucket_end = if bucket_idx == slot_bucket_count - 1 {
                         total_slots
                     } else {
                         ((bucket_idx as u64 + 1) * range_size).min(total_slots)

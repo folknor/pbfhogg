@@ -285,17 +285,13 @@ single-pass, tag expression and bbox filtering.
 
   **Bugs (must fix soon):**
 
-  - [ ] **Small-input external mode is structurally rejected.** The
-    startup assertion at `mod.rs:303`
-    (`max_blob_slots ≤ smallest_bucket_slots`) was sized for
-    planet/Europe and fires on legitimate small inputs where the
-    smallest of 256 buckets is tiny. Reproduced with
-    `tests/test.osm.pbf` after `cat + sort`: aborts with
-    `max blob slot span 3 exceeds smallest bucket slot span 1`.
-    Real correctness/usability bug. Fix candidates: scale `NUM_BUCKETS`
-    down dynamically based on `total_slots / max_blob_slots` floor;
-    or extend straddler staging from 2 pieces to N. (External review
-    2026-04-14 #2.)
+  - [x] ~~Small-input external mode is structurally rejected.~~ Fixed.
+    `slot_bucket_count` is now computed at runtime as
+    `min(NUM_BUCKETS, max(1, total_slots / max_blob_slots))` and
+    plumbed through stages 2 and 3. The hard-error startup assertion
+    is gone. Small inputs scale down to fewer slot buckets; the
+    2-piece straddler invariant remains by construction.
+    (External review 2026-04-14 #2.)
   - [ ] **External `Stats.missing_locations` always reports 0.** Dense
     path increments on lookup failure (`add_locations_to_ways.rs:1241`);
     external returns the static initial 0 (`stage4.rs:771,925`). Stats

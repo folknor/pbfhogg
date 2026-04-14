@@ -129,7 +129,7 @@ fn prepare_bucket(
 }
 
 /// Shared slot bucket writers protected by per-bucket mutexes.
-/// 256 files total regardless of worker count.
+/// `slot_bucket_count` files total regardless of worker count.
 pub(super) struct SharedSlotBuckets {
     writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
     entry_counts: Vec<std::sync::atomic::AtomicU64>,
@@ -139,12 +139,15 @@ pub(super) struct SharedSlotBuckets {
 const BUCKET_BUF_SIZE: usize = 256 * 1024;
 
 impl SharedSlotBuckets {
-    pub(super) fn create(scratch: &ScratchDir) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let mut writers = Vec::with_capacity(NUM_BUCKETS);
-        let mut paths = Vec::with_capacity(NUM_BUCKETS);
-        let mut entry_counts = Vec::with_capacity(NUM_BUCKETS);
+    pub(super) fn create(
+        scratch: &ScratchDir,
+        slot_bucket_count: usize,
+    ) -> std::result::Result<Self, Box<dyn std::error::Error>> {
+        let mut writers = Vec::with_capacity(slot_bucket_count);
+        let mut paths = Vec::with_capacity(slot_bucket_count);
+        let mut entry_counts = Vec::with_capacity(slot_bucket_count);
 
-        for i in 0..NUM_BUCKETS {
+        for i in 0..slot_bucket_count {
             let path = scratch.bucket_path("slot", i);
             let file = std::fs::File::create(&path)
                 .map_err(|e| format!("failed to create slot bucket {}: {e}", path.display()))?;
@@ -198,6 +201,7 @@ pub(super) fn stage2_node_join(
     rank_bucket_counts: &[u64],
     num_shard_workers: usize,
     slot_buckets: &SharedSlotBuckets,
+    slot_bucket_count: usize,
     total_slots: u64,
     unique_nodes: u64,
     coord_file_path: &Path,
@@ -280,10 +284,11 @@ pub(super) fn stage2_node_join(
 
                 // Per-slot-bucket local buffers. Flushed when any buffer
                 // exceeds FLUSH_THRESHOLD, and at the end of each rank bucket.
-                // 256 KB per buffer × 256 = 64 MB max per worker.
+                // 256 KB per buffer × slot_bucket_count = 64 MB max per worker
+                // at full 256-bucket scale, scales down for small inputs.
                 const FLUSH_THRESHOLD: usize = 256 * 1024;
-                let mut slot_bufs: Vec<Vec<u8>> = (0..NUM_BUCKETS).map(|_| Vec::new()).collect();
-                let mut slot_counts: Vec<u64> = vec![0; NUM_BUCKETS];
+                let mut slot_bufs: Vec<Vec<u8>> = (0..slot_bucket_count).map(|_| Vec::new()).collect();
+                let mut slot_counts: Vec<u64> = vec![0; slot_bucket_count];
 
                 loop {
                     if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
@@ -343,7 +348,7 @@ pub(super) fn stage2_node_join(
 
                             for &slot_pos in &bkt.grouped_slot_pos[start..end] {
                                 let entry = ResolvedEntry { slot_pos, lat, lon };
-                                let bucket = entry.slot_bucket(total_slots);
+                                let bucket = entry.slot_bucket(total_slots, slot_bucket_count);
                                 entry.write_to(&mut entry_buf);
                                 slot_bufs[bucket].extend_from_slice(&entry_buf);
                                 slot_counts[bucket] += 1;
@@ -407,7 +412,7 @@ pub(super) fn stage2_node_join(
 
                         // Flush non-empty local buffers to shared writers.
                         let mut nonempty_count: u64 = 0;
-                        for sb in 0..NUM_BUCKETS {
+                        for sb in 0..slot_bucket_count {
                             if slot_bufs[sb].is_empty() { continue; }
                             nonempty_count += 1;
                             let t_lock = std::time::Instant::now();

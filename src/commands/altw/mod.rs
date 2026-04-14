@@ -97,13 +97,13 @@ impl ResolvedEntry {
 
     /// Bucket index for slot-pos partitioning.
     #[allow(clippy::cast_possible_truncation)]
-    fn slot_bucket(&self, total_slots: u64) -> usize {
-        let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
+    fn slot_bucket(&self, total_slots: u64, slot_bucket_count: usize) -> usize {
+        let range_size = total_slots.div_ceil(slot_bucket_count as u64);
         if range_size == 0 {
             return 0;
         }
         let bucket = self.slot_pos / range_size;
-        (bucket as usize).min(NUM_BUCKETS - 1)
+        (bucket as usize).min(slot_bucket_count - 1)
     }
 }
 
@@ -260,12 +260,48 @@ pub fn external_join(
             (total_slots, unique_nodes, rank_bucket_counts, num_shard_workers, node_id_set)
         };
 
+    // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
+    // every bucket can fit at least one full blob's slot range. This
+    // keeps the 2-piece straddler invariant (a blob spans at most two
+    // adjacent buckets) for both planet-scale inputs and tiny test
+    // fixtures where total_slots / NUM_BUCKETS would otherwise be < 1.
+    //
+    // We need way_slot_starts (and therefore the ref-count sidecar)
+    // before stage 2 to compute max_blob_slots. The sidecar exists
+    // either from this run's stage 1 or from a prior --keep-scratch run.
+    let way_slot_starts =
+        stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+    let max_blob_slots: u64 = (0..way_slot_starts.len())
+        .map(|i| {
+            let end = if i + 1 < way_slot_starts.len() {
+                way_slot_starts[i + 1]
+            } else {
+                total_slots
+            };
+            end - way_slot_starts[i]
+        })
+        .max()
+        .unwrap_or(0);
+    let slot_bucket_count = if max_blob_slots == 0 {
+        NUM_BUCKETS
+    } else {
+        // Each bucket must hold ≥ max_blob_slots so the SMALLEST bucket
+        // (which can be smaller than range_size when total_slots is not
+        // a multiple of bucket_count) still satisfies the 2-piece
+        // straddler invariant. Equivalently: bucket_count ≤
+        // total_slots / max_blob_slots, with floor division.
+        let max_useful_u64 = (total_slots / max_blob_slots).max(1);
+        #[allow(clippy::cast_possible_truncation)]
+        let max_useful = max_useful_u64.min(NUM_BUCKETS as u64) as usize;
+        max_useful
+    };
+
     if start <= 2 {
         crate::debug::emit_marker("EXTJOIN_STAGE2_START");
         let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
-        let slot_buckets = SlotBuckets::create(&scratch_dir)?;
+        let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
         let resolved_count =
-            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &slot_buckets, total_slots, unique_nodes, &coord_file_path)?;
+            stage2_node_join(&scratch_dir, &rank_bucket_counts, num_shard_workers, &slot_buckets, slot_bucket_count, total_slots, unique_nodes, &coord_file_path)?;
         slot_buckets.finish()?;
         let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
@@ -293,45 +329,10 @@ pub fn external_join(
         Vec<std::path::PathBuf>,                                        // worker_tmp_paths
         Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>>,  // straddler_slots
     )> = if start <= 3 {
-        let way_slot_starts =
-            stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
         let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_flat(
             &per_way_refcount_sidecar,
             way_slot_starts.len(),
         )?;
-
-        // Startup assertion: no blob's slot span may exceed the SMALLEST
-        // bucket's span. Bucket 255 has slots [255*range_size, total_slots),
-        // which is strictly <= range_size and can be much smaller when
-        // total_slots is not a multiple of NUM_BUCKETS. classify_blobs_in_bucket
-        // would otherwise reject the blob at runtime for that bucket alone.
-        let range_size = total_slots.div_ceil(NUM_BUCKETS as u64);
-        let min_bucket_slots = if total_slots == 0 {
-            0
-        } else {
-            let last_idx = (total_slots - 1) / range_size;
-            total_slots - last_idx * range_size
-        };
-        let mut max_blob_slots: u64 = 0;
-        for i in 0..way_slot_starts.len() {
-            let end = if i + 1 < way_slot_starts.len() {
-                way_slot_starts[i + 1]
-            } else {
-                total_slots
-            };
-            let span = end - way_slot_starts[i];
-            if span > max_blob_slots {
-                max_blob_slots = span;
-            }
-        }
-        if max_blob_slots > min_bucket_slots {
-            return Err(format!(
-                "integrated path structural assumption violated: max blob slot span \
-                 {max_blob_slots} exceeds smallest bucket slot span {min_bucket_slots} \
-                 (total_slots={total_slots}, NUM_BUCKETS={NUM_BUCKETS}, range_size={range_size})"
-            )
-            .into());
-        }
 
         let num_workers = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2).max(1))
@@ -353,11 +354,11 @@ pub fn external_join(
     if start <= 3 {
         crate::debug::emit_marker("EXTJOIN_STAGE3_START");
         let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
-        let slot_entry_counts: Vec<u64> = (0..NUM_BUCKETS).map(|i| {
+        let slot_entry_counts: Vec<u64> = (0..slot_bucket_count).map(|i| {
             let path = scratch_dir.bucket_path("slot", i);
             std::fs::metadata(&path).map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64).unwrap_or(0)
         }).collect();
-        let slot_paths: Vec<std::path::PathBuf> = (0..NUM_BUCKETS)
+        let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
             .map(|i| scratch_dir.bucket_path("slot", i))
             .collect();
         let slot_bucket_ref = SlotBucketRef { paths: slot_paths, entry_counts: slot_entry_counts };
@@ -369,10 +370,10 @@ pub fn external_join(
             worker_tmp_paths: worker_tmp_paths.as_slice(),
             straddler_slots: straddler_slots.as_slice(),
         };
-        let s3_result = stage3_slot_reorder(&slot_bucket_ref, total_slots, integrated_inputs)?;
+        let s3_result = stage3_slot_reorder(&slot_bucket_ref, slot_bucket_count, total_slots, integrated_inputs)?;
         let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
         if !keep_scratch {
-            for i in 0..NUM_BUCKETS {
+            for i in 0..slot_bucket_count {
                 drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
             }
         }
@@ -425,12 +426,14 @@ pub fn external_join(
         )?)
     };
 
-    let way_slot_starts = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
+    // Re-load way_slot_starts to pass num_way_blobs to the reader. We
+    // only need the count; an integration follow-up could persist this
+    // in a manifest to avoid the re-load.
+    let num_way_blobs = stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?.len();
     let coord_payloads_reader = coord_payloads::CoordPayloadsReader::open(
         &coord_payloads_path,
-        way_slot_starts.len(),
+        num_way_blobs,
     )?;
-    drop(way_slot_starts);
 
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();

@@ -43,6 +43,13 @@ impl<T> ReorderBuffer<T> {
         }
         item
     }
+
+    /// Total slots currently held (filled + gaps). High-water tracking
+    /// uses this to gauge how out-of-order producers are running ahead
+    /// of the head item the consumer is waiting on.
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[cfg(test)]

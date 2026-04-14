@@ -287,7 +287,12 @@ pub(super) fn stage4_assembly(
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(32);
+    // A/B probe: bumped from 32 to 256 to test whether `s4_send_ms`
+    // backpressure is burst-absorption (helped by a deeper queue) or
+    // steady-state writer/compression saturation (a deeper queue just
+    // moves the wait into the writer pipeline, surfaced via the new
+    // `s4_flush_ms` counter at the end of stage 4).
+    let (decoded_tx, decoded_rx) = std::sync::mpsc::sync_channel::<DecodedItem>(256);
 
     let mut total_stats = Stats::default();
 
@@ -306,10 +311,20 @@ pub(super) fn stage4_assembly(
     let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_bytes = std::sync::atomic::AtomicU64::new(0);
+    // Channel depth high-water (workers ++ before send, consumer --
+    // after recv). Reaching `decoded_tx` capacity means the channel
+    // was the binding queue at some point; staying well below capacity
+    // says workers were never able to fill it (so consumer/writer is
+    // the limiter, not the channel).
+    let s4_channel_depth = std::sync::atomic::AtomicUsize::new(0);
+    let s4_channel_high_water = std::sync::atomic::AtomicUsize::new(0);
     // Consumer-side passthrough telemetry.
     let mut s4_passthrough_blobs: u64 = 0;
     let mut s4_passthrough_pread_ms: u64 = 0;
     let mut s4_passthrough_bytes: u64 = 0;
+    // Reorder-buffer high-water (consumer-only). Tracks how out-of-order
+    // workers ran ahead of the head item the consumer was waiting on.
+    let mut s4_reorder_high_water: usize = 0;
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
@@ -324,6 +339,8 @@ pub(super) fn stage4_assembly(
     let s4_max_worker_buf_ref = &s4_max_worker_buf_bytes;
     let s4_coord_payload_pread_ref = &s4_coord_payload_pread_ms;
     let s4_coord_payload_bytes_ref = &s4_coord_payload_bytes;
+    let s4_channel_depth_ref = &s4_channel_depth;
+    let s4_channel_high_water_ref = &s4_channel_high_water;
     let way_reframe_counters = WayReframeCounters::new();
     let way_reframe_cref = &way_reframe_counters;
 
@@ -510,6 +527,29 @@ pub(super) fn stage4_assembly(
                     }
 
                     let t3 = std::time::Instant::now();
+                    // Bump channel depth before send and update the
+                    // high-water mark with the post-bump value (i.e.
+                    // the depth the channel will hold once this send
+                    // completes). Bounded `sync_channel` blocks here
+                    // when full, so the recorded value still reflects
+                    // a real moment of saturation.
+                    let depth_after = s4_channel_depth_ref
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        + 1;
+                    {
+                        let mut hw = s4_channel_high_water_ref
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        while depth_after > hw {
+                            match s4_channel_high_water_ref.compare_exchange_weak(
+                                hw, depth_after,
+                                std::sync::atomic::Ordering::Relaxed,
+                                std::sync::atomic::Ordering::Relaxed,
+                            ) {
+                                Ok(_) => break,
+                                Err(actual) => hw = actual,
+                            }
+                        }
+                    }
                     if tx.send((desc.seq, result)).is_err() {
                         break;
                     }
@@ -638,11 +678,20 @@ pub(super) fn stage4_assembly(
             #[allow(clippy::cast_possible_truncation)]
             { s4_recv_ms += t_recv.elapsed().as_millis() as u64; }
             let (seq_num, item) = match msg {
-                Ok(v) => v,
+                Ok(v) => {
+                    // Decrement channel depth on successful recv.
+                    s4_channel_depth.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    v
+                }
                 Err(_) => break,
             };
 
             reorder.push(seq_num, ConsumerItem::Decoded(item));
+            // Track reorder-buffer high-water (single-thread consumer
+            // owns this — no atomics needed).
+            if reorder.len() > s4_reorder_high_water {
+                s4_reorder_high_water = reorder.len();
+            }
             drain(
                 &mut reorder, &mut total_stats,
                 &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
@@ -665,7 +714,16 @@ pub(super) fn stage4_assembly(
         Ok(())
     })?;
 
+    // Time the final writer flush. `write_raw_owned` and
+    // `write_primitive_block_owned` hand work to the writer thread
+    // (compression + file I/O); when the decoded_tx channel grows,
+    // backpressure that used to surface as `s4_send_ms` shifts into
+    // the writer pipeline and only materialises here. Isolating
+    // flush makes the channel-vs-writer attribution legible.
+    let t_flush = std::time::Instant::now();
     writer.flush()?;
+    #[allow(clippy::cast_possible_truncation)]
+    let s4_flush_ms: u64 = t_flush.elapsed().as_millis() as u64;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -690,6 +748,12 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes as i64);
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
         crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
+        crate::debug::emit_counter("s4_flush_ms", s4_flush_ms as i64);
+        crate::debug::emit_counter(
+            "s4_channel_high_water",
+            s4_channel_high_water.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter("s4_reorder_high_water", s4_reorder_high_water as i64);
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);
         crate::debug::emit_counter("s4_node_blobs_total", s4_node_blobs_total as i64);
         crate::debug::emit_counter("s4_node_blobs_no_tagindex", s4_node_blobs_no_tagindex as i64);

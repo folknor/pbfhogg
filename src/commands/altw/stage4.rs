@@ -27,10 +27,30 @@ use super::COORD_SLOT_SIZE;
 /// Blob descriptor for the stage 4 pre-scan schedule.
 struct BlobDescriptor {
     seq: usize,
+    /// Start of the on-disk 4-byte length prefix. Used by the consumer-side
+    /// raw passthrough path to pread the entire framed blob (header + data)
+    /// and hand it verbatim to `PbfWriter::write_raw_owned`.
+    frame_offset: u64,
+    /// `(data_offset - frame_offset) + data_size`. The exact number of
+    /// bytes to pread for raw passthrough.
+    frame_size: usize,
     data_offset: u64,
     data_size: usize,
     slot_start: u64,
     is_way_blob: bool,
+    /// `true` when the blob can be passed through as raw compressed bytes
+    /// without decompress + PrimitiveBlock decode + re-encode. Relations
+    /// always qualify; node blobs qualify only when `keep_untagged_nodes`.
+    /// Ways never qualify (they need coord_payloads splicing).
+    is_passthrough: bool,
+    /// Blob kind from indexdata; `None` only for blobs with no indexdata
+    /// header, which never reach stage 4 in practice (require_indexdata
+    /// gates the whole pipeline) but the field stays optional to match
+    /// the scanner API.
+    kind: Option<crate::blob_index::ElemKind>,
+    /// Element count from indexdata, used to populate Stats on the
+    /// passthrough path (no decode available for a live count).
+    count: u64,
     /// Index of this way blob within `way_slot_starts` (0 for non-way blobs;
     /// only meaningful when `is_way_blob`).
     way_blob_idx: usize,
@@ -103,7 +123,11 @@ pub(super) fn stage4_assembly(
     // Header-only pre-scan: build the blob schedule.
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
-    scanner.set_parse_tagdata(true);
+    // Tagdata is only needed by the `!keep_untagged_nodes` per-blob
+    // filter below. When keep_untagged_nodes is set every node blob
+    // either passes through raw or stays wholesale, so we can skip the
+    // per-blob tag-index parse during the scan.
+    scanner.set_parse_tagdata(!keep_untagged_nodes);
     // Skip OsmHeader.
     scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
@@ -130,7 +154,7 @@ pub(super) fn stage4_assembly(
     let mut s4_relation_blobs: u64 = 0;
 
     while let Some(result) = scanner.next_header_with_data_offset() {
-        let (header_entry, _, data_offset, data_size) = result?;
+        let (header_entry, frame_offset, data_offset, data_size) = result?;
         if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
@@ -190,14 +214,33 @@ pub(super) fn stage4_assembly(
             (0, 0)
         };
 
-        let is_way_blob = header_entry.index()
-            .is_some_and(|idx| matches!(idx.kind, crate::blob_index::ElemKind::Way));
+        let idx_entry = header_entry.index();
+        let kind = idx_entry.map(|i| i.kind);
+        let count = idx_entry.map_or(0, |i| i.count);
+        let is_way_blob = matches!(kind, Some(crate::blob_index::ElemKind::Way));
+        // Passthrough eligibility mirrors the dense-path rule in
+        // write_output_passthrough (add_locations_to_ways.rs):
+        //   - Relation blobs: always.
+        //   - Node blobs: only when keep_untagged_nodes is set (no
+        //     per-element filtering needed; the blob is kept as-is).
+        //   - Ways: never (they need coord_payloads splicing).
+        let is_passthrough = matches!(kind, Some(crate::blob_index::ElemKind::Relation))
+            || (matches!(kind, Some(crate::blob_index::ElemKind::Node)) && keep_untagged_nodes);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let frame_size = (data_offset - frame_offset) as usize + data_size;
+
         schedule.push(BlobDescriptor {
             seq,
+            frame_offset,
+            frame_size,
             data_offset,
             data_size,
             slot_start,
             is_way_blob,
+            is_passthrough,
+            kind,
+            count,
             way_blob_idx,
         });
         seq += 1;
@@ -232,6 +275,15 @@ pub(super) fn stage4_assembly(
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
 
+    // Split schedule: passthrough-eligible blobs (relations always; node
+    // blobs when keep_untagged_nodes=true) are handled by the consumer
+    // thread via direct pread + write_raw_owned. Decode blobs (ways and
+    // the remaining filtered node blobs) go to workers. This mirrors the
+    // extract.rs pread_execute pattern so raw-frame traffic never hits
+    // the worker channel.
+    let (decode_items, passthrough_items): (Vec<BlobDescriptor>, Vec<BlobDescriptor>) =
+        schedule.into_iter().partition(|d| !d.is_passthrough);
+
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
@@ -254,6 +306,10 @@ pub(super) fn stage4_assembly(
     let s4_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_coord_payload_bytes = std::sync::atomic::AtomicU64::new(0);
+    // Consumer-side passthrough telemetry.
+    let mut s4_passthrough_blobs: u64 = 0;
+    let mut s4_passthrough_pread_ms: u64 = 0;
+    let mut s4_passthrough_bytes: u64 = 0;
     let s4_pread_ref = &s4_pread_ms;
     let s4_decompress_ref = &s4_decompress_ms;
     let s4_assemble_ref = &s4_assemble_ms;
@@ -278,9 +334,11 @@ pub(super) fn stage4_assembly(
     let mut s4_write_calls: u64 = 0;
 
     std::thread::scope(|scope| -> Result<()> {
-        // Dispatcher: feed schedule into descriptor channel.
+        // Dispatcher: feed only decode-eligible blobs into the worker
+        // channel. Passthrough blobs bypass workers entirely (see
+        // consumer loop below) and never travel through this channel.
         scope.spawn(move || {
-            for desc in schedule {
+            for desc in decode_items {
                 if desc_tx.send(desc).is_err() {
                     break;
                 }
@@ -385,6 +443,7 @@ pub(super) fn stage4_assembly(
                             let mut block_stats = Stats::default();
                             block_stats.ways_written = way_count;
                             block_stats.missing_locations = missing;
+                            block_stats.blobs_decoded = 1;
                             #[allow(clippy::cast_possible_truncation)]
                             {
                                 let elapsed = t2.elapsed().as_millis() as u64;
@@ -400,7 +459,7 @@ pub(super) fn stage4_assembly(
                         let block = PrimitiveBlock::new(
                             bytes::Bytes::from(std::mem::take(&mut decompress_buf))
                         )?;
-                        let block_stats = assemble_block(
+                        let mut block_stats = assemble_block(
                             &block,
                             &mut bb,
                             &mut output_blocks,
@@ -409,6 +468,7 @@ pub(super) fn stage4_assembly(
                         ).map_err(|e| crate::error::new_error(
                             crate::error::ErrorKind::Io(std::io::Error::other(e))
                         ))?;
+                        block_stats.blobs_decoded = 1;
                         flush_local(&mut bb, &mut output_blocks).map_err(|e| {
                             crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
@@ -461,10 +521,116 @@ pub(super) fn stage4_assembly(
         drop(desc_rx);
         drop(decoded_tx);
 
-        // Consumer: reorder + write to PbfWriter.
-        let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            crate::error::Result<(Vec<OwnedBlock>, Stats)>
-        > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+        // Consumer: reorder + write to PbfWriter. Decode results arrive
+        // from workers; passthrough items are pre-seeded and the consumer
+        // preads their raw frames inline when they become the head of the
+        // reorder buffer. `write_raw_owned` hands the pre-framed bytes to
+        // the writer thread verbatim.
+        enum ConsumerItem {
+            Decoded(crate::error::Result<(Vec<OwnedBlock>, Stats)>),
+            Passthrough {
+                frame_offset: u64,
+                frame_size: usize,
+                count: u64,
+                kind: crate::blob_index::ElemKind,
+            },
+        }
+
+        let mut reorder: crate::reorder_buffer::ReorderBuffer<ConsumerItem> =
+            crate::reorder_buffer::ReorderBuffer::with_capacity(32);
+
+        // Pre-seed passthrough items at their global seq positions.
+        for desc in &passthrough_items {
+            let kind = desc.kind.expect(
+                "passthrough eligibility requires a known blob kind",
+            );
+            reorder.push(desc.seq, ConsumerItem::Passthrough {
+                frame_offset: desc.frame_offset,
+                frame_size: desc.frame_size,
+                count: desc.count,
+                kind,
+            });
+        }
+
+        let mut frame_read_buf: Vec<u8> = Vec::new();
+
+        // Drain helper: pop consecutive ready items. Shared between the
+        // main result loop and the final drain for schedules that end
+        // on a passthrough tail (no decode result arrives to push it).
+        let mut drain = |reorder: &mut crate::reorder_buffer::ReorderBuffer<ConsumerItem>,
+                         total_stats: &mut Stats,
+                         s4_bytes_written: &mut u64,
+                         s4_write_calls: &mut u64,
+                         s4_write_ms: &mut u64,
+                         s4_passthrough_blobs: &mut u64,
+                         s4_passthrough_pread_ms: &mut u64,
+                         s4_passthrough_bytes: &mut u64|
+            -> Result<()> {
+            while let Some(item) = reorder.pop_ready() {
+                match item {
+                    ConsumerItem::Decoded(result) => {
+                        let (blocks, block_stats) = result?;
+                        total_stats.merge(&block_stats);
+                        for (block_bytes, index, tagdata) in blocks {
+                            *s4_bytes_written += block_bytes.len() as u64;
+                            *s4_write_calls += 1;
+                            let t_w = std::time::Instant::now();
+                            writer.write_primitive_block_owned(
+                                block_bytes, index, tagdata.as_deref(),
+                            )?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
+                        }
+                    }
+                    ConsumerItem::Passthrough { frame_offset, frame_size, count, kind } => {
+                        let t_pread = std::time::Instant::now();
+                        frame_read_buf.resize(frame_size, 0);
+                        shared_file.read_exact_at(&mut frame_read_buf, frame_offset)
+                            .map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(e),
+                            ))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        { *s4_passthrough_pread_ms += t_pread.elapsed().as_millis() as u64; }
+                        *s4_passthrough_bytes += frame_size as u64;
+
+                        let t_w = std::time::Instant::now();
+                        *s4_bytes_written += frame_size as u64;
+                        *s4_write_calls += 1;
+                        writer.write_raw_owned(std::mem::take(&mut frame_read_buf))?;
+                        #[allow(clippy::cast_possible_truncation)]
+                        { *s4_write_ms += t_w.elapsed().as_millis() as u64; }
+
+                        *s4_passthrough_blobs += 1;
+                        total_stats.blobs_passthrough += 1;
+                        match kind {
+                            crate::blob_index::ElemKind::Node => {
+                                total_stats.nodes_read += count;
+                                total_stats.nodes_written += count;
+                            }
+                            crate::blob_index::ElemKind::Relation => {
+                                total_stats.relations_written += count;
+                            }
+                            crate::blob_index::ElemKind::Way => {
+                                // Ways never pass through (they need
+                                // coord_payloads splicing). Fall through
+                                // without touching stats; unreachable in
+                                // practice but we avoid a hard panic here
+                                // since this is on the output path.
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        // Drain any passthrough prefix before the first decode result.
+        drain(
+            &mut reorder, &mut total_stats,
+            &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
+            &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+            &mut s4_passthrough_bytes,
+        )?;
 
         loop {
             let t_recv = std::time::Instant::now();
@@ -476,24 +642,25 @@ pub(super) fn stage4_assembly(
                 Err(_) => break,
             };
 
-            reorder.push(seq_num, item);
-
-            while let Some(result) = reorder.pop_ready() {
-                let (blocks, block_stats) = result?;
-                total_stats.merge(&block_stats);
-
-                for (block_bytes, index, tagdata) in blocks {
-                    s4_bytes_written += block_bytes.len() as u64;
-                    s4_write_calls += 1;
-                    let t_w = std::time::Instant::now();
-                    writer.write_primitive_block_owned(
-                        block_bytes, index, tagdata.as_deref(),
-                    )?;
-                    #[allow(clippy::cast_possible_truncation)]
-                    { s4_write_ms += t_w.elapsed().as_millis() as u64; }
-                }
-            }
+            reorder.push(seq_num, ConsumerItem::Decoded(item));
+            drain(
+                &mut reorder, &mut total_stats,
+                &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
+                &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+                &mut s4_passthrough_bytes,
+            )?;
         }
+
+        // Final drain for passthrough tails: if the schedule ends on
+        // passthrough items (common — relations sit at EOF in sorted
+        // PBFs) there's no trailing decode push to trigger the last
+        // pop_ready, so do it here.
+        drain(
+            &mut reorder, &mut total_stats,
+            &mut s4_bytes_written, &mut s4_write_calls, &mut s4_write_ms,
+            &mut s4_passthrough_blobs, &mut s4_passthrough_pread_ms,
+            &mut s4_passthrough_bytes,
+        )?;
 
         Ok(())
     })?;
@@ -518,6 +685,9 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_max_worker_buf_bytes", s4_max_worker_buf_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_coord_payload_pread_ms", s4_coord_payload_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_coord_payload_bytes", s4_coord_payload_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_passthrough_blobs", s4_passthrough_blobs as i64);
+        crate::debug::emit_counter("s4_passthrough_pread_ms", s4_passthrough_pread_ms as i64);
+        crate::debug::emit_counter("s4_passthrough_bytes", s4_passthrough_bytes as i64);
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
         crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
         crate::debug::emit_counter("extjoin_skipped_node_blobs", skipped_node_blobs as i64);

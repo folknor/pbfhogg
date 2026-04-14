@@ -90,12 +90,23 @@ non-standard encoding.
 
 **Status:** Known, accepted. Documented in code.
 
-**Context:** `DenseMmapIndex` (used by `add-locations-to-ways`) stores node coordinates
-as `(lat: i32, lon: i32)` pairs in a direct-addressed array, using `(0, 0)` as the
-"unset" sentinel. This means a node at exactly `0.0000000, 0.0000000` (Null Island)
-is treated as missing. The same pattern appears in the geocode index builder
-(`src/geocode_index/builder.rs:502`), where the compact rank-indexed coordinate array
-is zero-initialized and `(0, 0)` is filtered as unpopulated.
+**Context:** All three `add-locations-to-ways` index types (`dense`, `sparse`,
+`external`) store node coordinates as `(lat: i32, lon: i32)` pairs in a
+zero-initialized backing store and use `(0, 0)` as the "unset" sentinel:
+
+- `DenseMmapIndex::get` treats `packed == 0` as absent
+  (`src/commands/add_locations_to_ways.rs:145`).
+- `SparseArrayIndex::get_at_offset` treats `lat == 0 && lon == 0` as absent
+  (`src/commands/add_locations_to_ways.rs:349`).
+- The external-join stage 2 counts an entry as resolved only when
+  `lat != 0 || lon != 0` (`src/commands/altw/stage2.rs`), and
+  `Stats.missing_locations = total_slots - resolved_count`.
+
+All three paths therefore treat a node at exactly `0.0000000, 0.0000000`
+(Null Island) as missing, with identical user-visible behavior. The same
+pattern also appears in the geocode index builder
+(`src/geocode_index/builder.rs:502`), where the compact rank-indexed
+coordinate array is zero-initialized and `(0, 0)` is filtered as unpopulated.
 
 **Impact:** Ways referencing nodes at exactly `(0, 0)` — decimicrodegree precision,
 so within ~11mm of the intersection of the prime meridian and equator — will not

@@ -283,43 +283,6 @@ single-pass, tag expression and bbox filtering.
   for the NVMe-floor analysis that closed the structural-rearrangement
   family of optimizations.
 
-  **Bugs (must fix soon):**
-
-  - [x] ~~Small-input external mode is structurally rejected.~~ Fixed
-    in two commits. First commit (`cdb97e7`) introduced
-    `slot_bucket_count = min(NUM_BUCKETS, max(1, total_slots / max_blob_slots))`
-    and plumbed it through stages 2/3, but kept `range_size =
-    total_slots.div_ceil(slot_bucket_count)` — which makes the LAST
-    bucket smaller, not larger, so the smallest bucket could still be
-    narrower than `max_blob_slots`. Reviewer counterexample
-    (`total_slots=10, max_blob_slots=3` → buckets [0,4)[4,8)[8,10),
-    last is 2 wide) caught it. Followup: switched `range_size` to
-    floor division (in both `ResolvedEntry::slot_bucket` and
-    `stage3_slot_reorder`), making the LAST bucket *absorb the
-    remainder* (and be wider, not narrower). Smallest bucket = floor
-    `range_size` = `total_slots / slot_bucket_count` ≥ `max_blob_slots`
-    by construction. Out-of-range high `slot_pos` values get clamped
-    to the last-bucket index. (External review 2026-04-14 #2 + #3
-    followup.)
-  - [x] ~~External `Stats.missing_locations` always reports 0.~~ Fixed
-    in three commits (`25031a1` + manifest-persistence followup).
-    Computed in `external_join` after stage 4 as
-    `total_slots − resolved_count`, where `resolved_count` comes from
-    stage 2's `is_resolved = lat != 0 || lon != 0` aggregation. When
-    stage 2 was skipped via `--start-stage >= 3`, `resolved_count` is
-    recovered from the manifest (extended to 16 bytes:
-    `[u64 total_slots][u64 resolved_count]`) — so resume runs populate
-    the field consistently with fresh runs.
-
-    **Caveat (acknowledged tradeoff, not parity with dense):** this
-    counts a real OSM node at exact (0,0) decimicrodegrees as missing,
-    while dense doesn't. The closed "Null Island" item accepted that
-    tradeoff because (0°, 0°) is in the Atlantic and no real OSM node
-    has those exact coords; the count is correct in practice but the
-    semantics differ in principle. Remove this caveat only if a
-    user-visible (0,0)-sentinel collision is observed. (External review
-    2026-04-14 #2 + #3 followup.)
-
   **Bugs (lower priority, dev-time only):**
 
   - [ ] **`--start-stage` resume is fragile.** Manifest stores only
@@ -340,19 +303,6 @@ single-pass, tag expression and bbox filtering.
 
   **Still open — small / quick:**
 
-  - [x] ~~Stage 4 `coord_payload` trailing-bytes assert.~~ Shipped
-    2026-04-14. One-line defensive check `payload_pos ==
-    coord_payload.len()` after the de-interleave loop (stage4.rs);
-    returns a descriptive Err on mismatch. Catches stage 3 bugs,
-    truncated payloads, version skew. (External review 2026-04-14 #1.)
-  - [x] ~~Drop `IdSetDense` after stage 1.~~ Shipped 2026-04-14.
-    `stage1_way_pass` no longer returns the set; it's dropped
-    internally at end-of-stage, saving ~2 GB RSS through stages
-    2/3/4. Manifest layout extended to
-    `[u64 total_slots][u64 unique_nodes][u64 resolved_count?]`
-    (16/24 bytes); `--start-stage >= 2` reads `unique_nodes` from
-    manifest instead of rebuilding the set. (External review
-    2026-04-14 #2.)
   - [ ] ~~Sparse stage 2 slot buffers.~~ Investigated 2026-04-14,
     not applied. `Vec::new()` is zero-allocation, so the eager
     256-entry vector itself costs nothing. The 384 MB worst-case
@@ -363,11 +313,6 @@ single-pass, tag expression and bbox filtering.
     `slot_bucket_count` is already clamped dynamically by the
     small-input fix. Revisit only if per-worker scratch becomes a
     constraint for a different reason.
-  - [x] ~~`coord_slice` resize moved out of per-bucket loop~~
-    (`stage2.rs`). Shipped 2026-04-14. Pre-sized once per worker
-    to `rank_range_size * COORD_SLOT_SIZE`; per-bucket preads slice
-    the needed prefix. Eliminates the per-bucket `resize(.., 0)`
-    zero-fill. (External review 2026-04-14 #1.)
   - [ ] **Per-way refcounts threaded into stage 4** so
     `reframe_way_blob_with_locations` can stop re-counting refs from
     field 8 varints. Modest CPU win, not transformative. **Deferred:**
@@ -377,14 +322,6 @@ single-pass, tag expression and bbox filtering.
     `PerWayRcs` lazy per-blob decode item below, which saves
     ~3.5 GB RSS AND enables refcount threading at lower peak.
     (External review 2026-04-14 #2 hypothetical.)
-  - [x] ~~Stale "coord_slots" comment sweep~~ across `altw/*`.
-    Shipped 2026-04-14. Updated the module-level pipeline description
-    in `mod.rs`, the slot_pos/ResolvedEntry docstrings, and the
-    top-of-file comments in `stage3.rs` / `stage4.rs`. Left intact the
-    intentional historical references in `coord_payloads.rs` (ratio
-    comparison to the retired format) and `stage3.rs:178`
-    (explicit "pre-integration" context). (External review
-    2026-04-14 #1.)
 
   **Still open — measurable wins inside the current architecture:**
 

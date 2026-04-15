@@ -354,14 +354,6 @@ enum Command {
         ///              Requires sorted PBF and indexdata. ~300 GB temp disk at planet.
         #[arg(long, default_value = "dense")]
         index_type: String,
-        /// Keep scratch directory after completion (for --start-stage on next run)
-        #[arg(long)]
-        keep_scratch: bool,
-        /// Skip stages 1..N-1, resume from persisted scratch state.
-        /// Requires a previous run with --keep-scratch on the same input.
-        /// Valid values: 2, 3, 4.
-        #[arg(long)]
-        start_stage: Option<u8>,
         #[command(flatten)]
         compression: CompressionArg,
         #[command(flatten)]
@@ -957,8 +949,6 @@ fn main() {
             output,
             keep_untagged_nodes,
             index_type,
-            keep_scratch,
-            start_stage,
             compression,
             force,
             io,
@@ -968,8 +958,6 @@ fn main() {
             &output.output,
             keep_untagged_nodes,
             &index_type,
-            keep_scratch,
-            start_stage,
             &compression.compression,
             io.direct_io,
             force.force,
@@ -1872,24 +1860,11 @@ fn run_add_locations_to_ways(
     output: &std::path::Path,
     keep_untagged_nodes: bool,
     index_type: &str,
-    keep_scratch: bool,
-    start_stage: Option<u8>,
     compression: &str,
     direct_io: bool,
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if let Some(stage) = start_stage {
-        if !(2..=4).contains(&stage) {
-            return Err(format!("--start-stage must be 2, 3, or 4 (got {stage})").into());
-        }
-        if !matches!(index_type, "external" | "auto") {
-            return Err("--start-stage is only supported with --index-type external".into());
-        }
-    }
-    if keep_scratch && !matches!(index_type, "external" | "auto") {
-        return Err("--keep-scratch is only supported with --index-type external".into());
-    }
     let compression: Compression = compression.parse()?;
     let index_type: pbfhogg::add_locations_to_ways::IndexType = index_type.parse()?;
     let stats = pbfhogg::add_locations_to_ways::add_locations_to_ways(
@@ -1901,8 +1876,6 @@ fn run_add_locations_to_ways(
         force,
         overrides,
         index_type,
-        keep_scratch,
-        start_stage,
     )?;
     stats.print_summary();
     Ok(())

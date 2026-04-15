@@ -726,8 +726,6 @@ pub fn add_locations_to_ways(
     force: bool,
     overrides: &HeaderOverrides,
     index_type: IndexType,
-    keep_scratch: bool,
-    start_stage: Option<u8>,
 ) -> Result<Stats> {
     // Auto-select: external if sorted + indexed, dense otherwise.
     let index_type = if index_type == IndexType::Auto {
@@ -764,8 +762,6 @@ pub fn add_locations_to_ways(
             direct_io,
             force,
             overrides,
-            keep_scratch,
-            start_stage,
         );
     }
 

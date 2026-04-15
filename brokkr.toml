@@ -251,3 +251,16 @@ xxhash = "f59b934d548446df7716b0163edc0126"
 [plantasjen.datasets.planet.snapshot.20260411.pbf.indexed]
 file = "planet-20260411-with-indexdata.osm.pbf"
 xxhash = "7facb6386ff18bba38b176ee720fec62"
+
+[dm6.datasets.denmark]
+origin = "Geofabrik"
+
+[dm6.datasets.denmark.pbf.raw]
+file = "denmark-20260415.osm.pbf"
+xxhash = "fba07e0f57475a22b49348ed6584a2df"
+seq = 4757
+
+[dm6.datasets.denmark.pbf.indexed]
+file = "denmark-20260415-with-indexdata.osm.pbf"
+xxhash = "e2d812be0ec0d57ba1e351c50b50e269"
+seq = 4757

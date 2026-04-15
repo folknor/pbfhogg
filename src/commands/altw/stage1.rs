@@ -24,15 +24,14 @@ pub(super) struct WayBlobTask {
 
 /// Stage 1 output handed to stage 2. Owns the `IdSetDense` (kept alive
 /// because stage 2 needs `rank_if_set` for inline node-blob coord
-/// resolution) and the per-blob rank mapping. Resume paths that skip
-/// stage 2 leave these as `None`.
+/// resolution) and the per-blob rank mapping.
 pub(super) struct Stage1Output {
     pub total_slots: u64,
     pub unique_nodes: u64,
     pub rank_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
-    pub node_id_set: Option<IdSetDense>,
-    pub node_blob_mapping: Option<Vec<NodeBlobInfo>>,
+    pub node_id_set: IdSetDense,
+    pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
 /// Build the way-blob schedule via header-only scan.
@@ -59,9 +58,7 @@ pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
 /// referenced node IDs and write the two ref-count sidecars in blob order.
 ///
 /// Returns `(total_refs, IdSetDense)` with `build_rank_index()` already
-/// called. Used by `stage1_way_pass` (the normal path) and by
-/// `--start-stage >= 2` resumes that need to rebuild the set after stage 1
-/// dropped it during a prior run.
+/// called. Used by `stage1_way_pass` as the entry into stage 1.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 pub(super) fn stage1_pass_a(
@@ -611,7 +608,7 @@ pub(super) fn stage1_way_pass(
         unique_nodes: unique_nodes_u64,
         rank_bucket_counts: merged_counts,
         num_shard_workers: num_actual_workers,
-        node_id_set: Some(node_id_set),
-        node_blob_mapping: Some(node_blob_mapping),
+        node_id_set,
+        node_blob_mapping,
     })
 }

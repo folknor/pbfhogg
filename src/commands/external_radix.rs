@@ -48,17 +48,6 @@ impl ScratchDir {
         Ok(Self { path })
     }
 
-    /// Create a scratch dir with a stable name (no PID suffix).
-    /// Used by `--keep-scratch` / `--start-stage` so subsequent runs
-    /// can find the persisted scratch state.
-    pub(crate) fn new_stable(parent: &Path, name: &str) -> Result<Self> {
-        let path = parent.join(format!(".pbfhogg-{name}-scratch"));
-        std::fs::create_dir_all(&path).map_err(|e| {
-            format!("failed to create scratch directory {}: {e}", path.display())
-        })?;
-        Ok(Self { path })
-    }
-
     pub(crate) fn bucket_path(&self, prefix: &str, index: usize) -> PathBuf {
         self.path.join(format!("{prefix}-{index:03}"))
     }

@@ -352,6 +352,24 @@ Why this is third:
 - this is still current-architecture work, not another redesign
 - Japan is big enough to answer it
 
+Result:
+
+- Shelved after a Japan-only test in `237cb2e`.
+- UUID:
+  - Japan: `36615411`
+- Japan:
+  - `EXTJOIN_STAGE2`: `5900ms -> 5922ms` (flat-to-slightly-worse)
+  - `s2_coord_fill_ms`: `10112 -> 8463` (`-16%`)
+  - `s2_resolve_ms`: `4317 -> 3493` (`-19%`)
+  - `s2_node_extract_ns` dropped sharply, but that was mostly attribution
+    movement because tuple materialization moved out of the extract phase
+  - `s2_node_rank_ns` rose correspondingly; the total stage-2 wall did not
+    move in the right direction
+- Conclusion:
+  - discard under the item's own Japan gate
+  - the branch mostly reshuffled stage-2 subcounter attribution without
+    producing a meaningful `EXTJOIN_STAGE2` win
+
 ### 4. Wire-format DenseNodes filter for stage-4 non-way blobs
 
 Hypothesis:

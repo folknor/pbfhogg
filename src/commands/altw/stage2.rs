@@ -16,7 +16,7 @@ use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use super::super::id_set_dense::IdSetDense;
-use super::super::node_scanner::{scan_dense_group_ranges, visit_dense_node_tuples};
+use super::super::node_scanner::{extract_node_tuples, NodeTuple};
 use super::super::Result;
 use super::{
     slot_bucket_bounds, NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE,
@@ -343,6 +343,7 @@ pub(super) fn stage2_node_join(
                 let mut coord_slice: Vec<u8> = vec![0u8; max_slice_bytes];
                 let mut node_read_buf: Vec<u8> = Vec::new();
                 let mut node_decompress_buf: Vec<u8> = Vec::new();
+                let mut node_tuples: Vec<NodeTuple> = Vec::new();
                 let mut node_group_starts: Vec<(usize, usize)> = Vec::new();
                 let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
                 let mut local_resolved: u64 = 0;
@@ -448,9 +449,9 @@ pub(super) fn stage2_node_join(
                             node_decompress_ns_ref.fetch_add(t_dc.elapsed().as_nanos() as u64, Relaxed);
 
                             let t_ex = std::time::Instant::now();
-                            let scan_meta = scan_dense_group_ranges(
-                                &node_decompress_buf,
-                                &mut node_group_starts,
+                            node_tuples.clear();
+                            extract_node_tuples(
+                                &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
                             ).map_err(|e| format!("stage2 node extract: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_extract_ref.fetch_add(t_ex.elapsed().as_millis() as u64, Relaxed);
@@ -458,28 +459,20 @@ pub(super) fn stage2_node_join(
                             node_extract_ns_ref.fetch_add(t_ex.elapsed().as_nanos() as u64, Relaxed);
 
                             let t_rk = std::time::Instant::now();
-                            let mut next_ref_rank = blob.ref_rank_start;
-                            visit_dense_node_tuples(
-                                &node_decompress_buf,
-                                &node_group_starts,
-                                scan_meta,
-                                |id, lat, lon| {
-                                    if !id_set_ref.get(id) {
-                                        return;
-                                    }
-                                    let rank = next_ref_rank;
-                                    next_ref_rank += 1;
-                                    if rank < bucket_rank_start || rank >= bucket_rank_end {
-                                        return;
-                                    }
-                                    #[allow(clippy::cast_possible_truncation)]
-                                    let local_rank = (rank - bucket_rank_start) as usize;
-                                    let off = local_rank * COORD_SLOT_SIZE;
-                                    coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
-                                    coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
-                                },
-                            ).map_err(|e| format!("stage2 node rank: {e}"))?;
-                            debug_assert_eq!(next_ref_rank, blob.ref_rank_end);
+                            for &NodeTuple { id, lat, lon } in &node_tuples {
+                                let Some(rank) = id_set_ref.rank_if_set(id) else {
+                                    continue;
+                                };
+                                if rank < bucket_rank_start || rank >= bucket_rank_end {
+                                    // Belongs to an adjacent bucket — skip.
+                                    continue;
+                                }
+                                #[allow(clippy::cast_possible_truncation)]
+                                let local_rank = (rank - bucket_rank_start) as usize;
+                                let off = local_rank * COORD_SLOT_SIZE;
+                                coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
+                                coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
+                            }
                             #[allow(clippy::cast_possible_truncation)]
                             node_rank_ref.fetch_add(t_rk.elapsed().as_millis() as u64, Relaxed);
                             #[allow(clippy::cast_possible_truncation)]
@@ -567,6 +560,8 @@ pub(super) fn stage2_node_join(
                                 + coord_slice.capacity() as u64
                                 + node_read_buf.capacity() as u64
                                 + node_decompress_buf.capacity() as u64
+                                + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
+                                + (node_group_starts.capacity() * std::mem::size_of::<(usize, usize)>()) as u64
                                 + slot_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
                             let mut current = max_worker_buf_ref.load(Relaxed);
                             while worker_bytes > current {

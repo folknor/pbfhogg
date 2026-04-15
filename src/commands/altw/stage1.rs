@@ -1,24 +1,37 @@
-//! Stage 1: Two-pass way scan + coord pass.
+//! Stage 1: Two-pass way scan + node-blob rank mapping.
 //!
-//!   Pass A: build IdSetDense of referenced node IDs (parallel)
-//!   Pass B: emit rank-bucketed (rank, slot_pos) records (parallel)
-//!   Coord pass: populate dense coords_by_rank temp file
+//!   Pass A: build IdSetDense of referenced node IDs (parallel).
+//!   Pass B: emit rank-bucketed (local_rank, slot_pos) records (parallel).
+//!   Node blob mapping: header-only walk of node blobs that records each
+//!     blob's referenced-rank range using IdSetDense::rank queries on the
+//!     blob's indexdata `(min_id, max_id)`. Replaces the historical 82 GB
+//!     `coords_by_rank` file — stage 2 reads node blobs directly.
 
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
-use super::super::external_radix::{BucketWriters, ScratchDir, NUM_BUCKETS};
-#[cfg(feature = "linux-direct-io")]
-use super::super::external_radix::advise_dontneed_file;
+use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::super::id_set_dense::IdSetDense;
 use super::super::Result;
-use super::{RANK_RECORD_SIZE, COORD_SLOT_SIZE, RankRecord};
+use super::{NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
     pub(super) seq: u32,
     pub(super) data_offset: u64,
     pub(super) data_size: usize,
+}
+
+/// Stage 1 output handed to stage 2. Owns the `IdSetDense` (kept alive
+/// because stage 2 needs `rank_if_set` for inline node-blob coord
+/// resolution) and the per-blob rank mapping.
+pub(super) struct Stage1Output {
+    pub total_slots: u64,
+    pub unique_nodes: u64,
+    pub rank_bucket_counts: Vec<u64>,
+    pub num_shard_workers: usize,
+    pub node_id_set: IdSetDense,
+    pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
 /// Build the way-blob schedule via header-only scan.
@@ -41,43 +54,29 @@ pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
     Ok(schedule)
 }
 
-/// Two-pass stage 1.
+/// Pass A standalone: parallel way scan to build `IdSetDense` of all
+/// referenced node IDs and write the two ref-count sidecars in blob order.
 ///
-/// **Pass A**: parallel way scan to build `IdSetDense` of all referenced
-/// node IDs + write sidecar ref counts.
-///
-/// **Pass B**: rescan ways with rank index available. Emit `(rank, slot_pos)`
-/// records into rank-bucketed per-worker shard files.
-///
-/// Returns `(total_refs, unique_nodes, rank_bucket_entry_counts, num_workers)`.
-///
-/// The internal `IdSetDense` (~2 GB RSS at planet) is dropped at end of
-/// stage 1 — nothing downstream reads it. `unique_nodes` is the only
-/// scalar downstream needs, and it's persisted in the keep-scratch
-/// manifest so `--start-stage >= 2` resumes don't rebuild the set.
+/// Returns `(total_refs, IdSetDense)` with `build_rank_index()` already
+/// called. Used by `stage1_way_pass` (the normal path) and by
+/// `--start-stage >= 2` resumes that need to rebuild the set after stage 1
+/// dropped it during a prior run.
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
-pub(super) fn stage1_way_pass(
+pub(super) fn stage1_pass_a(
     input: &Path,
-    _direct_io: bool,
-    scratch: &ScratchDir,
+    schedule: &[WayBlobTask],
+    num_workers: usize,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
-    coord_file_path: Option<&Path>,
-) -> Result<(u64, u64, Vec<u64>, usize)> {
+) -> Result<(u64, IdSetDense)> {
     use std::os::unix::fs::FileExt as _;
 
-    let schedule = build_way_schedule(input)?;
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
     );
 
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-
-    // ---- Pass A: build IdSetDense + sidecar ----
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
     // Workers each maintain a local IdSetDense (non-atomic, sparse) and the
@@ -85,7 +84,7 @@ pub(super) fn stage1_way_pass(
     // shared-set fetch_or contention of the previous design and lets
     // chunk allocation be driven by the actually-touched ID range, not a
     // planet-wide pre_allocate.
-    let mut node_id_set = super::super::id_set_dense::IdSetDense::new();
+    let mut node_id_set = IdSetDense::new();
 
     let s1a_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_decompress_ms = std::sync::atomic::AtomicU64::new(0);
@@ -100,20 +99,11 @@ pub(super) fn stage1_way_pass(
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let mut total_refs: u64 = 0;
 
-    // Workers scan way refs and set bits in their per-thread IdSetDense.
-    // Consumer writes two sidecars:
-    //   - ref_count_sidecar: per-blob total ref count (u64 LE, plus trailer).
-    //   - per_way_refcount_sidecar: per-blob varint stream
-    //     `[varint num_ways][varint rc0][varint rc1]...[varint rcN-1]`,
-    //     needed by the blob-ordered coord_payloads prototype.
     let s1a_per_way_sidecar_bytes = std::sync::atomic::AtomicU64::new(0);
     {
-        // Channel item carries (total_refs, per_way_refcounts). The per-way
-        // Vec is small (avg ~25K ways per blob at planet scale) so the
-        // allocation cost per blob is negligible vs the scan itself.
         type PassAItem = (u32, std::result::Result<(u64, Vec<u32>), String>);
         let (tx, rx) = std::sync::mpsc::sync_channel::<PassAItem>(32);
-        let schedule_ref = &schedule;
+        let schedule_ref = schedule;
         let next_ref = &next_idx;
         let s1a_pread_ref = &s1a_pread_ms;
         let s1a_decompress_ref = &s1a_decompress_ms;
@@ -124,14 +114,14 @@ pub(super) fn stage1_way_pass(
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
 
         std::thread::scope(|scope| -> Result<()> {
-            let mut handles: Vec<std::thread::ScopedJoinHandle<'_, super::super::id_set_dense::IdSetDense>> =
+            let mut handles: Vec<std::thread::ScopedJoinHandle<'_, IdSetDense>> =
                 Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
                 let file = std::sync::Arc::clone(&shared_file);
                 let tx = tx.clone();
-                let h = scope.spawn(move || -> super::super::id_set_dense::IdSetDense {
+                let h = scope.spawn(move || -> IdSetDense {
                     use std::sync::atomic::Ordering::Relaxed;
-                    let mut local_set = super::super::id_set_dense::IdSetDense::new();
+                    let mut local_set = IdSetDense::new();
                     let mut read_buf: Vec<u8> = Vec::new();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
@@ -158,7 +148,6 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 1: scan way refs (proto parsing only).
                             let t2 = std::time::Instant::now();
                             let mut blob_node_ids: Vec<i64> = Vec::new();
                             let mut per_way_rcs: Vec<u32> = Vec::new();
@@ -173,7 +162,6 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_scan_ref.fetch_add(t2.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 2: batch set into local IdSetDense (no atomics).
                             let t3 = std::time::Instant::now();
                             for &node_id in &blob_node_ids {
                                 local_set.set(node_id);
@@ -192,7 +180,6 @@ pub(super) fn stage1_way_pass(
             }
             drop(tx);
 
-            // Consumer: write both sidecars in blob order.
             let mut sidecar_writer = BufWriter::with_capacity(
                 64 * 1024,
                 std::fs::File::create(ref_count_sidecar)
@@ -216,7 +203,6 @@ pub(super) fn stage1_way_pass(
                     sidecar_writer.write_all(&ref_count.to_le_bytes())?;
                     total_refs += ref_count;
 
-                    // Per-way sidecar: [varint num_ways][varint rc0][varint rc1]...
                     varint_buf.clear();
                     protohoggr::encode_varint(&mut varint_buf, per_way_rcs.len() as u64);
                     for rc in &per_way_rcs {
@@ -233,8 +219,6 @@ pub(super) fn stage1_way_pass(
             sidecar_writer.flush()?;
             per_way_writer.flush()?;
 
-            // All workers have exited (rx drained → all senders dropped).
-            // Join each and merge its local set into the shared one.
             let t_merge = std::time::Instant::now();
             for h in handles {
                 let local = h.join()
@@ -262,13 +246,8 @@ pub(super) fn stage1_way_pass(
         })?;
     }
 
-    // Build rank index.
     node_id_set.build_rank_index();
     let unique_nodes = node_id_set.total_count();
-    let unique_nodes_u64 = unique_nodes;
-
-    // Load sidecar prefix sums for slot_pos computation in pass B.
-    let slot_starts = super::stage4::load_ref_count_sidecar(ref_count_sidecar, total_refs)?;
 
     #[allow(clippy::cast_possible_wrap)]
     {
@@ -286,7 +265,132 @@ pub(super) fn stage1_way_pass(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_END");
 
-    // ---- Pass B: emit rank-bucketed (rank, slot_pos) records ----
+    Ok((total_refs, node_id_set))
+}
+
+/// Header-only walk of node blobs that builds the `NodeBlobInfo` mapping
+/// stage 2 uses to find which blobs cover each rank bucket.
+///
+/// Replaces the historical 82 GB `coords_by_rank` file. No decompression
+/// happens here — for each node blob we read its indexdata `(min_id, max_id)`
+/// and call `IdSetDense::rank` to compute the half-open referenced-rank range
+/// `[ref_rank_start, ref_rank_end)`. Adjacent blobs' ranges are non-overlapping
+/// and monotonic in rank because the input PBF is sorted by node ID.
+#[hotpath::measure]
+pub(super) fn build_node_blob_mapping(
+    input: &Path,
+    node_id_set: &IdSetDense,
+) -> Result<Vec<NodeBlobInfo>> {
+    crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
+    let t0 = std::time::Instant::now();
+
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+
+    let mut mapping: Vec<NodeBlobInfo> = Vec::new();
+    let mut blobs_without_indexdata: u64 = 0;
+    let mut blobs_with_zero_refs: u64 = 0;
+
+    while let Some(result) = scanner.next_header_with_data_offset() {
+        let (hdr, _, data_offset, data_size) = result?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        let idx = match hdr.index() {
+            Some(i) if matches!(i.kind, crate::blob_index::ElemKind::Node) => i,
+            Some(_) => continue,
+            None => {
+                // No indexdata. External join requires it, so this is a hard
+                // error (caller already enforces require_indexdata, but stay
+                // defensive).
+                blobs_without_indexdata += 1;
+                continue;
+            }
+        };
+
+        // count_below() is the safe variant of rank() that handles IDs past
+        // the highest allocated chunk (which can happen when a node blob's
+        // max_id sits in a chunk that contains no referenced nodes — rank()
+        // would panic on the chunks[] index). Returns count of set IDs
+        // strictly less than the argument, so this yields the half-open
+        // referenced-rank range over [min_id, max_id].
+        let ref_rank_start = node_id_set.count_below(idx.min_id);
+        let ref_rank_end = match idx.max_id.checked_add(1) {
+            Some(v) => node_id_set.count_below(v),
+            None => node_id_set.total_count(),
+        };
+        if ref_rank_end == ref_rank_start {
+            blobs_with_zero_refs += 1;
+        }
+        mapping.push(NodeBlobInfo {
+            data_offset,
+            data_size,
+            ref_rank_start,
+            ref_rank_end,
+        });
+    }
+
+    if blobs_without_indexdata > 0 {
+        return Err(format!(
+            "external join: {blobs_without_indexdata} node blob(s) missing indexdata"
+        ).into());
+    }
+
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    {
+        crate::debug::emit_counter("s1_node_map_blobs", mapping.len() as i64);
+        crate::debug::emit_counter("s1_node_map_zero_ref_blobs", blobs_with_zero_refs as i64);
+        crate::debug::emit_counter("s1_node_map_build_ms", t0.elapsed().as_millis() as i64);
+    }
+    crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_END");
+    Ok(mapping)
+}
+
+/// Two-pass stage 1 + node-blob mapping construction.
+///
+/// **Pass A**: parallel way scan to build `IdSetDense` of all referenced
+/// node IDs + write sidecar ref counts.
+///
+/// **Pass B**: rescan ways with rank index available. Emit `(local_rank, slot_pos)`
+/// records into rank-bucketed per-worker shard files.
+///
+/// **Mapping**: header-only walk of node blobs to compute the
+/// `NodeBlobInfo` table stage 2 uses to find blobs covering each rank
+/// bucket. Replaces the historical 82 GB `coords_by_rank` file.
+///
+/// `IdSetDense` (~2 GB RSS at planet) is **kept alive** in `Stage1Output`
+/// because stage 2 calls `rank_if_set` while resolving coordinates inline.
+#[hotpath::measure]
+#[allow(clippy::too_many_lines)]
+pub(super) fn stage1_way_pass(
+    input: &Path,
+    _direct_io: bool,
+    scratch: &ScratchDir,
+    ref_count_sidecar: &Path,
+    per_way_refcount_sidecar: &Path,
+) -> Result<Stage1Output> {
+    use std::os::unix::fs::FileExt as _;
+
+    let schedule = build_way_schedule(input)?;
+
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4);
+
+    let (total_refs, node_id_set) = stage1_pass_a(
+        input, &schedule, num_workers, ref_count_sidecar, per_way_refcount_sidecar,
+    )?;
+    let unique_nodes_u64 = node_id_set.total_count();
+
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
+    );
+
+    // Load sidecar prefix sums for slot_pos computation in pass B.
+    let slot_starts = super::stage4::load_ref_count_sidecar(ref_count_sidecar, total_refs)?;
+
+    // ---- Pass B: emit rank-bucketed (local_rank, slot_pos) records ----
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_START");
 
     let s1b_pread_ms = std::sync::atomic::AtomicU64::new(0);
@@ -301,7 +405,7 @@ pub(super) fn stage1_way_pass(
     let s1b_shard_write_calls = std::sync::atomic::AtomicU64::new(0);
     let s1b_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
-    next_idx.store(0, std::sync::atomic::Ordering::Relaxed);
+    let next_idx = std::sync::atomic::AtomicUsize::new(0);
 
     let worker_counts: std::sync::Mutex<Vec<Vec<u64>>> = std::sync::Mutex::new(Vec::new());
     let actual_num_workers: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -359,7 +463,6 @@ pub(super) fn stage1_way_pass(
                     let mut rec_buf = [0u8; RANK_RECORD_SIZE];
 
                     loop {
-                        // Stop if another worker hit an error.
                         if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() {
                             break;
                         }
@@ -383,7 +486,6 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 1: scan way refs (proto parsing only).
                             let t2 = std::time::Instant::now();
                             let slot_start = slot_starts_ref[task.seq as usize];
                             let mut blob_node_ids: Vec<i64> = Vec::new();
@@ -398,10 +500,8 @@ pub(super) fn stage1_way_pass(
                             let blob_ref_count = blob_node_ids.len() as u64;
                             s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
 
-                            // Phase 2: batch rank lookups + bucket selection.
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
-                            // (local_rank, bucket, slot_pos) per ref.
                             let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
@@ -418,7 +518,6 @@ pub(super) fn stage1_way_pass(
                             #[allow(clippy::cast_possible_truncation)]
                             s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
 
-                            // Phase 3: batch encode + write.
                             let t4 = std::time::Instant::now();
                             let mut blob_bytes: u64 = 0;
                             let mut blob_writes: u64 = 0;
@@ -446,7 +545,6 @@ pub(super) fn stage1_way_pass(
                         }
                     }
 
-                    // Flush shard writers.
                     let t_flush = std::time::Instant::now();
                     for w in &mut shard_writers {
                         if let Some(writer) = w.as_mut() {
@@ -466,21 +564,6 @@ pub(super) fn stage1_way_pass(
                         .push(entry_counts);
                 });
             }
-            // Spawn coord pass concurrently with pass B workers.
-            // Both read from the same PBF via pread (different blob types),
-            // and share &node_id_set (read-only). No contention.
-            if let Some(cfp) = coord_file_path {
-                scope.spawn(move || {
-                    crate::debug::emit_marker("EXTJOIN_COORD_PASS_START");
-                    if let Err(e) = build_coords_by_rank_file(
-                        input, node_id_set_ref, unique_nodes_u64, cfp,
-                    ) {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(format!("coord pass: {e}"));
-                    }
-                    crate::debug::emit_marker("EXTJOIN_COORD_PASS_END");
-                });
-            }
 
             Ok(())
         })?;
@@ -492,7 +575,6 @@ pub(super) fn stage1_way_pass(
 
     let num_actual_workers = actual_num_workers.load(std::sync::atomic::Ordering::Relaxed);
 
-    // Merge per-worker entry counts.
     let all_counts = worker_counts.into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut merged_counts = vec![0u64; NUM_BUCKETS];
@@ -519,263 +601,16 @@ pub(super) fn stage1_way_pass(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 
-    let num_actual = num_actual_workers;
-    // Drop ~2 GB of IdSetDense bitset + rank index before the caller
-    // proceeds to stages 2/3/4. Nothing downstream reads it.
-    drop(node_id_set);
-    Ok((total_refs, unique_nodes_u64, merged_counts, num_actual))
-}
+    // Build the per-blob rank mapping (header-only walk + rank queries —
+    // no decompression).
+    let node_blob_mapping = build_node_blob_mapping(input, &node_id_set)?;
 
-/// Parallel node scan that writes dense (lat, lon) to a temp file indexed
-/// by IdSetDense rank. Workers decompress node blobs, compute rank_if_set
-/// for each node, coalesce adjacent ranks into contiguous pwrite extents.
-///
-/// Pre-sizes the file to `unique_nodes * 8` bytes (zeroed = missing sentinel).
-#[hotpath::measure]
-pub(super) fn build_coords_by_rank_file(
-    input: &Path,
-    node_id_set: &super::super::id_set_dense::IdSetDense,
-    unique_nodes: u64,
-    coord_file_path: &Path,
-) -> Result<()> {
-    use super::super::node_scanner::{NodeTuple, extract_node_tuples};
-    use std::os::unix::fs::FileExt as _;
-
-    let coord_file = std::fs::OpenOptions::new()
-        .read(true).write(true).create(true).truncate(true)
-        .open(coord_file_path)
-        .map_err(|e| format!("create coords_by_rank: {e}"))?;
-    let total_bytes = unique_nodes * COORD_SLOT_SIZE as u64;
-    coord_file.set_len(total_bytes)
-        .map_err(|e| format!("ftruncate coords_by_rank to {total_bytes}: {e}"))?;
-    let coord_file = std::sync::Arc::new(coord_file);
-
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
-    struct NodeBlobTask { data_offset: u64, data_size: usize }
-    let mut schedule: Vec<NodeBlobTask> = Vec::new();
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, _, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Node) { continue; }
-        }
-        schedule.push(NodeBlobTask { data_offset, data_size });
-    }
-
-    let shared_input = std::sync::Arc::new(
-        std::fs::File::open(input)
-            .map_err(|e| format!("open input for coord pass: {e}"))?
-    );
-
-    let num_workers = std::thread::available_parallelism()
-        .map(|n| n.get().saturating_sub(2).max(1))
-        .unwrap_or(4);
-
-    let next_idx = std::sync::atomic::AtomicUsize::new(0);
-    let s_pread_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_decompress_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_extract_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_rank_if_set_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_extent_build_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_pwrite_ms = std::sync::atomic::AtomicU64::new(0);
-    let s_nodes_written = std::sync::atomic::AtomicU64::new(0);
-    let s_extents = std::sync::atomic::AtomicU64::new(0);
-    let s_bytes_written = std::sync::atomic::AtomicU64::new(0);
-    let s_pwrite_calls = std::sync::atomic::AtomicU64::new(0);
-    let s_bytes_read = std::sync::atomic::AtomicU64::new(0);
-    let s_pread_calls = std::sync::atomic::AtomicU64::new(0);
-    let s_zero_gap_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s_max_extents_per_blob = std::sync::atomic::AtomicU64::new(0);
-    let coord_pass_error: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-
-    let schedule_ref = &schedule;
-    let next_ref = &next_idx;
-    let err_ref = &coord_pass_error;
-
-    std::thread::scope(|scope| {
-        for _ in 0..num_workers {
-            let input_file = std::sync::Arc::clone(&shared_input);
-            let out_file = std::sync::Arc::clone(&coord_file);
-            let pread_ref = &s_pread_ms;
-            let decompress_ref = &s_decompress_ms;
-            let extract_ref = &s_extract_ms;
-            let rank_if_set_ref = &s_rank_if_set_ms;
-            let extent_build_ref = &s_extent_build_ms;
-            let pwrite_ref = &s_pwrite_ms;
-            let written_ref = &s_nodes_written;
-            let extents_ref = &s_extents;
-            let bytes_ref = &s_bytes_written;
-            let pwrite_calls_ref = &s_pwrite_calls;
-            let bytes_read_ref = &s_bytes_read;
-            let pread_calls_ref = &s_pread_calls;
-            let zero_gap_ref = &s_zero_gap_bytes;
-            let max_extents_ref = &s_max_extents_per_blob;
-            scope.spawn(move || {
-                use std::sync::atomic::Ordering::Relaxed;
-                let mut read_buf: Vec<u8> = Vec::new();
-                let mut decompress_buf: Vec<u8> = Vec::new();
-                let mut tuples: Vec<NodeTuple> = Vec::new();
-                let mut group_starts: Vec<(usize, usize)> = Vec::new();
-                let mut extent_buf: Vec<u8> = Vec::new();
-
-                loop {
-                    if err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some() { break; }
-                    let idx = next_ref.fetch_add(1, Relaxed);
-                    if idx >= schedule_ref.len() { break; }
-                    let task = &schedule_ref[idx];
-
-                    let blob_result: std::result::Result<(), String> = (|| {
-                        let t0 = std::time::Instant::now();
-                        read_buf.resize(task.data_size, 0);
-                        input_file.read_exact_at(&mut read_buf, task.data_offset)
-                            .map_err(|e| format!("coord pass pread: {e}"))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        pread_ref.fetch_add(t0.elapsed().as_millis() as u64, Relaxed);
-                        bytes_read_ref.fetch_add(task.data_size as u64, Relaxed);
-                        pread_calls_ref.fetch_add(1, Relaxed);
-
-                        let t1 = std::time::Instant::now();
-                        crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
-                            .map_err(|e| format!("coord pass decompress: {e}"))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        decompress_ref.fetch_add(t1.elapsed().as_millis() as u64, Relaxed);
-
-                        // Phase 1: extract node tuples from proto.
-                        let t_extract = std::time::Instant::now();
-                        tuples.clear();
-                        extract_node_tuples(&decompress_buf, &mut tuples, &mut group_starts)
-                            .map_err(|e| format!("coord pass extract: {e}"))?;
-                        #[allow(clippy::cast_possible_truncation)]
-                        extract_ref.fetch_add(t_extract.elapsed().as_millis() as u64, Relaxed);
-
-                        // Phase 2: batch rank_if_set to identify referenced nodes.
-                        // Produces (rank, lat, lon) for referenced nodes only, in
-                        // rank-ascending order (nodes are ID-sorted, rank is monotonic).
-                        let t_rank = std::time::Instant::now();
-                        let mut ranked_coords: Vec<(u64, i32, i32)> = Vec::new();
-                        for &NodeTuple { id, lat, lon } in &tuples {
-                            if let Some(rank) = node_id_set.rank_if_set(id) {
-                                ranked_coords.push((rank, lat, lon));
-                            }
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        rank_if_set_ref.fetch_add(t_rank.elapsed().as_millis() as u64, Relaxed);
-                        let blob_nodes = ranked_coords.len() as u64;
-
-                        // Phase 3: coalesce adjacent ranks into contiguous pwrite
-                        // extents and write to the coord file.
-                        let t_extent = std::time::Instant::now();
-                        let mut extent_start_rank: Option<u64> = None;
-                        let mut prev_rank: u64 = 0;
-                        let mut blob_extents: u64 = 0;
-                        let mut blob_bytes: u64 = 0;
-                        let mut blob_pwrite_calls: u64 = 0;
-                        let mut blob_zero_gap_bytes: u64 = 0;
-                        extent_buf.clear();
-
-                        for &(rank, lat, lon) in &ranked_coords {
-                            let continues = extent_start_rank.is_some() && rank == prev_rank + 1;
-                            if !continues && !extent_buf.is_empty() {
-                                // Flush current extent.
-                                let start = extent_start_rank.unwrap_or(0);
-                                let t_w = std::time::Instant::now();
-                                out_file.write_all_at(&extent_buf, start * COORD_SLOT_SIZE as u64)
-                                    .map_err(|e| format!("coord pass pwrite: {e}"))?;
-                                #[allow(clippy::cast_possible_truncation)]
-                                pwrite_ref.fetch_add(t_w.elapsed().as_millis() as u64, Relaxed);
-                                blob_extents += 1;
-                                blob_pwrite_calls += 1;
-                                blob_bytes += extent_buf.len() as u64;
-                                // Gap between end of this extent and start of next.
-                                let extent_end_rank = prev_rank + 1;
-                                blob_zero_gap_bytes += (rank - extent_end_rank) * COORD_SLOT_SIZE as u64;
-                                extent_buf.clear();
-                            }
-                            if !continues {
-                                extent_start_rank = Some(rank);
-                            }
-                            extent_buf.extend_from_slice(&lat.to_le_bytes());
-                            extent_buf.extend_from_slice(&lon.to_le_bytes());
-                            prev_rank = rank;
-                        }
-
-                        // Flush final extent.
-                        if !extent_buf.is_empty() {
-                            let start = extent_start_rank.unwrap_or(0);
-                            let t_w = std::time::Instant::now();
-                            out_file.write_all_at(&extent_buf, start * COORD_SLOT_SIZE as u64)
-                                .map_err(|e| format!("coord pass pwrite final: {e}"))?;
-                            #[allow(clippy::cast_possible_truncation)]
-                            pwrite_ref.fetch_add(t_w.elapsed().as_millis() as u64, Relaxed);
-                            blob_extents += 1;
-                            blob_pwrite_calls += 1;
-                            blob_bytes += extent_buf.len() as u64;
-                            extent_buf.clear();
-                        }
-                        #[allow(clippy::cast_possible_truncation)]
-                        extent_build_ref.fetch_add(t_extent.elapsed().as_millis() as u64, Relaxed);
-
-                        written_ref.fetch_add(blob_nodes, Relaxed);
-                        extents_ref.fetch_add(blob_extents, Relaxed);
-                        bytes_ref.fetch_add(blob_bytes, Relaxed);
-                        pwrite_calls_ref.fetch_add(blob_pwrite_calls, Relaxed);
-                        zero_gap_ref.fetch_add(blob_zero_gap_bytes, Relaxed);
-                        // Update max extents per blob (relaxed CAS loop).
-                        {
-                            let mut current = max_extents_ref.load(Relaxed);
-                            while blob_extents > current {
-                                match max_extents_ref.compare_exchange_weak(
-                                    current, blob_extents, Relaxed, Relaxed,
-                                ) {
-                                    Ok(_) => break,
-                                    Err(actual) => current = actual,
-                                }
-                            }
-                        }
-                        Ok(())
-                    })();
-
-                    if let Err(e) = blob_result {
-                        *err_ref.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e);
-                        break;
-                    }
-                }
-            });
-        }
-    });
-
-    if let Some(e) = coord_pass_error.into_inner().unwrap_or(None) {
-        return Err(e.into());
-    }
-
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        let total_extents = s_extents.load(std::sync::atomic::Ordering::Relaxed);
-        let total_bytes = s_bytes_written.load(std::sync::atomic::Ordering::Relaxed);
-        crate::debug::emit_counter("coord_pass_pread_ms", s_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_decompress_ms", s_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_extract_ms", s_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_rank_if_set_ms", s_rank_if_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_extent_build_ms", s_extent_build_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_pwrite_ms", s_pwrite_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_nodes_written", s_nodes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_extents", total_extents as i64);
-        crate::debug::emit_counter("coord_pass_bytes_written", total_bytes as i64);
-        crate::debug::emit_counter("coord_pass_pwrite_calls", s_pwrite_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_bytes_read", s_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_pread_calls", s_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_zero_gap_bytes", s_zero_gap_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("coord_pass_max_extents_per_blob", s_max_extents_per_blob.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        #[allow(clippy::cast_possible_truncation)]
-        if total_extents > 0 {
-            crate::debug::emit_counter("coord_pass_avg_extent_bytes", (total_bytes / total_extents) as i64);
-        }
-        crate::debug::emit_counter("coord_pass_blobs", schedule.len() as i64);
-    }
-
-    Ok(())
+    Ok(Stage1Output {
+        total_slots: total_refs,
+        unique_nodes: unique_nodes_u64,
+        rank_bucket_counts: merged_counts,
+        num_shard_workers: num_actual_workers,
+        node_id_set,
+        node_blob_mapping,
+    })
 }

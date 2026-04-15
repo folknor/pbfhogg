@@ -396,6 +396,45 @@ impl IdSetDense {
         Some(r)
     }
 
+    /// Count of set IDs strictly less than `id`. Safe for any `i64` —
+    /// arguments below zero return 0, arguments past the highest allocated
+    /// chunk return `total_count()`. Unlike `rank()`, never panics on
+    /// out-of-range inputs.
+    ///
+    /// Requires `build_rank_index()`.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn count_below(&self, id: i64) -> u64 {
+        if id <= 0 {
+            return 0;
+        }
+        let uid = id as u64;
+        let cid = (uid >> (CHUNK_BITS + 3)) as usize;
+        if cid >= self.chunks.len() {
+            return self.total_count();
+        }
+        self.rank(id)
+    }
+
+    /// Count of set IDs in the inclusive range `[min_id, max_id]`. Returns
+    /// 0 for an empty range. Safe for arguments outside the allocated chunk
+    /// space (clamps via `count_below`).
+    ///
+    /// Used by external join's stage 1 to compute per-node-blob referenced
+    /// rank ranges from the blob's indexdata `(min_id, max_id)` without
+    /// decoding the blob.
+    ///
+    /// Requires `build_rank_index()`.
+    pub fn count_in_range(&self, min_id: i64, max_id: i64) -> u64 {
+        if max_id < min_id {
+            return 0;
+        }
+        let after_max = match max_id.checked_add(1) {
+            Some(v) => self.count_below(v),
+            None => self.total_count(),
+        };
+        after_max - self.count_below(min_id)
+    }
+
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
         let prefix = self.rank_chunk_prefix.as_ref()
@@ -562,6 +601,63 @@ mod tests {
             assert!(!s.get(id), "precondition: {id} should not be set");
             assert_eq!(s.rank_if_set(id), None, "rank_if_set({id}) for unset");
         }
+    }
+
+    #[test]
+    fn count_in_range_basic() {
+        let mut s = IdSetDense::new();
+        for id in [5, 10, 15, 20, 100] {
+            s.set(id);
+        }
+        s.build_rank_index();
+
+        // Inclusive range semantics, exact and gap cases.
+        assert_eq!(s.count_in_range(5, 20), 4);
+        assert_eq!(s.count_in_range(5, 5), 1);
+        assert_eq!(s.count_in_range(6, 9), 0);
+        assert_eq!(s.count_in_range(0, 100), 5);
+        assert_eq!(s.count_in_range(0, 4), 0);
+        assert_eq!(s.count_in_range(101, 1_000), 0);
+
+        // Inverted range.
+        assert_eq!(s.count_in_range(50, 10), 0);
+    }
+
+    #[test]
+    fn count_in_range_safe_past_allocated_chunks() {
+        // Regression test for the external join build_node_blob_mapping
+        // path: a node blob's indexdata may report (min_id, max_id) where
+        // max_id sits in a chunk past the highest allocated chunk in
+        // IdSetDense (because no referenced node has an ID that high).
+        // rank() panics on chunks[cid] indexing in that case;
+        // count_below() / count_in_range() must clamp to total_count.
+        let mut s = IdSetDense::new();
+        s.set(100);
+        s.set(200);
+        s.build_rank_index();
+
+        // chunks.len() == 1 because both IDs fall in chunk 0.
+        // Probe IDs many chunks past the end.
+        let way_past_end: i64 = 1_000_000_000_000;
+        assert_eq!(s.count_below(way_past_end), 2);
+        assert_eq!(s.count_in_range(0, way_past_end), 2);
+        assert_eq!(s.count_in_range(150, way_past_end), 1);
+        assert_eq!(s.count_in_range(way_past_end / 2, way_past_end), 0);
+
+        // i64::MAX is the saturating-add boundary in build_node_blob_mapping;
+        // count_in_range must handle max_id = i64::MAX without overflow.
+        assert_eq!(s.count_in_range(0, i64::MAX), 2);
+    }
+
+    #[test]
+    fn count_below_negative_and_zero() {
+        let mut s = IdSetDense::new();
+        s.set(5);
+        s.build_rank_index();
+        assert_eq!(s.count_below(-1), 0);
+        assert_eq!(s.count_below(0), 0);
+        assert_eq!(s.count_below(5), 0);
+        assert_eq!(s.count_below(6), 1);
     }
 
     #[test]

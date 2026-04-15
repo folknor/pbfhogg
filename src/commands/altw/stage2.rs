@@ -1,13 +1,24 @@
-//! Stage 2: Node join — parallel counting-sort per rank bucket, coord slice lookup.
+//! Stage 2: Node join — parallel counting-sort per rank bucket, inline
+//! per-bucket coordinate resolution from node blobs.
+//!
+//! Replaces the historical 82 GB `coords_by_rank` file pread with a direct
+//! per-bucket node-blob decode: each worker uses the stage 1 `NodeBlobInfo`
+//! mapping to find which blobs cover its bucket's rank range, preads and
+//! decompresses them, runs `extract_node_tuples`, and writes resolved
+//! coordinates into a per-bucket `coord_slice` keyed by `(rank - R_lo)`.
+//! The slice is then consumed by the existing rank-record join unchanged.
 
 use std::io::Write as _;
 use std::path::Path;
+use std::sync::Arc;
 
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
+use super::super::id_set_dense::IdSetDense;
+use super::super::node_scanner::{extract_node_tuples, NodeTuple};
 use super::super::Result;
-use super::{RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
+use super::{NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
 
 // ---------------------------------------------------------------------------
 // Stage 2: Parallel node join — coord slice lookup
@@ -190,8 +201,10 @@ impl SharedSlotBuckets {
 }
 
 /// Parallel stage 2: N workers each claim rank buckets via atomic dispatch,
-/// load rank records, counting-sort, pread coord slice, resolve to (lat, lon),
-/// write to shared slot bucket files (256 files total, per-bucket mutex).
+/// load rank records, counting-sort, fill the bucket's coord slice by
+/// decoding the node blobs covering its rank range (using the stage 1
+/// `NodeBlobInfo` mapping), resolve to `(lat, lon)`, write to shared slot
+/// bucket files (256 files total, per-bucket mutex).
 ///
 /// Returns resolved_count.
 #[hotpath::measure]
@@ -204,7 +217,9 @@ pub(super) fn stage2_node_join(
     slot_bucket_count: usize,
     total_slots: u64,
     unique_nodes: u64,
-    coord_file_path: &Path,
+    input_pbf: Arc<std::fs::File>,
+    node_id_set: &IdSetDense,
+    node_blob_mapping: &[NodeBlobInfo],
 ) -> Result<u64> {
     let rank_range_size = unique_nodes.div_ceil(NUM_BUCKETS as u64);
 
@@ -214,14 +229,23 @@ pub(super) fn stage2_node_join(
         .min(6);
 
     use std::os::unix::fs::FileExt as _;
-    let coord_file = std::sync::Arc::new(
-        std::fs::File::open(coord_file_path)
-            .map_err(|e| format!("open coords_by_rank for stage 2: {e}"))?
-    );
 
     let next_idx = std::sync::atomic::AtomicUsize::new(0);
     let resolved_total = std::sync::atomic::AtomicU64::new(0);
-    let s2_coord_read_ms = std::sync::atomic::AtomicU64::new(0);
+    // Wall time spent populating coord_slice (node-blob pread + decompress
+    // + extract + rank fill). Replaces the old s2_coord_read_ms metric.
+    let s2_coord_fill_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_pread_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_decompress_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_extract_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_rank_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_bytes_read = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_blobs_read = std::sync::atomic::AtomicU64::new(0);
+    // Buckets for which we touched at least one straddler blob (a blob
+    // whose rank range crosses our bucket boundary). Each straddler is
+    // re-decompressed by the adjacent bucket's worker, so high values
+    // mean wasted decode work.
+    let s2_node_straddler_blobs = std::sync::atomic::AtomicU64::new(0);
     let s2_resolve_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_bucket_load_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_bucket_loads = std::sync::atomic::AtomicU64::new(0);
@@ -230,7 +254,6 @@ pub(super) fn stage2_node_join(
     let s2_prepare_scatter_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_slot_flush_lock_wait_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_slot_flush_write_ms = std::sync::atomic::AtomicU64::new(0);
-    let s2_coord_slice_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s2_slot_bytes_written = std::sync::atomic::AtomicU64::new(0);
     let s2_slot_flush_calls = std::sync::atomic::AtomicU64::new(0);
     let s2_nonempty_slot_buckets_total = std::sync::atomic::AtomicU64::new(0);
@@ -246,7 +269,16 @@ pub(super) fn stage2_node_join(
 
     let next_ref = &next_idx;
     let resolved_ref = &resolved_total;
-    let coord_read_ref = &s2_coord_read_ms;
+    let coord_fill_ref = &s2_coord_fill_ms;
+    let node_pread_ref = &s2_node_pread_ms;
+    let node_decompress_ref = &s2_node_decompress_ms;
+    let node_extract_ref = &s2_node_extract_ms;
+    let node_rank_ref = &s2_node_rank_ms;
+    let node_bytes_ref = &s2_node_bytes_read;
+    let node_blobs_ref = &s2_node_blobs_read;
+    let node_straddler_ref = &s2_node_straddler_blobs;
+    let mapping_ref = node_blob_mapping;
+    let id_set_ref = node_id_set;
     let resolve_ref = &s2_resolve_ms;
     let load_ref = &s2_bucket_load_ms;
     let loads_ref = &s2_bucket_loads;
@@ -255,7 +287,6 @@ pub(super) fn stage2_node_join(
     let prepare_scatter_ref = &s2_prepare_scatter_ms;
     let flush_lock_ref = &s2_slot_flush_lock_wait_ms;
     let flush_write_ref = &s2_slot_flush_write_ms;
-    let coord_bytes_ref = &s2_coord_slice_bytes_read;
     let slot_bytes_ref = &s2_slot_bytes_written;
     let flush_calls_ref = &s2_slot_flush_calls;
     let nonempty_ref = &s2_nonempty_slot_buckets_total;
@@ -271,7 +302,7 @@ pub(super) fn stage2_node_join(
 
     std::thread::scope(|scope| {
         for _ in 0..num_workers {
-            let cf = std::sync::Arc::clone(&coord_file);
+            let pbf_file = Arc::clone(&input_pbf);
             scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 
@@ -280,11 +311,19 @@ pub(super) fn stage2_node_join(
                 };
                 // Pre-size once to the per-bucket worst case (the nominal
                 // rank_range_size; the last bucket may be smaller but
-                // never larger). Every pread slices the prefix it needs,
-                // avoiding any per-bucket resize + zero-fill work.
+                // never larger). The slice is fully zeroed at the start
+                // of each bucket and then populated only at slots where
+                // we decode a referenced node — the resolve loop below
+                // depends on (lat==0 && lon==0) as the missing-coord
+                // sentinel, so leftover bytes from a previous bucket
+                // would be silently misresolved as real coordinates.
                 #[allow(clippy::cast_possible_truncation)]
                 let max_slice_bytes = (rank_range_size as usize) * COORD_SLOT_SIZE;
                 let mut coord_slice: Vec<u8> = vec![0u8; max_slice_bytes];
+                let mut node_read_buf: Vec<u8> = Vec::new();
+                let mut node_decompress_buf: Vec<u8> = Vec::new();
+                let mut node_tuples: Vec<NodeTuple> = Vec::new();
+                let mut node_group_starts: Vec<(usize, usize)> = Vec::new();
                 let mut entry_buf = [0u8; RESOLVED_ENTRY_SIZE];
                 let mut local_resolved: u64 = 0;
 
@@ -322,16 +361,95 @@ pub(super) fn stage2_node_join(
                         fadvise_calls_ref.fetch_add(bkt.fadvise_calls, Relaxed);
                         fadvise_bytes_ref.fetch_add(bkt.fadvise_bytes, Relaxed);
 
-                        // Pread this bucket's contiguous coord slice.
+                        // Build this bucket's coord slice by decoding the
+                        // node blobs whose referenced-rank ranges intersect
+                        // [bucket_rank_start, bucket_rank_end).
+                        //
+                        // Correctness: the slice is reused across buckets
+                        // by this worker, so it MUST be zeroed before the
+                        // fill loop — only positions where a referenced
+                        // node lands get overwritten, and the resolve loop
+                        // depends on (lat==0 && lon==0) as the missing
+                        // sentinel. Without the zero, leftover bytes from
+                        // a previous bucket would silently look like real
+                        // resolved coordinates.
                         let t_coord = std::time::Instant::now();
                         let slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
-                        cf.read_exact_at(
-                            &mut coord_slice[..slice_bytes], bkt.bucket_rank_start * COORD_SLOT_SIZE as u64,
-                        ).map_err(|e| format!("pread coord slice: {e}"))?;
+                        coord_slice[..slice_bytes].fill(0);
+                        let bucket_rank_start = bkt.bucket_rank_start;
+                        let bucket_rank_end = bucket_rank_start + bkt.local_range as u64;
+
+                        // Binary search the mapping for the contiguous run
+                        // of blobs intersecting this bucket. Because the
+                        // input PBF is ID-sorted and rank is monotonic in
+                        // ID, blob rank ranges are non-overlapping and
+                        // monotonic; intersecting blobs form a contiguous
+                        // [lo, hi) slice of `mapping_ref`.
+                        let lo = mapping_ref.partition_point(
+                            |b| b.ref_rank_end <= bucket_rank_start,
+                        );
+                        let hi = mapping_ref.partition_point(
+                            |b| b.ref_rank_start < bucket_rank_end,
+                        );
+                        let mut bucket_blobs_read: u64 = 0;
+                        let mut bucket_straddlers: u64 = 0;
+                        for blob in &mapping_ref[lo..hi] {
+                            if blob.ref_count() == 0 { continue; }
+                            // A blob is a straddler if it extends past
+                            // either bucket boundary — i.e. it will also
+                            // be touched by an adjacent bucket worker.
+                            if blob.ref_rank_start < bucket_rank_start
+                                || blob.ref_rank_end > bucket_rank_end
+                            {
+                                bucket_straddlers += 1;
+                            }
+
+                            let t_pr = std::time::Instant::now();
+                            node_read_buf.resize(blob.data_size, 0);
+                            pbf_file.read_exact_at(&mut node_read_buf, blob.data_offset)
+                                .map_err(|e| format!("stage2 node pread: {e}"))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_pread_ref.fetch_add(t_pr.elapsed().as_millis() as u64, Relaxed);
+                            node_bytes_ref.fetch_add(blob.data_size as u64, Relaxed);
+
+                            let t_dc = std::time::Instant::now();
+                            crate::blob::decompress_blob_raw(&node_read_buf, &mut node_decompress_buf)
+                                .map_err(|e| format!("stage2 node decompress: {e}"))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_decompress_ref.fetch_add(t_dc.elapsed().as_millis() as u64, Relaxed);
+
+                            let t_ex = std::time::Instant::now();
+                            node_tuples.clear();
+                            extract_node_tuples(
+                                &node_decompress_buf, &mut node_tuples, &mut node_group_starts,
+                            ).map_err(|e| format!("stage2 node extract: {e}"))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_extract_ref.fetch_add(t_ex.elapsed().as_millis() as u64, Relaxed);
+
+                            let t_rk = std::time::Instant::now();
+                            for &NodeTuple { id, lat, lon } in &node_tuples {
+                                let Some(rank) = id_set_ref.rank_if_set(id) else {
+                                    continue;
+                                };
+                                if rank < bucket_rank_start || rank >= bucket_rank_end {
+                                    // Belongs to an adjacent bucket — skip.
+                                    continue;
+                                }
+                                #[allow(clippy::cast_possible_truncation)]
+                                let local_rank = (rank - bucket_rank_start) as usize;
+                                let off = local_rank * COORD_SLOT_SIZE;
+                                coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
+                                coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
+                            }
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_rank_ref.fetch_add(t_rk.elapsed().as_millis() as u64, Relaxed);
+                            bucket_blobs_read += 1;
+                        }
+                        node_blobs_ref.fetch_add(bucket_blobs_read, Relaxed);
+                        node_straddler_ref.fetch_add(bucket_straddlers, Relaxed);
                         #[allow(clippy::cast_possible_truncation)]
-                        coord_read_ref.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
-                        coord_bytes_ref.fetch_add(slice_bytes as u64, Relaxed);
-                        pread_calls_ref.fetch_add(1, Relaxed);
+                        coord_fill_ref.fetch_add(t_coord.elapsed().as_millis() as u64, Relaxed);
+                        pread_calls_ref.fetch_add(bucket_blobs_read, Relaxed);
 
                         // Resolve each rank group into worker-local slot buffers.
                         let t_resolve = std::time::Instant::now();
@@ -403,6 +521,9 @@ pub(super) fn stage2_node_join(
                         {
                             let worker_bytes = loader.data_buf.capacity() as u64
                                 + coord_slice.capacity() as u64
+                                + node_read_buf.capacity() as u64
+                                + node_decompress_buf.capacity() as u64
+                                + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
                                 + slot_bufs.iter().map(|b| b.capacity() as u64).sum::<u64>();
                             let mut current = max_worker_buf_ref.load(Relaxed);
                             while worker_bytes > current {
@@ -462,7 +583,14 @@ pub(super) fn stage2_node_join(
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s2_coord_read_ms", s2_coord_read_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_coord_fill_ms", s2_coord_fill_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_pread_ms", s2_node_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_decompress_ms", s2_node_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_extract_ms", s2_node_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_rank_ms", s2_node_rank_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_bytes_read", s2_node_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_blobs_read", s2_node_blobs_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_straddler_blobs", s2_node_straddler_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_resolve_ms", s2_resolve_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_bucket_load_ms", s2_bucket_load_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_bucket_loads", s2_bucket_loads.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -471,7 +599,6 @@ pub(super) fn stage2_node_join(
         crate::debug::emit_counter("s2_prepare_scatter_ms", s2_prepare_scatter_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_slot_flush_lock_wait_ms", s2_slot_flush_lock_wait_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_slot_flush_write_ms", s2_slot_flush_write_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s2_coord_slice_bytes_read", s2_coord_slice_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_slot_bytes_written", s2_slot_bytes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_slot_flush_calls", s2_slot_flush_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_nonempty_slot_buckets_total", s2_nonempty_slot_buckets_total.load(std::sync::atomic::Ordering::Relaxed) as i64);

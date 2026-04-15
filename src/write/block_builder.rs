@@ -8,7 +8,6 @@
 
 use crate::blob_index::{BlobIndex, ElemKind};
 use crate::PrimitiveBlock;
-use crate::read::wire::WireStringTable;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::io;
 use std::rc::Rc;
@@ -701,26 +700,6 @@ impl BlockBuilder {
         debug_assert!(self.is_empty(), "pre_seed must be called on empty builder");
         self.string_table.pre_seed(block);
         self.pre_seeded = true;
-    }
-
-    /// Pre-seed the string table directly from a parsed wire-format string table.
-    ///
-    /// This is the stage-4 node-filter fast path: it avoids constructing a
-    /// full `PrimitiveBlock` just to populate the identity mapping for
-    /// `add_node_raw`.
-    pub(crate) fn pre_seed_string_table_wire(
-        &mut self,
-        stringtable: &WireStringTable<'_>,
-    ) -> Result<(), std::str::Utf8Error> {
-        debug_assert!(self.is_empty(), "pre_seed must be called on empty builder");
-        let len = stringtable.len();
-        for i in 1..len {
-            if let Some(raw) = stringtable.get(i) {
-                self.string_table.add(std::str::from_utf8(raw)?);
-            }
-        }
-        self.pre_seeded = true;
-        Ok(())
     }
 
     /// Add a dense node using pre-seeded string table indices.

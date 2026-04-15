@@ -495,6 +495,46 @@ Why not earlier:
 - item 0's relation-scan marker gives this item a clean baseline to
   measure against.
 
+Result:
+
+- Shelved after Denmark correctness plus Japan / Europe / Europe-`zstd:1`
+  performance passes.
+- Denmark correctness:
+  - used direct `pbfhogg add-locations-to-ways` self-parity, not
+    `brokkr verify`, because ALTW has accepted osmium deviations
+  - `inspect --extended --locations` matched exactly between the normal
+    and wire-filter outputs
+  - `pbfhogg diff --summary --suppress-common` reported
+    `same=10175884 different=0`
+  - MD5 differed, so the path changed encoding shape without changing
+    semantic content; MD5 parity was the wrong gate for this item
+- Japan same-commit A/B:
+  - normal: `053d9e91`
+  - wire: `9449f20c`
+  - `s4_nonway_assemble_ms`: `1113 -> 557` (`-50%`)
+  - `EXTJOIN_STAGE4`: `9002ms -> 8759ms` (`-2.7%`)
+  - first-pass CPU gate cleared
+- Europe same-commit A/B:
+  - normal: `7ab12b2a`
+  - wire: `d0ffd614`
+  - `s4_nonway_assemble_ms`: `78501 -> 36940` (`-53%`)
+  - `s4_assemble_ms`: `520947 -> 426199` (`-18%`)
+  - but `EXTJOIN_STAGE4`: `122.7s -> 127.6s` (worse)
+  - `s4_send_ms`: `560971 -> 671809` cumulative
+  - conclusion: freed worker CPU just refilled the downstream writer queue
+- Europe `zstd:1` same-commit A/B:
+  - normal: `e3f3ec1b`
+  - wire: `774fe74b`
+  - `s4_nonway_assemble_ms`: `31634 -> 27400` (`-13%`)
+  - `EXTJOIN_STAGE4`: `94.1s -> 92.9s` (`-1.3%`)
+  - total wall: `5m40s -> 5m48s` (worse)
+- Conclusion:
+  - the node-wire filter is a real stage-4-local CPU win
+  - but even after the `zstd:1` tiebreaker it is not large enough to
+    justify the complexity on the current architecture
+  - keep the result as evidence that stage-4 non-way decode/re-encode
+    is not the next wall lever; do not keep the code path live on `main`
+
 ### 5. Prototype stage-1B grouped-by-local-rank emission
 
 Hypothesis:

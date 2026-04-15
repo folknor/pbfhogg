@@ -819,6 +819,33 @@ Why this stays late despite being likely material:
 - the win may be real, but it is less direct than the stage-2 / bucket items
 - confirm it explicitly first, then decide whether it is worth a redesign
 
+Result:
+
+- Kept on `main` after a direct Europe gate.
+- UUIDs:
+  - baseline normal Europe: `7ab12b2a`
+  - shared-metadata Europe: `f864b64f`
+- The shared metadata scan replaced three separate header-oriented passes:
+  - `s1_way_schedule_build_ms`: `24762 -> 80`
+  - `s1_node_map_build_ms`: `30887 -> 123`
+  - `s4_schedule_scan_ms`: `31537 -> 144`
+  - new `extjoin_meta_scan_ms`: `30852`
+- Net scan budget:
+  - old combined scan time: `24.8s + 30.9s + 31.5s = 87.2s`
+  - new shared scan + residual projection cost:
+    `30.9s + 0.08s + 0.12s + 0.14s = 31.2s`
+  - saved about `56s` of scan work on Europe
+- Europe wall:
+  - `6m37s -> 5m33s` (`-64s`)
+- Phase movement:
+  - `EXTJOIN_STAGE1`: `91.4s -> 36.0s`
+  - `EXTJOIN_STAGE4`: `122.7s -> 90.6s`
+- Conclusion:
+  - clearly above the item's keep gate
+  - the scan work was materially larger than the old note wording already
+    implied, and one shared metadata pass is enough to retire most of it
+    without making the code materially uglier
+
 ## Low-priority extras
 
 These are real but should not get ahead of the main queue.

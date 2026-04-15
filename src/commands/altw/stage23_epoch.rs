@@ -154,6 +154,7 @@ struct WorkerTmpState {
 
 const FLUSH_THRESHOLD: usize = 256 * 1024;
 const SPILL_FLUSH_THRESHOLD: usize = 256 * 1024;
+const DRAIN_READ_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 fn update_peak(peak: &AtomicU64, value: u64) {
     let mut current = peak.load(Ordering::Relaxed);
@@ -1047,7 +1048,8 @@ fn run_epoch_drain(
                 use std::sync::atomic::Ordering::Relaxed;
                 let mut local_bufs: Vec<Vec<u8>> =
                     (0..local_count).map(|_| Vec::new()).collect();
-                let mut read_buf: Vec<u8> = Vec::new();
+                let mut read_buf = vec![0u8; DRAIN_READ_CHUNK_SIZE + RESOLVED_ENTRY_SIZE];
+                let mut tail_len = 0usize;
 
                 loop {
                     if drain_error_ref
@@ -1073,71 +1075,89 @@ fn run_epoch_drain(
                             return;
                         }
                     };
-                    read_buf.clear();
-                    if let Err(e) = std::io::Read::read_to_end(&mut &f, &mut read_buf) {
-                        *drain_error_ref
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(format!("read spill {}: {e}", p.display()));
-                        return;
+                    tail_len = 0;
+                    loop {
+                        let bytes_read = match std::io::Read::read(
+                            &mut &f,
+                            &mut read_buf[tail_len..tail_len + DRAIN_READ_CHUNK_SIZE],
+                        ) {
+                            Ok(n) => n,
+                            Err(e) => {
+                                *drain_error_ref
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(format!("read spill {}: {e}", p.display()));
+                                return;
+                            }
+                        };
+                        if bytes_read == 0 {
+                            break;
+                        }
+                        spill_bytes_read.fetch_add(bytes_read as u64, Relaxed);
+
+                        let valid_len = tail_len + bytes_read;
+                        let full_len = valid_len - (valid_len % RESOLVED_ENTRY_SIZE);
+
+                        // Group records by their per-epoch local bucket index,
+                        // then flush each bucket's local buffer under its lock.
+                        for chunk in read_buf[..full_len].chunks_exact(RESOLVED_ENTRY_SIZE) {
+                            let slot_pos = u64::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                                chunk[4], chunk[5], chunk[6], chunk[7],
+                            ]);
+                            let entry = ResolvedEntry { slot_pos, lat: 0, lon: 0 };
+                            let global_bucket =
+                                entry.slot_bucket(total_slots, slot_bucket_count);
+                            if global_bucket < bucket_lo
+                                || global_bucket >= bucket_lo + local_count
+                            {
+                                *drain_error_ref
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                    Some(format!(
+                                        "spill epoch {epoch_idx} contained slot_pos {slot_pos} \
+                                         mapping to bucket {global_bucket} outside \
+                                         [{bucket_lo}, {})",
+                                        bucket_lo + local_count
+                                    ));
+                                return;
+                            }
+                            let local_idx = global_bucket - bucket_lo;
+                            local_bufs[local_idx].extend_from_slice(chunk);
+                            if local_bufs[local_idx].len() >= FLUSH_THRESHOLD {
+                                if let Err(e) = flush_local_to_scatter(
+                                    local_idx,
+                                    global_bucket,
+                                    &mut local_bufs[local_idx],
+                                    scatter_bufs_ref,
+                                    slot_bucket_count,
+                                    total_slots,
+                                ) {
+                                    *drain_error_ref
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                                        Some(e);
+                                    return;
+                                }
+                            }
+                        }
+
+                        tail_len = valid_len - full_len;
+                        if tail_len > 0 {
+                            read_buf.copy_within(full_len..valid_len, 0);
+                        }
                     }
-                    if read_buf.len() % RESOLVED_ENTRY_SIZE != 0 {
+                    if tail_len != 0 {
                         *drain_error_ref
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(
                             format!(
-                                "spill {} length {} not a multiple of {}",
+                                "spill {} length not a multiple of {}",
                                 p.display(),
-                                read_buf.len(),
                                 RESOLVED_ENTRY_SIZE
                             ),
                         );
                         return;
-                    }
-                    spill_bytes_read.fetch_add(read_buf.len() as u64, Relaxed);
-
-                    // Group records by their per-epoch local bucket index,
-                    // then flush each bucket's local buffer under its lock.
-                    for chunk in read_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
-                        let slot_pos = u64::from_le_bytes([
-                            chunk[0], chunk[1], chunk[2], chunk[3],
-                            chunk[4], chunk[5], chunk[6], chunk[7],
-                        ]);
-                        let entry = ResolvedEntry { slot_pos, lat: 0, lon: 0 };
-                        let global_bucket =
-                            entry.slot_bucket(total_slots, slot_bucket_count);
-                        if global_bucket < bucket_lo
-                            || global_bucket >= bucket_lo + local_count
-                        {
-                            *drain_error_ref
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                Some(format!(
-                                    "spill epoch {epoch_idx} contained slot_pos {slot_pos} \
-                                     mapping to bucket {global_bucket} outside \
-                                     [{bucket_lo}, {})",
-                                    bucket_lo + local_count
-                                ));
-                            return;
-                        }
-                        let local_idx = global_bucket - bucket_lo;
-                        local_bufs[local_idx].extend_from_slice(chunk);
-                        if local_bufs[local_idx].len() >= FLUSH_THRESHOLD {
-                            if let Err(e) = flush_local_to_scatter(
-                                local_idx,
-                                global_bucket,
-                                &mut local_bufs[local_idx],
-                                scatter_bufs_ref,
-                                slot_bucket_count,
-                                total_slots,
-                            ) {
-                                *drain_error_ref
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                                    Some(e);
-                                return;
-                            }
-                        }
                     }
 
                     let local_buf_bytes = local_bufs
@@ -1147,7 +1167,7 @@ fn run_epoch_drain(
                     update_peak(drain_local_buf_peak_ref, local_buf_bytes);
                     update_peak(
                         drain_worker_peak_ref,
-                        local_buf_bytes + read_buf.capacity() as u64,
+                        local_buf_bytes + read_buf.len() as u64,
                     );
                 }
 

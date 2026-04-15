@@ -245,8 +245,10 @@ pub fn external_join(
     let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
+        crate::debug::emit_counter("extjoin_rank_bucket_count", NUM_BUCKETS as i64);
         crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
         crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
+        crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers as i64);
         crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
     }
 
@@ -374,9 +376,18 @@ pub fn external_join(
     let relation_member_node_ids = if keep_untagged_nodes {
         None
     } else {
-        Some(super::add_locations_to_ways::collect_relation_member_node_ids(
+        crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
+        let t_relscan = std::time::Instant::now();
+        let ids = super::add_locations_to_ways::collect_relation_member_node_ids(
             input, direct_io,
-        )?)
+        )?;
+        #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+        crate::debug::emit_counter(
+            "extjoin_relation_member_collect_ms",
+            t_relscan.elapsed().as_millis() as i64,
+        );
+        crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_END");
+        Some(ids)
     };
 
     let num_way_blobs = way_slot_starts.len();

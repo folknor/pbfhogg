@@ -144,55 +144,6 @@ Do not re-plan these as hypotheticals — they already ship:
 
 This is the order to work in unless a new measurement disproves it.
 
-### 0. Refresh stage-2 instrumentation
-
-Hypothesis:
-
-- We need better stage-2 visibility before deciding whether the local
-  follow-ups are worth another Europe gate.
-
-Code surface:
-
-- `src/commands/altw/stage2.rs`
-- optionally `src/commands/altw/stage1.rs` / `stage4.rs` for explicit schedule
-  scan markers
-
-Change:
-
-- convert the stage-2 node subcounters from per-blob milliseconds to nanosecond
-  accumulators
-- follow the `WayReframeCounters` shape in `stage4.rs` (AtomicU64 ns
-  accumulators, `ns_to_ms` helper at emit time) — do not reinvent
-- split `coord_slice` zeroing from the rest of `s2_coord_fill_ms`
-- add an explicit marker/timer for `build_way_schedule()`
-- add an explicit marker/timer for the stage-4 schedule pre-scan
-- add `EXTJOIN_RELATION_SCAN_START` / `_END` markers around
-  `collect_relation_member_node_ids()` in `mod.rs`. Currently the cost
-  sits in the gap between `EXTJOIN_STAGE3_END` and `EXTJOIN_STAGE4_START`
-  with no attribution; item 4 (stage-4 node filter) and the low-priority
-  relation wire scanner both need this baseline.
-
-Smallest meaningful dataset:
-
-- Denmark for correctness
-- Japan for "did the instrumentation itself distort the run?"
-
-Keep gate:
-
-- keep the instrumentation if Japan total wall changes by `< 1%`
-- if the overhead is higher, simplify until it is cheap enough to leave on
-
-Discard gate:
-
-- none; this is enabling work, not a product path
-
-Why first:
-
-- The ns counters make the stage-2 hot-loop judgement (item 3) cheaper.
-- The relation-scan marker is a precondition for item 4 and the
-  low-priority relation scanner.
-- The schedule-scan timers feed item 8.
-
 ### 1. Make bucket count dev-tunable, then sweep `>256`
 
 Hypothesis:

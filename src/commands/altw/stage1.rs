@@ -36,6 +36,7 @@ pub(super) struct Stage1Output {
 
 /// Build the way-blob schedule via header-only scan.
 pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
+    crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = std::time::Instant::now();
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -57,6 +58,7 @@ pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
         crate::debug::emit_counter("s1_way_schedule_blobs", schedule.len() as i64);
         crate::debug::emit_counter("s1_way_schedule_build_ms", t0.elapsed().as_millis() as i64);
     }
+    crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_END");
     Ok(schedule)
 }
 

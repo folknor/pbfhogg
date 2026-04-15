@@ -118,6 +118,7 @@ pub(super) fn stage4_assembly(
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
     // Header-only pre-scan: build the blob schedule.
+    crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = std::time::Instant::now();
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
@@ -251,6 +252,7 @@ pub(super) fn stage4_assembly(
             way_slot_starts.len(), way_sidecar_idx,
         ).into());
     }
+    crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_END");
 
     // Open shared file for worker pread.
     let shared_file = std::sync::Arc::new(

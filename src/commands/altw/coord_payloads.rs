@@ -103,11 +103,6 @@ impl PerWayRcs {
         &self.data[self.offsets[blob_idx]..self.offsets[blob_idx + 1]]
     }
 
-    pub(super) fn estimated_heap_bytes(&self) -> u64 {
-        (self.data.capacity() * std::mem::size_of::<u8>()) as u64
-            + (self.offsets.capacity() * std::mem::size_of::<usize>()) as u64
-    }
-
     pub(super) fn num_blobs(&self) -> usize {
         self.offsets.len().saturating_sub(1)
     }

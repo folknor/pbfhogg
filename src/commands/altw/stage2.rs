@@ -24,36 +24,36 @@ use super::{NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE
 // Stage 2: Parallel node join — coord slice lookup
 // ---------------------------------------------------------------------------
 
-pub(super) struct LoaderScratch {
-    pub(super) data_buf: Vec<u8>,
-    pub(super) counts: Vec<u64>,
-    pub(super) write_pos: Vec<u64>,
+struct LoaderScratch {
+    data_buf: Vec<u8>,
+    counts: Vec<u64>,
+    write_pos: Vec<u64>,
 }
 
 impl LoaderScratch {
-    pub(super) fn new() -> Self {
+    fn new() -> Self {
         Self { data_buf: Vec::new(), counts: Vec::new(), write_pos: Vec::new() }
     }
 }
 
-pub(super) struct PreparedBucket {
-    pub(super) grouped_slot_pos: Vec<u64>,
-    pub(super) group_offsets: Vec<u64>,
-    pub(super) bucket_rank_start: u64,
-    pub(super) local_range: usize,
+struct PreparedBucket {
+    grouped_slot_pos: Vec<u64>,
+    group_offsets: Vec<u64>,
+    bucket_rank_start: u64,
+    local_range: usize,
     /// Sub-phase timings (ms): counting pass, prefix sum, scatter pass.
-    pub(super) prepare_count_ms: u64,
-    pub(super) prepare_prefix_ms: u64,
-    pub(super) prepare_scatter_ms: u64,
+    prepare_count_ms: u64,
+    prepare_prefix_ms: u64,
+    prepare_scatter_ms: u64,
     /// I/O accounting from shard loading.
-    pub(super) open_calls: u64,
-    pub(super) stat_calls: u64,
-    pub(super) fadvise_calls: u64,
-    pub(super) fadvise_bytes: u64,
+    open_calls: u64,
+    stat_calls: u64,
+    fadvise_calls: u64,
+    fadvise_bytes: u64,
 }
 
 #[allow(clippy::cast_possible_truncation)]
-pub(super) fn prepare_bucket(
+fn prepare_bucket(
     bucket_idx: usize,
     scratch: &ScratchDir,
     num_shard_workers: usize,

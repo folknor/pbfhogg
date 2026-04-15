@@ -68,7 +68,7 @@ fn merge_straddler(
     Ok(())
 }
 
-pub(super) fn scatter_bucket_entries(
+fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
     bucket_start: u64,
@@ -391,7 +391,7 @@ pub(super) fn stage3_slot_reorder(
 /// Emit integrated intersections for one bucket into the worker's temp file
 /// and straddler staging.
 #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
-pub(super) fn emit_integrated_intersections(
+fn emit_integrated_intersections(
     intersections: &[BlobBucketIntersection],
     scatter_buf: &[u8],
     bucket_start: u64,

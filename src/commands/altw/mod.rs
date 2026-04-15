@@ -32,7 +32,6 @@ mod blob_bucket_index;
 mod coord_payloads;
 mod stage1;
 mod stage2;
-mod stage23_epoch;
 mod stage3;
 mod stage4;
 
@@ -245,230 +244,125 @@ pub fn external_join(
     };
 
     let coord_payloads_path = scratch_dir.file_path("coord_payloads");
-    let stage4_per_way_rcs: coord_payloads::PerWayRcs;
-    let resolved_count: u64;
 
-    let epoch_count_opt = stage23_epoch::parse_epoch_env();
-
-    if let Some(num_epochs) = epoch_count_opt {
-        // ===== Epoch-spill path =====
-        // Subsumes stage 2 + stage 3 + finalize for the gated prototype.
-        crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-        let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
-        let (s3_minflt_before, s3_majflt_before) = (s2_minflt_before, s2_majflt_before);
-
-        let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
-            &per_way_refcount_sidecar,
-            way_slot_starts.len(),
-        )?;
-
-        let num_workers_emit = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4)
-            .min(6);
-        let worker_tmp_paths: Vec<std::path::PathBuf> = (0..num_workers_emit)
-            .map(|i| scratch_dir.file_path(&format!("payloads-W{i}")))
-            .collect();
-        let straddler_slots: Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>> =
-            (0..way_slot_starts.len())
-                .map(|_| std::sync::Mutex::new(None))
-                .collect();
-
-        let input_pbf = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("open input pbf for stage 2 (epoch path): {e}"))?,
-        );
-
-        let epoch_out = stage23_epoch::stage23_epoch_fused(stage23_epoch::Stage23EpochInputs {
-            scratch: &scratch_dir,
-            num_shard_workers,
-            rank_bucket_counts: &rank_bucket_counts,
-            slot_bucket_count,
-            total_slots,
-            unique_nodes,
-            input_pbf,
-            node_id_set: &node_id_set,
-            node_blob_mapping: &node_blob_mapping,
-            way_slot_starts: way_slot_starts.as_slice(),
-            per_way_rcs: &per_way_rcs,
-            worker_tmp_paths: &worker_tmp_paths,
-            straddler_slots: &straddler_slots,
-            num_epochs,
-        })?;
-        resolved_count = epoch_out.resolved_count;
-
-        drop(node_id_set);
-        drop(node_blob_mapping);
-
-        for worker_id in 0..num_shard_workers {
-            for bucket_idx in 0..NUM_BUCKETS {
-                let path = scratch_dir
-                    .path
-                    .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-                drop(std::fs::remove_file(&path));
-            }
+    crate::debug::emit_marker("EXTJOIN_STAGE2_START");
+    let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
+    let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
+    let input_pbf = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
+    );
+    let resolved_count = stage2_node_join(
+        &scratch_dir,
+        &rank_bucket_counts,
+        num_shard_workers,
+        &slot_buckets,
+        slot_bucket_count,
+        total_slots,
+        unique_nodes,
+        input_pbf,
+        &node_id_set,
+        &node_blob_mapping,
+    )?;
+    slot_buckets.finish()?;
+    let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
+    for worker_id in 0..num_shard_workers {
+        for bucket_idx in 0..NUM_BUCKETS {
+            let path = scratch_dir
+                .path
+                .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
+            drop(std::fs::remove_file(&path));
         }
-
-        let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-            crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
-            crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
-        }
-        crate::debug::emit_marker("EXTJOIN_STAGE2_END");
-
-        crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-        {
-            let finalize_stats = coord_payloads::finalize_coord_payloads(
-                &coord_payloads_path,
-                &per_way_rcs,
-                epoch_out.worker_manifests,
-                &worker_tmp_paths,
-                straddler_slots,
-            )?;
-            eprintln!(
-                "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
-                 output {} MB, straddlers {}, blobs {}",
-                finalize_stats.finalize_ms,
-                finalize_stats.encode_ms,
-                finalize_stats.read_ms,
-                finalize_stats.write_ms,
-                finalize_stats.output_bytes / 1_000_000,
-                finalize_stats.num_straddlers,
-                finalize_stats.num_way_blobs,
-            );
-        }
-        let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
-            crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
-        }
-        crate::debug::emit_marker("EXTJOIN_STAGE3_END");
-
-        stage4_per_way_rcs = per_way_rcs;
-    } else {
-        // ===== Disk path =====
-        crate::debug::emit_marker("EXTJOIN_STAGE2_START");
-        let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
-        let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
-        let input_pbf = std::sync::Arc::new(
-            std::fs::File::open(input)
-                .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
-        );
-        resolved_count = stage2_node_join(
-            &scratch_dir,
-            &rank_bucket_counts,
-            num_shard_workers,
-            &slot_buckets,
-            slot_bucket_count,
-            total_slots,
-            unique_nodes,
-            input_pbf,
-            &node_id_set,
-            &node_blob_mapping,
-        )?;
-        slot_buckets.finish()?;
-        let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
-        for worker_id in 0..num_shard_workers {
-            for bucket_idx in 0..NUM_BUCKETS {
-                let path = scratch_dir
-                    .path
-                    .join(format!("rank-W{worker_id}-{bucket_idx:03}"));
-                drop(std::fs::remove_file(&path));
-            }
-        }
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
-            crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
-            crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
-        }
-        crate::debug::emit_marker("EXTJOIN_STAGE2_END");
-
-        // Free the IdSetDense (~2 GB RSS at planet) and the per-blob mapping
-        // — both were stage 2 inputs only, nothing downstream reads them.
-        drop(node_id_set);
-        drop(node_blob_mapping);
-
-        // Prepare integrated coord_payloads artifacts for stage 3.
-        let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
-            &per_way_refcount_sidecar,
-            way_slot_starts.len(),
-        )?;
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4)
-            .min(6);
-        let worker_tmp_paths: Vec<std::path::PathBuf> = (0..num_workers)
-            .map(|i| scratch_dir.file_path(&format!("payloads-W{i}")))
-            .collect();
-        let straddler_slots: Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>> =
-            (0..way_slot_starts.len())
-                .map(|_| std::sync::Mutex::new(None))
-                .collect();
-
-        crate::debug::emit_marker("EXTJOIN_STAGE3_START");
-        let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
-        let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
-            .map(|i| {
-                let path = scratch_dir.bucket_path("slot", i);
-                std::fs::metadata(&path)
-                    .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
-                    .unwrap_or(0)
-            })
-            .collect();
-        let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
-            .map(|i| scratch_dir.bucket_path("slot", i))
-            .collect();
-        let slot_bucket_ref = SlotBucketRef {
-            paths: slot_paths,
-            entry_counts: slot_entry_counts,
-        };
-        let integrated_inputs = IntegratedInputs {
-            way_slot_starts: way_slot_starts.as_slice(),
-            per_way_rcs: &per_way_rcs,
-            worker_tmp_paths: worker_tmp_paths.as_slice(),
-            straddler_slots: straddler_slots.as_slice(),
-        };
-        let s3_result = stage3_slot_reorder(
-            &slot_bucket_ref,
-            slot_bucket_count,
-            total_slots,
-            integrated_inputs,
-        )?;
-        let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
-        for i in 0..slot_bucket_count {
-            drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
-        }
-        #[allow(clippy::cast_possible_wrap)]
-        {
-            crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
-            crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
-        }
-        crate::debug::emit_marker("EXTJOIN_STAGE3_END");
-
-        let finalize_stats = coord_payloads::finalize_coord_payloads(
-            &coord_payloads_path,
-            &per_way_rcs,
-            s3_result.worker_manifests,
-            &worker_tmp_paths,
-            straddler_slots,
-        )?;
-        eprintln!(
-            "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
-             output {} MB, straddlers {}, blobs {}",
-            finalize_stats.finalize_ms,
-            finalize_stats.encode_ms,
-            finalize_stats.read_ms,
-            finalize_stats.write_ms,
-            finalize_stats.output_bytes / 1_000_000,
-            finalize_stats.num_straddlers,
-            finalize_stats.num_way_blobs,
-        );
-        stage4_per_way_rcs = per_way_rcs;
     }
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extjoin_resolved_count", resolved_count as i64);
+        crate::debug::emit_counter("s2_minflt_delta", (s2_minflt_after - s2_minflt_before) as i64);
+        crate::debug::emit_counter("s2_majflt_delta", (s2_majflt_after - s2_majflt_before) as i64);
+    }
+    crate::debug::emit_marker("EXTJOIN_STAGE2_END");
+
+    // Free the IdSetDense (~2 GB RSS at planet) and the per-blob mapping
+    // — both were stage 2 inputs only, nothing downstream reads them.
+    drop(node_id_set);
+    drop(node_blob_mapping);
+
+    // Prepare integrated coord_payloads artifacts for stage 3.
+    let per_way_rcs = coord_payloads::load_per_way_refcount_sidecar_indexed(
+        &per_way_refcount_sidecar,
+        way_slot_starts.len(),
+    )?;
+    let num_workers = std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2).max(1))
+        .unwrap_or(4)
+        .min(6);
+    let worker_tmp_paths: Vec<std::path::PathBuf> = (0..num_workers)
+        .map(|i| scratch_dir.file_path(&format!("payloads-W{i}")))
+        .collect();
+    let straddler_slots: Vec<std::sync::Mutex<Option<coord_payloads::StraddlerSlot>>> =
+        (0..way_slot_starts.len())
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
+
+    crate::debug::emit_marker("EXTJOIN_STAGE3_START");
+    let (s3_minflt_before, s3_majflt_before) = crate::debug::read_page_faults();
+    let slot_entry_counts: Vec<u64> = (0..slot_bucket_count)
+        .map(|i| {
+            let path = scratch_dir.bucket_path("slot", i);
+            std::fs::metadata(&path)
+                .map(|m| m.len() / RESOLVED_ENTRY_SIZE as u64)
+                .unwrap_or(0)
+        })
+        .collect();
+    let slot_paths: Vec<std::path::PathBuf> = (0..slot_bucket_count)
+        .map(|i| scratch_dir.bucket_path("slot", i))
+        .collect();
+    let slot_bucket_ref = SlotBucketRef {
+        paths: slot_paths,
+        entry_counts: slot_entry_counts,
+    };
+    let integrated_inputs = IntegratedInputs {
+        way_slot_starts: way_slot_starts.as_slice(),
+        per_way_rcs: &per_way_rcs,
+        worker_tmp_paths: worker_tmp_paths.as_slice(),
+        straddler_slots: straddler_slots.as_slice(),
+    };
+    let s3_result = stage3_slot_reorder(
+        &slot_bucket_ref,
+        slot_bucket_count,
+        total_slots,
+        integrated_inputs,
+    )?;
+    let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
+    for i in 0..slot_bucket_count {
+        drop(std::fs::remove_file(&scratch_dir.bucket_path("slot", i)));
+    }
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("s3_minflt_delta", (s3_minflt_after - s3_minflt_before) as i64);
+        crate::debug::emit_counter("s3_majflt_delta", (s3_majflt_after - s3_majflt_before) as i64);
+    }
+    crate::debug::emit_marker("EXTJOIN_STAGE3_END");
+
+    let finalize_stats = coord_payloads::finalize_coord_payloads(
+        &coord_payloads_path,
+        &per_way_rcs,
+        s3_result.worker_manifests,
+        &worker_tmp_paths,
+        straddler_slots,
+    )?;
+    eprintln!(
+        "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
+         output {} MB, straddlers {}, blobs {}",
+        finalize_stats.finalize_ms,
+        finalize_stats.encode_ms,
+        finalize_stats.read_ms,
+        finalize_stats.write_ms,
+        finalize_stats.output_bytes / 1_000_000,
+        finalize_stats.num_straddlers,
+        finalize_stats.num_way_blobs,
+    );
+    let stage4_per_way_rcs = per_way_rcs;
 
     let relation_member_node_ids = if keep_untagged_nodes {
         None

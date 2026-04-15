@@ -20,6 +20,7 @@ pub mod merge_pbf;
 pub mod node_stats;
 pub mod renumber;
 pub mod renumber_external;
+pub(crate) mod relation_scanner;
 pub(crate) mod elements_pbf;
 pub(crate) mod elements_xml;
 pub mod sort;

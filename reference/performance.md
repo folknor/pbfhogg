@@ -178,6 +178,11 @@ anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
+Current Europe external baseline on `main` (commit `d3e13ed`): **333s**
+(`5m33s`). That win comes mostly from collapsing three whole-file
+header-oriented scans into one shared metadata pass (see below), not from a
+new stage redesign.
+
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
 (33.6 GB, external 7.4x faster). At Europe scale, dense's mmap working set
 (~16 GB) exceeds available RAM, causing thrashing. External's sequential
@@ -194,6 +199,32 @@ I/O stays bounded.
 | Stage 4 (assembly) | 129s | 3.1 GB peak | Per-blob pread of coord_payloads; de-interleave into PBF wire format |
 | **Total** | **400s** | | |
 
+### External join stage breakdown (Europe, commit `d3e13ed`, plantasjen)
+
+Shared blob-metadata scan is now explicit and replaces the old repeated
+header-only walks in stage 1 and stage 4.
+
+| Phase | Time | RSS (anon) | Description |
+|-------|------|-----------|-------------|
+| Meta scan | 30.9s | 19 MB peak | Single reusable blob-metadata pass (`BlobMeta`) with tagdata state |
+| Stage 1 (way pass) | 36.0s | 3.6 GB peak | Pass A + pass B; way schedule and node-blob mapping projected from metadata |
+| Stage 2 (node join) | 92.9s | 7.15 GB peak | Parallel counting-sort per rank bucket, inline node-blob coord fill |
+| Stage 3 (slot reorder) | 32.2s | 7.30 GB peak | Scatter 12-byte slot records directly into per-bucket `scatter_buf` |
+| Finalize | 18.3s | 2.95 GB peak | Parallel `coord_payloads` tail |
+| Relation scan | 14.3s | 0.85 GB peak | `collect_relation_member_node_ids()` between stage 3 and 4 |
+| Stage 4 (assembly) | 90.6s | 3.25 GB peak | Way reframe + node decode/filter + relation passthrough |
+| **Total** | **333s** | | |
+
+The shared metadata pass replaced three separate scans on Europe:
+
+- `s1_way_schedule_build_ms`: `24.8s -> 0.08s`
+- `s1_node_map_build_ms`: `30.9s -> 0.12s`
+- `s4_schedule_scan_ms`: `31.5s -> 0.14s`
+- new `extjoin_meta_scan_ms`: `30.9s`
+
+Net: about **87s** of repeated scan work collapsed to about **31s**, which is
+why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
+
 ### External join optimization history
 
 | Version | Denmark | Europe | Planet | Commit |
@@ -207,6 +238,7 @@ I/O stays bounded.
 | External radix permutation (full) | 14s | 422s | 1,462s | `b0a5fb8` |
 | Stage 1B overlap + misc | — | 392s | 1,075s | `091fc5b` |
 | **coord_payloads integrated** | **7.4s** | **400s** | **953s** | **`3d977a0`** |
+| **+ shared blob metadata scan** | — | **333s** | — | **`d3e13ed`** |
 
 The coord_payloads integration (2026-04-14) was pursued primarily for
 non-wall benefits. Planet measured −29 s wall as a pleasant surprise;
@@ -219,7 +251,8 @@ Key earlier optimizations: node-only wire scanner (bypasses
 PrimitiveBlock, eliminates 25 GB heap retention), scatter buffer
 (eliminates sort + 4.69B pwrite calls, 15x speedup), BlobReader
 fadvise(DONTNEED) (general infrastructure), deferred IdSetDense,
-buffer reuse in bucket loads.
+buffer reuse in bucket loads, shared blob metadata scan (collapses
+three repeated header passes into one reusable `BlobMeta` vector).
 
 See [altw-optimization-history.md](../notes/altw-optimization-history.md)
 for the full investigation and memory optimization research log.

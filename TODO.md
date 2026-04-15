@@ -115,6 +115,24 @@ level 6 matches osmium and is the right choice for interop. zstd is
 better for internal pipelines but the production pipeline already
 works. See [notes/zlib-level-tuning.md](notes/zlib-level-tuning.md).
 
+**Zstd:1 vs zlib:6 for ALTW external** (measured 2026-04-14): for
+pipelines that can opt out of osmium interop, `--compression zstd:1`
+is a substantial wall win on the external join path. Europe ALTW
+external: 419 s (zlib:6, UUID `f3c53a34`) → 379 s (zstd:1, UUID
+`66e43a11`), **−40 s, −9.5 %**. Stage 4 wall drops 28 % (132 s →
+95 s); `s4_send_ms` cumulative drops 81 % (270 s → 51 s) and
+`s4_channel_high_water` falls far below capacity — confirming that
+zlib compression throughput was the steady-state stage-4 ceiling
+under the consumer-owned raw-passthrough pipeline. The wall win
+comes entirely from relieving consumer/compression saturation
+downstream of the decode workers, not from any change in the
+encode/decode code path. Zstd is not safe as the library default
+(osmium and most consumers still expect zlib-compressed blobs;
+[wiki: PBF specifies zlib](https://wiki.openstreetmap.org/wiki/PBF_Format))
+but the flag is right there for internal-pipeline users. Output
+file size stays within a few percent of zlib:6 at zstd:1, so the
+knob is pure wall/interop trade-off, not a size trade-off.
+
 ### Reviewer findings (2026-03-29)
 
 **Do later:**
@@ -315,31 +333,46 @@ single-pass, tag expression and bbox filtering.
     constraint for a different reason.
   - [ ] **Per-way refcounts threaded into stage 4** so
     `reframe_way_blob_with_locations` can stop re-counting refs from
-    field 8 varints. Modest CPU win, not transformative. **Deferred:**
-    standalone, this requires keeping `PerWayRcs` (~4.7 GB planet)
-    alive through stage 4 (the peak-RSS stage), trading modest CPU
-    for a big RSS squeeze on 32 GB hosts. Bundle with the
-    `PerWayRcs` lazy per-blob decode item below, which saves
-    ~3.5 GB RSS AND enables refcount threading at lower peak.
+    field 8 varints. Modest CPU win, not transformative. The original
+    blocker was keeping the flat `PerWayRcs` table alive through stage 4;
+    lazy per-blob decode has removed that peak-RSS objection, so this is
+    now a straightforward follow-up rather than a paired project.
     (External review 2026-04-14 #2 hypothetical.)
 
   **Still open — measurable wins inside the current architecture:**
 
-  - [ ] **Stage 4 raw passthrough for non-way blobs.** Currently every
-    non-way blob goes through full `PrimitiveBlock` decode +
-    `BlockBuilder` re-encode (`stage4.rs:337`). Dense path already has
-    raw passthrough machinery for relation blobs (always) and untagged
-    node blobs (when `keep_untagged_nodes=true`). Planet
-    `s4_nonway_assemble_ms` = 922 s cumulative (~154 s wall ÷ 6
-    workers); even partial passthrough is meaningful. Plumb the same
-    machinery into the external stage 4. (External review
-    2026-04-14 #2.)
-  - [ ] **`PerWayRcs` lazy per-blob decode via blob-offset index.**
-    Currently parses entire varint sidecar into a flat `Vec<u32>`
-    held resident through stage 3 + finalize (~4.7 GB on planet). Add
-    a per-blob byte-offset index over the varint stream and decode
-    each blob's refcounts on demand. Saves ~3.5 GB RSS. (External
-    review 2026-04-14 #2.)
+  - [x] ~~Stage 4 raw passthrough for non-way blobs.~~ Shipped 2026-04-14
+    (commit `4910fd9`). Consumer-owned pattern mirroring
+    `extract.rs:pread_execute` — schedule partitioned into
+    decode_items (ways + filtered node blobs) and passthrough_items
+    (relations always, node blobs when `keep_untagged_nodes`).
+    Workers only handle decode; consumer pre-seeds passthrough items
+    into the ReorderBuffer and preads raw frames inline via
+    `write_raw_owned`. Added Stats/telemetry (`blobs_passthrough`,
+    `blobs_decoded`, `s4_passthrough_*`). Closed the pre-existing
+    `blobs_decoded = 0` gap in stage-4 summary at the same time.
+
+    **Architecturally correct, wall-neutral on default workloads.**
+    Planet clean A/B (baseline `c021dd91` @ `3d977a0` 953.5 s →
+    passthrough-only `ecd5dfa5` @ `4910fd9` 957.4 s): +0.4 % wall,
+    100 % relation coverage (452 / 452 blobs, 855 MB), −43 s
+    cumulative `s4_nonway_assemble_ms` (−5 %), +43 s `s4_send_ms`
+    (workers produce faster, block more on the channel). The
+    cumulative decode savings don't reach wall because the
+    consumer/compression pipeline is the steady-state ceiling — a
+    256-depth channel A/B probe confirmed that deepening the queue
+    only relocates the wait, it does not move wall. `s4_flush_ms`
+    stays tiny (~1 s) so the wait also isn't at the writer tail.
+    The architecture **will** pay on workloads with a higher
+    passthrough share (`--keep-untagged-nodes`) or once the writer
+    ceiling is addressed (zstd, parallel compression).
+  - [x] ~~`PerWayRcs` lazy per-blob decode via blob-offset index.~~
+    Shipped 2026-04-14. The per-way refcount sidecar now stays
+    varint-encoded in memory with a per-blob byte-offset index; stage 3
+    and finalize consume raw blob records on demand instead of
+    materializing a planet-scale flat `Vec<u32>` through both phases.
+    This closes the ~3.5 GB RSS item and leaves stage-4 refcount
+    threading as a separate CPU follow-up. (External review 2026-04-14 #2.)
   - [ ] **io_uring (SQPOLL) for stage 2 + stage 4 preads.** Stage 4
     now does ~17K (planet) / ~57K (Europe) per-blob preads on
     `coord_payloads`; stage 2 does its rank-bucket coord-slice
@@ -350,14 +383,24 @@ single-pass, tag expression and bbox filtering.
     straddler boundaries (~255 today × 2 at 512 buckets — still well
     under 1 GB staging). Tractable bench. Note: also affects the
     small-input bug fix (dynamic bucket count is one fix candidate).
-  - [ ] **Fuse the intermediate vectors in stage 1's hot loops.**
-    Pass A copies refs into `blob_node_ids` before setting bits
-    (`stage1.rs:151`); pass B builds `ranked` then immediately
-    serializes it (`stage1.rs:362`); coord pass builds
-    `ranked_coords` before turning into extents (`stage1.rs:613`).
-    Each is a per-blob `Vec` allocation feeding a single downstream
-    consumer — fuse to remove memory traffic. (External review
-    2026-04-14 #2.)
+  - [ ] **Fuse the remaining intermediate vectors in stage 1's hot loops.**
+    Pass A direct-set fusion was tried 2026-04-14 (`5e05b54`) and
+    reverted: best-of-3 Europe (`7a50c10d`) improved
+    `EXTJOIN_S1_PASS_A` 8.24 s → 7.25 s (−12 %) but still regressed
+    best wall 6m25s (`bd878fd4`) → 6m34s, with the loss dominated by
+    slower untouched coord-pass time. Under the Europe non-regression
+    rule, don't bank that one.
+
+    Pass B ranked-vector fusion was also tried 2026-04-14 (`ec365d3`)
+    and reverted: Europe (`47156108`) collapsed `s1b_rank_ms` to ~0
+    by folding the work into `s1b_encode_write_ms`, but still regressed
+    best wall 6m25s (`bd878fd4`) → 6m39s, again with the loss dominated
+    by slower untouched coord-pass time. Under the same Europe
+    non-regression rule, don't bank that one either.
+
+    Still open: coord pass builds `ranked_coords` before turning into
+    extents (`stage1.rs:613`). This remains the only untried vector
+    fusion in stage 1's hot loops. (External review 2026-04-14 #2.)
   - [ ] **Stage 3 parse-and-scatter directly from raw bytes.**
     Currently parses slot-bucket records into `Vec<ResolvedEntry>`
     before scattering into `scatter_buf` (`stage3.rs:223`). Same
@@ -436,8 +479,23 @@ single-pass, tag expression and bbox filtering.
   **Conditional on output compression** (currently `compression:none`
   in production, so both moot):
 
-  - [ ] **Output Zstd(1).** ~3× faster than zlib(6), similar ratio.
+  - [x] ~~Output Zstd(1).~~ **Measured 2026-04-14 under the consumer-owned
+    raw-passthrough pipeline** (commit `634b7f5`). Europe ALTW
+    external: 419 s (zlib:6, UUID `f3c53a34`) → 379 s (zstd:1, UUID
+    `66e43a11`), **−40 s, −9.5 % total wall.** Stage 4 wall drops
+    28 % (132 s → 95 s). `s4_send_ms` cumulative drops 81 % (270 s →
+    51 s); `s4_channel_high_water` = 55 vs cap 32 (overshoot from
+    concurrent bumps; effectively never saturates). Confirms the
+    earlier hypothesis that zlib:6 compression throughput is the
+    steady-state stage-4 ceiling on default workloads. Zstd:1 can't
+    be the library default (breaks osmium interop), but is an
+    excellent flag for internal pipelines. See the writeup in the
+    "Write-path throughput" section above.
   - [ ] **Reduce stage 4 decode workers by 1, give core to compression.**
+    Relevant for zlib:6 where compression is the ceiling; less
+    relevant under zstd:1 where compression no longer saturates.
+    Revisit only if the default-compression ceiling matters for
+    a specific workload.
 
   **External review rediscoveries (already considered or measured-and-closed):**
 

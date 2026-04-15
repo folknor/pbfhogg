@@ -280,6 +280,7 @@ pub(super) fn stage1_way_pass(
         let s1b_pread_ref = &s1b_pread_ms;
         let s1b_decompress_ref = &s1b_decompress_ms;
         let s1b_scan_ref = &s1b_scan_ms;
+        let s1b_rank_ref = &s1b_rank_ms;
         let s1b_encode_write_ref = &s1b_encode_write_ms;
         let s1b_flush_ref = &s1b_flush_ms;
         let s1b_refs_total_ref = &s1b_refs_total;
@@ -359,14 +360,11 @@ pub(super) fn stage1_way_pass(
                             let blob_ref_count = blob_node_ids.len() as u64;
                             s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
 
-                            // Phase 2: fuse rank lookup, bucket selection,
-                            // record encode, and write. This removes the
-                            // per-blob `ranked` staging vector; the fused
-                            // cost now lives under s1b_encode_write_ms.
+                            // Phase 2: batch rank lookups + bucket selection.
                             let t3 = std::time::Instant::now();
                             let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
-                            let mut blob_bytes: u64 = 0;
-                            let mut blob_writes: u64 = 0;
+                            // (local_rank, bucket, slot_pos) per ref.
+                            let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
                                 #[allow(clippy::cast_possible_truncation)]
@@ -377,6 +375,16 @@ pub(super) fn stage1_way_pass(
                                 #[allow(clippy::cast_possible_truncation)]
                                 let local_rank = (global_rank - bucket_rank_start) as u32;
                                 let slot_pos = slot_start + i as u64;
+                                ranked.push((local_rank, bucket, slot_pos));
+                            }
+                            #[allow(clippy::cast_possible_truncation)]
+                            s1b_rank_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
+
+                            // Phase 3: batch encode + write.
+                            let t4 = std::time::Instant::now();
+                            let mut blob_bytes: u64 = 0;
+                            let mut blob_writes: u64 = 0;
+                            for &(local_rank, bucket, slot_pos) in &ranked {
                                 let rec = RankRecord { local_rank, slot_pos };
                                 rec.write_to(&mut rec_buf);
                                 if let Some(w) = shard_writers[bucket].as_mut() {
@@ -388,7 +396,7 @@ pub(super) fn stage1_way_pass(
                                 entry_counts[bucket] += 1;
                             }
                             #[allow(clippy::cast_possible_truncation)]
-                            s1b_encode_write_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
+                            s1b_encode_write_ref.fetch_add(t4.elapsed().as_millis() as u64, Relaxed);
                             s1b_bytes_written_ref.fetch_add(blob_bytes, Relaxed);
                             s1b_shard_write_calls_ref.fetch_add(blob_writes, Relaxed);
                             Ok(())

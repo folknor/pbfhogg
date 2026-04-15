@@ -131,7 +131,7 @@ pbfhogg time-filter <file> -o <out> <ts>  Filter history PBF to a timestamp
 pbfhogg build-geocode-index <f> -d <dir>  Build reverse geocoding index
 ```
 
-All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Commands that benefit from indexdata will error without it — pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
+All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that don't need osmium/JOSM compatibility, `zstd:1` is a substantial wall-time win — measured ≈ −10 % on Europe `add-locations-to-ways --index-type external` (419 s → 379 s) by relieving consumer/compression saturation in stage 4, at similar output size. Commands that benefit from indexdata will error without it — pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
 
 See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, and index type details.
 

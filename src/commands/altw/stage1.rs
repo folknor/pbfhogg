@@ -10,7 +10,7 @@
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
 
-use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
+use super::super::external_radix::ScratchDir;
 use super::super::id_set_dense::IdSetDense;
 use super::super::Result;
 use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
@@ -32,6 +32,61 @@ pub(super) struct Stage1Output {
     pub num_shard_workers: usize,
     pub node_id_set: IdSetDense,
     pub node_blob_mapping: Vec<NodeBlobInfo>,
+}
+
+fn ensure_rank_shard_nofile(rank_bucket_count: usize, num_workers: usize) -> Result<()> {
+    #[allow(clippy::cast_possible_wrap)]
+    let required = rank_bucket_count
+        .saturating_mul(num_workers)
+        .saturating_add(64);
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return Err(format!(
+            "getrlimit RLIMIT_NOFILE: {}",
+            std::io::Error::last_os_error()
+        )
+        .into());
+    }
+    let required_rlim = required as libc::rlim_t;
+    if limit.rlim_cur >= required_rlim {
+        return Ok(());
+    }
+
+    let target = required_rlim.min(limit.rlim_max);
+    if target > limit.rlim_cur {
+        let raised = libc::rlimit {
+            rlim_cur: target,
+            rlim_max: limit.rlim_max,
+        };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            eprintln!(
+                "[altw] raised RLIMIT_NOFILE soft limit from {} to {} for {} workers × {} rank buckets",
+                limit.rlim_cur,
+                target,
+                num_workers,
+                rank_bucket_count,
+            );
+            limit.rlim_cur = target;
+        }
+    }
+
+    if limit.rlim_cur < required_rlim {
+        return Err(format!(
+            "rank bucket count {} with {} workers needs RLIMIT_NOFILE >= {} \
+             (soft {}, hard {})",
+            rank_bucket_count,
+            num_workers,
+            required,
+            limit.rlim_cur,
+            limit.rlim_max,
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 /// Build the way-blob schedule via header-only scan.
@@ -338,6 +393,7 @@ pub(super) fn stage1_way_pass(
     scratch: &ScratchDir,
     ref_count_sidecar: &Path,
     per_way_refcount_sidecar: &Path,
+    rank_bucket_count: usize,
 ) -> Result<Stage1Output> {
     use std::os::unix::fs::FileExt as _;
 
@@ -346,6 +402,7 @@ pub(super) fn stage1_way_pass(
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
+    ensure_rank_shard_nofile(rank_bucket_count, num_workers)?;
 
     let (total_refs, node_id_set) = stage1_pass_a(
         input, &schedule, num_workers, ref_count_sidecar, per_way_refcount_sidecar,
@@ -409,9 +466,10 @@ pub(super) fn stage1_way_pass(
                     use std::sync::atomic::Ordering::Relaxed;
 
                     // Per-worker rank-bucket shard files.
-                    let mut shard_writers: Vec<Option<BufWriter<std::fs::File>>> = Vec::with_capacity(NUM_BUCKETS);
-                    let mut entry_counts = vec![0u64; NUM_BUCKETS];
-                    for bucket_idx in 0..NUM_BUCKETS {
+                    let mut shard_writers: Vec<Option<BufWriter<std::fs::File>>> =
+                        Vec::with_capacity(rank_bucket_count);
+                    let mut entry_counts = vec![0u64; rank_bucket_count];
+                    for bucket_idx in 0..rank_bucket_count {
                         let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
                         let f = match std::fs::File::create(&path) {
                             Ok(f) => f,
@@ -471,14 +529,14 @@ pub(super) fn stage1_way_pass(
                             s1b_refs_total_ref.fetch_add(blob_ref_count, Relaxed);
 
                             let t3 = std::time::Instant::now();
-                            let rank_range = unique_nodes_u64.div_ceil(NUM_BUCKETS as u64);
+                            let rank_range = unique_nodes_u64.div_ceil(rank_bucket_count as u64);
                             let mut ranked: Vec<(u32, usize, u64)> = Vec::with_capacity(blob_node_ids.len());
                             for (i, &node_id) in blob_node_ids.iter().enumerate() {
                                 let global_rank = node_id_set_ref.rank(node_id);
                                 #[allow(clippy::cast_possible_truncation)]
                                 let bucket = if rank_range == 0 { 0 } else {
                                     (global_rank / rank_range) as usize
-                                }.min(NUM_BUCKETS - 1);
+                                }.min(rank_bucket_count - 1);
                                 let bucket_rank_start = bucket as u64 * rank_range;
                                 #[allow(clippy::cast_possible_truncation)]
                                 let local_rank = (global_rank - bucket_rank_start) as u32;
@@ -547,7 +605,7 @@ pub(super) fn stage1_way_pass(
 
     let all_counts = worker_counts.into_inner()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let mut merged_counts = vec![0u64; NUM_BUCKETS];
+    let mut merged_counts = vec![0u64; rank_bucket_count];
     for counts in &all_counts {
         for (i, &c) in counts.iter().enumerate() {
             merged_counts[i] += c;

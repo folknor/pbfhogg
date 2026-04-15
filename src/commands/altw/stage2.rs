@@ -12,7 +12,7 @@ use std::io::Write as _;
 use std::path::Path;
 use std::sync::Arc;
 
-use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
+use super::super::external_radix::ScratchDir;
 #[cfg(feature = "linux-direct-io")]
 use super::super::external_radix::advise_dontneed_file;
 use super::super::id_set_dense::IdSetDense;
@@ -59,10 +59,11 @@ fn prepare_bucket(
     num_shard_workers: usize,
     unique_nodes: u64,
     rank_range_size: u64,
+    rank_bucket_count: usize,
     loader: &mut LoaderScratch,
 ) -> std::result::Result<PreparedBucket, String> {
     let bucket_rank_start = bucket_idx as u64 * rank_range_size;
-    let bucket_rank_end = if bucket_idx == NUM_BUCKETS - 1 {
+    let bucket_rank_end = if bucket_idx == rank_bucket_count - 1 {
         unique_nodes
     } else {
         ((bucket_idx as u64 + 1) * rank_range_size).min(unique_nodes)
@@ -218,6 +219,7 @@ impl SharedSlotBuckets {
 pub(super) fn stage2_node_join(
     scratch: &ScratchDir,
     rank_bucket_counts: &[u64],
+    rank_bucket_count: usize,
     num_shard_workers: usize,
     slot_buckets: &SharedSlotBuckets,
     slot_bucket_count: usize,
@@ -227,7 +229,8 @@ pub(super) fn stage2_node_join(
     node_id_set: &IdSetDense,
     node_blob_mapping: &[NodeBlobInfo],
 ) -> Result<u64> {
-    let rank_range_size = unique_nodes.div_ceil(NUM_BUCKETS as u64);
+    debug_assert_eq!(rank_bucket_counts.len(), rank_bucket_count);
+    let rank_range_size = unique_nodes.div_ceil(rank_bucket_count as u64);
 
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -358,7 +361,7 @@ pub(super) fn stage2_node_join(
                         break;
                     }
                     let bucket_idx = next_ref.fetch_add(1, Relaxed);
-                    if bucket_idx >= NUM_BUCKETS { break; }
+                    if bucket_idx >= rank_bucket_count { break; }
                     if rank_bucket_counts[bucket_idx] == 0 { continue; }
 
                     let result: std::result::Result<(), String> = (|| {
@@ -366,7 +369,7 @@ pub(super) fn stage2_node_join(
                         let t_load = std::time::Instant::now();
                         let bkt = prepare_bucket(
                             bucket_idx, scratch, num_shard_workers,
-                            unique_nodes, rank_range_size, &mut loader,
+                            unique_nodes, rank_range_size, rank_bucket_count, &mut loader,
                         )?;
                         #[allow(clippy::cast_possible_truncation)]
                         load_ref.fetch_add(t_load.elapsed().as_millis() as u64, Relaxed);

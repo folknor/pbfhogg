@@ -869,6 +869,23 @@ Keep gate:
 
 - only if explicit timing shows `> 5s` wall
 
+Result:
+
+- Shelved after a Denmark self-parity check plus one Europe gate.
+- Denmark correctness:
+  - normal vs wire-scanner direct outputs were byte-identical
+  - MD5: `2d3c901a40eec6bf3bfb2084641519f4`
+- Europe:
+  - baseline: `f864b64f`
+  - wire-scanner prototype: `603b1043`
+  - `EXTJOIN_RELATION_SCAN`: `14294ms -> 15172ms` (worse)
+  - total wall moved `5m33s -> 5m31s`, but the gain came from unrelated
+    stage noise; the targeted serial relation-scan phase did not improve
+- Conclusion:
+  - discard under the item's own gate
+  - parsing just the relation memids/types arrays was not enough to beat the
+    existing full-block path on Europe
+
 ### Node-blob double-decode across stage 2 and stage 4
 
 Stage 2 decodes the kept node-blob set to populate bucket-local `coord_slice`;

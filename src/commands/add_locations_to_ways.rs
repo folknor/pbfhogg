@@ -953,7 +953,6 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
 /// Collect all node IDs referenced by relation members.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    let use_wire_scanner = std::env::var("PBFHOGG_ALTW_RELATION_SCAN_WIRE").as_deref() == Ok("1");
     // Sequential reader — only ~2K relation blobs at Europe scale, so retention
     // is negligible, but sequential is consistent with the other collection passes.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -964,7 +963,6 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
     let mut member_node_ids = IdSetDense::new();
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut group_starts: Vec<(usize, usize)> = Vec::new();
 
     for blob_result in &mut blob_reader {
         let blob = blob_result?;
@@ -973,24 +971,16 @@ pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) ->
             if !matches!(idx.kind, crate::blob_index::ElemKind::Relation) { continue; }
         }
         blob.decompress_into(&mut decompress_buf)?;
-        if use_wire_scanner {
-            super::relation_scanner::scan_relation_member_node_ids(
-                &decompress_buf,
-                &mut group_starts,
-                &mut member_node_ids,
-            )?;
-        } else {
-            let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-                std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
-            )?;
-            for element in block.elements_skip_metadata() {
-                if let Element::Relation(r) = element {
-                    for member in r.members() {
-                        if let MemberId::Node(id) = member.id
-                            && id >= 0
-                        {
-                            member_node_ids.set(id);
-                        }
+        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
+            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+        )?;
+        for element in block.elements_skip_metadata() {
+            if let Element::Relation(r) = element {
+                for member in r.members() {
+                    if let MemberId::Node(id) = member.id
+                        && id >= 0
+                    {
+                        member_node_ids.set(id);
                     }
                 }
             }

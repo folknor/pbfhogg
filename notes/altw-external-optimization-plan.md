@@ -15,44 +15,24 @@ Use this as the source of truth for sequencing. `TODO.md` remains the backlog.
 
 ## Current architecture
 
-The current external path is:
+1. `stage1.rs` — pass A parallel way scan builds a shared `IdSetDense` of
+   referenced nodes; pass B rescans ways and emits rank-bucketed
+   `(local_rank, slot_pos)` records; `build_node_blob_mapping()` records
+   `[ref_rank_start, ref_rank_end)` per node blob via a header-only walk.
+2. `stage2.rs` — per-rank-bucket counting-sort with inline coordinate
+   resolution from covering node blobs; resolved `(slot_pos, lat, lon)`
+   entries flushed into disk-backed slot buckets.
+3. `stage3.rs` + `coord_payloads.rs` — scatter slot buckets directly from
+   raw bytes into per-bucket `scatter_buf`, classify blob/bucket
+   intersections, emit per-blob payloads to worker temps, stage straddlers,
+   parallel-finalize into `coord_payloads`.
+4. `stage4.rs` — way blobs use wire-format reframe with per-blob
+   `coord_payloads`; relations are raw-passthrough; non-way node blobs go
+   through full decode + `BlockBuilder`.
 
-1. `stage1.rs`
-   - Pass A: parallel way scan builds a shared `IdSetDense` of referenced nodes.
-   - Pass B: rescans ways and emits rank-bucketed `(local_rank, slot_pos)` records.
-   - `build_node_blob_mapping()` does a header-only node-blob walk and records
-     `[ref_rank_start, ref_rank_end)` for each node blob.
-
-2. `stage2.rs`
-   - per-rank-bucket counting-sort of rank records
-   - inline coordinate resolution by decoding the node blobs that intersect the
-     bucket's rank range
-   - resolved `(slot_pos, lat, lon)` entries flushed into disk-backed slot buckets
-
-3. `stage3.rs` + `coord_payloads.rs`
-   - read each slot bucket
-   - scatter directly from raw `ResolvedEntry` bytes into a dense per-bucket
-     `scatter_buf`
-   - classify blob/bucket intersections
-   - emit fully-contained payloads into per-worker temp files
-   - stage straddlers
-   - parallel finalize into `coord_payloads`
-
-4. `stage4.rs`
-   - pre-scan blob schedule
-   - way blobs: wire-format reframe using per-blob `coord_payloads`
-   - non-way blobs: decode + `BlockBuilder`
-   - relation passthrough is already shipped
-
-Important current decisions:
-
-- Keep the inline stage-2 node-blob path. `coords_by_rank` is gone.
-- Keep the disk-backed slot-bucket path. The epoch-spill prototype was measured
-  and shelved.
-- Keep the shared-set stage-1 pass A. The per-worker local `IdSetDense` branch
-  was measured and shelved.
-- Keep the current `coord_payloads` representation. The old `coord_slots`
-  family is closed.
+The disk-backed slot-bucket path, shared-set pass A, and current
+`coord_payloads` representation all have alternatives that were measured
+and shelved; see §Measured and shelved below.
 
 ## Current measured profile
 
@@ -75,108 +55,57 @@ What those runs say:
 
 ## Dataset ladder and benchmark policy
 
-The old "2x Europe + 2x planet between every coding sprint" cadence does not
-scale. Use this ladder instead.
+The old "2× Europe + 2× planet between every coding sprint" cadence does not
+scale. Use this ladder. Batch related work before paying for Europe again.
 
-### Denmark
+**Denmark** — correctness, invariant checks, output parity, RSS sanity.
+Denmark wall is noise for almost every external-join item; do not accept or
+reject on it unless the change is extremely local and CPU-only.
 
-Use Denmark for:
+**Japan** — first performance gate for stage-1/2/3 CPU-local work and
+bucket-count sweeps. Gate: `< 1%` total-wall and `< 3%` targeted-phase movement
+are noise; only escalate to Europe when the target phase moves clearly in the
+expected direction.
 
-- correctness
-- invariant checks
-- output parity
-- scratch/output byte-shape sanity
-- verifying that a new path does not explode RSS immediately
+**Europe** — first real gate for anything syscall / I/O / cache / page-cache
+sensitive, anything touching stage-4 consumer/writer balance, and any
+shippable candidate. Gate: low/medium-effort items keep only if total wall
+improves `>= 1.5%` or the targeted phase improves `>= 3%` with the rest of
+the pipeline flat; architectural items need a clear Europe phase win or a
+compelling planet-only reason.
 
-Do not use Denmark to accept or reject ALTW performance work unless the change is
-extremely local and CPU-only. For almost every external-join item, Denmark wall
-is noise.
-
-### Japan
-
-Use Japan as the first performance gate for:
-
-- stage-1 CPU-local work
-- stage-2 CPU-local work
-- stage-3 CPU-local work
-- bucket-count sweeps
-
-Japan is the smallest dataset that is usually big enough to exercise the real
-hot loops without paying Europe time.
-
-Default Japan gate:
-
-- treat `< 1%` total-wall movement as noise
-- treat `< 3%` targeted-phase movement as noise
-- only escalate to Europe if the target phase moves clearly in the expected
-  direction
-
-### Europe
-
-Use Europe as the first real gate for:
-
-- anything syscall / I/O / cache / page-cache sensitive
-- anything touching stage-4 consumer / writer balance
-- any candidate you might actually ship
-
-Default Europe gate:
-
-- low/medium-effort item: keep only if total wall improves by `>= 1.5%`, or the
-  targeted phase improves by `>= 3%` and the rest of the pipeline stays flat
-- high-effort / architectural item: require either a clear phase win on Europe
-  or a compelling reason that only planet can decide it
-
-### Planet
-
-Use planet only for:
-
-- ship / no-ship decisions
-- memory-floor decisions
-- cases where slot count fundamentally changes the trade
-
-Do not pay for a planet A/B unless a candidate has already cleared its Denmark /
-Japan / Europe gate, or Europe is known to be non-representative for that
-question.
+**Planet** — ship/no-ship, memory floor, or cases where slot count
+fundamentally changes the trade. Do not pay for a planet A/B unless
+Denmark / Japan / Europe have cleared, or Europe is known to be
+non-representative.
 
 ### Noise-floor calibration
 
-The gate thresholds below are policy values. The real floor is whatever the
-current host's within-commit variance produces. Before trusting them:
+Gate thresholds are policy values. The real floor is within-commit variance
+on the current host. Before trusting them, run the baseline `--bench 3` on
+Japan and Europe once; if natural spread is `> 1%` on Japan or `> 1.5%` on
+Europe, raise the gates accordingly. Rerun after host changes or a major
+multi-stage-file churn.
 
-- run the current baseline `--bench 3` on Japan, record the spread
-- run the current baseline `--bench 3` on Europe, record the spread
-- if natural spread is `> 1%` on Japan or `> 1.5%` on Europe, raise the gates
-  accordingly
+## Already shipped on current main
 
-Rerun calibration when the host changes or after a major code churn across
-multiple stage files.
+Do not re-plan these as hypotheticals — they already ship:
 
-### General rule
+- `coords_by_rank` removal: stage 2 decodes node blobs directly via
+  `NodeBlobInfo`.
+- Stage-3 direct scatter from raw `ResolvedEntry` bytes — no
+  `Vec<ResolvedEntry>` materialization between read and scatter.
+- Parallel finalize tail in `coord_payloads.rs` — per-blob pread+pwrite
+  work-stealing across `available_parallelism` threads.
+- Stage-4 per-way refcount sidecar consumption in the way reframe path
+  — no field-8 ref re-counting in the hot loop.
+- Stage-4 raw passthrough for relation blobs (always) and node blobs
+  when `keep_untagged_nodes` is set; consumer-owned, mirroring
+  `extract.rs:pread_execute`.
+- `PerWayRcs` lazy per-blob decode via blob-offset sidecar index — no
+  flat planet-scale `Vec<u32>` residency through stage 3 / finalize.
 
-Batch related work before paying for Europe again.
-
-Examples:
-
-- do not Europe-bench two stage-2 hot-loop edits separately
-- do not planet-bench an architecture branch until the clean normal Europe gate
-  says it is worth carrying
-
-## Reconciliation with TODO.md
-
-`TODO.md` is now stale in several places for ALTW external. Before scheduling
-new work, normalize the state mentally:
-
-### Already shipped, even if TODO still says "open"
-
-- `coords_by_rank` removal: stage 2 now decodes node blobs directly using
-  `NodeBlobInfo`
-- stage-3 direct scatter from raw `ResolvedEntry` bytes
-- parallel finalize tail in `coord_payloads.rs`
-- stage-4 per-way refcount sidecar consumption in the way reframe path
-
-These should not be re-planned as hypotheticals.
-
-### Measured and shelved
+## Measured and shelved
 
 - Slot-space epochs / epoch spill:
   - Denmark correctness: passed
@@ -194,64 +123,22 @@ These should not be re-planned as hypotheticals.
   - pass-A direct-set fusion
   - pass-B ranked-vector fusion
 
-### Obsolete TODO wording
-
-- The remaining "coord pass ranked_coords fusion" note is obsolete on current
-  `main` because the old `coord_pass` path no longer exists in this pipeline.
-
-### Still genuinely live
-
-- bucket-count tuning (`>256`)
-- stage-2 hot-loop cleanup under the inline node-blob design
-- stage-1B grouped-by-local-rank redesign
-- `io_uring` for preads
-- compression-conditional stage-4 worker balance
-
-## New opportunities from code inspection
-
-These are not top-level TODO items today, but they are real enough to track:
-
-1. **Stage-2 callback node scanner / direct coord-slice fill**
-   - `stage2.rs` currently calls `extract_node_tuples()` into a `Vec<NodeTuple>`
-     and then loops that vector to do `rank_if_set()` + `coord_slice` writes.
-   - A callback-style scanner can parse DenseNodes and write directly into the
-     target slice, removing the `Vec<NodeTuple>` materialization and the second
-     loop.
-   - This is a natural paired follow-up to the existing
-     `rank_if_set()` -> monotonic-rank idea.
-
-2. **Stage-2 instrumentation is currently too lossy for micro-opts**
-   - `s2_node_pread_ms`, `s2_node_decompress_ms`, `s2_node_extract_ms`, and
-     `s2_node_rank_ms` are accumulated via per-blob `as_millis()`.
-   - That has the same truncation problem the stage-4 way counters used to
-     have: sub-ms work disappears.
-   - Before doing stage-2 hot-loop work, fix the instrumentation.
-
-3. **Shared header-scan / blob-metadata sidecar**
-   - Current normal path still performs multiple whole-file header-only scans:
-     `build_way_schedule()`, `build_node_blob_mapping()`, and the stage-4
-     schedule pre-scan.
-   - This may be worth collapsing into one reusable metadata pass or sidecar,
-     but only if explicit timing proves the scans are material.
-
-4. **Relation-member node collection is still full relation decode**
-   - `collect_relation_member_node_ids()` fully decompresses and parses relation
-     blobs.
-   - Relation blobs are few, so this is low priority, but if later profiling
-     shows it above the noise floor, a wire-format member scanner is plausible.
-
-5. **Known duplicated node-blob decode work**
-   - Current normal external mode decodes the kept node-blob set twice:
-     - stage 2 decodes node blobs to populate bucket-local `coord_slice`
-     - stage 4 decodes the same kept node blobs again to emit nodes
-   - On the current planet baseline this is real cumulative work:
-     - stage 2 `s2_node_decompress_ms = 192356`
-     - stage 4 processes all `32835 / 32835` node blobs again on the non-way
-       path
-   - This is architecturally awkward to fuse because stage 2 is rank-bucket
-     ordered while stage 4 is file-ordered and consumer/writer-bound.
-   - Keep it visible as a deferred structural item so it is not lost, but do
-     not make it part of the next sprint.
+- Stage-1B per-blob bucket staging (batch `write_all` per bucket per blob):
+  - commits: `e16674b` (land), `950c22d` (revert), 2026-04-14
+  - Europe stage 1 regressed +30% (77.0 s → 99.9 s); every CPU-bound
+    counter (`s1b_scan_ms`, `s1b_rank_ms`, `s1b_encode_write_ms`)
+    regressed together
+  - `write_all` call count dropped 4.69 B → 14.16 M (−331×) as designed,
+    but `BufWriter` was already amortizing the syscall cost; the staging
+    layer added an extra memcpy and scattered writes across 256
+    `Vec<u8>` tails, thrashing L1/TLB
+  - lesson: reviewer consensus + cumulative-ms numbers are not evidence
+    of a bottleneck; measurement is. `s1b_encode_write_ms` cumulative
+    looks like an attack surface but is a `BufWriter`-amortized memcpy,
+    not a syscall pile-up.
+  - conclusion: shelve the direct batching approach. The
+    grouped-by-local-rank redesign (item 5) is a different mechanism and
+    survives.
 
 ## Proposed order
 
@@ -279,6 +166,11 @@ Change:
 - split `coord_slice` zeroing from the rest of `s2_coord_fill_ms`
 - add an explicit marker/timer for `build_way_schedule()`
 - add an explicit marker/timer for the stage-4 schedule pre-scan
+- add `EXTJOIN_RELATION_SCAN_START` / `_END` markers around
+  `collect_relation_member_node_ids()` in `mod.rs`. Currently the cost
+  sits in the gap between `EXTJOIN_STAGE3_END` and `EXTJOIN_STAGE4_START`
+  with no attribution; item 4 (stage-4 node filter) and the low-priority
+  relation wire scanner both need this baseline.
 
 Smallest meaningful dataset:
 
@@ -296,7 +188,10 @@ Discard gate:
 
 Why first:
 
-- It makes items 2 and 6 much cheaper to judge.
+- The ns counters make the stage-2 hot-loop judgement (item 3) cheaper.
+- The relation-scan marker is a precondition for item 4 and the
+  low-priority relation scanner.
+- The schedule-scan timers feed item 8.
 
 ### 1. Make bucket count dev-tunable, then sweep `>256`
 
@@ -374,7 +269,89 @@ Why this is first:
 - it is the cheapest current-architecture knob with plausible upside
 - it answers a long-open question without another large design fork
 
-### 2. Batch the stage-2 hot-loop follow-ups
+### 2. Shrink slot-bucket records from 16 to 12 bytes
+
+Hypothesis:
+
+- Stage 2 writes `~199 GB` of slot-bucket records at planet
+  (`s2_slot_bytes_written = 198967358576`). Each `ResolvedEntry` today
+  is 16 bytes (`u64 slot_pos + i32 lat + i32 lon`). Within a slot bucket
+  the range `[bucket_start, bucket_end)` fits in `u32`, so a
+  bucket-local `u32 local_slot_pos` shrinks the record to 12 bytes
+  (−25 % scratch; `~199 GB → ~150 GB` on planet). Stage 3 already
+  computes `local_pos = slot_pos - bucket_start`, so the subtraction
+  comes for free on the reader side too.
+
+Prior art:
+
+- `cfa916f external_join: shrink rank record from 16 to 12 bytes`
+  applied exactly this technique to the rank record (stage 1 → stage 2)
+  via `(u32 local_rank, u64 slot_pos)` for a 25 % I/O reduction. The
+  commit is proof that the pattern works; the same idea applied to the
+  slot record is the new surface.
+
+Code surface:
+
+- `ResolvedEntry` in `src/commands/altw/mod.rs` (write + read helpers,
+  `slot_bucket()` routing)
+- `src/commands/altw/stage2.rs` (write path, slot-buffer append)
+- `src/commands/altw/stage3.rs` (`scatter_bucket_entries`, the
+  raw-bytes-to-`scatter_buf` loop)
+
+Implementation notes:
+
+- Bucket width = `total_slots / slot_bucket_count`. At planet with 256
+  buckets: `12.4 B / 256 ≈ 48 M` — fits in `u32` with room to spare.
+  Widening buckets (item 1 sweep to 512 or 768) narrows the range;
+  narrowing buckets (small-input floor) is bounded by `max_blob_slots`.
+  In every case the bucket-local `slot_pos` fits in `u32`.
+- Add a debug-assert at routing time:
+  `debug_assert!(bucket_end - bucket_start <= u32::MAX as u64)`. The
+  assertion is cheap and documents the invariant in code.
+- Touches the same three stage files as item 1. Ship them in separate
+  commits so either can be reverted independently — do not batch.
+
+Smallest meaningful dataset:
+
+- Denmark for correctness (MD5 parity vs current path)
+- Japan for the first CPU signal
+- Europe for scratch / page-cache impact
+
+Metrics:
+
+- `EXTJOIN_STAGE2`
+- `EXTJOIN_STAGE3`
+- `s2_slot_bytes_written` (expected −25 %)
+- `s3_bytes_read` (expected −25 %)
+- `s2_bucket_load_ms` (expected smaller; less data to load per bucket)
+- `s2_max_worker_buf_bytes` (per-bucket slot buffers shrink)
+
+Keep gate:
+
+- Europe scratch write+read drops `≥ 20 %` AND stage 2 + stage 3 wall is
+  flat or better
+- do not keep if stage 2 + stage 3 CPU regresses by `> 1 %`
+
+Discard gate:
+
+- counting-sort or scatter regresses materially on Japan
+- Denmark MD5 parity fails
+
+Why this is second:
+
+- Narrow blast radius, clear signal, prior art in-repo.
+- Natural pairing with item 1: both touch stage-2/3 scratch layout.
+  Running the record shrink at the baseline bucket count gives a clean
+  delta; running it again at the bucket-sweep winner confirms the
+  scratch numbers under the chosen layout.
+
+Why not earlier:
+
+- Item 1's knob lands before item 2 so that the bucket-width assertion
+  holds across every sweep point we might keep. If item 1 is flat and
+  the knob stays at 256, item 2 still runs.
+
+### 3. Batch the stage-2 hot-loop follow-ups
 
 This is one branch, not two separate Europe gates.
 
@@ -433,13 +410,138 @@ Discard gate:
 - or if it only moves micro-counters while `EXTJOIN_STAGE2` stays flat
 - or if it increases node rereads / correctness complexity
 
-Why this is second:
+Why this is third:
 
 - stage 2 is the largest remaining phase on planet
 - this is still current-architecture work, not another redesign
 - Japan is big enough to answer it
 
-### 3. Prototype stage-1B grouped-by-local-rank emission
+### 4. Wire-format DenseNodes filter for stage-4 non-way blobs
+
+Hypothesis:
+
+- Stage 4's non-way blob path does full `PrimitiveBlock` decode +
+  element iteration + `BlockBuilder::add_node` + `flush_local` per kept
+  node. Planet `s4_nonway_assemble_ms = 868410` cumulative (~145 s /
+  worker) is one of the largest wall-attributable signals in stage 4.
+- A wire-format DenseNodes filter — analogous to
+  `reframe_way_blob_with_locations` and `reframe_dense_with_new_ids` —
+  could splice out untagged non-member dense-nodes while copying
+  stringtable entries, lat/lon deltas, and keys/vals verbatim for kept
+  elements, skipping the `PrimitiveBlock` materialization entirely.
+
+Prior art:
+
+- `reframe_way_blob_with_locations` in `src/commands/altw/stage4.rs`
+  (commit `a705fde`) — the analogous way-side rewrite that ships today.
+  The commit note explicitly defers the non-way case: "Non-way blobs
+  (nodes, relations) stay on the full decode+re-encode path since nodes
+  need per-element filtering (tag/member check)." That deferred case is
+  this item.
+- `reframe_dense_with_new_ids` in `src/commands/renumber_external.rs`
+  (commit `dc13a7b`) — a DenseNodes wire-format rewriter that patches
+  ID deltas and copies all other fields verbatim. Per-node cost 113 ns
+  → 16 ns (7×). Demonstrates the technique on DenseNodes end-to-end in
+  the repo.
+
+Why this is harder than either precedent:
+
+- Renumber rewrites every element; ALTW has to drop some. Dropping
+  dense-nodes breaks the packed delta chains in `ids`, `lat`, `lon`,
+  and `keys_vals` simultaneously — each kept element's first delta has
+  to be rebased to the last kept predecessor.
+- `keys_vals` is a flat stream keyed by per-element counts terminated
+  by `0`; the filter has to walk it in lockstep with the id/lat/lon
+  streams and emit only the runs belonging to kept elements.
+- `DenseInfo` (if present) carries parallel arrays for version /
+  timestamp / changeset / uid / user_sid that all need the same
+  filtering.
+
+Code surface:
+
+- `src/commands/altw/stage4.rs` — the `assemble_block` non-way branch
+  and a new `reframe_node_blob_filtered` function modelled on
+  `reframe_way_blob_with_locations`
+- `src/read/dense.rs` (DenseNodes wire layout reference)
+- the `!keep_untagged_nodes` case is the primary target; the
+  `keep_untagged_nodes` case is already raw-passthrough (item does not
+  affect it)
+- relation-member predicate via `relation_member_node_ids.any_in_range`
+  — same check as today, just applied inside the wire-format walk
+
+Implementation notes:
+
+- Start behind an env var (`stage23_epoch.rs` idiom), default off. Gate
+  removal waits on clean Denmark MD5 parity + Europe wall gate.
+- The filter can fall back to the existing `assemble_block` path for
+  blobs with unusual layouts (non-dense Nodes, unexpected fields). Keep
+  the fallback lit during prototype.
+- Instrumentation: per-blob `s4_nonway_filter_ms` ns counter; kept /
+  dropped element counts; emitted bytes. Counter names mirror the way
+  reframe set.
+
+Smallest meaningful dataset:
+
+- Denmark for correctness (MD5 parity vs current non-way path)
+- Japan for per-node CPU signal
+- Europe for wall
+- Planet for ship decision
+
+Metrics:
+
+- `s4_nonway_assemble_ms` (expected material drop)
+- `s4_nonway_filter_ms` (new, ns)
+- `EXTJOIN_STAGE4`
+- `s4_send_ms` (may drop — workers produce faster; may reveal writer
+  ceiling underneath)
+- `s4_bytes_written` (parity check: kept element bytes should match the
+  decode+re-encode path within tolerance)
+- total wall
+
+Keep gate (first pass — CPU):
+
+- Denmark MD5 parity intact
+- Japan or Europe `s4_nonway_assemble_ms` drops by `≥ 10 %`
+
+If the first-pass gate clears, evaluate the second:
+
+Keep gate (second pass — wall):
+
+- Europe `EXTJOIN_STAGE4` improves by `≥ 5 %`, or
+- Europe total wall improves by `≥ 2 %` with no RSS regression
+
+If the second gate is flat under default `zlib:6`, the CPU win may be
+masked by the writer ceiling. Re-evaluate under `zstd:1` (item 6a)
+before discarding — the stage-4 raw passthrough for relations showed
+exactly this pattern at `4910fd9`: `s4_nonway_assemble_ms` cumulative
+dropped 5 % while wall moved +0.4 %, because the freed worker time
+refilled the writer queue. A real stage-4-local CPU win can be invisible
+on wall under a writer-bound workload and still be worth shipping for
+the workloads where the writer is not the ceiling.
+
+Discard gate:
+
+- Denmark MD5 parity fails (correctness; no perf argument overrides)
+- both first-pass CPU and second-pass wall gates are flat AND `zstd:1`
+  is also flat
+
+Why this is fourth:
+
+- Attacks one of the larger cumulative planet signals
+  (`s4_nonway_assemble_ms`) with stage-4-local scope.
+- Prior art at two levels (way reframe + renumber dense rewriter) makes
+  the path credible.
+- Harder than item 3, so sits after the stage-2 hot-loop batch.
+
+Why not earlier:
+
+- filter-during-rewrite is a strictly harder edit than either shipped
+  precedent; the stage-2 hot-loop batch is a smaller-effort win on a
+  larger phase and goes first.
+- item 0's relation-scan marker gives this item a clean baseline to
+  measure against.
+
+### 5. Prototype stage-1B grouped-by-local-rank emission
 
 Hypothesis:
 
@@ -494,12 +596,16 @@ Discard gate:
 - discard immediately if Japan repeats the earlier pattern:
   lower write-call count but slower stage 1 or slower total stage 1+2
 
-Why this is third:
+Why this is fifth:
 
 - it still attacks the biggest open planet phase
-- but it is riskier than items 1 and 2
+- but it is riskier than items 1–4
+- the batching variant (per-blob per-bucket staging) was tried and
+  regressed +30 % on Europe stage 1 — see the measured-and-shelved
+  entry for that failure; this item is the surviving grouped-emission
+  direction, not the batching direction
 
-### 4. Compressed-output rail: writer/compression first
+### 6. Compressed-output rail: writer/compression first
 
 This is a conditional branch, not the default-path mainline.
 
@@ -518,7 +624,7 @@ Important scope rule:
 - If the real workload is `compression:none`, skip this section entirely and
   stay on the default-path rail.
 
-#### 4a. One planet `zstd:1` characterization run
+#### 6a. One planet `zstd:1` characterization run
 
 Hypothesis:
 
@@ -541,13 +647,13 @@ Metrics:
 Keep gate:
 
 - if `zstd:1` gives a clear planet win for the actual internal pipeline use
-  case, record it as an operational recommendation and then consider 4b
+  case, record it as an operational recommendation and then consider 6b
 
 Discard gate:
 
 - if planet `zstd:1` is flat, stop the compression rail there
 
-#### 4b. Stage-4 decode-worker balance under compressed output
+#### 6b. Stage-4 decode-worker balance under compressed output
 
 Hypothesis:
 
@@ -586,7 +692,7 @@ Why this stays conditional:
 
 - it tunes a compression-bound path, not the universal default path
 
-### 5. `io_uring` preads, staged and gated
+### 7. `io_uring` preads, staged and gated
 
 Hypothesis:
 
@@ -638,13 +744,13 @@ Discard gate:
 - if stage-4-only is flat on Europe, stop there
 - do not extend a flat stage-4 prototype into stage 2
 
-Why this is fifth:
+Why this is seventh:
 
 - it is system-specific and higher effort
 - it needs Europe to answer it
 - there is no reason to pay this cost before current-architecture CPU work
 
-### 6. Shared header-scan / blob-metadata sidecar
+### 8. Shared header-scan / blob-metadata sidecar
 
 Hypothesis:
 
@@ -706,7 +812,8 @@ Current code:
   parses `PrimitiveBlock`s
 
 This is only worth revisiting if explicit measurement shows it above the noise
-floor. It is probably too small to matter before the six items above.
+floor. It is probably too small to matter before the eight items above, and
+item 0's relation-scan marker gives it a baseline when revisited.
 
 Smallest meaningful dataset:
 
@@ -715,6 +822,17 @@ Smallest meaningful dataset:
 Keep gate:
 
 - only if explicit timing shows `> 5s` wall
+
+### Node-blob double-decode across stage 2 and stage 4
+
+Stage 2 decodes the kept node-blob set to populate bucket-local `coord_slice`;
+stage 4 decodes the same kept node blobs again on the non-way path. Real
+cumulative planet work: `s2_node_decompress_ms = 192356`, plus stage 4
+processing all `32835 / 32835` node blobs again. Fusing is architecturally
+awkward — stage 2 is rank-bucket ordered while stage 4 is file-ordered and
+consumer/writer-bound. Kept visible as a deferred structural item; not a
+next-sprint candidate. Item 4 (wire-format DenseNodes filter) reduces stage
+4's side of this cost without cross-stage fusion.
 
 ### Generic writer/compression throughput work
 
@@ -740,17 +858,26 @@ Do not spend more time on these until a precondition changes:
 
 The next sensible batching is:
 
-1. instrumentation refresh
-2. bucket-count tunable + Japan sweep
-3. if that is flat, move immediately to the stage-2 hot-loop batch
-4. only then pay for Europe again on the default path
-5. only branch into the compressed-output rail if compressed-output wall
-   actually matters for the target workload
+1. instrumentation refresh (the relation-scan marker is the only
+   outstanding piece; the rest is already in tree)
+2. bucket-count tunable + Japan sweep (item 1)
+3. slot-bucket record shrink (item 2) — independent scratch win, runs on
+   the bucket-sweep winner (or at 256 if item 1 is flat)
+4. if that cluster is flat, move to the stage-2 hot-loop batch (item 3)
+5. only then pay for Europe again on the default path
+6. stage-4 wire-format DenseNodes filter (item 4) is the next
+   stage-local opportunity; schedule it once the Europe baseline from
+   step 5 exists
+7. only branch into the compressed-output rail (item 6) if
+   compressed-output wall actually matters for the target workload
 
 After that:
 
-- if one of those two branches wins on Europe, planet becomes worth paying for
-- if both are flat, move to the grouped-by-local-rank prototype
+- if any of items 1–4 win on Europe, planet becomes worth paying for
+- if all four are flat, move to the grouped-by-local-rank prototype
+  (item 5)
+- item 7 (`io_uring`) and item 8 (header-scan sidecar) stay deferred
+  behind the CPU-local work
 
 That gives one Europe gate per cluster, not one Europe gate per commit.
 
@@ -836,7 +963,7 @@ Any ALTW external prototype preserves these or explicitly replaces them:
   `--hotpath` profiles. New stage functions carry it.
 - **Env-var-gated prototype.** `stage23_epoch.rs` was the reference shape:
   parallel file, gated in `mod.rs` by env var check, one-commit delete on
-  shelving. Use for any item behind a dev flag (items 1, 3, 4b, 5).
+  shelving. Use for any item behind a dev flag (items 1, 4, 5, 6b).
 - **Worker count convention.** `available_parallelism() - 2 max 1 min 4`,
   often `.min(6)`. The `-2` reserves cores for the consumer + writer threads.
   Any tuning that changes this justifies why.

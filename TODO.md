@@ -559,6 +559,28 @@ single-pass, tag expression and bbox filtering.
     change worth measuring; do not trust desk estimates without a
     bench. Effort: medium. (External review 2026-04-14 #2 hypothetical.)
 
+    2026-04-15 status: the first implementation was tried and is not
+    bankable in its current form. Europe runs on the local-set branch
+    (`957a4c84`, `624ff859`) pushed stage-1 peak anon to ~29 GB and
+    showed extreme chunk duplication:
+    `s1a_idset_local_chunks=8932` vs
+    `s1a_idset_final_chunks=406`. That is not a "needs tuning"
+    result; the current design materially duplicates dense-chunk
+    ownership across workers and contaminates all later benches with
+    stage-1 RSS/fault noise. Revert/shelve the current implementation
+    before evaluating other large ALTW changes.
+
+    If this idea is revisited later, it likely needs a materially
+    different shape, not an incremental tweak to the current one.
+    Plausible directions:
+    - partition pass-A work so workers touch less-overlapping ID
+      ranges, reducing duplicated local chunks before merge
+    - use a different local representation than full dense chunk
+      ownership (for example something sparse/chunk-indexed) and only
+      densify at merge time
+    - revisit after larger upstream pipeline changes alter the access
+      pattern enough that local dense ownership is less overlapping
+
   **Still open — dev convenience:**
 
   - [ ] ~~Serialize `IdSetDense` for `--start-stage` resume.~~

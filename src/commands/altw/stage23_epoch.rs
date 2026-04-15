@@ -170,6 +170,21 @@ fn update_peak(peak: &AtomicU64, value: u64) {
     }
 }
 
+/// Read current RSS in bytes from `/proc/self/statm`.
+/// Returns 0 on failure or non-Linux-like environments.
+fn read_rss_bytes() -> u64 {
+    let Ok(statm) = std::fs::read_to_string("/proc/self/statm") else {
+        return 0;
+    };
+    let Some(resident_str) = statm.split_whitespace().nth(1) else {
+        return 0;
+    };
+    let Ok(pages) = resident_str.parse::<u64>() else {
+        return 0;
+    };
+    pages.saturating_mul(4096)
+}
+
 fn num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -225,6 +240,65 @@ fn epoch_scatter_bytes(scatter_bufs: &[Mutex<Box<[u8]>>]) -> u64 {
         total += g.len() as u64;
     }
     total
+}
+
+fn worker_tmp_manifest_live_bytes(worker_tmps: &[WorkerTmpState]) -> u64 {
+    worker_tmps
+        .iter()
+        .map(|w| (w.manifest.capacity() * std::mem::size_of::<ManifestEntry>()) as u64)
+        .sum()
+}
+
+fn worker_tmp_metadata_bytes(worker_tmps: &[WorkerTmpState]) -> u64 {
+    worker_tmps
+        .iter()
+        .map(|w| {
+            w.path.capacity() as u64
+                + (std::mem::size_of::<WorkerTmpState>() as u64)
+                - (std::mem::size_of::<PathBuf>() as u64)
+                - (std::mem::size_of::<Vec<ManifestEntry>>() as u64)
+        })
+        .sum()
+}
+
+fn manifest_vec_bytes(manifests: &[Vec<ManifestEntry>]) -> u64 {
+    manifests
+        .iter()
+        .map(|m| (m.capacity() * std::mem::size_of::<ManifestEntry>()) as u64)
+        .sum()
+}
+
+fn emit_memory_snapshot(
+    prefix: &str,
+    scatter_bufs: Option<&[Mutex<Box<[u8]>>]>,
+    worker_tmps: Option<&[WorkerTmpState]>,
+    worker_manifests: Option<&[Vec<ManifestEntry>]>,
+) {
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter(&format!("{prefix}_rss_bytes"), read_rss_bytes() as i64);
+        crate::debug::emit_counter(
+            &format!("{prefix}_scatter_live_bytes"),
+            scatter_bufs.map(epoch_scatter_bytes).unwrap_or(0) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_worker_tmp_manifest_live_bytes"),
+            worker_tmps
+                .map(worker_tmp_manifest_live_bytes)
+                .unwrap_or(0) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_worker_tmp_metadata_bytes"),
+            worker_tmps
+                .map(worker_tmp_metadata_bytes)
+                .unwrap_or(0) as i64,
+        );
+        crate::debug::emit_counter(
+            &format!("{prefix}_worker_manifests_live_bytes"),
+            worker_manifests.map(manifest_vec_bytes).unwrap_or(0) as i64,
+        );
+    }
+    crate::debug::emit_mallinfo2(prefix);
 }
 
 #[hotpath::measure]
@@ -341,6 +415,12 @@ pub(super) fn stage23_epoch_fused(
     )?;
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_PRODUCER_END");
     total_resolved += ep0_resolved;
+    emit_memory_snapshot(
+        "s23epoch_epoch0_after_producer",
+        Some(&epoch0_scatter_bufs),
+        Some(&worker_tmps),
+        None,
+    );
 
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_EMIT_START");
     run_epoch_emit(
@@ -354,7 +434,14 @@ pub(super) fn stage23_epoch_fused(
         &s23epoch_emit_worker_peak_bytes,
     )?;
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_EMIT_END");
+    emit_memory_snapshot(
+        "s23epoch_epoch0_after_emit",
+        Some(&epoch0_scatter_bufs),
+        Some(&worker_tmps),
+        None,
+    );
     drop(epoch0_scatter_bufs);
+    emit_memory_snapshot("s23epoch_epoch0_after_drop", None, Some(&worker_tmps), None);
 
     // ------------------------------------------------------------------
     // Epochs 1..N-1: drain spill -> scatter -> emit
@@ -385,6 +472,12 @@ pub(super) fn stage23_epoch_fused(
             &s23epoch_drain_local_buf_peak_bytes,
         )?;
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_DRAIN_END"));
+        emit_memory_snapshot(
+            &format!("s23epoch_epoch{epoch_idx}_after_drain"),
+            Some(&scatter_bufs),
+            Some(&worker_tmps),
+            None,
+        );
 
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_EMIT_START"));
         run_epoch_emit(
@@ -398,7 +491,19 @@ pub(super) fn stage23_epoch_fused(
             &s23epoch_emit_worker_peak_bytes,
         )?;
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_EMIT_END"));
+        emit_memory_snapshot(
+            &format!("s23epoch_epoch{epoch_idx}_after_emit"),
+            Some(&scatter_bufs),
+            Some(&worker_tmps),
+            None,
+        );
         drop(scatter_bufs);
+        emit_memory_snapshot(
+            &format!("s23epoch_epoch{epoch_idx}_after_drop"),
+            None,
+            Some(&worker_tmps),
+            None,
+        );
     }
 
     // Spill cleanup. (mod.rs handles rank-shard cleanup for the disk path
@@ -409,6 +514,14 @@ pub(super) fn stage23_epoch_fused(
             drop(std::fs::remove_file(&p));
         }
     }
+    emit_memory_snapshot("s23epoch_after_spill_cleanup", None, Some(&worker_tmps), None);
+
+    emit_memory_snapshot(
+        "s23epoch_before_manifest_collect",
+        None,
+        Some(&worker_tmps),
+        None,
+    );
 
     let worker_manifests: Vec<Vec<ManifestEntry>> = worker_tmps
         .into_iter()
@@ -418,6 +531,12 @@ pub(super) fn stage23_epoch_fused(
             w.manifest
         })
         .collect();
+    emit_memory_snapshot(
+        "s23epoch_after_manifest_collect",
+        None,
+        None,
+        Some(&worker_manifests),
+    );
 
     #[allow(clippy::cast_possible_wrap)]
     {

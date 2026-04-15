@@ -200,8 +200,8 @@ pub fn external_join(
     let mut manifest_resolved_count: Option<u64> = None;
 
     // Stage 1 hand-off: total_slots, unique_nodes, rank_bucket_counts,
-    // num_shard_workers, the live IdSetDense (kept alive through stage 2
-    // for inline coord resolution), and the per-blob rank mapping.
+    // num_shard_workers, and optionally the live IdSetDense + per-blob
+    // rank mapping when this invocation will run stage 2.
     let stage1_out: Stage1Output = if start >= 2 {
         let manifest = std::fs::read(&manifest_path)
             .map_err(|e| format!("read manifest for --start-stage: {e}. Run with --keep-scratch first."))?;
@@ -243,28 +243,36 @@ pub fn external_join(
             }
         }
 
-        // Stage 2 needs the IdSetDense for inline node-blob coord
-        // resolution, but the prior keep-scratch run dropped it after
-        // stage 1. Rebuild it by re-running pass A — the only stage-1
-        // work that produces the set. Pass B's per-worker rank shard
-        // files are already on disk and are not regenerated.
-        eprintln!(
-            "[altw] --start-stage {start}: rebuilding IdSetDense via pass A re-scan \
-             (prior keep-scratch run dropped it; needed for inline stage 2 coord lookup)"
-        );
-        let schedule = build_way_schedule(input)?;
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get().saturating_sub(2).max(1))
-            .unwrap_or(4);
-        let (_total_refs, node_id_set) = stage1_pass_a(
-            input,
-            &schedule,
-            num_workers,
-            &ref_count_sidecar,
-            &per_way_refcount_sidecar,
-        )?;
-        let unique_nodes = node_id_set.total_count();
-        let node_blob_mapping = build_node_blob_mapping(input, &node_id_set)?;
+        let mut node_id_set = None;
+        let mut node_blob_mapping = None;
+        let unique_nodes = if start <= 2 {
+            // Stage 2 needs the IdSetDense for inline node-blob coord
+            // resolution, but the prior keep-scratch run dropped it after
+            // stage 1. Rebuild it by re-running pass A — the only stage-1
+            // work that produces the set. Pass B's per-worker rank shard
+            // files are already on disk and are not regenerated.
+            eprintln!(
+                "[altw] --start-stage {start}: rebuilding IdSetDense via pass A re-scan \
+                 (prior keep-scratch run dropped it; needed for inline stage 2 coord lookup)"
+            );
+            let schedule = build_way_schedule(input)?;
+            let num_workers = std::thread::available_parallelism()
+                .map(|n| n.get().saturating_sub(2).max(1))
+                .unwrap_or(4);
+            let (_total_refs, rebuilt_set) = stage1_pass_a(
+                input,
+                &schedule,
+                num_workers,
+                &ref_count_sidecar,
+                &per_way_refcount_sidecar,
+            )?;
+            let rebuilt_unique_nodes = rebuilt_set.total_count();
+            node_blob_mapping = Some(build_node_blob_mapping(input, &rebuilt_set)?);
+            node_id_set = Some(rebuilt_set);
+            rebuilt_unique_nodes
+        } else {
+            _manifest_unique_nodes
+        };
 
         Stage1Output {
             total_slots,
@@ -307,8 +315,8 @@ pub fn external_join(
     let unique_nodes = stage1_out.unique_nodes;
     let rank_bucket_counts = stage1_out.rank_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
-    let node_id_set = stage1_out.node_id_set;
-    let node_blob_mapping = stage1_out.node_blob_mapping;
+    let mut node_id_set = stage1_out.node_id_set;
+    let mut node_blob_mapping = stage1_out.node_blob_mapping;
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
     // every bucket can fit at least one full blob's slot range. This
@@ -369,8 +377,8 @@ pub fn external_join(
             total_slots,
             unique_nodes,
             input_pbf,
-            &node_id_set,
-            &node_blob_mapping,
+            node_id_set.as_ref().expect("stage 2 missing IdSetDense"),
+            node_blob_mapping.as_deref().expect("stage 2 missing node-blob mapping"),
         )?;
         stage2_resolved_count = Some(resolved_count);
         slot_buckets.finish()?;
@@ -405,8 +413,8 @@ pub fn external_join(
 
     // Free the IdSetDense (~2 GB RSS at planet) and the per-blob mapping
     // — both were stage 2 inputs only, nothing downstream reads them.
-    drop(node_id_set);
-    drop(node_blob_mapping);
+    drop(node_id_set.take());
+    drop(node_blob_mapping.take());
 
     // Prepare integrated coord_payloads artifacts before stage 3.
     let coord_payloads_path = scratch_dir.file_path("coord_payloads");

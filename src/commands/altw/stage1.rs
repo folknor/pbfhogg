@@ -24,14 +24,15 @@ pub(super) struct WayBlobTask {
 
 /// Stage 1 output handed to stage 2. Owns the `IdSetDense` (kept alive
 /// because stage 2 needs `rank_if_set` for inline node-blob coord
-/// resolution) and the per-blob rank mapping.
+/// resolution) and the per-blob rank mapping. Resume paths that skip
+/// stage 2 leave these as `None`.
 pub(super) struct Stage1Output {
     pub total_slots: u64,
     pub unique_nodes: u64,
     pub rank_bucket_counts: Vec<u64>,
     pub num_shard_workers: usize,
-    pub node_id_set: IdSetDense,
-    pub node_blob_mapping: Vec<NodeBlobInfo>,
+    pub node_id_set: Option<IdSetDense>,
+    pub node_blob_mapping: Option<Vec<NodeBlobInfo>>,
 }
 
 /// Build the way-blob schedule via header-only scan.
@@ -610,7 +611,7 @@ pub(super) fn stage1_way_pass(
         unique_nodes: unique_nodes_u64,
         rank_bucket_counts: merged_counts,
         num_shard_workers: num_actual_workers,
-        node_id_set,
-        node_blob_mapping,
+        node_id_set: Some(node_id_set),
+        node_blob_mapping: Some(node_blob_mapping),
     })
 }

@@ -35,20 +35,22 @@ pub(crate) struct NodeTuple {
     pub lon: i32,
 }
 
-/// Extract (id, lat, lon) tuples from decompressed PrimitiveBlock bytes.
-///
-/// Zero heap allocations per block — reads wire format inline, appends to caller's Vec.
-/// The caller owns the Vec and can clear+reuse it across blocks.
-///
-/// Only parses DenseNodes (field 2 in PrimitiveGroup). Non-dense Node messages
-/// (field 1) are skipped — all modern PBFs use dense encoding exclusively.
+#[derive(Clone, Copy)]
+pub(crate) struct DenseNodeScanMeta {
+    pub granularity: i64,
+    pub lat_offset: i64,
+    pub lon_offset: i64,
+}
+
+/// Scan PrimitiveBlock metadata and collect PrimitiveGroup byte ranges that
+/// may contain DenseNodes. Returns the block-level coordinate metadata needed
+/// to decode the delta streams later.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-pub(crate) fn extract_node_tuples(
+pub(crate) fn scan_dense_group_ranges(
     decompressed: &[u8],
-    out: &mut Vec<NodeTuple>,
     group_starts: &mut Vec<(usize, usize)>,
-) -> Result<()> {
-    use crate::read::wire::{Cursor, WireDenseNodes, PackedSint64Iter, WIRE_LEN, WIRE_VARINT};
+) -> Result<DenseNodeScanMeta> {
+    use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
 
     let buffer = decompressed;
     let mut cursor = Cursor::new(buffer);
@@ -72,7 +74,30 @@ pub(crate) fn extract_node_tuples(
         }
     }
 
-    for &(off, len) in group_starts.iter() {
+    Ok(DenseNodeScanMeta {
+        granularity,
+        lat_offset,
+        lon_offset,
+    })
+}
+
+/// Visit `(id, lat, lon)` tuples from DenseNodes groups without
+/// materializing a `Vec<NodeTuple>`.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub(crate) fn visit_dense_node_tuples<F>(
+    decompressed: &[u8],
+    group_starts: &[(usize, usize)],
+    meta: DenseNodeScanMeta,
+    mut visit: F,
+) -> Result<()>
+where
+    F: FnMut(i64, i32, i32),
+{
+    use crate::read::wire::{Cursor, PackedSint64Iter, WireDenseNodes, WIRE_LEN};
+
+    let buffer = decompressed;
+
+    for &(off, len) in group_starts {
         let group_data = &buffer[off..off + len];
         let mut gcursor = Cursor::new(group_data);
         let mut dense_data: Option<&[u8]> = None;
@@ -98,13 +123,33 @@ pub(crate) fn extract_node_tuples(
             cum_id += did;
             cum_lat += dlat;
             cum_lon += dlon;
-            out.push(NodeTuple {
-                id: cum_id,
-                lat: ((lat_offset + granularity * cum_lat) / 100) as i32,
-                lon: ((lon_offset + granularity * cum_lon) / 100) as i32,
-            });
+            visit(
+                cum_id,
+                ((meta.lat_offset + meta.granularity * cum_lat) / 100) as i32,
+                ((meta.lon_offset + meta.granularity * cum_lon) / 100) as i32,
+            );
         }
     }
 
     Ok(())
+}
+
+/// Extract (id, lat, lon) tuples from decompressed PrimitiveBlock bytes.
+///
+/// Zero heap allocations per block — reads wire format inline, appends to caller's Vec.
+/// The caller owns the Vec and can clear+reuse it across blocks.
+///
+/// Only parses DenseNodes (field 2 in PrimitiveGroup). Non-dense Node messages
+/// (field 1) are skipped — all modern PBFs use dense encoding exclusively.
+#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+pub(crate) fn extract_node_tuples(
+    decompressed: &[u8],
+    out: &mut Vec<NodeTuple>,
+    group_starts: &mut Vec<(usize, usize)>,
+) -> Result<()> {
+    out.clear();
+    let meta = scan_dense_group_ranges(decompressed, group_starts)?;
+    visit_dense_node_tuples(decompressed, group_starts, meta, |id, lat, lon| {
+        out.push(NodeTuple { id, lat, lon });
+    })
 }

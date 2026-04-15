@@ -246,6 +246,33 @@ Discard gate:
 - counting-sort or scatter regresses materially on Japan
 - Denmark MD5 parity fails
 
+Result:
+
+- Kept on `main` in `fcd4fa2`.
+- UUIDs:
+  - Denmark: `d285275e`
+  - Japan: `a065f776`
+  - Europe: `e03dff10`
+- Japan:
+  - `s2_slot_bytes_written`: `5.66 GB -> 4.25 GB` (`-25%`)
+  - `s3_bytes_read`: `5.66 GB -> 4.25 GB` (`-25%`)
+  - `EXTJOIN_STAGE2 + EXTJOIN_STAGE3 + COORD_PAYLOADS_FINALIZE`:
+    `9116ms -> 8529ms` (`-6.4%`)
+- Europe:
+  - `s2_slot_bytes_written`: `75.04 GB -> 56.28 GB` (`-25%`)
+  - `s3_bytes_read`: `75.04 GB -> 56.28 GB` (`-25%`)
+  - `EXTJOIN_STAGE2 + EXTJOIN_STAGE3` stayed flat-to-slightly-better:
+    `134.185s -> 134.158s`
+  - including finalize, the slice moved `152.011s -> 152.921s`
+    (`+0.6%`), still within the item's keep gate
+- Fault signal:
+  - Europe total major faults improved materially overall
+    (`378,816 -> 249,097`, `-34%`)
+  - the strongest win was in stage 4 majors
+    (`122,545 -> 9,353`), suggesting less downstream page-cache /
+    scratch pressure even though total wall stayed dominated elsewhere
+  - total minor faults were roughly flat
+
 Why this is second:
 
 - Narrow blast radius, clear signal, prior art in-repo.

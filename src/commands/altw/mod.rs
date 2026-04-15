@@ -29,6 +29,7 @@ use super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::{require_indexdata, HeaderOverrides, Result};
 
 mod blob_bucket_index;
+mod blob_meta;
 mod coord_payloads;
 mod stage1;
 mod stage2;
@@ -188,12 +189,27 @@ pub fn external_join(
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
 
+    crate::debug::emit_marker("EXTJOIN_META_SCAN_START");
+    let t_meta = std::time::Instant::now();
+    let blob_meta = blob_meta::scan_blob_metadata(input, !keep_untagged_nodes)?;
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    {
+        crate::debug::emit_counter("extjoin_meta_scan_ms", t_meta.elapsed().as_millis() as i64);
+        crate::debug::emit_counter("extjoin_meta_blobs", blob_meta.len() as i64);
+        crate::debug::emit_counter(
+            "extjoin_meta_tag_scan_enabled",
+            if keep_untagged_nodes { 0 } else { 1 },
+        );
+    }
+    crate::debug::emit_marker("EXTJOIN_META_SCAN_END");
+
     // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
     // num_shard_workers, the live IdSetDense (kept alive through stage 2
     // for inline coord resolution), and the per-blob rank mapping.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
     let stage1_out = stage1_way_pass(
+        &blob_meta,
         input,
         direct_io,
         &scratch_dir,
@@ -409,6 +425,7 @@ pub fn external_join(
     let mut stats = stage4_assembly(
         input,
         output,
+        &blob_meta,
         &coord_payloads_reader,
         &stage4_per_way_rcs,
         way_slot_starts.as_slice(),

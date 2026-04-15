@@ -13,6 +13,7 @@ use std::path::Path;
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::super::id_set_dense::IdSetDense;
 use super::super::Result;
+use super::blob_meta::BlobMeta;
 use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
 
 /// Way-blob schedule entry for the parallel way scans.
@@ -34,23 +35,21 @@ pub(super) struct Stage1Output {
     pub node_blob_mapping: Vec<NodeBlobInfo>,
 }
 
-/// Build the way-blob schedule via header-only scan.
-pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
+/// Build the way-blob schedule from the shared blob metadata scan.
+pub(super) fn build_way_schedule(blob_meta: &[BlobMeta]) -> Result<Vec<WayBlobTask>> {
     crate::debug::emit_marker("EXTJOIN_S1_WAY_SCHEDULE_START");
     let t0 = std::time::Instant::now();
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let mut schedule: Vec<WayBlobTask> = Vec::new();
     let mut seq: u32 = 0;
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, _, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(idx) = hdr.index() {
-            if !matches!(idx.kind, crate::blob_index::ElemKind::Way) { continue; }
+    for meta in blob_meta {
+        if !matches!(meta.kind, crate::blob_index::ElemKind::Way) {
+            continue;
         }
-        schedule.push(WayBlobTask { seq, data_offset, data_size });
+        schedule.push(WayBlobTask {
+            seq,
+            data_offset: meta.data_offset,
+            data_size: meta.data_size,
+        });
         seq += 1;
     }
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -248,44 +247,27 @@ pub(super) fn stage1_pass_a(
 /// and monotonic in rank because the input PBF is sorted by node ID.
 #[hotpath::measure]
 pub(super) fn build_node_blob_mapping(
-    input: &Path,
+    blob_meta: &[BlobMeta],
     node_id_set: &IdSetDense,
 ) -> Result<Vec<NodeBlobInfo>> {
     crate::debug::emit_marker("EXTJOIN_S1_NODE_MAP_START");
     let t0 = std::time::Instant::now();
 
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-
     let mut mapping: Vec<NodeBlobInfo> = Vec::new();
-    let mut blobs_without_indexdata: u64 = 0;
     let mut blobs_with_zero_refs: u64 = 0;
 
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (hdr, _, data_offset, data_size) = result?;
-        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        let idx = match hdr.index() {
-            Some(i) if matches!(i.kind, crate::blob_index::ElemKind::Node) => i,
-            Some(_) => continue,
-            None => {
-                // No indexdata. External join requires it, so this is a hard
-                // error (caller already enforces require_indexdata, but stay
-                // defensive).
-                blobs_without_indexdata += 1;
-                continue;
-            }
-        };
-
+    for meta in blob_meta {
+        if !matches!(meta.kind, crate::blob_index::ElemKind::Node) {
+            continue;
+        }
         // count_below() is the safe variant of rank() that handles IDs past
         // the highest allocated chunk (which can happen when a node blob's
         // max_id sits in a chunk that contains no referenced nodes — rank()
         // would panic on the chunks[] index). Returns count of set IDs
         // strictly less than the argument, so this yields the half-open
         // referenced-rank range over [min_id, max_id].
-        let ref_rank_start = node_id_set.count_below(idx.min_id);
-        let ref_rank_end = match idx.max_id.checked_add(1) {
+        let ref_rank_start = node_id_set.count_below(meta.min_id);
+        let ref_rank_end = match meta.max_id.checked_add(1) {
             Some(v) => node_id_set.count_below(v),
             None => node_id_set.total_count(),
         };
@@ -293,17 +275,11 @@ pub(super) fn build_node_blob_mapping(
             blobs_with_zero_refs += 1;
         }
         mapping.push(NodeBlobInfo {
-            data_offset,
-            data_size,
+            data_offset: meta.data_offset,
+            data_size: meta.data_size,
             ref_rank_start,
             ref_rank_end,
         });
-    }
-
-    if blobs_without_indexdata > 0 {
-        return Err(format!(
-            "external join: {blobs_without_indexdata} node blob(s) missing indexdata"
-        ).into());
     }
 
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -333,6 +309,7 @@ pub(super) fn build_node_blob_mapping(
 #[hotpath::measure]
 #[allow(clippy::too_many_lines)]
 pub(super) fn stage1_way_pass(
+    blob_meta: &[BlobMeta],
     input: &Path,
     _direct_io: bool,
     scratch: &ScratchDir,
@@ -341,7 +318,7 @@ pub(super) fn stage1_way_pass(
 ) -> Result<Stage1Output> {
     use std::os::unix::fs::FileExt as _;
 
-    let schedule = build_way_schedule(input)?;
+    let schedule = build_way_schedule(blob_meta)?;
 
     let num_workers = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -575,7 +552,7 @@ pub(super) fn stage1_way_pass(
 
     // Build the per-blob rank mapping (header-only walk + rank queries —
     // no decompression).
-    let node_blob_mapping = build_node_blob_mapping(input, &node_id_set)?;
+    let node_blob_mapping = build_node_blob_mapping(blob_meta, &node_id_set)?;
 
     Ok(Stage1Output {
         total_slots: total_refs,

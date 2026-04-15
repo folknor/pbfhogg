@@ -19,6 +19,7 @@ use super::super::{
     flush_local, HeaderOverrides, Result, writer_from_header,
 };
 
+use super::blob_meta::BlobMeta;
 use super::COORD_SLOT_SIZE;
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
@@ -104,6 +105,7 @@ pub(super) fn load_ref_count_sidecar(path: &Path, total_slots: u64) -> Result<Ve
 pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
+    blob_meta: &[BlobMeta],
     coord_payloads_reader: &super::coord_payloads::CoordPayloadsReader,
     per_way_rcs: &super::coord_payloads::PerWayRcs,
     way_slot_starts: &[u64],
@@ -114,19 +116,9 @@ pub(super) fn stage4_assembly(
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
-    // Header-only pre-scan: build the blob schedule.
+    // Build the blob schedule from the shared metadata scan.
     crate::debug::emit_marker("EXTJOIN_S4_SCHEDULE_START");
     let t_schedule = std::time::Instant::now();
-    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
-    scanner.set_parse_indexdata(true);
-    // Tagdata is only needed by the `!keep_untagged_nodes` per-blob
-    // filter below. When keep_untagged_nodes is set every node blob
-    // either passes through raw or stays wholesale, so we can skip the
-    // per-blob tag-index parse during the scan.
-    scanner.set_parse_tagdata(!keep_untagged_nodes);
-    // Skip OsmHeader.
-    scanner.next_header_skip_blob()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     // Also read the header for the writer (need a regular BlobReader for this).
     let mut header_reader = crate::blob::BlobReader::open(input, direct_io)?;
@@ -149,94 +141,73 @@ pub(super) fn stage4_assembly(
     let mut s4_way_blobs: u64 = 0;
     let mut s4_relation_blobs: u64 = 0;
 
-    while let Some(result) = scanner.next_header_with_data_offset() {
-        let (header_entry, frame_offset, data_offset, data_size) = result?;
-        if !matches!(header_entry.blob_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-
+    for meta in blob_meta {
         // Count blob types for diagnostics.
-        if let Some(idx) = header_entry.index() {
-            match idx.kind {
-                crate::blob_index::ElemKind::Node => s4_node_blobs_total += 1,
-                crate::blob_index::ElemKind::Way => s4_way_blobs += 1,
-                crate::blob_index::ElemKind::Relation => s4_relation_blobs += 1,
-            }
+        match meta.kind {
+            crate::blob_index::ElemKind::Node => s4_node_blobs_total += 1,
+            crate::blob_index::ElemKind::Way => s4_way_blobs += 1,
+            crate::blob_index::ElemKind::Relation => s4_relation_blobs += 1,
         }
 
         // P1b: skip node blobs with only untagged non-member nodes.
-        if !keep_untagged_nodes {
-            if let Some(idx) = header_entry.index() {
-                if matches!(idx.kind, crate::blob_index::ElemKind::Node) {
-                    let tag_index = header_entry.tag_index();
-                    let has_tagindex = tag_index.is_some();
-                    let has_tags = tag_index.is_none_or(|ti| !ti.keys_empty());
-                    if !has_tagindex {
-                        s4_node_blobs_no_tagindex += 1;
-                    } else if !has_tags {
-                        s4_node_blobs_empty_tags += 1;
-                    }
-                    if has_tags {
-                        s4_node_blobs_kept_by_tags += 1;
-                    } else {
-                        let has_members = relation_member_node_ids
-                            .is_some_and(|ids| ids.any_in_range(idx.min_id, idx.max_id));
-                        if has_members {
-                            s4_node_blobs_kept_by_members += 1;
-                        }
-                        if !has_members {
-                            skipped_node_blobs += 1;
-                            continue;
-                        }
-                    }
+        if !keep_untagged_nodes && matches!(meta.kind, crate::blob_index::ElemKind::Node) {
+            if !meta.has_tagindex {
+                s4_node_blobs_no_tagindex += 1;
+            } else if !meta.has_tags {
+                s4_node_blobs_empty_tags += 1;
+            }
+            if meta.has_tags {
+                s4_node_blobs_kept_by_tags += 1;
+            } else {
+                let has_members = relation_member_node_ids
+                    .is_some_and(|ids| ids.any_in_range(meta.min_id, meta.max_id));
+                if has_members {
+                    s4_node_blobs_kept_by_members += 1;
+                }
+                if !has_members {
+                    skipped_node_blobs += 1;
+                    continue;
                 }
             }
         }
 
         // Way blobs consume sidecar entries for slot_start.
-        let (slot_start, way_blob_idx) = if let Some(idx) = header_entry.index() {
-            if matches!(idx.kind, crate::blob_index::ElemKind::Way) {
-                if way_sidecar_idx >= way_slot_starts.len() {
-                    return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
-                }
-                let start = way_slot_starts[way_sidecar_idx];
-                let this_way_blob_idx = way_sidecar_idx;
-                way_sidecar_idx += 1;
-                (start, this_way_blob_idx)
-            } else {
-                (0, 0)
+        let (slot_start, way_blob_idx) = if matches!(meta.kind, crate::blob_index::ElemKind::Way) {
+            if way_sidecar_idx >= way_slot_starts.len() {
+                return Err("ref count sidecar has fewer entries than way blobs in PBF".into());
             }
+            let start = way_slot_starts[way_sidecar_idx];
+            let this_way_blob_idx = way_sidecar_idx;
+            way_sidecar_idx += 1;
+            (start, this_way_blob_idx)
         } else {
             (0, 0)
         };
 
-        let idx_entry = header_entry.index();
-        let kind = idx_entry.map(|i| i.kind);
-        let count = idx_entry.map_or(0, |i| i.count);
-        let is_way_blob = matches!(kind, Some(crate::blob_index::ElemKind::Way));
+        let is_way_blob = matches!(meta.kind, crate::blob_index::ElemKind::Way);
         // Passthrough eligibility mirrors the dense-path rule in
         // write_output_passthrough (add_locations_to_ways.rs):
         //   - Relation blobs: always.
         //   - Node blobs: only when keep_untagged_nodes is set (no
         //     per-element filtering needed; the blob is kept as-is).
         //   - Ways: never (they need coord_payloads splicing).
-        let is_passthrough = matches!(kind, Some(crate::blob_index::ElemKind::Relation))
-            || (matches!(kind, Some(crate::blob_index::ElemKind::Node)) && keep_untagged_nodes);
+        let is_passthrough = matches!(meta.kind, crate::blob_index::ElemKind::Relation)
+            || (matches!(meta.kind, crate::blob_index::ElemKind::Node) && keep_untagged_nodes);
 
         #[allow(clippy::cast_possible_truncation)]
-        let frame_size = (data_offset - frame_offset) as usize + data_size;
+        let frame_size = (meta.data_offset - meta.frame_offset) as usize + meta.data_size;
 
         schedule.push(BlobDescriptor {
             seq,
-            frame_offset,
+            frame_offset: meta.frame_offset,
             frame_size,
-            data_offset,
-            data_size,
+            data_offset: meta.data_offset,
+            data_size: meta.data_size,
             slot_start,
             is_way_blob,
             is_passthrough,
-            kind,
-            count,
+            kind: Some(meta.kind),
+            count: meta.count,
             way_blob_idx,
         });
         seq += 1;

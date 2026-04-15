@@ -40,6 +40,35 @@ impl IdSetDense {
         self.chunks.iter().filter(|chunk| chunk.is_some()).count()
     }
 
+    /// Approximate heap bytes currently owned by the chunk storage.
+    ///
+    /// Includes the outer `chunks` vec storage plus every allocated 4 MB
+    /// chunk. Does not include the rank index.
+    pub fn estimated_chunk_bytes(&self) -> u64 {
+        let outer = (self.chunks.capacity() * std::mem::size_of::<Option<Box<[u8; CHUNK_SIZE]>>>()) as u64;
+        let chunks = (self.allocated_chunk_count() * CHUNK_SIZE) as u64;
+        outer + chunks
+    }
+
+    /// Approximate heap bytes currently owned by the rank index.
+    ///
+    /// Includes the outer vecs plus every allocated per-chunk block-prefix vec.
+    /// Intended for telemetry / budgeting, not byte-perfect accounting.
+    pub fn estimated_rank_index_bytes(&self) -> u64 {
+        let mut total: u64 = 0;
+        if let Some(chunk_prefix) = &self.rank_chunk_prefix {
+            total += (chunk_prefix.capacity() * std::mem::size_of::<u64>()) as u64;
+        }
+        if let Some(block_prefix) = &self.rank_block_prefix {
+            total += (block_prefix.capacity()
+                * std::mem::size_of::<Option<Vec<u32>>>()) as u64;
+            for bp in block_prefix.iter().flatten() {
+                total += (bp.capacity() * std::mem::size_of::<u32>()) as u64;
+            }
+        }
+        total
+    }
+
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
         if id < 0 { return; } // Negative IDs are not valid OSM element IDs

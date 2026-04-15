@@ -155,6 +155,21 @@ struct WorkerTmpState {
 const FLUSH_THRESHOLD: usize = 256 * 1024;
 const SPILL_FLUSH_THRESHOLD: usize = 256 * 1024;
 
+fn update_peak(peak: &AtomicU64, value: u64) {
+    let mut current = peak.load(Ordering::Relaxed);
+    while value > current {
+        match peak.compare_exchange_weak(
+            current,
+            value,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
 fn num_workers() -> usize {
     std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
@@ -258,8 +273,43 @@ pub(super) fn stage23_epoch_fused(
     let s23epoch_spill_bytes_written = AtomicU64::new(0);
     let s23epoch_spill_bytes_read = AtomicU64::new(0);
     let s23epoch_active_scatter_peak_bytes = AtomicU64::new(0);
+    let s23epoch_known_idset_chunk_bytes = AtomicU64::new(0);
+    let s23epoch_known_idset_rank_bytes = AtomicU64::new(0);
+    let s23epoch_known_node_blob_mapping_bytes = AtomicU64::new(0);
+    let s23epoch_known_way_slot_starts_bytes = AtomicU64::new(0);
+    let s23epoch_known_per_way_rcs_bytes = AtomicU64::new(0);
+    let s23epoch_known_input_bytes = AtomicU64::new(0);
+    let s23epoch_epoch0_worker_peak_bytes = AtomicU64::new(0);
+    let s23epoch_epoch0_loader_peak_bytes = AtomicU64::new(0);
+    let s23epoch_epoch0_active_local_peak_bytes = AtomicU64::new(0);
+    let s23epoch_epoch0_spill_local_peak_bytes = AtomicU64::new(0);
+    let s23epoch_drain_worker_peak_bytes = AtomicU64::new(0);
+    let s23epoch_drain_local_buf_peak_bytes = AtomicU64::new(0);
+    let s23epoch_emit_worker_peak_bytes = AtomicU64::new(0);
+    let s23epoch_manifest_bytes = AtomicU64::new(0);
 
     let mut total_resolved: u64 = 0;
+
+    let idset_chunk_bytes = inputs.node_id_set.estimated_chunk_bytes();
+    let idset_rank_bytes = inputs.node_id_set.estimated_rank_index_bytes();
+    let node_blob_mapping_bytes =
+        (inputs.node_blob_mapping.len() * std::mem::size_of::<NodeBlobInfo>()) as u64;
+    let way_slot_starts_bytes =
+        (inputs.way_slot_starts.len() * std::mem::size_of::<u64>()) as u64;
+    let per_way_rcs_bytes = inputs.per_way_rcs.estimated_heap_bytes();
+    s23epoch_known_idset_chunk_bytes.store(idset_chunk_bytes, Ordering::Relaxed);
+    s23epoch_known_idset_rank_bytes.store(idset_rank_bytes, Ordering::Relaxed);
+    s23epoch_known_node_blob_mapping_bytes.store(node_blob_mapping_bytes, Ordering::Relaxed);
+    s23epoch_known_way_slot_starts_bytes.store(way_slot_starts_bytes, Ordering::Relaxed);
+    s23epoch_known_per_way_rcs_bytes.store(per_way_rcs_bytes, Ordering::Relaxed);
+    s23epoch_known_input_bytes.store(
+        idset_chunk_bytes
+            + idset_rank_bytes
+            + node_blob_mapping_bytes
+            + way_slot_starts_bytes
+            + per_way_rcs_bytes,
+        Ordering::Relaxed,
+    );
 
     // ------------------------------------------------------------------
     // Epoch 0: full stage-2 producer + scatter epoch 0 / spill epochs >0
@@ -273,18 +323,7 @@ pub(super) fn stage23_epoch_fused(
     );
     {
         let bytes = epoch_scatter_bytes(&epoch0_scatter_bufs);
-        let mut current = s23epoch_active_scatter_peak_bytes.load(Ordering::Relaxed);
-        while bytes > current {
-            match s23epoch_active_scatter_peak_bytes.compare_exchange_weak(
-                current,
-                bytes,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        update_peak(&s23epoch_active_scatter_peak_bytes, bytes);
     }
 
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_PRODUCER_START");
@@ -295,6 +334,10 @@ pub(super) fn stage23_epoch_fused(
         n_workers,
         &epoch0_scatter_bufs,
         &s23epoch_spill_bytes_written,
+        &s23epoch_epoch0_worker_peak_bytes,
+        &s23epoch_epoch0_loader_peak_bytes,
+        &s23epoch_epoch0_active_local_peak_bytes,
+        &s23epoch_epoch0_spill_local_peak_bytes,
     )?;
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_PRODUCER_END");
     total_resolved += ep0_resolved;
@@ -308,6 +351,7 @@ pub(super) fn stage23_epoch_fused(
         &mut worker_tmps,
         &fully_contained_emitted,
         n_workers,
+        &s23epoch_emit_worker_peak_bytes,
     )?;
     crate::debug::emit_marker("EXTJOIN_S23EPOCH_EPOCH0_EMIT_END");
     drop(epoch0_scatter_bufs);
@@ -325,18 +369,7 @@ pub(super) fn stage23_epoch_fused(
         );
         {
             let bytes = epoch_scatter_bytes(&scatter_bufs);
-            let mut current = s23epoch_active_scatter_peak_bytes.load(Ordering::Relaxed);
-            while bytes > current {
-                match s23epoch_active_scatter_peak_bytes.compare_exchange_weak(
-                    current,
-                    bytes,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => break,
-                    Err(actual) => current = actual,
-                }
-            }
+            update_peak(&s23epoch_active_scatter_peak_bytes, bytes);
         }
 
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_DRAIN_START"));
@@ -348,6 +381,8 @@ pub(super) fn stage23_epoch_fused(
             n_workers,
             n_tmps,
             &s23epoch_spill_bytes_read,
+            &s23epoch_drain_worker_peak_bytes,
+            &s23epoch_drain_local_buf_peak_bytes,
         )?;
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_DRAIN_END"));
 
@@ -360,6 +395,7 @@ pub(super) fn stage23_epoch_fused(
             &mut worker_tmps,
             &fully_contained_emitted,
             n_workers,
+            &s23epoch_emit_worker_peak_bytes,
         )?;
         crate::debug::emit_marker(&format!("EXTJOIN_S23EPOCH_EPOCH{epoch_idx}_EMIT_END"));
         drop(scatter_bufs);
@@ -376,7 +412,11 @@ pub(super) fn stage23_epoch_fused(
 
     let worker_manifests: Vec<Vec<ManifestEntry>> = worker_tmps
         .into_iter()
-        .map(|w| w.manifest)
+        .map(|w| {
+            let bytes = (w.manifest.capacity() * std::mem::size_of::<ManifestEntry>()) as u64;
+            s23epoch_manifest_bytes.fetch_add(bytes, Ordering::Relaxed);
+            w.manifest
+        })
         .collect();
 
     #[allow(clippy::cast_possible_wrap)]
@@ -392,6 +432,62 @@ pub(super) fn stage23_epoch_fused(
         crate::debug::emit_counter(
             "s23epoch_active_scatter_peak_bytes",
             s23epoch_active_scatter_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_idset_chunk_bytes",
+            s23epoch_known_idset_chunk_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_idset_rank_bytes",
+            s23epoch_known_idset_rank_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_node_blob_mapping_bytes",
+            s23epoch_known_node_blob_mapping_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_way_slot_starts_bytes",
+            s23epoch_known_way_slot_starts_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_per_way_rcs_bytes",
+            s23epoch_known_per_way_rcs_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_known_input_bytes",
+            s23epoch_known_input_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_epoch0_worker_peak_bytes",
+            s23epoch_epoch0_worker_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_epoch0_loader_peak_bytes",
+            s23epoch_epoch0_loader_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_epoch0_active_local_peak_bytes",
+            s23epoch_epoch0_active_local_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_epoch0_spill_local_peak_bytes",
+            s23epoch_epoch0_spill_local_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_drain_worker_peak_bytes",
+            s23epoch_drain_worker_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_drain_local_buf_peak_bytes",
+            s23epoch_drain_local_buf_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_emit_worker_peak_bytes",
+            s23epoch_emit_worker_peak_bytes.load(Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "s23epoch_manifest_bytes",
+            s23epoch_manifest_bytes.load(Ordering::Relaxed) as i64,
         );
         crate::debug::emit_counter("s23epoch_resolved_count", total_resolved as i64);
     }
@@ -449,6 +545,10 @@ fn run_epoch0_producer(
     n_workers: usize,
     epoch0_scatter_bufs: &[Mutex<Box<[u8]>>],
     spill_bytes_written: &AtomicU64,
+    worker_peak_bytes: &AtomicU64,
+    loader_peak_bytes: &AtomicU64,
+    active_local_peak_bytes: &AtomicU64,
+    spill_local_peak_bytes: &AtomicU64,
 ) -> Result<u64> {
     let num_epochs = epoch_ranges.len();
     let (epoch0_lo, _epoch0_hi) = epoch_ranges[0];
@@ -472,6 +572,10 @@ fn run_epoch0_producer(
     let bucket_epoch_ref = bucket_epoch;
     let scatter_bufs_ref = epoch0_scatter_bufs;
     let spill_bytes_ref = spill_bytes_written;
+    let worker_peak_ref = worker_peak_bytes;
+    let loader_peak_ref = loader_peak_bytes;
+    let active_local_peak_ref = active_local_peak_bytes;
+    let spill_local_peak_ref = spill_local_peak_bytes;
 
     std::thread::scope(|scope| {
         for worker_id in 0..n_workers {
@@ -528,6 +632,12 @@ fn run_epoch0_producer(
                             rank_range_size,
                             &mut loader,
                         )?;
+                        let loader_bytes = loader.data_buf.capacity() as u64
+                            + (loader.counts.capacity() * std::mem::size_of::<u64>()) as u64
+                            + (loader.write_pos.capacity() * std::mem::size_of::<u64>()) as u64
+                            + (bkt.grouped_slot_pos.capacity() * std::mem::size_of::<u64>()) as u64
+                            + (bkt.group_offsets.capacity() * std::mem::size_of::<u64>()) as u64;
+                        update_peak(loader_peak_ref, loader_bytes);
                         let slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
                         coord_slice[..slice_bytes].fill(0);
                         let bucket_rank_start = bkt.bucket_rank_start;
@@ -654,6 +764,32 @@ fn run_epoch0_producer(
                             }
                         }
 
+                        let active_local_bytes = active_local_bufs
+                            .iter()
+                            .map(|b| b.capacity() as u64)
+                            .sum::<u64>();
+                        let spill_local_bytes = spill_local_bufs
+                            .iter()
+                            .map(|b| b.capacity() as u64)
+                            .sum::<u64>();
+                        update_peak(active_local_peak_ref, active_local_bytes);
+                        update_peak(spill_local_peak_ref, spill_local_bytes);
+                        let spill_writer_buf_bytes = spill_writers
+                            .iter()
+                            .filter(|w| w.is_some())
+                            .count() as u64
+                            * 256
+                            * 1024;
+                        let worker_bytes = loader_bytes
+                            + coord_slice.capacity() as u64
+                            + node_read_buf.capacity() as u64
+                            + node_decompress_buf.capacity() as u64
+                            + (node_tuples.capacity() * std::mem::size_of::<NodeTuple>()) as u64
+                            + active_local_bytes
+                            + spill_local_bytes
+                            + spill_writer_buf_bytes;
+                        update_peak(worker_peak_ref, worker_bytes);
+
                         Ok(())
                     })();
 
@@ -765,6 +901,8 @@ fn run_epoch_drain(
     n_workers: usize,
     n_spill_files: usize,
     spill_bytes_read: &AtomicU64,
+    drain_worker_peak_bytes: &AtomicU64,
+    drain_local_buf_peak_bytes: &AtomicU64,
 ) -> Result<()> {
     let next_file = AtomicUsize::new(0);
     let drain_error: Mutex<Option<String>> = Mutex::new(None);
@@ -775,6 +913,8 @@ fn run_epoch_drain(
     let drain_error_ref = &drain_error;
     let scatter_bufs_ref = scatter_bufs;
     let local_count = scatter_bufs.len();
+    let drain_worker_peak_ref = drain_worker_peak_bytes;
+    let drain_local_buf_peak_ref = drain_local_buf_peak_bytes;
 
     // bucket_lo for this epoch, derived from the same formula as
     // compute_epoch_ranges. Caller already validated num_epochs > 0.
@@ -880,6 +1020,16 @@ fn run_epoch_drain(
                             }
                         }
                     }
+
+                    let local_buf_bytes = local_bufs
+                        .iter()
+                        .map(|b| b.capacity() as u64)
+                        .sum::<u64>();
+                    update_peak(drain_local_buf_peak_ref, local_buf_bytes);
+                    update_peak(
+                        drain_worker_peak_ref,
+                        local_buf_bytes + read_buf.capacity() as u64,
+                    );
                 }
 
                 // Drain any non-empty locals.
@@ -927,6 +1077,7 @@ fn run_epoch_emit(
     worker_tmps: &mut [WorkerTmpState],
     fully_contained_emitted: &[AtomicBool],
     n_workers: usize,
+    emit_worker_peak_bytes: &AtomicU64,
 ) -> Result<()> {
     let (bucket_lo, bucket_hi) = epoch_ranges[epoch_idx];
     let next_bucket = AtomicUsize::new(bucket_lo);
@@ -947,6 +1098,7 @@ fn run_epoch_emit(
     let dummy_encode_ms = AtomicU64::new(0);
     let dummy_straddler_copy_ms = AtomicU64::new(0);
     let dummy_worker_tmp_bytes = AtomicU64::new(0);
+    let emit_worker_peak_ref = emit_worker_peak_bytes;
 
     let n_threads = n_workers.min(worker_tmps.len()).max(1);
 
@@ -979,6 +1131,12 @@ fn run_epoch_emit(
                 };
                 let mut tmp_writer = std::io::BufWriter::with_capacity(512 * 1024, f);
                 let mut encode_scratch: Vec<u8> = Vec::new();
+                update_peak(
+                    emit_worker_peak_ref,
+                    (state.manifest.capacity() * std::mem::size_of::<ManifestEntry>()) as u64
+                        + encode_scratch.capacity() as u64
+                        + 512 * 1024,
+                );
 
                 loop {
                     if emit_error_ref
@@ -1048,6 +1206,12 @@ fn run_epoch_emit(
                             dummy_straddler_ref,
                             dummy_tmp_bytes_ref,
                         )?;
+                        update_peak(
+                            emit_worker_peak_ref,
+                            (state.manifest.capacity() * std::mem::size_of::<ManifestEntry>()) as u64
+                                + encode_scratch.capacity() as u64
+                                + 512 * 1024,
+                        );
                         Ok(())
                     })();
 

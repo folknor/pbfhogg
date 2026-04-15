@@ -426,6 +426,14 @@ single-pass, tag expression and bbox filtering.
     to contiguous-but-not-trivially-aligned node-blob ranges.
     Effort: large. (External review 2026-04-14 #1.)
 
+    Follow-up if the new path benches clean: the stage-2 fill loop
+    still does `rank_if_set()` per referenced node. Node tuples within
+    a blob are ID-sorted and blob-local referenced ranks are
+    monotonic, so this can likely become `get()` + monotonic
+    `next_ref_rank` progression instead of a full rank lookup per hit.
+    Keep this as a local follow-up under the redesign, not a separate
+    top-level item.
+
   - [ ] **Eliminate slot-bucket files by partitioning stage 2 output
     per-blob in memory.** Today: stage 2 writes ~50 GB slot-bucket
     files (planet, `s2_slot_bytes_written`); stage 3 reads them back
@@ -444,6 +452,91 @@ single-pass, tag expression and bbox filtering.
     rank buckets — rejected on coalescing-ratio grounds). This
     proposal eliminates the slot-bucket *intermediate*, not the
     final output, so the NVMe-floor argument doesn't transfer.
+
+    2026-04-15 design note: the naive "replace files with one dense
+    in-memory scatter_buf per slot bucket" first cut is a no-go on
+    planet-scale hosts — it effectively resurrects a live
+    `total_slots * 8` intermediate (~27 GB on planet) before any
+    payload emission happens. Do not ship that as phase 1.
+
+    Safer prototype path: slot-space epochs with bounded spill. Start
+    with `E=4`, runtime-gated behind a dev flag (same-binary A/B
+    against the current disk path, not a Cargo feature). Keep only the
+    active epoch's scatter buffers resident; off-epoch output spills
+    once to per-worker epoch shards. This is no longer "purely
+    eliminate slot-bucket files" — it is "shrink them sharply and hold
+    the active epoch in RAM" — but it is the first bounded-memory path
+    worth measuring.
+
+    Prototype status, 2026-04-15:
+    - Denmark correctness validated on `96b6451`:
+      disk path and epoch path (`E=4`) produced bit-identical output
+      (`md5 c747403d6e41fb4dae0dfd9b1aabe96d`) with identical
+      `coord_payloads` bytes, straddler count (`255`), blob count
+      (`832`), and missing count (`0`). The
+      `fully-contained-emitted` invariant never tripped.
+    - Europe A/B on the same commit:
+      baseline `e3c0e00a` wall `490.3s`, epoch `8fb2feb2` wall
+      `492.0s` (effectively flat). The stage-2/3/finalize slice did
+      improve modestly (`102.8 + 38.5 + 18.9 = 160.2s` →
+      `137.4 + 17.7 = 155.1s`), so the mechanism is not obviously bad
+      on wall.
+    - Scratch-I/O hypothesis validated:
+      baseline slot-bucket write+read `150.1 GB` →
+      epoch spill write+read `112.6 GB` (−25%).
+    - Memory result is the blocker:
+      `s23epoch_active_scatter_peak_bytes = 9.38 GB` on Europe at
+      `E=4`, but phase peak anon was ~`29 GB`. The prototype is
+      therefore correct and scratch-positive, but not yet bankable as
+      a general path.
+
+    Interpretation / next moves:
+    - First explain the gap between active-scatter bytes and total
+      stage-2/3 anon (`~29 GB` on Europe). Until that overhead is
+      understood, changing `E` is guesswork.
+    - If the extra memory is mostly retention / avoidable buffering,
+      keep the line of inquiry alive. If it is fundamental to the
+      design, try `E=8` or abandon this path.
+    - Europe is the first real perf/RSS decision run; Denmark is
+      correctness-only.
+    - A planet peak anon in the low-20s GB may still be acceptable on
+      `plantasjen`; do not reject the path solely because it exceeds
+      the earlier "below stage-4 peak" guess. The real gate is: is the
+      overhead understood, and does the architecture open enough
+      future speed potential to justify that memory budget? Measure
+      first.
+    - If the epoch path remains wall-flat and memory-heavy after the
+      overhead audit, move to clearer items like `io_uring (SQPOLL)`
+      for stage 2 + stage 4 preads.
+
+    RSS scaling note:
+    - The dense active-epoch floor scales with `total_slots / E`, not
+      with dataset size in bytes. Earlier rough planet math used
+      `~3.4B` slots and gave an `E=4` floor of `~6.8 GB`, but the
+      current Europe dataset already measures
+      `extjoin_total_slots = 4.69B`, which explains the measured
+      `9.38 GB` active-scatter floor on Europe.
+    - There is therefore no reason to expect Europe and planet to have
+      the same active-scatter floor. For planet, re-estimate from the
+      actual measured `total_slots` once the current branch is run
+      there.
+    - If the current Europe overhead ratio (`~29 GB` phase peak vs
+      `9.38 GB` active scatter) scaled unchanged, planet `E=4` would
+      likely land in the low-20s GB peak-anon range. Treat that as a
+      rough budget only, not a prediction.
+
+    Metrics to capture in the prototype mode:
+    - peak anon RSS during stages 2/3
+    - wall delta vs baseline
+    - `EXTJOIN_STAGE2` / `EXTJOIN_STAGE3`
+    - spill bytes written / read
+    - active-epoch in-memory bytes
+    - straddler count parity
+    - final `coord_payloads` byte parity
+
+    Resume semantics if this path ever ships: if on-disk slot buckets
+    truly disappear, `--start-stage 3` should error with a clear
+    message instead of silently aliasing to stage 2.
 
   - [ ] **Parallelize the finalize tail.** Currently sequential:
     walk blobs in order, pread each worker temp's bytes, append to

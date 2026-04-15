@@ -31,7 +31,6 @@ use super::{require_indexdata, HeaderOverrides, Result};
 mod blob_bucket_index;
 mod coord_payloads;
 mod stage1;
-mod stage12_grouped;
 mod stage2;
 mod stage3;
 mod stage4;
@@ -188,34 +187,19 @@ pub fn external_join(
 
     let ref_count_sidecar = scratch_dir.file_path("way-ref-counts");
     let per_way_refcount_sidecar = scratch_dir.file_path("per-way-refcounts");
-    let grouped_rank_segments = stage12_grouped::parse_grouped_env();
-    crate::debug::emit_counter(
-        "extjoin_grouped_rank_segments",
-        if grouped_rank_segments { 1 } else { 0 },
-    );
 
     // Stage 1: produces total_slots, unique_nodes, rank_bucket_counts,
     // num_shard_workers, the live IdSetDense (kept alive through stage 2
     // for inline coord resolution), and the per-blob rank mapping.
     crate::debug::emit_marker("EXTJOIN_STAGE1_START");
     let (s1_minflt_before, s1_majflt_before) = crate::debug::read_page_faults();
-    let stage1_out = if grouped_rank_segments {
-        stage12_grouped::stage1_way_pass_grouped(
-            input,
-            direct_io,
-            &scratch_dir,
-            &ref_count_sidecar,
-            &per_way_refcount_sidecar,
-        )?
-    } else {
-        stage1_way_pass(
-            input,
-            direct_io,
-            &scratch_dir,
-            &ref_count_sidecar,
-            &per_way_refcount_sidecar,
-        )?
-    };
+    let stage1_out = stage1_way_pass(
+        input,
+        direct_io,
+        &scratch_dir,
+        &ref_count_sidecar,
+        &per_way_refcount_sidecar,
+    )?;
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
     let total_coo: u64 = stage1_out.rank_bucket_counts.iter().sum();
     #[allow(clippy::cast_possible_wrap)]
@@ -285,33 +269,18 @@ pub fn external_join(
         std::fs::File::open(input)
             .map_err(|e| format!("open input pbf for stage 2: {e}"))?,
     );
-    let resolved_count = if grouped_rank_segments {
-        stage12_grouped::stage2_node_join_grouped(
-            &scratch_dir,
-            &rank_bucket_counts,
-            num_shard_workers,
-            &slot_buckets,
-            slot_bucket_count,
-            total_slots,
-            unique_nodes,
-            input_pbf,
-            &node_id_set,
-            &node_blob_mapping,
-        )?
-    } else {
-        stage2_node_join(
-            &scratch_dir,
-            &rank_bucket_counts,
-            num_shard_workers,
-            &slot_buckets,
-            slot_bucket_count,
-            total_slots,
-            unique_nodes,
-            input_pbf,
-            &node_id_set,
-            &node_blob_mapping,
-        )?
-    };
+    let resolved_count = stage2_node_join(
+        &scratch_dir,
+        &rank_bucket_counts,
+        num_shard_workers,
+        &slot_buckets,
+        slot_bucket_count,
+        total_slots,
+        unique_nodes,
+        input_pbf,
+        &node_id_set,
+        &node_blob_mapping,
+    )?;
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
     for worker_id in 0..num_shard_workers {

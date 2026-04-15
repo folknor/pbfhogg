@@ -599,6 +599,31 @@ Why this is fifth:
   entry for that failure; this item is the surviving grouped-emission
   direction, not the batching direction
 
+Result:
+
+- Shelved after Denmark correctness plus a Japan-only performance gate.
+- Denmark correctness:
+  - normal vs grouped direct-output MD5 matched exactly
+  - no semantic diff work was needed; the internal shard-format change
+    preserved output bytes on the smallest dataset
+- Japan same-commit A/B:
+  - normal: `3b5fcc08`
+  - grouped: `856a7bb9`
+  - `s2_prepare_scatter_ms`: `3761 -> 3629` (`-3.5%`)
+  - `EXTJOIN_STAGE1`: `3212ms -> 4239ms` (`+31.9%`)
+  - `EXTJOIN_STAGE2`: `6009ms -> 5601ms` (`-6.8%`)
+  - combined `EXTJOIN_STAGE1 + EXTJOIN_STAGE2`:
+    `9221ms -> 9840ms` (`+6.7%`)
+  - `s1b_bytes_written`: `4.25 GB -> 5.31 GB` (`+25%`)
+  - `s1b_shard_write_calls`: `353,908,450 -> 663,854,662`
+  - `s1b_grouped_headers`: `309,946,212`
+- Conclusion:
+  - discard under the item's own Japan gate
+  - the grouped format barely moved `s2_prepare_scatter_ms`, made stage 1
+    materially slower, and increased scratch bytes because most emitted runs
+    were too short for the per-group headers to pay back
+  - do not take this line to Europe
+
 ### 6. Compressed-output rail: writer/compression first
 
 This is a conditional branch, not the default-path mainline.

@@ -47,8 +47,8 @@ pub(super) const MAX_NODE_ID: u64 = 14_000_000_000;
 /// Size of a rank-occurrence record: `(local_rank: u32, slot_pos: u64)` = 12 bytes.
 pub(super) const RANK_RECORD_SIZE: usize = 12;
 
-/// Size of a resolved entry: `(slot_pos: u64, lat: i32, lon: i32)` = 16 bytes.
-pub(super) const RESOLVED_ENTRY_SIZE: usize = 16;
+/// Size of a resolved entry: `(local_slot_pos: u32, lat: i32, lon: i32)` = 12 bytes.
+pub(super) const RESOLVED_ENTRY_SIZE: usize = 12;
 
 /// Size of a coordinate slot: `(lat: i32, lon: i32)` = 8 bytes.
 pub(super) const COORD_SLOT_SIZE: usize = 8;
@@ -107,19 +107,12 @@ pub(super) struct ResolvedEntry {
 }
 
 impl ResolvedEntry {
-    fn write_to(&self, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
-        buf[..8].copy_from_slice(&self.slot_pos.to_le_bytes());
-        buf[8..12].copy_from_slice(&self.lat.to_le_bytes());
-        buf[12..16].copy_from_slice(&self.lon.to_le_bytes());
-    }
-
-    fn read_from(buf: &[u8; RESOLVED_ENTRY_SIZE]) -> Self {
-        let slot_pos = u64::from_le_bytes([
-            buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-        ]);
-        let lat = i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
-        let lon = i32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]);
-        Self { slot_pos, lat, lon }
+    fn write_to(&self, bucket_start: u64, buf: &mut [u8; RESOLVED_ENTRY_SIZE]) {
+        #[allow(clippy::cast_possible_truncation)]
+        let local_slot_pos = (self.slot_pos - bucket_start) as u32;
+        buf[..4].copy_from_slice(&local_slot_pos.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.lat.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.lon.to_le_bytes());
     }
 
     /// Bucket index for slot-pos partitioning.
@@ -141,6 +134,21 @@ impl ResolvedEntry {
         let bucket = self.slot_pos / range_size;
         (bucket as usize).min(slot_bucket_count - 1)
     }
+}
+
+pub(super) fn slot_bucket_bounds(
+    total_slots: u64,
+    slot_bucket_count: usize,
+    bucket_idx: usize,
+) -> (u64, u64) {
+    let range_size = total_slots / slot_bucket_count as u64;
+    let bucket_start = bucket_idx as u64 * range_size;
+    let bucket_end = if bucket_idx == slot_bucket_count - 1 {
+        total_slots
+    } else {
+        ((bucket_idx as u64 + 1) * range_size).min(total_slots)
+    };
+    (bucket_start, bucket_end)
 }
 
 /// Run the full external join pipeline for add-locations-to-ways.

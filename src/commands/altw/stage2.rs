@@ -18,7 +18,10 @@ use super::super::external_radix::advise_dontneed_file;
 use super::super::id_set_dense::IdSetDense;
 use super::super::node_scanner::{extract_node_tuples, NodeTuple};
 use super::super::Result;
-use super::{NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE, ResolvedEntry};
+use super::{
+    slot_bucket_bounds, NodeBlobInfo, RANK_RECORD_SIZE, RESOLVED_ENTRY_SIZE, COORD_SLOT_SIZE,
+    ResolvedEntry,
+};
 
 // ---------------------------------------------------------------------------
 // Stage 2: Parallel node join — coord slice lookup
@@ -503,7 +506,10 @@ pub(super) fn stage2_node_join(
                             for &slot_pos in &bkt.grouped_slot_pos[start..end] {
                                 let entry = ResolvedEntry { slot_pos, lat, lon };
                                 let bucket = entry.slot_bucket(total_slots, slot_bucket_count);
-                                entry.write_to(&mut entry_buf);
+                                let (bucket_start, bucket_end) =
+                                    slot_bucket_bounds(total_slots, slot_bucket_count, bucket);
+                                debug_assert!(bucket_end - bucket_start <= u32::MAX as u64);
+                                entry.write_to(bucket_start, &mut entry_buf);
                                 slot_bufs[bucket].extend_from_slice(&entry_buf);
                                 slot_counts[bucket] += 1;
                                 if is_resolved {

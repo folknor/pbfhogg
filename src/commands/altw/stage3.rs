@@ -71,8 +71,8 @@ fn merge_straddler(
 fn scatter_bucket_entries(
     data_buf: &[u8],
     bucket_idx: usize,
-    bucket_start: u64,
-    bucket_end: u64,
+    _bucket_start: u64,
+    _bucket_end: u64,
     scatter_buf: &mut [u8],
 ) -> std::result::Result<u64, String> {
     if data_buf.len() % RESOLVED_ENTRY_SIZE != 0 {
@@ -86,25 +86,17 @@ fn scatter_bucket_entries(
     let bucket_slots = scatter_buf.len() / COORD_SLOT_SIZE;
     let mut stores: u64 = 0;
     for chunk in data_buf.chunks_exact(RESOLVED_ENTRY_SIZE) {
-        let slot_pos = u64::from_le_bytes([
+        let local_slot_pos = u32::from_le_bytes([
             chunk[0], chunk[1], chunk[2], chunk[3],
-            chunk[4], chunk[5], chunk[6], chunk[7],
-        ]);
-        if slot_pos < bucket_start || slot_pos >= bucket_end {
+        ]) as usize;
+        if local_slot_pos >= bucket_slots {
             return Err(format!(
-                "slot bucket {bucket_idx} contains slot_pos {slot_pos} outside [{bucket_start}, {bucket_end})"
+                "slot bucket {bucket_idx} local_pos {local_slot_pos} outside bucket slot span {bucket_slots}"
             ));
         }
-        #[allow(clippy::cast_possible_truncation)]
-        let local_pos = (slot_pos - bucket_start) as usize;
-        if local_pos >= bucket_slots {
-            return Err(format!(
-                "slot bucket {bucket_idx} local_pos {local_pos} outside bucket slot span {bucket_slots}"
-            ));
-        }
-        let offset = local_pos * COORD_SLOT_SIZE;
-        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[8..12]);
-        scatter_buf[offset + 4..offset + 8].copy_from_slice(&chunk[12..16]);
+        let offset = local_slot_pos * COORD_SLOT_SIZE;
+        scatter_buf[offset..offset + 4].copy_from_slice(&chunk[4..8]);
+        scatter_buf[offset + 4..offset + 8].copy_from_slice(&chunk[8..12]);
         stores += 1;
     }
 

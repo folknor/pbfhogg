@@ -118,6 +118,7 @@ pub(super) fn stage4_assembly(
 ) -> Result<Stats> {
     use std::os::unix::fs::FileExt;
     // Header-only pre-scan: build the blob schedule.
+    let t_schedule = std::time::Instant::now();
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     // Tagdata is only needed by the `!keep_untagged_nodes` per-blob
@@ -712,8 +713,11 @@ pub(super) fn stage4_assembly(
     writer.flush()?;
     #[allow(clippy::cast_possible_truncation)]
     let s4_flush_ms: u64 = t_flush.elapsed().as_millis() as u64;
+    let s4_output_bytes = std::fs::metadata(output)
+        .map_err(|e| format!("stat output {}: {e}", output.display()))?
+        .len();
 
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
         crate::debug::emit_counter("s4_pread_ms", s4_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_decompress_ms", s4_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -737,6 +741,8 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_consumer_recv_ms", s4_recv_ms as i64);
         crate::debug::emit_counter("s4_consumer_write_ms", s4_write_ms as i64);
         crate::debug::emit_counter("s4_flush_ms", s4_flush_ms as i64);
+        crate::debug::emit_counter("s4_decode_threads", decode_threads as i64);
+        crate::debug::emit_counter("s4_output_bytes", s4_output_bytes as i64);
         crate::debug::emit_counter(
             "s4_channel_high_water",
             s4_channel_high_water.load(std::sync::atomic::Ordering::Relaxed) as i64,
@@ -749,6 +755,7 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_node_blobs_kept_by_members", s4_node_blobs_kept_by_members as i64);
         crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
         crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
+        crate::debug::emit_counter("s4_schedule_scan_ms", t_schedule.elapsed().as_millis() as i64);
     }
     way_reframe_counters.emit();
 

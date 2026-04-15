@@ -242,6 +242,13 @@ pub fn external_join(
         let max_useful = max_useful_u64.min(NUM_BUCKETS as u64) as usize;
         max_useful
     };
+    let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
+        crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
+        crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
+    }
 
     let coord_payloads_path = scratch_dir.file_path("coord_payloads");
 

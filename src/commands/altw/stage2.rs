@@ -241,10 +241,16 @@ pub(super) fn stage2_node_join(
     // Wall time spent populating coord_slice (node-blob pread + decompress
     // + extract + rank fill). Replaces the old s2_coord_read_ms metric.
     let s2_coord_fill_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_coord_zero_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_coord_zero_ns = std::sync::atomic::AtomicU64::new(0);
     let s2_node_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_node_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_node_extract_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_node_rank_ms = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_pread_ns = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_decompress_ns = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_extract_ns = std::sync::atomic::AtomicU64::new(0);
+    let s2_node_rank_ns = std::sync::atomic::AtomicU64::new(0);
     let s2_node_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s2_node_blobs_read = std::sync::atomic::AtomicU64::new(0);
     // Buckets for which we touched at least one straddler blob (a blob
@@ -276,10 +282,16 @@ pub(super) fn stage2_node_join(
     let next_ref = &next_idx;
     let resolved_ref = &resolved_total;
     let coord_fill_ref = &s2_coord_fill_ms;
+    let coord_zero_ms_ref = &s2_coord_zero_ms;
+    let coord_zero_ns_ref = &s2_coord_zero_ns;
     let node_pread_ref = &s2_node_pread_ms;
     let node_decompress_ref = &s2_node_decompress_ms;
     let node_extract_ref = &s2_node_extract_ms;
     let node_rank_ref = &s2_node_rank_ms;
+    let node_pread_ns_ref = &s2_node_pread_ns;
+    let node_decompress_ns_ref = &s2_node_decompress_ns;
+    let node_extract_ns_ref = &s2_node_extract_ns;
+    let node_rank_ns_ref = &s2_node_rank_ns;
     let node_bytes_ref = &s2_node_bytes_read;
     let node_blobs_ref = &s2_node_blobs_read;
     let node_straddler_ref = &s2_node_straddler_blobs;
@@ -381,7 +393,12 @@ pub(super) fn stage2_node_join(
                         // resolved coordinates.
                         let t_coord = std::time::Instant::now();
                         let slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
+                        let t_zero = std::time::Instant::now();
                         coord_slice[..slice_bytes].fill(0);
+                        #[allow(clippy::cast_possible_truncation)]
+                        coord_zero_ms_ref.fetch_add(t_zero.elapsed().as_millis() as u64, Relaxed);
+                        #[allow(clippy::cast_possible_truncation)]
+                        coord_zero_ns_ref.fetch_add(t_zero.elapsed().as_nanos() as u64, Relaxed);
                         let bucket_rank_start = bkt.bucket_rank_start;
                         let bucket_rank_end = bucket_rank_start + bkt.local_range as u64;
 
@@ -416,6 +433,8 @@ pub(super) fn stage2_node_join(
                                 .map_err(|e| format!("stage2 node pread: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_pread_ref.fetch_add(t_pr.elapsed().as_millis() as u64, Relaxed);
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_pread_ns_ref.fetch_add(t_pr.elapsed().as_nanos() as u64, Relaxed);
                             node_bytes_ref.fetch_add(blob.data_size as u64, Relaxed);
 
                             let t_dc = std::time::Instant::now();
@@ -423,6 +442,8 @@ pub(super) fn stage2_node_join(
                                 .map_err(|e| format!("stage2 node decompress: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_decompress_ref.fetch_add(t_dc.elapsed().as_millis() as u64, Relaxed);
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_decompress_ns_ref.fetch_add(t_dc.elapsed().as_nanos() as u64, Relaxed);
 
                             let t_ex = std::time::Instant::now();
                             node_tuples.clear();
@@ -431,6 +452,8 @@ pub(super) fn stage2_node_join(
                             ).map_err(|e| format!("stage2 node extract: {e}"))?;
                             #[allow(clippy::cast_possible_truncation)]
                             node_extract_ref.fetch_add(t_ex.elapsed().as_millis() as u64, Relaxed);
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_extract_ns_ref.fetch_add(t_ex.elapsed().as_nanos() as u64, Relaxed);
 
                             let t_rk = std::time::Instant::now();
                             for &NodeTuple { id, lat, lon } in &node_tuples {
@@ -449,6 +472,8 @@ pub(super) fn stage2_node_join(
                             }
                             #[allow(clippy::cast_possible_truncation)]
                             node_rank_ref.fetch_add(t_rk.elapsed().as_millis() as u64, Relaxed);
+                            #[allow(clippy::cast_possible_truncation)]
+                            node_rank_ns_ref.fetch_add(t_rk.elapsed().as_nanos() as u64, Relaxed);
                             bucket_blobs_read += 1;
                         }
                         node_blobs_ref.fetch_add(bucket_blobs_read, Relaxed);
@@ -590,10 +615,16 @@ pub(super) fn stage2_node_join(
     #[allow(clippy::cast_possible_wrap)]
     {
         crate::debug::emit_counter("s2_coord_fill_ms", s2_coord_fill_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_coord_zero_ms", s2_coord_zero_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_coord_zero_ns", s2_coord_zero_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_pread_ms", s2_node_pread_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_decompress_ms", s2_node_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_extract_ms", s2_node_extract_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_rank_ms", s2_node_rank_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_pread_ns", s2_node_pread_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_decompress_ns", s2_node_decompress_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_extract_ns", s2_node_extract_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s2_node_rank_ns", s2_node_rank_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_bytes_read", s2_node_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_blobs_read", s2_node_blobs_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s2_node_straddler_blobs", s2_node_straddler_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);

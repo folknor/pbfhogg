@@ -36,6 +36,7 @@ pub(super) struct Stage1Output {
 
 /// Build the way-blob schedule via header-only scan.
 pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
+    let t0 = std::time::Instant::now();
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.next_header_skip_blob()
@@ -50,6 +51,11 @@ pub(super) fn build_way_schedule(input: &Path) -> Result<Vec<WayBlobTask>> {
         }
         schedule.push(WayBlobTask { seq, data_offset, data_size });
         seq += 1;
+    }
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+    {
+        crate::debug::emit_counter("s1_way_schedule_blobs", schedule.len() as i64);
+        crate::debug::emit_counter("s1_way_schedule_build_ms", t0.elapsed().as_millis() as i64);
     }
     Ok(schedule)
 }
@@ -560,6 +566,7 @@ pub(super) fn stage1_way_pass(
         crate::debug::emit_counter("s1b_shard_write_calls", s1b_shard_write_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_pread_calls", s1b_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1b_blobs", schedule.len() as i64);
+        crate::debug::emit_counter("s1b_actual_workers", num_actual_workers as i64);
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 

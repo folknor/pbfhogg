@@ -150,9 +150,9 @@ fn prepare_bucket(
 /// Shared slot bucket writers protected by per-bucket mutexes.
 /// `slot_bucket_count` files total regardless of worker count.
 pub(super) struct SharedSlotBuckets {
-    writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
-    entry_counts: Vec<std::sync::atomic::AtomicU64>,
-    paths: Vec<std::path::PathBuf>,
+    pub(super) writers: Vec<std::sync::Mutex<std::io::BufWriter<std::fs::File>>>,
+    pub(super) entry_counts: Vec<std::sync::atomic::AtomicU64>,
+    pub(super) paths: Vec<std::path::PathBuf>,
 }
 
 const BUCKET_BUF_SIZE: usize = 256 * 1024;

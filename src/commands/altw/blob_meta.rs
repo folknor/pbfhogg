@@ -42,6 +42,12 @@ pub(super) fn scan_blob_metadata(
         }
         let idx = hdr.index().ok_or("external join metadata scan: OsmData blob missing indexdata")?;
         let tag_index = if parse_tagdata { hdr.tag_index() } else { None };
+        let has_tagindex = tag_index.is_some();
+        let has_tags = if parse_tagdata {
+            tag_index.is_none_or(|ti| !ti.keys_empty())
+        } else {
+            false
+        };
         metas.push(BlobMeta {
             frame_offset,
             data_offset,
@@ -50,8 +56,8 @@ pub(super) fn scan_blob_metadata(
             min_id: idx.min_id,
             max_id: idx.max_id,
             count: idx.count,
-            has_tagindex: tag_index.is_some(),
-            has_tags: tag_index.is_some_and(|ti| !ti.keys_empty()),
+            has_tagindex,
+            has_tags,
         });
     }
 

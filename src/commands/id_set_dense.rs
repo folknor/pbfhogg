@@ -35,6 +35,11 @@ impl IdSetDense {
         self.chunks.iter().any(std::option::Option::is_some)
     }
 
+    /// Returns the number of allocated 4 MB chunks backing this set.
+    pub fn allocated_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|chunk| chunk.is_some()).count()
+    }
+
     #[allow(clippy::cast_sign_loss)]
     pub fn set(&mut self, id: i64) {
         if id < 0 { return; } // Negative IDs are not valid OSM element IDs

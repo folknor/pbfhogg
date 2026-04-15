@@ -92,6 +92,8 @@ pub(super) fn stage1_way_pass(
     let s1a_scan_way_refs_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_idset_set_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_idset_merge_ms = std::sync::atomic::AtomicU64::new(0);
+    let s1a_idset_local_chunks = std::sync::atomic::AtomicU64::new(0);
+    let s1a_idset_final_chunks = std::sync::atomic::AtomicU64::new(0);
     let s1a_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1a_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
@@ -239,11 +241,21 @@ pub(super) fn stage1_way_pass(
                     .map_err(|_| -> Box<dyn std::error::Error> {
                         "pass A worker panicked".into()
                     })?;
+                #[allow(clippy::cast_possible_truncation)]
+                s1a_idset_local_chunks.fetch_add(
+                    local.allocated_chunk_count() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
                 node_id_set.merge(local);
             }
             #[allow(clippy::cast_possible_truncation)]
             s1a_idset_merge_ms.fetch_add(
                 t_merge.elapsed().as_millis() as u64,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            s1a_idset_final_chunks.store(
+                node_id_set.allocated_chunk_count() as u64,
                 std::sync::atomic::Ordering::Relaxed,
             );
             Ok(())
@@ -265,6 +277,8 @@ pub(super) fn stage1_way_pass(
         crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_idset_set_ms", s1a_idset_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_idset_merge_ms", s1a_idset_merge_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1a_idset_local_chunks", s1a_idset_local_chunks.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s1a_idset_final_chunks", s1a_idset_final_chunks.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_unique_nodes", unique_nodes as i64);

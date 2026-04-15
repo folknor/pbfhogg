@@ -13,7 +13,7 @@ use std::path::Path;
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
 use super::super::id_set_dense::IdSetDense;
 use super::super::Result;
-use super::{NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
+use super::{MAX_NODE_ID, NodeBlobInfo, RANK_RECORD_SIZE, RankRecord};
 
 /// Way-blob schedule entry for the parallel way scans.
 pub(super) struct WayBlobTask {
@@ -77,20 +77,15 @@ pub(super) fn stage1_pass_a(
 
     crate::debug::emit_marker("EXTJOIN_S1_PASS_A_START");
 
-    // Workers each maintain a local IdSetDense (non-atomic, sparse) and the
-    // consumer merges them into this one after all workers join. Avoids the
-    // shared-set fetch_or contention of the previous design and lets
-    // chunk allocation be driven by the actually-touched ID range, not a
-    // planet-wide pre_allocate.
     let mut node_id_set = IdSetDense::new();
+    // Pre-allocate for planet-scale node IDs (~13B max).
+    #[allow(clippy::cast_possible_wrap)]
+    node_id_set.pre_allocate(MAX_NODE_ID as i64);
 
     let s1a_pread_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_decompress_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_scan_way_refs_ms = std::sync::atomic::AtomicU64::new(0);
     let s1a_idset_set_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1a_idset_merge_ms = std::sync::atomic::AtomicU64::new(0);
-    let s1a_idset_local_chunks = std::sync::atomic::AtomicU64::new(0);
-    let s1a_idset_final_chunks = std::sync::atomic::AtomicU64::new(0);
     let s1a_bytes_read = std::sync::atomic::AtomicU64::new(0);
     let s1a_pread_calls = std::sync::atomic::AtomicU64::new(0);
 
@@ -112,14 +107,12 @@ pub(super) fn stage1_pass_a(
         let s1a_per_way_bytes_ref = &s1a_per_way_sidecar_bytes;
 
         std::thread::scope(|scope| -> Result<()> {
-            let mut handles: Vec<std::thread::ScopedJoinHandle<'_, IdSetDense>> =
-                Vec::with_capacity(num_workers);
             for _ in 0..num_workers {
                 let file = std::sync::Arc::clone(&shared_file);
                 let tx = tx.clone();
-                let h = scope.spawn(move || -> IdSetDense {
+                let node_id_set_ref = &node_id_set;
+                scope.spawn(move || {
                     use std::sync::atomic::Ordering::Relaxed;
-                    let mut local_set = IdSetDense::new();
                     let mut read_buf: Vec<u8> = Vec::new();
                     let mut decompress_buf: Vec<u8> = Vec::new();
                     let mut refs_buf: Vec<i64> = Vec::new();
@@ -162,7 +155,7 @@ pub(super) fn stage1_pass_a(
 
                             let t3 = std::time::Instant::now();
                             for &node_id in &blob_node_ids {
-                                local_set.set(node_id);
+                                node_id_set_ref.set_atomic(node_id);
                             }
                             #[allow(clippy::cast_possible_truncation)]
                             s1a_idset_ref.fetch_add(t3.elapsed().as_millis() as u64, Relaxed);
@@ -172,9 +165,7 @@ pub(super) fn stage1_pass_a(
 
                         if tx.send((task.seq, result)).is_err() { break; }
                     }
-                    local_set
                 });
-                handles.push(h);
             }
             drop(tx);
 
@@ -216,30 +207,6 @@ pub(super) fn stage1_pass_a(
             sidecar_writer.write_all(&total_refs.to_le_bytes())?;
             sidecar_writer.flush()?;
             per_way_writer.flush()?;
-
-            let t_merge = std::time::Instant::now();
-            for h in handles {
-                let local = h.join()
-                    .map_err(|_| -> Box<dyn std::error::Error> {
-                        "pass A worker panicked".into()
-                    })?;
-                #[allow(clippy::cast_possible_truncation)]
-                s1a_idset_local_chunks.fetch_add(
-                    local.allocated_chunk_count() as u64,
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-                node_id_set.merge(local);
-            }
-            #[allow(clippy::cast_possible_truncation)]
-            s1a_idset_merge_ms.fetch_add(
-                t_merge.elapsed().as_millis() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            #[allow(clippy::cast_possible_truncation)]
-            s1a_idset_final_chunks.store(
-                node_id_set.allocated_chunk_count() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
             Ok(())
         })?;
     }
@@ -253,9 +220,6 @@ pub(super) fn stage1_pass_a(
         crate::debug::emit_counter("s1a_decompress_ms", s1a_decompress_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_scan_way_refs_ms", s1a_scan_way_refs_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_idset_set_ms", s1a_idset_set_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_idset_merge_ms", s1a_idset_merge_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_idset_local_chunks", s1a_idset_local_chunks.load(std::sync::atomic::Ordering::Relaxed) as i64);
-        crate::debug::emit_counter("s1a_idset_final_chunks", s1a_idset_final_chunks.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_bytes_read", s1a_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_pread_calls", s1a_pread_calls.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s1a_unique_nodes", unique_nodes as i64);

@@ -6,10 +6,10 @@
 //! bounded memory:
 //!
 //! 1. **Way pass**: stream ways, emit `(node_id, slot_pos)` COO pairs into
-//!    rank buckets partitioned by rank range.
+//!    256 node buckets partitioned by high bits of node_id.
 //! 2. **Node join**: per bucket, sort pairs by node_id in RAM (~500 MB),
 //!    merge-join with matching node stream, emit `(slot_pos, lat, lon)` into
-//!    slot buckets partitioned by slot range.
+//!    256 slot buckets partitioned by high bits of slot_pos.
 //! 3. **Slot reorder**: per bucket, sort by slot_pos, emit final blob-ordered
 //!    delta-varint `coord_payloads` (see `coord_payloads.rs`). The flat
 //!    `coord_slots` array is a historical intermediate, retired in 2026-04.
@@ -39,8 +39,6 @@ use stage1::stage1_way_pass;
 use stage2::{stage2_node_join, SlotBuckets};
 use stage3::{stage3_slot_reorder, IntegratedInputs, SlotBucketRef};
 use stage4::stage4_assembly;
-
-const ALTW_RANK_BUCKETS_ENV: &str = "PBFHOGG_ALTW_RANK_BUCKETS";
 
 /// Maximum node ID in current OSM data. Used to compute bucket ranges.
 /// 14B gives headroom above the current ~13B maximum.
@@ -145,22 +143,6 @@ impl ResolvedEntry {
     }
 }
 
-fn parse_rank_bucket_count_env() -> Result<Option<usize>> {
-    let Some(raw) = std::env::var_os(ALTW_RANK_BUCKETS_ENV) else {
-        return Ok(None);
-    };
-    let raw = raw.into_string().map_err(|_| {
-        format!("{ALTW_RANK_BUCKETS_ENV} must be valid UTF-8").to_string()
-    })?;
-    let count = raw.parse::<usize>().map_err(|e| {
-        format!("{ALTW_RANK_BUCKETS_ENV} must be a positive integer: {e}")
-    })?;
-    if count == 0 {
-        return Err(format!("{ALTW_RANK_BUCKETS_ENV} must be >= 1").into());
-    }
-    Ok(Some(count))
-}
-
 /// Run the full external join pipeline for add-locations-to-ways.
 ///
 /// Bounded memory (<1 GB), all sequential I/O. Uses ~224 GB temp disk at
@@ -176,13 +158,6 @@ pub fn external_join(
     force: bool,
     overrides: &HeaderOverrides,
 ) -> Result<Stats> {
-    let rank_bucket_count = parse_rank_bucket_count_env()?.unwrap_or(NUM_BUCKETS);
-    if std::env::var_os(ALTW_RANK_BUCKETS_ENV).is_some() {
-        eprintln!(
-            "[altw] rank buckets: {rank_bucket_count} (env {ALTW_RANK_BUCKETS_ENV})"
-        );
-    }
-
     require_indexdata(
         input,
         direct_io,
@@ -216,7 +191,6 @@ pub fn external_join(
         &scratch_dir,
         &ref_count_sidecar,
         &per_way_refcount_sidecar,
-        rank_bucket_count,
     )?;
     let (s1_minflt_after, s1_majflt_after) = crate::debug::read_page_faults();
     let total_coo: u64 = stage1_out.rank_bucket_counts.iter().sum();
@@ -237,11 +211,11 @@ pub fn external_join(
     let node_id_set = stage1_out.node_id_set;
     let node_blob_mapping = stage1_out.node_blob_mapping;
 
-    // Compute slot_bucket_count: scale down from rank_bucket_count so that
+    // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
     // every bucket can fit at least one full blob's slot range. This
     // keeps the 2-piece straddler invariant (a blob spans at most two
     // adjacent buckets) for both planet-scale inputs and tiny test
-    // fixtures where total_slots / rank_bucket_count would otherwise be < 1.
+    // fixtures where total_slots / NUM_BUCKETS would otherwise be < 1.
     let way_slot_starts =
         stage4::load_ref_count_sidecar(&ref_count_sidecar, total_slots)?;
     let max_blob_slots: u64 = (0..way_slot_starts.len())
@@ -256,7 +230,7 @@ pub fn external_join(
         .max()
         .unwrap_or(0);
     let slot_bucket_count = if max_blob_slots == 0 {
-        rank_bucket_count
+        NUM_BUCKETS
     } else {
         // Each bucket must hold ≥ max_blob_slots so the SMALLEST bucket
         // (which can be smaller than range_size when total_slots is not
@@ -265,13 +239,13 @@ pub fn external_join(
         // total_slots / max_blob_slots, with floor division.
         let max_useful_u64 = (total_slots / max_blob_slots).max(1);
         #[allow(clippy::cast_possible_truncation)]
-        let max_useful = max_useful_u64.min(rank_bucket_count as u64) as usize;
+        let max_useful = max_useful_u64.min(NUM_BUCKETS as u64) as usize;
         max_useful
     };
-    let total_rank_shard_files = num_shard_workers * rank_bucket_count;
+    let total_rank_shard_files = num_shard_workers * NUM_BUCKETS;
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("extjoin_rank_bucket_count", rank_bucket_count as i64);
+        crate::debug::emit_counter("extjoin_rank_bucket_count", NUM_BUCKETS as i64);
         crate::debug::emit_counter("extjoin_slot_bucket_count", slot_bucket_count as i64);
         crate::debug::emit_counter("extjoin_max_blob_slots", max_blob_slots as i64);
         crate::debug::emit_counter("extjoin_num_shard_workers", num_shard_workers as i64);
@@ -290,7 +264,6 @@ pub fn external_join(
     let resolved_count = stage2_node_join(
         &scratch_dir,
         &rank_bucket_counts,
-        rank_bucket_count,
         num_shard_workers,
         &slot_buckets,
         slot_bucket_count,
@@ -303,7 +276,7 @@ pub fn external_join(
     slot_buckets.finish()?;
     let (s2_minflt_after, s2_majflt_after) = crate::debug::read_page_faults();
     for worker_id in 0..num_shard_workers {
-        for bucket_idx in 0..rank_bucket_count {
+        for bucket_idx in 0..NUM_BUCKETS {
             let path = scratch_dir
                 .path
                 .join(format!("rank-W{worker_id}-{bucket_idx:03}"));

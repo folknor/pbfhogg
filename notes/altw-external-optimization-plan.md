@@ -144,81 +144,39 @@ Do not re-plan these as hypotheticals — they already ship:
 
 This is the order to work in unless a new measurement disproves it.
 
-### 1. Make bucket count dev-tunable, then sweep `>256`
+### 1. Discarded: `>256` rank-bucket sweep
 
-Hypothesis:
+Result:
 
-- Smaller rank/slot buckets may improve cache fit in stage 2 and stage 3 enough
-  to outweigh the extra straddlers and file-management overhead.
+- Implemented behind a runtime knob in `2168a7e`, then reverted after Japan.
+- UUIDs:
+  - `256` baseline: `6453221b`
+  - `384`: `800de5c2`
+  - `512`: `d3a320de`
 
-Code surface:
+What happened:
 
-- `src/commands/external_radix.rs`
-- `src/commands/altw/mod.rs`
-- `src/commands/altw/stage1.rs`
-- `src/commands/altw/stage2.rs`
-- `src/commands/altw/stage3.rs`
+- The targeted slice got worse, not better:
+  - `256`: `EXTJOIN_STAGE2 + EXTJOIN_STAGE3 + COORD_PAYLOADS_FINALIZE = 9116ms`
+  - `384`: `9711ms` (`+6.5%`)
+  - `512`: `10377ms` (`+13.8%`)
+- Stage 1 did not give back enough to offset that regression:
+  - `256`: `3307ms`
+  - `384`: `3342ms`
+  - `512`: `3229ms`
+- The failure mode matched the architecture:
+  - `s2_bucket_loads`: `256 -> 384 -> 512`
+  - `s2_open_calls`: `5632 -> 8448 -> 11264`
+  - `s2_node_straddler_blobs`: `510 -> 766 -> 1022`
+  - `s3_integrated_straddler_count`: `255 -> 383 -> 511`
 
-Important caveat:
+Conclusion:
 
-- This is not just a scatter-buffer question.
-- `NUM_BUCKETS = 256` is a `const` in `external_radix.rs`. The dev knob
-  becomes a runtime parameter threaded through `external_join` → stage 1 →
-  stage 2 → stage 3. Do not replace the const with another const.
-- Pass B keeps `workers × buckets` shard writers open. Today `6 × 256 = 1536`
-  FDs; at `512` it is `3072`; at `768` it is `4608`. Default `ulimit -n` is
-  `1024` on most Linux distros — the sweep raises it via `setrlimit` at
-  startup or documents the `ulimit` prerequisite.
-- The `slot_bucket_count` floor (`total_slots / max_blob_slots`) enforces
-  the 2-piece straddler invariant. Sweeps only widen where the invariant
-  still holds; see the invariant list in the appendix.
-
-Implementation shape:
-
-- do not hardcode a new constant first
-- add a dev/runtime knob so `256`, `384`, `512`, and maybe `768` can be swept
-  without a code fork
-- emit the live rank-bucket count as a counter (`extjoin_rank_bucket_count`)
-  in the same `emit_counter` block that already emits
-  `extjoin_slot_bucket_count`. Without this the sweep points are
-  indistinguishable in `brokkr results`.
-- env-var-gated prototype idiom — see appendix
-
-Smallest meaningful dataset:
-
-- Japan sweep first
-- Europe only for the best Japan candidate
-
-Metrics:
-
-- `EXTJOIN_STAGE1`
-- `EXTJOIN_STAGE2`
-- `EXTJOIN_STAGE3`
-- `COORD_PAYLOADS_FINALIZE`
-- `s2_prepare_scatter_ms`
-- `s2_slot_flush_lock_wait_ms`
-- `s3_scatter_ms`
-- `s3_integrated_straddler_count`
-- `s3_worker_tmp_bytes`
-- FD count / operational friction
-
-Keep gate:
-
-- keep exactly one non-256 candidate only if Japan improves
-  `EXTJOIN_STAGE2 + EXTJOIN_STAGE3 + COORD_PAYLOADS_FINALIZE` by `>= 3%`
-- and `EXTJOIN_STAGE1` gives back less than half of that gain
-- then run Europe on the winner and only bank it if Europe also clears the
-  normal gate
-
-Discard gate:
-
-- if every `>256` sweep point is flat or worse on Japan
-- or if the only wins require operationally ugly FD settings / worker caps
-
-Why this is first:
-
-- it is the cheapest current-architecture knob with plausible upside
-- it answers a long-open question without another large design fork
+- More rank buckets increase reopen / reread / straddler overhead faster than
+  they improve cache fit on Japan.
+- Keep `NUM_BUCKETS = 256` on current main.
+- Do not take this line to Europe unless another structural change alters the
+  cost model first.
 
 ### 2. Shrink slot-bucket records from 16 to 12 bytes
 

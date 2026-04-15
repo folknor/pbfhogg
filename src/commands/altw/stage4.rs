@@ -14,15 +14,20 @@ use crate::{Element, PrimitiveBlock};
 use super::super::add_locations_to_ways::Stats;
 use super::super::id_set_dense::IdSetDense;
 use super::super::{
-    dense_node_metadata, element_metadata,
-    ensure_node_capacity_local, ensure_relation_capacity_local, ensure_way_capacity_local,
+    dense_node_metadata, dense_node_raw_metadata, element_metadata,
+    ensure_node_capacity_local, ensure_relation_capacity_local,
     flush_local, HeaderOverrides, Result, writer_from_header,
 };
-use super::COORD_SLOT_SIZE;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+fn node_wire_filter_enabled() -> bool {
+    std::env::var("PBFHOGG_ALTW_NODE_FILTER_WIRE")
+        .ok()
+        .is_some_and(|v| v != "0" && !v.is_empty())
+}
 
 /// Blob descriptor for the stage 4 pre-scan schedule.
 struct BlobDescriptor {
@@ -274,6 +279,7 @@ pub(super) fn stage4_assembly(
     let decode_threads = std::thread::available_parallelism()
         .map(|n| n.get().saturating_sub(2).max(1))
         .unwrap_or(4);
+    let use_node_wire_filter = node_wire_filter_enabled() && !keep_untagged_nodes;
 
     // Split schedule: passthrough-eligible blobs (relations always; node
     // blobs when keep_untagged_nodes=true) are handled by the consumer
@@ -301,8 +307,13 @@ pub(super) fn stage4_assembly(
     let s4_assemble_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_way_reframe_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_nonway_assemble_ms = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_filter_ns = std::sync::atomic::AtomicU64::new(0);
     let s4_way_blobs_processed = std::sync::atomic::AtomicU64::new(0);
     let s4_nonway_blobs_processed = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_filter_fallback_blobs = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_filter_nodes_written = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_filter_nodes_dropped = std::sync::atomic::AtomicU64::new(0);
+    let s4_nonway_filter_output_bytes = std::sync::atomic::AtomicU64::new(0);
     let s4_send_ms = std::sync::atomic::AtomicU64::new(0);
     let s4_blobs = std::sync::atomic::AtomicU64::new(0);
     let s4_bytes_read = std::sync::atomic::AtomicU64::new(0);
@@ -326,8 +337,13 @@ pub(super) fn stage4_assembly(
     let s4_assemble_ref = &s4_assemble_ms;
     let s4_way_reframe_ref = &s4_way_reframe_ms;
     let s4_nonway_assemble_ref = &s4_nonway_assemble_ms;
+    let s4_nonway_filter_ns_ref = &s4_nonway_filter_ns;
     let s4_way_blobs_ref = &s4_way_blobs_processed;
     let s4_nonway_blobs_ref = &s4_nonway_blobs_processed;
+    let s4_nonway_filter_fallback_ref = &s4_nonway_filter_fallback_blobs;
+    let s4_nonway_filter_nodes_written_ref = &s4_nonway_filter_nodes_written;
+    let s4_nonway_filter_nodes_dropped_ref = &s4_nonway_filter_nodes_dropped;
+    let s4_nonway_filter_output_bytes_ref = &s4_nonway_filter_output_bytes;
     let s4_send_ref = &s4_send_ms;
     let s4_blobs_ref = &s4_blobs;
     let s4_bytes_read_ref = &s4_bytes_read;
@@ -372,6 +388,8 @@ pub(super) fn stage4_assembly(
                 let mut output_blocks: Vec<OwnedBlock> = Vec::new();
                 let mut way_reframe_scratch = WayReframeScratch::new();
                 let mut reframe_output: Vec<u8> = Vec::new();
+                let mut node_wire_st_scratch: Vec<(u32, u32)> = Vec::new();
+                let mut node_wire_gr_scratch: Vec<(u32, u32)> = Vec::new();
                 // Per-blob coord payload buffer (prototype path only). Reused
                 // across blobs within this worker.
                 let mut coord_payload_buf: Vec<u8> = Vec::new();
@@ -468,25 +486,71 @@ pub(super) fn stage4_assembly(
                             return Ok((std::mem::take(&mut output_blocks), block_stats));
                         }
 
-                        // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
-                        let block = PrimitiveBlock::new(
-                            bytes::Bytes::from(std::mem::take(&mut decompress_buf))
-                        )?;
-                        let mut block_stats = assemble_block(
-                            &block,
-                            &mut bb,
-                            &mut output_blocks,
-                            keep_untagged_nodes,
-                            relation_member_node_ids,
-                        ).map_err(|e| crate::error::new_error(
-                            crate::error::ErrorKind::Io(std::io::Error::other(e))
-                        ))?;
+                        let used_wire_filter = use_node_wire_filter
+                            && matches!(desc.kind, Some(crate::blob_index::ElemKind::Node))
+                            && node_blob_wire_filter_supported(&decompress_buf).map_err(|e| {
+                                crate::error::new_error(
+                                    crate::error::ErrorKind::Io(std::io::Error::other(e))
+                                )
+                            })?;
+                        let mut block_stats = if used_wire_filter {
+                            let t_filter = std::time::Instant::now();
+                            let stats = assemble_node_blob_wire(
+                                &mut decompress_buf,
+                                &mut bb,
+                                &mut output_blocks,
+                                relation_member_node_ids,
+                                &mut node_wire_st_scratch,
+                                &mut node_wire_gr_scratch,
+                            ).map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            ))?;
+                            #[allow(clippy::cast_possible_truncation)]
+                            s4_nonway_filter_ns_ref.fetch_add(
+                                t_filter.elapsed().as_nanos() as u64,
+                                Relaxed,
+                            );
+                            s4_nonway_filter_nodes_written_ref.fetch_add(
+                                stats.nodes_written,
+                                Relaxed,
+                            );
+                            s4_nonway_filter_nodes_dropped_ref.fetch_add(
+                                stats.nodes_dropped,
+                                Relaxed,
+                            );
+                            stats
+                        } else {
+                            if use_node_wire_filter
+                                && matches!(desc.kind, Some(crate::blob_index::ElemKind::Node))
+                            {
+                                s4_nonway_filter_fallback_ref.fetch_add(1, Relaxed);
+                            }
+                            // Non-way blobs: full PrimitiveBlock decode + BlockBuilder.
+                            let block = PrimitiveBlock::new(
+                                bytes::Bytes::from(std::mem::take(&mut decompress_buf))
+                            )?;
+                            assemble_block(
+                                &block,
+                                &mut bb,
+                                &mut output_blocks,
+                                keep_untagged_nodes,
+                                relation_member_node_ids,
+                            ).map_err(|e| crate::error::new_error(
+                                crate::error::ErrorKind::Io(std::io::Error::other(e))
+                            ))?
+                        };
                         block_stats.blobs_decoded = 1;
                         flush_local(&mut bb, &mut output_blocks).map_err(|e| {
                             crate::error::new_error(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
                             )
                         })?;
+                        if used_wire_filter {
+                            s4_nonway_filter_output_bytes_ref.fetch_add(
+                                output_blocks.iter().map(|(buf, _, _)| buf.len() as u64).sum::<u64>(),
+                                Relaxed,
+                            );
+                        }
                         #[allow(clippy::cast_possible_truncation)]
                         {
                             let elapsed = t2.elapsed().as_millis() as u64;
@@ -508,7 +572,9 @@ pub(super) fn stage4_assembly(
                     {
                         let worker_bytes = read_buf.capacity() as u64
                             + decompress_buf.capacity() as u64
-                            + reframe_output.capacity() as u64;
+                            + reframe_output.capacity() as u64
+                            + (node_wire_st_scratch.capacity() * std::mem::size_of::<(u32, u32)>()) as u64
+                            + (node_wire_gr_scratch.capacity() * std::mem::size_of::<(u32, u32)>()) as u64;
                         let mut current = s4_max_worker_buf_ref.load(std::sync::atomic::Ordering::Relaxed);
                         while worker_bytes > current {
                             match s4_max_worker_buf_ref.compare_exchange_weak(
@@ -726,8 +792,13 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_assemble_ms", s4_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_way_reframe_ms", s4_way_reframe_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_nonway_assemble_ms", s4_nonway_assemble_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_filter_ns", s4_nonway_filter_ns.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_way_blobs_processed", s4_way_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_nonway_blobs_processed", s4_nonway_blobs_processed.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_filter_fallback_blobs", s4_nonway_filter_fallback_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_filter_nodes_written", s4_nonway_filter_nodes_written.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_filter_nodes_dropped", s4_nonway_filter_nodes_dropped.load(std::sync::atomic::Ordering::Relaxed) as i64);
+        crate::debug::emit_counter("s4_nonway_filter_output_bytes", s4_nonway_filter_output_bytes.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_send_ms", s4_send_ms.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_blobs", s4_blobs.load(std::sync::atomic::Ordering::Relaxed) as i64);
         crate::debug::emit_counter("s4_bytes_read", s4_bytes_read.load(std::sync::atomic::Ordering::Relaxed) as i64);
@@ -758,6 +829,7 @@ pub(super) fn stage4_assembly(
         crate::debug::emit_counter("s4_way_blobs", s4_way_blobs as i64);
         crate::debug::emit_counter("s4_relation_blobs", s4_relation_blobs as i64);
         crate::debug::emit_counter("s4_schedule_scan_ms", t_schedule.elapsed().as_millis() as i64);
+        crate::debug::emit_counter("s4_node_wire_filter_enabled", use_node_wire_filter as i64);
     }
     way_reframe_counters.emit();
 
@@ -837,6 +909,117 @@ fn assemble_block(
                 let meta = element_metadata(&r.info());
                 bb.add_relation(r.id(), r.tags(), &members_buf, meta.as_ref());
                 stats.relations_written += 1;
+            }
+        }
+    }
+
+    Ok(stats)
+}
+
+fn node_blob_wire_filter_supported(decompressed: &[u8]) -> std::result::Result<bool, String> {
+    use crate::read::wire::{Cursor, WIRE_LEN, WIRE_VARINT};
+
+    let mut cursor = Cursor::new(decompressed);
+    let mut saw_group = false;
+
+    while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| e.to_string())? {
+        match (field, wire_type) {
+            (1, WIRE_LEN) => {
+                cursor.skip_field(wire_type).map_err(|e| e.to_string())?;
+            }
+            (2, WIRE_LEN) => {
+                let group = cursor.read_len_delimited().map_err(|e| e.to_string())?;
+                let mut gc = Cursor::new(group);
+                let mut saw_dense = false;
+                while let Some((group_field, group_wire_type)) =
+                    gc.read_tag().map_err(|e| e.to_string())?
+                {
+                    match (group_field, group_wire_type) {
+                        (2, WIRE_LEN) => {
+                            gc.skip_field(group_wire_type).map_err(|e| e.to_string())?;
+                            saw_dense = true;
+                        }
+                        _ => return Ok(false),
+                    }
+                }
+                if !saw_dense {
+                    return Ok(false);
+                }
+                saw_group = true;
+            }
+            (17..=20, WIRE_VARINT) => {
+                cursor.skip_field(wire_type).map_err(|e| e.to_string())?;
+            }
+            _ => return Ok(false),
+        }
+    }
+
+    Ok(saw_group)
+}
+
+fn assemble_node_blob_wire(
+    decompressed: &mut Vec<u8>,
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlock>,
+    relation_member_node_ids: Option<&IdSetDense>,
+    stringtable_scratch: &mut Vec<(u32, u32)>,
+    group_scratch: &mut Vec<(u32, u32)>,
+) -> std::result::Result<Stats, String> {
+    let meta = crate::read::wire::WireBlock::parse_and_inline_with_scratch(
+        decompressed,
+        stringtable_scratch,
+        group_scratch,
+    )
+    .map_err(|e| e.to_string())?;
+    let wire_block = crate::read::wire::WireBlock::from_inline(decompressed, &meta);
+    #[allow(clippy::transmute_undefined_repr)]
+    let wire_block = unsafe {
+        std::mem::transmute::<
+            crate::read::wire::WireBlock<'_>,
+            crate::read::wire::WireBlock<'static>,
+        >(wire_block)
+    };
+
+    let mut stats = Stats::default();
+
+    for group_idx in 0..wire_block.group_count() {
+        let group = crate::read::wire::WireGroup::new(wire_block.group(group_idx));
+        if group.nodes().next().is_some()
+            || group.ways().next().is_some()
+            || group.relations().next().is_some()
+        {
+            return Err("wire node filter encountered unsupported non-dense group".into());
+        }
+        let dense_data = group
+            .dense()
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "wire node filter group missing DenseNodes".to_string())?;
+        let dense = crate::read::wire::WireDenseNodes::parse(dense_data)
+            .map_err(|e| e.to_string())?;
+
+        for dn in crate::read::dense::DenseNodeIter::new(&wire_block, dense) {
+            stats.nodes_read += 1;
+            let mut raw_tags = dn.raw_tags().peekable();
+            let has_tags = raw_tags.peek().is_some();
+            let keep = has_tags
+                || relation_member_node_ids.is_some_and(|ids| ids.get(dn.id()));
+            if keep {
+                ensure_node_capacity_local(bb, output)?;
+                if bb.is_empty() {
+                    bb.pre_seed_string_table_wire(&wire_block.stringtable)
+                        .map_err(|e| e.to_string())?;
+                }
+                let meta = dense_node_raw_metadata(&dn);
+                bb.add_node_raw(
+                    dn.id(),
+                    dn.decimicro_lat(),
+                    dn.decimicro_lon(),
+                    raw_tags,
+                    meta.as_ref(),
+                );
+                stats.nodes_written += 1;
+            } else {
+                stats.nodes_dropped += 1;
             }
         }
     }

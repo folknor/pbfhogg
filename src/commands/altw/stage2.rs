@@ -9,7 +9,6 @@
 //! The slice is then consumed by the existing rank-record join unchanged.
 
 use std::io::Write as _;
-use std::path::Path;
 use std::sync::Arc;
 
 use super::super::external_radix::{ScratchDir, NUM_BUCKETS};
@@ -273,7 +272,6 @@ pub(super) fn stage2_node_join(
     let s2_slot_flush_calls = std::sync::atomic::AtomicU64::new(0);
     let s2_nonempty_slot_buckets_total = std::sync::atomic::AtomicU64::new(0);
     let s2_max_slot_buffer_bytes = std::sync::atomic::AtomicU64::new(0);
-    let s2_slot_buffer_append_ms = std::sync::atomic::AtomicU64::new(0);
     let s2_max_worker_buf_bytes = std::sync::atomic::AtomicU64::new(0);
     let s2_pread_calls = std::sync::atomic::AtomicU64::new(0);
     let s2_open_calls = std::sync::atomic::AtomicU64::new(0);
@@ -312,7 +310,6 @@ pub(super) fn stage2_node_join(
     let flush_calls_ref = &s2_slot_flush_calls;
     let nonempty_ref = &s2_nonempty_slot_buckets_total;
     let max_buf_ref = &s2_max_slot_buffer_bytes;
-    let append_ref = &s2_slot_buffer_append_ms;
     let max_worker_buf_ref = &s2_max_worker_buf_bytes;
     let pread_calls_ref = &s2_pread_calls;
     let open_calls_ref = &s2_open_calls;

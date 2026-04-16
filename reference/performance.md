@@ -178,10 +178,12 @@ anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
-Current Europe external baseline on `main` (commit `d3e13ed`): **333s**
-(`5m33s`). That win comes mostly from collapsing three whole-file
-header-oriented scans into one shared metadata pass (see below), not from a
-new stage redesign.
+Current Europe external baseline on `main` (commit `e497e54`): **320.5s**
+(`5m21s`, UUID `4268196a`). Previous baseline `d3e13ed` was 333s; the
+`e497e54` change replaces the `finalize_coord_payloads` consolidation
+phase with an in-RAM `BlobLocationRouter` (see the stage-breakdown tables
+below). Earlier step `d3e13ed` had dropped 400s → 333s by collapsing
+three whole-file header-oriented scans into one shared metadata pass.
 
 **Crossover point**: between Japan (2.4 GB, dense 2x faster) and Europe
 (33.6 GB, external 7.4x faster). At Europe scale, dense's mmap working set
@@ -215,6 +217,30 @@ header-only walks in stage 1 and stage 4.
 | Stage 4 (assembly) | 90.6s | 3.25 GB peak | Way reframe + node decode/filter + relation passthrough |
 | **Total** | **333s** | | |
 
+### External join stage breakdown (Europe, commit `e497e54`, plantasjen)
+
+The finalize phase is replaced by an in-RAM routing table: worker tmp
+files stay open and stage 4 preads directly from the right fd. No more
+consolidated `coord_payloads` file. See `notes/altw-structural-reports.md`
+item #8.
+
+| Phase | Time | RSS (anon) | Description |
+|-------|------|-----------|-------------|
+| Meta scan | 28.5s | 16 MB peak | Single reusable blob-metadata pass |
+| Stage 1 (way pass) | 36.9s | 3.66 GB peak | Pass A + pass B; unchanged from `d3e13ed` |
+| Stage 2 (node join) | 91.0s | 7.57 GB peak | unchanged; overall RSS peak |
+| Stage 3 (slot reorder) | 33.6s | 7.50 GB peak | unchanged; emits per-worker tmps (not finalized into a single file) |
+| **Router build** | **0.163s** | 3.07 GB peak | Replaces finalize: walks manifests + straddler staging, encodes straddlers into RAM |
+| Relation scan | 21.0s | 3.14 GB peak | `collect_relation_member_node_ids()` — single-sample variance vs baseline |
+| Stage 4 (assembly) | 91.7s | 3.40 GB peak | `BlobLocationRouter::pread_blob_payload` routes to worker tmps or in-RAM straddlers |
+| **Total** | **320.5s** | | −12.5 s vs `d3e13ed` on single `--bench 1` sample (UUID `4268196a`) |
+
+Direct phase saving is unambiguous: `18.3 s → 0.163 s` on finalize. Single-sample
+wall delta is smaller than the phase saving because relation-scan and stage-4 wobble
+±a few seconds between runs. Router stats: 56,692 way blobs → 56,437 worker /
+255 straddler / 0 empty; 95 MB encoded straddler bytes held in RAM; 20.7 GB of
+worker tmps kept open for stage-4 pread (no longer consolidated into a separate file).
+
 The shared metadata pass replaced three separate scans on Europe:
 
 - `s1_way_schedule_build_ms`: `24.8s -> 0.08s`
@@ -239,6 +265,7 @@ why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
 | Stage 1B overlap + misc | — | 392s | 1,075s | `091fc5b` |
 | **coord_payloads integrated** | **7.4s** | **400s** | **953s** | **`3d977a0`** |
 | **+ shared blob metadata scan** | — | **333s** | — | **`d3e13ed`** |
+| **+ BlobLocationRouter (no finalize consolidation)** | — | **320.5s** | — | **`e497e54`** |
 
 The coord_payloads integration (2026-04-14) was pursued primarily for
 non-wall benefits. Planet measured −29 s wall as a pleasant surprise;

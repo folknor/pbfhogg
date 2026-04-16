@@ -18,13 +18,13 @@ Do not re-propose these — they are in tree and are reflected in the baseline m
 
 - `coords_by_rank` removal: stage 2 decodes node blobs directly via `NodeBlobInfo`
 - Stage-3 direct scatter from raw `ResolvedEntry` bytes (no `Vec<ResolvedEntry>` materialization)
-- Parallel finalize tail in [coord_payloads.rs](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs) — per-blob pread+pwrite work-stealing across `available_parallelism` threads
 - Stage-4 per-way refcount sidecar consumption in the way reframe path
 - Stage-4 raw passthrough for relation blobs (always) and node blobs when `keep_untagged_nodes` is set
 - `PerWayRcs` lazy per-blob decode via blob-offset sidecar
 - `IdSetDense::rank_if_set()` fused get+rank in stage 2; the remaining opportunity is deleting per-node rank queries entirely, not re-proposing separate `get()+rank()` lookups
 - Slot-bucket `ResolvedEntry` record shrunk 16 → 12 bytes (`fcd4fa2`) — −25% stage 2+3 scratch
 - Shared header-scan sidecar replacing three separate header-only passes (`f864b64f`) — saved ~56 s Europe wall
+- **`BlobLocationRouter` replaces `finalize_coord_payloads` consolidation + `CoordPayloadsReader`** (`e497e54`, item #8 below) — finalize phase `18.3 s → 0.163 s` at Europe, wall `333 s → 320.5 s`, byte-identical output
 
 ---
 
@@ -44,27 +44,33 @@ A four-stage serial chain with three disk-materialized intermediates and no stag
 - → **~112 GB of slot bucket files** (R3 on-disk accounting; R2 gives ~200 GB of raw `ResolvedEntry` records across 256 files, and ~150 GB for the current spill volume)
 
 **Stage 3 — slot reorder.** [stage3.rs:234](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:234)
-- Read slot buckets → scatter into a dense bucket-local buffer → classify blob/bucket intersections plus straddlers ([stage3.rs:292](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292), [:386](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386)) → delta-varint encode per-blob `coord_payloads` → finalize/copy pass in [coord_payloads.rs:255](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs:255)
-- → **~55 GB `coord_payloads` file**
+- Read slot buckets → scatter into a dense bucket-local buffer → classify blob/bucket intersections plus straddlers ([stage3.rs:292](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292), [:386](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386)) → delta-varint encode per-blob coord payloads into **per-worker tmp files**
+- → **~55 GB across per-worker tmp files** (planet)
+
+**Router build — replaces finalize consolidation since `e497e54` (item #8).** [coord_payloads.rs:302](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs:302)
+- Walk per-worker manifests + straddler staging → encode straddlers into RAM, record per-blob locations as `(worker_id, byte_offset, byte_length)` or in-RAM straddler buffer
+- Europe-measured: 0.163 s, 95 MB in-RAM straddler bytes, 20.7 GB of worker tmps kept open for stage-4 pread
+- **No consolidated `coord_payloads` file is written.** Planet saves ~55 GB write + ~55 GB read vs the pre-#8 shape.
 
 **Stage 4 — assembly.** [stage4.rs:376](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:376)
-- Open a second reader, pread each payload from `coord_payloads` again
+- Use `BlobLocationRouter::pread_blob_payload(blob_idx)` — preads directly from the right worker tmp fd or reads the in-RAM straddler bytes
 - Re-read the full input PBF → decompress way blobs → wire-format reframe using payloads → passthrough node/relation blobs → write enriched PBF
 - Also **re-decodes the kept node blobs** on the non-way path at [stage4.rs:439](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:439) (decoded already in stage 2)
 
-**Planet-scale totals.**
-- Scratch: ~80 + ~112 + ~55 = **~247 GB written, ~247 GB read back** (R3 accounting)
+**Planet-scale totals (post-#8).**
+- Scratch: ~80 + ~112 + ~55 = **~247 GB written** in stages 1–3 (unchanged), **~192 GB read back** (no more finalize-consolidate read)
 - Input PBF read ~3×: ways twice (1A, 1B), nodes in stage 2, everything in stage 4
 - Fully serialized — the machine idles at every stage boundary while setup/teardown runs
 
-**Measured baselines on current `main`** (UUIDs stored in `.brokkr/results.db`):
+**Measured baselines on current `main`** (from [reference/performance.md](../reference/performance.md)):
 
-| Dataset | UUID | Wall | Stage 1 | Stage 2 | Stage 3 | Finalize | Stage 4 |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| Europe | `ffdf5f69` | 375.9 s | 71.0 s | 97.0 s | 37.2 s | 17.8 s | 121.1 s |
-| Planet | `4f059b67` | 867.7 s | 148.5 s | 266.6 s | 100.2 s | 46.4 s | 231.6 s |
+| Dataset | Commit | Wall | Meta | Stage 1 | Stage 2 | Stage 3 | Finalize | Relscan | Stage 4 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| Europe | `d3e13ed` (pre-#8) | 333 s | 30.9 s | 36.0 s | 92.9 s | 32.2 s | 18.3 s | 14.3 s | 90.6 s |
+| Europe | `e497e54` (post-#8) | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
+| Planet | `4f059b67` (pre-#8) | 867.7 s | — | 148.5 s | 266.6 s | 100.2 s | 46.4 s | — | 231.6 s |
 
-Reviewer estimates occasionally quote ~68 s finalize and ~259 s stage 4 at planet — a different run or reviewer-level approximation. Treat the table as ground truth. Europe is stage-4-led; planet is stage-2-led with stage 4 second.
+Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet post-#8 not yet measured.
 
 ---
 
@@ -298,7 +304,9 @@ This deletes `rank_if_set()` from stage 2 entirely. `build_node_blob_mapping()` 
 
 ---
 
-### #8 — Routing table over worker tmp fds; eliminate finalize's consolidate copy
+### #8 — Routing table over worker tmp fds; eliminate finalize's consolidate copy — **LANDED 2026-04-16 (commit `e497e54`)**
+
+**Landed-result.** Europe `--bench 1` UUID `4268196a`: finalize phase `18.3 s → 0.163 s` (direct saving ~18.1 s). Total wall `333 s → 320.5 s` (−12.5 s, −3.8 % on single sample; relation-scan and stage-4 numbers wobble a few seconds between runs and eat into the direct saving on this sample). Peak anon RSS unchanged at ~7.57 GB (stage 2 coord slices still dominate, as expected — the router itself peaks at 3.07 GB). Router stats: 56,692 way blobs → 56,437 worker / 255 straddler / 0 empty; 95 MB of encoded straddler bytes held in RAM, 20.7 GB of worker-tmp bytes that used to be consolidated into a second 20.7 GB `coord_payloads` file. Byte-identical output (`extjoin_resolved_count == extjoin_total_slots`; `s4_way_refs_present == s4_way_refs_total`). Planet run pending.
 
 **Convergence: R4 A2, R6 #2 (unchanged after the 30 GB follow-up).** A much smaller-scope variant of #2. Stages 1–3 unchanged; only finalize and stage 4 change. R4 explicitly recommends this as the first cut for blast-radius reasons, and R6 independently rediscovers it from code alone.
 

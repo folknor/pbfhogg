@@ -6,15 +6,12 @@
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::Ordering::Relaxed;
 
 #[cfg(feature = "linux-direct-io")]
 use super::direct_writer::DirectWriter;
 use super::metrics::WRITER_METRICS;
-use super::{fallocate_hint_bytes, should_sync_all};
 
 fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -37,7 +34,6 @@ impl FileWriter {
     /// Create a buffered file writer (default path).
     pub fn buffered(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
-        maybe_fallocate(&file)?;
         Ok(FileWriter::Buffered(BufWriter::with_capacity(
             256 * 1024,
             file,
@@ -49,37 +45,6 @@ impl FileWriter {
     pub fn direct(path: &Path) -> io::Result<Self> {
         Ok(FileWriter::Direct(DirectWriter::create(path)?))
     }
-}
-
-#[cfg(target_os = "linux")]
-fn maybe_fallocate(file: &File) -> io::Result<()> {
-    let Some(len) = fallocate_hint_bytes() else {
-        return Ok(());
-    };
-    let len_off_t: libc::off_t = len
-        .try_into()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "fallocate hint too large"))?;
-    let t = std::time::Instant::now();
-    // Safety: valid fd from an owned File; KEEP_SIZE reserves extents without
-    // changing the visible file length if the final output is smaller.
-    let rc = unsafe {
-        libc::fallocate(file.as_raw_fd(), libc::FALLOC_FL_KEEP_SIZE, 0, len_off_t)
-    };
-    WRITER_METRICS
-        .fallocate_ns
-        .fetch_add(elapsed_ns_u64(t), Relaxed);
-    if rc == 0 {
-        WRITER_METRICS.fallocate_bytes.fetch_add(len, Relaxed);
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn maybe_fallocate(_file: &File) -> io::Result<()> {
-    let _ = fallocate_hint_bytes();
-    Ok(())
 }
 
 #[cfg(feature = "linux-direct-io")]
@@ -129,30 +94,22 @@ impl Write for FileWriter {
         match self {
             FileWriter::Buffered(w) => {
                 w.flush()?;
-                if should_sync_all() {
-                    let t_sync = std::time::Instant::now();
-                    let result = w.get_ref().sync_all();
-                    WRITER_METRICS
-                        .sync_all_ns
-                        .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                    result
-                } else {
-                    Ok(())
-                }
+                let t_sync = std::time::Instant::now();
+                let result = w.get_ref().sync_all();
+                WRITER_METRICS
+                    .sync_all_ns
+                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                result
             }
             #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(w) => {
                 w.flush()?;
-                if should_sync_all() {
-                    let t_sync = std::time::Instant::now();
-                    let result = w.sync_all();
-                    WRITER_METRICS
-                        .sync_all_ns
-                        .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                    result
-                } else {
-                    Ok(())
-                }
+                let t_sync = std::time::Instant::now();
+                let result = w.sync_all();
+                WRITER_METRICS
+                    .sync_all_ns
+                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                result
             }
         }
     }

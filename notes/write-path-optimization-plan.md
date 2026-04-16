@@ -866,7 +866,8 @@ Result (2026-04-16):
 - decision:
   - item 7 is unresolved
   - keep the API cleanup (`603385e` / `3602978`)
-  - do not roll out the vectored sink beyond env-gated experiments
+  - the experimental vectored sink path was removed from `main` during
+    surface cleanup; only the internal API cleanup remains
   - Japan proves the mechanism can help on framed-heavy buffered output, but
     Europe disproves the current threshold / batching shape as a robust win
   - the Europe follow-ups suggest the line is nearly salvageable only with
@@ -974,6 +975,18 @@ Discard gate:
 
 - item 1 removed `sync_all` entirely, and Europe real-file wall is not
   constrained by page-cache pressure
+
+Current status:
+
+- a hidden-hook probe was tried briefly in `985f76c`
+- Europe ALTW external `--compression none` probe:
+  - nearby no-hint reference `0d253e44`: `300.1s`
+  - hinted run `1fc20b79`: `303.2s`
+- conclusion:
+  - no obvious large win from preallocation alone
+  - not worth a same-commit A/B
+  - the hidden hook was removed during surface cleanup; if this line is
+    revisited later, it should come back as a coherent real API or not at all
 
 Why here:
 
@@ -1168,3 +1181,38 @@ bullet list all remain parked behind item 0. They represent expansion
 of the backlog from a fresh code read, not a reordering of the measured
 work above — none of them should jump into the sprint without item 0
 counters saying so.
+
+## Current state
+
+At this point, the performance side of this note is mostly exhausted.
+The only clearly live high-upside item left here is the `io_uring`
+rail on a real command path. The rest of the note is now either
+answered, deferred for good reason, too permutation-heavy to justify
+more Europe/planet time, or dependent on item 7 having turned into a
+robust win, which it did not.
+
+That does **not** mean the note is done. It still contains unresolved
+API and surface-design questions that are separate from pure
+performance:
+
+- whether `OutputChunk`, `FramedBlobParts`, and `OutputSink` should
+  remain the internal writer shape even if the vectored sink behavior
+  does not ship
+- whether deferred header write is a real future capability or just an
+  interesting idea
+- whether buffered size hints / preallocation should ever become a real
+  builder surface
+
+The cleanup pass already removed the writer experiment env vars. So the
+remaining surface question is no longer "which knobs survive?" but
+"which internal abstractions are worth keeping now that the knobs are
+gone?" That is the healthier state: structure that still makes sense,
+without carrying experiment routing in the shipped code.
+
+So the practical read of this note now is:
+
+- if the goal is more write-path performance work, the next real item
+  is `io_uring`
+- if the goal is reducing surface pollution and clarifying what we
+  actually intend to support, this note should feed a separate cleanup
+  plan rather than keep growing more experiment switches

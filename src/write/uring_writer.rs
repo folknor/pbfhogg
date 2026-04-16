@@ -26,7 +26,7 @@ use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::atomic::Ordering::Relaxed;
 
-use super::{PAGE_SIZE, alloc_page_aligned, should_sync_all};
+use super::{PAGE_SIZE, alloc_page_aligned};
 use super::metrics::WRITER_METRICS;
 
 fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
@@ -525,13 +525,11 @@ impl UringState {
         self.submit_current()?;
         self.drain()?;
         file.set_len(self.logical_size)?;
-        if should_sync_all() {
-            let t_sync = std::time::Instant::now();
-            file.sync_all()?;
-            WRITER_METRICS
-                .sync_all_ns
-                .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-        }
+        let t_sync = std::time::Instant::now();
+        file.sync_all()?;
+        WRITER_METRICS
+            .sync_all_ns
+            .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
         Ok(())
     }
 }

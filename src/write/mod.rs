@@ -1,4 +1,3 @@
-pub(crate) mod batched_sink;
 pub mod block_builder;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_writer;
@@ -8,26 +7,6 @@ pub mod uring_writer;
 pub(crate) mod metrics;
 pub(crate) mod raw_passthrough;
 pub mod writer;
-
-pub(crate) fn should_sync_all() -> bool {
-    static SHOULD_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SHOULD_SYNC.get_or_init(|| {
-        !matches!(
-            std::env::var("PBFHOGG_WRITE_SKIP_SYNC_ALL").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        )
-    })
-}
-
-pub(crate) fn fallocate_hint_bytes() -> Option<u64> {
-    static HINT_BYTES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *HINT_BYTES.get_or_init(|| {
-        std::env::var("PBFHOGG_WRITE_FALLOCATE_BYTES")
-            .ok()
-            .and_then(|s| s.parse::<u64>().ok())
-            .filter(|&n| n > 0)
-    })
-}
 
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]

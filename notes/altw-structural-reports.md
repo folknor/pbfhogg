@@ -6,6 +6,21 @@ Convergence: two reviewers rank **epoch-spill promotion** as the #1 lever; the *
 
 ---
 
+## Context: already shipped on current `main`
+
+Do not re-propose these — they are in tree and are reflected in the baseline measured below:
+
+- `coords_by_rank` removal: stage 2 decodes node blobs directly via `NodeBlobInfo`
+- Stage-3 direct scatter from raw `ResolvedEntry` bytes (no `Vec<ResolvedEntry>` materialization)
+- Parallel finalize tail in [coord_payloads.rs](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs) — per-blob pread+pwrite work-stealing across `available_parallelism` threads
+- Stage-4 per-way refcount sidecar consumption in the way reframe path
+- Stage-4 raw passthrough for relation blobs (always) and node blobs when `keep_untagged_nodes` is set
+- `PerWayRcs` lazy per-blob decode via blob-offset sidecar
+- Slot-bucket `ResolvedEntry` record shrunk 16 → 12 bytes (`fcd4fa2`) — −25% stage 2+3 scratch
+- Shared header-scan sidecar replacing three separate header-only passes (`f864b64f`) — saved ~56 s Europe wall
+
+---
+
 ## How the pipeline works today
 
 A four-stage serial chain with three disk-materialized intermediates and no stage overlap. The serialized seam spans [mod.rs:340](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:340)–[mod.rs:425](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:425); the `slot_bucket_count` and 2-piece straddler machinery lives at [mod.rs:238](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:238).
@@ -35,9 +50,27 @@ A four-stage serial chain with three disk-materialized intermediates and no stag
 - Input PBF read ~3×: ways twice (1A, 1B), nodes in stage 2, everything in stage 4
 - Fully serialized — the machine idles at every stage boundary while setup/teardown runs
 
-**Measured phase wall times.**
-- Europe: stage 3 ≈ 37.2s (R1) / 42.5s (R2) · finalize 17.8s · stage 4 121.1s
-- Planet: stage 3 100.2s · finalize 46.4s (R1) / ~68s (R2) · stage 4 231.6s (R1) / ~259s (R2) · stages 2+3+finalize ≈ 388s (R2)
+**Measured baselines on current `main`** (UUIDs stored in `.brokkr/results.db`):
+
+| Dataset | UUID | Wall | Stage 1 | Stage 2 | Stage 3 | Finalize | Stage 4 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Europe | `ffdf5f69` | 375.9 s | 71.0 s | 97.0 s | 37.2 s | 17.8 s | 121.1 s |
+| Planet | `4f059b67` | 867.7 s | 148.5 s | 266.6 s | 100.2 s | 46.4 s | 231.6 s |
+
+Reviewer estimates occasionally quote ~68 s finalize and ~259 s stage 4 at planet — a different run or reviewer-level approximation. Treat the table as ground truth. Europe is stage-4-led; planet is stage-2-led with stage 4 second.
+
+---
+
+## Correctness invariants
+
+Any rewrite preserves these or explicitly replaces them:
+
+- **Sorted + indexed PBF precondition.** `external_join` requires `Sort.Type_then_ID` headers and indexdata. Enforced at entry; do not relax.
+- **2-piece straddler invariant.** A blob's slot range spans at most two adjacent slot buckets. `slot_bucket_count` is chosen so every bucket width ≥ `max_blob_slots`. Constrains #5 (blob-group rewrite) and any layout change to slot buckets.
+- **Zero-coord sentinel.** Stage 2's `coord_slice` uses `(lat==0, lon==0)` as the unresolved sentinel; the slice is fully zeroed at the start of each rank bucket. Any redesign that removes zeroing (e.g. #4's per-blob accumulators skipping empty slots) must replace the sentinel with an explicit presence signal.
+- **Per-way refcount ordering.** The stage-1 per-way refcount sidecar is written in PBF blob order and consumed in PBF blob order by stage-4 reframe. Any stage-1 reshape preserves this ordering.
+- **Straddler state machine.** Stage 3's merge is an exhaustive `None → Left|Right → Both`; duplicate or third halves error. Do not weaken to `Option<(Vec<u8>, Vec<u8>)>`. Affects #2 (the streaming coordinator must maintain this).
+- **`build_rank_index()` before any `rank_if_set` / `rank`.** `IdSetDense` requires the rank index built after all `set_atomic` calls. Affects #3 — the scratch-spool variant must finish populating `IdSetDense` during pass A before `build_rank_index()`, and pass B's rank lookups must see the completed index.
 
 ---
 
@@ -97,6 +130,8 @@ Concrete changes:
 - Memory pressure: 55 GB of `coord_payloads` cannot all live in RAM. The handoff buffer must be bounded — once stage 4 consumes a blob's payload, that memory is freed
 - Straddler completion ordering: a straddler isn't ready until both halves arrive from two different slot buckets; if the second half is produced late, stage 4 blocks on that blob
 - Thread contention: concurrent stage 3 workers + stage 4 workers + `PbfWriter`'s rayon compression threads all running together
+
+**Writer-ceiling diagnostic.** A shelved probe on stage-4 wire-format DenseNodes filtering (`4910fd9`) delivered a real stage-4-local CPU win that did not reach wall: Europe `s4_nonway_assemble_ms` 78.5 s → 36.9 s (−53%), yet `EXTJOIN_STAGE4` went 122.7 s → 127.6 s because `s4_send_ms` cumulative grew 561 s → 672 s — freed decoder CPU refilled the writer queue. Under `zstd:1` the phase moved only −1.3% and total wall still regressed (5m40s → 5m48s). **Streaming 3 → 4 will hit the same ceiling on any workload where `PbfWriter` compression is the true limit.** The keep-decision gate for #2 therefore evaluates under both default `zlib:6` and `zstd:1` (or `compression:none` for the internal pipeline), because a stage-boundary win can be real and still invisible on wall under a writer-bound output mode.
 
 **Composition note.** #2 is viable on the **current slot-bucket representation** as a legitimate smaller first cut before #5 (the full blob-group rewrite). After #1 lands, the finalize phase is already absorbed into per-epoch emits, which makes #2 cleaner because the boundary it attacks is already softer.
 
@@ -185,7 +220,7 @@ The cost model flips from `pread + zlib (CPU) + protobuf (branch-heavy)` to `pre
 
 ### #6 — Single-decode node path
 
-**R1 #3.** Hardest item here. Already flagged as a deferred structural issue at [notes/altw-external-optimization-plan.md:892](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:892).
+**R1 #3.** Hardest item here. The old optimization plan explicitly deferred this: stage 2 is rank-bucket ordered while stage 4 is file-ordered and consumer/writer-bound; fusing is architecturally awkward. Measured evidence: planet `s2_node_decompress_ms = 192356` cumulative, and stage 4 processes all 32835/32835 node blobs again.
 
 **Bottleneck.** Stage 2 decodes node blobs to populate `coord_slice` at [stage2.rs:382](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:382). Stage 4 decodes the kept node blobs **again** on the non-way passthrough path at [stage4.rs:439](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:439).
 
@@ -205,10 +240,10 @@ The cost model flips from `pread + zlib (CPU) + protobuf (branch-heavy)` to `pre
 
 Consolidated from all three reports:
 
-- **More rank-bucket-count experiments.** The failure mode was structural — more opens, more straddlers, worse stage 2+3+finalize ([notes/altw-external-optimization-plan.md:147](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:147)). The 256-bucket counting sort is O(n) regardless, and 256 is well-tuned for the planet-scale memory envelope.
-- **Another stage-1B shard-shape experiment.** The grouped and batched variants already regressed or went flat ([:126](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:126), [:602](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:602)).
-- **Another stage-2 hot-loop micro pass.** Measured batching reshuffled counters without moving wall.
-- **Stage-4 non-way wire filtering as the main bet.** A real CPU win, still the wrong wall lever on Europe ([:498](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:498)).
+- **More rank-bucket-count experiments.** Measured at 256 / 384 / 512 on Japan: stage 2+3+finalize slice went +6.5% then +13.8%; `s2_open_calls` scaled 5632 → 8448 → 11264; `s2_node_straddler_blobs` 510 → 766 → 1022; `s3_integrated_straddler_count` 255 → 383 → 511. More buckets grow reopens and straddlers faster than they improve cache fit. Keep `NUM_BUCKETS = 256`.
+- **Another stage-1B shard-shape experiment on the existing emission shape.** The grouped-by-local-rank variant regressed `EXTJOIN_STAGE1 +31.9%` on Japan with scratch +25%; the per-blob bucket-staging variant regressed Europe stage 1 +30% because the `BufWriter` layer was already amortizing syscall cost and the staging layer added memcpy + 256-way cache thrash. Excludes #3 — the scratch-spool fusion is a different mechanism (replaces pass B's zlib path entirely, does not reshape the emission).
+- **Another stage-2 hot-loop micro pass.** Measured batching (`237cb2e`) reshuffled subcounter attribution — `s2_coord_fill_ms` −16%, `s2_node_extract_ns` down, `s2_node_rank_ns` up correspondingly — without moving `EXTJOIN_STAGE2` wall.
+- **Stage-4 non-way wire filtering as the main bet.** Shelved — real CPU win (`s4_nonway_assemble_ms` −53% Europe) but freed decoder CPU refilled the writer queue; wall regressed under both `zlib:6` and `zstd:1`. See "Writer-ceiling diagnostic" under #2.
 - **Compressing or varint-encoding rank records further.** The 12-byte record (down from 16) is already optimized. In a stage that is not I/O-bound, more encode/decode CPU buys marginal I/O savings.
 - **Stage-4 `coord_payloads` pread micro-optimizations** — `madvise` tuning, `mmap` variants, batching ~57K preads. Reads are sequential (blobs in order) and OS readahead handles them; the optimization history shows per-blob work is at the NVMe floor. Stage 4's ~259s is dominated by input PBF read + output PBF write + rayon compression; `coord_payloads` reads are a small fraction.
 - **Reducing stage-2 node-blob straddler re-reads.** At planet scale with 256 rank buckets and ~400K node blobs, ~255 straddler re-decompressions total — roughly 100 MB of extra decompress. Negligible.
@@ -238,4 +273,24 @@ Consolidated from all three reports:
 
 ### Benchmark plan for #2 (streaming stage 3 → stage 4)
 
-Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark correctness (semantic). Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up — roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse.
+Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark correctness (semantic). Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up — roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse. Evaluate under `zstd:1` (or `compression:none`) as well — see writer-ceiling diagnostic.
+
+---
+
+## Implementation conventions
+
+Apply when implementing any of the opportunities above:
+
+- **Ns accumulators for per-item timing.** `AtomicU64` holding nanoseconds, `ns_to_ms` helper at emit time. Reference: `WayReframeCounters` in `stage4.rs`. Do not accumulate `as_millis()` per item — sub-ms work truncates.
+- **Reorder-buffer for parallel producer → serialized consumer.** `crate::reorder_buffer::ReorderBuffer::with_capacity(N)`; push with `(seq, value)`, `pop_ready()` drains in order. Already used by stage 1 pass A, stage 3, stage 4. Reuse for #2's streaming coordinator — do not reinvent.
+- **ScratchDir for all temp files.** `scratch.file_path(name)` or `scratch.bucket_path(kind, idx)`. Lifetime-tied cleanup on drop. Applies to #3's node-ID scratch and #4's per-blob spill.
+- **`#[hotpath::measure]` on functions > 1 ms wall** so they show in `--hotpath` profiles.
+- **Worker count convention.** `available_parallelism() - 2 max 1 min 4`, often `.min(6)`. The `-2` reserves cores for the consumer + writer threads. Any tuning that changes this must justify why.
+- **Counter naming.** `s<stage><phase>_<thing>_ms` / `_bytes` / `_calls`. Stage-scoped prefix keeps grep/history readable.
+- **Env-var-gated prototype pattern.** `stage23_epoch.rs` is the reference shape: parallel file, gated in `mod.rs` by env var check, one-commit delete on shelving. Use for any item that wants a short-lived fallback during rollout. **But:** the lesson from the old plan is that shipping a prototype behind a flag and shelving it on a narrow probe does not falsify the underlying idea. Prefer the proper rewrite over the env-var-gated prototype once the direction is clear.
+
+---
+
+## Historical probe record
+
+See [`altw-external-optimization-plan.md`](altw-external-optimization-plan.md) — the stripped historical record of probes attempted before the structural re-plan. Useful when a proposal looks like an old probe: the UUIDs, measured outcomes, and reasons for shelving are recorded there so future work can distinguish between *the idea was wrong* and *the probe was too timid*.

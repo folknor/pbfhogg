@@ -1,8 +1,20 @@
 # ALTW as renumber — ground-up reshape plan
 
-**Supersedes** the four-stage external-sort framing in [`altw-structural-reports.md`](altw-structural-reports.md). That document's ranked opportunities all attack seams in a pipeline shape this plan proposes to delete.
+> **⚠ EXPERIMENT FAILED — 2026-04-16. This plan's core thesis is disproven. Do not implement as written.**
+>
+> A working implementation was built (`src/commands/altw_v2.rs`) and tested. Denmark passes byte-identical output in 3.5 s (2.8× faster than the 4-stage pipeline). Europe **OOM-killed** at Phase 2's `coord_table` allocation: the actual unique-referenced-node count was **3.6 B** (29 GB coord table), not the ~1 B / ~8 GB estimated for Europe in this document's memory-budget section. Planet projects to ~10 B referenced / ~80 GB coord table. **The in-RAM coord table does not fit past Denmark-scale on a 30 GB host.**
+>
+> The plan's own step-1 ("measure `unique_referenced_nodes` on planet before committing to the 16 GB coord_table sizing") was the correct caveat — but the thesis was constructed around an estimate that was wrong by ~4–5× at every scale. Measurement-before-design would have caught this.
+>
+> **Reverse of the framing here**: the existing four-stage external-sort pipeline in `src/commands/altw/*` is not "the wrong shape" — it is **load-bearing for any input whose coord table does not fit in RAM**. Renumber's in-RAM form works because `new_id = start + rank(old_id)` is a pure function needing only a 2 GB bitmap; ALTW's resolver needs 8 bytes of data per referenced node, which scales linearly with PBF size (~73× coord-table ratio Denmark→Europe vs ~64× PBF size ratio).
+>
+> **Actively valid work going forward** is in [`altw-structural-reports.md`](altw-structural-reports.md) — the ranked specific-seam items there (stage-1 decompress duplication, finalize-removal routing table, stage-2 de-ranking, relation-member forward fold, BlobHeader refcount extension) all survive this result. Their payoffs are smaller individually than the reshape's claimed target, but they are real and they do not depend on a wrong sizing assumption.
+>
+> The rest of this document is preserved below as historical record of the thesis that failed and the reasoning that led to it.
+>
+> ---
 
-## Thesis
+## Thesis (DISPROVEN — see notice above)
 
 ALTW today is a four-stage external sort (`stage 1 → stage 2 → stage 3 → stage 4`) with three disk-materialized intermediates totaling ~247 GB of read + ~247 GB of write on planet. It is the wrong shape for this problem.
 
@@ -91,11 +103,11 @@ Cost: 1× way-blob decompress. Rank lookups: ~6.5B × ~30–50 ns = 30–60 s ag
 - **Relation blobs:** raw passthrough via `write_raw_owned`. Same as today's stage 4.
 - **Node blobs (when `!keep_untagged_nodes`):** pre-compute kept-blob set via the existing relation-member scan ([`collect_relation_member_node_ids`](../src/commands/add_locations_to_ways.rs)). Gated per-blob in Phase 3's dispatcher the same way current stage 4 does. Unchanged logic; no coord splicing involved.
 
-## Memory budget (planet)
+## Memory budget (planet) — MEASURED, plan was wrong
 
-At Phase 3 peak (the heaviest phase — coord_table alive, plus all worker scratch, plus writer pipeline):
+Planned (at the time of writing):
 
-| Component | Size |
+| Component | Planned size |
 |---|---:|
 | `IdSetDense` bitmap | ~2.0 GB |
 | `IdSetDense` rank index | ~0.1 GB |
@@ -104,11 +116,17 @@ At Phase 3 peak (the heaviest phase — coord_table alive, plus all worker scrat
 | Writer pipeline (`PIPELINE_DISPATCH_PERMITS` × block) | ~0.3 GB |
 | `ReorderBuffer` (64 × block) | ~0.3 GB |
 | Sidecars held in RAM (ref-counts, per-way) | <0.3 GB |
-| **Subtotal** | **~20–21 GB** |
+| **Subtotal** | **~20–21 GB (planned)** |
 
-Host: 30 GB. OS overhead: ~2 GB. Margin: ~7 GB for input-PBF page cache + compression rayon scratch.
+Actual (measured 2026-04-16 via `altw_v2` implementation):
 
-**If `unique_referenced` on planet is materially higher than 2 B (e.g. 3 B):** `coord_table` grows to 24 GB, subtotal 28 GB, margin shrinks to 0 GB. That's a fail-soft scenario — either use a compact encoding (28-bit lat + 28-bit lon = 7 bytes/coord, still ~1.5 cm precision, saves 4 GB) or fall back to the current external-sort shape. **Measure this before committing** (first step in "Plan of attack" below).
+| Dataset | Unique referenced | Coord table | Outcome |
+|---|---:|---:|---|
+| Denmark | 49 M | 394 MB | works, 3.5 s (2.8× speedup vs old external) |
+| Europe | **3.6 B** | **29 GB** | **OOM-killed at Phase 2 coord_table alloc on 30 GB host** |
+| Planet (projected) | **~10 B** | **~80 GB** | would fail worse |
+
+The plan's written-in caveat ("if `unique_referenced` on planet is materially higher than 2 B, fall back to the current external-sort shape") was the right caveat, reached faster than expected — Europe alone already violates it. The "fail-soft" branch of the plan is the only viable one: **fall back to the current external-sort shape**. The compact-encoding escape hatch (7 bytes/coord) would save 12 % at planet; still doesn't fit.
 
 ## Decompression and I/O
 
@@ -170,16 +188,16 @@ Everything else — stage-2→3 epoch-spill, coord_payloads streaming, slot-buck
 - **`missing_locations` stat.** Computed inline in Phase 3 by counting `None` branches of `rank_if_set`. Matches `total_slots - resolved_count` from the current pipeline.
 - **`LocationsOnWays` output feature flag.** Set on the output header. Unchanged.
 
-## Plan of attack
+## Plan of attack (executed 2026-04-16 — failed at step 4)
 
-1. **Measure `unique_referenced_nodes` on planet.** Instrument stage 1A for one run; emit `unique_count = node_id_set.total_count()` after Pass A. If ≤ 2 B, the 16 GB coord_table plan proceeds unchanged. If ≥ 3 B, adopt compact coord encoding (7 bytes/coord) or defer the reshape.
-2. **Build `src/commands/altw_v2/` alongside the existing `altw/`.** New command flag or entry point; current code stays for cross-validation. Roughly: one file mirroring `renumber_external.rs` structure (entry + Phase 1 + Phase 2 + Phase 3 + non-way dispatch), one file for the coord-splice reframe variant.
-3. **Cross-validate on Denmark and Europe** via `brokkr verify add-locations-to-ways --dataset denmark` and Europe equivalent. Output must match current external mode byte-for-byte within PrimitiveBlock content (blob framing may differ; compare after decode).
-4. **Benchmark on Denmark, Europe, planet.** Record UUIDs. Targets: planet wall ≤ 400 s, peak RSS ≤ 25 GB, zero `.pbfhogg-external-join-*` scratch files touched.
-5. **If targets met:** delete `src/commands/altw/`, rename `altw_v2` → `altw`, update `altw-structural-reports.md` with a "superseded" pointer to this plan, update `benchmark_baselines` memory.
-6. **If coord_table RSS is too tight on planet:** fall back to 7-byte compact encoding. If that's still tight, ship on Europe and document the planet gap — current ALTW stays as the planet fallback until RAM or encoding improves.
+1. ❌ ~~**Measure `unique_referenced_nodes` on planet.**~~ — **skipped** in practice; implementation ran first. Had this step actually gone first, the 3.6 B Europe / ~10 B planet figures would have killed the plan before any code was written. The caveat inside this step ("if ≥ 3 B, adopt compact coord encoding or defer the reshape") was correct.
+2. ✅ **Built `src/commands/altw_v2.rs`** alongside `altw/`. Wired `--index-type external` dispatch to it.
+3. ✅ **Cross-validated on Denmark.** Byte-identical output to sparse, dense, and prior external variants.
+4. ❌ **Benchmarked.** Denmark 3.5 s (2.8× speedup vs old external's 9.7 s). **Europe OOM-killed** — unique referenced 3.6 B → coord_table 29 GB on a 30 GB host. Planet not attempted.
+5. N/A **If targets met.** Not reached.
+6. ✅ **Fallback branch applies.** Revert to the external-sort shape — current `altw/*` stays as the production path. Retain `altw_v2` only as a small-input fast path if useful, or delete.
 
-Benchmark command shape (single-ref): `brokkr add-locations-to-ways --dataset planet --index-type external --bench 1`.
+Lesson: when a plan rests on an in-RAM sizing assumption that scales with input data, **measure the real size at the target scale before writing code**. The cost of measurement is minutes; the cost of implementing-first is hours plus a failed OOM run. This applies not just to step 1 here but to any plan elsewhere in the repo that assumes a particular "unique referenced" or similar runtime-measured quantity.
 
 ## Open questions
 

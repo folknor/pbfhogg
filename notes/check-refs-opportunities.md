@@ -173,6 +173,8 @@ At phase-3 peak (the heaviest — all three ID sets live, plus per-worker scratc
 
 Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelization is still trivial).
 
+**Why this plan's sizing is robust where altw-as-renumber's was not.** `IdSetDense` pre-allocated to `MAX_NODE_ID` is a fixed 1.6 GB regardless of how many IDs are actually set; it does not scale with the unique-referenced count. The [altw-as-renumber](altw-as-renumber.md) reshape (attempted 2026-04-16) OOM'd on Europe because its `coord_table` scaled as `unique_referenced × 8 bytes` and the real count was ~4–5× the estimate. check-refs avoids that failure mode by construction: the bitmap size is bounded by the ID space, not the population, and the ID space is a global OSM constant.
+
 ## Plan of attack
 
 1. **Add per-phase `_ms` counters** unconditionally (not `cfg(feature = "hotpath")`). Measure current planet to fix the 20m54s baseline, then re-measure after each step. Each step's proof is "wall went down and result is identical."

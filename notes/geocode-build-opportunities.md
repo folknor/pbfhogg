@@ -154,7 +154,7 @@ A CSR-style layout (one contiguous offsets array + one contiguous values array, 
 
 ## What to leave alone
 
-- **The 16 GB anon `coord_mmap`.** Same structural role as ALTW's coord table. Right size, right indexing, fits under 30 GB with margin. Do not try to compact or partition.
+- **The ~16 GB anon `coord_mmap`.** Structurally similar to (a proposed version of) ALTW's coord table, but **sized by geocode's filtered `referenced_count`** — only nodes referenced by geocode-relevant ways (streets, building addrs, interp, admin). At planet this is well below ALTW's total unique-referenced count (~10 B, measured 2026-04-16 when an ALTW reshape attempt OOM'd at Europe with a 29 GB coord table). Geocode's tag-filter pre-narrowing is what keeps this structure viable in RAM; do not copy this pattern to a command that touches **all** way refs. Right size, right indexing; do not try to compact or partition. **Any future plan change that alters the filter's breadth must re-measure `referenced_count` at planet before assuming the RAM footprint stays similar.**
 - **`IdSetDense`.** Used correctly. The only change is the per-worker→shared-atomic swap in #7, which is a usage-pattern tweak, not an API change.
 - **`PrimitiveBlock` in Pass 2.** Once Pass 2 is parallel, full-decode cost amortizes across cores. A wire-format tagged scanner would duplicate tag-resolution logic for modest gain — save as a possible post-parallelization tweak if profiling shows tag iteration hot.
 - **PbfWriter.** Not used. Outputs are raw binary files.
@@ -183,6 +183,6 @@ Cross-validation: there's no `brokkr verify` for the geocode index. Byte-for-byt
 
 ## Open questions
 
-- **Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.** Renumber demonstrates this fits comfortably in renumber's 3.3 GB peak. Geocode has an additional 16 GB `coord_mmap` live across Phase 2a/2b and a `way_geom` hashmap that grows through Phase 2b. Expect peak ~18–20 GB during Phase 2b — still under 30 GB with margin, but measure on Europe first before committing to planet.
+- **Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.** Renumber demonstrates this fits comfortably in renumber's 3.3 GB peak. Geocode has an additional ~16 GB `coord_mmap` live across Phase 2a/2b and a `way_geom` hashmap that grows through Phase 2b. Expect peak ~18–20 GB during Phase 2b — still under 30 GB with margin, but **measure `referenced_count` on Europe first** before assuming this holds at planet. The ALTW-as-renumber reshape (2026-04-16) assumed a similar sizing for *unfiltered* referenced nodes and OOM'd at Europe because the real count was 4–5× the estimate. Geocode's filter keeps its count smaller, but the same measurement discipline applies.
 - **Is the admin-level flood-fill cost uneven enough to matter?** If one polygon (e.g., Russia at admin level 10) dominates, `par_iter` gives only ~2× speedup in practice. If it's measurable and binding, split large-polygon flood-fill into cell-stripe sub-tasks. Leave this decision until after measurement.
 - **StringPool merge order determinism.** For byte-for-byte cross-validation of the output against the sequential build, worker-local pool merge order must be deterministic (e.g. worker 0's strings before worker 1's before …). This is a merge-phase detail; specify it up front.

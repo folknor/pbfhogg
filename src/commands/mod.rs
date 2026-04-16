@@ -771,6 +771,13 @@ pub(crate) fn writer_from_header_bytes(
     direct_io: bool,
     io_uring: bool,
 ) -> Result<PbfWriter<FileWriter>> {
+    // Opt-in routing to the step-2 batched-writev sink. See
+    // notes/write-path-optimization-plan.md. The env var overrides
+    // --direct-io and --io-uring — intentional, so measurement runs don't
+    // silently combine two unrelated backends.
+    if std::env::var("PBFHOGG_WRITE_VECTORED").ok().as_deref() == Some("1") {
+        return Ok(PbfWriter::to_path_vectored(output, compression, header_bytes)?);
+    }
     if io_uring {
         #[cfg(feature = "linux-io-uring")]
         {

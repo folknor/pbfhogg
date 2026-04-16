@@ -6,7 +6,7 @@ use rayon::prelude::*;
 
 use super::{
     build_output_header, dense_node_metadata, element_metadata, require_indexdata,
-    for_each_primitive_block_batch_budgeted, HeaderOverrides, TypeFilter,
+    for_each_primitive_block_batch_budgeted, writer_from_header, HeaderOverrides, TypeFilter,
     ensure_node_capacity_local, ensure_way_capacity_local, ensure_relation_capacity_local,
     DECODE_BATCH_BYTE_BUDGET,
 };
@@ -121,7 +121,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
         hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
     };
 
-    let mut writer = open_cat_writer(output, compression, &header_bytes, direct_io)?;
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
     let mut blobs: u64 = 0;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
@@ -204,7 +204,7 @@ fn cat_type_passthrough(files: &[&Path], output: &Path, filter: &str, compressio
         hdr_bytes.ok_or("no OSMHeader blob found in first input file")?
     };
 
-    let mut writer = open_cat_writer(output, compression, &header_bytes, direct_io)?;
+    let mut writer = super::writer_from_header_bytes(output, compression, &header_bytes, direct_io, false)?;
     let mut blobs_passthrough: u64 = 0;
     let mut blobs_decoded: u64 = 0;
     let mut elements_written: u64 = 0;
@@ -353,8 +353,7 @@ fn cat_filtered(files: &[&Path], output: &Path, filter: &str, clean: &CleanAttrs
     let first_reader = ElementReader::open(files[0], direct_io)?;
     super::warn_locations_on_ways_loss(first_reader.header());
     let header = first_reader.header().clone();
-    let header_bytes = build_output_header(&header, single_file, overrides, |hb| hb)?;
-    let mut writer = open_cat_writer(output, compression, &header_bytes, direct_io)?;
+    let mut writer = writer_from_header(output, compression, &header, single_file, overrides, |hb| hb, direct_io, false)?;
     let mut blobs_decoded: u64 = 0;
     let mut elements: u64 = 0;
 
@@ -470,23 +469,3 @@ fn process_batch(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Open the output writer for cat.
-///
-/// When `PBFHOGG_WRITE_VECTORED=1` is set, routes through the step-2 batched
-/// `writev` sink ([`PbfWriter::to_path_vectored`]). Otherwise falls back to
-/// the standard pipelined buffered writer. The env var is a measurement hook
-/// for the write-path optimization plan and deliberately overrides
-/// `direct_io` when active — do not extend this wiring to other commands.
-fn open_cat_writer(
-    output: &Path,
-    compression: Compression,
-    header_bytes: &[u8],
-    direct_io: bool,
-) -> Result<PbfWriter<crate::file_writer::FileWriter>> {
-    if std::env::var("PBFHOGG_WRITE_VECTORED").ok().as_deref() == Some("1") {
-        Ok(PbfWriter::to_path_vectored(output, compression, header_bytes)?)
-    } else {
-        super::writer_from_header_bytes(output, compression, header_bytes, direct_io, false)
-    }
-}

@@ -19,6 +19,16 @@ pub(crate) fn should_sync_all() -> bool {
     })
 }
 
+pub(crate) fn fallocate_hint_bytes() -> Option<u64> {
+    static HINT_BYTES: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *HINT_BYTES.get_or_init(|| {
+        std::env::var("PBFHOGG_WRITE_FALLOCATE_BYTES")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    })
+}
+
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
 const PAGE_SIZE: usize = 4096;

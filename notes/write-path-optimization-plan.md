@@ -826,6 +826,53 @@ Why here:
   converged, so the signal has to come from item 0 instrumentation plus a
   command where the writer is actually on the path
 
+Result (2026-04-16):
+
+- step 1 landed as API cleanup:
+  - `603385e` / `3602978`
+  - `OutputChunk`, `FramedBlobParts`, `OutputSink`
+  - default behavior preserved (flatten locally through `FileOutputSink`)
+- first step-2 probe on planet `cat` was the wrong harness:
+  - `PBFHOGG_WRITE_SKIP_SYNC_ALL=1` baseline `99bcfd69`: `476.9s`
+  - initial vectored sink `01b49b83`: `476.4s`
+  - batching had not engaged (`50642` writev calls for `50816` frames)
+  - threshold-tunable follow-up `4a68c52` with
+    `PBFHOGG_WRITE_VECTORED_BYTES=0 PBFHOGG_WRITE_VECTORED_FRAMES=64`
+    produced `1b3a082b`: `502.0s`
+  - batching engaged correctly there (`794` writev calls for `50816` frames,
+    exactly `64.0` frames/syscall), but wall regressed hard
+  - conclusion: planet `cat` is the wrong harness for this line
+- framed-heavy ALTW `--compression none` is the right harness:
+  - Japan, same commit `687d81e`, both with
+    `PBFHOGG_WRITE_SKIP_SYNC_ALL=1`:
+    - baseline `642ab89a`: `50.8s`
+    - vectored `1d4913fc`: `39.7s`
+    - delta: `-11.1s` (`-21.9%`)
+    - `writer_write_ns`: `6.03s -> 1.34s`
+  - Europe, same commit `687d81e`, both with
+    `PBFHOGG_WRITE_SKIP_SYNC_ALL=1`:
+    - baseline `0af3adde`: `306.8s`
+    - vectored `a788e951`: `318.5s`
+    - delta: `+11.7s` (`+3.8%`)
+    - plain no-env reference `0d253e44`: `300.1s`
+    - `writer_write_ns` still drops materially on the vectored run, but
+      Europe wall regresses overall
+    - batching engaged at about `14.0` frames/syscall
+    - follow-up threshold probes confirmed over-batching as the Europe issue:
+      - `PBFHOGG_WRITE_VECTORED_FRAMES=4` `3dcf20a0`: `313.2s`
+      - `PBFHOGG_WRITE_VECTORED_FRAMES=2` `b01aa708`: `307.6s`
+      - shrinking the cap reduces the regression sharply, but does not turn
+        the path into a clear win on Europe/HDD
+- decision:
+  - item 7 is unresolved
+  - keep the API cleanup (`603385e` / `3602978`)
+  - do not roll out the vectored sink beyond env-gated experiments
+  - Japan proves the mechanism can help on framed-heavy buffered output, but
+    Europe disproves the current threshold / batching shape as a robust win
+  - the Europe follow-ups suggest the line is nearly salvageable only with
+    very small batches, at which point the benefit largely disappears
+  - do not treat planet `cat` as the generic gate for this family
+
 ### 8. Deferred header write (API capability)
 
 Hypothesis:

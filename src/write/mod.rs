@@ -1,3 +1,4 @@
+pub(crate) mod batched_sink;
 pub mod block_builder;
 #[cfg(feature = "linux-direct-io")]
 pub mod direct_writer;

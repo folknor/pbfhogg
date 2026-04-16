@@ -391,6 +391,50 @@ impl PbfWriter<FileWriter> {
         Self::start_pipeline(writer, compression, header_block_bytes)
     }
 
+    /// Create a pipelined `PbfWriter` that writes via a batched `writev` sink.
+    ///
+    /// Bypasses `BufWriter` entirely: the writer thread accumulates
+    /// [`OutputChunk`]s in the sink and flushes via one `writev(2)` syscall per
+    /// batch. Forked for the step-2 measurement of the write-path plan — wired
+    /// only into `cat` to isolate the batching + scatter-gather lever from the
+    /// rest of the writer path.
+    ///
+    /// See [`crate::write::batched_sink::BatchedBufferedSink`] for thresholds
+    /// and semantics (including forced flush before `CopyRange`).
+    pub fn to_path_vectored(
+        path: &Path,
+        compression: Compression,
+        header_block_bytes: &[u8],
+    ) -> io::Result<Self> {
+        use crate::write::batched_sink::BatchedBufferedSink;
+        use std::fs::File;
+
+        let mut file = File::create(path)?;
+        // Write header synchronously before starting the pipeline — File is
+        // unbuffered so this lands at offset 0 immediately.
+        let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
+        file.write_all(&framed_header)?;
+
+        let sink = BatchedBufferedSink::new(file);
+
+        let (tx, rx) = sync_channel(WRITE_AHEAD);
+        let handle = std::thread::spawn(move || writer_thread(rx, sink));
+
+        let (permit_tx, permit_rx) = new_permit_pool();
+        Ok(PbfWriter {
+            writer: None,
+            compression,
+            pipeline: Some(WritePipeline {
+                tx,
+                seq: 0,
+                join_handle: Some(handle),
+                permit_tx,
+                permit_rx,
+            }),
+            scratch: FrameScratch::new(),
+        })
+    }
+
     /// Create a pipelined `PbfWriter` with `O_DIRECT` for page-cache-free writes.
     ///
     /// All writes bypass the kernel page cache, preventing cache pollution
@@ -992,7 +1036,7 @@ fn writer_thread<S: OutputSink>(
 /// Output uses the fd's current position (sequential write).
 #[cfg(feature = "linux-direct-io")]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-fn copy_range(
+pub(crate) fn copy_range(
     in_fd: std::os::unix::io::RawFd,
     out_fd: std::os::unix::io::RawFd,
     mut offset: u64,

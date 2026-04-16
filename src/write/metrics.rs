@@ -27,6 +27,12 @@ pub(crate) struct WriterMetrics {
     pub direct_write_bytes: AtomicU64,
     pub sync_all_ns: AtomicU64,
 
+    /// `writev` syscalls issued by the batched-buffered sink.
+    pub batched_writev_calls: AtomicU64,
+    /// Total frames (`OutputChunk` items) across all batched `writev`
+    /// calls — divide by `batched_writev_calls` for average batch size.
+    pub batched_writev_frames: AtomicU64,
+
     pub uring_submit_calls: AtomicU64,
     pub uring_submit_ns: AtomicU64,
     pub uring_submit_and_wait_calls: AtomicU64,
@@ -60,6 +66,8 @@ impl WriterMetrics {
             direct_write_calls: AtomicU64::new(0),
             direct_write_bytes: AtomicU64::new(0),
             sync_all_ns: AtomicU64::new(0),
+            batched_writev_calls: AtomicU64::new(0),
+            batched_writev_frames: AtomicU64::new(0),
             uring_submit_calls: AtomicU64::new(0),
             uring_submit_ns: AtomicU64::new(0),
             uring_submit_and_wait_calls: AtomicU64::new(0),
@@ -117,6 +125,9 @@ impl WriterMetrics {
         emit!("writer_direct_write_calls", direct_write_calls);
         emit!("writer_direct_write_bytes", direct_write_bytes);
         emit!("writer_sync_all_ns", sync_all_ns);
+
+        emit!("writer_batched_writev_calls", batched_writev_calls);
+        emit!("writer_batched_writev_frames", batched_writev_frames);
 
         emit!("writer_uring_submit_calls", uring_submit_calls);
         emit!("writer_uring_submit_ns", uring_submit_ns);

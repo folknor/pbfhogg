@@ -62,29 +62,75 @@ pub(super) struct ManifestEntry {
     pub byte_length: u64,
 }
 
-enum CopyTask {
+/// Location of one way blob's encoded coord payload.
+///
+/// Replaces the consolidated `coord_payloads` file. Fully-contained blobs
+/// live in a per-worker tmp file (`Worker`); straddler blobs are encoded
+/// into RAM at router-build time (`Straddler`); zero-ref blobs have no
+/// payload at all (`Empty`). Stage 4 preads directly from the right
+/// worker tmp fd or reads the straddler bytes in-place.
+pub(super) enum BlobLocation {
     Worker {
         worker_id: u32,
-        src_offset: u64,
-        dst_offset: u64,
-        len: usize,
+        byte_offset: u64,
+        byte_length: u64,
     },
     Straddler {
-        dst_offset: u64,
         bytes: Vec<u8>,
     },
+    Empty,
 }
 
-/// Stats from `finalize_coord_payloads`.
-#[derive(Debug)]
-pub(super) struct FinalizeStats {
-    pub output_bytes: u64,
+/// Dispatch table keyed by `blob_idx`. Replaces `CoordPayloadsReader`
+/// + the consolidated `coord_payloads` file produced by finalize.
+///
+/// Owns the open worker tmp `File` handles; stage 4 borrows `&Self` and
+/// calls [`BlobLocationRouter::pread_blob_payload`] per blob.
+pub(super) struct BlobLocationRouter {
+    worker_files: Vec<std::fs::File>,
+    locations: Vec<BlobLocation>,
+}
+
+impl BlobLocationRouter {
+    /// Read blob `blob_idx`'s encoded payload into `buf` (resized to exact length).
+    /// Drop-in replacement for the old `CoordPayloadsReader::pread_blob_payload`.
+    pub(super) fn pread_blob_payload(&self, blob_idx: usize, buf: &mut Vec<u8>) -> Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        match &self.locations[blob_idx] {
+            BlobLocation::Worker { worker_id, byte_offset, byte_length } => {
+                #[allow(clippy::cast_possible_truncation)]
+                let len = *byte_length as usize;
+                buf.resize(len, 0);
+                if len > 0 {
+                    self.worker_files[*worker_id as usize]
+                        .read_exact_at(buf, *byte_offset)
+                        .map_err(|e| format!(
+                            "router pread worker {worker_id} blob {blob_idx}: {e}"
+                        ))?;
+                }
+            }
+            BlobLocation::Straddler { bytes } => {
+                buf.clear();
+                buf.extend_from_slice(bytes);
+            }
+            BlobLocation::Empty => {
+                buf.clear();
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Stats from `build_blob_location_router`.
+#[derive(Debug, Default)]
+pub(super) struct RouterStats {
     pub num_way_blobs: u64,
     pub num_straddlers: u64,
-    pub finalize_ms: u64,
-    pub read_ms: u64,
-    pub encode_ms: u64,
-    pub write_ms: u64,
+    pub num_worker: u64,
+    pub num_empty: u64,
+    pub straddler_bytes: u64,
+    pub worker_bytes: u64,
+    pub build_ms: u64,
 }
 
 /// Indexed per-way ref-count sidecar.
@@ -235,41 +281,40 @@ pub(super) fn load_per_way_refcount_sidecar_indexed(
     build_per_way_refcount_index(data, num_way_blobs)
 }
 
-/// Finalize the integrated coord_payloads file after stage 3 workers complete.
+/// Build the blob-location routing table from stage-3 outputs.
 ///
-/// Phase 1 (sequential) walks blobs in `blob_idx` order to drain straddlers,
-/// encode them, and build a single flat `Vec<CopyTask>` whose entries describe
-/// either a worker-temp pread+pwrite or a straddler pwrite at a known dst
-/// offset. Cumulative offsets become the file's `blob_offsets` table.
+/// Replaces the old `finalize_coord_payloads` consolidation pass. Instead of
+/// pwrite-copying ~55 GB of worker-tmp bytes + encoded straddler bytes into a
+/// single consolidated `coord_payloads` file (which stage 4 then pread from),
+/// keep the worker tmps open and route stage 4's per-blob pread directly to
+/// the correct fd (or to an in-RAM buffer for straddlers).
 ///
-/// Phase 2 (parallel) preallocates the output file and dispatches the flat
-/// task list across `available_parallelism` threads via an atomic index.
-/// Each thread pulls one task at a time, so per-worker temp files no longer
-/// gate parallelism (a worker with a long tail of large blobs is drained by
-/// peers via work stealing). Straddlers run through the same pool — they're
-/// pwrite-only, with the bytes already encoded by phase 1.
+/// Walks blobs in `blob_idx` order. For straddlers (`StraddlerSlot::Both`),
+/// encodes the coord payload in-place (same encoding path the old finalize
+/// used for straddlers) and stashes the bytes in the returned router. For
+/// fully-contained blobs, records `(worker_id, byte_offset, byte_length)`
+/// from the per-worker manifest. For zero-ref blobs, records `Empty`.
 ///
-/// Worker temp files are opened once and shared across threads via `Arc<File>`
-/// so any thread can pread from any worker tmp.
-#[allow(clippy::too_many_lines, clippy::needless_pass_by_value, clippy::cast_possible_truncation)]
-pub(super) fn finalize_coord_payloads(
-    output_path: &Path,
+/// Worker tmp files are opened once as plain `File` handles held by the
+/// router; `File: Sync` on Unix via `FileExt::read_exact_at` (pread-backed),
+/// so `&BlobLocationRouter` can be shared across stage-4 worker threads.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_truncation, clippy::too_many_lines)]
+pub(super) fn build_blob_location_router(
     per_way_rcs: &PerWayRcs,
     worker_manifests: Vec<Vec<ManifestEntry>>,
     worker_tmp_paths: &[std::path::PathBuf],
     straddler_slots: Vec<std::sync::Mutex<Option<StraddlerSlot>>>,
-) -> Result<FinalizeStats> {
-    use std::os::unix::fs::FileExt as _;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
-    use std::sync::Arc;
+) -> Result<(BlobLocationRouter, RouterStats)> {
     use std::time::Instant;
 
-    crate::debug::emit_marker("COORD_PAYLOADS_FINALIZE_START");
+    crate::debug::emit_marker("COORD_PAYLOADS_ROUTER_BUILD_START");
     let t_all = Instant::now();
 
     let num_way_blobs = per_way_rcs.num_blobs();
 
-    let mut blob_location: Vec<Option<(u32, u64, u64)>> = vec![None; num_way_blobs];
+    // Fold worker manifests into a single per-blob lookup. Verify no
+    // blob appears in multiple worker manifests.
+    let mut blob_in_worker: Vec<Option<(u32, u64, u64)>> = vec![None; num_way_blobs];
     for (worker_id, manifest) in worker_manifests.iter().enumerate() {
         for entry in manifest {
             let idx = entry.blob_idx as usize;
@@ -278,42 +323,32 @@ pub(super) fn finalize_coord_payloads(
                     "worker {worker_id} manifest entry blob_idx {idx} out of range (num_way_blobs={num_way_blobs})"
                 ).into());
             }
-            if blob_location[idx].is_some() {
+            if blob_in_worker[idx].is_some() {
                 return Err(format!("blob {idx} appears in multiple worker manifests").into());
             }
-            blob_location[idx] = Some((worker_id as u32, entry.byte_offset, entry.byte_length));
+            blob_in_worker[idx] = Some((worker_id as u32, entry.byte_offset, entry.byte_length));
         }
     }
 
-    for (idx, loc) in blob_location.iter().enumerate() {
-        if loc.is_some() {
-            let guard = straddler_slots[idx]
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if guard.is_some() {
-                return Err(format!(
-                    "blob {idx} appears in both a worker manifest and straddler staging"
-                )
-                .into());
-            }
+    // Mutual-exclusivity check: a blob must not be in both worker manifests
+    // and straddler staging.
+    for (idx, slot) in straddler_slots.iter().enumerate() {
+        let guard = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.is_some() && blob_in_worker[idx].is_some() {
+            return Err(format!(
+                "blob {idx} appears in both a worker manifest and straddler staging"
+            )
+            .into());
         }
     }
 
-    let header_size: u64 = 16 + (num_way_blobs as u64 + 1) * 8;
-    let mut blob_offsets: Vec<u64> = Vec::with_capacity(num_way_blobs + 1);
-    blob_offsets.push(0);
-    let mut copy_tasks: Vec<CopyTask> = Vec::with_capacity(num_way_blobs);
-
+    let mut locations: Vec<BlobLocation> = Vec::with_capacity(num_way_blobs);
     let mut encode_scratch: Vec<u8> = Vec::with_capacity(1024 * 1024);
-    let mut payload_pos: u64 = 0;
-    let mut stats = FinalizeStats {
-        output_bytes: 0,
+    let mut stats = RouterStats {
         num_way_blobs: num_way_blobs as u64,
-        num_straddlers: 0,
-        finalize_ms: 0,
-        read_ms: 0,
-        encode_ms: 0,
-        write_ms: 0,
+        ..Default::default()
     };
 
     for blob_idx in 0..num_way_blobs {
@@ -322,12 +357,10 @@ pub(super) fn finalize_coord_payloads(
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
 
-        let bytes_written: u64 = match straddler_taken {
+        let location = match straddler_taken {
             Some(StraddlerSlot::Both { left, right }) => {
                 let mut coord_bytes = left;
                 coord_bytes.extend_from_slice(&right);
-
-                let t_enc = Instant::now();
                 encode_scratch.clear();
                 encode_blob_payload_from_record(
                     &coord_bytes,
@@ -335,221 +368,77 @@ pub(super) fn finalize_coord_payloads(
                     blob_idx,
                     &mut encode_scratch,
                 )
-                    .map_err(|e| format!("finalize straddler blob {blob_idx}: {e}"))?;
-                stats.encode_ms += t_enc.elapsed().as_millis() as u64;
+                .map_err(|e| format!("router straddler encode blob {blob_idx}: {e}"))?;
                 stats.num_straddlers += 1;
-
-                let bytes = std::mem::take(&mut encode_scratch);
-                let len = bytes.len() as u64;
-                copy_tasks.push(CopyTask::Straddler {
-                    dst_offset: header_size + payload_pos,
-                    bytes,
-                });
-                len
+                stats.straddler_bytes += encode_scratch.len() as u64;
+                BlobLocation::Straddler {
+                    bytes: std::mem::take(&mut encode_scratch),
+                }
             }
             Some(StraddlerSlot::Left(_)) => {
-                return Err(format!(
-                    "blob {blob_idx}: straddler missing right half"
-                )
-                .into());
+                return Err(format!("blob {blob_idx}: straddler missing right half").into());
             }
             Some(StraddlerSlot::Right(_)) => {
-                return Err(format!(
-                    "blob {blob_idx}: straddler missing left half"
-                )
-                .into());
+                return Err(format!("blob {blob_idx}: straddler missing left half").into());
             }
-            None => match blob_location[blob_idx] {
+            None => match blob_in_worker[blob_idx] {
                 Some((worker_id, byte_offset, byte_length)) => {
-                    let len = byte_length as usize;
-                    copy_tasks.push(CopyTask::Worker {
+                    stats.num_worker += 1;
+                    stats.worker_bytes += byte_length;
+                    BlobLocation::Worker {
                         worker_id,
-                        src_offset: byte_offset,
-                        dst_offset: header_size + payload_pos,
-                        len,
-                    });
-                    byte_length
+                        byte_offset,
+                        byte_length,
+                    }
                 }
                 None => {
-                    // No manifest entry and no straddler staging. Valid only
-                    // for a zero-ref blob; any non-zero rc here means stage 3
-                    // lost this blob (upstream bug).
+                    // Zero-ref blob: no manifest entry and no straddler. Any
+                    // non-zero ref count here means stage 3 lost the blob.
                     if per_way_rcs.blob_has_nonzero_refs(blob_idx)? {
                         return Err(format!(
                             "blob {blob_idx} has non-zero ref counts but no worker manifest \
                              entry and no straddler staging — upstream bug"
-                        ).into());
+                        )
+                        .into());
                     }
-                    0
+                    stats.num_empty += 1;
+                    BlobLocation::Empty
                 }
             },
         };
-
-        payload_pos += bytes_written;
-        blob_offsets.push(payload_pos);
+        locations.push(location);
     }
 
-    stats.output_bytes = header_size + payload_pos;
-
-    let output_file = Arc::new(
-        std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(output_path)
-            .map_err(|e| format!("create coord_payloads: {e}"))?,
-    );
-    output_file
-        .set_len(stats.output_bytes)
-        .map_err(|e| format!("preallocate coord_payloads: {e}"))?;
-
-    // Open every worker tmp once and share via Arc. `pread` is thread-safe
-    // (does not mutate file position), so a single handle per tmp is enough
-    // to feed every thread.
-    let worker_files: Vec<Arc<std::fs::File>> = worker_tmp_paths
+    // Open worker tmps once; they live as long as the router does. Stage 4
+    // shares `&BlobLocationRouter` across worker threads; plain `&File` is
+    // Sync via pread (`FileExt::read_exact_at`) on Unix, no `Arc` needed.
+    let worker_files: Vec<std::fs::File> = worker_tmp_paths
         .iter()
         .map(|path| {
-            std::fs::File::open(path)
-                .map(Arc::new)
-                .map_err(|e| format!("open worker tmp {}: {e}", path.display()).into())
+            std::fs::File::open(path).map_err(|e| -> Box<dyn std::error::Error> {
+                format!("open worker tmp {}: {e}", path.display()).into()
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let read_ms = AtomicU64::new(0);
-    let write_ms = AtomicU64::new(0);
-
-    if !copy_tasks.is_empty() {
-        let next_idx = AtomicUsize::new(0);
-        let parallelism = std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(8)
-            .min(copy_tasks.len())
-            .max(1);
-
-        std::thread::scope(|scope| -> Result<()> {
-            let copy_tasks_ref = &copy_tasks;
-            let worker_files_ref = &worker_files;
-            let output_file_ref = &output_file;
-            let next_idx_ref = &next_idx;
-            let read_ms_ref = &read_ms;
-            let write_ms_ref = &write_ms;
-
-            let mut handles = Vec::with_capacity(parallelism);
-            for _ in 0..parallelism {
-                let handle = scope.spawn(move || -> std::result::Result<(), String> {
-                    use std::os::unix::fs::FileExt as _;
-                    let mut scratch: Vec<u8> = Vec::new();
-                    loop {
-                        let i = next_idx_ref.fetch_add(1, Relaxed);
-                        if i >= copy_tasks_ref.len() {
-                            break;
-                        }
-                        match &copy_tasks_ref[i] {
-                            CopyTask::Worker {
-                                worker_id,
-                                src_offset,
-                                dst_offset,
-                                len,
-                            } => {
-                                if *len == 0 {
-                                    continue;
-                                }
-                                scratch.resize(*len, 0);
-
-                                let t_rd = Instant::now();
-                                worker_files_ref[*worker_id as usize]
-                                    .read_exact_at(&mut scratch, *src_offset)
-                                    .map_err(|e| format!(
-                                        "pread worker {worker_id} task {i}: {e}",
-                                    ))?;
-                                read_ms_ref
-                                    .fetch_add(t_rd.elapsed().as_millis() as u64, Relaxed);
-
-                                let t_wr = Instant::now();
-                                output_file_ref
-                                    .write_all_at(&scratch, *dst_offset)
-                                    .map_err(|e| format!(
-                                        "pwrite coord_payloads worker {worker_id} task {i}: {e}",
-                                    ))?;
-                                write_ms_ref
-                                    .fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
-                            }
-                            CopyTask::Straddler { dst_offset, bytes } => {
-                                if bytes.is_empty() {
-                                    continue;
-                                }
-                                let t_wr = Instant::now();
-                                output_file_ref
-                                    .write_all_at(bytes, *dst_offset)
-                                    .map_err(|e| format!(
-                                        "pwrite coord_payloads straddler task {i}: {e}",
-                                    ))?;
-                                write_ms_ref
-                                    .fetch_add(t_wr.elapsed().as_millis() as u64, Relaxed);
-                            }
-                        }
-                    }
-                    Ok(())
-                });
-                handles.push(handle);
-            }
-
-            for handle in handles {
-                match handle.join() {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(payload) => {
-                        let msg = if let Some(s) = payload.downcast_ref::<&str>() {
-                            format!("finalize worker thread panicked: {s}")
-                        } else if let Some(s) = payload.downcast_ref::<String>() {
-                            format!("finalize worker thread panicked: {s}")
-                        } else {
-                            "finalize worker thread panicked (unknown payload)".to_string()
-                        };
-                        return Err(msg.into());
-                    }
-                }
-            }
-            Ok(())
-        })?;
-    }
-
-    stats.read_ms = read_ms.load(Relaxed);
-    stats.write_ms = write_ms.load(Relaxed);
-
-    let mut header_buf: Vec<u8> = Vec::with_capacity(header_size as usize);
-    header_buf.extend_from_slice(&(num_way_blobs as u64).to_le_bytes());
-    header_buf.extend_from_slice(&payload_pos.to_le_bytes());
-    for &off in &blob_offsets {
-        header_buf.extend_from_slice(&off.to_le_bytes());
-    }
-    debug_assert_eq!(header_buf.len() as u64, header_size);
-    debug_assert_eq!(blob_offsets.len(), num_way_blobs + 1);
-
-    output_file
-        .write_all_at(&header_buf, 0)
-        .map_err(|e| format!("pwrite coord_payloads header: {e}"))?;
-    output_file
-        .sync_data()
-        .map_err(|e| format!("sync coord_payloads: {e}"))?;
-
     #[allow(clippy::cast_possible_truncation)]
     {
-        stats.finalize_ms = t_all.elapsed().as_millis() as u64;
+        stats.build_ms = t_all.elapsed().as_millis() as u64;
     }
 
     #[allow(clippy::cast_possible_wrap)]
     {
-        crate::debug::emit_counter("s3_integrated_finalize_encode_ms", stats.encode_ms as i64);
-        crate::debug::emit_counter("s3_integrated_finalize_read_ms", stats.read_ms as i64);
-        crate::debug::emit_counter("s3_integrated_finalize_write_ms", stats.write_ms as i64);
-        crate::debug::emit_counter("s3_integrated_output_bytes", stats.output_bytes as i64);
-        crate::debug::emit_counter("s3_integrated_straddler_count", stats.num_straddlers as i64);
+        crate::debug::emit_counter("s3_router_build_ms", stats.build_ms as i64);
+        crate::debug::emit_counter("s3_router_num_way_blobs", stats.num_way_blobs as i64);
+        crate::debug::emit_counter("s3_router_num_straddlers", stats.num_straddlers as i64);
+        crate::debug::emit_counter("s3_router_num_worker", stats.num_worker as i64);
+        crate::debug::emit_counter("s3_router_num_empty", stats.num_empty as i64);
+        crate::debug::emit_counter("s3_router_straddler_bytes", stats.straddler_bytes as i64);
+        crate::debug::emit_counter("s3_router_worker_bytes", stats.worker_bytes as i64);
     }
-    crate::debug::emit_marker("COORD_PAYLOADS_FINALIZE_END");
+    crate::debug::emit_marker("COORD_PAYLOADS_ROUTER_BUILD_END");
 
-    Ok(stats)
+    Ok((BlobLocationRouter { worker_files, locations }, stats))
 }
 
 const _: () = {
@@ -681,81 +570,6 @@ pub(super) fn encode_blob_payload_from_record(
         ));
     }
     Ok(())
-}
-
-/// Reader for `coord_payloads`. Holds the file handle + offset table in
-/// memory (`~ 140 KB` at planet scale; trivial).
-pub(super) struct CoordPayloadsReader {
-    file: std::fs::File,
-    /// Byte offset of blob i's payload within the file. blob_offsets.len()
-    /// == num_way_blobs + 1; blob i's payload spans
-    /// `[blob_offsets[i], blob_offsets[i+1])`.
-    blob_offsets: Vec<u64>,
-    payload_base: u64,
-}
-
-impl CoordPayloadsReader {
-    pub(super) fn open(path: &Path, expected_num_blobs: usize) -> Result<Self> {
-        use std::io::Read as _;
-        let mut file = std::fs::File::open(path)
-            .map_err(|e| format!("open coord_payloads: {e}"))?;
-        let mut hdr = [0u8; 16];
-        file.read_exact(&mut hdr)
-            .map_err(|e| format!("read coord_payloads header: {e}"))?;
-        let num_way_blobs = u64::from_le_bytes([
-            hdr[0], hdr[1], hdr[2], hdr[3], hdr[4], hdr[5], hdr[6], hdr[7],
-        ]);
-        let total_payload_bytes = u64::from_le_bytes([
-            hdr[8], hdr[9], hdr[10], hdr[11], hdr[12], hdr[13], hdr[14], hdr[15],
-        ]);
-        #[allow(clippy::cast_possible_truncation)]
-        let n = num_way_blobs as usize;
-        if n != expected_num_blobs {
-            return Err(format!(
-                "coord_payloads num_way_blobs={n} != expected {expected_num_blobs}"
-            )
-            .into());
-        }
-        let mut offsets_bytes = vec![0u8; (n + 1) * 8];
-        file.read_exact(&mut offsets_bytes)
-            .map_err(|e| format!("read coord_payloads offsets: {e}"))?;
-        let mut blob_offsets: Vec<u64> = Vec::with_capacity(n + 1);
-        for chunk in offsets_bytes.chunks_exact(8) {
-            blob_offsets.push(u64::from_le_bytes([
-                chunk[0], chunk[1], chunk[2], chunk[3],
-                chunk[4], chunk[5], chunk[6], chunk[7],
-            ]));
-        }
-        if blob_offsets[n] != total_payload_bytes {
-            return Err(format!(
-                "coord_payloads trailing offset {} != total_payload_bytes {}",
-                blob_offsets[n], total_payload_bytes
-            )
-            .into());
-        }
-        let payload_base: u64 = 16 + ((n as u64) + 1) * 8;
-        Ok(Self {
-            file,
-            blob_offsets,
-            payload_base,
-        })
-    }
-
-    /// Read blob `blob_idx`'s payload into `buf` (resized to exact length).
-    pub(super) fn pread_blob_payload(&self, blob_idx: usize, buf: &mut Vec<u8>) -> Result<()> {
-        use std::os::unix::fs::FileExt as _;
-        let start = self.blob_offsets[blob_idx];
-        let end = self.blob_offsets[blob_idx + 1];
-        #[allow(clippy::cast_possible_truncation)]
-        let len = (end - start) as usize;
-        buf.resize(len, 0);
-        if len > 0 {
-            self.file
-                .read_exact_at(buf, self.payload_base + start)
-                .map_err(|e| format!("pread coord_payloads blob {blob_idx}: {e}"))?;
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -947,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn finalize_coord_payloads_happy_path() {
+    fn router_build_happy_path() {
         // 4 blobs:
         //   blob 0: 2 ways [2,1] refs — fully-contained in worker 0
         //   blob 1: 1 way [3] refs   — fully-contained in worker 1
@@ -1001,36 +815,36 @@ mod tests {
             })
             .collect();
 
-        let output_path = tmp_dir.path().join("coord_payloads");
-        let stats = finalize_coord_payloads(
-            &output_path,
+        let (router, stats) = build_blob_location_router(
             &per_way_rcs,
             worker_manifests,
             &[w0_path, w1_path],
             straddler_slots,
-        ).expect("finalize");
+        )
+        .expect("router build");
         assert_eq!(stats.num_way_blobs, 4);
         assert_eq!(stats.num_straddlers, 1);
+        assert_eq!(stats.num_worker, 2);
+        assert_eq!(stats.num_empty, 1);
 
-        let reader = CoordPayloadsReader::open(&output_path, 4).expect("open reader");
         let mut buf: Vec<u8> = Vec::new();
 
-        reader.pread_blob_payload(0, &mut buf).expect("pread 0");
+        router.pread_blob_payload(0, &mut buf).expect("pread 0");
         assert_eq!(reconstruct_coords(&buf, rcs_b0), coords_b0);
 
-        reader.pread_blob_payload(1, &mut buf).expect("pread 1");
+        router.pread_blob_payload(1, &mut buf).expect("pread 1");
         assert_eq!(reconstruct_coords(&buf, rcs_b1), coords_b1);
 
-        reader.pread_blob_payload(2, &mut buf).expect("pread 2");
+        router.pread_blob_payload(2, &mut buf).expect("pread 2");
         assert_eq!(reconstruct_coords(&buf, rcs_b2), coords_b2);
 
         // blob 3: zero refs — payload is empty.
-        reader.pread_blob_payload(3, &mut buf).expect("pread 3");
+        router.pread_blob_payload(3, &mut buf).expect("pread 3");
         assert!(buf.is_empty(), "zero-ref blob payload must be empty");
     }
 
     #[test]
-    fn finalize_coord_payloads_missing_half_error() {
+    fn router_build_missing_half_error() {
         let per_way_rcs = make_per_way_rcs(&[&[1]]);
         let tmp_dir = tempfile::tempdir().expect("tempdir");
         let w0_path = tmp_dir.path().join("payloads-W0");
@@ -1040,16 +854,17 @@ mod tests {
             std::sync::Mutex::new(Some(StraddlerSlot::Left(vec![0u8; 8]))),
         ];
 
-        let output_path = tmp_dir.path().join("coord_payloads");
-        let result = finalize_coord_payloads(
-            &output_path,
+        let result = build_blob_location_router(
             &per_way_rcs,
             vec![vec![]],
             &[w0_path],
             straddler_slots,
         );
-        assert!(result.is_err(), "expected Err for missing right half");
-        let msg = format!("{}", result.expect_err("err"));
+        let err = match result {
+            Ok(_) => panic!("expected Err for missing right half"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
         assert!(msg.contains("missing right half"), "error message: {msg}");
     }
 }

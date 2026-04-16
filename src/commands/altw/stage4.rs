@@ -106,7 +106,7 @@ pub(super) fn stage4_assembly(
     input: &Path,
     output: &Path,
     blob_meta: &[BlobMeta],
-    coord_payloads_reader: &super::coord_payloads::CoordPayloadsReader,
+    coord_payloads_reader: &super::coord_payloads::BlobLocationRouter,
     per_way_rcs: &super::coord_payloads::PerWayRcs,
     way_slot_starts: &[u64],
     keep_untagged_nodes: bool,

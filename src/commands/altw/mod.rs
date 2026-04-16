@@ -276,8 +276,6 @@ pub fn external_join(
         crate::debug::emit_counter("extjoin_total_rank_shard_files", total_rank_shard_files as i64);
     }
 
-    let coord_payloads_path = scratch_dir.file_path("coord_payloads");
-
     crate::debug::emit_marker("EXTJOIN_STAGE2_START");
     let (s2_minflt_before, s2_majflt_before) = crate::debug::read_page_faults();
     let slot_buckets = SlotBuckets::create(&scratch_dir, slot_bucket_count)?;
@@ -377,23 +375,22 @@ pub fn external_join(
     }
     crate::debug::emit_marker("EXTJOIN_STAGE3_END");
 
-    let finalize_stats = coord_payloads::finalize_coord_payloads(
-        &coord_payloads_path,
+    let (coord_router, router_stats) = coord_payloads::build_blob_location_router(
         &per_way_rcs,
         s3_result.worker_manifests,
         &worker_tmp_paths,
         straddler_slots,
     )?;
     eprintln!(
-        "[coord_payloads] finalize {} ms (enc {} rd {} wr {}), \
-         output {} MB, straddlers {}, blobs {}",
-        finalize_stats.finalize_ms,
-        finalize_stats.encode_ms,
-        finalize_stats.read_ms,
-        finalize_stats.write_ms,
-        finalize_stats.output_bytes / 1_000_000,
-        finalize_stats.num_straddlers,
-        finalize_stats.num_way_blobs,
+        "[coord_payloads] router {} ms, {} way blobs ({} worker / {} straddler / {} empty), \
+         {} MB in worker tmps + {} KB straddler bytes in RAM",
+        router_stats.build_ms,
+        router_stats.num_way_blobs,
+        router_stats.num_worker,
+        router_stats.num_straddlers,
+        router_stats.num_empty,
+        router_stats.worker_bytes / 1_000_000,
+        router_stats.straddler_bytes / 1_000,
     );
     let stage4_per_way_rcs = per_way_rcs;
 
@@ -414,19 +411,13 @@ pub fn external_join(
         Some(ids)
     };
 
-    let num_way_blobs = way_slot_starts.len();
-    let coord_payloads_reader = coord_payloads::CoordPayloadsReader::open(
-        &coord_payloads_path,
-        num_way_blobs,
-    )?;
-
     crate::debug::emit_marker("EXTJOIN_STAGE4_START");
     let (s4_minflt_before, s4_majflt_before) = crate::debug::read_page_faults();
     let mut stats = stage4_assembly(
         input,
         output,
         &blob_meta,
-        &coord_payloads_reader,
+        &coord_router,
         &stage4_per_way_rcs,
         way_slot_starts.as_slice(),
         keep_untagged_nodes,

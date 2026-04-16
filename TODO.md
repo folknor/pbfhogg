@@ -1,5 +1,19 @@
 # pbfhogg TODO
 
+## Active optimization plans (high priority)
+
+Four planet-scale command plans are in notes, each with a ranked set of opportunities and a plan of attack. Read the plan before touching the command.
+
+- [ ] **[notes/altw-as-renumber.md](notes/altw-as-renumber.md)** — `add-locations-to-ways --index-type external`. Current: **867 s / ~16.7 GB anon** at planet. Target: **250–400 s / ~20 GB RSS**. Ground-up reshape from 4-stage external sort (3 disk-materialized intermediates, ~247 GB scratch) to renumber's 3-pass linear shape with a 16 GB in-RAM coord table. Deletes most of `src/commands/altw/`.
+
+- [ ] **[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)** — `build-geocode-index`. Current: **1346 s / 14.59 GB RSS** at planet. Target: **~10–12 min / same RSS**. Single-threaded Pass 2 is the dominant phase; `mallopt(M_ARENA_MAX, 2)` + parallel node/way split unlocks it. Plus parallelizing Pass 3 stage B and fusing fine+coarse cell computation.
+
+- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** — `check --refs`. Current: **1254 s / 1.8 GB RSS** at planet. Target: **~6–10 min / ~2 GB RSS**. ~30-line diff: swap three `RoaringTreemap`s for `IdSetDense`. Profiling diagnosis already in the source; the author reached for the wrong container. Parallelization as a renumber-shaped three-phase scan is a secondary follow-up.
+
+- [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** — `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9–10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining — `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
+
+Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
+
 ## Important: ignored tests
 
 `roundtrip_denmark` in `tests/roundtrip_real.rs` is `#[ignore]` — it roundtrips the entire

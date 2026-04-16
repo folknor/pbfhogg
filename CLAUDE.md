@@ -26,6 +26,8 @@ brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg
 
 `--stop MARKER` requires a measured mode. Kills process after the named marker. Example: `brokkr renumber --dataset planet --bench 1 --stop RENUMBER_EXT_STAGE2D_END`.
 
+Markers are point-in-time bookmarks — the FIFO protocol is `<timestamp_us> <name>` per marker, nothing else. brokkr's `--timeline --summary` segments the stream between consecutive markers; `--markers --durations` is the one view that opts into the `FOO_START` / `FOO_END` pairing convention for duration math.
+
 `--bench N` runs N times, stores best. Default `--bench 3`. Requires clean git tree (ignoring `*.md` and `.brokkr/results.db`); `--force` overrides (results not stored).
 
 I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--force` is a top-level flag before the subcommand.

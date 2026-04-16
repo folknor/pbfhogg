@@ -443,7 +443,7 @@ fn process_batch(
                         tagdata.as_deref(),
                     )
                     .map_err(|e| e.to_string())?;
-                    framed.push(blob);
+                    framed.push(blob.into_vec());
                 }
                 Ok((framed, count))
             },

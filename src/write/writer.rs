@@ -124,10 +124,14 @@ impl FromStr for Compression {
     }
 }
 
-/// Payload for the writer pipeline channel.
-pub(crate) enum PipelinePayload {
-    /// Framed blob bytes ready to write.
-    Framed(io::Result<Vec<u8>>),
+/// One unit of output the writer thread can consume, independent of backend.
+///
+/// `Framed` is the common case (a compressed `OSMData` blob). `Raw` and
+/// `RawChunks` carry pre-framed bytes (passthrough). `CopyRange` asks the
+/// backend to splice bytes from another fd via `copy_file_range`.
+pub(crate) enum OutputChunk {
+    /// Framed blob parts, not yet concatenated.
+    Framed(FramedBlobParts),
     /// Pre-framed raw blob bytes.
     Raw(Vec<u8>),
     /// Multiple framed blob chunks, written sequentially. Avoids
@@ -142,10 +146,131 @@ pub(crate) enum PipelinePayload {
     },
 }
 
-/// A framed blob with its sequence number, ready for the writer thread.
+/// The three owned parts of a framed blob:
+/// `4 B big-endian header_len | BlobHeader | Blob protobuf body`.
+///
+/// Kept split so backends that support scatter-gather I/O can issue one
+/// `writev` without an intermediate concat, while backends that need a
+/// single buffer flatten locally via [`into_vec`](Self::into_vec).
+pub(crate) struct FramedBlobParts {
+    pub(crate) prefix: [u8; 4],
+    pub(crate) header: Vec<u8>,
+    pub(crate) blob: Vec<u8>,
+}
+
+impl FramedBlobParts {
+    pub(crate) fn total_len(&self) -> u64 {
+        (self.prefix.len() + self.header.len() + self.blob.len()) as u64
+    }
+
+    /// Flatten the three parts into a single owned `Vec<u8>`.
+    ///
+    /// Compatibility escape hatch for callers that want one contiguous buffer.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        let total_len = self.prefix.len() + self.header.len() + self.blob.len();
+        let mut out = Vec::with_capacity(total_len);
+        out.extend_from_slice(&self.prefix);
+        out.extend_from_slice(&self.header);
+        out.extend_from_slice(&self.blob);
+        out
+    }
+}
+
+/// A chunk with its sequence number, ready for the writer thread.
+///
+/// `data` is `io::Result<OutputChunk>` because framing runs on rayon workers
+/// and may fail asynchronously — the error is propagated in order via the
+/// reorder buffer so the writer thread surfaces it at the correct position.
 pub(crate) struct PipelineItem {
     pub(crate) seq: usize,
-    pub(crate) data: PipelinePayload,
+    pub(crate) data: io::Result<OutputChunk>,
+}
+
+/// A sink that consumes ordered [`OutputChunk`]s and writes them to a backend.
+///
+/// Each backend is free to flatten, batch, or scatter-gather as it sees fit —
+/// the pipeline machinery only cares about ordering and error propagation.
+pub(crate) trait OutputSink {
+    fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+/// Default sink that wraps a [`FileWriter`] (buffered or O_DIRECT).
+///
+/// Flattens `Framed` chunks via [`FramedBlobParts::into_vec`] before handing
+/// them to the underlying writer. Step 2 of the write-path plan adds a sibling
+/// sink that issues real `writev` syscalls instead.
+pub(crate) struct FileOutputSink {
+    writer: FileWriter,
+}
+
+impl FileOutputSink {
+    pub(crate) fn new(writer: FileWriter) -> Self {
+        Self { writer }
+    }
+}
+
+impl OutputSink for FileOutputSink {
+    fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()> {
+        match chunk {
+            OutputChunk::Framed(parts) => {
+                let len = parts.total_len();
+                let bytes = parts.into_vec();
+                let t_write = std::time::Instant::now();
+                self.writer.write_all(&bytes)?;
+                WRITER_METRICS
+                    .write_ns
+                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                Ok(())
+            }
+            OutputChunk::Raw(bytes) => {
+                let len = bytes.len() as u64;
+                let t_write = std::time::Instant::now();
+                self.writer.write_all(&bytes)?;
+                WRITER_METRICS
+                    .write_ns
+                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                Ok(())
+            }
+            OutputChunk::RawChunks(chunks) => {
+                let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                let t_write = std::time::Instant::now();
+                for chunk in &chunks {
+                    self.writer.write_all(chunk)?;
+                }
+                WRITER_METRICS
+                    .write_ns
+                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
+                Ok(())
+            }
+            #[cfg(feature = "linux-direct-io")]
+            OutputChunk::CopyRange { in_fd, offset, len } => {
+                let t_write = std::time::Instant::now();
+                let out_fd = self
+                    .writer
+                    .flush_and_raw_fd()?
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            "copy_file_range incompatible with O_DIRECT output",
+                        )
+                    })?;
+                copy_range(in_fd, out_fd, offset, len)?;
+                WRITER_METRICS
+                    .write_ns
+                    .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                Ok(())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.writer.flush()
+    }
 }
 
 /// Write pipeline state — active when using pipelined mode.
@@ -353,9 +478,9 @@ impl PbfWriter<FileWriter> {
         let framed_header = frame_blob("OSMHeader", header_block_bytes, &compression, None)?;
         writer.write_all(&framed_header)?;
 
-        // Spawn the writer thread and hand it the writer.
+        // Spawn the writer thread and hand it the writer wrapped in a sink.
         let (tx, rx) = sync_channel(WRITE_AHEAD);
-        let handle = std::thread::spawn(move || writer_thread(rx, writer));
+        let handle = std::thread::spawn(move || writer_thread(rx, FileOutputSink::new(writer)));
 
         let (permit_tx, permit_rx) = new_permit_pool();
         Ok(PbfWriter {
@@ -445,14 +570,17 @@ impl<W: Write> PbfWriter<W> {
                         scratch,
                     )
                 });
-                if let Ok(ref bytes) = result {
+                if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
                     WRITER_METRICS
                         .payload_framed_bytes
-                        .fetch_add(bytes.len() as u64, Relaxed);
+                        .fetch_add(parts.total_len(), Relaxed);
                 }
                 let t_send = std::time::Instant::now();
-                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Framed(result) }));
+                drop(tx.send(PipelineItem {
+                    seq,
+                    data: result.map(OutputChunk::Framed),
+                }));
                 record_send_wait(t_send);
                 // Release the permit so the main thread can dispatch more
                 // work. Must happen AFTER `tx.send` above so the in-flight
@@ -521,14 +649,17 @@ impl<W: Write> PbfWriter<W> {
                         scratch,
                     )
                 });
-                if let Ok(ref bytes) = result {
+                if let Ok(ref parts) = result {
                     WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
                     WRITER_METRICS
                         .payload_framed_bytes
-                        .fetch_add(bytes.len() as u64, Relaxed);
+                        .fetch_add(parts.total_len(), Relaxed);
                 }
                 let t_send = std::time::Instant::now();
-                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Framed(result) }));
+                drop(tx.send(PipelineItem {
+                    seq,
+                    data: result.map(OutputChunk::Framed),
+                }));
                 record_send_wait(t_send);
                 // Failure here means the main thread already dropped its
                 // receiver (shutting down); safe to ignore.
@@ -566,7 +697,7 @@ impl<W: Write> PbfWriter<W> {
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::Raw(raw_framed_bytes.to_vec()),
+                    data: Ok(OutputChunk::Raw(raw_framed_bytes.to_vec())),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             record_send_wait(t_send);
@@ -595,7 +726,7 @@ impl<W: Write> PbfWriter<W> {
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::Raw(raw_framed_bytes),
+                    data: Ok(OutputChunk::Raw(raw_framed_bytes)),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             record_send_wait(t_send);
@@ -624,7 +755,7 @@ impl<W: Write> PbfWriter<W> {
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::RawChunks(chunks),
+                    data: Ok(OutputChunk::RawChunks(chunks)),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             record_send_wait(t_send);
@@ -794,7 +925,7 @@ impl PbfWriter<FileWriter> {
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::CopyRange { in_fd, offset, len },
+                    data: Ok(OutputChunk::CopyRange { in_fd, offset, len }),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
             record_send_wait(t_send);
@@ -817,19 +948,18 @@ impl PbfWriter<FileWriter> {
     }
 }
 
-/// Writer thread: receives framed blobs and writes them in sequence order.
+/// Writer thread: receives [`OutputChunk`]s and hands them to the sink in
+/// sequence order.
 ///
 /// Uses a shared sequence-number reorder buffer to handle out-of-order
-/// arrivals from parallel rayon tasks.
-///
-/// Specialized to `FileWriter` (not generic `W: Write`) to support
-/// `CopyRange` payloads that require `flush_and_raw_fd()`.
-#[allow(clippy::needless_pass_by_value)] // Thread entry point owns the writer moved into std::thread::spawn.
-fn writer_thread(
+/// arrivals from parallel rayon tasks. Framing errors produced on rayon
+/// workers are propagated in order via `io::Result<OutputChunk>`.
+#[allow(clippy::needless_pass_by_value)] // Thread entry point owns the sink moved into std::thread::spawn.
+fn writer_thread<S: OutputSink>(
     rx: std::sync::mpsc::Receiver<PipelineItem>,
-    mut writer: FileWriter,
+    mut sink: S,
 ) -> io::Result<()> {
-    let mut pending: ReorderBuffer<PipelinePayload> =
+    let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
@@ -845,60 +975,13 @@ fn writer_thread(
         WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
         // Drain consecutive ready items from the front.
-        while let Some(payload) = pending.pop_ready() {
-            match payload {
-                PipelinePayload::Framed(result) => {
-                    let bytes = result?;
-                    let len = bytes.len() as u64;
-                    let t_write = std::time::Instant::now();
-                    writer.write_all(&bytes)?;
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-                PipelinePayload::Raw(bytes) => {
-                    let len = bytes.len() as u64;
-                    let t_write = std::time::Instant::now();
-                    writer.write_all(&bytes)?;
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-                PipelinePayload::RawChunks(chunks) => {
-                    let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
-                    let t_write = std::time::Instant::now();
-                    for chunk in &chunks {
-                        writer.write_all(chunk)?;
-                    }
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
-                    WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
-                }
-                #[cfg(feature = "linux-direct-io")]
-                PipelinePayload::CopyRange { in_fd, offset, len } => {
-                    let t_write = std::time::Instant::now();
-                    let out_fd = writer
-                        .flush_and_raw_fd()?
-                        .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::Unsupported,
-                                "copy_file_range incompatible with O_DIRECT output",
-                            )
-                        })?;
-                    copy_range(in_fd, out_fd, offset, len)?;
-                    WRITER_METRICS
-                        .write_ns
-                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
-                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
-                }
-            }
+        while let Some(result) = pending.pop_ready() {
+            let chunk = result?;
+            sink.write_chunk(chunk)?;
         }
     }
 
-    writer.flush()?;
+    sink.flush()?;
     Ok(())
 }
 
@@ -1001,7 +1084,15 @@ pub(crate) fn frame_blob(
     indexdata: Option<&[u8]>,
 ) -> io::Result<Vec<u8>> {
     let mut scratch = FrameScratch::new();
-    frame_blob_into(blob_type, uncompressed, compression, indexdata, None, &mut scratch)
+    Ok(frame_blob_into(
+        blob_type,
+        uncompressed,
+        compression,
+        indexdata,
+        None,
+        &mut scratch,
+    )?
+    .into_vec())
 }
 
 /// Compress and frame a blob using per-thread scratch buffers.
@@ -1014,7 +1105,7 @@ pub(crate) fn frame_blob_pipelined(
     compression: &Compression,
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<FramedBlobParts> {
     PIPELINE_SCRATCH.with_borrow_mut(|scratch| {
         frame_blob_into("OSMData", uncompressed, compression, indexdata, tagdata, scratch)
     })
@@ -1040,7 +1131,7 @@ fn frame_blob_into(
     indexdata: Option<&[u8]>,
     tagdata: Option<&[u8]>,
     scratch: &mut FrameScratch,
-) -> io::Result<Vec<u8>> {
+) -> io::Result<FramedBlobParts> {
     let t_compress = std::time::Instant::now();
     encode_blob_body(uncompressed, compression, scratch)?;
     WRITER_METRICS
@@ -1056,10 +1147,6 @@ fn frame_blob_into(
     let header_len = u32::try_from(scratch.header_buf.len())
         .map_err(|_| io::Error::other(format!("header too large: {} bytes", scratch.header_buf.len())))?;
     let total_len = 4 + scratch.header_buf.len() + scratch.blob_buf.len();
-    let mut out = Vec::with_capacity(total_len);
-    out.extend_from_slice(&header_len.to_be_bytes());
-    out.extend_from_slice(&scratch.header_buf);
-    out.extend_from_slice(&scratch.blob_buf);
     WRITER_METRICS
         .frame_ns
         .fetch_add(elapsed_ns_u64(t_frame), Relaxed);
@@ -1067,7 +1154,16 @@ fn frame_blob_into(
         .bytes_framed
         .fetch_add(total_len as u64, Relaxed);
 
-    Ok(out)
+    let mut header = Vec::new();
+    let mut blob = Vec::new();
+    std::mem::swap(&mut header, &mut scratch.header_buf);
+    std::mem::swap(&mut blob, &mut scratch.blob_buf);
+
+    Ok(FramedBlobParts {
+        prefix: header_len.to_be_bytes(),
+        header,
+        blob,
+    })
 }
 
 /// Encode the Blob protobuf body (optionally compressed) into scratch buffers.

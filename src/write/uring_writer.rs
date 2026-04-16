@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use crate::write::writer::{PipelineItem, PipelinePayload, WRITE_AHEAD};
+use crate::write::writer::{OutputChunk, PipelineItem, WRITE_AHEAD};
 use io_uring::opcode;
 use io_uring::types::Fixed;
 use io_uring::IoUring;
@@ -713,7 +713,7 @@ fn uring_main_loop(
     rx: &Receiver<PipelineItem>,
     state: &mut UringState,
 ) -> io::Result<()> {
-    let mut pending: ReorderBuffer<PipelinePayload> =
+    let mut pending: ReorderBuffer<io::Result<OutputChunk>> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 
     loop {
@@ -729,10 +729,13 @@ fn uring_main_loop(
         WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
         // Drain consecutive ready items from the front.
-        while let Some(payload) = pending.pop_ready() {
-            match payload {
-                PipelinePayload::Framed(result) => {
-                    let bytes = result?;
+        while let Some(result) = pending.pop_ready() {
+            let chunk = result?;
+            match chunk {
+                OutputChunk::Framed(parts) => {
+                    // io_uring backend flattens at the backend boundary
+                    // (registered-buffer copy is backend-local).
+                    let bytes = parts.into_vec();
                     let len = bytes.len() as u64;
                     let t_write = std::time::Instant::now();
                     state.write(&bytes)?;
@@ -741,7 +744,7 @@ fn uring_main_loop(
                         .fetch_add(elapsed_ns_u64(t_write), Relaxed);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
-                PipelinePayload::Raw(bytes) => {
+                OutputChunk::Raw(bytes) => {
                     let len = bytes.len() as u64;
                     let t_write = std::time::Instant::now();
                     state.write(&bytes)?;
@@ -750,7 +753,7 @@ fn uring_main_loop(
                         .fetch_add(elapsed_ns_u64(t_write), Relaxed);
                     WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
-                PipelinePayload::RawChunks(chunks) => {
+                OutputChunk::RawChunks(chunks) => {
                     let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
                     let t_write = std::time::Instant::now();
                     for chunk in &chunks {
@@ -762,7 +765,7 @@ fn uring_main_loop(
                     WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
                 #[cfg(feature = "linux-direct-io")]
-                PipelinePayload::CopyRange { in_fd, offset, len } => {
+                OutputChunk::CopyRange { in_fd, offset, len } => {
                     let t_write = std::time::Instant::now();
                     handle_copy_range_uring(state, in_fd, offset, len)?;
                     WRITER_METRICS

@@ -265,7 +265,7 @@ Consolidated from all three reports:
 ### Benchmark plan for #1 (epoch-spill default)
 
 1. Remove `parse_epoch_env()`. Auto-compute `num_epochs` from `/proc/meminfo`, or hardcode `num_epochs = 4` initially. Delete `SlotBuckets`, `SharedSlotBuckets`, `stage2_node_join`, and the disk-path `else` branch in `mod.rs`. Keep `prepare_bucket` and `LoaderScratch`.
-2. Correctness gate: `brokkr verify add-locations-to-ways --dataset denmark` — **semantic parity, not MD5-only**.
+2. Correctness gate: semantic Denmark parity, not MD5-only parity. Use direct output comparison / semantic diff as the primary gate; `brokkr verify add-locations-to-ways --dataset denmark` is optional extra signal only, because ALTW has accepted deviations from `osmium` and the verify harness is expensive.
 3. Europe is the real gate (not Japan): `brokkr add-locations-to-ways --dataset europe --index-type external --bench 3` against current main via `brokkr results --compare`.
 4. Key metrics: total wall, peak RSS, scratch disk usage, per-stage marker durations, old downstream slice equivalence, new `s4_send_ms`, eliminated `s3_integrated_finalize_*`, eliminated `s4_coord_payload_pread_ms`, new payload reorder-depth/high-water.
 5. **Keep if** Europe total wall improves clearly — thresholds from the three reviewers: ≥5% Europe wall (R1), ≥10s wall (R2), improves-or-neutral with peak RSS ≤ ~10 GB (R3). If flat or worse, check whether auto-tuned epoch count is suboptimal — try manual E=2 for Europe as a diagnostic before reverting. If structurally broken, revert cleanly with diagnostic data.
@@ -273,7 +273,7 @@ Consolidated from all three reports:
 
 ### Benchmark plan for #2 (streaming stage 3 → stage 4)
 
-Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark correctness (semantic). Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up — roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse. Evaluate under `zstd:1` (or `compression:none`) as well — see writer-ceiling diagnostic.
+Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark semantic correctness/parity first. Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up — roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse. Evaluate under `zstd:1` (or `compression:none`) as well — see writer-ceiling diagnostic.
 
 ---
 
@@ -287,7 +287,7 @@ Apply when implementing any of the opportunities above:
 - **`#[hotpath::measure]` on functions > 1 ms wall** so they show in `--hotpath` profiles.
 - **Worker count convention.** `available_parallelism() - 2 max 1 min 4`, often `.min(6)`. The `-2` reserves cores for the consumer + writer threads. Any tuning that changes this must justify why.
 - **Counter naming.** `s<stage><phase>_<thing>_ms` / `_bytes` / `_calls`. Stage-scoped prefix keeps grep/history readable.
-- **Env-var-gated prototype pattern.** `stage23_epoch.rs` is the reference shape: parallel file, gated in `mod.rs` by env var check, one-commit delete on shelving. Use for any item that wants a short-lived fallback during rollout. **But:** the lesson from the old plan is that shipping a prototype behind a flag and shelving it on a narrow probe does not falsify the underlying idea. Prefer the proper rewrite over the env-var-gated prototype once the direction is clear.
+- **Prototype discipline.** Prefer full coherent branch rewrites with keep/revert benchmarking over env-var-gated probes. If a temporary fallback is unavoidable during rollout, keep it short-lived and delete it as soon as the decision is made. The old plan showed that narrow env-var probes created codebase pollution and often failed to answer the real structural question.
 
 ---
 

@@ -19,11 +19,23 @@ use super::should_sync_all;
 use super::writer::{OutputChunk, OutputSink};
 
 /// Byte threshold (~1 MiB). Flushes when the accumulated chunks reach this.
+/// Override at runtime via `PBFHOGG_WRITE_VECTORED_BYTES` (0 = disabled).
 const DEFAULT_FLUSH_BYTES: usize = 1 << 20;
 
 /// Frame threshold. Kept well below `IOV_MAX / 3` so even three-slice
 /// `Framed` chunks never exceed the kernel's iovec limit in one batch.
+/// Override at runtime via `PBFHOGG_WRITE_VECTORED_FRAMES` (0 = disabled).
 const DEFAULT_FLUSH_FRAMES: usize = 256;
+
+/// Read a `usize` from an environment variable, falling back to `default` on
+/// missing or unparseable values. A value of 0 signals "disabled" — the
+/// caller is expected to translate that into `usize::MAX`.
+fn read_usize_env(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
 
 fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -39,12 +51,24 @@ pub(crate) struct BatchedBufferedSink {
 
 impl BatchedBufferedSink {
     pub(crate) fn new(file: File) -> Self {
+        let bytes = read_usize_env("PBFHOGG_WRITE_VECTORED_BYTES", DEFAULT_FLUSH_BYTES);
+        let frames = read_usize_env("PBFHOGG_WRITE_VECTORED_FRAMES", DEFAULT_FLUSH_FRAMES);
+        // 0 disables the threshold. At least one must stay finite, otherwise
+        // `flush_batch` would only run on drain — document that by clamping
+        // the frame threshold up to 1 if both env vars are 0.
+        let flush_threshold_bytes = if bytes == 0 { usize::MAX } else { bytes };
+        let flush_threshold_frames = match (frames, bytes) {
+            (0, 0) => 1,
+            (0, _) => usize::MAX,
+            (n, _) => n,
+        };
+        let initial_capacity = flush_threshold_frames.min(4096);
         Self {
             file,
-            pending: Vec::with_capacity(DEFAULT_FLUSH_FRAMES),
+            pending: Vec::with_capacity(initial_capacity),
             pending_bytes: 0,
-            flush_threshold_bytes: DEFAULT_FLUSH_BYTES,
-            flush_threshold_frames: DEFAULT_FLUSH_FRAMES,
+            flush_threshold_bytes,
+            flush_threshold_frames,
         }
     }
 

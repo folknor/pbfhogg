@@ -1154,15 +1154,14 @@ fn frame_blob_into(
         .bytes_framed
         .fetch_add(total_len as u64, Relaxed);
 
-    let mut header = Vec::new();
-    let mut blob = Vec::new();
-    std::mem::swap(&mut header, &mut scratch.header_buf);
-    std::mem::swap(&mut blob, &mut scratch.blob_buf);
-
+    // Clone (not swap) so `scratch.header_buf` / `scratch.blob_buf` retain
+    // their high-water capacity across blobs. Swap would leave the scratch
+    // with empty Vecs, forcing both buffers to re-grow from zero on every
+    // subsequent blob — breaking the reuse invariant documented above.
     Ok(FramedBlobParts {
         prefix: header_len.to_be_bytes(),
-        header,
-        blob,
+        header: scratch.header_buf.clone(),
+        blob: scratch.blob_buf.clone(),
     })
 }
 

@@ -1,382 +1,241 @@
-## Report 1
+# ALTW External-Join: Structural Opportunities
 
-ALTW today behaves like a reorder pipeline, not a saturated engine: way blobs are exploded into rank-sharded `slot_pos` records in [src/commands/altw/stage1.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:340), regrouped by referenced-node rank and fanned back out into
-slot buckets in [src/commands/altw/stage2.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:365), rebuilt into dense slot images and sliced back into blob payloads in [src/commands/altw/stage3.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:234), then reread again for way assembly in [src/commands/altw/stage4.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:376).
-The code is disciplined, but it still pays real wall time to destroy and then reconstruct blob ownership.
+Synthesis of three independent reviews of the ALTW (`add-locations-to-ways --index-type external`) pipeline. All three reviewers land on the same framing: ALTW today behaves like a reorder pipeline, not a saturated engine. It pays real wall time to destroy blob ownership, externally permute coordinates through rank-sharded and slot-bucketed intermediates, then reconstruct blob order. The disciplined four-stage structure survives because each handoff is a filesystem round-trip; the cost shows up as long idle moments at stage boundaries.
 
-### Ranked Opportunities
+Convergence: two reviewers rank **epoch-spill promotion** as the #1 lever; the **stage 3 → stage 4 seam** and the **stage 1 decompress duplication** each appear in two reports. This document consolidates all six distinct opportunities and everything the three reviewers flagged as *not* worth pursuing.
 
-#### 1. Delete the stage3 -> finalize -> stage4 barrier and make payload handoff streaming.
+---
 
-Bottleneck: the current code finishes stage 3, then does a full finalize/copy pass in [src/commands/altw/coord_payloads.rs](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs:255), then opens a second reader and preads each payload again in [src/commands/altw/stage4.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:376).
-In `mod.rs`, that is a hard serialized seam from lines [src/commands/altw/mod.rs](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:340) through [src/commands/altw/mod.rs](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:425).
+## How the pipeline works today
 
-Why the structure causes it: stage 3 workers own temporary payload fragments, not blob-order emission. So ALTW stops, reconstructs blob order, writes another artifact, then stage 4 re-reads it.
+A four-stage serial chain with three disk-materialized intermediates and no stage overlap. The serialized seam spans [mod.rs:340](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:340)–[mod.rs:425](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:425); the `slot_bucket_count` and 2-piece straddler machinery lives at [mod.rs:238](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:238).
 
-Stronger redesign: stage 3 workers should emit ready `blob_idx -> payload_bytes` items to a blob-order coordinator. That coordinator should merge straddlers, reorder by `blob_idx`, and either append directly to a final
-blob-ordered payload stream that stage 4 can consume immediately, or feed stage 4 directly through a bounded queue. No worker tmp manifests. No finalize copy. No second payload pread.
+**Stage 1 — way scan (two sub-passes).** [stage1.rs:340](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:340)
+- 1A: decompress every way blob → build `IdSetDense`, write ref-count sidecars
+- 1B: re-decompress the same way blobs → emit rank-bucketed `(local_rank, slot_pos)` records ([stage1.rs:327](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:327), [:421](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:421))
+- 1B cannot start until `IdSetDense::build_rank_index()` at [stage1.rs:247](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:247) completes
+- Blob ownership is discarded in [stage1.rs:451](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:451)
+- → **~80 GB of rank shard files** (256 × W per-worker files)
 
-Why high-payoff: this directly attacks the biggest remaining seam. On the current baseline in [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:37), Europe still spends 37.2s in stage 3, 17.8s in finalize, and 121.1s in stage 4;
-planet spends 100.2s, 46.4s, and 231.6s. Turning that from serial to overlapped is one of the few remaining double-digit wall opportunities.
+**Stage 2 — node join.** [stage2.rs:365](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:365)
+- Read rank shards → counting-sort per rank bucket → `pread + decompress` node blobs → populate `coord_slice` ([stage2.rs:382](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:382)) → resolve `(slot_pos, lat, lon)` → write to shared slot buckets via per-bucket `Mutex<BufWriter>`
+- → **~112 GB of slot bucket files** (R3 on-disk accounting; R2 gives ~200 GB of raw `ResolvedEntry` records across 256 files, and ~150 GB for the current spill volume)
 
-Risks: you need real backpressure and bounded reorder state. If stage 4 or the writer is the true limiter, this can just move waiting around.
+**Stage 3 — slot reorder.** [stage3.rs:234](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:234)
+- Read slot buckets → scatter into a dense bucket-local buffer → classify blob/bucket intersections plus straddlers ([stage3.rs:292](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292), [:386](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386)) → delta-varint encode per-blob `coord_payloads` → finalize/copy pass in [coord_payloads.rs:255](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs:255)
+- → **~55 GB `coord_payloads` file**
 
-#### 2. Re-key the downstream half around way blobs, not global slot buckets.
+**Stage 4 — assembly.** [stage4.rs:376](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:376)
+- Open a second reader, pread each payload from `coord_payloads` again
+- Re-read the full input PBF → decompress way blobs → wire-format reframe using payloads → passthrough node/relation blobs → write enriched PBF
+- Also **re-decodes the kept node blobs** on the non-way path at [stage4.rs:439](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:439) (decoded already in stage 2)
 
-Bottleneck: stage 1 emits global `slot_pos` records, stage 2 routes every resolved coordinate into shared slot buckets, stage 3 rebuilds dense bucket-local slot images and then classifies blob/bucket intersections plus
-straddlers in [src/commands/altw/stage3.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292) and [src/commands/altw/stage3.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386).
+**Planet-scale totals.**
+- Scratch: ~80 + ~112 + ~55 = **~247 GB written, ~247 GB read back** (R3 accounting)
+- Input PBF read ~3×: ways twice (1A, 1B), nodes in stage 2, everything in stage 4
+- Fully serialized — the machine idles at every stage boundary while setup/teardown runs
 
-Why the structure causes it: blob ownership is thrown away in [src/commands/altw/stage1.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:451) and only reconstructed later. The whole `slot_bucket_count` and 2-piece straddler machinery in [src/commands/altw/mod.rs](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:238)
-exists to survive that choice.
+**Measured phase wall times.**
+- Europe: stage 3 ≈ 37.2s (R1) / 42.5s (R2) · finalize 17.8s · stage 4 121.1s
+- Planet: stage 3 100.2s · finalize 46.4s (R1) / ~68s (R2) · stage 4 231.6s (R1) / ~259s (R2) · stages 2+3+finalize ≈ 388s (R2)
 
-Stronger redesign: change the downstream key from `slot_pos` to `way_blob_idx + blob_local_slot` or a blob-group-local equivalent. Partition contiguous way blobs into bounded blob groups, have stage 2 emit resolved records
-to blob-group files, and have stage 3 scatter and encode directly within those blob-aligned groups. That deletes blob/bucket classification, straddler staging, and most of finalize by construction.
+---
 
-Why high-payoff: this is the cleanest way to stop rebuilding the same coordinate stream in three ownership domains. It also makes opportunity 1 much cleaner.
+## Ranked opportunities
 
-Risks: it is a real rewrite of stages 1-4. The fundamental rank-order vs blob-order mismatch still exists, so a bad blob-group design can preserve most of the scatter cost while adding new bookkeeping.
+### #1 — Promote epoch-spill to default; delete the disk slot-bucket path
 
-#### 3. Decode each kept node blob once and use that decode for both the join and final node output.
+**Convergence: R2 #1, R3 #1.** The code already exists in [src/commands/altw/stage23_epoch.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage23_epoch.rs) as an env-var-gated prototype. This is delete + promote, not greenfield.
 
-Bottleneck: stage 2 decodes node blobs to populate `coord_slice` in [src/commands/altw/stage2.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:382), then stage 4 decodes the kept node blobs again on the non-way path in [src/commands/altw/stage4.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:439). The note already
-calls this out as a deferred structural issue [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:892).
+**Bottleneck.** The stage 2 → stage 3 handoff materializes the largest intermediate in the pipeline — ~112 GB of slot bucket files, which stage 3 then reads cold, scatters, and encodes.
 
-Why the structure causes it: stage 2 is rank-bucket-owned work; stage 4 is file-order output work. Node blobs are treated as stage-local inputs instead of source-owned work units.
+**Why the structure causes it.** Stage 2 produces resolved entries in rank-bucket (node-ID) order; stage 3 needs them in slot-pos (way-PBF) order. The slot bucket files are the external radix step that bridges those orderings. Stages 2 and 3 are separate `thread::scope` blocks connected only by the filesystem, so **100% of entries transit disk** — even entries that could be processed immediately in memory.
 
-Stronger redesign: move to a node-blob-owned executor or node-stripe executor that decodes a node blob once, fans its tuples into the way-join path, and also emits the filtered node output side directly. That probably
-means rewriting the stage-2 scheduler, not patching it.
+**Redesign.** The epoch-spill path already fuses stages 2+3. Epoch 0 resolves entries and scatters them directly into in-memory `Mutex<Box<[u8]>>` `scatter_buf`s (zero disk). Entries for epochs > 0 spill to disk and drain on later passes. After each epoch's producer pass, an emit pass encodes `coord_payloads` from the in-memory buffers while they are still L3-hot. Stage 3 ceases to exist as a separate phase — finalize becomes the tail of the last epoch's emit.
 
-Why high-payoff: this attacks duplicated input decode on the largest planet-side phase and can remove one more full stage-local ownership handoff.
-
-Risks: hardest item here. It is easy to trade duplicate decode for worse buffering or a weaker stage-2 join.
-
-### Medium-Value Local Changes
-
-- If you want a smaller first cut before item 2, do item 1 on the current slot-bucket representation. I think that is a legitimate keep/revert candidate.
-- A single-ingest way-ref spool that removes stage 1 pass B’s second PBF decode in [src/commands/altw/stage1.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:327) and [src/commands/altw/stage1.rs](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:421) is plausible, but I would not treat it as a first-order wall lever
-  unless it comes bundled with the downstream key rewrite.
-
-### Probably Not Worth Pursuing
-
-- More rank-bucket-count experiments. The repo note already shows the failure mode was structural: more opens, more straddlers, worse stage 2+3+finalize [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:147).
-- Another stage-1B shard-shape experiment. The grouped and batched variants already regressed or were flat [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:126) and [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:602).
-- Another stage-2 hot-loop micro pass. The measured batch already reshuffled counters without moving wall.
-- Stage-4 non-way wire filtering as the main bet. It was a real CPU win and still the wrong wall lever on Europe [notes/altw-external-optimization-plan.md](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:498).
-- Generic writer work as the primary ALTW answer. Relevant, but not ALTW-local.
-
-### Recommendation
-
-Top 3 opportunities: 1) streaming stage3 -> stage4 handoff, 2) blob-group downstream rewrite, 3) single-decode node path.
-
-I would do 1) first. It is the clearest test of your stated thesis: whether ALTW is still losing end-to-end throughput at stage seams. It is also a full change, not a probe.
-
-Keep/revert plan for 1):
-
-1. Implement the full coordinator path on a branch with no env-var default path.
-2. Denmark: correctness only. Use semantic parity, not MD5-only parity.
-3. Europe: this is the real gate, not Japan. Run `--bench 3` against current main and the branch.
-4. Keep metrics: total wall, old downstream slice equivalence, `s4_send_ms`, eliminated `s3_integrated_finalize_*`, eliminated `s4_coord_payload_pread_ms`, new payload reorder-depth/high-water, scratch bytes, peak RSS.
-5. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up. For this size of rewrite, I would want roughly `>=5%` Europe wall or a very
-   obvious downstream-phase win.
-6. If Europe wins, run one planet confirmation. If Europe is flat or worse, revert cleanly.
-
-## Report 2
-
-### Ranked Opportunities
-
-#### #1: Fuse stages 2+3 by making epoch-spill the default path (HIGH CONVICTION)
-
-Bottleneck. The slot-bucket intermediate between stages 2 and 3 is the single largest disk materialization in the pipeline. Stage 2 writes ~200 GB of `(slot_pos, lat, lon)` entries to 256 files. Stage 3 reads them back, scatters them into dense buffers, then encodes `coord_payloads`. This write-read cycle exists solely because rank order ≠ slot order — stage 2 produces entries in rank order, stage 3 needs them in slot order.
-
-Why the current structure causes it. Stages 2 and 3 are separate `thread::scope` blocks with a filesystem intermediate. Stage 2 workers write `ResolvedEntry` records to shared `SlotBuckets` via per-bucket `Mutex<BufWriter>`. Stage 3 workers re-read those files, scatter into a dense `Vec<u8>`, then encode. The structural seam is the filesystem round-trip.
-
-The stronger design. The epoch-spill path (`stage23_epoch.rs`) already implements the right idea: during stage 2 processing, entries destined for the "active epoch's" slot buckets scatter directly into in-memory `Mutex<Box<[u8]>>` buffers. After each epoch's producer pass, a separate emit pass encodes `coord_payloads` from those buffers. Entries for other epochs spill to disk.
-
-The change: make epoch-spill the default, auto-tune epoch count based on available memory, eliminate the disk-backed `SlotBuckets` path entirely.
-
-Concretely:
-
+Concrete changes:
 - Remove `parse_epoch_env()` and the env-var gate
-- Compute epoch count as `max(1, total_slots * 8 / target_memory)` where `target_memory` is ~40-50% of available RAM (use `sysinfo` or `/proc/meminfo`)
-- At `E=1` (small datasets where `total_slots * 8` fits in RAM): zero slot-bucket disk I/O — the entire stage 2→3 handoff is in-memory
-- At `E=4` (planet, ~30 GB RAM): 25% of entries handled in-memory, 75% spill. Spill I/O: ~112 GB vs current 150 GB (net saving ~38 GB disk I/O)
-- Eliminate the separate stage 3 phase — the emit loop runs immediately after each epoch's scatter
-- For Europe (~40 GB scatter): `E=2` would give ~20 GB in memory, comfortably fitting 30 GB RAM with 5.9 GB peak anon from other state
+- Auto-tune `num_epochs = max(1, total_slots * 8 / target_memory)` where `target_memory` ≈ 40–50% of available RAM (`sysinfo` or `/proc/meminfo`); or hardcode `num_epochs = 4` as a simpler initial default
+- Delete the disk-path `else` branch in [mod.rs](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs) along with `SlotBuckets`, `SharedSlotBuckets`, and `stage2_node_join` from `stage2.rs`. Keep `prepare_bucket` and `LoaderScratch` — they are shared with the epoch path
 
-What makes this plausibly high-payoff.
+**Payoff.**
+- **E=1** (datasets where `total_slots * 8` fits in RAM): the entire slot-bucket intermediate vanishes; zero slot-bucket disk I/O
+- **E=2** for Europe (~40 GB scatter → ~20 GB in memory; fits 30 GB RAM with 5.9 GB peak anon from other state): the ~42.5s Europe stage-3 wall mostly disappears
+- **E=4** for planet (~30 GB RAM): ~25% of entries never touch disk; spill is ~84 GB (R3) or ~112 GB (R2) vs current 150 GB — **net saving ~38 GB of disk I/O**, ≈19s at ~2 GB/s NVMe, plus eliminated stage-3 open/read/close overhead and eliminated finalize as a separate phase (absorbed into the final epoch's emit; current finalize ≈ 68s at planet)
+- Epoch-0 scatter is per-bucket, which eliminates the most-contended cross-bucket slot-bucket mutexes
+- **Estimated wall savings: 30–60s planet, 20–40s Europe**
 
-- Europe/planet crossover: at Europe scale with `E=1` or `E=2`, the entire slot-bucket intermediate vanishes. Current stage 3 is 42.5s (Europe) — most of that goes away.
-- Planet: I/O reduction is ~38 GB. At ~2 GB/s NVMe, that's ~19s. Plus the elimination of stage-3 file-open/read/close overhead.
-- The finalize step (68s planet) should see reduced overhead because it's no longer a separate phase boundary — it's the tail of the last epoch's emit.
-- Conservative estimate: 30–60s planet, 20–40s Europe.
+**Risks.**
+- Peak memory rises ~6.8 GB at E=4 for epoch-0 `scatter_buf`s (vs < 1 GB for the disk path). Acceptable on any machine that can run ALTW planet — which already needs ~8.7 GB for `IdSetDense` — but conservative auto-tuning matters
+- The epoch path has had limited production testing; a full `brokkr verify` on Denmark and Europe is required
+- Spill for epochs > 0 has worse spatial locality than the current slot-bucket layout, because entries arrive interleaved across epochs
 
-Risks.
-
-- Memory pressure: if epoch count is set too low, scatter buffers + `IdSetDense` + other stage-2 state may exceed physical memory. Need conservative auto-tuning.
-- The epoch path has had limited production testing (env-var gated prototype). Would need full `brokkr verify` on Denmark + Europe.
-- Spill file I/O for epochs > 0 has worse spatial locality than the current slot-bucket approach (entries arrive interleaved across epochs).
-
-Implementation scope. Moderate. The epoch code exists in `stage23_epoch.rs`. Main work: remove the env-var gate, add auto-tuning, run it through the full benchmark/verify cycle. This is a "make the full change, benchmark, keep/revert" candidate.
+**Conviction: high.** Delete + promote, not new architecture. **Scope: moderate.**
 
 ---
 
-#### #2: Overlap stage 3 coord_payloads emission with stage 4 assembly (HIGH PAYOFF, HIGH COMPLEXITY)
+### #2 — Stream stage 3 → stage 4; eliminate the `coord_payloads` file
 
-Bottleneck. Stages 2+3+finalize (388s planet) and stage 4 (259s planet) run sequentially. Stage 4 doesn't touch any shared state with stage 3 — it only consumes the `coord_payloads` file (read-only) and re-reads the input PBF (read-only). These two workloads are naturally independent once a blob's payload is available.
+**Convergence: R1 #1, R2 #2.** The biggest remaining double-digit wall opportunity, but a real architectural rewrite of the stage 3/4 boundary. Lands cleaner after #1.
 
-Why the current structure causes it. Stage 4 opens the `coord_payloads` file after finalize completes and uses `CoordPayloadsReader::pread_blob_payload()` indexed by the file's header. The header requires all blob offsets to be known upfront, which requires all payloads to be written first. This forces full serialization.
+**Bottleneck.** Stage 3 finishes, then a finalize/copy pass runs in [coord_payloads.rs:255](/home/folk/Programs/pbfhogg/src/commands/altw/coord_payloads.rs:255), then stage 4 opens a second reader and preads each payload again at [stage4.rs:376](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:376). Stages 2+3+finalize (~388s planet) and stage 4 (~259s planet) are fully sequential — yet stage 4 touches no shared state with stage 3 beyond the read-only `coord_payloads` file and the read-only input PBF. They are naturally independent once any given blob's payload is available.
 
-The stronger design. Replace the `coord_payloads` file with a streaming handoff:
+**Why the structure causes it.** Stage 3 workers own temporary payload *fragments*, not blob-order emission — so ALTW must stop, reconstruct blob order, write another artifact, then stage 4 re-reads it. `CoordPayloadsReader::pread_blob_payload()` requires all blob offsets to be known upfront (from the file's header), which forces the full serialization.
 
-1. Stage 3 workers produce encoded payloads per way blob. For `FullyContained` blobs, the payload is immediately ready. For straddlers, both halves are needed.
-2. A shared `Vec<OnceCell<Vec<u8>>>` (or `Vec<Mutex<Option<Vec<u8>>>>`) indexed by `blob_idx` serves as the handoff buffer. Stage 3 deposits payloads as they become available.
-3. Stage 4 starts concurrently with stage 3. Its way-blob workers check the handoff buffer; if the payload isn't ready yet, they block (condvar or spin) until stage 3 deposits it.
-4. For node/relation blobs, stage 4 proceeds immediately (no `coord_payloads` dependency).
-5. The `coord_payloads` file is eliminated entirely. 55 GB write + 55 GB read = 110 GB of disk I/O removed at planet.
+**Redesign.** Replace the `coord_payloads` file with a streaming handoff:
+1. Stage 3 workers emit ready `blob_idx → payload_bytes` items to a blob-order coordinator. The coordinator merges straddler halves, reorders by `blob_idx`, and either appends to a final blob-ordered payload stream or feeds stage 4 directly through a bounded queue. **No worker tmp manifests. No finalize copy. No second payload pread.**
+2. Handoff buffer: shared `Vec<OnceCell<Vec<u8>>>` (or `Vec<Mutex<Option<Vec<u8>>>>`) indexed by `blob_idx`. Stage 3 deposits payloads as they become available. Stage 4's way-blob workers read the buffer and block (condvar or spin) if a payload is not yet ready. Node/relation blobs proceed immediately.
+3. Key insight: payloads are produced in roughly increasing `blob_idx` order (because `way_slot_starts` is monotonic and slot buckets are processed in order), and stage 4 processes blobs in PBF order (also roughly blob-index order). Blocking on late straddlers should be rare.
 
-The key insight: blob payloads are produced in roughly increasing blob-index order (because `way_slot_starts` is monotonic and slot buckets are processed in order). So stage 4, which processes blobs in PBF order (also roughly blob-index order), would rarely block.
+**Payoff.**
+- Eliminates the 55 GB write + 55 GB read of `coord_payloads` — **~110 GB of planet I/O removed**
+- Full overlap upper bound: wall ≈ max(stage-3-side, stage-4) instead of sum. R2 gives a rough planet figure of `max(176, 259) ≈ 259s` vs sequential `176 + 259 = 435s`, i.e. ~176s saved at planet (~18% total)
+- **Conservative estimates: 100–150s planet, 40–60s Europe**
 
-What makes this plausibly high-payoff.
+**Risks.**
+- Real backpressure and bounded reorder state required. If stage 4 or the writer is the true limiter, this just relocates idle time
+- Memory pressure: 55 GB of `coord_payloads` cannot all live in RAM. The handoff buffer must be bounded — once stage 4 consumes a blob's payload, that memory is freed
+- Straddler completion ordering: a straddler isn't ready until both halves arrive from two different slot buckets; if the second half is produced late, stage 4 blocks on that blob
+- Thread contention: concurrent stage 3 workers + stage 4 workers + `PbfWriter`'s rayon compression threads all running together
 
-- If stage 3 and stage 4 fully overlapped: wall time ≈ `max(176, 259)` ≈ `259s` instead of `176 + 259 = 435s`. That's ~176s saved at planet — a ~18% total improvement.
-- In practice, partial overlap is realistic. Stage 4's way-blob processing starts after stage 3 has processed a few slot buckets (which contain the lowest-indexed way blobs). The overlap would be substantial.
-- Conservative estimate: 100–150s at planet, 40–60s at Europe.
+**Composition note.** #2 is viable on the **current slot-bucket representation** as a legitimate smaller first cut before #5 (the full blob-group rewrite). After #1 lands, the finalize phase is already absorbed into per-epoch emits, which makes #2 cleaner because the boundary it attacks is already softer.
 
-Risks.
-
-- Architectural complexity is significant. Concurrent stage 3 + stage 4 sharing the `coord_payloads` data requires careful synchronization.
-- Memory pressure: at planet, 55 GB of `coord_payloads` can't all be in memory. The handoff buffer would need to be bounded — once stage 4 consumes a blob's payload, that memory should be freed.
-- Straddler completion ordering: a straddler blob's payload isn't ready until both halves arrive (from two different slot buckets). If the second half's bucket is processed late, stage 4 could block for a long time on that blob.
-- The write-path (`PbfWriter`) for stage 4 uses rayon for compression. Concurrent stage 3 workers + stage 4 workers + rayon compression threads = high thread contention.
-
-Implementation scope. Large. This is a full architectural rewrite of the stage 3→4 boundary. Not a "try and revert in a day" change. Would need careful design, phased rollout, and extensive benchmarking.
+**Conviction: high on payoff, medium on ease. Scope: large.** Not a try-and-revert-in-a-day change — needs careful design, phased rollout, extensive benchmarking.
 
 ---
 
-#### #3: Single-pass stage 1 via deferred ranking (MEDIUM CONVICTION)
+### #3 — Fuse stage 1A + 1B via a node-ID scratch spool
 
-Bottleneck. Stage 1 reads all way blobs twice. Pass A decompresses and scans every way blob to build the `IdSetDense`. Pass B decompresses and scans the same blobs again to compute ranks and emit rank-bucketed records. The decompression + protobuf parse is duplicated across ~57K way blobs at planet.
+**Convergence: R2 #3, R3 #2.** Independent of #1 and #2; stacks cleanly. Subsumes R1's medium-value "single-ingest way-ref spool" note targeting [stage1.rs:327](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:327) and [:421](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:421).
 
-Why the current structure causes it. Pass B depends on the rank index, which is built after pass A completes. The `IdSetDense::build_rank_index()` call at line 247 of `stage1.rs` happens after all pass A workers join. Only then can `rank()` be called. So pass B can't start until pass A is done and the rank index is built.
+**Bottleneck.** Stage 1 decompresses and scans every way blob twice — ~57K blobs, ~37 GB compressed at planet. Zlib decompression is pure CPU, accounting for roughly 50% of stage 1 wall time, and it executes twice.
 
-The stronger design. During pass A, each worker writes per-blob node-ID lists to a temporary file alongside its normal work (populating the local `IdSetDense` and writing sidecars). After pass A, build the rank index. Then pass B re-reads the node-ID files (flat `i64` arrays) instead of re-decompressing the PBF.
+**Why the structure causes it.** Pass B depends on the rank index, and `IdSetDense::build_rank_index()` at [stage1.rs:247](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:247) only runs after all pass-A workers join. The decompression itself is identical in both passes; only the callback differs (1A inserts into `IdSetDense`; 1B looks up ranks + emits records).
 
-Reading flat `i64` arrays is dramatically cheaper than PBF `pread` + zlib decompress + protobuf parse:
+**Redesign.** During pass A, each worker already has `blob_node_ids`. Dump those to per-worker scratch files alongside the normal work. Once pass A joins and the rank index is built, pass B reads back the scratch files instead of re-decompressing the PBF. Two viable encodings:
+- **Flat `i64` arrays** (R2): one `BufWriter` per worker; `pread` → directly usable, no zlib, no protobuf. Planet scratch ≈ 37.5 GB
+- **Delta-varint per blob** (R3): node IDs within a way blob are correlated; planet scratch ≈ 15–20 GB; pass B does sequential read + simple varint decode
 
-- PBF: `pread` (kernel copy) → zlib decompress (CPU-bound) → protobuf decode (branch-heavy)
-- Flat file: `pread` (kernel copy) → directly usable
+The cost model flips from `pread + zlib (CPU) + protobuf (branch-heavy)` to `pread → directly usable` (flat) or `pread → varint` (compact).
 
-At planet scale, pass B's `s1b_decompress_ms + s1b_scan_ms` represent substantial CPU time. The trade is writing ~37.5 GB of flat node-ID files during pass A (minimal overhead since pass A already has the IDs in `blob_node_ids`), then reading them in pass B instead of re-decompressing.
+**Payoff.**
+- Eliminates one full zlib decompression + protobuf parse of all way blobs — CPU-bound and not cacheable
+- On planet (30 GB RAM, 87 GB input PBF), pass A evicts its own data from page cache, so pass B re-reads from NVMe. Flat/compact scratch is smaller and sequentially written → better cache residency
+- **Estimates: 15–30s planet (R2); 20–30% of stage 1 wall (R3); Europe extrapolates to ~45s cumulative across workers, ~8s wall**
 
-What makes this plausibly high-payoff.
+**Risks.**
+- Adds ~20–37.5 GB to the scratch budget (marginal against the current ~247 GB). NVMe write overhead ≈ 18s at planet for the flat variant
+- If pass B's PBF data is still in page cache (unlikely at planet scale, possible on smaller datasets), the net effect could be negative
+- Correctness: node ID order in scratch must exactly match the scan order pass B expects for `slot_pos` computation. Bit-exact validation required
+- Varint encode/decode adds CPU — but far less than zlib
 
-- Eliminates all decompression and protobuf work in pass B. At planet: `s1b_decompress_ms + s1b_scan_ms` cumulative across workers is significant (extrapolating from Europe: ~45s cumulative, ~8s wall)
-- The PBF data may or may not be in page cache by pass B. On 30 GB RAM with 87 GB input PBF, pass A evicts its own data. Re-reading from PBF in pass B triggers real NVMe reads. Flat node-ID files, being smaller and sequentially written, would have better cache residency.
-- Conservative estimate: 15–30s at planet.
-
-Risks.
-
-- Adds ~37.5 GB of temporary disk writes during pass A. On NVMe this is ~18s. If pass B's PBF data is still cached, the net effect could be negative.
-- Memory accounting: pass A workers would need slightly more memory per blob for the write buffer.
-- Correctness: the order of node IDs in the flat file must exactly match the scan order for pass B's `slot_pos` computation.
-
-Implementation scope. Moderate. Localized to `stage1.rs`. The pass A worker loop already has `blob_node_ids`; just add a `BufWriter` per worker that dumps them. Pass B's `pread+decompress+scan` loop gets replaced with a flat-file read.
+**Conviction: high.** The duplication is measured, not speculative. **Scope: moderate** — localized to `stage1.rs`.
 
 ---
 
-### Things probably NOT worth pursuing
+### #4 — Direct-to-`coord_payloads` via per-blob accumulators (skip `scatter_buf`)
 
-- Changing the number of rank buckets (256). The counting sort is O(n) regardless. Fewer buckets = larger per-bucket memory but fewer node-blob re-decompressions. The current 256 is well-tuned for the planet-scale memory envelope.
-- Stage 4 coord-access micro-optimizations. The optimization history exhaustively demonstrates that per-blob `pread`, `madvise` tuning, `mmap` variants, and inner-loop work are all at the NVMe floor. The ~259s is dominated by input PBF read + output PBF write + rayon compression. `coord_payloads` reads are a small fraction.
-- Compressing rank records further. The 12-byte rank records (down from 16) were already optimized. Delta-encoding or varint would add CPU cost for marginal I/O savings, in a stage that's not I/O-bound.
-- Generic writer refactoring. The wire-format way reframe in stage 4 is already the right approach. Abstracting it further wouldn't improve ALTW throughput.
-- `io_uring` for scattered writes. Stage 3's write pattern is large sequential writes (one per bucket). `io_uring` helps most with many small concurrent I/O operations. Not applicable here.
+**R3 #3.** Builds on #1 (the fused epoch path). A coherent rewrite of the fused resolve/encode inner loop.
 
----
+**Bottleneck.** Even in the epoch-spill path, each epoch does: scatter resolved entries into a dense `scatter_buf` → classify blobs → slice per blob → delta-varint encode → write worker tmp → finalize copies to `coord_payloads`. `scatter_buf` touches every byte of the epoch's bucket range, including empty slots (zeroed = missing coord); encoding then re-reads the same bytes.
 
-### Recommendation
+**Why the structure causes it.** `scatter_buf` provides O(1) random access by `slot_pos`, which `coord_payloads` encoding needs. But it is write-once-read-once with poor locality — stage 2 writes in rank-bucket order (scattered across the buffer) while encoding reads in blob order (sequential within a blob but different from the write order). The dense layout also pays memset cost for empty slots.
 
-Top 3:
+**Redesign.** Skip `scatter_buf`. Each resolved entry already knows its `slot_pos`; derive `blob_idx` via binary search in `way_slot_starts` (~16 comparisons for ~57K blobs) and local offset `= slot_pos - way_slot_starts[blob_idx]`. Route directly to per-blob accumulators:
+- `Vec<(u16 local_offset, i32 lat, i32 lon)>` — 10 bytes per entry vs 8 bytes in `scatter_buf`, but **only non-zero entries**; no zero-fill for missing
+- Planet: ~10B resolved entries × 10 bytes ≈ 100 GB total — same ballpark as `scatter_buf`, but no dense allocation, no memset, no second read pass
+- Epoch 0: accumulators live in memory. Epochs > 0: spill to per-blob (or per-blob-group) files
+- Encode reads each accumulator, sorts by local offset (trivial at ~175 entries/blob average — entries arrive out-of-order across rank buckets), delta-varint encodes in one shot
 
-1. Epoch-spill as default (fuse stages 2+3)
-2. Pipeline stage 3 + stage 4 (overlap `coord_payloads` emission with assembly)
-3. Single-pass stage 1 via deferred ranking
-
-Do first: #1, epoch-spill as default. Reasons:
-
-- The code already exists in `stage23_epoch.rs` — it's a prototype that needs hardening, not a greenfield implementation
-- It's the lowest-risk architectural change with real payoff
-- It creates the foundation for #2: once stage 3 is fused into stage 2, the stage boundary that blocks #2 is softer
-- It's a clean keep/revert candidate
-
-Benchmark plan for #1:
-
-1. Make the change: remove `parse_epoch_env()`, auto-compute epoch count from `/proc/meminfo`, delete the disk-backed `SlotBuckets` path and all code guarded by `epoch_count_opt.is_none()`
-2. Verify correctness: `brokkr verify add-locations-to-ways --dataset denmark` must produce identical output
-3. Benchmark Europe: `brokkr add-locations-to-ways --dataset europe --index-type external --bench`
-4. Compare against the most recent baseline (`768d3d4e` or equivalent) using `brokkr results --compare`
-5. If Europe shows `≥10s` wall improvement with no correctness regression: keep
-6. If flat or regression: check whether auto-tuned epoch count is suboptimal, try manual `E=2` for Europe as a diagnostic
-7. If structurally broken: revert, file the diagnostic data
-
-## Report 3
-
-### How it works today
-
-The pipeline is a 4-stage serial chain with two large disk-materialized intermediates:
-
-Stage 1  (way scan, 2 sub-passes)
-
-1A: decompress all way blobs → build `IdSetDense`, write ref-count sidecars
-1B: re-decompress all way blobs → emit rank-bucketed `(local_rank, slot_pos)` records
-→ ~80 GB rank shard files (256 × W per-worker files)
-
-Stage 2  (node join)
-
-Read rank shards → counting-sort per rank bucket → `pread+decompress` node blobs
-→ resolve `(slot_pos, lat, lon)` → write to shared slot bucket files
-→ ~112 GB slot bucket files
-
-Stage 3  (slot reorder)
-
-Read slot bucket files → scatter into dense buffer → classify blobs
-→ encode per-blob delta-varint `coord_payloads` → finalize
-→ ~55 GB `coord_payloads` file
-
-Stage 4  (assembly)
-
-Re-read full PBF → decompress way blobs → wire-format reframe with `coord_payloads`
-→ passthrough node/relation blobs → write enriched PBF
-
-Total scratch I/O at planet scale: ~80 GB (rank shards) + ~112 GB (slot buckets) + ~55 GB (`coord_payloads`) = ~247 GB written, ~247 GB read back. Plus ~3 PBF reads of the ~80 GB input (stage 1 reads ways twice, stage 2
-reads nodes, stage 4 reads everything).
-
-Stages are fully serialized — no overlap between 1→2, 2→3, or 3→4. The machine goes idle at every stage boundary while setup/teardown runs.
-
----
-
-### Opportunity #1: Promote epoch-spill to default, delete the disk path
-
-Bottleneck: The stage 2 → stage 3 handoff materializes 112 GB of slot bucket files. Stage 3 reads them cold from disk, scatters into memory, encodes, and writes `coord_payloads`. This is the single largest intermediate
-materialization in the pipeline.
-
-Why the current structure causes it: Stage 2 produces resolved entries in rank-bucket order (node-ID order). Stage 3 needs them in slot-pos order (way-PBF order). The slot bucket files serve as the external radix step for
-this permutation. But 100% of entries go through disk — even entries that could be processed immediately.
-
-What the stronger design looks like: The epoch-spill path (`stage23_epoch.rs`) already subsumes stages 2+3 into a fused pass. Epoch 0 resolves entries and scatters them directly into in-memory `scatter_buf`s (zero disk).
-Entries for epochs >0 spill to disk and drain later. At `E=4`, ~25% of entries never touch disk at all, and the epoch-0 emit runs while scatter data is cache-hot.
-
-The change is: remove the env-var gate, make the epoch path the only path, delete `SlotBuckets`/`SharedSlotBuckets` and the disk-path branch in `mod.rs`.
-
-What makes it high-payoff:
-
-- Eliminates 112 GB slot bucket write + 112 GB slot bucket read
-- Epoch-0 entries (25% at `E=4`) are never serialized — pure memory scatter
-- Emit runs while scatter data is L3-hot instead of cold from disk
-- Spill is still 84 GB (75% of 112 GB), but it's write-once/read-once sequential — same I/O pattern, 25% less volume
-- The epoch-0 path eliminates the most-contended slot bucket mutexes (epoch-0 scatters per-bucket, not cross-bucket)
-
-Risks:
-
-- Peak memory: ~6.8 GB at `E=4` (epoch-0 `scatter_buf`s) vs <1 GB for disk path. Acceptable on any machine that can run ALTW planet (which requires ~8.7 GB for the `IdSetDense`). Could default `E=4` and let users tune.
-- Epoch path has had limited production testing (env-var gated prototype). Would need full `brokkr verify` on Denmark + Europe.
-
-Conviction: High. The code exists. It's a delete + promote, not a write.
-
----
-
-### Opportunity #2: Fuse stage 1A + 1B into a single way decompression pass
-
-Bottleneck: Way blobs are decompressed and scanned twice. 1A decompresses to build `IdSetDense`. 1B decompresses the same blobs again to emit rank records (because rank computation requires the complete `IdSetDense` from
-1A). At planet scale, way blobs are ~37 GB compressed. Zlib decompression is pure CPU — this is ~50% of stage 1 wall time, executed twice.
-
-Why the current structure causes it: The dependency is real: 1B needs the rank index, which needs all of 1A to complete. But the decompression is the same in both passes — only the callback differs (1A: insert node IDs
-into `IdSetDense`, 1B: look up rank and emit records).
-
-What the stronger design looks like: During 1A, after `scan_way_refs`, capture each blob's extracted node ref list compactly into a per-blob scratch record (delta-varint encoded refs — much smaller than the full protobuf
-blob). Store these in a single scratch file. When 1A completes and the rank index is built, 1B reads from the compact scratch file instead of re-decompressing the PBF.
-
-At planet: ~10B node refs. Delta-varint encoded per blob (node IDs within a way blob are correlated), estimate ~15-20 GB scratch. Net effect: trade 37 GB PBF re-read + full zlib decompression + protobuf parse for 20 GB
-sequential scratch read + simple varint decode.
-
-Alternative (even more aggressive): during 1A, accumulate per-blob `(node_id, intra_blob_position)` pairs in a memory-mapped scratch structure and stream 1B's output as a continuation of 1A. But the sequential-scratch
-approach is simpler and still a large win.
-
-What makes it high-payoff:
-
-- Eliminates one full zlib decompression of all way blobs (CPU-bound, not cacheable)
-- On NVMe, the scratch file I/O is nearly free compared to decompression CPU
-- Stage 1 is currently 2× the serial work it needs to be for its actual output
-- Wall time reduction is approximately `(1B_decompress_ms / num_workers)`, likely 20-30% of stage 1
-
-Risks:
-
-- Adds ~20 GB to scratch disk budget (currently ~247 GB, so marginal)
-- The varint encode/decode adds some CPU — but far less than zlib decompress
-- Design requires choosing a compact per-blob format and validating bit-exactness
-
-Conviction: High. The decompress duplication is measured, not speculative.
-
----
-
-### Opportunity #3: Direct-to-coord_payloads encoding in the fused epoch path (skip scatter_buf intermediation)
-
-Bottleneck: Even in the epoch-spill path, each epoch does: scatter resolved entries into a dense `scatter_buf` (per-bucket, slot-pos indexed) → classify blobs → slice `scatter_buf` per blob → delta-varint encode → write to
-worker tmp → finalize copies to `coord_payloads`. The scatter step touches every byte of the epoch's bucket range even when many slots are empty (zeroed = missing coord). Then encoding re-reads the same bytes.
-
-Why the current structure causes it: The `scatter_buf` exists because `coord_payloads` encoding needs per-blob coords in slot-pos order. The dense buffer provides O(1) random access by `slot_pos`. But it's write-once-read-once
-with poor locality: stage 2 writes entries in rank-bucket order (scattered across the buffer), then encoding reads in blob order (sequential but different from write order).
-
-What the stronger design looks like: Skip the `scatter_buf` entirely. During stage 2's resolve loop, instead of writing `ResolvedEntry` to a slot bucket or `scatter_buf`, write `(blob_local_offset, lat, lon)` directly to a
-per-blob accumulator. Each resolved entry knows its `slot_pos`, from which we derive `blob_idx` (binary search in `way_slot_starts`) and the offset within that blob (`slot_pos - way_slot_starts[blob_idx]`).
-
-Per-blob accumulators could be small `Vec<(u16_local_offset, i32_lat, i32_lon)>` — 10 bytes per entry instead of 8 bytes in the dense `scatter_buf`, but only for non-zero entries (skip missing coords entirely). At planet scale
-with ~10B resolved entries, that's ~100 GB total... same ballpark. But the crucial difference: no dense buffer allocation, no zero-fill of empty slots, and no second read pass. Entries arrive and are routed directly to
-where they'll be consumed.
-
-For the epoch variant: epoch 0 routes directly to per-blob accumulators in memory. Epochs >0 spill to per-blob (or per-blob-group) files. The encode step reads per-blob accumulators, sorts by local offset (they arrive out
-of order from different rank buckets), and delta-varint encodes in one shot.
-
-What makes it high-payoff:
-
-- Eliminates `scatter_buf` allocation + zero-fill (6.8 GB memset at `E=4`)
-- Eliminates the `scatter_buf` write → read round-trip (different access patterns = poor cache)
-- Eliminates the `classify_blobs_in_bucket + emit_integrated_intersections` machinery (slot-bucket boundaries become irrelevant; blobs ARE the natural unit)
+**Payoff.**
+- Eliminates `scatter_buf` allocation and zero-fill (~6.8 GB memset at E=4)
+- Eliminates the `scatter_buf` write → read round-trip (access patterns differ, cache is cold)
+- Eliminates the `classify_blobs_in_bucket` + `emit_integrated_intersections` machinery — slot-bucket boundaries become irrelevant, blobs are the natural unit
 - Per-blob accumulators are the right granularity for the final output format
 
-Risks:
+**Risks.**
+- Per-blob sort is trivial (~175 entries/blob average)
+- Binary search per resolved entry — cheap vs the current dense random-scatter store, but still a per-entry CPU cost
+- Significant rewrite of the stage-2 resolve loop and stage-3 replacement
+- Cache-miss savings are real but quantification requires measurement
 
-- Requires a sort per blob (entries arrive from different rank buckets in rank order, need slot-pos order). At ~175 entries/blob average, this is trivial.
-- Binary search per resolved entry (`slot_pos → blob_idx`) adds CPU. But with ~57K blobs, binary search is 16 comparisons — cheap vs. the current dense-buffer random scatter.
-- Significant rewrite of stage 2 resolve loop + stage 3 replacement. This is a "full coherent rewrite" of the fused path.
+**Relationship to #5.** Both #4 and #5 re-key downstream around blobs. #4 stays inside the fused epoch path (resolve → per-blob accumulator → encode). #5 re-keys the entire pipeline including stage 1 emission.
 
-Conviction: Medium-high. The `scatter_buf` intermediation is real overhead, but quantifying the cache miss cost requires measurement. The rewrite is substantial.
-
----
-
-### Things probably not worth pursuing
-
-- Reducing node blob straddler re-reads in stage 2. At planet scale with 256 rank buckets and ~400K node blobs, ~255 straddler re-decompressions total. Cost: ~100 MB of extra decompress. Negligible.
-- Changing the `PbfWriter` architecture for ALTW. The writer's rayon-based compression pipeline is already parallel and well-tuned. Stage 4's consumer thread is not the bottleneck (passthrough blobs skip compression entirely;
-  way reframe is fast). Writer changes would be generic improvements, not ALTW-specific wins.
-- Reducing stage 4 `coord_payloads` preads. ~57K preads is a lot of syscalls, but each is sequential (the consumer reads blobs in order) and the OS readahead handles this well. Could batch with a single `mmap`, but the win is
-  small.
-- Attempting to overlap stages 1 and 4 (pipe decompressed way blobs from stage 1 through to stage 4). This would require running stages 2/3 concurrently with way blob transit — a fundamentally different pipeline
-  architecture. The win is one fewer PBF read of way blobs, but the complexity is enormous. Not justified pre-1.0.
+**Conviction: medium-high. Scope: substantial rewrite of the fused path.**
 
 ---
 
-### Recommendation
+### #5 — Blob-group downstream rewrite: re-key around way blobs, not global slot buckets
 
-Do #1 first. Promote epoch-spill to default, benchmark, keep/revert.
+**R1 #2.** The structurally cleanest answer, at the cost of rewriting stages 1–4.
 
-Benchmark plan:
+**Bottleneck.** Stage 1 emits global `slot_pos` records; stage 2 routes every resolved coordinate into shared global slot buckets; stage 3 rebuilds dense bucket-local slot images and then classifies blob/bucket intersections and straddlers ([stage3.rs:292](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:292), [:386](/home/folk/Programs/pbfhogg/src/commands/altw/stage3.rs:386)). The entire `slot_bucket_count` and 2-piece straddler apparatus at [mod.rs:238](/home/folk/Programs/pbfhogg/src/commands/altw/mod.rs:238) exists only to survive this key choice.
 
-1. Remove the `parse_epoch_env()` gate. Hardcode `num_epochs = 4` (or make it a computed default based on available memory).
-2. Delete the disk-path branch in `mod.rs` (the `else` block with `SlotBuckets::create → stage2_node_join → stage3_slot_reorder`).
-3. Delete `SlotBuckets`/`SharedSlotBuckets` from `stage2.rs` and the `stage2_node_join` function. Keep `prepare_bucket` and `LoaderScratch` (shared with epoch path).
-4. `brokkr add-locations-to-ways --dataset europe --index-type external --bench` — compare against the most recent disk-path result. Key metrics: wall time, peak RSS, scratch disk usage, per-stage marker durations.
-5. `brokkr verify add-locations-to-ways --dataset denmark` — correctness gate.
-6. If wall time improves or is neutral and peak RSS stays under ~10 GB: keep. If wall time regresses >5%: investigate epoch count tuning before reverting.
+**Why the structure causes it.** Blob ownership is thrown away at [stage1.rs:451](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:451) and only reconstructed downstream. Every subsequent stage rebuilds it, in a different ownership domain.
 
-After #1 ships, do #2 (fuse 1A+1B). It's an independent change targeting a different stage, so it stacks cleanly. Then #3 if there's appetite for a deeper rewrite of the fused resolve/encode path.
+**Redesign.** Change the downstream key from `slot_pos` to `way_blob_idx + blob_local_slot` (or a blob-group-local equivalent). Partition contiguous way blobs into bounded blob groups. Stage 2 emits resolved records to blob-group files. Stage 3 scatters and encodes directly within those blob-aligned groups. This deletes blob/bucket classification, straddler staging, and most of finalize **by construction**.
+
+**Payoff.** The cleanest way to stop rebuilding the same coordinate stream in three ownership domains. Also makes #2 (streaming 3→4) much cleaner — payloads are produced already in blob-aligned order, and straddlers vanish.
+
+**Risks.** Real rewrite of stages 1–4. The fundamental rank-order vs blob-order mismatch does not go away; a bad blob-group design can preserve most of the scatter cost while adding new bookkeeping.
+
+**Conviction: medium** (high structural payoff, high implementation risk). **Scope: very large.**
+
+---
+
+### #6 — Single-decode node path
+
+**R1 #3.** Hardest item here. Already flagged as a deferred structural issue at [notes/altw-external-optimization-plan.md:892](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:892).
+
+**Bottleneck.** Stage 2 decodes node blobs to populate `coord_slice` at [stage2.rs:382](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:382). Stage 4 decodes the kept node blobs **again** on the non-way passthrough path at [stage4.rs:439](/home/folk/Programs/pbfhogg/src/commands/altw/stage4.rs:439).
+
+**Why the structure causes it.** Stage 2 is rank-bucket-owned work; stage 4 is file-order output work. Node blobs are treated as stage-local inputs instead of source-owned work units.
+
+**Redesign.** Move to a node-blob-owned executor (or node-stripe executor) that decodes each kept node blob once, fans its tuples into the way-join path, and directly emits the filtered node output side. This almost certainly means rewriting the stage-2 scheduler, not patching it.
+
+**Payoff.** Attacks duplicated input decode on the largest planet-side phase and removes one more full stage-local ownership handoff.
+
+**Risks.** Easiest item here to get wrong. It is easy to trade a duplicate decode for worse buffering or a weaker stage-2 join.
+
+**Conviction: medium-low. Scope: very large** — scheduler rewrite.
+
+---
+
+## Probably not worth pursuing
+
+Consolidated from all three reports:
+
+- **More rank-bucket-count experiments.** The failure mode was structural — more opens, more straddlers, worse stage 2+3+finalize ([notes/altw-external-optimization-plan.md:147](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:147)). The 256-bucket counting sort is O(n) regardless, and 256 is well-tuned for the planet-scale memory envelope.
+- **Another stage-1B shard-shape experiment.** The grouped and batched variants already regressed or went flat ([:126](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:126), [:602](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:602)).
+- **Another stage-2 hot-loop micro pass.** Measured batching reshuffled counters without moving wall.
+- **Stage-4 non-way wire filtering as the main bet.** A real CPU win, still the wrong wall lever on Europe ([:498](/home/folk/Programs/pbfhogg/notes/altw-external-optimization-plan.md:498)).
+- **Compressing or varint-encoding rank records further.** The 12-byte record (down from 16) is already optimized. In a stage that is not I/O-bound, more encode/decode CPU buys marginal I/O savings.
+- **Stage-4 `coord_payloads` pread micro-optimizations** — `madvise` tuning, `mmap` variants, batching ~57K preads. Reads are sequential (blobs in order) and OS readahead handles them; the optimization history shows per-blob work is at the NVMe floor. Stage 4's ~259s is dominated by input PBF read + output PBF write + rayon compression; `coord_payloads` reads are a small fraction.
+- **Reducing stage-2 node-blob straddler re-reads.** At planet scale with 256 rank buckets and ~400K node blobs, ~255 straddler re-decompressions total — roughly 100 MB of extra decompress. Negligible.
+- **`io_uring` for scattered writes.** Stage 3's write pattern is large sequential writes (one per bucket). `io_uring` helps most with many small concurrent I/Os — not applicable here.
+- **Overlapping stages 1 and 4** (pipe decompressed way blobs from stage 1 through to stage 4). Requires running stages 2/3 concurrently with way-blob transit — a fundamentally different pipeline architecture. Win: one fewer PBF read of way blobs. Complexity: enormous. Not justified pre-1.0.
+- **Generic `PbfWriter` / writer refactoring as the primary ALTW answer.** The writer's rayon-based compression pipeline is already parallel and well-tuned; stage 4's consumer is not the bottleneck (passthrough blobs skip compression entirely; way reframe is fast). Writer work is relevant but not ALTW-local.
+
+---
+
+## Recommendation
+
+**Sequence.**
+
+1. **#1 first — promote epoch-spill.** Lowest-risk architectural change with real payoff. Code already exists in `stage23_epoch.rs`. Delete + promote, not a write. Clean keep/revert candidate. Creates the foundation for #2 (softens the stage 3/4 boundary) and #4 (refines the same fused path).
+2. **Then #3 — fuse stage 1A + 1B.** Independent of #1/#2, stacks cleanly, moderate scope.
+3. **Then #2 — stream stage 3 → stage 4.** Largest remaining payoff, but the biggest rewrite; needs #1 landed first to be tractable.
+4. **Then #4, #5, #6** as appetite allows. #4 is a natural continuation of #1's fused path; #5 subsumes #4 at whole-pipeline scope; #6 is the hardest and most speculative.
+
+### Benchmark plan for #1 (epoch-spill default)
+
+1. Remove `parse_epoch_env()`. Auto-compute `num_epochs` from `/proc/meminfo`, or hardcode `num_epochs = 4` initially. Delete `SlotBuckets`, `SharedSlotBuckets`, `stage2_node_join`, and the disk-path `else` branch in `mod.rs`. Keep `prepare_bucket` and `LoaderScratch`.
+2. Correctness gate: `brokkr verify add-locations-to-ways --dataset denmark` — **semantic parity, not MD5-only**.
+3. Europe is the real gate (not Japan): `brokkr add-locations-to-ways --dataset europe --index-type external --bench 3` against current main via `brokkr results --compare`.
+4. Key metrics: total wall, peak RSS, scratch disk usage, per-stage marker durations, old downstream slice equivalence, new `s4_send_ms`, eliminated `s3_integrated_finalize_*`, eliminated `s4_coord_payload_pread_ms`, new payload reorder-depth/high-water.
+5. **Keep if** Europe total wall improves clearly — thresholds from the three reviewers: ≥5% Europe wall (R1), ≥10s wall (R2), improves-or-neutral with peak RSS ≤ ~10 GB (R3). If flat or worse, check whether auto-tuned epoch count is suboptimal — try manual E=2 for Europe as a diagnostic before reverting. If structurally broken, revert cleanly with diagnostic data.
+6. If Europe wins, run one planet confirmation.
+
+### Benchmark plan for #2 (streaming stage 3 → stage 4)
+
+Same shape, scaled for a bigger rewrite. Implement the full coordinator path on a branch with no env-var default. Denmark correctness (semantic). Europe `--bench 3`. Keep only if Europe total wall improves clearly, or the old `stage3 + finalize + stage4` slice drops materially with no RSS/scratch blow-up — roughly **≥5% Europe wall** for a rewrite of this size. Planet confirmation if Europe wins. Revert cleanly if flat or worse.

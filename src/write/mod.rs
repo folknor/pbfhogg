@@ -8,6 +8,16 @@ pub(crate) mod metrics;
 pub(crate) mod raw_passthrough;
 pub mod writer;
 
+pub(crate) fn should_sync_all() -> bool {
+    static SHOULD_SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SHOULD_SYNC.get_or_init(|| {
+        !matches!(
+            std::env::var("PBFHOGG_WRITE_SKIP_SYNC_ALL").ok().as_deref(),
+            Some("1") | Some("true") | Some("yes")
+        )
+    })
+}
+
 /// Page size for alignment. 4096 is universally safe across Linux filesystems.
 #[cfg(any(feature = "linux-direct-io", feature = "linux-io-uring"))]
 const PAGE_SIZE: usize = 4096;

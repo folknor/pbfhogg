@@ -12,6 +12,7 @@ use std::sync::atomic::Ordering::Relaxed;
 #[cfg(feature = "linux-direct-io")]
 use super::direct_writer::DirectWriter;
 use super::metrics::WRITER_METRICS;
+use super::should_sync_all;
 
 fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
     u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
@@ -94,22 +95,30 @@ impl Write for FileWriter {
         match self {
             FileWriter::Buffered(w) => {
                 w.flush()?;
-                let t_sync = std::time::Instant::now();
-                let result = w.get_ref().sync_all();
-                WRITER_METRICS
-                    .sync_all_ns
-                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                result
+                if should_sync_all() {
+                    let t_sync = std::time::Instant::now();
+                    let result = w.get_ref().sync_all();
+                    WRITER_METRICS
+                        .sync_all_ns
+                        .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                    result
+                } else {
+                    Ok(())
+                }
             }
             #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(w) => {
                 w.flush()?;
-                let t_sync = std::time::Instant::now();
-                let result = w.sync_all();
-                WRITER_METRICS
-                    .sync_all_ns
-                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
-                result
+                if should_sync_all() {
+                    let t_sync = std::time::Instant::now();
+                    let result = w.sync_all();
+                    WRITER_METRICS
+                        .sync_all_ns
+                        .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                    result
+                } else {
+                    Ok(())
+                }
             }
         }
     }

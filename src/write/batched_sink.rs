@@ -65,11 +65,24 @@ impl BatchedBufferedSink {
         }
     }
 
+    /// Count the number of *PBF frames* an `OutputChunk` represents.
+    ///
+    /// `Framed` and `Raw` are always one frame. `RawChunks` carries multiple
+    /// pre-framed blobs, one per inner `Vec`.
+    fn chunk_frame_count(chunk: &OutputChunk) -> u64 {
+        match chunk {
+            OutputChunk::Framed(_) | OutputChunk::Raw(_) => 1,
+            OutputChunk::RawChunks(chunks) => chunks.len() as u64,
+            #[cfg(feature = "linux-direct-io")]
+            OutputChunk::CopyRange { .. } => 1,
+        }
+    }
+
     fn flush_batch(&mut self) -> io::Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
-        let frames = self.pending.len() as u64;
+        let frames: u64 = self.pending.iter().map(Self::chunk_frame_count).sum();
         let bytes = self.pending_bytes as u64;
 
         let mut slices: Vec<IoSlice<'_>> = Vec::new();
@@ -99,12 +112,14 @@ impl BatchedBufferedSink {
         }
 
         let t_write = std::time::Instant::now();
-        write_all_vectored_raw(&mut self.file, &mut slices)?;
+        let syscalls = write_all_vectored_raw(&mut self.file, &mut slices)?;
         WRITER_METRICS
             .write_ns
             .fetch_add(elapsed_ns_u64(t_write), Relaxed);
         WRITER_METRICS.bytes_written.fetch_add(bytes, Relaxed);
-        WRITER_METRICS.batched_writev_calls.fetch_add(1, Relaxed);
+        WRITER_METRICS
+            .batched_writev_calls
+            .fetch_add(syscalls, Relaxed);
         WRITER_METRICS
             .batched_writev_frames
             .fetch_add(frames, Relaxed);
@@ -167,10 +182,17 @@ impl OutputSink for BatchedBufferedSink {
 /// `std::io::Write::write_all_vectored` is nightly-only; this is the stable
 /// equivalent. Mutates `bufs` via [`IoSlice::advance_slices`] to track the
 /// remaining unwritten region without allocating a new slice Vec per round.
-fn write_all_vectored_raw<W: Write>(w: &mut W, bufs: &mut [IoSlice<'_>]) -> io::Result<()> {
+///
+/// Returns the number of `write_vectored` syscalls actually issued — a
+/// partial write forces a follow-up call, so this is strictly `>= 1` when
+/// `bufs` is non-empty. Callers attribute the count to the writev syscall
+/// counter.
+fn write_all_vectored_raw<W: Write>(w: &mut W, bufs: &mut [IoSlice<'_>]) -> io::Result<u64> {
     let mut bufs: &mut [IoSlice<'_>] = bufs;
+    let mut syscalls: u64 = 0;
     while !bufs.is_empty() {
         let n = w.write_vectored(bufs)?;
+        syscalls += 1;
         if n == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -179,5 +201,5 @@ fn write_all_vectored_raw<W: Write>(w: &mut W, bufs: &mut [IoSlice<'_>]) -> io::
         }
         IoSlice::advance_slices(&mut bufs, n);
     }
-    Ok(())
+    Ok(syscalls)
 }

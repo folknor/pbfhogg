@@ -27,10 +27,14 @@ pub(crate) struct WriterMetrics {
     pub direct_write_bytes: AtomicU64,
     pub sync_all_ns: AtomicU64,
 
-    /// `writev` syscalls issued by the batched-buffered sink.
+    /// Actual `write_vectored` syscalls issued by the batched-buffered sink.
+    /// A single batch flush may produce multiple syscalls when the first
+    /// call returns a partial write — each loop iteration is counted.
     pub batched_writev_calls: AtomicU64,
-    /// Total frames (`OutputChunk` items) across all batched `writev`
-    /// calls — divide by `batched_writev_calls` for average batch size.
+    /// Total PBF frames written through the batched-buffered sink. A
+    /// `RawChunks` contributes one frame per inner `Vec`, so this counts
+    /// real frames rather than `OutputChunk` items. Divide by
+    /// `batched_writev_calls` for average frames per syscall.
     pub batched_writev_frames: AtomicU64,
 
     pub uring_submit_calls: AtomicU64,

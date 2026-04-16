@@ -7,9 +7,15 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
+use std::sync::atomic::Ordering::Relaxed;
 
 #[cfg(feature = "linux-direct-io")]
 use super::direct_writer::DirectWriter;
+use super::metrics::WRITER_METRICS;
+
+fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
@@ -64,9 +70,23 @@ impl FileWriter {
 impl Write for FileWriter {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
-            FileWriter::Buffered(w) => w.write(buf),
+            FileWriter::Buffered(w) => {
+                let n = w.write(buf)?;
+                WRITER_METRICS.buffered_write_calls.fetch_add(1, Relaxed);
+                WRITER_METRICS
+                    .buffered_write_bytes
+                    .fetch_add(n as u64, Relaxed);
+                Ok(n)
+            }
             #[cfg(feature = "linux-direct-io")]
-            FileWriter::Direct(w) => w.write(buf),
+            FileWriter::Direct(w) => {
+                let n = w.write(buf)?;
+                WRITER_METRICS.direct_write_calls.fetch_add(1, Relaxed);
+                WRITER_METRICS
+                    .direct_write_bytes
+                    .fetch_add(n as u64, Relaxed);
+                Ok(n)
+            }
         }
     }
 
@@ -74,12 +94,22 @@ impl Write for FileWriter {
         match self {
             FileWriter::Buffered(w) => {
                 w.flush()?;
-                w.get_ref().sync_all()
+                let t_sync = std::time::Instant::now();
+                let result = w.get_ref().sync_all();
+                WRITER_METRICS
+                    .sync_all_ns
+                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                result
             }
             #[cfg(feature = "linux-direct-io")]
             FileWriter::Direct(w) => {
                 w.flush()?;
-                w.sync_all()
+                let t_sync = std::time::Instant::now();
+                let result = w.sync_all();
+                WRITER_METRICS
+                    .sync_all_ns
+                    .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
+                result
             }
         }
     }

@@ -43,6 +43,10 @@ impl<T> ReorderBuffer<T> {
         }
         item
     }
+
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
 }
 
 #[cfg(test)]

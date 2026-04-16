@@ -12,6 +12,7 @@
 
 use crate::blob_index;
 use crate::write::file_writer::FileWriter;
+use crate::write::metrics::WRITER_METRICS;
 use protohoggr::{encode_bytes_field, encode_int32_field};
 use flate2::Compress;
 use flate2::Compression as FlateCompression;
@@ -23,6 +24,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
+use std::sync::atomic::Ordering::Relaxed;
 use std::thread::JoinHandle;
 
 /// Maximum number of framed blobs in-flight before backpressure stalls senders.
@@ -125,10 +127,12 @@ impl FromStr for Compression {
 /// Payload for the writer pipeline channel.
 pub(crate) enum PipelinePayload {
     /// Framed blob bytes ready to write.
-    Bytes(io::Result<Vec<u8>>),
+    Framed(io::Result<Vec<u8>>),
+    /// Pre-framed raw blob bytes.
+    Raw(Vec<u8>),
     /// Multiple framed blob chunks, written sequentially. Avoids
     /// concatenating passthrough frames into a single Vec.
-    ByteChunks(Vec<Vec<u8>>),
+    RawChunks(Vec<Vec<u8>>),
     /// Kernel-space copy from input fd (avoids userspace copy for passthrough).
     #[cfg(feature = "linux-direct-io")]
     CopyRange {
@@ -168,6 +172,16 @@ fn new_permit_pool() -> (SyncSender<()>, Receiver<()>) {
         permit_tx.send(()).expect("seeding permit pool on fresh channel");
     }
     (permit_tx, permit_rx)
+}
+
+fn record_send_wait(send_start: std::time::Instant) {
+    WRITER_METRICS
+        .pipeline_send_wait_ns
+        .fetch_add(elapsed_ns_u64(send_start), Relaxed);
+}
+
+fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Reusable scratch buffers for blob framing, avoiding per-call allocation.
@@ -403,9 +417,13 @@ impl<W: Write> PbfWriter<W> {
             // from growing without bound (see `PIPELINE_DISPATCH_PERMITS`
             // doc comment for the planet-scale OOM story that motivated
             // this).
+            let t_permit = std::time::Instant::now();
             pipeline.permit_rx.recv().map_err(|_| {
                 io::Error::other("pipelined writer permit pool disconnected")
             })?;
+            WRITER_METRICS
+                .permit_wait_ns
+                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
@@ -427,7 +445,15 @@ impl<W: Write> PbfWriter<W> {
                         scratch,
                     )
                 });
-                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
+                if let Ok(ref bytes) = result {
+                    WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
+                    WRITER_METRICS
+                        .payload_framed_bytes
+                        .fetch_add(bytes.len() as u64, Relaxed);
+                }
+                let t_send = std::time::Instant::now();
+                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Framed(result) }));
+                record_send_wait(t_send);
                 // Release the permit so the main thread can dispatch more
                 // work. Must happen AFTER `tx.send` above so the in-flight
                 // count stays correct while the result is waiting in the
@@ -471,9 +497,13 @@ impl<W: Write> PbfWriter<W> {
             // Bound in-flight rayon dispatches — see the sibling
             // `write_primitive_block` above and the
             // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
+            let t_permit = std::time::Instant::now();
             pipeline.permit_rx.recv().map_err(|_| {
                 io::Error::other("pipelined writer permit pool disconnected")
             })?;
+            WRITER_METRICS
+                .permit_wait_ns
+                .fetch_add(elapsed_ns_u64(t_permit), Relaxed);
             let seq = pipeline.seq;
             pipeline.seq += 1;
             let compression = self.compression;
@@ -491,7 +521,15 @@ impl<W: Write> PbfWriter<W> {
                         scratch,
                     )
                 });
-                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Bytes(result) }));
+                if let Ok(ref bytes) = result {
+                    WRITER_METRICS.payload_framed_items.fetch_add(1, Relaxed);
+                    WRITER_METRICS
+                        .payload_framed_bytes
+                        .fetch_add(bytes.len() as u64, Relaxed);
+                }
+                let t_send = std::time::Instant::now();
+                drop(tx.send(PipelineItem { seq, data: PipelinePayload::Framed(result) }));
+                record_send_wait(t_send);
                 // Failure here means the main thread already dropped its
                 // receiver (shutting down); safe to ignore.
                 permit_tx.send(()).ok();
@@ -519,13 +557,19 @@ impl<W: Write> PbfWriter<W> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
+            WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .payload_raw_bytes
+                .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
+            let t_send = std::time::Instant::now();
             pipeline
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::Bytes(Ok(raw_framed_bytes.to_vec())),
+                    data: PipelinePayload::Raw(raw_framed_bytes.to_vec()),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
+            record_send_wait(t_send);
             Ok(())
         } else {
             self.writer_mut().write_all(raw_framed_bytes)
@@ -542,13 +586,19 @@ impl<W: Write> PbfWriter<W> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
+            WRITER_METRICS.payload_raw_items.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .payload_raw_bytes
+                .fetch_add(raw_framed_bytes.len() as u64, Relaxed);
+            let t_send = std::time::Instant::now();
             pipeline
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::Bytes(Ok(raw_framed_bytes)),
+                    data: PipelinePayload::Raw(raw_framed_bytes),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
+            record_send_wait(t_send);
             Ok(())
         } else {
             self.writer_mut().write_all(&raw_framed_bytes)
@@ -564,13 +614,20 @@ impl<W: Write> PbfWriter<W> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
+            let total_bytes: u64 = chunks.iter().map(|c| c.len() as u64).sum();
+            WRITER_METRICS.payload_raw_chunk_items.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .payload_raw_chunk_bytes
+                .fetch_add(total_bytes, Relaxed);
+            let t_send = std::time::Instant::now();
             pipeline
                 .tx
                 .send(PipelineItem {
                     seq,
-                    data: PipelinePayload::ByteChunks(chunks),
+                    data: PipelinePayload::RawChunks(chunks),
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
+            record_send_wait(t_send);
             Ok(())
         } else {
             let w = self.writer_mut();
@@ -587,6 +644,7 @@ impl<W: Write> PbfWriter<W> {
     /// deferred compression or I/O errors. After flush, the pipeline is
     /// stopped and subsequent writes go through the direct (non-pipelined) path.
     pub fn flush(&mut self) -> io::Result<()> {
+        let t_flush = std::time::Instant::now();
         if let Some(mut pipeline) = self.pipeline.take() {
             // Drop sender to signal the writer thread that no more items are coming.
             drop(pipeline.tx);
@@ -599,6 +657,10 @@ impl<W: Write> PbfWriter<W> {
         if let Some(ref mut w) = self.writer {
             w.flush()?;
         }
+        WRITER_METRICS
+            .flush_ns
+            .fetch_add(elapsed_ns_u64(t_flush), Relaxed);
+        WRITER_METRICS.emit();
         Ok(())
     }
 
@@ -640,11 +702,12 @@ impl<W: Write> PbfWriter<W> {
         indexdata: Option<&[u8]>,
         tagdata: Option<&[u8]>,
     ) -> io::Result<()> {
-        encode_blob_body(
-            uncompressed,
-            &self.compression,
-            &mut self.scratch,
-        )?;
+        let t_compress = std::time::Instant::now();
+        encode_blob_body(uncompressed, &self.compression, &mut self.scratch)?;
+        WRITER_METRICS
+            .compress_ns
+            .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
+        let t_frame = std::time::Instant::now();
         let datasize = i32::try_from(self.scratch.blob_buf.len()).map_err(|_| {
             io::Error::other(format!(
                 "blob datasize overflow: {} bytes",
@@ -664,11 +727,25 @@ impl<W: Write> PbfWriter<W> {
                 self.scratch.header_buf.len()
             ))
         })?;
+        let total_len = 4 + self.scratch.header_buf.len() + self.scratch.blob_buf.len();
+        WRITER_METRICS
+            .frame_ns
+            .fetch_add(elapsed_ns_u64(t_frame), Relaxed);
+        WRITER_METRICS
+            .bytes_framed
+            .fetch_add(total_len as u64, Relaxed);
         // Write the 3 frame parts directly — no intermediate `out` Vec.
         let writer = self.writer.as_mut().expect("writer consumed by pipeline");
+        let t_write = std::time::Instant::now();
         writer.write_all(&header_len.to_be_bytes())?;
         writer.write_all(&self.scratch.header_buf)?;
         writer.write_all(&self.scratch.blob_buf)?;
+        WRITER_METRICS
+            .write_ns
+            .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+        WRITER_METRICS
+            .bytes_written
+            .fetch_add(total_len as u64, Relaxed);
         Ok(())
     }
 }
@@ -708,6 +785,11 @@ impl PbfWriter<FileWriter> {
         if let Some(ref mut pipeline) = self.pipeline {
             let seq = pipeline.seq;
             pipeline.seq += 1;
+            WRITER_METRICS.payload_copy_range_items.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .payload_copy_range_bytes
+                .fetch_add(len, Relaxed);
+            let t_send = std::time::Instant::now();
             pipeline
                 .tx
                 .send(PipelineItem {
@@ -715,6 +797,7 @@ impl PbfWriter<FileWriter> {
                     data: PipelinePayload::CopyRange { in_fd, offset, len },
                 })
                 .map_err(|_| io::Error::other("writer thread terminated"))?;
+            record_send_wait(t_send);
             Ok(())
         } else {
             // Same invariant as writer_mut — programming error if None.
@@ -741,6 +824,7 @@ impl PbfWriter<FileWriter> {
 ///
 /// Specialized to `FileWriter` (not generic `W: Write`) to support
 /// `CopyRange` payloads that require `flush_and_raw_fd()`.
+#[allow(clippy::needless_pass_by_value)] // Thread entry point owns the writer moved into std::thread::spawn.
 fn writer_thread(
     rx: std::sync::mpsc::Receiver<PipelineItem>,
     mut writer: FileWriter,
@@ -748,20 +832,54 @@ fn writer_thread(
     let mut pending: ReorderBuffer<PipelinePayload> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 
-    for item in rx {
+    loop {
+        let t_recv = std::time::Instant::now();
+        let item = match rx.recv() {
+            Ok(item) => item,
+            Err(_) => break,
+        };
+        WRITER_METRICS
+            .recv_wait_ns
+            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
         pending.push(item.seq, item.data);
+        WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
         // Drain consecutive ready items from the front.
         while let Some(payload) = pending.pop_ready() {
             match payload {
-                PipelinePayload::Bytes(result) => writer.write_all(&result?)?,
-                PipelinePayload::ByteChunks(chunks) => {
+                PipelinePayload::Framed(result) => {
+                    let bytes = result?;
+                    let len = bytes.len() as u64;
+                    let t_write = std::time::Instant::now();
+                    writer.write_all(&bytes)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                }
+                PipelinePayload::Raw(bytes) => {
+                    let len = bytes.len() as u64;
+                    let t_write = std::time::Instant::now();
+                    writer.write_all(&bytes)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                }
+                PipelinePayload::RawChunks(chunks) => {
+                    let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                    let t_write = std::time::Instant::now();
                     for chunk in &chunks {
                         writer.write_all(chunk)?;
                     }
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
                 #[cfg(feature = "linux-direct-io")]
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
+                    let t_write = std::time::Instant::now();
                     let out_fd = writer
                         .flush_and_raw_fd()?
                         .ok_or_else(|| {
@@ -771,6 +889,10 @@ fn writer_thread(
                             )
                         })?;
                     copy_range(in_fd, out_fd, offset, len)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
             }
         }
@@ -919,7 +1041,12 @@ fn frame_blob_into(
     tagdata: Option<&[u8]>,
     scratch: &mut FrameScratch,
 ) -> io::Result<Vec<u8>> {
+    let t_compress = std::time::Instant::now();
     encode_blob_body(uncompressed, compression, scratch)?;
+    WRITER_METRICS
+        .compress_ns
+        .fetch_add(elapsed_ns_u64(t_compress), Relaxed);
+    let t_frame = std::time::Instant::now();
 
     let datasize = i32::try_from(scratch.blob_buf.len()).map_err(|_| {
         io::Error::other(format!("blob datasize overflow: {} bytes", scratch.blob_buf.len()))
@@ -933,6 +1060,12 @@ fn frame_blob_into(
     out.extend_from_slice(&header_len.to_be_bytes());
     out.extend_from_slice(&scratch.header_buf);
     out.extend_from_slice(&scratch.blob_buf);
+    WRITER_METRICS
+        .frame_ns
+        .fetch_add(elapsed_ns_u64(t_frame), Relaxed);
+    WRITER_METRICS
+        .bytes_framed
+        .fetch_add(total_len as u64, Relaxed);
 
     Ok(out)
 }

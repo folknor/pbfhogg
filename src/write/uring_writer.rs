@@ -24,8 +24,14 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::ptr::NonNull;
 use std::sync::mpsc::{Receiver, SyncSender};
+use std::sync::atomic::Ordering::Relaxed;
 
 use super::{PAGE_SIZE, alloc_page_aligned};
+use super::metrics::WRITER_METRICS;
+
+fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
+    u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
 
 /// Registered file descriptor index for the output file.
 const OUT_FD_IDX: u32 = 0;
@@ -251,10 +257,15 @@ impl UringState {
         // registered fd (OUT_FD_IDX). The buffer will not be touched until the
         // CQE is reaped (enforced by the free-list protocol).
         self.push_sqe(&sqe)?;
+        let t_submit = std::time::Instant::now();
         self.ring
             .submitter()
             .submit()
             .map_err(|e| io::Error::new(e.kind(), format!("io_uring submit failed: {e}")))?;
+        WRITER_METRICS.uring_submit_calls.fetch_add(1, Relaxed);
+        WRITER_METRICS
+            .uring_submit_ns
+            .fetch_add(elapsed_ns_u64(t_submit), Relaxed);
 
         self.write_offset += aligned_len as u64;
         self.in_flight += 1;
@@ -332,10 +343,15 @@ impl UringState {
         // Safety: both SQEs reference registered buffers and registered fds.
         // The buffer will not be touched until both CQEs are reaped.
         self.push_sqe_pair(&read_sqe, &write_sqe)?;
+        let t_submit = std::time::Instant::now();
         self.ring
             .submitter()
             .submit()
             .map_err(|e| io::Error::new(e.kind(), format!("io_uring submit failed: {e}")))?;
+        WRITER_METRICS.uring_submit_calls.fetch_add(1, Relaxed);
+        WRITER_METRICS
+            .uring_submit_ns
+            .fetch_add(elapsed_ns_u64(t_submit), Relaxed);
 
         self.write_offset += aligned_len as u64;
         self.in_flight += 2; // Both SQEs produce CQEs
@@ -438,12 +454,19 @@ impl UringState {
             return Ok(());
         }
         if wait {
+            let t_wait = std::time::Instant::now();
             self.ring
                 .submitter()
                 .submit_and_wait(1)
                 .map_err(|e| {
                     io::Error::new(e.kind(), format!("io_uring submit_and_wait failed: {e}"))
                 })?;
+            let elapsed = elapsed_ns_u64(t_wait);
+            WRITER_METRICS.uring_submit_and_wait_calls.fetch_add(1, Relaxed);
+            WRITER_METRICS
+                .uring_submit_and_wait_ns
+                .fetch_add(elapsed, Relaxed);
+            WRITER_METRICS.uring_cq_wait_ns.fetch_add(elapsed, Relaxed);
         }
         for cqe in self.ring.completion() {
             let ud = cqe.user_data();
@@ -502,7 +525,11 @@ impl UringState {
         self.submit_current()?;
         self.drain()?;
         file.set_len(self.logical_size)?;
+        let t_sync = std::time::Instant::now();
         file.sync_all()?;
+        WRITER_METRICS
+            .sync_all_ns
+            .fetch_add(elapsed_ns_u64(t_sync), Relaxed);
         Ok(())
     }
 }
@@ -687,23 +714,59 @@ fn uring_main_loop(
     let mut pending: ReorderBuffer<PipelinePayload> =
         ReorderBuffer::with_capacity(WRITE_AHEAD);
 
-    for item in rx {
+    loop {
+        let t_recv = std::time::Instant::now();
+        let item = match rx.recv() {
+            Ok(item) => item,
+            Err(_) => break,
+        };
+        WRITER_METRICS
+            .recv_wait_ns
+            .fetch_add(elapsed_ns_u64(t_recv), Relaxed);
         pending.push(item.seq, item.data);
+        WRITER_METRICS.record_reorder_high_water(pending.pending_len());
 
         // Drain consecutive ready items from the front.
         while let Some(payload) = pending.pop_ready() {
             match payload {
-                PipelinePayload::Bytes(result) => {
-                    state.write(&result?)?;
+                PipelinePayload::Framed(result) => {
+                    let bytes = result?;
+                    let len = bytes.len() as u64;
+                    let t_write = std::time::Instant::now();
+                    state.write(&bytes)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
-                PipelinePayload::ByteChunks(chunks) => {
+                PipelinePayload::Raw(bytes) => {
+                    let len = bytes.len() as u64;
+                    let t_write = std::time::Instant::now();
+                    state.write(&bytes)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
+                }
+                PipelinePayload::RawChunks(chunks) => {
+                    let total_bytes: u64 = chunks.iter().map(|chunk| chunk.len() as u64).sum();
+                    let t_write = std::time::Instant::now();
                     for chunk in &chunks {
                         state.write(chunk)?;
                     }
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(total_bytes, Relaxed);
                 }
                 #[cfg(feature = "linux-direct-io")]
                 PipelinePayload::CopyRange { in_fd, offset, len } => {
+                    let t_write = std::time::Instant::now();
                     handle_copy_range_uring(state, in_fd, offset, len)?;
+                    WRITER_METRICS
+                        .write_ns
+                        .fetch_add(elapsed_ns_u64(t_write), Relaxed);
+                    WRITER_METRICS.bytes_written.fetch_add(len, Relaxed);
                 }
             }
         }

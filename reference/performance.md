@@ -305,6 +305,7 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | cat --type way | 239 ms |
 | merge-changes | 107 ms |
 | inspect-tags | 1.61s |
+| diff --format osc | 1.6s (`1a42c27`) |
 | inspect-nodes | 1.73s |
 | check --ids | 1.87s |
 | getid --invert | 0.5s |

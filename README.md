@@ -40,7 +40,7 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `cat --type way` (raw passthrough) | 44s | **10 MB** | zero decompression, indexdata blob filter |
 | `getid --invert` | 1m23s | 102 MB | raw-frame passthrough for non-intersecting blobs |
 | `cat` (indexdata generation) | 8m17s | ~200 MB | rewrites BlobHeader without re-compressing |
-| `tags-filter highway=primary` | 52s | 688 MB | two-pass, parallel classify |
+| `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
 | `getid` | 1m6s | 833 MB | multi-blob ID resolution via indexdata |
 | `check --refs` | 20m25s | 1.73 GB | full referential integrity over 11.6B elements |
 | `apply-changes` (daily diff, zlib) | 12m33s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |

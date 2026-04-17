@@ -49,6 +49,59 @@ verifies the debug monotonicity assertion fires on unsorted nodes when `Sort.Typ
 is declared. Requires `debug_assertions` to be enabled in the test profile. Nightly 1.95
 (2026-02-25) has a regression where `debug_assertions` is off in test builds.
 
+## Investigate planet regressions (2026-04-17)
+
+Overnight rerun on commit `28fd26c` (plantasjen, UUIDs below) measured
+large deltas vs the README.md planet table.
+
+| Row | README | New (`28fd26c`) | Δ | UUID |
+|---|---|---|---|---|
+| `tags-filter highway=primary` | 52s | 153.2s | +195% | `d71445a6` |
+| `cat --type way` (raw passthrough) | 44s | **73.8s** | **+69%** | `127fdf1e` |
+| `getid --invert` | 83s | 89.1s | +7% | `3edfefb5` |
+| `cat` (indexdata generation) | 497s | 477.1s | -4% | `d7857f19` |
+| `diff --format osc` (osc 4913, cache hit) | (no planet row) | 6245.2s (~104m) | n/a | `aaaf31ec` |
+
+- [x] **`tags-filter highway=primary` is NOT a regression, workload changed.**
+  Baseline `0e44e017` (commit `7818c0f`, 2026-03-29) used `-R
+  w/highway=primary` (single-pass, `--omit-referenced`) → 52.5 s. The
+  2026-04-17 rerun used default two-pass (includes referenced nodes) →
+  153 s. Sidecar `d71445a6 --durations` confirms: PASS1 27.8 s, WAYDEPS
+  29.4 s, PASS2 75.3 s - the WAYDEPS + PASS2-emit work is exactly what
+  `-R` skips. README row label `tags-filter highway=primary` is
+  ambiguous; the new number is the honest two-pass measurement. If we
+  want both in README, label them `-R` vs default explicitly.
+
+- [ ] **`cat --type way` planet regression is real - 43.7 s → 73.8 s (+69%).**
+  Same workload (bare `--type way`, indexed planet), same dataset.
+  Baseline `8ebb563e` (commit `46e8764`, 2026-03-29) 43.3 s; `16107a76`
+  (commit `573ef71`, 2026-03-30) 43.7 s. Current `127fdf1e` sidecar:
+  CAT_SCAN_START 52.2 s + CAT_SCAN_END 21.5 s = 73.5 s wall; 95 GB read +
+  28 GB written. Between `573ef71` and `28fd26c` the write path saw a
+  batched-writev sink (`4ed7e52`), runtime-tunable thresholds
+  (`4a68c52`), metrics rework (`8d349c2`, `687d81e`, `985f76c`,
+  `213136f`), permit pool (`9695ad5`), `OutputChunk`/`OutputSink` API
+  (`603385e`), and a `fallocate` hint (`985f76c`). Write-path is the
+  prime suspect; also possible the per-element-alloc elimination
+  (`b45b731`) or `fc17b51` columnar decode regressed the decompress-scan
+  side. Bisect candidates in rough order of likelihood: `603385e`,
+  `4ed7e52`, `9695ad5`, `b45b731`. `brokkr <cmd> --commit <hash>` does
+  git-worktree checkout internally (safe for `.brokkr/results.db`).
+- [ ] **Rerun `add-locations-to-ways --index-type external` planet** - the
+  2026-04-17 overnight hit EMFILE (`rank-W13-047: Too many open files`)
+  during stage-1 shard creation. Stage 1 opens `num_shard_workers *
+  NUM_BUCKETS` (=256) files; the failing worker index 13 implies at
+  least 14 workers × 256 = 3584 FDs. Shell `ulimit -n` is 524288 on this
+  host, so either the pbfhogg process inherited a lower limit or the
+  FD accounting is higher than expected. Verify `/proc/<pid>/limits`
+  for the child and rerun. Row in README still reads 953s / 11m38s from
+  the `3d977a0` baseline.
+- [ ] **Add a planet `diff --format osc` row** somewhere - currently only
+  the Denmark 73.1s value at `reference/performance.md:352` exists. The
+  new 6245s / 104m planet number wants a home (likely alongside the
+  other planet rows). Deferred until the regressions above are resolved
+  so the table lands in one coherent update.
+
 ## Next up (2026-04-13)
 
 - [ ] **Multi-extract way classify per-worker scratch** - line 868

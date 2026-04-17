@@ -526,6 +526,18 @@ pub(super) fn stage2_node_join(
                             let lon = i32::from_le_bytes([
                                 coord_slice[co+4], coord_slice[co+5], coord_slice[co+6], coord_slice[co+7],
                             ]);
+                            // KNOWN LIMITATION: (0, 0) doubles as the
+                            // unresolved-coord sentinel (coord slots are
+                            // zero-filled before the node scan fills them)
+                            // AND as a legitimate OSM node at Null Island.
+                            // A real node at 0°, 0° will be counted here as
+                            // unresolved (under-counting `resolved_rank`) and
+                            // still get written as (0, 0) to ways that
+                            // reference it. A proper fix is a presence bitmap
+                            // alongside the coord array. Same pattern exists
+                            // in the geocode builder (`src/geocode_index/builder.rs`
+                            // `coords` filter_map); fix both together if the
+                            // contract ever changes.
                             let is_resolved = lat != 0 || lon != 0;
 
                             for &slot_pos in &bkt.grouped_slot_pos[start..end] {

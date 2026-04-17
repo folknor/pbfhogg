@@ -630,10 +630,32 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 /// Per-worker accumulation classify: workers accumulate into `S` across
 /// all blobs, send `S` once at completion.
 ///
-/// Use ONLY for sparse paths where per-worker `S` is bounded at planet
-/// scale (relation classify: ~68 MB per worker; relation closure members:
-/// ~13 MB per worker). NOT safe for dense paths - per-worker Vec or
-/// IdSetDense accumulation is unbounded for node/way classify.
+/// # When to use
+///
+/// The per-worker `S` is held for the duration of the whole scan and only
+/// merged at the end. The safe usage envelope is determined by the upper
+/// bound on per-worker `S` memory at the largest scale you support,
+/// multiplied by the number of decode threads.
+///
+/// Safe: relation classify (~68 MB per worker at planet) and relation
+/// closure members (~13 MB per worker). These are sparse paths where `S`
+/// is dominated by a small set of relation-local IDs or metadata.
+///
+/// Borderline: per-worker `IdSetDense` accumulation of node IDs during
+/// way classify (geocode Pass 1.5). A worker can legitimately touch node
+/// IDs across the full planet range via referenced-node unions, so the
+/// worst-case per-worker bitmap is ~1.3 GB at planet scale (10.4 B node
+/// IDs × 1 bit). Shipping at 14.59 GB peak RSS (planet) — OK in practice,
+/// but on the rewrite list in `notes/geocode-build-opportunities.md`.
+/// If you add another caller like this, measure first.
+///
+/// Unsafe: per-worker `Vec<i64>` accumulation of node IDs during dense
+/// node classify (would be O(billions of i64) per worker). Use
+/// [`parallel_classify_phase`] instead — its per-blob merge is bounded
+/// by blob size (~8 000 elements).
+///
+/// If you change this comment, also update the caller audit in the
+/// geocode Pass 1.5 call site and the TODO item tracking it.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_accumulate<S: Send>(
     shared_file: &std::sync::Arc<std::fs::File>,

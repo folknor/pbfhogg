@@ -88,32 +88,101 @@ non-standard encoding.
 
 ## Null Island ambiguity in dense mmap index
 
-**Status:** Known, accepted. Documented in code.
+**Status:** Known, accepted. Documented in code at every affected site.
 
-**Context:** All three `add-locations-to-ways` index types (`dense`, `sparse`,
-`external`) store node coordinates as `(lat: i32, lon: i32)` pairs in a
-zero-initialized backing store and use `(0, 0)` as the "unset" sentinel:
+**Context:** Every index that stores node coordinates as `(lat: i32, lon: i32)`
+pairs in a zero-initialized backing store uses `(0, 0)` as the "unset"
+sentinel:
 
 - `DenseMmapIndex::get` treats `packed == 0` as absent
-  (`src/commands/add_locations_to_ways.rs:145`).
+  (`src/commands/add_locations_to_ways.rs`, `DenseMmapIndex::get`).
 - `SparseArrayIndex::get_at_offset` treats `lat == 0 && lon == 0` as absent
-  (`src/commands/add_locations_to_ways.rs:349`).
-- The external-join stage 2 counts an entry as resolved only when
-  `lat != 0 || lon != 0` (`src/commands/altw/stage2.rs`), and
+  (`src/commands/add_locations_to_ways.rs`, `SparseArrayIndex::get_at_offset`).
+- External-join stage 2 counts an entry as resolved only when
+  `lat != 0 || lon != 0` (`src/commands/altw/stage2.rs`, `is_resolved`), and
   `Stats.missing_locations = total_slots - resolved_count`.
+- Geocode builder Pass 2 filters ways' `(lat, lon)` coords with
+  `if lat == 0 && lon == 0 { None }` inside the `way.refs()` filter_map
+  (`src/geocode_index/builder.rs`, the `coords` collection in the
+  per-way handler).
 
-All three paths therefore treat a node at exactly `0.0000000, 0.0000000`
-(Null Island) as missing, with identical user-visible behavior. The same
-pattern also appears in the geocode index builder
-(`src/geocode_index/builder.rs:502`), where the compact rank-indexed
-coordinate array is zero-initialized and `(0, 0)` is filtered as unpopulated.
+All sites therefore treat a node at exactly `0.0000000, 0.0000000` (Null
+Island) as missing, with identical user-visible behavior. Each site carries
+a `KNOWN LIMITATION` comment cross-linking to the others so a future
+sentinel-contract change covers all of them at once.
 
-**Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree precision,
-so within ~11mm of the intersection of the prime meridian and equator - will not
-have locations added. In the geocode builder, streets or address ways with a node at
-exactly `(0, 0)` will have that coordinate silently dropped from their geometry. This
-affects zero real-world nodes. The nearest land is ~570 km away (Gulf of Guinea).
+**Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree
+precision, so within ~11 mm of the intersection of the prime meridian and
+equator - will not have locations added. In the geocode builder, streets or
+address ways with a node at exactly `(0, 0)` will have that coordinate
+silently dropped from their geometry. This affects zero real-world nodes.
+The nearest land is ~570 km away (Gulf of Guinea).
 
-**Why not fix:** Fixing requires either a separate occupancy bitmap (1 bit per node,
-~550 MB at planet scale) or reserving an impossible sentinel with explicit valid-bit
-tracking. Both add memory overhead and complexity for a case that affects no real data.
+**Why not fix:** Fixing requires either a separate occupancy bitmap (1 bit
+per node, ~550 MB at planet scale) or reserving an impossible sentinel
+with explicit valid-bit tracking. Both add memory overhead and complexity
+for a case that affects no real data.
+
+## Geocode index: interpolation unresolved-endpoint sentinel
+
+**Status:** Known, accepted. Documented in code.
+
+**Context:** `SlimInterpWay` (the in-memory staging struct that flushes to
+`interp_ways.bin` as `InterpWay`) stores resolved interpolation house
+numbers in `start_number: u32, end_number: u32`. The resolver
+(`resolve_interpolation_endpoints_mmap` in `src/geocode_index/builder.rs`)
+runs after Pass 2 and matches each endpoint against nearby addr points
+with the same street name; on a match, it overwrites `start_number` and
+`end_number` with the matched house numbers. On failure, both stay at
+their initial `0` - the same value a legitimate OSM interpolation way
+starting at house number 0 would carry.
+
+**Impact:** A reader distinguishing "unresolved interp way" from "interp
+way starting at house 0" sees identical bytes. "0" as a house number is
+rare but exists in some regions. Ambiguity affects only interpolation
+ways where at least one endpoint fails to match an addr point AND the
+legitimate range happens to begin at 0.
+
+**Why not fix:** The clean fix is a `resolved: bool` field persisted into
+`InterpWay` and a `FORMAT_VERSION` bump. Unrecorded observations in
+production so far; the extra byte of format growth and the regeneration
+cost for existing indexes aren't justified until the ambiguity is seen
+affecting real output. Fix shape is captured at the struct comment in
+`SlimInterpWay`.
+
+## Geocode index: u16 on-disk count caps (hard error on overflow)
+
+**Status:** Enforced. Builder hard-errors if any cap is exceeded.
+
+**Context:** The geocode on-disk format uses `u16` count fields in several
+places:
+
+- Per-cell entry counts for street / addr / interp segments
+  (`street_entries.bin`, `addr_entries.bin`, `interp_entries.bin`,
+  read by `SegmentEntryIter` / `U32EntryIter` in
+  `src/geocode_index/reader.rs`).
+- Per-cell entry counts for admin polygons (`admin_entries.bin`, read
+  by `AdminEntryIter`).
+- Per-way node counts in `StreetWay.node_count` and
+  `InterpWay.node_count` (`src/geocode_index/format.rs`).
+
+The builder (`src/geocode_index/builder.rs`) used to silently truncate
+oversized cells/ways to `u16::MAX`, producing silently-incomplete output.
+It now hard-errors at the write site via `u16::try_from(...)`, naming the
+offending cell or way in the error message.
+
+**Impact:** A build fails instead of quietly losing data. Unreachable
+today in practice:
+
+- Per-cell entry caps are well above observed density at street level
+  17 (~150 m cells) and coarse level 14 (~1 km cells in dense urban
+  areas).
+- Per-way `node_count` is well above the OSM convention cap of 2 000
+  refs per way.
+
+**Why hard-error instead of bumping to u32:** The format version change
+costs on-disk growth and forces regeneration of existing indexes; a
+hard error is a strictly better signal than silent truncation until a
+real workload actually hits the cap. If that happens, the error message
+names the exact field and the migration path: bump the count to `u32`
+and increment `FORMAT_VERSION` in `src/geocode_index/format.rs`.

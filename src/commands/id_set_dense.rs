@@ -79,6 +79,25 @@ impl IdSetDense {
     /// Pre-allocate all chunks needed to hold IDs up to `max_id`.
     /// Call before `set_atomic` to avoid dynamic resizing during
     /// concurrent access.
+    ///
+    /// # Invariant for callers
+    ///
+    /// `max_id` is the contract between the caller and every thread that
+    /// later calls `set_atomic` / `set_atomic_if_new` through `&self`. Any
+    /// `id > max_id` will panic (no dynamic chunk growth is possible under
+    /// shared borrow). The panic message in `set_atomic` points back at this.
+    ///
+    /// Common sources of overshoot seen in practice:
+    ///
+    /// - Corrupted or mismatched indexdata: a blob header reports a smaller
+    ///   `max_id` than the element IDs that actually appear once the blob is
+    ///   decoded. `renumber_external` builds its schedule from indexdata and
+    ///   uses `pass1_schedule.last().max_id`.
+    /// - Future planet growth past a hard-coded cap (see `verify_ids`,
+    ///   `check_refs` which cap at 14e9 nodes, 1.5e9 ways, 25e6 relations).
+    ///
+    /// The defensive option is to verify `max_id` during the schedule scan
+    /// against a sanity bound, or to widen the hard-coded caps.
     #[allow(clippy::cast_sign_loss)]
     pub fn pre_allocate(&mut self, max_id: i64) {
         if max_id < 0 { return; }
@@ -98,14 +117,27 @@ impl IdSetDense {
     /// via `&self` (no `&mut` needed). Uses `Relaxed` ordering - callers must
     /// synchronize (e.g. thread join) before reading via `get()` or `rank()`.
     ///
-    /// # Safety
-    /// The caller must ensure that chunks are pre-allocated via `pre_allocate()`.
-    /// Panics if `id` falls outside the pre-allocated range.
+    /// # Panics
+    ///
+    /// Panics if `id` falls outside the pre-allocated range. This usually
+    /// means the caller's `pre_allocate(max_id)` argument underestimated the
+    /// highest ID that would be seen — most commonly because the value was
+    /// derived from indexdata that understated the real maximum (see the
+    /// `pre_allocate` doc for the full list of failure modes). The panic
+    /// message includes the offending ID and the pre-allocated upper bound
+    /// so it's obvious whether this is an indexdata bug, a hard-coded cap
+    /// overshoot, or a missing `pre_allocate` call.
+    ///
+    /// Do NOT "fix" this panic by replacing it with a silent no-op or by
+    /// resizing `self.chunks` here — both would be wrong. A silent no-op
+    /// loses data; a resize is unsound because `&self` methods cannot
+    /// safely grow the backing `Vec` while other threads hold pointers
+    /// into it.
     #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic(&self, id: i64) {
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let chunk = self.chunks[cid].as_ref().expect("set_atomic: chunk not pre-allocated");
+        let chunk = self.chunk_for_atomic(cid, id, "set_atomic");
         let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
         let bit = 1u8 << (id & 7);
         // SAFETY: AtomicU8 and u8 have identical size/alignment. The chunk
@@ -124,14 +156,14 @@ impl IdSetDense {
     /// use from multiple threads via `&self`. Relaxed ordering; callers must
     /// synchronize (thread join) before reading via `get()`.
     ///
-    /// # Safety
-    /// Caller must ensure chunks are pre-allocated. Panics if `id` is
-    /// outside the pre-allocated range.
+    /// # Panics
+    ///
+    /// See [`Self::set_atomic`] — same panic contract and diagnostics.
     #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic_if_new(&self, id: i64) -> bool {
         let id = id as u64;
         let cid = (id >> (CHUNK_BITS + 3)) as usize;
-        let chunk = self.chunks[cid].as_ref().expect("set_atomic_if_new: chunk not pre-allocated");
+        let chunk = self.chunk_for_atomic(cid, id, "set_atomic_if_new");
         let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
         let bit = 1u8 << (id & 7);
         // SAFETY: same as set_atomic. fetch_or returns the previous byte,
@@ -139,6 +171,42 @@ impl IdSetDense {
         let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
         let prev = atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
         (prev & bit) == 0
+    }
+
+    /// Shared chunk-lookup helper for `set_atomic` / `set_atomic_if_new`.
+    /// Produces a detailed panic message when the caller's `pre_allocate`
+    /// budget was exceeded — callers see exactly which ID fell outside the
+    /// pre-allocated range, so indexdata/max-id bugs are diagnosable from
+    /// a single panic line rather than an opaque "not pre-allocated".
+    #[inline]
+    fn chunk_for_atomic(&self, cid: usize, id: u64, fn_name: &'static str) -> &[u8; CHUNK_SIZE] {
+        if cid >= self.chunks.len() {
+            let max_covered = if self.chunks.is_empty() {
+                "<none - pre_allocate was never called>".to_string()
+            } else {
+                format!("chunk {} (~id {})",
+                    self.chunks.len() - 1,
+                    (self.chunks.len() as u64) << (CHUNK_BITS + 3))
+            };
+            panic!(
+                "{fn_name}: id {id} lands in chunk {cid}, but pre_allocate only \
+                 covers up to {max_covered}. Most likely cause: the caller's \
+                 `pre_allocate(max_id)` argument was derived from indexdata that \
+                 understated the real maximum ID, or from a hard-coded cap that \
+                 planet growth has exceeded. See `IdSetDense::pre_allocate` docs."
+            );
+        }
+        match self.chunks[cid].as_ref() {
+            Some(c) => c,
+            None => panic!(
+                "{fn_name}: id {id} lands in chunk {cid} (within Vec length {}), \
+                 but that chunk's slot is None. This means `pre_allocate()` was \
+                 never called on this IdSetDense — the `set_atomic*` methods \
+                 require explicit pre-allocation because they cannot grow under \
+                 a shared `&self` borrow.",
+                self.chunks.len(),
+            ),
+        }
     }
 
     #[allow(clippy::cast_sign_loss)]

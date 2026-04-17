@@ -115,6 +115,16 @@ impl StringPool {
 /// Slim interpolation metadata kept in memory during the build.
 /// Node coordinates are written directly to interp_nodes.bin;
 /// this struct stores only the file offset and count.
+///
+/// KNOWN LIMITATION (sentinel ambiguity): `start_number == 0 && end_number == 0`
+/// is reused as the "unresolved" sentinel -
+/// `resolve_interpolation_endpoints_mmap` only overwrites these fields when it
+/// finds both endpoints among addr points. A real OSM interpolation way that
+/// genuinely starts at house number 0 is indistinguishable from an unresolved
+/// one at read time. "0" as a house number is rare but exists in some regions.
+/// If the caller ever needs to disambiguate, add a separate `resolved: bool`
+/// field here and persist it into [`crate::geocode_index::format::InterpWay`]
+/// (requires bumping `FORMAT_VERSION`).
 struct SlimInterpWay {
     street_offset: u32,
     interpolation_type: u8,
@@ -259,6 +269,17 @@ impl Pass2State<'_> {
                 let off = r * 8;
                 let lat = i32::from_le_bytes(self.coord_mmap[off..off+4].try_into().ok()?);
                 let lon = i32::from_le_bytes(self.coord_mmap[off+4..off+8].try_into().ok()?);
+                // KNOWN LIMITATION: (0, 0) doubles as the "unresolved" sentinel
+                // for the coord mmap (zero-filled on creation, see Pass 2 write
+                // path) AND as a legitimate OSM node at Null Island off the
+                // African coast. A real node at 0°, 0° - periodically created
+                // by broken edits, test fixtures, and GPS-zero errors - is
+                // silently dropped here. A proper fix would be a presence
+                // bitmap alongside the coord array (one bit per node); not
+                // worth the extra pass unless actually observed in production.
+                // Same convention is used in ALTW stage 2 (see
+                // `src/commands/altw/stage2.rs` `is_resolved`) - fix both
+                // together if we ever change the sentinel contract.
                 if lat == 0 && lon == 0 { None } else { Some((lat, lon)) }
             })
             .collect();
@@ -273,14 +294,29 @@ impl Pass2State<'_> {
             self.way_geom.insert(way_id, coords.clone());
         }
 
-        // Interpolation ways - write nodes to file, keep slim metadata
+        // Interpolation ways - write nodes to file, keep slim metadata.
+        // INVARIANT: `InterpWay.node_count` is u16 on disk (see `format.rs`).
+        // OSM convention caps ways at 2000 refs; 65535 is well above that.
+        // Hard-error rather than silently truncating the count while the
+        // node-coordinate stream advances by the full length - that mismatch
+        // used to truncate the tail of one way at read time.
         if is_interp {
             if coords.len() >= 2 {
                 let itype = match interp.unwrap_or("") {
                     "even" => 1u8, "odd" => 2, _ => 0,
                 };
-                #[allow(clippy::cast_possible_truncation)]
-                let nc = coords.len().min(u16::MAX as usize) as u16;
+                let nc = u16::try_from(coords.len()).map_err(|_| format!(
+                    "interp way: {} coords exceeds u16::MAX. OSM ways are capped at \
+                     2000 refs by convention; if this limit ever changes, bump \
+                     `InterpWay.node_count` to u32 and increment FORMAT_VERSION.",
+                    coords.len()
+                ))?;
+                // `start_number = 0, end_number = 0` is the unresolved sentinel
+                // here - `resolve_interpolation_endpoints_mmap` will overwrite
+                // these later if both endpoints match addr points. See the
+                // KNOWN LIMITATION note on `SlimInterpWay` for the sentinel
+                // ambiguity against interpolation ways that legitimately start
+                // at house number 0.
                 self.interp_ways.push(SlimInterpWay {
                     street_offset: self.strings.intern(addr_st.unwrap_or("")),
                     interpolation_type: itype,
@@ -325,10 +361,18 @@ impl Pass2State<'_> {
             self.addr_point_count += 1;
         }
 
-        // Streets - stream to street_ways.bin + street_nodes.bin
+        // Streets - stream to street_ways.bin + street_nodes.bin.
+        // INVARIANT: `StreetWay.node_count` is u16 on disk (see `format.rs`).
+        // Hard-error on overflow - see the interp-way comment above for the
+        // full rationale (silent truncation used to drop the tail of one way
+        // at read time without any error signal).
         if is_street && coords.len() >= 2 {
-            #[allow(clippy::cast_possible_truncation)]
-            let nc = coords.len().min(u16::MAX as usize) as u16;
+            let nc = u16::try_from(coords.len()).map_err(|_| format!(
+                "street way: {} coords exceeds u16::MAX. OSM ways are capped at \
+                 2000 refs by convention; if this limit ever changes, bump \
+                 `StreetWay.node_count` to u32 and increment FORMAT_VERSION.",
+                coords.len()
+            ))?;
             let sw = StreetWay {
                 node_offset: self.street_node_offset,
                 name_offset: self.strings.intern(name.unwrap_or("")),
@@ -495,6 +539,18 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
             &config.input_path, Some(crate::blob_index::ElemKind::Way),
         )?;
 
+        // CAVEAT: per-worker `IdSetDense` accumulation sits on the "borderline"
+        // side of the `parallel_classify_accumulate` contract (see that fn's
+        // docs). A worker can touch node IDs across the full planet range,
+        // so the worst-case per-worker bitmap is ~1.3 GB at planet scale
+        // (10.4 B node IDs × 1 bit). Measured peak RSS is 14.59 GB at
+        // planet — tight but workable.
+        //
+        // The correct long-term shape is
+        // [`parallel_classify_phase`]: per-blob `Vec<i64>` merged immediately
+        // into the shared `referenced_nodes`, bounding memory by blob size
+        // (~8 000 elements) rather than by total accumulated unique IDs.
+        // Tracked in `notes/geocode-build-opportunities.md`.
         crate::commands::parallel_classify_accumulate(
             &shared_file,
             &schedule,
@@ -1014,6 +1070,12 @@ fn resolve_interpolation_endpoints_mmap(
             iw.end_number = e;
             resolved += 1;
         }
+        // KNOWN LIMITATION: if either endpoint fails to match an addr point,
+        // we leave `start_number = 0, end_number = 0`. That collides with a
+        // real OSM interpolation way that genuinely starts and ends at house
+        // number 0. See `SlimInterpWay` doc. If this becomes an observed
+        // correctness problem, introduce a `resolved: bool` persisted into
+        // `InterpWay` and bump `FORMAT_VERSION`.
     }
 
     resolved
@@ -1426,12 +1488,22 @@ fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
                 }
             }
 
-            // Write street entries
+            // Write street entries.
+            // INVARIANT: the on-disk count field is u16 (see `format::SegmentEntryIter`
+            // and `U32EntryIter` reader-side decoders). Hard-error if any cell's
+            // per-type entry count exceeds `u16::MAX`, rather than silently truncating.
+            // If this ever fires in practice, bump the on-disk count to u32 and
+            // increment `FORMAT_VERSION`. Do NOT restore a `.min(u16::MAX)` here -
+            // silent truncation made this a latent bug for a long time.
             let has_streets = !streets.is_empty();
             if has_streets {
-                let count = streets.len().min(u16::MAX as usize) as u16;
+                let count = u16::try_from(streets.len()).map_err(|_| format!(
+                    "geocode Stage B: cell {cell_id} has {} street entries, exceeds u16::MAX. \
+                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
+                    streets.len()
+                ))?;
                 street_out.write_all(&count.to_le_bytes())?;
-                for e in &streets[..count as usize] {
+                for e in &streets {
                     street_out.write_all(&SegmentRef {
                         way_index: e.index,
                         segment_index: e.segment,
@@ -1439,22 +1511,30 @@ fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
                 }
             }
 
-            // Write addr entries
+            // Write addr entries. Same u16 on-disk invariant as streets above.
             let has_addrs = !addrs.is_empty();
             if has_addrs {
-                let count = addrs.len().min(u16::MAX as usize) as u16;
+                let count = u16::try_from(addrs.len()).map_err(|_| format!(
+                    "geocode Stage B: cell {cell_id} has {} addr entries, exceeds u16::MAX. \
+                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
+                    addrs.len()
+                ))?;
                 addr_out.write_all(&count.to_le_bytes())?;
-                for e in &addrs[..count as usize] {
+                for e in &addrs {
                     addr_out.write_all(&e.index.to_le_bytes())?;
                 }
             }
 
-            // Write interp entries
+            // Write interp entries. Same u16 on-disk invariant as streets above.
             let has_interps = !interps.is_empty();
             if has_interps {
-                let count = interps.len().min(u16::MAX as usize) as u16;
+                let count = u16::try_from(interps.len()).map_err(|_| format!(
+                    "geocode Stage B: cell {cell_id} has {} interp entries, exceeds u16::MAX. \
+                     Bump on-disk count to u32 and increment FORMAT_VERSION.",
+                    interps.len()
+                ))?;
                 interp_out.write_all(&count.to_le_bytes())?;
-                for e in &interps[..count as usize] {
+                for e in &interps {
                     interp_out.write_all(&SegmentRef {
                         way_index: e.index,
                         segment_index: e.segment,
@@ -1477,18 +1557,16 @@ fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
             prev_cell_id = cell_id;
             total_cells += 1;
 
-            // Advance byte offsets
+            // Advance byte offsets. The per-type `u16::try_from` above guarantees
+            // `streets.len() <= u16::MAX`, so full length matches the write above.
             if has_streets {
-                let count = streets.len().min(u16::MAX as usize);
-                street_byte_offset += 2 + (count * SEGMENT_REF_SIZE) as u64;
+                street_byte_offset += 2 + (streets.len() * SEGMENT_REF_SIZE) as u64;
             }
             if has_addrs {
-                let count = addrs.len().min(u16::MAX as usize);
-                addr_byte_offset += 2 + (count * 4) as u64;
+                addr_byte_offset += 2 + (addrs.len() * 4) as u64;
             }
             if has_interps {
-                let count = interps.len().min(u16::MAX as usize);
-                interp_byte_offset += 2 + (count * SEGMENT_REF_SIZE) as u64;
+                interp_byte_offset += 2 + (interps.len() * SEGMENT_REF_SIZE) as u64;
             }
         }
     }
@@ -1605,10 +1683,18 @@ fn write_admin_index(dir: &Path, entries: &mut [AdminCellEntry]) -> Result<u32> 
 
         cells_out.write_all(&AdminCell { cell_id: cid, entries_offset: byte_off }.to_bytes())?;
 
-        let count = (i - start).min(u16::MAX as usize) as u16;
+        // INVARIANT: the on-disk count for admin entries is u16 (see
+        // `format::AdminEntryIter` reader-side). Hard-error on overflow rather
+        // than silently truncating. If this fires, bump the count to u32 and
+        // increment `FORMAT_VERSION`.
+        let group_len = i - start;
+        let count = u16::try_from(group_len).map_err(|_| format!(
+            "write_admin_index: admin cell {cid} has {group_len} entries, exceeds u16::MAX. \
+             Bump on-disk count to u32 and increment FORMAT_VERSION."
+        ))?;
         entries_out.write_all(&count.to_le_bytes())?;
         byte_off += 2;
-        for e in &entries[start..start + count as usize] {
+        for e in &entries[start..i] {
             let val = if e.is_interior { e.poly_index | INTERIOR_FLAG } else { e.poly_index };
             entries_out.write_all(&val.to_le_bytes())?;
             byte_off += 4;

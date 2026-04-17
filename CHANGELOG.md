@@ -47,6 +47,43 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
 - Dead `loc_missing` increments removed from merge way writers.
 - Geocode builder pass 2 extraction + merge locations pre-scan.
 - Geocode `FORMAT_VERSION` bumped to 2, `cover_segment` steps capped.
+- **Geocode builder: fail hard on u16 on-disk count overflow** instead of
+  silently truncating. Stage B (street/addr/interp per-cell entries, admin
+  entries) and per-way `StreetWay.node_count` / `InterpWay.node_count`
+  previously used `.min(u16::MAX)` which could drop data without any error
+  signal. Errors now include the offending cell/way and explicit guidance to
+  bump the field to u32 + FORMAT_VERSION if the limit is ever hit in
+  practice.
+- **`IdSetDense::set_atomic` / `set_atomic_if_new`: diagnostic panic on
+  out-of-range IDs.** The `.expect("not pre-allocated")` was opaque when
+  indexdata under-reported `max_id` (rare but possible with corrupted
+  inputs). New panic text names the offending ID, the pre-allocated upper
+  bound, and the most likely root causes (indexdata mismatch, hard-coded
+  cap overshoot, missing `pre_allocate`).
+
+### Documentation
+
+- **Null Island sentinel collision**: ALTW stage 2 and the geocode builder
+  both use `(lat_e7 == 0, lon_e7 == 0)` as the unresolved-coordinate
+  sentinel, colliding with the legitimate OSM node at 0°, 0° off the
+  African coast. Flagged in both source files as a known limitation with
+  pointers to the other site so a future fix (presence bitmap) covers both.
+  Root `CORRECTNESS.md` Null Island section updated to list the geocode
+  builder site explicitly alongside the three ALTW index types.
+- **Interpolation unresolved sentinel**: `SlimInterpWay.start_number == 0
+  && end_number == 0` doubles as "unresolved" and as a legitimate
+  interpolation way that genuinely starts at house number 0. Documented at
+  the struct definition, init site, and resolve site, and promoted to a
+  new `CORRECTNESS.md` section.
+- **Geocode u16 on-disk count caps**: new `CORRECTNESS.md` section
+  documenting the per-cell and per-way u16 caps, the builder's hard-error
+  contract on overflow, and the `FORMAT_VERSION` bump path if a real
+  workload ever hits the limit.
+- **`parallel_classify_accumulate` safety envelope**: clarified to describe
+  three tiers (safe sparse, borderline, unsafe dense) with the geocode
+  Pass 1.5 call site as the borderline exemplar. Pass 1.5 call site cross-
+  links back to the contract and to the rewrite item in
+  `notes/geocode-build-opportunities.md`.
 
 ### Testing
 

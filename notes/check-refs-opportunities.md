@@ -331,3 +331,90 @@ Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelizati
 - **Does `pre_allocate(14_000_000_000)` cost visibly at startup?** That's a ~1.6 GB contiguous memset on Phase-1 entry. At ~10 GB/s DDR bandwidth, ~160 ms. Negligible against a 6-10 min wall, but worth noting.
 - **Is phase #3's decompression genuinely faster than phase #2's?** Relation blobs are a tiny fraction of total bytes. Phase 3 might complete in seconds regardless; if so, the end-of-pipeline tail is dominated by the post-pass merge, not relation decode. Neutral either way.
 - **Do we gain anything by fusing phase 2 and phase 3?** The dependency chain says way_ids must be built before relation-ref-to-way checks. But relation member checks are deferred to the post-pass anyway for relation-relation refs, and the node/way checks are small. Could collapse phase 2 and phase 3 into one parallel scan that reads both kinds of blobs and relies on the sorted-PBF ordering for the dependency. Not critical; leave as two phases for clarity.
+
+## Off-plan discoveries (2026-04-17)
+
+Surfaced during step #2 measurement work. None were in the original plan.
+Measured cost/benefit where possible; captured as TODO hooks where deferred.
+
+### Schedule-walk duplication — LANDED (commit `fbf591c`)
+
+The naive step-#2 rewrite called `build_classify_schedule` three times
+(one per phase), walking the PBF header chain from start to end each
+time. At Europe scale, SCHEDULE_SCAN_LOOP was 16.5 s + 14.1 s = 30.6 s
+of the initial 51.2 s post-parallel run (UUID `44805a8b`) - 60 % of wall
+just to discover blob kinds three times over.
+
+Fix: `build_classify_schedules_split` walks once, emits per-kind
+schedules with local 0..n seqs. Europe dropped 51.2 s → 33.6 s.
+
+### BufReader seek-discard (codebase-wide) — DEFERRED (TODO.md hook)
+
+While tuning the remaining ~15 s of schedule-walk time at Europe, tried
+bumping `seekable_from_path`'s BufReader capacity from 256 KB to 16 MB
+(commit `027b354`). Result: 13× regression, 33.6 s → 448 s. Root cause:
+stdlib `BufReader::seek(SeekFrom::Current)` always discards the buffer
+regardless of whether the target is in-range. `seek_raw` goes through
+that path, so every per-blob "skip past body" seek flushes the buffer;
+with a larger buffer each flush wastes more prefetched data.
+
+Proper fix is `BufReader::seek_relative` but that's a BufReader-specific
+method, not on the `Seek` trait. The `BlobReader<R: Seek>` generic
+abstraction can't reach it without design work. Reverted in `86761d6`.
+~10 other callers of `seekable_from_path` (extract, tags_filter, altw,
+renumber_external) are likely paying similar proportional cost;
+investigation logged in `TODO.md` Performance section.
+
+### mmap-based schedule walk — DEFERRED (not tracked)
+
+Alternative to the BufReader path: memory-map the PBF file and scan
+header offsets directly from the mapped slice. Eliminates all read
+syscalls, lets the kernel handle readahead with MADV_SEQUENTIAL. At
+35 GB Europe the walk is CPU-bound on 520 K protobuf header parses
+anyway, so the upper bound is probably ~8-10 s (down from current
+14.8 s) — mmap removes I/O orchestration overhead but not the parse
+cost. At planet (87 GB, 1.37 M headers) ratio should scale similarly.
+
+Worth exploring if/when:
+- The seek_raw fix lands and the remaining schedule-walk cost still
+  dominates at planet scale, *or*
+- A new command shows up whose wall is dominated by repeated header
+  walks (currently no repeat-walk callers exist post-`build_classify_schedules_split`).
+
+Needs careful handling of madvise hints across Linux / macOS and the
+ownership story between the mmap handle and the Arc<File> that
+`parallel_classify_phase` currently consumes.
+
+### Parallel schedule walk — DEFERRED (not tracked)
+
+Higher-ceiling alternative to mmap: partition the file into N byte
+chunks, dispatch N workers to each scan their chunk's header chain
+independently, merge the per-kind schedules. At 8-way parallelism on
+35 GB Europe this could in principle drop the walk from 14.8 s to
+~2-3 s.
+
+The hard part is finding a valid frame boundary inside a random chunk.
+PBF frames start with a 4-byte big-endian length prefix followed by a
+`BlobHeader` protobuf whose first field is `type` (a string - "OSMData"
+or "OSMHeader"). A worker starting mid-chunk would need to scan forward
+for the next plausible `OSMData`/`OSMHeader` magic string within a
+reasonable header-size window, then validate the length prefix lines
+up. This is fragile - a real blob payload could contain the same byte
+sequence (particularly decompressed, which is why blob.rs currently
+reads strictly sequentially). Would need careful validation logic plus
+robust handling of the edge case where the first frame starts before
+the chunk boundary.
+
+Worth exploring only if mmap doesn't close the gap enough to matter.
+Substantial complexity budget.
+
+### Workload-specific: `check_relations = false` skips Phase 3
+
+The default `brokkr check-refs` CLI passthrough is `pbfhogg check --refs`
+(no `--check-relations`), which skips relation blobs entirely. All
+measurement tables in this doc are under that default. With
+`--check-relations`, phase 3 kicks in with its own ~0.5 s (Europe) /
+~0.2 s (planet) wall plus a deferred-resolve post-pass. The parallel
+structure handles this correctly; just not exercised by the default
+bench. Flagged because the plan's yardstick table assumed relations
+were being checked.

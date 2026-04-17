@@ -6,16 +6,16 @@ Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 Do not use your Memory functionality. Update CLAUDE.md instead. This project is developed across several hosts and several users. Memories do not transfer across hosts or users. CLAUDE.md does.
 
 ## Bash rules
-- Never use sed, find, awk, or complex bash commands
+- Never use sed, find, awk, head, tail, or complex bash commands
 - Never chain commands with &&
 - Never chain commands with ;
-- Never pipe commands with |
-- Never capture stdout into env vars (`UUID=$(...)`). Read the output directly and use the value inline.
+- Never chain/pipe commands with |
+- Never capture stdout into env vars (`UUID=$(...)`).
 - Never read or write from /tmp. All data lives in the project.
 - Never run raw cargo, curl, pkill. Use `brokkr`.
 
 ## git commit rules
-- Never commit markdown changes and/or results.db alone. Bundle them with upcoming commits. The exception is: if the markdown changes are very substantive.
+- Never commit markdown changes and/or results.db alone. Bundle them with upcoming code commits.
 - When committing other changes: always tag along brokkrs 'results.db' and markdown files if dirty.
 - Write substantive engineering-focused commit messages.
 - Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements)
@@ -46,7 +46,9 @@ Brokkr is convention-free at the protocol layer. Two optional naming conventions
 
 Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count — derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
-`--bench N` runs N times, stores best. Default `--bench 3`. Requires clean git tree (ignoring `*.md` and `.brokkr/results.db`); `--force` overrides (results not stored).
+`--bench N` runs N times, stores best. Default `--bench 3`.
+
+Requires clean git tree (except for `*.md` and `.brokkr/results.db`); `--force` overrides (results not stored).
 
 I/O flags (`--direct-io`, `--io-uring`) create named variants in results. `--force` is a top-level flag before the subcommand.
 

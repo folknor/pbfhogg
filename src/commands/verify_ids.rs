@@ -386,19 +386,26 @@ fn rank_to_name(rank: u8) -> &'static str {
 
 /// Validate PBF ID integrity: monotonicity, type ordering, and optional duplicate detection.
 ///
-/// Streams through all elements in a single pipelined pass. When `full` is true,
-/// maintains per-type `RoaringTreemap` sets to detect duplicate IDs (increases
-/// memory usage from O(1) to O(n) in the number of unique IDs). Without `full`,
-/// only monotonicity and type ordering are checked in constant memory.
+/// Two internal paths depending on `opts.full`:
+///
+/// - **Streaming (default):** single pipelined pass via `for_each_pipelined`.
+///   Constant memory. Monotonicity + type-order only - no duplicate detection.
+/// - **Full:** three-phase parallel scan via `parallel_classify_phase`. Each
+///   phase populates a shared `IdSetDense` using `set_atomic_if_new`; cross-blob
+///   monotonicity is resolved in the main-thread merge via seq-ordered buffering.
 ///
 /// # Planet-scale memory (full mode)
 ///
-/// Uses [`IdSetDense`] (same as `check_refs`) for ID storage. Chunks grow
-/// lazily - only chunks covering seen ID ranges are allocated. For the full
-/// planet (~10 B nodes, ~1 B ways, ~17 M relations), the sets occupy
-/// ~1.8 GB total. Streaming mode (default) uses constant memory.
+/// Three `IdSetDense` pre-allocated to OSM ID ceilings (~1.6 GB for nodes,
+/// 175 MB for ways, 3 MB for relations) when the corresponding `type_filter`
+/// bit is set. Pre-allocation is mandatory for `set_atomic_if_new` (workers
+/// panic on unallocated chunks). Total full-mode RSS at planet: ~1.8 GB.
 #[hotpath::measure]
 pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+    if opts.full {
+        return verify_ids_full_parallel(path, opts);
+    }
+
     let reader = ElementReader::open(path, opts.direct_io)?;
     let header_sorted = reader.header().is_sorted();
     let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
@@ -420,4 +427,317 @@ pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsR
         total_violations: state.total_violations,
         violations: state.violations,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Parallel full-mode implementation
+// ---------------------------------------------------------------------------
+
+/// Per-blob classify result for the parallel full-mode verifier.
+///
+/// Kept small: the main-thread merge sees one of these per blob and aggregates
+/// in schedule-order. Bounded by blob size (~8000 elements) so it streams
+/// cheaply back over the parallel_classify_phase channel.
+struct BlobVerifyResult {
+    first_id: Option<i64>,
+    last_id: Option<i64>,
+    count: u64,
+    /// Non-monotonic violations observed *within* this blob.
+    within_violations: Vec<IdViolation>,
+    /// IDs that were already set in the shared IdSetDense when this blob
+    /// tried to insert them. One entry per collision (not deduplicated -
+    /// distinct duplicate occurrences count separately, matching the
+    /// pre-swap RoaringTreemap::insert-returns-false semantics).
+    duplicate_ids: Vec<i64>,
+}
+
+impl BlobVerifyResult {
+    fn empty() -> Self {
+        Self {
+            first_id: None,
+            last_id: None,
+            count: 0,
+            within_violations: Vec::new(),
+            duplicate_ids: Vec::new(),
+        }
+    }
+}
+
+/// Full-mode entry. Three-phase parallel scan mirroring the check_refs step #2
+/// shape. Each phase is independent of the others' results (no cross-kind
+/// dependency - verify_ids only cares about per-kind monotonicity and
+/// per-kind duplicates), so phase ordering is purely for phase-wall
+/// attribution in the sidecar.
+#[allow(clippy::too_many_lines)]
+fn verify_ids_full_parallel(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
+    use crate::blob_index::ElemKind;
+    use crate::Element;
+
+    crate::debug::emit_marker("VERIFYIDS_SCAN_START");
+
+    // mallopt prelude - same motivation as check_refs step #2: cap glibc
+    // arenas at 2 to prevent cross-thread alloc/free fragmentation in the
+    // pread worker pool.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    // Cheap: ElementReader::open reads the header and stops. Drop it
+    // immediately; parallel_classify_phase reopens the file internally via
+    // the shared_file from build_classify_schedules_split.
+    let header_sorted = ElementReader::open(path, opts.direct_io)?.header().is_sorted();
+    let indexed = crate::commands::has_indexdata(path, opts.direct_io)?;
+
+    let type_filter = opts.type_filter.map_or_else(TypeFilter::all, TypeFilter::parse);
+
+    // Pre-allocate IdSetDenses for the kinds we intend to verify.
+    let mut node_ids = IdSetDense::new();
+    let mut way_ids = IdSetDense::new();
+    let mut relation_ids = IdSetDense::new();
+    if type_filter.nodes {
+        node_ids.pre_allocate(14_000_000_000);
+    }
+    if type_filter.ways {
+        way_ids.pre_allocate(1_500_000_000);
+    }
+    if type_filter.relations {
+        relation_ids.pre_allocate(25_000_000);
+    }
+
+    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        crate::commands::build_classify_schedules_split(path)?;
+
+    // Accumulators for the report.
+    let mut node_count: u64 = 0;
+    let mut way_count: u64 = 0;
+    let mut relation_count: u64 = 0;
+    let mut violations: Vec<IdViolation> = Vec::new();
+    let mut total_violations: u64 = 0;
+
+    // Type-ordering check: track max data_offset per kind. After all phases
+    // are dispatched, validate that max(node_offsets) < min(way_offsets) and
+    // max(way_offsets) < min(relation_offsets). Uses the schedule directly
+    // (no extra I/O); relies on build_classify_schedules_split delivering
+    // offsets in file order, which it does.
+    check_type_order(&node_schedule, &way_schedule, &rel_schedule, &mut violations, &mut total_violations, opts.max_errors);
+
+    // Phase 1 - nodes
+    if type_filter.nodes {
+        crate::debug::emit_marker("VERIFYIDS_NODES_START");
+        let node_ids_ref = &node_ids;
+        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
+            &shared_file,
+            &node_schedule,
+            node_ids_ref,
+            "node",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::DenseNode(dn) => Some(dn.id()),
+                Element::Node(n) => Some(n.id()),
+                _ => None,
+            },
+        )?;
+        node_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_NODES_END");
+    }
+
+    // Phase 2 - ways
+    if type_filter.ways {
+        crate::debug::emit_marker("VERIFYIDS_WAYS_START");
+        let way_ids_ref = &way_ids;
+        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
+            &shared_file,
+            &way_schedule,
+            way_ids_ref,
+            "way",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::Way(w) => Some(w.id()),
+                _ => None,
+            },
+        )?;
+        way_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_WAYS_END");
+    }
+
+    // Phase 3 - relations
+    if type_filter.relations {
+        crate::debug::emit_marker("VERIFYIDS_RELATIONS_START");
+        let relation_ids_ref = &relation_ids;
+        let (count, phase_violations, phase_total) = verify_single_kind_parallel(
+            &shared_file,
+            &rel_schedule,
+            relation_ids_ref,
+            "relation",
+            opts.max_errors.saturating_sub(violations.len()),
+            |el| match el {
+                Element::Relation(r) => Some(r.id()),
+                _ => None,
+            },
+        )?;
+        relation_count = count;
+        total_violations += phase_total;
+        violations.extend(phase_violations);
+        crate::debug::emit_marker("VERIFYIDS_RELATIONS_END");
+    }
+
+    crate::debug::emit_marker("VERIFYIDS_SCAN_END");
+
+    Ok(VerifyIdsReport {
+        header_sorted,
+        indexed,
+        full: true,
+        node_count,
+        way_count,
+        relation_count,
+        passed: total_violations == 0,
+        total_violations,
+        violations,
+    })
+}
+
+/// Run a single parallel phase for one element kind. Each blob returns a
+/// `BlobVerifyResult`; the main thread collects them in schedule-order (via
+/// a `Vec<Option<_>>` indexed by seq) and does the sequential merge:
+/// cross-blob monotonicity, duplicate violation translation, count sum.
+#[allow(clippy::type_complexity)]
+fn verify_single_kind_parallel(
+    shared_file: &std::sync::Arc<std::fs::File>,
+    schedule: &[(usize, u64, usize)],
+    id_set: &IdSetDense,
+    elem_type: &'static str,
+    max_errors_remaining: usize,
+    extract_id: impl Fn(&crate::Element) -> Option<i64> + Send + Sync,
+) -> Result<(u64, Vec<IdViolation>, u64)> {
+    if schedule.is_empty() {
+        return Ok((0, Vec::new(), 0));
+    }
+
+    let mut per_blob: Vec<Option<BlobVerifyResult>> = (0..schedule.len()).map(|_| None).collect();
+    let extract_ref = &extract_id;
+
+    crate::commands::parallel_classify_phase(
+        shared_file,
+        schedule,
+        || (),
+        |block, _state| -> BlobVerifyResult {
+            let mut r = BlobVerifyResult::empty();
+            let mut prev: Option<i64> = None;
+            for el in block.elements_skip_metadata() {
+                if let Some(id) = extract_ref(&el) {
+                    r.count += 1;
+                    if r.first_id.is_none() {
+                        r.first_id = Some(id);
+                    }
+                    r.last_id = Some(id);
+                    if let Some(p) = prev
+                        && id <= p
+                    {
+                        r.within_violations.push(IdViolation::NonMonotonic {
+                            elem_type,
+                            id,
+                            prev_id: p,
+                        });
+                    }
+                    prev = Some(id);
+                    if !id_set.set_atomic_if_new(id) {
+                        r.duplicate_ids.push(id);
+                    }
+                }
+            }
+            r
+        },
+        |seq, r| {
+            per_blob[seq] = Some(r);
+        },
+    )?;
+
+    // Serial merge in schedule (= file) order.
+    let mut count: u64 = 0;
+    let mut violations: Vec<IdViolation> = Vec::new();
+    let mut total_violations: u64 = 0;
+    let mut prev_last: Option<i64> = None;
+    for slot in per_blob {
+        let r = slot.expect("parallel_classify_phase must deliver every blob");
+        count += r.count;
+        for v in r.within_violations {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(v);
+            }
+        }
+        if let (Some(pl), Some(fi)) = (prev_last, r.first_id)
+            && fi <= pl
+        {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(IdViolation::NonMonotonic {
+                    elem_type,
+                    id: fi,
+                    prev_id: pl,
+                });
+            }
+        }
+        for id in r.duplicate_ids {
+            total_violations += 1;
+            if violations.len() < max_errors_remaining {
+                violations.push(IdViolation::Duplicate { elem_type, id });
+            }
+        }
+        if r.last_id.is_some() {
+            prev_last = r.last_id;
+        }
+    }
+
+    Ok((count, violations, total_violations))
+}
+
+/// Verify that schedules appear in canonical file order: all node blobs
+/// before all way blobs before all relation blobs. Uses data offsets from
+/// the schedules directly (cheap; no extra I/O).
+///
+/// Emits one `TypeOrder` violation per inversion found (bounded at three:
+/// node→way, node→relation, way→relation).
+fn check_type_order(
+    node_sched: &[(usize, u64, usize)],
+    way_sched: &[(usize, u64, usize)],
+    rel_sched: &[(usize, u64, usize)],
+    violations: &mut Vec<IdViolation>,
+    total_violations: &mut u64,
+    max_errors: usize,
+) {
+    let record = |after: &'static str, found: &'static str, violations: &mut Vec<IdViolation>, total_violations: &mut u64| {
+        *total_violations += 1;
+        if violations.len() < max_errors {
+            violations.push(IdViolation::TypeOrder { found, after });
+        }
+    };
+
+    let max_node = node_sched.iter().map(|(_, o, _)| *o).max();
+    let min_way = way_sched.iter().map(|(_, o, _)| *o).min();
+    let max_way = way_sched.iter().map(|(_, o, _)| *o).max();
+    let min_rel = rel_sched.iter().map(|(_, o, _)| *o).min();
+    let max_rel = rel_sched.iter().map(|(_, o, _)| *o).max();
+    let min_node = node_sched.iter().map(|(_, o, _)| *o).min();
+
+    if let (Some(mn), Some(mw)) = (max_node, min_way)
+        && mn > mw
+    {
+        record("node", "way", violations, total_violations);
+    }
+    if let (Some(mw), Some(mr)) = (max_way, min_rel)
+        && mw > mr
+    {
+        record("way", "relation", violations, total_violations);
+    }
+    if let (Some(mr), Some(mnd)) = (max_rel, min_node)
+        && mr > mnd
+    {
+        record("relation", "node", violations, total_violations);
+    }
 }

@@ -534,12 +534,14 @@ pub(crate) fn build_classify_schedules_split(
 ///
 /// Each entry in `schedule` is `(seq, data_offset, data_size)`. Workers pread
 /// the compressed blob data, decompress, build a `PrimitiveBlock`, run the
-/// `classify` closure, and send the result. The consumer calls `merge` for
-/// each result.
+/// `classify` closure, and send the result. The consumer calls `merge(seq, r)`
+/// for each result, forwarding the blob's schedule-order sequence number so
+/// callers that care (e.g. `verify_ids`, which needs cross-blob monotonicity)
+/// can reorder via `ReorderBuffer` or similar. Callers that don't care ignore
+/// the seq argument.
 ///
 /// **Note:** `merge` is called in arbitrary worker-completion order, not blob
-/// file order. All current callers use order-independent merge operations
-/// (IdSetDense::set, BTreeSet::extend, Vec::push for unordered data).
+/// file order. Callers that need file-order processing must buffer by seq.
 /// Per-blob streaming classify: workers send `R` per blob, keep `S` for scratch.
 ///
 /// Use for dense/hot paths (node classify, way classify) where per-worker
@@ -555,7 +557,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
     schedule: &[(usize, u64, usize)],
     worker_init: impl Fn() -> S + Send + Sync,
     classify: impl Fn(&crate::PrimitiveBlock, &mut S) -> R + Send + Sync,
-    mut merge: impl FnMut(R),
+    mut merge: impl FnMut(usize, R),
 ) -> Result<()> {
     use std::os::unix::fs::FileExt as _;
 
@@ -616,8 +618,8 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
         drop(desc_rx);
         drop(result_tx);
 
-        for (_seq, result) in result_rx {
-            merge(result?);
+        for (seq, result) in result_rx {
+            merge(seq, result?);
         }
         Ok(())
     })?;

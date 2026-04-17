@@ -218,7 +218,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 }
                 count
             },
-            |count| {
+            |_seq, count| {
                 result.node_count += count;
             },
         )?;
@@ -266,7 +266,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 }
                 r
             },
-            |r| {
+            |_seq, r| {
                 result.way_count += r.way_count;
                 way_refs_checked += r.way_refs_checked;
                 missing_node_refs_vec.extend(r.missing_node_refs);
@@ -349,7 +349,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                     }
                     r
                 },
-                |r| {
+                |_seq, r| {
                     result.relation_count += r.relation_count;
                     rel_node_members_checked += r.rel_node_members_checked;
                     rel_way_members_checked += r.rel_way_members_checked;

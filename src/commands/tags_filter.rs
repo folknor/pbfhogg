@@ -639,7 +639,7 @@ fn tags_filter_two_pass(
             }
             result
         },
-        |cr| {
+        |_seq, cr| {
             for id in cr.matched_nodes {
                 matched_node_ids.set(id);
             }

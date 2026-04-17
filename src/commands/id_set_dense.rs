@@ -53,6 +53,29 @@ impl IdSetDense {
         chunk[offset] |= 1u8 << (id & 7);
     }
 
+    /// Set a bit and report whether it was previously unset. Returns `true`
+    /// the first time an ID is seen, `false` on every subsequent call with
+    /// the same ID. Negative IDs are silently rejected (and return `false`).
+    ///
+    /// Matches `RoaringTreemap::insert`'s semantics for duplicate-detection
+    /// callers. `verify_ids --full` uses this; general monotonic-population
+    /// callers should prefer the void-return [`set`].
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_if_new(&mut self, id: i64) -> bool {
+        if id < 0 { return false; }
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        if cid >= self.chunks.len() {
+            self.chunks.resize_with(cid + 1, || None);
+        }
+        let chunk = self.chunks[cid].get_or_insert_with(|| Box::new([0u8; CHUNK_SIZE]));
+        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
+        let bit = 1u8 << (id & 7);
+        let was_set = (chunk[offset] & bit) != 0;
+        chunk[offset] |= bit;
+        !was_set
+    }
+
     /// Pre-allocate all chunks needed to hold IDs up to `max_id`.
     /// Call before `set_atomic` to avoid dynamic resizing during
     /// concurrent access.
@@ -91,6 +114,31 @@ impl IdSetDense {
         // the thread::scope join barrier.
         let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
         atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Atomic set + duplicate detection. Returns `true` the first time an
+    /// ID is seen (in the happens-before sense of the atomic op), `false`
+    /// if some other thread already set the same bit.
+    ///
+    /// Requires `pre_allocate()` to have covered `id`. Safe for concurrent
+    /// use from multiple threads via `&self`. Relaxed ordering; callers must
+    /// synchronize (thread join) before reading via `get()`.
+    ///
+    /// # Safety
+    /// Caller must ensure chunks are pre-allocated. Panics if `id` is
+    /// outside the pre-allocated range.
+    #[allow(clippy::cast_sign_loss)]
+    pub fn set_atomic_if_new(&self, id: i64) -> bool {
+        let id = id as u64;
+        let cid = (id >> (CHUNK_BITS + 3)) as usize;
+        let chunk = self.chunks[cid].as_ref().expect("set_atomic_if_new: chunk not pre-allocated");
+        let offset = ((id >> 3) & ((1u64 << CHUNK_BITS) - 1)) as usize;
+        let bit = 1u8 << (id & 7);
+        // SAFETY: same as set_atomic. fetch_or returns the previous byte,
+        // from which we extract the prior state of this specific bit.
+        let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
+        let prev = atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+        (prev & bit) == 0
     }
 
     #[allow(clippy::cast_sign_loss)]

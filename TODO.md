@@ -8,7 +8,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)** - `build-geocode-index`. Current: **1346 s / 14.59 GB RSS** at planet. Target: **~10-12 min / same RSS**. Single-threaded Pass 2 is the dominant phase; `mallopt(M_ARENA_MAX, 2)` + parallel node/way split unlocks it. Plus parallelizing Pass 3 stage B and fusing fine+coarse cell computation.
 
-- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Current: **1254 s / 1.8 GB RSS** at planet. Target: **~6-10 min / ~2 GB RSS**. ~30-line diff: swap three `RoaringTreemap`s for `IdSetDense`. Profiling diagnosis already in the source; the author reached for the wrong container. Parallelization as a renumber-shaped three-phase scan is a secondary follow-up.
+- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Steps #1 + #2 **LANDED** (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17). Europe: 426.2 s → **33.6 s** (12.7×). Japan: 56.7 s → **2.1 s** (27×). Planet projection ~2.8 min, already 2× better than plan floor (6-10 min); confirmation bench deferred until a quiet-host window. Step #3 (selective wire-format parser) unnecessary at current numbers. See notes doc for full measurement tables. Related codebase-wide TODO: `BlobReader::seek_raw` / `BufReader::seek_relative` (listed in Performance section below).
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
@@ -183,6 +183,47 @@ large deltas vs the README.md planet table.
   don't exist in the base PBF, then re-extract to filter to bbox.
 
 ## Performance
+
+- [ ] **`BlobReader::seek_raw` discards BufReader buffer on every call** -
+  latent codebase-wide perf issue surfaced while tuning `check_refs`
+  schedule walk at Europe scale.
+  [`blob.rs:966`](src/read/blob.rs#L966) calls `self.reader.seek(pos)` which
+  for `BufReader<File>` always invokes `discard_buffer()` after the seek
+  (stdlib semantics - `Seek::seek` is not the buffer-preserving path).
+  `BufReader::seek_relative` exists specifically to keep the buffer when
+  the target is in-range, but it's a BufReader-specific method, not on the
+  `Seek` trait, so generic `impl<R: Seek> BlobReader<R>` can't reach it.
+
+  Observed blast radius (check_refs, Europe 35 GB, 520 K blobs): every
+  `next_header_with_data_offset` call does a 4-byte len read, a ~150-byte
+  header read, then a `seek_raw(SeekFrom::Current(+data_size))` to skip
+  the body. At the default 256 KB buffer the amplification is ~10× the
+  file size (~350 GB of reads, page-cache-served, 14.8 s wall on Europe).
+  At 16 MB buffer the amplification is ~670× - measured 14.8 → 426 s
+  regression when bumping the buffer size without fixing the seek
+  (reverted in `86761d6`). The current 256 KB buffer is masking the bug,
+  not avoiding it.
+
+  Other callers of `BlobReader::seekable_from_path` all do the same
+  header-walk-then-skip-body pattern and likely pay similar proportional
+  cost: `build_classify_schedule` / `build_classify_schedules_split`
+  ([`commands/mod.rs`](src/commands/mod.rs)), `tags_filter`, `extract`
+  (×3), `altw/blob_meta`, `renumber_external`. Most don't bench on
+  Europe today in a way that would have surfaced it.
+
+  Fix options:
+  - Specialize `impl BlobReader<BufReader<R>>` with a `seek_relative`-based
+    seek. Cleanest; limited to the BufReader case.
+  - Add a `SeekRelative` trait with impls for `BufReader` (fast path) and
+    `File` (trivial forward to `seek`). Lets the generic abstraction stay
+    one layer deep across all reader types.
+  - Open-code the in-buffer cursor bump inside `seek_raw`. Fragile
+    (duplicates stdlib logic); not recommended.
+
+  Investigation scope: profile each caller's header-walk share of wall
+  at Europe / planet, estimate expected win per caller, pick the fix
+  shape, land once. Probably worth elevating to a dedicated notes doc
+  if two or more callers show >10 % of wall in header-walk work.
 
 - [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys

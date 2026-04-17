@@ -768,7 +768,7 @@ fn try_extract_multi_single_pass(
                 columns.collect_matching_ids_multi_bbox(&bboxes, scratch);
                 scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
             },
-            |region_ids: Vec<Vec<i64>>| {
+            |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids { bbox_node_ids[i].set(id); }
                 }
@@ -806,7 +806,7 @@ fn try_extract_multi_single_pass(
                 }
                 scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
             },
-            |region_ids: Vec<Vec<i64>>| {
+            |_seq, region_ids: Vec<Vec<i64>>| {
                 for (i, ids) in region_ids.into_iter().enumerate() {
                     for id in ids { bbox_node_ids[i].set(id); }
                 }
@@ -877,7 +877,7 @@ fn try_extract_multi_single_pass(
             }
             region_ids
         },
-        |region_ids| {
+        |_seq, region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {
                 for id in ids { matched_way_ids[i].set(id); }
             }
@@ -2684,7 +2684,7 @@ fn collect_pass1_generic<H: RelationHandler>(
             }
             ids.drain(..).collect::<Vec<i64>>()
         },
-        |ids| {
+        |_seq, ids| {
             for id in ids { bbox_node_ids.set(id); }
         },
     )?;
@@ -2709,7 +2709,7 @@ fn collect_pass1_generic<H: RelationHandler>(
             }
             (way_ids, node_ids)
         },
-        |(way_ids, node_ids)| {
+        |_seq, (way_ids, node_ids)| {
             for id in way_ids { matched_way_ids.set(id); }
             for id in node_ids { all_way_node_ids.set(id); }
         },
@@ -2958,7 +2958,7 @@ fn extract_smart(
             }
             scratch.drain(..).collect::<Vec<i64>>()
         },
-        |refs| {
+        |_seq, refs| {
             for id in refs { extra_node_ids.set(id); }
         },
     )?;

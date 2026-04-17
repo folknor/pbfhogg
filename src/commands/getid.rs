@@ -166,7 +166,7 @@ pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
             }
             batch
         },
-        |batch| {
+        |_seq, batch| {
             for id in batch.node_ids { set.node_ids.set(id); }
             for id in batch.way_ids { set.way_ids.set(id); }
             for id in batch.relation_ids { set.relation_ids.set(id); }

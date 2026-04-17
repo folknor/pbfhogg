@@ -2,8 +2,7 @@
 
 use std::path::Path;
 
-use roaring::RoaringTreemap;
-
+use super::id_set_dense::IdSetDense;
 use super::{Result, TypeFilter};
 use crate::ElementReader;
 
@@ -13,7 +12,7 @@ use crate::ElementReader;
 
 /// Configuration for the `verify_ids` command.
 pub struct VerifyIdsOptions<'a> {
-    /// When true, use `RoaringTreemap` per type to detect duplicate IDs.
+    /// When true, use `IdSetDense` per type to detect duplicate IDs.
     /// Increases memory usage but catches duplicates that monotonicity alone cannot.
     pub full: bool,
     /// Filter by element type (comma-separated: "node", "way", "relation").
@@ -239,9 +238,9 @@ struct ScanState {
     total_violations: u64,
     max_errors: usize,
     type_filter: TypeFilter,
-    node_ids: Option<RoaringTreemap>,
-    way_ids: Option<RoaringTreemap>,
-    relation_ids: Option<RoaringTreemap>,
+    node_ids: Option<IdSetDense>,
+    way_ids: Option<IdSetDense>,
+    relation_ids: Option<IdSetDense>,
 }
 
 impl ScanState {
@@ -259,9 +258,9 @@ impl ScanState {
             total_violations: 0,
             max_errors: opts.max_errors,
             type_filter,
-            node_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
-            way_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
-            relation_ids: if opts.full { Some(RoaringTreemap::new()) } else { None },
+            node_ids: if opts.full { Some(IdSetDense::new()) } else { None },
+            way_ids: if opts.full { Some(IdSetDense::new()) } else { None },
+            relation_ids: if opts.full { Some(IdSetDense::new()) } else { None },
         }
     }
 
@@ -350,13 +349,13 @@ impl ScanState {
     }
 }
 
-/// Check for duplicate ID in the given treemap (free function to avoid borrow conflicts).
+/// Check for duplicate ID in the given `IdSetDense` (free function to avoid
+/// borrow conflicts).
 ///
-/// When the treemap is `None` (streaming mode), this is a no-op. When `Some`,
-/// inserts the ID and records a violation if it was already present.
-#[allow(clippy::cast_sign_loss)]
+/// When the set is `None` (streaming mode), this is a no-op. When `Some`,
+/// calls `set_if_new` and records a violation if the ID was already present.
 fn check_duplicate(
-    set: &mut Option<RoaringTreemap>,
+    set: &mut Option<IdSetDense>,
     violations: &mut Vec<IdViolation>,
     total_violations: &mut u64,
     max_errors: usize,
@@ -364,7 +363,7 @@ fn check_duplicate(
     id: i64,
 ) {
     if let Some(set) = set.as_mut()
-        && !set.insert(id.cast_unsigned())
+        && !set.set_if_new(id)
     {
         *total_violations += 1;
         if violations.len() < max_errors {
@@ -394,9 +393,10 @@ fn rank_to_name(rank: u8) -> &'static str {
 ///
 /// # Planet-scale memory (full mode)
 ///
-/// Uses `RoaringTreemap` (same as `check_refs`) for ID storage. For the full
-/// planet (~10B nodes, ~1B ways, ~17M relations), the treemaps consume ~2-3 GB.
-/// Streaming mode (default) uses constant memory.
+/// Uses [`IdSetDense`] (same as `check_refs`) for ID storage. Chunks grow
+/// lazily - only chunks covering seen ID ranges are allocated. For the full
+/// planet (~10 B nodes, ~1 B ways, ~17 M relations), the sets occupy
+/// ~1.8 GB total. Streaming mode (default) uses constant memory.
 #[hotpath::measure]
 pub fn verify_ids(path: &Path, opts: &VerifyIdsOptions<'_>) -> Result<VerifyIdsReport> {
     let reader = ElementReader::open(path, opts.direct_io)?;

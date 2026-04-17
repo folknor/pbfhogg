@@ -31,6 +31,84 @@ Workload at planet:
 
 That is ~16 min of the 21 min wall, matching the "100% CPU on treemap insertions" profile. The remaining ~5 min is blob I/O + decompression + `PrimitiveBlock` construction on the same sequential main thread.
 
+## Measured baseline (Japan, commit `eebba66`, 2026-04-17, plantasjen)
+
+Dev-loop A/B dataset is Japan. Planet is too long (21 min) for tight iteration; Denmark (8 s) is too short to escape noise on a 60 % win. Japan sits at ~57 s and shows all the same consumer work in the same proportion. Note: `brokkr check-refs` passes only `--refs` (no `--check-relations`), so the relation path is skipped - same as the 1225 s planet baseline.
+
+**Instrumentation overhead:** adding unconditional `Instant::now()` brackets around every per-element op costs ~15 s at Japan (700 M timer fires × ~22 ns). This is constant across pre/post, so A/B comparisons remain valid, but absolute numbers are not directly comparable to pre-instrumentation baselines (prior cadc3e6 Japan: 42.1 s).
+
+### Wall (UUID `09484939`, bench mode)
+
+| Sub-op | Time | Share | Ops | Notes |
+|---|---:|---:|---:|---|
+| `node_insert_ms` | 17.9 s | 31.6 % | 301 M | RoaringTreemap inserts - swap target |
+| `way_ref_check_ms` | 15.5 s | 27.4 % | 354 M | contains + dedup-insert - swap target |
+| `decompress_ms` | 6.6 s | 11.7 % | 43 K blobs, 6.4 GB | won't change |
+| `pread_ms` | 0.6 s | 1.1 % | 43 K | won't change |
+| `block_build_ms` | 0.3 s | 0.6 % | 43 K | won't change |
+| Timer overhead (unaccounted) | ~15.5 s | 27 % | ~700 M `Instant::now()` | constant across A/B |
+| **Total wall** | **56.7 s** | | | |
+
+Consumer work (inserts + contains) = **33.4 s, 59 % of wall**. Matches the plan's "consumer-bound" thesis exactly.
+
+### Hotpath (UUID `0b1ab47e`)
+
+| Function | Total | % |
+|---|---:|---:|
+| `check_refs` | 59.1 s | 100 % |
+| `decompress_into` | 7.04 s | 11.92 % |
+| `from_vec_with_scratch` | 385 ms | 0.65 % |
+| `parse_and_inline_with_scratch` | 162 ms | 0.27 % |
+| `blob::parse` | 2 ms | 0 % |
+
+Read-path total ≈ 13 %. The remaining ~87 % lives inside `check_refs` itself (RoaringTreemap work, not coverable by hotpath - it's external crate code).
+
+### Alloc (UUID `c8c6029f`)
+
+| Function | Total Alloc | % |
+|---|---:|---:|
+| `parse_and_inline_with_scratch` | 12.0 GB | 55.4 % (scratch churn, won't change) |
+| `decompress_into` | 6.0 GB | 27.7 % (won't change) |
+| **`check_refs` exclusive** | **3.6 GB** | **16.9 %** (swap target) |
+| main + others | 1 MB | 0 % |
+| **Total** | **21.5 GB** | churn; **RSS diff +559 MB** |
+
+### Measured post-swap (Japan, commit `8f0ccbb`, 2026-04-17, plantasjen)
+
+Swap landed as a single commit: the three element-ID `RoaringTreemap`s become `IdSetDense` (pre-allocated to OSM ID ceilings), the three missing-ref sets become `Vec<i64>` with `sort_unstable + dedup` for unique counts, and the deferred relation-resolve path uses the same pattern. ~30 lines of diff. Cross-validated vs osmium on Denmark: all four check paths (ways-only + with-relations × nodes / ways / relations) return identical counts.
+
+| Metric | Pre (`09484939`) | Post (`1fd77d78`) | Δ |
+|---|---:|---:|---:|
+| Wall | 56.7 s | **33.1 s** | **−41.6 %** |
+| NODES phase | 35.7 s | 24.9 s | −30 % |
+| WAYS phase | 20.9 s | 8.1 s | −61 % |
+| `node_insert_ms` | 17.9 s | 6.6 s | −63 % (22 ns/op measured) |
+| `way_ref_check_ms` | 15.5 s | 2.5 s | **−84 %** (7 ns/op measured) |
+| `decompress_ms` | 6.6 s | 6.8 s | unchanged |
+| `check_refs` exclusive alloc (alloc mode) | 3.6 GB | 3.9 GB | +0.3 GB (one-shot pre-alloc vs incremental churn) |
+| RSS diff at exit | 559 MB | 1.6 GB | +1.0 GB (pre-alloc'd IdSetDense chunks stay resident) |
+| after_nodes `hblkhd` | 10 MB | **1.76 GB** | 420 chunks × 4 MB = 1.68 GB (pre-allocated to 14 B node IDs) |
+
+**Plan prediction vs reality:** projected ~27 s wall, measured 33.1 s. Gap is instrumentation: `Instant::now()` itself is ~20 ns, so the per-op readings ("22 ns node_insert", "7 ns way_ref_check") are hitting the timer-resolution floor. Underlying `IdSetDense` work is closer to the 5 ns/op the plan posited; we just can't see below ~20 ns with nanosecond-granularity wall timers. Dropping the per-op timers would likely recover the extra 5 s and land near the projection.
+
+**Hotpath shape flip (`fc7bcfef`):**
+
+| Function | Pre % | Post % |
+|---|---:|---:|
+| `decompress_into` | 11.9 % | **20.6 %** (now biggest-attributed) |
+| `from_vec_with_scratch` | 0.65 % | 0.9 % |
+| `parse_and_inline` | 0.27 % | 0.2 % |
+| `check_refs` (consumer + timer OH) | ~87 % | ~78 % |
+
+Of the ~78 % still inside `check_refs`, ~45 % is instrumentation timer overhead and ~33 % is real consumer work. Post-swap at planet the consumer share should drop well below decompression, validating the plan's claim that step #1 flips the bottleneck.
+
+### Protocol artefacts
+
+- Phase markers (nested in existing `CHECKREFS_SCAN_*`): `CHECKREFS_NODES_*`, `CHECKREFS_WAYS_*`, `CHECKREFS_RELATIONS_*`, `CHECKREFS_DEFERRED_RESOLVE_*`.
+- Per-sub-op `_ms` counters: `pread`, `decompress`, `block_build`, `node_insert`, `way_insert`, `way_ref_check`, `rel_insert`, `rel_member_check`, `deferred_resolve`. Accumulated as nanos, emitted as millis.
+- Structural counters: `node_blobs`, `way_blobs`, `relation_blobs`, `total_bytes_decompressed`, `way_refs_checked`, `rel_{node,way,rel}_members_{checked,deferred}`, `missing_*_occurrences`.
+- `mallinfo2` snapshots at `checkrefs_after_nodes`, `checkrefs_after_ways`, `checkrefs_after_relations`, `checkrefs_final`.
+
 ## Current architecture
 
 Sequential single-threaded loop at [check_refs.rs:152-244](../src/commands/check_refs.rs#L152). For each `OsmData` blob:
@@ -75,7 +153,9 @@ That's a ~10× speedup on every one of the ~11 B insert operations and ~5 B cont
 
 ## Ranked opportunities
 
-### #1 - Replace `RoaringTreemap` with `IdSetDense` (headline)
+### #1 - Replace `RoaringTreemap` with `IdSetDense` (headline) — LANDED (commit `8f0ccbb`, 2026-04-17)
+
+Japan bench confirmed the thesis: wall 56.7 s → 33.1 s (−41.6 %). Per-op `way_ref_check` dropped from 44 ns to 7 ns (timer-resolution limited), `node_insert` from 60 ns to 22 ns (same limit). `check_refs` now accounts for only ~33 % real consumer work, down from ~59 %. Decompression is the new biggest-attributed function in hotpath. Cross-validated against osmium on Denmark. See "Measured post-swap" section above for the full table. Planet bench deferred until a quiet-host window.
 
 Scope: three local replacements in [`check_refs`](../src/commands/check_refs.rs#L105).
 
@@ -102,7 +182,60 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 
 **Expected RSS**: ~same or slightly lower (1.5-1.8 GB). Pre-allocating to `MAX_NODE_ID` allocates all ~400 chunks up front (~1.6 GB), versus `RoaringTreemap` growing as containers fill. Peak is comparable.
 
-### #2 - Parallelize as a three-phase renumber-shaped scan
+### #2 - Parallelize as a three-phase renumber-shaped scan — LANDED (commits `053def6`, `fbf591c`, 2026-04-17)
+
+**Landed in three steps** plus one preparatory cleanup:
+
+1. `d536466` — dropped per-element `Instant::now()` brackets (measurement tax we added in the instrumentation pass). Japan 33.1 s → 18.2 s; the tax was never real work.
+2. `053def6` — parallel three-phase scan. Each phase builds a per-kind schedule and runs through `parallel_classify_phase`. Pre-allocation of all three `IdSetDense`s moved to function entry (required for `set_atomic`). `mallopt(M_ARENA_MAX, 2)` prelude added. Deferred relation-relation resolve stays serial post-loop.
+3. `fbf591c` — follow-up: added `build_classify_schedules_split`, a one-pass header walk that emits all three per-kind schedules from a single file read. The naive rewrite called `build_classify_schedule` three times, doubling/tripling the header-chain walk cost at Europe scale (30.5 s of 51.2 s wall on the first parallel run). One-pass brings Europe to 33.6 s.
+
+**Measured results (commits cumulative through `fbf591c`):**
+
+| Dataset | Pre-#2 wall | Post-#2 wall | Speedup |
+|---|---:|---:|---:|
+| Japan (`09484939` → `4a347e3b`) | 18.2 s (timers dropped) | **2.1 s** | 8.7× |
+| Europe (`fb042f27` → `70ff6c5d`) | 426.2 s (post-swap, instrumented) | **33.6 s** | 12.7× |
+
+**Plan target:** ~6-10 min at planet. Projection from Europe × 5 file-size ratio = **~170 s ≈ 2.8 min**, already ~2× better than the plan's floor before any step #3 work.
+
+**Europe phase breakdown (UUID `70ff6c5d`, commit `fbf591c`):**
+
+| Phase | Wall |
+|---|---:|
+| SCHEDULE_SCAN_LOOP (one header walk, all kinds) | 14.8 s |
+| CHECKREFS_NODES (parallel scan) | 11.2 s |
+| CHECKREFS_WAYS (parallel scan) | 7.4 s |
+| **Total** | **33.6 s** |
+
+**Hotpath attribution at Europe (UUID `07d4d92b`):**
+
+| Function | Total / wall | % |
+|---|---:|---:|
+| `decompress_blob_raw` | 162.3 s total | ~4× worker-concurrent |
+| `build_classify_schedules_split` | 20.7 s wall | 52 % |
+| `next_header_with_data_offset` | 20.6 s | 52 % (all of schedule-walk time is here) |
+| `parallel_classify_phase` | 18.9 s wall | 48 % |
+| `from_vec_pooled_with_scratch` | 9.1 s total | 23 % |
+| `parse_and_inline` | 2.1 s | 5 % |
+
+**Alloc at Europe (UUID `75840aff`, total 1.8 GB, no churn):**
+
+| Function | Alloc |
+|---|---:|
+| `check_refs` exclusive (IdSetDense pre-alloc) | 1.6 GB |
+| `parse_and_inline` (scratch) | 53 MB |
+| schedule build vecs | 27 MB |
+| worker scratch | 20 MB |
+| `decompress_blob_raw` | 6 MB |
+
+From 21.5 GB churn at Japan post-swap to 1.8 GB at Europe post-parallel — all the per-op incremental allocation is gone; only the one-shot pre-alloc remains.
+
+**Cross-validation:** osmium parity still passes on Denmark across all four check paths (ways-only + nodes/ways/rels in relations) after each step. Planet confirmation bench deferred until a quiet-host window.
+
+**Off-plan discoveries logged in `TODO.md` Performance section:** `BlobReader::seek_raw` goes through stdlib `Seek::seek` which always discards the `BufReader` buffer; fixing this to use `BufReader::seek_relative` is codebase-wide perf work beyond check-refs scope. Buffer-size tuning alone is unsafe without that fix (verified: 16 MB buffer caused a 13× regression when the seek path still discards per blob; reverted in `86761d6`).
+
+### Original #2 plan (preserved for reference)
 
 Once #1 lands, the profile flips. `IdSetDense::set_atomic` is essentially free (a relaxed atomic OR per ID), so per-element work goes from the dominant cost to negligible. At that point the sequential reader at [check_refs.rs:112](../src/commands/check_refs.rs#L112) is the new binding constraint, and decode workers - currently "idle at 1% CPU" - can actually do useful work.
 

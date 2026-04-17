@@ -3,11 +3,10 @@
 use std::path::Path;
 use std::time::Instant;
 
-use roaring::RoaringTreemap;
-
 use crate::blob_index::ElemKind;
 use crate::{Element, MemberId};
 
+use super::id_set_dense::IdSetDense;
 use super::Result;
 
 /// A single missing reference entry (populated when `show_ids` is true).
@@ -76,39 +75,38 @@ impl RefCheckResult {
 ///
 /// A pure "ID-only scan mode" that skips refs/members would not work here.
 /// A selective parse that skips stringtable, tags, coordinates, and metadata
-/// but keeps IDs + refs + members was considered but is **not worth it**: profiling
-/// shows check-refs is consumer-bound (main thread 100% CPU on RoaringTreemap
-/// insertions, decode workers idle at 1% CPU each). Faster parsing would not
-/// reduce wall time.
+/// but keeps IDs + refs + members was considered but is **not worth it**
+/// while the current consumer work dominates. Once `IdSetDense` drops consumer
+/// cost by ~10×, the parse cost may be worth revisiting (see
+/// [notes/check-refs-opportunities.md](../../../notes/check-refs-opportunities.md)
+/// section #3).
 ///
 /// # Planet-scale memory usage
 ///
-/// Uses `roaring::RoaringTreemap` instead of `HashSet<i64>` for ID storage.
-/// OSM node IDs are dense and roughly sequential (1 through ~13 billion with
-/// gaps from deletions). RoaringTreemap exploits this density by compressing
-/// runs of consecutive IDs into bitmap containers (~2 bits per entry for dense
-/// chunks) instead of storing each ID individually (~40 bytes per entry in
-/// HashSet). For the full planet (~10B nodes, ~1B ways, ~17M relations):
+/// Uses [`IdSetDense`] for all three ID sets. `IdSetDense` is a chunked
+/// 4 MB-bitmap keyed by element ID, purpose-built for dense-monotonic OSM ID
+/// spaces. Insert and contains are O(1) (chunk index + byte offset +
+/// bitmask - no hashing, no tree walk) and ~10× faster than
+/// `RoaringTreemap` for this workload. Pre-allocating to the known OSM ID
+/// ceiling is a fixed cost regardless of population: ~1.6 GB for nodes
+/// (14 B pre-allocated IDs), ~175 MB for ways (1.5 B), ~3 MB for
+/// relations (25 M).
 ///
-/// - `HashSet<i64>`: ~400 GB (infeasible)
-/// - `RoaringTreemap`: ~2-3 GB (fits comfortably on any server)
+/// Planet scale (~10 B nodes, ~1 B ways, ~17 M relations): ~1.8 GB total,
+/// vs ~2-3 GB for RoaringTreemap and ~400 GB for `HashSet<i64>`.
 ///
-/// The `i64→u64` mapping uses `i64::cast_unsigned()`. Planet files from official
-/// servers contain only positive IDs, so the cast is lossless. Files with negative
-/// IDs (e.g. from JOSM for uncommitted elements) will wrap to the upper half
-/// of `u64` space, which is fine for set membership tests - the mapping just
-/// needs to be injective, not order-preserving.
-///
-/// RoaringTreemap (not RoaringBitmap) is required because RoaringBitmap only
-/// supports `u32` (max ~4.3B), which cannot hold current node IDs exceeding
-/// 10 billion.
+/// Missing-ID sets are small by construction (thousands to low millions
+/// even on a broken input) and are stored as `Vec<i64>` with a final
+/// `sort_unstable` + `dedup` to count unique missing IDs. This avoids
+/// a second bitmap allocation for a set that fits comfortably in a
+/// cache-friendly vector.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
     crate::debug::emit_marker("CHECKREFS_SCAN_START");
     // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
     // retention (25+ GB at Europe/planet scale). check-refs does lightweight
-    // per-element work (RoaringTreemap inserts) - the pipelined reader's
+    // per-element work (IdSetDense set/get) - the pipelined reader's
     // parallel decode creates cross-thread churn that dominates at scale.
     // See notes/cross-pipeline-optimization-plan.md.
     let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
@@ -117,23 +115,31 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
     let mut decompress_buf: Vec<u8> = Vec::new();
 
-    let mut node_ids = RoaringTreemap::new();
-    let mut way_ids = RoaringTreemap::new();
-    let mut relation_ids = RoaringTreemap::new();
+    // IdSetDense pre-allocated to the current OSM ID ceilings. Memory is
+    // bounded by the ID space (~1.8 GB total across all three), not the
+    // number of IDs set, so pre-allocation is a fixed up-front cost with
+    // no scaling risk.
+    let mut node_ids = IdSetDense::new();
+    node_ids.pre_allocate(14_000_000_000);
+    let mut way_ids = IdSetDense::new();
+    let mut relation_ids = IdSetDense::new();
+    if check_relations {
+        way_ids.pre_allocate(1_500_000_000);
+        relation_ids.pre_allocate(25_000_000);
+    }
 
-    // Track unique missing IDs (not reference occurrences) to match osmium
-    // semantics: "441 nodes missing" means 441 distinct node IDs that don't
-    // exist, not 712 references that point to missing nodes.
-    let mut missing_node_refs_set = RoaringTreemap::new();
-    let mut missing_way_refs_set = RoaringTreemap::new();
-    let mut missing_node_members_set = RoaringTreemap::new();
+    // Missing IDs are small (thousands to low millions); collect as Vec<i64>
+    // and sort+dedup at the end to count unique misses.
+    let mut missing_node_refs_vec: Vec<i64> = Vec::new();
+    let mut missing_way_refs_vec: Vec<i64> = Vec::new();
+    let mut missing_node_members_vec: Vec<i64> = Vec::new();
 
     // Deferred relation-to-relation references. Relations can reference other
     // relations that appear later in the file (forward references), so we
     // collect all relation member IDs during the pass and check them after
     // reading completes, when the full relation_ids set is available. This
     // matches osmium's two-pass approach for relation members.
-    let mut deferred_relation_refs: Vec<u64> = Vec::new();
+    let mut deferred_relation_refs: Vec<i64> = Vec::new();
     let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
 
     let mut missing_refs: Vec<MissingRef> = Vec::new();
@@ -254,13 +260,13 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         match element {
             Element::DenseNode(dn) => {
                 let t = Instant::now();
-                node_ids.insert(dn.id() .cast_unsigned());
+                node_ids.set(dn.id());
                 node_insert_ns += t.elapsed().as_nanos();
                 result.node_count += 1;
             }
             Element::Node(n) => {
                 let t = Instant::now();
-                node_ids.insert(n.id() .cast_unsigned());
+                node_ids.set(n.id());
                 node_insert_ns += t.elapsed().as_nanos();
                 result.node_count += 1;
             }
@@ -268,16 +274,16 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 let wid = w.id();
                 if check_relations {
                     let t = Instant::now();
-                    way_ids.insert(wid .cast_unsigned());
+                    way_ids.set(wid);
                     way_insert_ns += t.elapsed().as_nanos();
                 }
                 result.way_count += 1;
                 let t_refs = Instant::now();
                 for node_ref in w.refs() {
                     way_refs_checked += 1;
-                    if !node_ids.contains(node_ref .cast_unsigned()) {
+                    if !node_ids.get(node_ref) {
                         missing_node_refs_occurrences += 1;
-                        missing_node_refs_set.insert(node_ref .cast_unsigned());
+                        missing_node_refs_vec.push(node_ref);
                         if show_ids {
                             missing_refs.push(MissingRef {
                                 missing_type: 'n', missing_id: node_ref,
@@ -292,7 +298,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 let rid = r.id();
                 if check_relations {
                     let t = Instant::now();
-                    relation_ids.insert(rid .cast_unsigned());
+                    relation_ids.set(rid);
                     rel_insert_ns += t.elapsed().as_nanos();
                 }
                 result.relation_count += 1;
@@ -302,9 +308,9 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                         match member.id {
                             MemberId::Node(id) => {
                                 rel_node_members_checked += 1;
-                                if !node_ids.contains(id .cast_unsigned()) {
+                                if !node_ids.get(id) {
                                     missing_node_members_occurrences += 1;
-                                    missing_node_members_set.insert(id .cast_unsigned());
+                                    missing_node_members_vec.push(id);
                                     if show_ids {
                                         missing_refs.push(MissingRef {
                                             missing_type: 'n', missing_id: id,
@@ -315,9 +321,9 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                             }
                             MemberId::Way(id) => {
                                 rel_way_members_checked += 1;
-                                if !way_ids.contains(id .cast_unsigned()) {
+                                if !way_ids.get(id) {
                                     missing_way_refs_occurrences += 1;
-                                    missing_way_refs_set.insert(id .cast_unsigned());
+                                    missing_way_refs_vec.push(id);
                                     if show_ids {
                                         missing_refs.push(MissingRef {
                                             missing_type: 'w', missing_id: id,
@@ -328,7 +334,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                             }
                             MemberId::Relation(id) => {
                                 rel_rel_members_deferred += 1;
-                                deferred_relation_refs.push(id .cast_unsigned());
+                                deferred_relation_refs.push(id);
                                 if show_ids {
                                     // Deferred - store relation ID for later resolution
                                     // We store the referencing relation ID alongside
@@ -364,33 +370,42 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         None => {}
     }
 
-    result.missing_node_refs = missing_node_refs_set.len();
-    result.missing_node_members = missing_node_members_set.len();
-    result.missing_way_refs = missing_way_refs_set.len();
+    // Dedup the per-kind missing-ref vecs to get the unique-missing counts.
+    // Input sizes are small (thousands to low millions) so in-place
+    // sort_unstable + dedup is cheaper than a second bitmap.
+    let t_dedup = Instant::now();
+    let unique_len = |v: &mut Vec<i64>| -> u64 {
+        v.sort_unstable();
+        v.dedup();
+        v.len() as u64
+    };
+    result.missing_node_refs = unique_len(&mut missing_node_refs_vec);
+    result.missing_way_refs = unique_len(&mut missing_way_refs_vec);
+    result.missing_node_members = unique_len(&mut missing_node_members_vec);
+    let missing_dedup_ns = t_dedup.elapsed().as_nanos();
 
     // Resolve deferred relation refs against the complete relation_ids set.
-    // Deduplicate missing IDs via RoaringTreemap to count unique missing
-    // relation IDs, consistent with node/way counting above.
+    // Deduplicate missing IDs via sort+dedup for the unique-missing count.
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
     let t_deferred = Instant::now();
     if check_relations {
-        let mut missing_relation_members_set = RoaringTreemap::new();
+        let mut missing_relation_members_vec: Vec<i64> = Vec::new();
         let mut occurrences: u64 = 0;
         for (i, &id) in deferred_relation_refs.iter().enumerate() {
-            if !relation_ids.contains(id) {
-                missing_relation_members_set.insert(id);
+            if !relation_ids.get(id) {
+                missing_relation_members_vec.push(id);
                 occurrences += 1;
                 if show_ids {
                     missing_refs.push(MissingRef {
                         missing_type: 'r',
-                        missing_id: id.cast_signed(),
+                        missing_id: id,
                         referencing_type: 'r',
                         referencing_id: deferred_relation_ref_sources[i],
                     });
                 }
             }
         }
-        result.missing_relation_members = missing_relation_members_set.len();
+        result.missing_relation_members = unique_len(&mut missing_relation_members_vec);
         result.missing_relation_member_occurrences = occurrences;
     }
     let deferred_resolve_ns = t_deferred.elapsed().as_nanos();
@@ -421,6 +436,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         crate::debug::emit_counter("checkrefs_way_ref_check_ms", ns_to_ms(way_ref_check_ns));
         crate::debug::emit_counter("checkrefs_rel_insert_ms", ns_to_ms(rel_insert_ns));
         crate::debug::emit_counter("checkrefs_rel_member_check_ms", ns_to_ms(rel_member_check_ns));
+        crate::debug::emit_counter("checkrefs_missing_dedup_ms", ns_to_ms(missing_dedup_ns));
         crate::debug::emit_counter("checkrefs_deferred_resolve_ms", ns_to_ms(deferred_resolve_ns));
 
         // Structural counters (validate yardstick + plan cost model).

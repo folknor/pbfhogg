@@ -31,6 +31,7 @@ use super::{require_indexdata, HeaderOverrides, Result};
 mod blob_bucket_index;
 mod blob_meta;
 mod coord_payloads;
+mod relation_scan;
 mod stage1;
 mod stage2;
 mod stage3;
@@ -406,8 +407,8 @@ pub fn external_join(
     } else {
         crate::debug::emit_marker("EXTJOIN_RELATION_SCAN_START");
         let t_relscan = std::time::Instant::now();
-        let ids = super::add_locations_to_ways::collect_relation_member_node_ids(
-            input, direct_io,
+        let ids = relation_scan::collect_relation_member_node_ids_indexed(
+            input, &blob_meta,
         )?;
         #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
         crate::debug::emit_counter(

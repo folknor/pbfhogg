@@ -160,6 +160,9 @@ Concrete changes:
 
 ### #3 — Fuse stage 1A + 1B via a node-ID scratch spool
 
+**Attempted 2026-04-17 (commit `44913a5`, reverted `ba62fb1`).** Flat-`i64` scratch-spool variant: each Pass A worker opens one scratch file, `write_all_at`s each blob's `blob_node_ids` at a tracked offset, records `(worker_id, file_offset, ref_count)`; Pass B `read_exact_at`s the payload and skips pread + decompress + way-scan. Europe `--bench 1` UUID `b29877e2`: wall `291.6 s → 324.2 s` (**+11.2% regression**). Pass A `7.3 s → 15.0 s` (+7.7 s, the scratch-write overhead), Pass B `30.0 s → 44.9 s` (got *worse*, not better), Stage 2 `89 s → 95 s` (likely page-cache contention from the ~2.4 GB scratch competing with stage-2 working set). The implementation used per-blob `write_all_at` / `read_exact_at` — ~9.5 K unbuffered pwrites per worker at ~42 KB average, plus the scratch bytes thrashing page cache that stage 2 also needs. Scratch-spool as a *shape* is not ruled out, but any retry needs (a) a buffered writer per worker with tracked append offset rather than per-blob `pwrite`, (b) evidence the 2.4 GB extra working set won't thrash stage 2, and (c) a delta-varint encoding to shrink the scratch volume. Until that's designed, prefer R4 A1 (ID-bucketed single-pass) or a different seam.
+
+
 **Convergence: R2 #3, R3 #2, R5 #2, R6 #1/follow-up.** Independent of #1 and #2; stacks cleanly. Subsumes R1's medium-value "single-ingest way-ref spool" note targeting [stage1.rs:327](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:327) and [:421](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:421). R4 A1 attacks the same bottleneck with a more aggressive mechanism — see "Variant" below. R6's follow-up, after the explicit 30 GB RAM constraint, sharpens which sub-variants are actually viable.
 
 **Bottleneck.** Stage 1 decompresses and scans every way blob twice — ~57K blobs, ~37 GB compressed at planet. Zlib decompression is pure CPU, accounting for roughly 50% of stage 1 wall time, and it executes twice.
@@ -400,6 +403,8 @@ Building the routing table is a metadata pass over the existing per-worker manif
 ---
 
 ### #11 — Replace zero-filled stage-2 coord slices with an explicit presence bitmap
+
+**Attempted 2026-04-17 (commit `631f284`, reverted).** Per-worker `Vec<u64>` bitmap, one bit per local rank; set the bit on coord write, check it in the resolve loop, zero only the bitmap prefix at each bucket boundary. Europe `--bench 1` UUID `85464a37`: wall `291.6 s → 293.1 s` (essentially flat, +0.5% single-run). Stage 2 regressed `89.3 s → 95.2 s` (+6 s) — the per-slot bitmap OR in the fill loop and bitmap bit-test in the resolve loop cost more than the saved per-bucket zero-fill (Europe `local_range ≈ 780 K` ≈ 6.2 MB coord-slice zero per bucket, which modern memset moves in a few ms). Europe stage 2 is pread/decompress-bound (cf. #4 landing), so there's no headroom for the bitmap overhead to hide in. The doc's own rating was "likely modest" and that's confirmed. Planet might differ (local_range ~18× bigger), but not worth resurrecting this standalone — the doc's own guidance was "pairs naturally with #4 if stage 2's fill loop is already being edited", and #4 is now landed. If a future seam reshapes the stage-2 inner loop, it can carry a presence bit for free; until then the sentinel-based path is the smaller diff.
 
 **Convergence: R6 M1 only.** Smaller than the structural items above and potentially obsoleted by #5 or #6, but worth recording because the current `coord_slice[..slice_bytes].fill(0)` at [stage2.rs:397](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:397) is correctness-driven, not incidental.
 

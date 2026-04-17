@@ -1,6 +1,6 @@
 # `apply-changes --locations-on-ways` — optimization plan
 
-Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC. Current: 12m42s (762 s) wall, 1.8 GB peak RSS. Production uses `--compression none` (no zlib encode in the output path).
+Target: `pbfhogg apply-changes --locations-on-ways` on planet with a daily OSC. Current: 12m33s (753 s, zlib) / 8m52s (532 s, none) wall, 1.8 GB peak RSS (commit `7e9c2e9`, 2026-04-17). Production uses `--compression none` (no zlib encode in the output path).
 
 ## Thesis
 
@@ -14,7 +14,7 @@ Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mos
 - coalesced passthrough writes (consecutive raw frames flush as a single `write_raw_owned` move)
 - raw-bytes pre-seeded string table path for base element rewrite (no re-parse, no re-intern)
 
-The 12m42s is the real cost of rewriting 70–90 % of a planet's blobs with locations preserved, not an artefact of a wrong shape.
+The 12m33s zlib / 8m52s none is the real cost of rewriting 70–90 % of a planet's blobs with locations preserved, not an artefact of a wrong shape.
 
 The wins are **two incremental parallelizations** of the remaining single-threaded stretches: `NodeLocationIndex::prefill_from_base`, and the reader thread. Plus one default-change that is moot in production but worth knowing exists.
 
@@ -26,7 +26,8 @@ Target after this plan: **~6–9 min at planet under `--compression none`**, RSS
 
 | Command | Wall | Peak RSS | Notes |
 |---|---:|---:|---|
-| `apply-changes --locations-on-ways` (current, `--compression none`) | 12m42s | 1.8 GB | ~80 % blob rewrite ratio on daily OSC |
+| `apply-changes --locations-on-ways` (current, `--compression none`) | 8m52s | 1.8 GB | ~80 % blob rewrite ratio on daily OSC |
+| `apply-changes --locations-on-ways` (current, `--compression zlib`) | 12m33s | 1.8 GB | as above with zlib encode (osmium-interop default) |
 
 Inferred per-phase breakdown for a daily planet OSC under `--compression none`:
 
@@ -39,7 +40,7 @@ Inferred per-phase breakdown for a daily planet OSC under `--compression none`:
 | Phase 3 rewrite (~80 % blobs re-encode) | ~50–150 s | yes (rayon) | `BlockBuilder` + tag work |
 | Phase 4 output (no compression) | ~30–60 s | yes (writer thread) | NVMe write throughput |
 | Writer flush | ~5 s | — | trivial |
-| **Sum** | ~275–745 s | | 762 s lands at the high end |
+| **Sum** | ~275–745 s | | 532 s (none) / 753 s (zlib) lands inside this band; zlib at the high end |
 
 Two single-threaded stretches (~80–250 s combined) and input decompression (~100–250 s) are the main targets.
 
@@ -156,7 +157,7 @@ Under `--compression none` at planet:
 - #2 + #3: ~80–160 s saved. New wall **~9–10 min**.
 - #2 + #3 + #1 (if any caller hits the zlib:6 default): #1 doesn't help production. Off-production callers see an additional ~150–300 s on their paths.
 
-Primary target: **~9–10 min at planet in production**, from 12m42s.
+Primary target: **~6–7 min at planet in production (`--compression none`)**, from 8m52s. (Or ~9–10 min if osmium-interop zlib output is required, from 12m33s.)
 
 ## What to leave alone
 

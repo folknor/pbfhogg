@@ -99,7 +99,7 @@ Best results per dataset. Commit `a6ebbfe` (NA), `a65a198` (multi-region),
 | Japan | 2.4 GB | 1.87s | 2.88s | — | — |
 | Germany | 4.7 GB | 3.42s | 5.34s | 4.4s | 9.6s |
 | North America | 18.8 GB | 14.9s | 17.3s | **11.9s** | 15.2s |
-| Planet | 87 GB | 515s | 762s | — | — |
+| Planet | 87 GB | 532s | 753s | — | — |
 
 Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
 North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
@@ -674,7 +674,11 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Germany (4.5 GB) | — | **9.8 min** | After optimization (was 30 min) |
 | Planet (~87 GB) | 8-10 hours (192 GB RAM) | — | Would OOM on 30 GB host |
 
-Planet (validated): **1,346s (22.4 min), 17.8 GB RSS** (sidecar `6887288a`). Our index is larger due to segment-level indexing (6 bytes
+Planet (validated): **1,255s (20.9 min), 29.5 GB peak anon RSS** in
+`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`). The earlier
+17.8 GB figure under-reported: brokkr previously hid short-emitting phase
+markers from sidecar output, so PASS1_5's transient peak never surfaced.
+The peak itself has not changed — only its visibility. Our index is larger due to segment-level indexing (6 bytes
 vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
 builder currently holds all intermediate data in RAM — planet requires
 streaming to temp files (not yet implemented).

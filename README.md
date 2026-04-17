@@ -41,12 +41,12 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `getid --invert` | 1m23s | 102 MB | raw-frame passthrough for non-intersecting blobs |
 | `cat` (indexdata generation) | 8m17s | ~200 MB | rewrites BlobHeader without re-compressing |
 | `tags-filter highway=primary` | 52s | 688 MB | two-pass, parallel classify |
-| `getid` | 1m12s | 833 MB | multi-blob ID resolution via indexdata |
-| `check --refs` | 20m54s | 1.73 GB | full referential integrity over 11.6B elements |
-| `apply-changes` (daily diff, zlib) | 12m42s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
+| `getid` | 1m6s | 833 MB | multi-blob ID resolution via indexdata |
+| `check --refs` | 20m25s | 1.73 GB | full referential integrity over 11.6B elements |
+| `apply-changes` (daily diff, zlib) | 12m33s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
 | `renumber` | 3m14s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
-| `extract --smart` (Europe bbox) | 4m39s | 11.17 GB | three-pass, multipolygon-complete |
-| `build-geocode-index` | 22m26s | 14.59 GB | reverse geocoding index, S2 cells |
+| `extract --smart` (Europe bbox) | 4m42s | 11.17 GB | three-pass, multipolygon-complete |
+| `build-geocode-index` | 20m55s | 29.5 GB | reverse geocoding index, S2 cells (pass-1.5 transient peak) |
 | `add-locations-to-ways --index-type external` | 15m53s | **8.7 GB** | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~256 GB temp disk |
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md).

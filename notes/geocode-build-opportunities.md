@@ -1,6 +1,6 @@
 # Geocode index builder — optimization plan
 
-Target: `pbfhogg build-geocode-index` on planet. Current: 22m26s (1346 s) wall, 14.59 GB peak RSS.
+Target: `pbfhogg build-geocode-index` on planet. Current: 20m55s (1255 s) wall, **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`, 2026-04-17). Phase peaks (anon): PASS1 12 MB, **PASS1_5 29.5 GB**, PASS2 13.9 GB, PASS3 10.4 GB. Earlier numbers in this note (14.59 GB / 17.8 GB) under-reported the peak: brokkr previously hid short-emitting phase markers from sidecar output, so PASS1_5's transient peak never surfaced. The peak itself has not regressed — only its visibility.
 
 ## Thesis
 
@@ -12,18 +12,18 @@ No internal API needs rewriting. `IdSetDense`, `PrimitiveBlock`, `parallel_class
 
 ## Yardstick
 
-| Phase | Wall (inferred) | Notes |
-|---|---:|---|
-| Pass 1 (relations) | ~5–10 s | sequential, tiny input fraction |
-| Pass 1.5 (referenced-node collect) | ~100–200 s | parallel, full `PrimitiveBlock` decode |
-| Pass 2 (fused nodes + ways) | **~700–900 s** | **single-threaded** |
-| Pass 3 (cell assignment, both levels) | ~200–400 s | rayon compute + sequential bucket merge, run twice |
-| Admin polygon + flood-fill | ~30–100 s | sequential per polygon |
-| **Total** | 1346 s | |
+| Phase | Wall (measured `7e9c2e9`) | Peak Anon | Notes |
+|---|---:|---:|---|
+| Pass 1 (relations) | 42 s | 12 MB | sequential, tiny input fraction |
+| Pass 1.5 (referenced-node collect) | **167 s** | **29.5 GB** | parallel, full `PrimitiveBlock` decode — actual peak, previously hidden by brokkr's short-marker filter |
+| Schedule scanner | 16 s | 12 MB | between passes |
+| Pass 2 (fused nodes + ways) | **881 s** | 13.9 GB | **single-threaded** (mallopt fix not yet applied here) |
+| Pass 3 (cell assignment, both levels) | 141 s | 10.4 GB | rayon compute + sequential bucket merge, run twice |
+| **Total** | **1255 s** | **29.5 GB peak** | |
 
-Breakdown is inferred from code shape (Pass 2 decodes ~70 GB of compressed data on one thread at ~500 MB/s decompressed throughput). Add explicit `*_ms` counters during the rewrite to ground-truth it.
+Breakdown ground-truthed by sidecar markers (`1c708509`). Pass 2 still holds ~70 % of wall and is the headline target. Pass 1.5 is now the **memory** target — its peak is what governs whether the build fits on a 30 GB host without swap.
 
-Target after this plan: **~10–12 min wall at planet, RSS same or lower than 14.59 GB.**
+Target after this plan: **~10–12 min wall at planet, RSS reduced from 29.5 GB Pass 1.5 peak to <16 GB.**
 
 ## Current architecture (for reference)
 
@@ -140,7 +140,7 @@ Pass 1.5 currently uses **per-worker `IdSetDense` accumulation** — each worker
 
 Switch to the pattern renumber uses at [renumber_external.rs:166–179](../src/commands/renumber_external.rs#L166): one shared pre-allocated `IdSetDense`, populated concurrently via `set_atomic`. Drops the per-worker residency entirely.
 
-**Expected win: not wall; ~5 GB transient RSS during Pass 1.5.** Worth doing if RSS matters on the 14.59 GB peak, skippable otherwise.
+**Expected win: not wall; large transient RSS during Pass 1.5.** Originally framed as "~5 GB transient" against a believed-14.59 GB whole-build peak. With brokkr now reporting short-emitting phases, the true Pass 1.5 peak on planet is **29.5 GB** — this item is **load-bearing for 30 GB hosts**, not optional.
 
 ## Local changes worth keeping on the list
 

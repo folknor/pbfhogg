@@ -6,7 +6,7 @@ design direction).
 **Note: implementation deviated from this spec.** Node coordinates use a compact
 rank-indexed array (via `IdSetDense` rank) instead of the spec's `DenseMmapIndex`.
 Pass 4 (S2 cell assignment) uses 256 temp-file buckets instead of external merge
-sort. Actual peak RSS is 17.8 GB (planet) vs the spec's ~14.5 GB budget.
+sort. Actual peak anon RSS is **29.5 GB** (planet, commit `7e9c2e9`, 2026-04-17) vs the spec's ~14.5 GB budget — the peak lands in `GEOCODE_PASS1_5` (referenced-node collect), not in the `DenseMmapIndex` mmap. The earlier 17.8 GB figure under-reported because brokkr's sidecar previously hid short-emitting phase markers. See [geocode-build-opportunities.md](geocode-build-opportunities.md) for the breakdown.
 
 ## 1. Scope
 

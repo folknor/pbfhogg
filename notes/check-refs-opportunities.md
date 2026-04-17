@@ -1,6 +1,6 @@
 # `check --refs` — optimization plan
 
-Target: `pbfhogg check --refs` on planet. Current: 20m54s (1254 s) wall, 1.8 GB peak RSS.
+Target: `pbfhogg check --refs` on planet. Current: 20m25s (1225 s) wall, 1.8 GB peak RSS (commit `7e9c2e9`, 2026-04-17).
 
 ## Thesis
 
@@ -98,7 +98,7 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 
 **Missing-ref sets** (`missing_node_refs_set`, `missing_way_refs_set`, `missing_node_members_set`) are `RoaringTreemap`s used only to deduplicate missing IDs for the final count. At planet these are typically a few thousand to a few million IDs. Replace with `Vec<i64>` + `sort_unstable` + `dedup` at the end. Simpler, faster for small sets, and easier to concat-merge across workers in phase #2.
 
-**Expected wall**: from 20m54s to roughly **10–13 min**. The consumer loop stops being the bottleneck; whatever surfaces next (blob I/O + decompression + `PrimitiveBlock` construction, all still on one thread) becomes the new limit.
+**Expected wall**: from 20m25s to roughly **10–13 min**. The consumer loop stops being the bottleneck; whatever surfaces next (blob I/O + decompression + `PrimitiveBlock` construction, all still on one thread) becomes the new limit.
 
 **Expected RSS**: ~same or slightly lower (1.5–1.8 GB). Pre-allocating to `MAX_NODE_ID` allocates all ~400 chunks up front (~1.6 GB), versus `RoaringTreemap` growing as containers fill. Peak is comparable.
 
@@ -177,7 +177,7 @@ Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelizati
 
 ## Plan of attack
 
-1. **Add per-phase `_ms` counters** unconditionally (not `cfg(feature = "hotpath")`). Measure current planet to fix the 20m54s baseline, then re-measure after each step. Each step's proof is "wall went down and result is identical."
+1. **Add per-phase `_ms` counters** unconditionally (not `cfg(feature = "hotpath")`). Measure current planet to fix the 20m25s baseline, then re-measure after each step. Each step's proof is "wall went down and result is identical."
 2. **Land #1 alone first** — `RoaringTreemap` → `IdSetDense` + missing-refs vec-and-dedup. ~30 lines of diff. This is most of the win. Cross-validate against current `main` on Denmark, Europe, planet — `RefCheckResult` fields should be identical (node_count, way_count, all four missing counts) plus identical `missing_refs` vec contents (sort both sides before comparing if order matters).
 3. **Land #2** — `mallopt` + three-phase parallel scan. Confirm no RSS regression on planet (expect +300–500 MB from per-worker scratch). Re-measure wall.
 4. **Measure post-#2 breakdown**. If decompression dominates, stop — #3 would not help. If `PrimitiveBlock` construction is a significant share, land #3.

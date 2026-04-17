@@ -7,7 +7,7 @@ use crate::blob_index::ElemKind;
 use crate::{Element, MemberId};
 
 use super::id_set_dense::IdSetDense;
-use super::Result;
+use super::{build_classify_schedule, parallel_classify_phase, Result};
 
 /// A single missing reference entry (populated when `show_ids` is true).
 pub struct MissingRef {
@@ -55,6 +55,33 @@ impl RefCheckResult {
     }
 }
 
+/// Per-way-blob classify result. Bounded by blob size (~8000 elements × typical
+/// ~10 refs/way). Streamed back to the main thread for merge.
+#[derive(Default)]
+struct WayBlobResult {
+    way_count: u64,
+    way_refs_checked: u64,
+    missing_node_refs: Vec<i64>,
+    /// Populated only when `show_ids` is true.
+    missing_refs: Vec<MissingRef>,
+}
+
+/// Per-relation-blob classify result.
+#[derive(Default)]
+struct RelBlobResult {
+    relation_count: u64,
+    rel_node_members_checked: u64,
+    rel_way_members_checked: u64,
+    rel_rel_members_deferred: u64,
+    missing_node_members: Vec<i64>,
+    missing_way_refs: Vec<i64>,
+    deferred_relation_refs: Vec<i64>,
+    /// Parallel to `deferred_relation_refs`, populated only when `show_ids` is true.
+    deferred_relation_ref_sources: Vec<i64>,
+    /// Populated only when `show_ids` is true.
+    missing_refs: Vec<MissingRef>,
+}
+
 /// Check referential integrity of a PBF file.
 ///
 /// Verifies that all node references in ways point to existing nodes.
@@ -67,58 +94,61 @@ impl RefCheckResult {
 /// relation IDs for relation-to-relation members (deferred to post-pass to
 /// handle forward references, then deduplicated).
 ///
-/// # Why this is NOT an ID-only consumer
+/// # Architecture
 ///
-/// Despite appearances, check_refs needs more than just element IDs:
-/// - Way node refs (`w.refs()`) - the delta-decoded refs array
-/// - Relation member IDs and types (`r.members()`) - the memids and types arrays
+/// Three-phase parallel scan following the renumber_external pattern.
+/// `mallopt(M_ARENA_MAX, 2)` caps glibc arenas at 2 to prevent cross-thread
+/// alloc/free fragmentation from the pread worker pool. Each phase builds
+/// a per-kind schedule via [`build_classify_schedule`] and dispatches
+/// through [`parallel_classify_phase`]: workers pread + decompress +
+/// decode + classify in parallel; the main thread merges per-blob results.
 ///
-/// A pure "ID-only scan mode" that skips refs/members would not work here.
-/// A selective parse that skips stringtable, tags, coordinates, and metadata
-/// but keeps IDs + refs + members was considered but is **not worth it**
-/// while the current consumer work dominates. Once `IdSetDense` drops consumer
-/// cost by ~10×, the parse cost may be worth revisiting (see
-/// [notes/check-refs-opportunities.md](../../../notes/check-refs-opportunities.md)
-/// section #3).
+/// Phase 1 (nodes) writes to `node_ids` via `IdSetDense::set_atomic`. Phase 2
+/// (ways) reads `node_ids` to check refs, optionally writes to `way_ids`.
+/// Phase 3 (relations, only when `check_relations`) reads both and populates
+/// `relation_ids`. Forward relation-relation references are deferred to a
+/// post-pass when `relation_ids` is complete.
 ///
 /// # Planet-scale memory usage
 ///
-/// Uses [`IdSetDense`] for all three ID sets. `IdSetDense` is a chunked
-/// 4 MB-bitmap keyed by element ID, purpose-built for dense-monotonic OSM ID
-/// spaces. Insert and contains are O(1) (chunk index + byte offset +
-/// bitmask - no hashing, no tree walk) and ~10× faster than
-/// `RoaringTreemap` for this workload. Pre-allocating to the known OSM ID
-/// ceiling is a fixed cost regardless of population: ~1.6 GB for nodes
-/// (14 B pre-allocated IDs), ~175 MB for ways (1.5 B), ~3 MB for
-/// relations (25 M).
-///
-/// Planet scale (~10 B nodes, ~1 B ways, ~17 M relations): ~1.8 GB total,
-/// vs ~2-3 GB for RoaringTreemap and ~400 GB for `HashSet<i64>`.
+/// Uses [`IdSetDense`] for all three ID sets, pre-allocated to OSM ID
+/// ceilings. Memory is bounded by the ID space, not the population:
+/// ~1.6 GB for nodes (pre-allocated to 14 B), ~175 MB for ways (1.5 B),
+/// ~3 MB for relations (25 M).
 ///
 /// Missing-ID sets are small by construction (thousands to low millions
 /// even on a broken input) and are stored as `Vec<i64>` with a final
-/// `sort_unstable` + `dedup` to count unique missing IDs. This avoids
-/// a second bitmap allocation for a set that fits comfortably in a
-/// cache-friendly vector.
+/// `sort_unstable` + `dedup` to count unique missing IDs.
+///
+/// # Why this is NOT an ID-only consumer
+///
+/// Despite appearances, check_refs needs more than just element IDs:
+/// way node refs (`w.refs()`) and relation member IDs and types
+/// (`r.members()`). A selective wire-format parser that skips
+/// stringtable/tags/coords/metadata but keeps IDs + refs + members is
+/// the plan's step #3 - worth revisiting if decompression remains the
+/// bottleneck after this parallelization. See
+/// [notes/check-refs-opportunities.md](../../../notes/check-refs-opportunities.md).
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io: bool) -> Result<RefCheckResult> {
-    crate::debug::emit_marker("CHECKREFS_SCAN_START");
-    // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
-    // retention (25+ GB at Europe/planet scale). check-refs does lightweight
-    // per-element work (IdSetDense set/get) - the pipelined reader's
-    // parallel decode creates cross-thread churn that dominates at scale.
-    // See notes/cross-pipeline-optimization-plan.md.
-    let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
-    blob_reader.set_parse_indexdata(true);
-    blob_reader.next()
-        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
-    let mut decompress_buf: Vec<u8> = Vec::new();
+    // `direct_io` is not plumbed through the parallel pread workers yet
+    // (parallel_classify_phase opens the input via a shared Arc<File>
+    // without O_DIRECT). Accept silently for now; if this matters for a
+    // workload it can be added to build_classify_schedule's contract.
+    let _ = direct_io;
 
-    // IdSetDense pre-allocated to the current OSM ID ceilings. Memory is
-    // bounded by the ID space (~1.8 GB total across all three), not the
-    // number of IDs set, so pre-allocation is a fixed up-front cost with
-    // no scaling risk.
+    crate::debug::emit_marker("CHECKREFS_SCAN_START");
+
+    // Prelude: cap glibc arenas at 2 to prevent cross-thread alloc/free
+    // fragmentation from the pread worker pool. Scoped to this command.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
+    // IdSetDense pre-allocated to the current OSM ID ceilings. Required
+    // before any set_atomic call - set_atomic panics on unallocated chunks.
     let mut node_ids = IdSetDense::new();
     node_ids.pre_allocate(14_000_000_000);
     let mut way_ids = IdSetDense::new();
@@ -127,22 +157,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         way_ids.pre_allocate(1_500_000_000);
         relation_ids.pre_allocate(25_000_000);
     }
-
-    // Missing IDs are small (thousands to low millions); collect as Vec<i64>
-    // and sort+dedup at the end to count unique misses.
-    let mut missing_node_refs_vec: Vec<i64> = Vec::new();
-    let mut missing_way_refs_vec: Vec<i64> = Vec::new();
-    let mut missing_node_members_vec: Vec<i64> = Vec::new();
-
-    // Deferred relation-to-relation references. Relations can reference other
-    // relations that appear later in the file (forward references), so we
-    // collect all relation member IDs during the pass and check them after
-    // reading completes, when the full relation_ids set is available. This
-    // matches osmium's two-pass approach for relation members.
-    let mut deferred_relation_refs: Vec<i64> = Vec::new();
-    let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
-
-    let mut missing_refs: Vec<MissingRef> = Vec::new();
 
     let mut result = RefCheckResult {
         node_count: 0,
@@ -155,189 +169,208 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         missing_relation_member_occurrences: 0,
         missing_refs: Vec::new(),
     };
-    let mut st_scratch: Vec<(u32, u32)> = Vec::new();
-    let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    // Structural counters for yardstick validation.
-    let mut node_blobs: u64 = 0;
-    let mut way_blobs: u64 = 0;
-    let mut relation_blobs: u64 = 0;
-    let mut total_bytes_decompressed: u64 = 0;
+    let mut missing_node_refs_vec: Vec<i64> = Vec::new();
+    let mut missing_way_refs_vec: Vec<i64> = Vec::new();
+    let mut missing_node_members_vec: Vec<i64> = Vec::new();
+    let mut deferred_relation_refs: Vec<i64> = Vec::new();
+    let mut deferred_relation_ref_sources: Vec<i64> = Vec::new();
+    let mut missing_refs: Vec<MissingRef> = Vec::new();
+
     let mut way_refs_checked: u64 = 0;
     let mut rel_node_members_checked: u64 = 0;
     let mut rel_way_members_checked: u64 = 0;
     let mut rel_rel_members_deferred: u64 = 0;
-    let mut missing_node_refs_occurrences: u64 = 0;
-    let mut missing_way_refs_occurrences: u64 = 0;
-    let mut missing_node_members_occurrences: u64 = 0;
 
-    // Track the element kind currently being processed so phase markers
-    // (NODES / WAYS / RELATIONS) are emitted on kind transitions. Driven
-    // off element kind rather than blob.index() so the instrumentation is
-    // robust against non-indexed inputs.
-    let mut current_phase: Option<ElemKind> = None;
-
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
-        if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
-            continue;
-        }
-        if !check_relations {
-            if let Some(idx) = blob.index() {
-                if matches!(idx.kind, ElemKind::Relation) {
-                    continue;
+    // ------------------------------------------------------------------
+    // Phase 1 — node scan. Workers populate `node_ids` via `set_atomic`.
+    // ------------------------------------------------------------------
+    crate::debug::emit_marker("CHECKREFS_NODES_START");
+    let (node_schedule, shared_file) = build_classify_schedule(path, Some(ElemKind::Node))?;
+    let node_blobs = node_schedule.len() as u64;
+    {
+        let node_ids_ref = &node_ids;
+        parallel_classify_phase(
+            &shared_file,
+            &node_schedule,
+            || (),
+            |block, &mut ()| -> u64 {
+                let mut count: u64 = 0;
+                for el in block.elements_skip_metadata() {
+                    match el {
+                        Element::DenseNode(dn) => {
+                            node_ids_ref.set_atomic(dn.id());
+                            count += 1;
+                        }
+                        Element::Node(n) => {
+                            node_ids_ref.set_atomic(n.id());
+                            count += 1;
+                        }
+                        _ => {}
+                    }
                 }
-            }
-        }
-        blob.decompress_into(&mut decompress_buf)?;
-        total_bytes_decompressed += decompress_buf.len() as u64;
-        let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
-            std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
+                count
+            },
+            |count| {
+                result.node_count += count;
+            },
         )?;
+    }
+    crate::debug::emit_marker("CHECKREFS_NODES_END");
+    crate::debug::emit_mallinfo2("checkrefs_after_nodes");
 
-        // Per-blob kind tally via blob.index() when available; falls back
-        // to first-element inspection below via current_phase updates.
-        if let Some(idx) = blob.index() {
-            match idx.kind {
-                ElemKind::Node => node_blobs += 1,
-                ElemKind::Way => way_blobs += 1,
-                ElemKind::Relation => relation_blobs += 1,
-            }
-        }
-
-        for element in block.elements_skip_metadata() {
-        let kind = match element {
-            Element::DenseNode(_) | Element::Node(_) => ElemKind::Node,
-            Element::Way(_) => ElemKind::Way,
-            Element::Relation(_) => ElemKind::Relation,
-        };
-        if current_phase != Some(kind) {
-            match current_phase {
-                Some(ElemKind::Node) => {
-                    crate::debug::emit_marker("CHECKREFS_NODES_END");
-                    crate::debug::emit_mallinfo2("checkrefs_after_nodes");
-                }
-                Some(ElemKind::Way) => {
-                    crate::debug::emit_marker("CHECKREFS_WAYS_END");
-                    crate::debug::emit_mallinfo2("checkrefs_after_ways");
-                }
-                Some(ElemKind::Relation) => {
-                    crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
-                    crate::debug::emit_mallinfo2("checkrefs_after_relations");
-                }
-                None => {}
-            }
-            match kind {
-                ElemKind::Node => crate::debug::emit_marker("CHECKREFS_NODES_START"),
-                ElemKind::Way => crate::debug::emit_marker("CHECKREFS_WAYS_START"),
-                ElemKind::Relation => crate::debug::emit_marker("CHECKREFS_RELATIONS_START"),
-            }
-            current_phase = Some(kind);
-        }
-        match element {
-            Element::DenseNode(dn) => {
-                node_ids.set(dn.id());
-                result.node_count += 1;
-            }
-            Element::Node(n) => {
-                node_ids.set(n.id());
-                result.node_count += 1;
-            }
-            Element::Way(w) => {
-                let wid = w.id();
-                if check_relations {
-                    way_ids.set(wid);
-                }
-                result.way_count += 1;
-                for node_ref in w.refs() {
-                    way_refs_checked += 1;
-                    if !node_ids.get(node_ref) {
-                        missing_node_refs_occurrences += 1;
-                        missing_node_refs_vec.push(node_ref);
-                        if show_ids {
-                            missing_refs.push(MissingRef {
-                                missing_type: 'n', missing_id: node_ref,
-                                referencing_type: 'w', referencing_id: wid,
-                            });
+    // ------------------------------------------------------------------
+    // Phase 2 — way scan. Workers read `node_ids` (via `get`, no atomic
+    // needed now that phase 1 joined), optionally write `way_ids`, and
+    // collect per-blob missing-ref vecs.
+    // ------------------------------------------------------------------
+    crate::debug::emit_marker("CHECKREFS_WAYS_START");
+    let (way_schedule, _) = build_classify_schedule(path, Some(ElemKind::Way))?;
+    let way_blobs = way_schedule.len() as u64;
+    {
+        let node_ids_ref = &node_ids;
+        let way_ids_ref = &way_ids;
+        parallel_classify_phase(
+            &shared_file,
+            &way_schedule,
+            || (),
+            |block, &mut ()| -> WayBlobResult {
+                let mut r = WayBlobResult::default();
+                for el in block.elements_skip_metadata() {
+                    if let Element::Way(w) = el {
+                        let wid = w.id();
+                        if check_relations {
+                            way_ids_ref.set_atomic(wid);
                         }
-                    }
-                }
-            }
-            Element::Relation(r) => {
-                let rid = r.id();
-                if check_relations {
-                    relation_ids.set(rid);
-                }
-                result.relation_count += 1;
-                if check_relations {
-                    for member in r.members() {
-                        match member.id {
-                            MemberId::Node(id) => {
-                                rel_node_members_checked += 1;
-                                if !node_ids.get(id) {
-                                    missing_node_members_occurrences += 1;
-                                    missing_node_members_vec.push(id);
-                                    if show_ids {
-                                        missing_refs.push(MissingRef {
-                                            missing_type: 'n', missing_id: id,
-                                            referencing_type: 'r', referencing_id: rid,
-                                        });
-                                    }
-                                }
-                            }
-                            MemberId::Way(id) => {
-                                rel_way_members_checked += 1;
-                                if !way_ids.get(id) {
-                                    missing_way_refs_occurrences += 1;
-                                    missing_way_refs_vec.push(id);
-                                    if show_ids {
-                                        missing_refs.push(MissingRef {
-                                            missing_type: 'w', missing_id: id,
-                                            referencing_type: 'r', referencing_id: rid,
-                                        });
-                                    }
-                                }
-                            }
-                            MemberId::Relation(id) => {
-                                rel_rel_members_deferred += 1;
-                                deferred_relation_refs.push(id);
+                        r.way_count += 1;
+                        for nref in w.refs() {
+                            r.way_refs_checked += 1;
+                            if !node_ids_ref.get(nref) {
+                                r.missing_node_refs.push(nref);
                                 if show_ids {
-                                    // Deferred - store relation ID for later resolution
-                                    // We store the referencing relation ID alongside
-                                    deferred_relation_ref_sources.push(rid);
+                                    r.missing_refs.push(MissingRef {
+                                        missing_type: 'n',
+                                        missing_id: nref,
+                                        referencing_type: 'w',
+                                        referencing_id: wid,
+                                    });
                                 }
                             }
-                            // Unknown member types from newer PBF producers -
-                            // skip for ref-checking since we don't know what
-                            // collection to check against.
-                            MemberId::Unknown(_, _) => {}
                         }
                     }
                 }
-            }
-        }
-    } } // for element, for blob_result
+                r
+            },
+            |r| {
+                result.way_count += r.way_count;
+                way_refs_checked += r.way_refs_checked;
+                missing_node_refs_vec.extend(r.missing_node_refs);
+                if show_ids {
+                    missing_refs.extend(r.missing_refs);
+                }
+            },
+        )?;
+    }
+    crate::debug::emit_marker("CHECKREFS_WAYS_END");
+    crate::debug::emit_mallinfo2("checkrefs_after_ways");
 
-    // Close whichever phase marker is current.
-    match current_phase {
-        Some(ElemKind::Node) => {
-            crate::debug::emit_marker("CHECKREFS_NODES_END");
-            crate::debug::emit_mallinfo2("checkrefs_after_nodes");
+    // ------------------------------------------------------------------
+    // Phase 3 — relation scan (only when `check_relations`). Workers read
+    // both `node_ids` and `way_ids`, write `relation_ids`, and collect
+    // per-blob missing/deferred vecs.
+    // ------------------------------------------------------------------
+    let mut relation_blobs: u64 = 0;
+    if check_relations {
+        crate::debug::emit_marker("CHECKREFS_RELATIONS_START");
+        let (rel_schedule, _) = build_classify_schedule(path, Some(ElemKind::Relation))?;
+        relation_blobs = rel_schedule.len() as u64;
+        {
+            let node_ids_ref = &node_ids;
+            let way_ids_ref = &way_ids;
+            let relation_ids_ref = &relation_ids;
+            parallel_classify_phase(
+                &shared_file,
+                &rel_schedule,
+                || (),
+                |block, &mut ()| -> RelBlobResult {
+                    let mut r = RelBlobResult::default();
+                    for el in block.elements_skip_metadata() {
+                        if let Element::Relation(rel) = el {
+                            let rid = rel.id();
+                            relation_ids_ref.set_atomic(rid);
+                            r.relation_count += 1;
+                            for mem in rel.members() {
+                                match mem.id {
+                                    MemberId::Node(id) => {
+                                        r.rel_node_members_checked += 1;
+                                        if !node_ids_ref.get(id) {
+                                            r.missing_node_members.push(id);
+                                            if show_ids {
+                                                r.missing_refs.push(MissingRef {
+                                                    missing_type: 'n',
+                                                    missing_id: id,
+                                                    referencing_type: 'r',
+                                                    referencing_id: rid,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    MemberId::Way(id) => {
+                                        r.rel_way_members_checked += 1;
+                                        if !way_ids_ref.get(id) {
+                                            r.missing_way_refs.push(id);
+                                            if show_ids {
+                                                r.missing_refs.push(MissingRef {
+                                                    missing_type: 'w',
+                                                    missing_id: id,
+                                                    referencing_type: 'r',
+                                                    referencing_id: rid,
+                                                });
+                                            }
+                                        }
+                                    }
+                                    MemberId::Relation(id) => {
+                                        r.rel_rel_members_deferred += 1;
+                                        r.deferred_relation_refs.push(id);
+                                        if show_ids {
+                                            r.deferred_relation_ref_sources.push(rid);
+                                        }
+                                    }
+                                    // Unknown member types from newer PBF producers -
+                                    // skip for ref-checking since we don't know what
+                                    // collection to check against.
+                                    MemberId::Unknown(_, _) => {}
+                                }
+                            }
+                        }
+                    }
+                    r
+                },
+                |r| {
+                    result.relation_count += r.relation_count;
+                    rel_node_members_checked += r.rel_node_members_checked;
+                    rel_way_members_checked += r.rel_way_members_checked;
+                    rel_rel_members_deferred += r.rel_rel_members_deferred;
+                    missing_node_members_vec.extend(r.missing_node_members);
+                    missing_way_refs_vec.extend(r.missing_way_refs);
+                    deferred_relation_refs.extend(r.deferred_relation_refs);
+                    if show_ids {
+                        deferred_relation_ref_sources.extend(r.deferred_relation_ref_sources);
+                        missing_refs.extend(r.missing_refs);
+                    }
+                },
+            )?;
         }
-        Some(ElemKind::Way) => {
-            crate::debug::emit_marker("CHECKREFS_WAYS_END");
-            crate::debug::emit_mallinfo2("checkrefs_after_ways");
-        }
-        Some(ElemKind::Relation) => {
-            crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
-            crate::debug::emit_mallinfo2("checkrefs_after_relations");
-        }
-        None => {}
+        crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
+        crate::debug::emit_mallinfo2("checkrefs_after_relations");
     }
 
+    // Occurrence counts = pre-dedup vec lengths.
+    let missing_node_refs_occurrences = missing_node_refs_vec.len() as u64;
+    let missing_way_refs_occurrences = missing_way_refs_vec.len() as u64;
+    let missing_node_members_occurrences = missing_node_members_vec.len() as u64;
+
     // Dedup the per-kind missing-ref vecs to get the unique-missing counts.
-    // Input sizes are small (thousands to low millions) so in-place
-    // sort_unstable + dedup is cheaper than a second bitmap.
     let t_dedup = Instant::now();
     let unique_len = |v: &mut Vec<i64>| -> u64 {
         v.sort_unstable();
@@ -350,7 +383,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     let missing_dedup_ns = t_dedup.elapsed().as_nanos();
 
     // Resolve deferred relation refs against the complete relation_ids set.
-    // Deduplicate missing IDs via sort+dedup for the unique-missing count.
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
     let t_deferred = Instant::now();
     if check_relations {
@@ -390,18 +422,15 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         crate::debug::emit_counter("checkrefs_missing_node_members", result.missing_node_members as i64);
         crate::debug::emit_counter("checkrefs_missing_relation_members", result.missing_relation_members as i64);
 
-        // One-shot post-pass timers (the only timers kept - these are
-        // outside the hot per-element loop, so no Instant overhead
-        // amortizes into the measurement).
+        // One-shot post-pass timers.
         let ns_to_ms = |ns: u128| (ns / 1_000_000) as i64;
         crate::debug::emit_counter("checkrefs_missing_dedup_ms", ns_to_ms(missing_dedup_ns));
         crate::debug::emit_counter("checkrefs_deferred_resolve_ms", ns_to_ms(deferred_resolve_ns));
 
-        // Structural counters (validate yardstick + plan cost model).
+        // Structural counters.
         crate::debug::emit_counter("checkrefs_node_blobs", node_blobs as i64);
         crate::debug::emit_counter("checkrefs_way_blobs", way_blobs as i64);
         crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs as i64);
-        crate::debug::emit_counter("checkrefs_total_bytes_decompressed", total_bytes_decompressed as i64);
         crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked as i64);
         crate::debug::emit_counter("checkrefs_rel_node_members_checked", rel_node_members_checked as i64);
         crate::debug::emit_counter("checkrefs_rel_way_members_checked", rel_way_members_checked as i64);

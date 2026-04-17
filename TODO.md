@@ -72,22 +72,86 @@ large deltas vs the README.md planet table.
   ambiguous; the new number is the honest two-pass measurement. If we
   want both in README, label them `-R` vs default explicitly.
 
-- [ ] **`cat --type way` planet regression - 54 s -> 74 s cold (+37%).**
-  The README 43.7 s baseline was `--bench 3` (warm best-of-3); today's
-  single-shot `--bench 1` at the same commit `573ef71` is 53.9 s cold
-  (UUID `2a5c6c3b`). True cold-vs-cold regression is 54 s -> 74 s, not
-  44 s -> 74 s.
+- [ ] **`cat --type way` planet regression - open, bisect result
+  suspect, needs verification.**
 
-  Narrowed bisect window: **`573ef71..a496e81`**. Probe at `a496e81`
-  (UUID `a58333e3`) already measured 73.8 s - identical to current
-  `28fd26c` - so the regression predates `a496e81` and is NOT in any of
-  the write-path commits (`603385e`, `4ed7e52`, `9695ad5`, `b45b731`,
-  etc.) that followed. The suspect window is 40-ish commits between
-  `573ef71` (2026-03-30, 54 s) and `a496e81` (protohoggr 0.4.0 bump,
-  74 s); the intermediate commits that pinned protohoggr 0.2.1/0.3.0
-  should now build against crates.io since the path-dep was removed.
-  Phase breakdown at current tip: CAT_SCAN_START 52.2 s + CAT_SCAN_END
-  21.5 s, 95 GB read + 28 GB written.
+  **Next step: re-verify the 573ef71 baseline.** Run
+  `brokkr cat --type way --bench 1 --commit 573ef71 --dataset planet`
+  again. If it reproduces at ~54 s, the bisect stands and the c3b271f
+  diagnosis needs a codegen/noise explanation (see points 2-3 below).
+  If it drifts to ~74 s like every other probe, there is no regression
+  - the original 53.9 s reading was a warm-cache outlier from the
+  previous night's `02800a77` cat run and this item closes as
+  "artefact of single-sample --bench 1 variance". Either answer ends
+  the investigation cleanly in one more bench run.
+
+  Nominal regression: README 44 s -> 74 s on commit `28fd26c`.
+  First correction: README `44 s` was `--bench 3` warm best-of-3
+  (default for `bench` mode); today's single-shot `--bench 1` on the
+  same commit `573ef71` measured 53.9 s cold (UUID `2a5c6c3b`). So
+  the cold-vs-cold framing is **54 s -> 74 s (+37 %)**, not 44 -> 74.
+
+  **Bisect runs (2026-04-17, plantasjen, `--bench 1` single-shot,
+  planet-20260223-with-indexdata.osm.pbf):**
+
+  | Position | Commit | Window position | Wall | UUID |
+  |---:|---|---|---:|---|
+  | 0 | `573ef71` | window start | **53.9 s** | `2a5c6c3b` |
+  | 1 | `c3b271f` | position 1/50 | 74.7 s | `9c793ddf` |
+  | 2 | `d08c9b1` | position 2/50 | 74.4 s | `30585bc0` |
+  | 5 | `0963d88` | position 5/50 | 74.6 s | `dd83fb20` |
+  | 11 | `bf0b259` | position 11/50 | 74.4 s | `42d9ea03` |
+  | 22 | `9180d8a` | protohoggr 0.3.0 bump | 75.1 s | `162f2fb7` |
+  | 50 | `a496e81` | window end (0.4.0 bump) | 73.8 s | `a58333e3` |
+  | tip | `28fd26c` | current | 73.8 s | `127fdf1e` |
+
+  Binary search collapsed the window to a single commit: **`c3b271f`
+  "Revert hot classify paths to Vec accumulation, keep IdSetDense for
+  sparse"** (2026-04-09). But `c3b271f` only touches
+  `src/commands/extract.rs` (+25/-25 lines) - no change to `cat.rs`,
+  `raw_passthrough.rs`, the writer, or anything on `cat --type way`'s
+  hot path. So one of the following is true, in decreasing order of
+  likelihood:
+
+  1. **`573ef71`'s 53.9 s is an outlier from a warm-ish page-cache
+     state**, and the "regression" does not exist. The 92 GB planet
+     PBF can't fit in 28 GB RAM, but `results.db` shows
+     `02800a77 2026-04-16 21:00:35 7e9c2e9 cat bench 83501 ms` the
+     night before, and today's first bench (`2a5c6c3b` at 10:15) may
+     have benefited from warm indexdata/header pages. Every bench
+     from 10:24 onwards sat in the 73-75 s band including the same
+     commit (`573ef71`) re-tested - this is the single outstanding
+     verification step. **Rerun `brokkr cat --type way --bench 1
+     --commit 573ef71 --dataset planet` to confirm whether 573ef71
+     actually reproduces at 54 s or drifts to ~74 s like everything
+     else**. If it reproduces at 54 s, continue; otherwise close as
+     "no regression, 2a5c6c3b was a warm cache outlier".
+  2. `c3b271f` changed compiled code in some module that cat shares
+     with extract (e.g. inlined helpers, generic monomorphisation).
+     `git show c3b271f` shows it only swaps
+     `IdSetDense::set`-in-a-loop for `Vec::push` accumulation in
+     extract. Checking `cargo rustc -- --emit=asm` between
+     `573ef71` and `c3b271f` on cat.rs / raw_passthrough.rs /
+     writer.rs would tell us whether codegen drifted for the cat
+     hot path (LTO boundary or generic instantiation cascade). Low
+     prior.
+  3. Noise - single-sample `--bench 1` can drift 10-15 % on
+     memory-bound workloads. `--bench 3` would tighten, at 3x the
+     wall cost per commit.
+
+  **Phase breakdown at current tip** (UUID `127fdf1e`, commit
+  `28fd26c`): CAT_SCAN_START 52.2 s + CAT_SCAN_END 21.5 s = 73.5 s
+  wall, 95 GB disk read, 28 GB disk write. 28 GB write to `hdd`
+  target implies ~1.3 GB/s HDD write throughput - plausibly the
+  CAT_SCAN_END bound.
+
+  **Commits ruled out as suspects** (by bisect probes already
+  landing at the regressed time): `bf0b259`, `0963d88`, `d08c9b1`,
+  `9180d8a`, `a496e81`, and every write-path commit from
+  `a496e81..28fd26c` (`603385e`, `4ed7e52`, `9695ad5`, `b45b731`,
+  etc.). `9695ad5`'s permit pool was examined directly: it wraps
+  `write_primitive_block{,_owned}` only; `cat --type way` goes
+  through `write_raw_owned` which bypasses the pool. Not implicated.
 - [ ] **Rerun `add-locations-to-ways --index-type external` planet** - the
   2026-04-17 overnight hit EMFILE (`rank-W13-047: Too many open files`)
   during stage-1 shard creation. Stage 1 opens `num_shard_workers *

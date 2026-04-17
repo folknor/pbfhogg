@@ -1,9 +1,11 @@
 //! Validate referential integrity in a PBF file. Equivalent to `osmium check-refs`.
 
 use std::path::Path;
+use std::time::Instant;
 
 use roaring::RoaringTreemap;
 
+use crate::blob_index::ElemKind;
 use crate::{Element, MemberId};
 
 use super::Result;
@@ -149,40 +151,131 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     };
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
-    for blob_result in &mut blob_reader {
-        let blob = blob_result?;
+
+    // Per-sub-operation wall-time accumulators (unconditional).
+    // Accumulated per-blob / per-element-kind-transition rather than per-op
+    // to keep Instant::now() overhead negligible (~100K calls at planet).
+    let mut pread_ms: u128 = 0;
+    let mut decompress_ms: u128 = 0;
+    let mut block_build_ms: u128 = 0;
+    let mut node_insert_ms: u128 = 0;
+    let mut way_insert_ms: u128 = 0;
+    let mut way_ref_check_ms: u128 = 0;
+    let mut rel_insert_ms: u128 = 0;
+    let mut rel_member_check_ms: u128 = 0;
+
+    // Structural counters for yardstick validation.
+    let mut node_blobs: u64 = 0;
+    let mut way_blobs: u64 = 0;
+    let mut relation_blobs: u64 = 0;
+    let mut total_bytes_decompressed: u64 = 0;
+    let mut way_refs_checked: u64 = 0;
+    let mut rel_node_members_checked: u64 = 0;
+    let mut rel_way_members_checked: u64 = 0;
+    let mut rel_rel_members_deferred: u64 = 0;
+    let mut missing_node_refs_occurrences: u64 = 0;
+    let mut missing_way_refs_occurrences: u64 = 0;
+    let mut missing_node_members_occurrences: u64 = 0;
+
+    // Track the element kind currently being processed so phase markers
+    // (NODES / WAYS / RELATIONS) are emitted on kind transitions. Driven
+    // off element kind rather than blob.index() so the instrumentation is
+    // robust against non-indexed inputs.
+    let mut current_phase: Option<ElemKind> = None;
+
+    loop {
+        let t_pread = Instant::now();
+        let next = blob_reader.next();
+        pread_ms += t_pread.elapsed().as_millis();
+        let blob = match next {
+            None => break,
+            Some(r) => r?,
+        };
         if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
             continue;
         }
         if !check_relations {
             if let Some(idx) = blob.index() {
-                if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                if matches!(idx.kind, ElemKind::Relation) {
                     continue;
                 }
             }
         }
+        let t_dec = Instant::now();
         blob.decompress_into(&mut decompress_buf)?;
+        decompress_ms += t_dec.elapsed().as_millis();
+        total_bytes_decompressed += decompress_buf.len() as u64;
+        let t_build = Instant::now();
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
         )?;
+        block_build_ms += t_build.elapsed().as_millis();
+
+        // Per-blob kind tally via blob.index() when available; falls back
+        // to first-element inspection below via current_phase updates.
+        if let Some(idx) = blob.index() {
+            match idx.kind {
+                ElemKind::Node => node_blobs += 1,
+                ElemKind::Way => way_blobs += 1,
+                ElemKind::Relation => relation_blobs += 1,
+            }
+        }
+
         for element in block.elements_skip_metadata() {
+        let kind = match element {
+            Element::DenseNode(_) | Element::Node(_) => ElemKind::Node,
+            Element::Way(_) => ElemKind::Way,
+            Element::Relation(_) => ElemKind::Relation,
+        };
+        if current_phase != Some(kind) {
+            match current_phase {
+                Some(ElemKind::Node) => {
+                    crate::debug::emit_marker("CHECKREFS_NODES_END");
+                    crate::debug::emit_mallinfo2("checkrefs_after_nodes");
+                }
+                Some(ElemKind::Way) => {
+                    crate::debug::emit_marker("CHECKREFS_WAYS_END");
+                    crate::debug::emit_mallinfo2("checkrefs_after_ways");
+                }
+                Some(ElemKind::Relation) => {
+                    crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
+                    crate::debug::emit_mallinfo2("checkrefs_after_relations");
+                }
+                None => {}
+            }
+            match kind {
+                ElemKind::Node => crate::debug::emit_marker("CHECKREFS_NODES_START"),
+                ElemKind::Way => crate::debug::emit_marker("CHECKREFS_WAYS_START"),
+                ElemKind::Relation => crate::debug::emit_marker("CHECKREFS_RELATIONS_START"),
+            }
+            current_phase = Some(kind);
+        }
         match element {
             Element::DenseNode(dn) => {
+                let t = Instant::now();
                 node_ids.insert(dn.id() .cast_unsigned());
+                node_insert_ms += t.elapsed().as_millis();
                 result.node_count += 1;
             }
             Element::Node(n) => {
+                let t = Instant::now();
                 node_ids.insert(n.id() .cast_unsigned());
+                node_insert_ms += t.elapsed().as_millis();
                 result.node_count += 1;
             }
             Element::Way(w) => {
                 let wid = w.id();
                 if check_relations {
+                    let t = Instant::now();
                     way_ids.insert(wid .cast_unsigned());
+                    way_insert_ms += t.elapsed().as_millis();
                 }
                 result.way_count += 1;
+                let t_refs = Instant::now();
                 for node_ref in w.refs() {
+                    way_refs_checked += 1;
                     if !node_ids.contains(node_ref .cast_unsigned()) {
+                        missing_node_refs_occurrences += 1;
                         missing_node_refs_set.insert(node_ref .cast_unsigned());
                         if show_ids {
                             missing_refs.push(MissingRef {
@@ -192,18 +285,24 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                         }
                     }
                 }
+                way_ref_check_ms += t_refs.elapsed().as_millis();
             }
             Element::Relation(r) => {
                 let rid = r.id();
                 if check_relations {
+                    let t = Instant::now();
                     relation_ids.insert(rid .cast_unsigned());
+                    rel_insert_ms += t.elapsed().as_millis();
                 }
                 result.relation_count += 1;
                 if check_relations {
+                    let t_mem = Instant::now();
                     for member in r.members() {
                         match member.id {
                             MemberId::Node(id) => {
+                                rel_node_members_checked += 1;
                                 if !node_ids.contains(id .cast_unsigned()) {
+                                    missing_node_members_occurrences += 1;
                                     missing_node_members_set.insert(id .cast_unsigned());
                                     if show_ids {
                                         missing_refs.push(MissingRef {
@@ -214,7 +313,9 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                                 }
                             }
                             MemberId::Way(id) => {
+                                rel_way_members_checked += 1;
                                 if !way_ids.contains(id .cast_unsigned()) {
+                                    missing_way_refs_occurrences += 1;
                                     missing_way_refs_set.insert(id .cast_unsigned());
                                     if show_ids {
                                         missing_refs.push(MissingRef {
@@ -225,6 +326,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                                 }
                             }
                             MemberId::Relation(id) => {
+                                rel_rel_members_deferred += 1;
                                 deferred_relation_refs.push(id .cast_unsigned());
                                 if show_ids {
                                     // Deferred - store relation ID for later resolution
@@ -238,10 +340,28 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                             MemberId::Unknown(_, _) => {}
                         }
                     }
+                    rel_member_check_ms += t_mem.elapsed().as_millis();
                 }
             }
         }
-    } } // for element, for blob_result
+    } } // for element, loop
+
+    // Close whichever phase marker is current.
+    match current_phase {
+        Some(ElemKind::Node) => {
+            crate::debug::emit_marker("CHECKREFS_NODES_END");
+            crate::debug::emit_mallinfo2("checkrefs_after_nodes");
+        }
+        Some(ElemKind::Way) => {
+            crate::debug::emit_marker("CHECKREFS_WAYS_END");
+            crate::debug::emit_mallinfo2("checkrefs_after_ways");
+        }
+        Some(ElemKind::Relation) => {
+            crate::debug::emit_marker("CHECKREFS_RELATIONS_END");
+            crate::debug::emit_mallinfo2("checkrefs_after_relations");
+        }
+        None => {}
+    }
 
     result.missing_node_refs = missing_node_refs_set.len();
     result.missing_node_members = missing_node_members_set.len();
@@ -250,6 +370,8 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // Resolve deferred relation refs against the complete relation_ids set.
     // Deduplicate missing IDs via RoaringTreemap to count unique missing
     // relation IDs, consistent with node/way counting above.
+    crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_START");
+    let t_deferred = Instant::now();
     if check_relations {
         let mut missing_relation_members_set = RoaringTreemap::new();
         let mut occurrences: u64 = 0;
@@ -270,11 +392,14 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         result.missing_relation_members = missing_relation_members_set.len();
         result.missing_relation_member_occurrences = occurrences;
     }
+    let deferred_resolve_ms = t_deferred.elapsed().as_millis();
+    crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_END");
 
     result.missing_refs = missing_refs;
 
     crate::debug::emit_marker("CHECKREFS_SCAN_END");
-    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_mallinfo2("checkrefs_final");
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
         crate::debug::emit_counter("checkrefs_node_count", result.node_count as i64);
         crate::debug::emit_counter("checkrefs_way_count", result.way_count as i64);
@@ -283,6 +408,30 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         crate::debug::emit_counter("checkrefs_missing_way_refs", result.missing_way_refs as i64);
         crate::debug::emit_counter("checkrefs_missing_node_members", result.missing_node_members as i64);
         crate::debug::emit_counter("checkrefs_missing_relation_members", result.missing_relation_members as i64);
+
+        // Per-sub-operation wall-time breakdown.
+        crate::debug::emit_counter("checkrefs_pread_ms", pread_ms as i64);
+        crate::debug::emit_counter("checkrefs_decompress_ms", decompress_ms as i64);
+        crate::debug::emit_counter("checkrefs_block_build_ms", block_build_ms as i64);
+        crate::debug::emit_counter("checkrefs_node_insert_ms", node_insert_ms as i64);
+        crate::debug::emit_counter("checkrefs_way_insert_ms", way_insert_ms as i64);
+        crate::debug::emit_counter("checkrefs_way_ref_check_ms", way_ref_check_ms as i64);
+        crate::debug::emit_counter("checkrefs_rel_insert_ms", rel_insert_ms as i64);
+        crate::debug::emit_counter("checkrefs_rel_member_check_ms", rel_member_check_ms as i64);
+        crate::debug::emit_counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms as i64);
+
+        // Structural counters (validate yardstick + plan cost model).
+        crate::debug::emit_counter("checkrefs_node_blobs", node_blobs as i64);
+        crate::debug::emit_counter("checkrefs_way_blobs", way_blobs as i64);
+        crate::debug::emit_counter("checkrefs_relation_blobs", relation_blobs as i64);
+        crate::debug::emit_counter("checkrefs_total_bytes_decompressed", total_bytes_decompressed as i64);
+        crate::debug::emit_counter("checkrefs_way_refs_checked", way_refs_checked as i64);
+        crate::debug::emit_counter("checkrefs_rel_node_members_checked", rel_node_members_checked as i64);
+        crate::debug::emit_counter("checkrefs_rel_way_members_checked", rel_way_members_checked as i64);
+        crate::debug::emit_counter("checkrefs_rel_rel_members_deferred", rel_rel_members_deferred as i64);
+        crate::debug::emit_counter("checkrefs_missing_node_refs_occurrences", missing_node_refs_occurrences as i64);
+        crate::debug::emit_counter("checkrefs_missing_way_refs_occurrences", missing_way_refs_occurrences as i64);
+        crate::debug::emit_counter("checkrefs_missing_node_members_occurrences", missing_node_members_occurrences as i64);
     }
 
     Ok(result)

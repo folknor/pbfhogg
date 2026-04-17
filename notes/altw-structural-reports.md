@@ -22,6 +22,7 @@ Do not re-propose these — they are in tree and are reflected in the baseline m
 - Stage-4 raw passthrough for relation blobs (always) and node blobs when `keep_untagged_nodes` is set
 - `PerWayRcs` lazy per-blob decode via blob-offset sidecar
 - `IdSetDense::rank_if_set()` fused get+rank in stage 2; the remaining opportunity is deleting per-node rank queries entirely, not re-proposing separate `get()+rank()` lookups
+- **Stage-2 de-ranking via blob-local rank counter** (`f1a4ada`, item #4 below) — stage 2 now calls `get(id)` and increments a per-blob counter seeded from `NodeBlobInfo.ref_rank_start`; `IdSetDense::drop_rank_index()` runs between stage 1 and stage 2. Europe wall `320.5 s → 308.0 s` (−3.9%), stage-3 peak anon `7.50 GB → 5.95 GB` (−1.55 GB), stage-2 peak anon `7.57 GB → 7.04 GB` (−530 MB); stage-2 wall itself flat (Europe stage 2 is pread/decompress-bound, not rank-walk-bound). Debug asserts guard monotonic tuple IDs and `next_rank == ref_rank_end`. Byte-identical vs dense/sparse on Denmark.
 - Slot-bucket `ResolvedEntry` record shrunk 16 → 12 bytes (`fcd4fa2`) — −25% stage 2+3 scratch
 - Shared header-scan sidecar replacing three separate header-only passes (`f864b64f`) — saved ~56 s Europe wall
 - **`BlobLocationRouter` replaces `finalize_coord_payloads` consolidation + `CoordPayloadsReader`** (`e497e54`, item #8 below) — finalize phase `18.3 s → 0.163 s` at Europe, wall `333 s → 320.5 s`, byte-identical output
@@ -202,7 +203,9 @@ The cost model flips from `pread + zlib (CPU) + protobuf (branch-heavy)` to `pre
 
 ---
 
-### #4 — Remove stage-2 per-node rank queries; assign ranks by blob-local counters
+### #4 — Remove stage-2 per-node rank queries; assign ranks by blob-local counters — **LANDED 2026-04-17 (commit `f1a4ada`)**
+
+**Landed-result.** Europe `--bench 3` UUID `10f4587d`: total wall `320.5 s → 308.0 s` (−12.5 s, −3.9%). Stage-2 wall flat (91.0 → 92.6 s) — Europe stage 2 is pread/decompress-bound, not rank-walk-bound, so removing the rank walk shows up in RSS rather than wall. Stage-3 peak anon `7.50 GB → 5.95 GB` (−1.55 GB); stage-2 peak anon `7.57 GB → 7.04 GB` (−530 MB). Stage-1 pass B `29.0 s → 24.8 s` (−14.5%, some cross-run variance included). Byte-identical vs dense/sparse on Denmark; osmium diff is the accepted ALTW-wide deviation. Planet not yet measured — hypothesis is the wall improvement scales more strongly there because tuple count is ~10× Europe's.
 
 **Convergence: R6 follow-up only, but grounded in current code and historical stage-2 profiling.** This is not an `IdSetDense` rewrite. Keep the bitmap / `set_atomic()` / `get()` path; stop using rank metadata in the stage-2 hot loop.
 
@@ -446,23 +449,18 @@ Consolidated from all six reports:
 
 **Sequence (revised after the sixth-review follow-up and the explicit 30 GB-RAM planet constraint).**
 
-1. **#1 first — promote epoch-spill.** Still the strongest structural seam deletion with real payoff, and the code already exists in `stage23_epoch.rs`. Delete + promote, not a write. Clean keep/revert candidate. R6 did not evaluate it because the prototype sat outside the mainline code read.
-2. **Prototype #4 immediately before or after #1.** Small, local, RAM-positive, and the cleanest contained benchmark under the 30 GB host constraint. Add blob-local rank-monotonicity asserts and measure it directly.
-3. **Then #8 — routing table / `BlobLocation` over worker tmp fds.** Smallest blast radius among the remaining seam deletions. Eliminates ~110 GB of disk traffic at planet (the finalize consolidate copy + stage-4 payload preads) without architectural change. R6 independently rediscovers it and tightens the implementation by keeping straddlers in RAM.
-4. **#9 in parallel** — pull relation-member collection forward into stage 1. Independent of #1/#2/#3/#4/#8, small scope, can land any time. Two-review convergence remains enough for a clear keep candidate.
-5. **Then #3 — fuse stage 1A + 1B.** Under the 30 GB host constraint, discard all-RAM buffer/sweep forms. Re-evaluate scratch-spool vs ID-bucketed emission after #4; the latter becomes more attractive once per-node rank queries are gone.
-6. **Then #2 — stream stage 3 → stage 4.** Largest remaining payoff, but the biggest rewrite; wants #1 landed first and bounded backpressure discipline from the start. Subsumes #8 — if #2 is intended within the same release, consider skipping #8 and going directly to #2. If horizons are uncertain, take the #8 win first.
+1. ~~**#4** — stage-2 de-ranking.~~ **LANDED `f1a4ada` 2026-04-17.** Europe −3.9% wall, stage-3 peak anon −1.55 GB, stage-2 peak anon −530 MB. Measure planet when convenient; hypothesis is a larger wall win there since tuple count scales ~10×.
+2. ~~**#8** — `BlobLocationRouter` finalize deletion.~~ **LANDED `e497e54` 2026-04-16.**
+3. **#1 — promote epoch-spill.** The natural next step. Still the strongest structural seam deletion with real payoff, and the code already exists in `stage23_epoch.rs`. Delete + promote, not a write. Clean keep/revert candidate. R6 did not evaluate it because the prototype sat outside the mainline code read.
+4. **#9 in parallel** — pull relation-member collection forward into stage 1. Independent of #1/#3, small scope, can land any time. Two-review convergence remains enough for a clear keep candidate.
+5. **Then #3 — fuse stage 1A + 1B.** Under the 30 GB host constraint, discard all-RAM buffer/sweep forms. With #4 landed, the ID-bucketed emission variant becomes more attractive: the old "rank work migrates downstream" objection is gone because stage 2 no longer does per-node rank queries.
+6. **Then #2 — stream stage 3 → stage 4.** Largest remaining payoff, but the biggest rewrite; wants #1 landed first and bounded backpressure discipline from the start. #2 would conceptually replace #8's `BlobLocationRouter` with a streaming coordinator.
 7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation of #1's fused path; #6 subsumes #5 at whole-pipeline scope (and R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.
 8. **#10 separately, conditional.** Conservative refcounts-only BlobHeader metadata is now supported by three reviewers, but it still depends on codifying the `cat` output contract. Aggressive full-ref-list forms remain blocked on the 64 KiB header cap.
 
-### Benchmark plan for #4 (stage-2 de-ranking)
+### Benchmark plan for #4 (stage-2 de-ranking) — **EXECUTED, landed `f1a4ada`**
 
-1. Replace per-tuple `rank_if_set(id)` in stage 2 with `get(id)` + blob-local `next_rank`, seeded from `NodeBlobInfo.ref_rank_start`.
-2. Add debug/validation assertions: tuple IDs within each decoded node blob are monotonic; the number of membership hits equals `blob.ref_count()`; and `next_rank` finishes at `blob.ref_rank_end`.
-3. Add an explicit `drop_rank_index()` helper to `IdSetDense` and call it once pass B + `build_node_blob_mapping()` are complete. On the current architecture, stage 2 should carry only the bitmap, not the rank prefixes.
-4. Gate with semantic Denmark parity first, then benchmark Europe with `brokkr add-locations-to-ways --dataset europe --index-type external --bench 3` against current `main`.
-5. Key metrics: total wall, `EXTJOIN_STAGE2`, `s2_node_rank_ns` disappearance, peak RSS / anon, page-fault deltas, and whether `s2_coord_fill_ms` or downstream phases move unexpectedly.
-6. **Keep if** Europe total wall improves clearly or stage 2 drops materially with no RSS increase. Planet confirmation matters here because the benefit should scale with tuple count much more strongly than on Europe.
+See the landed-result note in #4 above. Europe `--bench 3` (UUID `10f4587d`): wall 320.5 s → 308.0 s (−3.9%). Stage-2 wall flat because Europe stage 2 is pread/decompress-bound — the rank walk was never the hot cost on Europe. The benefit shows up as peak-anon drops (stage 3 −1.55 GB, stage 2 −530 MB) because the rank-prefix metadata is freed before stage 2 starts. Debug asserts cover monotonic tuple IDs and `next_rank == ref_rank_end` per blob. Denmark external byte-identical to dense/sparse (accepted osmium deviation is ALTW-wide, not introduced here).
 
 ### Benchmark plan for #1 (epoch-spill default)
 

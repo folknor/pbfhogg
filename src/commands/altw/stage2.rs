@@ -329,15 +329,18 @@ pub(super) fn stage2_node_join(
                 };
                 // Pre-size once to the per-bucket worst case (the nominal
                 // rank_range_size; the last bucket may be smaller but
-                // never larger). The slice is fully zeroed at the start
-                // of each bucket and then populated only at slots where
-                // we decode a referenced node — the resolve loop below
-                // depends on (lat==0 && lon==0) as the missing-coord
-                // sentinel, so leftover bytes from a previous bucket
-                // would be silently misresolved as real coordinates.
+                // never larger). Missing-coord detection is driven by
+                // `presence_bitmap` (one bit per local rank) instead of
+                // a `(lat==0, lon==0)` sentinel — only the bitmap prefix
+                // needs zeroing at each bucket boundary, which is 64×
+                // cheaper than zeroing the full coord slice and lets
+                // legitimate (0, 0) coordinates remain distinguishable.
                 #[allow(clippy::cast_possible_truncation)]
                 let max_slice_bytes = (rank_range_size as usize) * COORD_SLOT_SIZE;
+                #[allow(clippy::cast_possible_truncation)]
+                let max_local_range = rank_range_size as usize;
                 let mut coord_slice: Vec<u8> = vec![0u8; max_slice_bytes];
+                let mut presence_bitmap: Vec<u64> = vec![0u64; max_local_range.div_ceil(64)];
                 let mut node_read_buf: Vec<u8> = Vec::new();
                 let mut node_decompress_buf: Vec<u8> = Vec::new();
                 let mut node_tuples: Vec<NodeTuple> = Vec::new();
@@ -383,18 +386,18 @@ pub(super) fn stage2_node_join(
                         // node blobs whose referenced-rank ranges intersect
                         // [bucket_rank_start, bucket_rank_end).
                         //
-                        // Correctness: the slice is reused across buckets
-                        // by this worker, so it MUST be zeroed before the
-                        // fill loop — only positions where a referenced
-                        // node lands get overwritten, and the resolve loop
-                        // depends on (lat==0 && lon==0) as the missing
-                        // sentinel. Without the zero, leftover bytes from
-                        // a previous bucket would silently look like real
-                        // resolved coordinates.
+                        // Correctness: the bitmap is reused across buckets
+                        // and MUST be zeroed before the fill loop so stale
+                        // presence bits don't mark an untouched slot as
+                        // resolved. The coord slice itself no longer needs
+                        // zeroing — the resolve loop keys off the bitmap,
+                        // so leftover bytes from a prior bucket in unset
+                        // slots are ignored.
                         let t_coord = std::time::Instant::now();
-                        let slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
+                        let _slice_bytes = bkt.local_range * COORD_SLOT_SIZE;
                         let t_zero = std::time::Instant::now();
-                        coord_slice[..slice_bytes].fill(0);
+                        let bitmap_words = bkt.local_range.div_ceil(64);
+                        presence_bitmap[..bitmap_words].fill(0);
                         #[allow(clippy::cast_possible_truncation)]
                         coord_zero_ms_ref.fetch_add(t_zero.elapsed().as_millis() as u64, Relaxed);
                         #[allow(clippy::cast_possible_truncation)]
@@ -491,6 +494,7 @@ pub(super) fn stage2_node_join(
                                 let off = local_rank * COORD_SLOT_SIZE;
                                 coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
                                 coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
+                                presence_bitmap[local_rank >> 6] |= 1u64 << (local_rank & 63);
                             }
                             debug_assert_eq!(
                                 next_rank, blob.ref_rank_end,
@@ -520,13 +524,22 @@ pub(super) fn stage2_node_join(
                             if start == end { continue; }
 
                             let co = local_rank * COORD_SLOT_SIZE;
-                            let lat = i32::from_le_bytes([
-                                coord_slice[co], coord_slice[co+1], coord_slice[co+2], coord_slice[co+3],
-                            ]);
-                            let lon = i32::from_le_bytes([
-                                coord_slice[co+4], coord_slice[co+5], coord_slice[co+6], coord_slice[co+7],
-                            ]);
-                            let is_resolved = lat != 0 || lon != 0;
+                            let is_resolved =
+                                (presence_bitmap[local_rank >> 6] >> (local_rank & 63)) & 1 != 0;
+                            let (lat, lon) = if is_resolved {
+                                (
+                                    i32::from_le_bytes([
+                                        coord_slice[co], coord_slice[co+1],
+                                        coord_slice[co+2], coord_slice[co+3],
+                                    ]),
+                                    i32::from_le_bytes([
+                                        coord_slice[co+4], coord_slice[co+5],
+                                        coord_slice[co+6], coord_slice[co+7],
+                                    ]),
+                                )
+                            } else {
+                                (0, 0)
+                            };
 
                             for &slot_pos in &bkt.grouped_slot_pos[start..end] {
                                 let entry = ResolvedEntry { slot_pos, lat, lon };

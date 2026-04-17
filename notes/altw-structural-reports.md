@@ -23,6 +23,7 @@ Do not re-propose these — they are in tree and are reflected in the baseline m
 - `PerWayRcs` lazy per-blob decode via blob-offset sidecar
 - `IdSetDense::rank_if_set()` fused get+rank in stage 2; the remaining opportunity is deleting per-node rank queries entirely, not re-proposing separate `get()+rank()` lookups
 - **Stage-2 de-ranking via blob-local rank counter** (`f1a4ada`, item #4 below) — stage 2 now calls `get(id)` and increments a per-blob counter seeded from `NodeBlobInfo.ref_rank_start`; `IdSetDense::drop_rank_index()` runs between stage 1 and stage 2. Europe wall `320.5 s → 308.0 s` (−3.9%), stage-3 peak anon `7.50 GB → 5.95 GB` (−1.55 GB), stage-2 peak anon `7.57 GB → 7.04 GB` (−530 MB); stage-2 wall itself flat (Europe stage 2 is pread/decompress-bound, not rank-walk-bound). Debug asserts guard monotonic tuple IDs and `next_rank == ref_rank_end`. Byte-identical vs dense/sparse on Denmark.
+- **Metadata-driven relation scan** (`6d71053`, item #9 layer 1 below) — external join now preads only relation blobs using the `blob_meta` table instead of running the generic `BlobReader::next()` sequential scan that reads every compressed blob payload. Europe `--bench 1` wall `308.0 s → 291.6 s` (−5.3%); `EXTJOIN_RELATION_SCAN` `13.65 s → 3.82 s` (−72%). Byte-identical vs dense/sparse on Denmark. The generic `collect_relation_member_node_ids` stays for the dense/sparse paths that don't have `blob_meta`.
 - Slot-bucket `ResolvedEntry` record shrunk 16 → 12 bytes (`fcd4fa2`) — −25% stage 2+3 scratch
 - Shared header-scan sidecar replacing three separate header-only passes (`f864b64f`) — saved ~56 s Europe wall
 - **`BlobLocationRouter` replaces `finalize_coord_payloads` consolidation + `CoordPayloadsReader`** (`e497e54`, item #8 below) — finalize phase `18.3 s → 0.163 s` at Europe, wall `333 s → 320.5 s`, byte-identical output
@@ -341,7 +342,9 @@ Building the routing table is a metadata pass over the existing per-worker manif
 
 ---
 
-### #9 — Pull relation-member collection forward into stage 1
+### #9 — Pull relation-member collection forward into stage 1 — **Layer 1 LANDED 2026-04-17 (commit `6d71053`)**
+
+**Landed-result (layer 1).** Europe `--bench 1` UUID `149f29ac`: `EXTJOIN_RELATION_SCAN` `13.65 s → 3.82 s` (−72%), total wall `308.0 s → 291.6 s` (−5.3%). The new `relation_scan::collect_relation_member_node_ids_indexed` filters `blob_meta` to `ElemKind::Relation` and preads only those byte ranges, using the same `read_exact_at` + `decompress_blob_raw` pattern stage 2 uses. Serial is fine — Europe has on the order of a few hundred relation blobs. Byte-identical vs dense/sparse on Denmark. Layer 2 (fold into stage 1 workers / concurrent scheduling) not implemented — the layer-1 win covers most of the theoretical payoff; defer layer 2 until profile shows relation scan still sitting as a serial gap.
 
 **Convergence: R4 B1, R5 medium.** Two reviewers independently flag the extra full-PBF pass as wasted serial time wedged between stage 3 and stage 4.
 
@@ -451,8 +454,8 @@ Consolidated from all six reports:
 
 1. ~~**#4** — stage-2 de-ranking.~~ **LANDED `f1a4ada` 2026-04-17.** Europe −3.9% wall, stage-3 peak anon −1.55 GB, stage-2 peak anon −530 MB. Measure planet when convenient; hypothesis is a larger wall win there since tuple count scales ~10×.
 2. ~~**#8** — `BlobLocationRouter` finalize deletion.~~ **LANDED `e497e54` 2026-04-16.**
-3. **#1 — promote epoch-spill.** The natural next step. Still the strongest structural seam deletion with real payoff, and the code already exists in `stage23_epoch.rs`. Delete + promote, not a write. Clean keep/revert candidate. R6 did not evaluate it because the prototype sat outside the mainline code read.
-4. **#9 in parallel** — pull relation-member collection forward into stage 1. Independent of #1/#3, small scope, can land any time. Two-review convergence remains enough for a clear keep candidate.
+3. ~~**#9 layer 1** — metadata-driven relation scan.~~ **LANDED `6d71053` 2026-04-17.** Europe −5.3% wall, relation scan −72%. Layer 2 (fold into stage 1 concurrency) deferred — the serial gap is now only 3.8 s on Europe, probably not worth the complexity.
+4. **#1 — promote epoch-spill.** Was described as "delete + promote" but `stage23_epoch.rs` was deleted in `3ae1052` (2026-04-15), so in practice this is resurrect-from-history + port to the current `BlobLocationRouter` and blob-local-rank-counter shapes + promote. Treat as a real rewrite. Clean keep/revert candidate if benched rigorously.
 5. **Then #3 — fuse stage 1A + 1B.** Under the 30 GB host constraint, discard all-RAM buffer/sweep forms. With #4 landed, the ID-bucketed emission variant becomes more attractive: the old "rank work migrates downstream" objection is gone because stage 2 no longer does per-node rank queries.
 6. **Then #2 — stream stage 3 → stage 4.** Largest remaining payoff, but the biggest rewrite; wants #1 landed first and bounded backpressure discipline from the start. #2 would conceptually replace #8's `BlobLocationRouter` with a streaming coordinator.
 7. **Then #5, #6, #7, #11** as appetite allows. #5 is the natural continuation of #1's fused path; #6 subsumes #5 at whole-pipeline scope (and R5 #1 + R1 #2 both land here); #7 is the hardest and most speculative; #11 only matters if dense stage-2 coord slices survive.

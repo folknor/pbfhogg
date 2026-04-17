@@ -14,6 +14,91 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (or add unconditional `*_ms` counters) to ground-truth the inferred per-phase breakdowns before committing to the order of landing items within a plan.
 
+## Split oversized source files (blocker for upcoming optimization work)
+
+Fifteen `.rs` files under `src/` are over 1000 lines. Two of them
+(`src/commands/extract.rs` at **3793 lines** and
+`src/geocode_index/builder.rs` at **1758 lines**) are the direct targets
+of plans above (build-geocode-index, extract smart/complete/simple
+optimizations). Splitting these two BEFORE diving into the next round
+of optimization work makes the diffs reviewable and the blast radius
+legible; trying to land `mallopt(M_ARENA_MAX, 2)` + parallel node/way
+split into a 1.8 K-line file is a recipe for merge pain and review
+fatigue.
+
+Rank-ordered by urgency (measured in total lines and proximity to
+active optimization plans):
+
+| Lines | File | Active plan proximity |
+|------:|------|------|
+| 3793 | `src/commands/extract.rs` | ✓ extract smart/complete (strong), multi-extract (recent) |
+| ~~1957~~ | ~~`src/commands/inspect.rs`~~ — split 2026-04-17, now `src/commands/inspect/` (7 files) | — |
+| 1758 | `src/geocode_index/builder.rs` | ✓ build-geocode-index (active plan) |
+| ~~1705~~ | ~~`src/commands/renumber_external.rs`~~ — split 2026-04-17, now `src/commands/renumber_external/` (6 files) | renumber regression (open investigation) |
+| 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
+| 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
+| 1506 | `src/osc.rs` | — |
+| 1376 | `src/read/blob.rs` | `seek_raw` fix lands here soon |
+| 1316 | `src/write/writer.rs` | write-path work |
+| 1295 | `src/commands/mod.rs` | — |
+| 1225 | `src/blob_index.rs` | — |
+| 1145 | `src/commands/altw/stage4.rs` | ALTW external (active plan proximity) |
+| 1136 | `src/commands/merge/rewrite.rs` | apply-changes (active plan proximity) |
+| 1110 | `src/commands/tags_filter.rs` | — |
+| 1084 | `src/geocode_index/reader.rs` | — |
+
+Priority ordering for the split work (don't try to batch the whole list
+at once - each split is a separate review surface):
+
+- [ ] **`src/commands/extract.rs` (3793 lines) - MUST split before next extract round.**
+  Natural seams: `extract.rs` dispatcher + types + `pub fn extract_multi`,
+  `extract/simple.rs` (`extract_simple` + `extract_simple_single_pass`
+  + `try_extract_multi_single_pass` + `multi_extract_pread_write{,_nodes}`),
+  `extract/complete.rs` (`extract_complete_ways` + related helpers),
+  `extract/smart.rs` (`extract_smart` + PASS1/PASS2/PASS3 + `collect_pass1_generic`),
+  `extract/common.rs` (BlobDesc, `build_blob_schedule_with_passthrough`,
+  `pread_execute`, `pread_write_pass*`, `write_consumer_item`,
+  `flush_local`, shared `ExtractStats` printer, `Region` / `BboxInt` / polygon
+  helpers). Shared instrumentation markers (`EXTRACT_SCAN_START`,
+  `EXTRACT_SCHEDULE_SCAN_*`) stay with the dispatcher or common module.
+- [ ] **`src/geocode_index/builder.rs` (1758 lines) - MUST split before build-geocode-index optimization.**
+  Natural seams: `builder/mod.rs` (entrypoint + `BuildConfig` + `BuildStats`),
+  `builder/pass1.rs` (relation metadata scan + admin rel collection),
+  `builder/pass1_5.rs` (referenced-node collection via `parallel_classify_accumulate`),
+  `builder/pass2.rs` (fused nodes + ways scan, way geometry / addr / interp writes),
+  `builder/pass3_fine.rs` + `builder/pass3_coarse.rs` (S2 cell aggregation),
+  `builder/admin.rs` (`assemble_admin_polygons`, `write_admin_index`),
+  `builder/interp.rs` (`resolve_interpolation_endpoints_mmap` and helpers),
+  `builder/strings.rs` (StringPool). The new KNOWN LIMITATION comments
+  should stay attached to the structs / resolve site they annotate.
+- [x] ~~**`src/commands/inspect.rs` (1957 lines)**~~ - **DONE 2026-04-17.**
+  Split into 7 files under `src/commands/inspect/` via general-purpose subagent:
+  `mod.rs` (14 lines, re-exports), `types.rs` (519, stats + `InspectReport`),
+  `scan.rs` (357, index-only + full-decode scan loops),
+  `report.rs` (547, human-readable output), `json.rs` (243, feature-gated
+  JSON output), `show_element.rs` (237, single-element lookup),
+  `format.rs` (81, pure formatters).
+- [x] ~~**`src/commands/renumber_external.rs` (1705 lines)**~~ - **DONE 2026-04-17.**
+  Split into 6 files under `src/commands/renumber_external/` via subagent:
+  `mod.rs` (318, entry + orchestration + `StageCounters`),
+  `schedule.rs` (79, `build_all_blob_schedules` + `BlobTask`),
+  `pass1.rs` (224, parallel node scan), `stage2.rs` (247, stage 2d way assembly),
+  `relations.rs` (300, fused R1 / R2d relation rewrite),
+  `wire_rewrite.rs` (595, protobuf wire-format ID rewriters for
+  DenseNodes / Ways / Relations).
+- [ ] **Remaining >1000 line files** - split opportunistically when the
+  next feature or optimization touches them. Don't mass-refactor; pay the
+  split cost as each file becomes hot.
+
+Splitting discipline:
+- One file per commit. Don't bundle multiple splits.
+- No behavior changes in a split commit - pure move + module wiring.
+- Preserve `#[cfg_attr(feature = "hotpath", hotpath::measure)]` / marker
+  / counter coverage verbatim. Instrumentation audits (like
+  `notes/seek-raw-audit.md`) assume the functions are findable by name.
+- Run `brokkr check` after each move to catch unused-import drift.
+- Update `notes/` cross-references if line numbers change substantially.
+
 ## Correctness concerns spotted while spelunking
 
 Surfaced during the optimization-plan reviews above. All six closed on 2026-04-17 - the silent-truncation ones with hard errors at the write site, the sentinel collisions with documentation (a real fix is a presence bitmap; not worth it until observed in production).

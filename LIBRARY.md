@@ -2,7 +2,7 @@
 
 Rust library for reading, writing, and transforming OpenStreetMap PBF files. Designed for planet-scale operations on normal hardware.
 
-Read 59 million elements in 0.31s (parallel) or 1.3s (pipelined, preserving file order). Write them back with pipelined compression in 6.3s. All encoding and decoding is hand-rolled wire-format protobuf — no external protobuf dependencies, no per-element allocation.
+Read 59 million elements in 0.31s (parallel) or 1.3s (pipelined, preserving file order). Write them back with pipelined compression in 6.3s. All encoding and decoding is hand-rolled wire-format protobuf - no external protobuf dependencies, no per-element allocation.
 
 Developed on Linux, untested elsewhere. Optional features for O_DIRECT and io_uring are Linux-only.
 
@@ -112,16 +112,16 @@ writer.flush()?;
 | Method | Order | Use case |
 |--------|-------|----------|
 | `for_each` | File order | Sequential processing, order-dependent consumers |
-| `for_each_pipelined` | File order | Fastest ordered read — parallel decompression overlapping I/O |
+| `for_each_pipelined` | File order | Fastest ordered read - parallel decompression overlapping I/O |
 | `for_each_block_pipelined` | File order | Consumers that need owned `PrimitiveBlock`s for parallel per-block processing |
-| `into_blocks_pipelined` | File order | Iterator interface — early exit, zipping two files |
+| `into_blocks_pipelined` | File order | Iterator interface - early exit, zipping two files |
 | `par_map_reduce` | Arbitrary | Aggregation (counts, statistics) where order doesn't matter |
 
 `for_each_pipelined` is the production hot path. It uses a 3-stage pipeline (I/O thread → rayon decode pool → reorder buffer) to overlap reading, decompression, and element processing while preserving file order.
 
 `for_each_block_pipelined` and `into_blocks_pipelined` deliver owned `PrimitiveBlock`s that can be sent to other threads, enabling overlapped I/O + decode + consumer parallelism. `into_blocks_pipelined` requires `R: 'static` (`ElementReader<FileReader>` satisfies this).
 
-`HeaderBuilder::from_header(&existing_header)` copies bbox and replication metadata from an existing PBF header — useful for transforms that preserve metadata.
+`HeaderBuilder::from_header(&existing_header)` copies bbox and replication metadata from an existing PBF header - useful for transforms that preserve metadata.
 
 ## Features
 
@@ -129,8 +129,8 @@ writer.flush()?;
 |---------|-------------|
 | `commands` (default) | Enables `check_refs`, `extract`, geocode index builder, and their deps (`roaring`, `serde_json`, `s2`) |
 | `geocode-reader` | Enables `geocode_index::Reader` for reverse geocoding queries (depends on `s2`). Included by `commands`. |
-| `linux-direct-io` | O_DIRECT read/write paths — bypasses page cache for planet-scale I/O |
-| `linux-io-uring` | io_uring writer with registered buffers — 20% faster writes above ~4 GB |
+| `linux-direct-io` | O_DIRECT read/write paths - bypasses page cache for planet-scale I/O |
+| `linux-io-uring` | io_uring writer with registered buffers - 20% faster writes above ~4 GB |
 
 ## Compression
 
@@ -140,7 +140,7 @@ writer.flush()?;
 |------|-------------|
 | `Compression::Zlib(level)` | Standard PBF compression (default level 6), compatible with all tools |
 | `Compression::Zstd(level)` | Better ratio and faster decompression than zlib |
-| `Compression::None` | No compression — fastest writes, ideal for erofs or intermediate files |
+| `Compression::None` | No compression - fastest writes, ideal for erofs or intermediate files |
 
 Zlib uses `zlib-rs` (pure Rust, no C compiler needed). With pipelined writes (`to_path`), compression is dispatched to rayon and all modes converge to the decode + serialization floor.
 

@@ -34,12 +34,12 @@ Requires Rust 1.87+. The binary is called `pbfhogg`.
 
 Most write commands accept:
 
-- `-o, --output <FILE>` — output file
-- `--compression <SPEC>` — `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
-- `--direct-io` — bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` — proceed without indexdata (slower)
-- `--generator <NAME>` — override writing program in output header
-- `--output-header <K=V>` — set replication metadata fields
+- `-o, --output <FILE>` - output file
+- `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
+- `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
+- `--force` - proceed without indexdata (slower)
+- `--generator <NAME>` - override writing program in output header
+- `--output-header <K=V>` - set replication metadata fields
 
 ## Indexdata
 
@@ -57,7 +57,7 @@ Benchmarked on Denmark (487 MB, 59M elements):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
-| inspect (indexed) | 0.036s | — | 109x vs full decode |
+| inspect (indexed) | 0.036s | - | 109x vs full decode |
 | sort (sorted, indexed) | 0.14s | 11.6s | 83x |
 | apply-changes (indexed) | 2.7s | 7.2s | 2.7x |
 | tags-filter | 0.24s | 0.56s | 2.3x |

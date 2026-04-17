@@ -6,7 +6,7 @@ Target: `pbfhogg check --refs` on planet. Current: 20m25s (1225 s) wall, 1.8 GB 
 
 Unlike ALTW and the geocode builder, this command is a much simpler optimization story. It is not a pipeline reshape. It is not a barrier-removal. It is **one wrong data structure**. The author of [`check_refs.rs`](../src/commands/check_refs.rs) profiled the command, wrote the diagnosis down in a comment, and then reached for the wrong container to fix it.
 
-From [check_refs.rs:76–80](../src/commands/check_refs.rs#L76):
+From [check_refs.rs:76-80](../src/commands/check_refs.rs#L76):
 
 > profiling shows check-refs is consumer-bound (main thread 100% CPU on `RoaringTreemap` insertions, decode workers idle at 1% CPU each). Faster parsing would not reduce wall time.
 
@@ -14,7 +14,7 @@ That is the complete diagnosis. Decompression is not the bottleneck. Parsing is 
 
 The fix is ~30 lines of diff: swap the three `RoaringTreemap`s for three `IdSetDense`. This is the codebase's own purpose-built dense-monotonic-ID set, used by renumber, ALTW, extract, tags_filter, and geocode_index. It is ~10× faster per op and has the same or slightly lower RSS. Parallelization (phase #2 below) is a secondary win that only becomes worth doing *after* the data-structure swap flips the profile.
 
-Target after this plan: **~6–10 min at planet, RSS ~1.5–2 GB.**
+Target after this plan: **~6-10 min at planet, RSS ~1.5-2 GB.**
 
 ## Yardstick
 
@@ -25,7 +25,7 @@ Workload at planet:
 | node_id inserts (monotonic) | ~10 B | ~70 ns | ~700 s |
 | way_id inserts (monotonic) | ~1 B | ~70 ns | ~70 s |
 | relation_id inserts (monotonic) | ~17 M | ~70 ns | ~1 s |
-| way-ref contains (random) | ~4–6 B | ~40 ns | ~200 s |
+| way-ref contains (random) | ~4-6 B | ~40 ns | ~200 s |
 | relation-member contains (random) | ~100 M | ~40 ns | ~4 s |
 | Sum of consumer work | | | ~975 s |
 
@@ -33,7 +33,7 @@ That is ~16 min of the 21 min wall, matching the "100% CPU on treemap insertions
 
 ## Current architecture
 
-Sequential single-threaded loop at [check_refs.rs:152–244](../src/commands/check_refs.rs#L152). For each `OsmData` blob:
+Sequential single-threaded loop at [check_refs.rs:152-244](../src/commands/check_refs.rs#L152). For each `OsmData` blob:
 
 1. Pread the blob frame (sequential `BlobReader::next()`).
 2. Decompress into a reused `Vec<u8>`.
@@ -46,7 +46,7 @@ Sequential single-threaded loop at [check_refs.rs:152–244](../src/commands/che
 
 Missing-ref sets (`missing_node_refs_set`, `missing_way_refs_set`, `missing_node_members_set`) are also `RoaringTreemap`s, used solely to deduplicate missing IDs to match osmium's "441 unique missing nodes" semantics.
 
-Sequential reader comment at [check_refs.rs:107–111](../src/commands/check_refs.rs#L107):
+Sequential reader comment at [check_refs.rs:107-111](../src/commands/check_refs.rs#L107):
 
 > Sequential reader to avoid `PrimitiveBlock` cross-thread alloc/free retention (25+ GB at Europe/planet scale). check-refs does lightweight per-element work (`RoaringTreemap` inserts) — the pipelined reader's parallel decode creates cross-thread churn that dominates at scale.
 
@@ -54,7 +54,7 @@ Same glibc arena fragmentation issue described in Pass 2 of the geocode builder.
 
 ## Central observation
 
-The RSS justification at [check_refs.rs:82–102](../src/commands/check_refs.rs#L82) compares `RoaringTreemap` against `HashSet<i64>`:
+The RSS justification at [check_refs.rs:82-102](../src/commands/check_refs.rs#L82) compares `RoaringTreemap` against `HashSet<i64>`:
 
 > - `HashSet<i64>`: ~400 GB (infeasible)
 > - `RoaringTreemap`: ~2-3 GB (fits comfortably on any server)
@@ -67,7 +67,7 @@ The baseline is a strawman. The codebase's native structure for exactly this wor
 | `RoaringTreemap` | ~2 GB | ~70 ns | ~40 ns |
 | `IdSetDense` (pre-allocated to `MAX_NODE_ID`) | ~1.6 GB | ~5 ns | ~5 ns |
 
-`IdSetDense` is strictly smaller *and* strictly faster for this workload. It's a 4 MB-chunked bitmap — `set(id)` is chunk-index + byte-offset + bitmask OR (~3–5 instructions, one cache line touched). `get(id)` is the same shape. No tree walk, no hash, no run-length decode.
+`IdSetDense` is strictly smaller *and* strictly faster for this workload. It's a 4 MB-chunked bitmap — `set(id)` is chunk-index + byte-offset + bitmask OR (~3-5 instructions, one cache line touched). `get(id)` is the same shape. No tree walk, no hash, no run-length decode.
 
 check_refs needs only membership, never rank, so `build_rank_index()` is not called. The cheap path throughout.
 
@@ -98,9 +98,9 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 
 **Missing-ref sets** (`missing_node_refs_set`, `missing_way_refs_set`, `missing_node_members_set`) are `RoaringTreemap`s used only to deduplicate missing IDs for the final count. At planet these are typically a few thousand to a few million IDs. Replace with `Vec<i64>` + `sort_unstable` + `dedup` at the end. Simpler, faster for small sets, and easier to concat-merge across workers in phase #2.
 
-**Expected wall**: from 20m25s to roughly **10–13 min**. The consumer loop stops being the bottleneck; whatever surfaces next (blob I/O + decompression + `PrimitiveBlock` construction, all still on one thread) becomes the new limit.
+**Expected wall**: from 20m25s to roughly **10-13 min**. The consumer loop stops being the bottleneck; whatever surfaces next (blob I/O + decompression + `PrimitiveBlock` construction, all still on one thread) becomes the new limit.
 
-**Expected RSS**: ~same or slightly lower (1.5–1.8 GB). Pre-allocating to `MAX_NODE_ID` allocates all ~400 chunks up front (~1.6 GB), versus `RoaringTreemap` growing as containers fill. Peak is comparable.
+**Expected RSS**: ~same or slightly lower (1.5-1.8 GB). Pre-allocating to `MAX_NODE_ID` allocates all ~400 chunks up front (~1.6 GB), versus `RoaringTreemap` growing as containers fill. Peak is comparable.
 
 ### #2 — Parallelize as a three-phase renumber-shaped scan
 
@@ -108,7 +108,7 @@ Once #1 lands, the profile flips. `IdSetDense::set_atomic` is essentially free (
 
 The structure maps cleanly onto `renumber_external`'s three-phase shape, because check_refs's phases have the same dependencies renumber's do: each type's ID set must be fully built before the *next* type's ref-checks against it can run.
 
-**Prelude**: `mallopt(M_ARENA_MAX, 2)` at function entry ([renumber_external.rs:95–98](../src/commands/renumber_external.rs#L95)). Prevents the glibc arena retention the current code's comment calls out. Two lines.
+**Prelude**: `mallopt(M_ARENA_MAX, 2)` at function entry ([renumber_external.rs:95-98](../src/commands/renumber_external.rs#L95)). Prevents the glibc arena retention the current code's comment calls out. Two lines.
 
 **Phase 1 — node scan.** Pattern: [`pass1_parallel_scan`](../src/commands/renumber_external.rs#L615). Work-stealing dispatch over node blobs (schedule from [`build_classify_schedule`](../src/commands/mod.rs#L429) filtered to `ElemKind::Node`). Each worker: pread → decompress → `PrimitiveBlock` → walk DenseNode IDs → `node_ids.set_atomic(id)`. No contains checks yet. `node_ids` is the single shared pre-allocated `IdSetDense`.
 
@@ -120,11 +120,11 @@ The structure maps cleanly onto `renumber_external`'s three-phase shape, because
 
 **Merging missing-ref vecs**: concatenate per-worker `Vec<i64>`s, `sort_unstable`, `dedup`, take `len()` for the unique-missing count. If `show_ids`, concatenate per-worker `Vec<MissingRef>`s in worker order; the output order no longer matches file order, but the current contract doesn't promise file order (deferred relation-relation refs are already resolved out-of-order in the post-pass).
 
-**Expected wall**: another 2–4 min saved. Target end state: **~6–10 min** at planet, primarily decompression-bound.
+**Expected wall**: another 2-4 min saved. Target end state: **~6-10 min** at planet, primarily decompression-bound.
 
 ### #3 — Selective wire-format parser (conditional on #1 + #2)
 
-The comment at [check_refs.rs:69–80](../src/commands/check_refs.rs#L69) explicitly rejects this:
+The comment at [check_refs.rs:69-80](../src/commands/check_refs.rs#L69) explicitly rejects this:
 
 > A pure "ID-only scan mode" that skips refs/members would not work here. A selective parse that skips stringtable, tags, coordinates, and metadata but keeps IDs + refs + members was considered but is **not worth it**: profiling shows check-refs is consumer-bound …
 
@@ -169,17 +169,17 @@ At phase-3 peak (the heaviest — all three ID sets live, plus per-worker scratc
 | Per-worker read + decompress buffers × 6 | ~300 MB |
 | Per-worker missing-ref `Vec<i64>` × 6 (typical case: small) | <50 MB |
 | Per-worker deferred relation-relation vecs (Phase 3 only) | <100 MB |
-| **Total** | **~2.1–2.3 GB** |
+| **Total** | **~2.1-2.3 GB** |
 
 Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelization is still trivial).
 
-**Why this plan's sizing is robust where altw-as-renumber's was not.** `IdSetDense` pre-allocated to `MAX_NODE_ID` is a fixed 1.6 GB regardless of how many IDs are actually set; it does not scale with the unique-referenced count. The [altw-as-renumber](altw-as-renumber.md) reshape (attempted 2026-04-16) OOM'd on Europe because its `coord_table` scaled as `unique_referenced × 8 bytes` and the real count was ~4–5× the estimate. check-refs avoids that failure mode by construction: the bitmap size is bounded by the ID space, not the population, and the ID space is a global OSM constant.
+**Why this plan's sizing is robust where altw-as-renumber's was not.** `IdSetDense` pre-allocated to `MAX_NODE_ID` is a fixed 1.6 GB regardless of how many IDs are actually set; it does not scale with the unique-referenced count. The [altw-as-renumber](altw-as-renumber.md) reshape (attempted 2026-04-16) OOM'd on Europe because its `coord_table` scaled as `unique_referenced × 8 bytes` and the real count was ~4-5× the estimate. check-refs avoids that failure mode by construction: the bitmap size is bounded by the ID space, not the population, and the ID space is a global OSM constant.
 
 ## Plan of attack
 
 1. **Add per-phase `_ms` counters** unconditionally (not `cfg(feature = "hotpath")`). Measure current planet to fix the 20m25s baseline, then re-measure after each step. Each step's proof is "wall went down and result is identical."
 2. **Land #1 alone first** — `RoaringTreemap` → `IdSetDense` + missing-refs vec-and-dedup. ~30 lines of diff. This is most of the win. Cross-validate against current `main` on Denmark, Europe, planet — `RefCheckResult` fields should be identical (node_count, way_count, all four missing counts) plus identical `missing_refs` vec contents (sort both sides before comparing if order matters).
-3. **Land #2** — `mallopt` + three-phase parallel scan. Confirm no RSS regression on planet (expect +300–500 MB from per-worker scratch). Re-measure wall.
+3. **Land #2** — `mallopt` + three-phase parallel scan. Confirm no RSS regression on planet (expect +300-500 MB from per-worker scratch). Re-measure wall.
 4. **Measure post-#2 breakdown**. If decompression dominates, stop — #3 would not help. If `PrimitiveBlock` construction is a significant share, land #3.
 
 ## Correctness invariants
@@ -187,12 +187,12 @@ Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelizati
 - **Dedup semantics.** The command reports *unique missing IDs* ("441 nodes missing" = 441 distinct IDs that don't exist). Preserved by vec-sort-dedup at end, same cardinality as the current `RoaringTreemap::len()`.
 - **Deferred relation-relation refs.** Sorted PBF does not guarantee relations are referenced only after their definition; forward references exist. The post-pass check after `relation_ids` is fully built is the correct shape; preserve it across parallelization by merging per-worker deferred vecs before the check.
 - **`MissingRef` output order.** Currently produced in PBF blob order within a single pass, but the deferred relation-relation refs are already appended out-of-order by the post-pass. So callers cannot rely on full file-order. Phase #2's per-worker concatenation preserves that contract — the order within each worker's block is PBF order; across workers is undefined, same as the existing deferred tail.
-- **`check_relations = false` skip.** `skip_field(relation_kind)` at [check_refs.rs:157–162](../src/commands/check_refs.rs#L157). Preserved by simply not running Phase 3 when the flag is false, and by filtering the relation blob schedule appropriately.
-- **Negative-ID handling.** Current code uses `id.cast_unsigned()` because `RoaringTreemap` is `u64`. `IdSetDense::set` takes `i64` and rejects negative IDs silently via the `if id < 0 { return; }` guard (see id_set_dense.rs:45). Production planet files never contain negative IDs (comment at [check_refs.rs:94–98](../src/commands/check_refs.rs#L94)); JOSM-local negative IDs are out of scope. If negative-ID support is required, `IdSetDense` would need extension — but this is a non-goal for check-refs against official planet dumps.
+- **`check_relations = false` skip.** `skip_field(relation_kind)` at [check_refs.rs:157-162](../src/commands/check_refs.rs#L157). Preserved by simply not running Phase 3 when the flag is false, and by filtering the relation blob schedule appropriately.
+- **Negative-ID handling.** Current code uses `id.cast_unsigned()` because `RoaringTreemap` is `u64`. `IdSetDense::set` takes `i64` and rejects negative IDs silently via the `if id < 0 { return; }` guard (see id_set_dense.rs:45). Production planet files never contain negative IDs (comment at [check_refs.rs:94-98](../src/commands/check_refs.rs#L94)); JOSM-local negative IDs are out of scope. If negative-ID support is required, `IdSetDense` would need extension — but this is a non-goal for check-refs against official planet dumps.
 
 ## Open questions
 
 - **Exactly how much wall time does #1 alone save?** My estimate (~10 min) is based on a per-op cost model. Actual speedup depends on where the `RoaringTreemap` ops land in the cache hierarchy — `IdSetDense` at 1.6 GB doesn't fit in L3, so every contains is an L3 miss at minimum. This is still much cheaper than a tree walk, but the absolute numbers want verification.
-- **Does `pre_allocate(14_000_000_000)` cost visibly at startup?** That's a ~1.6 GB contiguous memset on Phase-1 entry. At ~10 GB/s DDR bandwidth, ~160 ms. Negligible against a 6–10 min wall, but worth noting.
+- **Does `pre_allocate(14_000_000_000)` cost visibly at startup?** That's a ~1.6 GB contiguous memset on Phase-1 entry. At ~10 GB/s DDR bandwidth, ~160 ms. Negligible against a 6-10 min wall, but worth noting.
 - **Is phase #3's decompression genuinely faster than phase #2's?** Relation blobs are a tiny fraction of total bytes. Phase 3 might complete in seconds regardless; if so, the end-of-pipeline tail is dominated by the post-pass merge, not relation decode. Neutral either way.
 - **Do we gain anything by fusing phase 2 and phase 3?** The dependency chain says way_ids must be built before relation-ref-to-way checks. But relation member checks are deferred to the post-pass anyway for relation-relation refs, and the node/way checks are small. Could collapse phase 2 and phase 3 into one parallel scan that reads both kinds of blobs and relies on the sorted-PBF ordering for the dependency. Not critical; leave as two phases for clarity.

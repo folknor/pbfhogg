@@ -97,7 +97,7 @@ So this plan treats the write path as two related rails:
 
 - `io_uring` already has a measured crossover for merge-like workloads:
   [reference/performance.md](../reference/performance.md) records that it
-  starts to pay around `4–5 GB` input and shows a clear North America win
+  starts to pay around `4-5 GB` input and shows a clear North America win
 - `zstd` is already a proven internal-pipeline lever when interop does not
   matter
 - the repo already rejected at least one naive writer-memory idea:
@@ -1098,7 +1098,7 @@ Why here:
 
 These came out of the same fresh code read and are worth recording so
 they are not rediscovered from scratch. None should be pursued until
-the measured backlog (items 0–6) has surfaced concrete signal that one
+the measured backlog (items 0-6) has surfaced concrete signal that one
 of them could address — and none should be confused with the
 **measured and shelved** list earlier in this note, which represents
 work that has already been tried.
@@ -1176,7 +1176,7 @@ sequencing.
 That keeps the next cycle from degenerating into another expensive
 command-specific bench hunt.
 
-Items `2b`, `5b`, `7`–`11` and the *Hypotheticals not yet measured*
+Items `2b`, `5b`, `7`-`11` and the *Hypotheticals not yet measured*
 bullet list all remain parked behind item 0. They represent expansion
 of the backlog from a fresh code read, not a reordering of the measured
 work above — none of them should jump into the sprint without item 0

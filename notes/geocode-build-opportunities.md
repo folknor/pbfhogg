@@ -4,7 +4,7 @@ Target: `pbfhogg build-geocode-index` on planet. Current: 20m55s (1255 s) wall, 
 
 ## Thesis
 
-Unlike ALTW, the geocode builder is **structurally well-shaped**. There is no external sort, no redundant decompression loop, no staged disk seam chain. The problem is narrower: **Pass 2 is single-threaded on purpose, and it is doing most of the work**. The documented reason for that choice is a glibc arena retention issue, and the fix for that issue is already in the codebase — in [`renumber_external.rs:95–98`](../src/commands/renumber_external.rs#L95).
+Unlike ALTW, the geocode builder is **structurally well-shaped**. There is no external sort, no redundant decompression loop, no staged disk seam chain. The problem is narrower: **Pass 2 is single-threaded on purpose, and it is doing most of the work**. The documented reason for that choice is a glibc arena retention issue, and the fix for that issue is already in the codebase — in [`renumber_external.rs:95-98`](../src/commands/renumber_external.rs#L95).
 
 One `mallopt(M_ARENA_MAX, 2)` call unlocks Pass 2 parallelization. That is the headline change. Secondary wins live in Pass 1.5 (over-decoding), Pass 3 stage B (sequential bucket merge), and fine/coarse level duplication.
 
@@ -23,7 +23,7 @@ No internal API needs rewriting. `IdSetDense`, `PrimitiveBlock`, `parallel_class
 
 Breakdown ground-truthed by sidecar markers (`1c708509`). Pass 2 still holds ~70 % of wall and is the headline target. Pass 1.5 is now the **memory** target — its peak is what governs whether the build fits on a 30 GB host without swap.
 
-Target after this plan: **~10–12 min wall at planet, RSS reduced from 29.5 GB Pass 1.5 peak to <16 GB.**
+Target after this plan: **~10-12 min wall at planet, RSS reduced from 29.5 GB Pass 1.5 peak to <16 GB.**
 
 ## Current architecture (for reference)
 
@@ -35,7 +35,7 @@ Target after this plan: **~10–12 min wall at planet, RSS reduced from 29.5 GB 
 - For each dense node: if `referenced_nodes.get(id)`, write `(lat, lon)` to `coord_mmap[rank*8 ..]` using `rank(id)`. If the node has addr tags, emit an `AddrPoint` to `addr_points.bin`.
 - For each way: classify by tags (highway / building / addr:interpolation / `needed_admin_ways`), resolve coords via `referenced_nodes.rank()` lookups into `coord_mmap`, emit to `street_ways.bin` / `street_nodes.bin` / `addr_points.bin` (building centroids) / `interp_nodes.bin` / `way_geom` hashmap (admin).
 
-The comment at [builder.rs:606–611](../src/geocode_index/builder.rs#L606) explains the sequential choice: glibc arena retention when `PrimitiveBlock` `Vec`s cross thread boundaries grows heap to 25+ GB at planet scale.
+The comment at [builder.rs:606-611](../src/geocode_index/builder.rs#L606) explains the sequential choice: glibc arena retention when `PrimitiveBlock` `Vec`s cross thread boundaries grows heap to 25+ GB at planet scale.
 
 **Pass 3** [(builder.rs:725)](../src/geocode_index/builder.rs#L725). [`bucketed_cell_assignment`](../src/geocode_index/builder.rs#L1262) runs twice (fine level 17, coarse level 14). Each run:
 - **Stage A**: rayon-parallel `cover_segment` over streets (chunked via `STREET_CHUNK = 100_000`); sequential loops for addr points and interpolation; single-threaded distribute-to-bucket-files step.
@@ -45,7 +45,7 @@ Then admin cells via [`assign_admin_cells`](../src/geocode_index/builder.rs#L150
 
 ## Central observation
 
-[`renumber_external.rs:95–98`](../src/commands/renumber_external.rs#L95) shows the two-line fix for exactly the problem Pass 2 avoids by going sequential:
+[`renumber_external.rs:95-98`](../src/commands/renumber_external.rs#L95) shows the two-line fix for exactly the problem Pass 2 avoids by going sequential:
 
 ```rust
 #[cfg(target_os = "linux")]
@@ -54,7 +54,7 @@ unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }
 
 Documented in-place: without it, renumber's cross-thread `OwnedBlock` Vec traffic grows to ~26 GB anon on planet. With it, under 1 GB. Scoped to the command, other pbfhogg paths unaffected.
 
-Pass 2's choice at [builder.rs:606–611](../src/geocode_index/builder.rs#L606) describes the same arena fragmentation phenomenon and picks the wrong remedy. The sequential decode bound was never a correctness constraint — it was an RSS constraint, and renumber's `mallopt` answers it directly.
+Pass 2's choice at [builder.rs:606-611](../src/geocode_index/builder.rs#L606) describes the same arena fragmentation phenomenon and picks the wrong remedy. The sequential decode bound was never a correctness constraint — it was an RSS constraint, and renumber's `mallopt` answers it directly.
 
 **With `M_ARENA_MAX = 2` set, Pass 2 can be parallelized exactly like renumber's pass 1.**
 
@@ -97,7 +97,7 @@ The `tags_filter` / `tags_filter_osc` commands already use this byte-match patte
 
 Feed `parallel_classify_accumulate` with a variant worker that runs the wire-format scanner instead of building a `PrimitiveBlock`. Alternatively, accept that the decode is part of the worker state and switch to a targeted pread + decompress loop in `parallel_classify_accumulate`'s shape.
 
-**Expected win: ~50–100 s at planet.** Also frees residency during Pass 1.5.
+**Expected win: ~50-100 s at planet.** Also frees residency during Pass 1.5.
 
 ### #3 — Parallelize Pass 3 stage B
 
@@ -107,7 +107,7 @@ Parallelize with rayon:
 - Each bucket task: `read(bucket_path)` → parse → sort by `cell_id` → group → emit per-type streams into **per-bucket tmp output files** (`cells.{i:03}`, `street_entries.{i:03}`, `addr_entries.{i:03}`, `interp_entries.{i:03}`).
 - After join: sequential concatenation of the 256 per-bucket tmp files per stream into the final output files. `geo_cells.bin` records contain byte offsets into the entry streams — during concatenation, add the running prefix offset (across buckets) to each record's `street_offset` / `addr_offset` / `interp_offset` before writing. Same pattern as Phase 2b file concatenation.
 
-**Expected win: ~40–80 s at planet.** No correctness ambiguity — ordering preserved by construction.
+**Expected win: ~40-80 s at planet.** No correctness ambiguity — ordering preserved by construction.
 
 ### #4 — Fuse fine + coarse cell computation
 
@@ -116,29 +116,29 @@ Parallelize with rayon:
 A level-14 S2 cell is the unique parent of its level-17 children (the two levels differ by 3 cell-ID bits). If `cover_segment` at level 17 produces cell set `S17`, the correct level-14 cover is `{ parent(c) : c ∈ S17 }` deduplicated — `cover_segment` at a coarser level can only find cells already hit (as parents) by a finer-level cover.
 
 Restructure Pass 3 to **one fused parallel pass**:
-- rayon flat_map over segments emits both `(cell_17, way_idx, seg_idx)` and, for each distinct parent of those level-17 cells, `(parent_cell_14, way_idx, seg_idx)`. Per-segment dedup of parents via a small stack set (segments usually touch 1–4 level-17 cells ⇒ 1–2 distinct parents).
+- rayon flat_map over segments emits both `(cell_17, way_idx, seg_idx)` and, for each distinct parent of those level-17 cells, `(parent_cell_14, way_idx, seg_idx)`. Per-segment dedup of parents via a small stack set (segments usually touch 1-4 level-17 cells ⇒ 1-2 distinct parents).
 - Distribute to two separate bucket trees: `.buckets-level17/` and `.buckets-level14/`.
 - Stage B (parallelized per #3) runs on both tree sets independently; reuse the same worker pool.
 
-**Expected win: ~40–60 s at planet.** Halves the Stage A `cover_segment` workload.
+**Expected win: ~40-60 s at planet.** Halves the Stage A `cover_segment` workload.
 
 ### #5 — Parallelize addr-point and interpolation cell assignment
 
-[builder.rs:1330–1344](../src/geocode_index/builder.rs#L1330) (addr points) and [builder.rs:1347–1368](../src/geocode_index/builder.rs#L1347) (interpolation) are sequential loops over per-entry work that is trivially independent. `.into_par_iter().flat_map_iter(...)` + bucket distribute, same shape as streets. At planet, ~20 M addr points and smaller interp count.
+[builder.rs:1330-1344](../src/geocode_index/builder.rs#L1330) (addr points) and [builder.rs:1347-1368](../src/geocode_index/builder.rs#L1347) (interpolation) are sequential loops over per-entry work that is trivially independent. `.into_par_iter().flat_map_iter(...)` + bucket distribute, same shape as streets. At planet, ~20 M addr points and smaller interp count.
 
-**Expected win: 20–60 s at planet.** Straightforward.
+**Expected win: 20-60 s at planet.** Straightforward.
 
 ### #6 — Parallelize admin cell flood-fill
 
 [`assign_admin_cells`](../src/geocode_index/builder.rs#L1509) iterates polygons sequentially, running a full BFS per polygon. Per-polygon work is independent. `polygons.par_iter().flat_map(...)`, merge into a single `Vec<AdminCellEntry>` at end. Work is uneven (large countries at admin level 10 dominate), but rayon work-stealing handles that.
 
-**Expected win: 20–60 s at planet.**
+**Expected win: 20-60 s at planet.**
 
 ### #7 — Shared atomic IdSetDense in Pass 1.5
 
 Pass 1.5 currently uses **per-worker `IdSetDense` accumulation** — each worker holds up to ~1 GB of bitmap chunks during the phase, ~5 GB transient across 6 workers, then merges into a single ~1.5 GB `referenced_nodes`.
 
-Switch to the pattern renumber uses at [renumber_external.rs:166–179](../src/commands/renumber_external.rs#L166): one shared pre-allocated `IdSetDense`, populated concurrently via `set_atomic`. Drops the per-worker residency entirely.
+Switch to the pattern renumber uses at [renumber_external.rs:166-179](../src/commands/renumber_external.rs#L166): one shared pre-allocated `IdSetDense`, populated concurrently via `set_atomic`. Drops the per-worker residency entirely.
 
 **Expected win: not wall; large transient RSS during Pass 1.5.** Originally framed as "~5 GB transient" against a believed-14.59 GB whole-build peak. With brokkr now reporting short-emitting phases, the true Pass 1.5 peak on planet is **29.5 GB** — this item is **load-bearing for 30 GB hosts**, not optional.
 
@@ -150,7 +150,7 @@ Switch to the pattern renumber uses at [renumber_external.rs:166–179](../src/c
 
 A CSR-style layout (one contiguous offsets array + one contiguous values array, sorted by cell_id, binary-search lookup) would roughly halve the peak. The structure is short-lived (built during resolution, dropped immediately after), so this is peak-heap reduction, not throughput.
 
-**Peak heap during this phase: ~2.5 GB. The transient index is the largest contributor.** Not on the wall-time critical path; keep as a follow-up once #1–#4 land.
+**Peak heap during this phase: ~2.5 GB. The transient index is the largest contributor.** Not on the wall-time critical path; keep as a follow-up once #1-#4 land.
 
 ## What to leave alone
 
@@ -183,6 +183,6 @@ Cross-validation: there's no `brokkr verify` for the geocode index. Byte-for-byt
 
 ## Open questions
 
-- **Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.** Renumber demonstrates this fits comfortably in renumber's 3.3 GB peak. Geocode has an additional ~16 GB `coord_mmap` live across Phase 2a/2b and a `way_geom` hashmap that grows through Phase 2b. Expect peak ~18–20 GB during Phase 2b — still under 30 GB with margin, but **measure `referenced_count` on Europe first** before assuming this holds at planet. The ALTW-as-renumber reshape (2026-04-16) assumed a similar sizing for *unfiltered* referenced nodes and OOM'd at Europe because the real count was 4–5× the estimate. Geocode's filter keeps its count smaller, but the same measurement discipline applies.
+- **Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.** Renumber demonstrates this fits comfortably in renumber's 3.3 GB peak. Geocode has an additional ~16 GB `coord_mmap` live across Phase 2a/2b and a `way_geom` hashmap that grows through Phase 2b. Expect peak ~18-20 GB during Phase 2b — still under 30 GB with margin, but **measure `referenced_count` on Europe first** before assuming this holds at planet. The ALTW-as-renumber reshape (2026-04-16) assumed a similar sizing for *unfiltered* referenced nodes and OOM'd at Europe because the real count was 4-5× the estimate. Geocode's filter keeps its count smaller, but the same measurement discipline applies.
 - **Is the admin-level flood-fill cost uneven enough to matter?** If one polygon (e.g., Russia at admin level 10) dominates, `par_iter` gives only ~2× speedup in practice. If it's measurable and binding, split large-polygon flood-fill into cell-stripe sub-tasks. Leave this decision until after measurement.
 - **StringPool merge order determinism.** For byte-for-byte cross-validation of the output against the sequential build, worker-local pool merge order must be deterministic (e.g. worker 0's strings before worker 1's before …). This is a merge-phase detail; specify it up front.

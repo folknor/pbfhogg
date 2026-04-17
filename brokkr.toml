@@ -3,7 +3,7 @@ project = "pbfhogg"
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.
 # Unknown hostnames fall back to defaults: data="data", scratch="data/scratch".
-# Datasets are scoped per host — each machine lists only the datasets it has.
+# Datasets are scoped per host - each machine lists only the datasets it has.
 # ---------------------------------------------------------------------------
 
 [plantasjen]

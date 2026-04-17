@@ -4,7 +4,7 @@
 
 In a Sort.Type_then_ID PBF, ways are sorted by OSM way ID. Way IDs
 are assigned **chronologically** (sequential at creation time), not
-geographically. A blob containing ways 100,000,000–100,008,000 has
+geographically. A blob containing ways 100,000,000-100,008,000 has
 ways created within a few-hour window by mappers worldwide.
 
 **Consequence:** way blob bboxes would typically span large areas —

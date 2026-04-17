@@ -20,7 +20,7 @@ instead of a single packed blob, all values in that field are silently dropped. 
 tag fields (`keys`/`vals`), this means tags are lost. For `refs`, way node references
 are lost. For dense node coordinate fields, nodes get zero coordinates.
 
-**Why not fix:** Supporting non-packed encoding adds overhead to the read hot path —
+**Why not fix:** Supporting non-packed encoding adds overhead to the read hot path -
 the most performance-critical code in the library. Every approach requires either
 heap allocation per element, a branch per iterator `.next()` call, or a fallback
 re-parse. The current parser processes 59M elements in 0.31s (parallel) / 1.3s
@@ -36,19 +36,19 @@ for years before anyone noticed.
 **Fix approach (if ever needed):** For each packed repeated field, add an alternative
 match arm for `WIRE_VARINT` that reads a single value. Length-delimited repeated fields
 (like string table entries) already work since non-packed and packed use the same wire
-type — the fix is only needed for numeric repeated fields (varint, sint32, sint64, etc).
-Multiple non-packed entries for the same field should accumulate, not overwrite — repeated
+type - the fix is only needed for numeric repeated fields (varint, sint32, sint64, etc).
+Multiple non-packed entries for the same field should accumulate, not overwrite - repeated
 varint fields need to append to a buffer rather than storing a single slice. libosmium's
 fix (PR #400) handles only the single-value case; a general fix should handle multiple
 non-packed entries. The key performance question is whether checking both wire types in the
 hot path is acceptable, or whether a fallback re-parse on finding nothing is better.
 
 **Affected parsers:**
-- `WireNode::parse()` — fields 2 (keys), 3 (vals)
-- `WireWay::parse()` — fields 2 (keys), 3 (vals), 8 (refs), 9 (lats), 10 (lons)
-- `WireRelation::parse()` — fields 2 (keys), 3 (vals), 8 (roles_sid), 9 (memids), 10 (types)
-- `WireDenseNodes::parse()` — fields 1 (ids), 8 (lats), 9 (lons), 10 (keys_vals)
-- `WireDenseInfo::parse()` — fields 1 (versions), 2 (timestamps), 3 (changesets), 4 (uids), 5 (user_sids), 6 (visibles)
+- `WireNode::parse()` - fields 2 (keys), 3 (vals)
+- `WireWay::parse()` - fields 2 (keys), 3 (vals), 8 (refs), 9 (lats), 10 (lons)
+- `WireRelation::parse()` - fields 2 (keys), 3 (vals), 8 (roles_sid), 9 (memids), 10 (types)
+- `WireDenseNodes::parse()` - fields 1 (ids), 8 (lats), 9 (lons), 10 (keys_vals)
+- `WireDenseInfo::parse()` - fields 1 (versions), 2 (timestamps), 3 (changesets), 4 (uids), 5 (user_sids), 6 (visibles)
 
 ## Osmosis -1 sentinel for absent metadata
 
@@ -58,20 +58,20 @@ hot path is acceptable, or whether a fallback re-parse on finding nothing is bet
 ([libosmium#247](https://github.com/osmcode/libosmium/issues/247)). The protobuf
 default for these fields is 0, but Osmosis explicitly encodes -1 as a sentinel
 meaning "no data." Without normalization, pbfhogg round-trips `-1` as a real version
-number, which is semantically wrong — downstream tools may interpret it as a genuine
+number, which is semantically wrong - downstream tools may interpret it as a genuine
 historical version.
 
-**Fix strategy — two-tier normalization:**
+**Fix strategy - two-tier normalization:**
 
 1. **Non-dense elements (Node, Way, Relation):** Normalized at parse time in
    `WireInfo::parse` (`src/read/wire.rs`). After the field loop, `version == Some(-1)`
    and `changeset == Some(-1)` are mapped to `None`. This covers both the library API
-   and all command paths with zero additional overhead — the parse loop is already
+   and all command paths with zero additional overhead - the parse loop is already
    branchy, and two comparisons on values in registers are invisible.
 
 2. **Dense nodes:** Normalized at write/conversion boundaries only. `DenseNodeInfo`
    stores `version: i32` and `changeset: i64` as plain non-optional values decoded
-   from packed arrays in the dense node iterator — the tightest loop in the library
+   from packed arrays in the dense node iterator - the tightest loop in the library
    (~8 billion iterations for planet). Changing these to `Option` would add per-element
    overhead on a path where every nanosecond matters. Instead, the four conversion
    sites that bridge dense reads to writes guard against -1:
@@ -108,8 +108,8 @@ pattern also appears in the geocode index builder
 (`src/geocode_index/builder.rs:502`), where the compact rank-indexed
 coordinate array is zero-initialized and `(0, 0)` is filtered as unpopulated.
 
-**Impact:** Ways referencing nodes at exactly `(0, 0)` — decimicrodegree precision,
-so within ~11mm of the intersection of the prime meridian and equator — will not
+**Impact:** Ways referencing nodes at exactly `(0, 0)` - decimicrodegree precision,
+so within ~11mm of the intersection of the prime meridian and equator - will not
 have locations added. In the geocode builder, streets or address ways with a node at
 exactly `(0, 0)` will have that coordinate silently dropped from their geometry. This
 affects zero real-world nodes. The nearest land is ~570 km away (Gulf of Guinea).

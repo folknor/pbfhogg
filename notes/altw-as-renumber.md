@@ -4,7 +4,7 @@
 >
 > A working implementation was built (`src/commands/altw_v2.rs`) and tested. Denmark passes byte-identical output in 3.5 s (2.8× faster than the 4-stage pipeline). Europe **OOM-killed** at Phase 2's `coord_table` allocation: the actual unique-referenced-node count was **3.6 B** (29 GB coord table), not the ~1 B / ~8 GB estimated for Europe in this document's memory-budget section. Planet projects to ~10 B referenced / ~80 GB coord table. **The in-RAM coord table does not fit past Denmark-scale on a 30 GB host.**
 >
-> The plan's own step-1 ("measure `unique_referenced_nodes` on planet before committing to the 16 GB coord_table sizing") was the correct caveat — but the thesis was constructed around an estimate that was wrong by ~4–5× at every scale. Measurement-before-design would have caught this.
+> The plan's own step-1 ("measure `unique_referenced_nodes` on planet before committing to the 16 GB coord_table sizing") was the correct caveat — but the thesis was constructed around an estimate that was wrong by ~4-5× at every scale. Measurement-before-design would have caught this.
 >
 > **Reverse of the framing here**: the existing four-stage external-sort pipeline in `src/commands/altw/*` is not "the wrong shape" — it is **load-bearing for any input whose coord table does not fit in RAM**. Renumber's in-RAM form works because `new_id = start + rank(old_id)` is a pure function needing only a 2 GB bitmap; ALTW's resolver needs 8 bytes of data per referenced node, which scales linearly with PBF size (~73× coord-table ratio Denmark→Europe vs ~64× PBF size ratio).
 >
@@ -34,7 +34,7 @@ All three commands run on the same ~87 GB planet input on the same host:
 | `renumber_external` | 194 s | 3.3 GB | full way-blob rewrite with inline ref resolution. |
 | `altw --index-type external` (current, `4f059b67`) | 867 s | ~16.7 GB anon | 4-stage external sort. ~247 GB temp disk. |
 
-Target for this plan: **wall within 1.3–2× of renumber** (250–400 s), **peak RSS ≤ 25 GB**, **zero temp disk**.
+Target for this plan: **wall within 1.3-2× of renumber** (250-400 s), **peak RSS ≤ 25 GB**, **zero temp disk**.
 
 `cat --type way` is the pure decompress-copy-recompress floor; ALTW cannot match it because ALTW must modify the way blob (splice fields 9, 10). `renumber_external` is the realistic target because it does a structurally similar thing (rewrite a way blob using an ID-set-backed resolver).
 
@@ -94,9 +94,9 @@ Pattern: [`stage2d_parallel_way_assembly`](../src/commands/renumber_external.rs#
       None       => splice (0, 0),
   }
   ```
-- Output via `sync_channel(32)` → `ReorderBuffer<Vec<OwnedBlock>>` with capacity 64 → `writer.write_primitive_block_owned`. Exactly the renumber pattern at [renumber_external.rs:670–704](../src/commands/renumber_external.rs#L670).
+- Output via `sync_channel(32)` → `ReorderBuffer<Vec<OwnedBlock>>` with capacity 64 → `writer.write_primitive_block_owned`. Exactly the renumber pattern at [renumber_external.rs:670-704](../src/commands/renumber_external.rs#L670).
 
-Cost: 1× way-blob decompress. Rank lookups: ~6.5B × ~30–50 ns = 30–60 s aggregate across 6 workers. Renumber pays the same cost and still hits 194 s, so this is not a new bottleneck.
+Cost: 1× way-blob decompress. Rank lookups: ~6.5B × ~30-50 ns = 30-60 s aggregate across 6 workers. Renumber pays the same cost and still hits 194 s, so this is not a new bottleneck.
 
 ### Non-way blobs
 
@@ -116,7 +116,7 @@ Planned (at the time of writing):
 | Writer pipeline (`PIPELINE_DISPATCH_PERMITS` × block) | ~0.3 GB |
 | `ReorderBuffer` (64 × block) | ~0.3 GB |
 | Sidecars held in RAM (ref-counts, per-way) | <0.3 GB |
-| **Subtotal** | **~20–21 GB (planned)** |
+| **Subtotal** | **~20-21 GB (planned)** |
 
 Actual (measured 2026-04-16 via `altw_v2` implementation):
 
@@ -132,13 +132,13 @@ The plan's written-in caveat ("if `unique_referenced` on planet is materially hi
 
 | | Current | Proposed | Savings |
 |---|---:|---:|---:|
-| Way-blob decompressions | 3× | 2× | 1× way pass (~50–80 s at planet) |
+| Way-blob decompressions | 3× | 2× | 1× way pass (~50-80 s at planet) |
 | Node-blob decompressions | 1× | 1× | — |
 | Temp disk bytes written | ~247 GB | 0 | all of it |
 | Temp disk bytes read | ~247 GB | 0 | all of it |
 | Disk-seam stages | 3 (stage 2→3, 3→finalize, 3→stage 4) | 0 | all of it |
 
-The single way-pass savings is smaller than it sounds in isolation (~50–80 s). The real win is the ~400+ GB of temp-disk traffic deleted, which is wall time eaten by the filesystem on every pipeline barrier.
+The single way-pass savings is smaller than it sounds in isolation (~50-80 s). The real win is the ~400+ GB of temp-disk traffic deleted, which is wall time eaten by the filesystem on every pipeline barrier.
 
 ## What gets deleted
 

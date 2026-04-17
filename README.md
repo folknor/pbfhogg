@@ -15,7 +15,7 @@
 
 ---
 
-Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. **The full planet (87 GB, 11.6B elements) processes on a 32 GB machine — every command, bounded memory, no compromises.**
+Rust library and CLI for reading, writing, and transforming OpenStreetMap PBF files. **The full planet (87 GB, 11.6B elements) processes on a 32 GB machine - every command, bounded memory, no compromises.**
 
 Developed on Linux, untested elsewhere.
 
@@ -24,12 +24,12 @@ Built with LLMs. See [LLM.md](LLM.md).
 ## Features
 
 - **Read** `.osm.pbf` files sequentially, in parallel (`par_map_reduce`), or with a 3-stage pipelined decoder
-- **Write** valid `.osm.pbf` files with `HeaderBuilder`, `BlockBuilder`, and `PbfWriter` — dense node packing, delta encoding, configurable compression (none, zlib, zstd)
-- **Blob passthrough** for copying unmodified blobs during merge/cat — kernel-space copy eliminates userspace buffer overhead
-- **Blob indexdata** — embeds element type + ID range + spatial bbox in BlobHeader for O(1) blob classification without decompression
-- **Blob tag index** — per-blob tag key metadata enables skipping decompression of blobs that provably lack required tag keys
-- **O_DIRECT I/O** — optional `linux-direct-io` feature bypasses the page cache for planet-scale reads and writes
-- **io_uring writes** — optional `linux-io-uring` feature for maximum throughput when I/O-bound
+- **Write** valid `.osm.pbf` files with `HeaderBuilder`, `BlockBuilder`, and `PbfWriter` - dense node packing, delta encoding, configurable compression (none, zlib, zstd)
+- **Blob passthrough** for copying unmodified blobs during merge/cat - kernel-space copy eliminates userspace buffer overhead
+- **Blob indexdata** - embeds element type + ID range + spatial bbox in BlobHeader for O(1) blob classification without decompression
+- **Blob tag index** - per-blob tag key metadata enables skipping decompression of blobs that provably lack required tag keys
+- **O_DIRECT I/O** - optional `linux-direct-io` feature bypasses the page cache for planet-scale reads and writes
+- **io_uring writes** - optional `linux-io-uring` feature for maximum throughput when I/O-bound
 
 ## Planet scale
 
@@ -131,13 +131,13 @@ pbfhogg time-filter <file> -o <out> <ts>  Filter history PBF to a timestamp
 pbfhogg build-geocode-index <f> -d <dir>  Build reverse geocoding index
 ```
 
-All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that don't need osmium/JOSM compatibility, `zstd:1` is a substantial wall-time win — measured ≈ −10 % on Europe `add-locations-to-ways --index-type external` (419 s → 379 s) by relieving consumer/compression saturation in stage 4, at similar output size. Commands that benefit from indexdata will error without it — pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
+All write commands accept `--compression` (`none`, `zlib`, `zstd`, or with level: `zlib:9`). Default is `zlib:6` for osmium interop. For internal pipelines that don't need osmium/JOSM compatibility, `zstd:1` is a substantial wall-time win - measured ≈ −10 % on Europe `add-locations-to-ways --index-type external` (419 s → 379 s) by relieving consumer/compression saturation in stage 4, at similar output size. Commands that benefit from indexdata will error without it - pass `--force` to proceed (slower), or generate indexed PBFs with `pbfhogg cat input.osm.pbf -o indexed.osm.pbf`.
 
 See [docs/cli/commands.md](docs/cli/commands.md) for detailed command documentation, [docs/guide/advanced.md](docs/guide/advanced.md) for O_DIRECT, io_uring, and index type details.
 
 ## Performance
 
-Read throughput — 59M elements in Denmark (461 MB), best of 3 (commit `90df51f`):
+Read throughput - 59M elements in Denmark (461 MB), best of 3 (commit `90df51f`):
 
 | Tool | Mode | Time |
 |------|------|------|
@@ -149,7 +149,7 @@ Read throughput — 59M elements in Denmark (461 MB), best of 3 (commit `90df51f
 | osmpbf 0.3 | sequential | 5.6s |
 | osmium 1.19 | cat → opl | 5.7s |
 
-CLI commands vs osmium — Denmark (487 MB, commit `6fc1283`):
+CLI commands vs osmium - Denmark (487 MB, commit `6fc1283`):
 
 | Command | pbfhogg | osmium | speedup |
 |---------|---------|--------|---------|
@@ -166,7 +166,7 @@ System: AMD Ryzen 9 5900X (12c/24t), 32 GB DDR4, NVMe SSD, Linux 6.18. Measured 
 
 ## Acknowledgements
 
-pbfhogg started as a fork of [osmpbf](https://github.com/b-r-u/osmpbf/) by Thomas Bruggemann. [osmium-tool](https://osmcode.org/osmium-tool/) and [libosmium](https://osmcode.org/libosmium/) by Jochen Topf are the reference implementation — pbfhogg's CLI covers the same use cases, cross-validated against osmium using [brokkr](https://github.com/folknor/brokkr).
+pbfhogg started as a fork of [osmpbf](https://github.com/b-r-u/osmpbf/) by Thomas Bruggemann. [osmium-tool](https://osmcode.org/osmium-tool/) and [libosmium](https://osmcode.org/libosmium/) by Jochen Topf are the reference implementation - pbfhogg's CLI covers the same use cases, cross-validated against osmium using [brokkr](https://github.com/folknor/brokkr).
 
 ## License
 

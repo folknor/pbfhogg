@@ -119,7 +119,7 @@ This pass assembles administrative boundary polygons. It follows a two-scan appr
 
 **Scan 3a — Collect boundary relations:**
 Stream relations. For each relation with `boundary=administrative` (admin_level
-2–10) or `boundary=postal_code` (treated as level 11):
+2-10) or `boundary=postal_code` (treated as level 11):
 - Record the relation ID, admin_level, name, and country_code (ISO 3166-1:alpha2
   from `ISO3166-1:alpha2` tag, for admin_level=2 only).
 - Collect all way member IDs into an `IdSetDense`, recording the role (`outer`,
@@ -158,7 +158,7 @@ the total vertex count is bounded (~150M vertices worst case before simplificati
 
 ### 3.4. Pass 4: S2 cell assignment and index construction
 
-No PBF reading — this pass operates on the temporary files from passes 1–3.
+No PBF reading — this pass operates on the temporary files from passes 1-3.
 
 **For each address point:**
 Compute cell IDs at both `street_level` and `coarse_level`. Record
@@ -372,10 +372,10 @@ For interpolation, computing the house number requires way-level context
 3. Compute total way length and accumulated distance to the snap point by
    reading **all** nodes in the way. This is O(node_count), not
    O(segment_index), because total_way_length requires the full polyline.
-   Interpolation ways are typically short (5–20 nodes), so this is
+   Interpolation ways are typically short (5-20 nodes), so this is
    acceptable.
 
-**Entry count overflow (sections 4.2–4.4):** The u16 entry count limits each cell
+**Entry count overflow (sections 4.2-4.4):** The u16 entry count limits each cell
 to 65535 entries. At level 17 (~77m cells) with segment-level indexing, each
 segment maps to ~1 cell, so the count per cell is bounded by the number of
 segments intersecting a 77m area — well under 65535 even in dense urban areas.
@@ -514,7 +514,7 @@ remaining same-level candidates once confirmed. See section 3.4 for semantics.
 | 8 | `u32` | Vertex count |
 | 12 | `u32` | Name string offset |
 | 16 | `u16` | Country code (ISO 3166-1 alpha2, packed: `(c0 << 8) | c1`) |
-| 18 | `u8` | Admin level (2–11) |
+| 18 | `u8` | Admin level (2-11) |
 | 19 | `u8` | Reserved (zero) |
 
 Record size: **20 bytes**.
@@ -602,7 +602,7 @@ pub mod geocode_index {
         /// Interpolated address, if any.
         pub interpolation: Option<InterpolationMatch<'a>>,
         /// Administrative hierarchy (one entry per admin level found).
-        /// Admin levels are 2–11, so max 10 entries. ArrayVec avoids heap
+        /// Admin levels are 2-11, so max 10 entries. ArrayVec avoids heap
         /// allocation on the query hot path.
         pub admin: ArrayVec<AdminMatch<'a>, 10>,
     }
@@ -731,7 +731,7 @@ impl Reader {
 `candidates()` returns all matches within the applicable search radius (fine
 or coarse). It uses `Vec` — callers choosing the low-level API accept the
 allocation cost. Admin matches use `ArrayVec<_, 10>` since admin levels are
-bounded (2–11).
+bounded (2-11).
 
 `query()` is allocation-free internally: it tracks only the nearest candidate
 of each type during iteration, never materializing the full candidate set.
@@ -797,7 +797,7 @@ The step size of 2 with rounding to the nearest multiple keeps the output on
 the correct parity without an additional +1 offset.
 
 **Step 3a — Coarse fallback (if no street or address found):**
-If the fine-level search found no street and no address, repeat steps 1–3
+If the fine-level search found no street and no address, repeat steps 1-3
 against the coarse index (`coarse_geo_cells.bin` and its entry files) at
 `coarse_level` (default 14), using the **coarse search radius** (default
 1000m) instead of the fine radius (75m). The 9-cell neighborhood at level 14
@@ -820,7 +820,7 @@ For each cell, binary search `admin_cells.bin`. For each polygon entry:
 - Once a match is confirmed at a given admin level, skip remaining candidates
   at that level (interior hints make this early-exit effective).
 
-For each admin level (2–11), keep the smallest-area polygon that contains the
+For each admin level (2-11), keep the smallest-area polygon that contains the
 query point (handles nested boundaries like city within state).
 
 **Step 5 — Assemble `ReverseResult<'_>`.**
@@ -902,7 +902,7 @@ pub mod geo {
 - `PolygonRings` struct stays in extract.rs (it's specific to GeoJSON parsing).
 - `BboxInt` stays in extract.rs (it's specific to the extract spatial filter).
 
-The existing tests in extract.rs (lines 1958–2027) for `point_in_ring` move to
+The existing tests in extract.rs (lines 1958-2027) for `point_in_ring` move to
 `src/geo.rs` and are extended with additional cases for `simplify_ring` and
 `assemble_rings`.
 
@@ -1032,6 +1032,6 @@ interpolation and edge-case polygon containment).
 7. **Benchmarking** — Add `brokkr bench commands build-geocode-index` support.
    Measure Denmark build time and query latency.
 
-Steps 1–3 can proceed without the S2 dependency (use stub cell IDs for unit tests).
-Step 4 introduces the S2 crate. Step 5 is mechanical CLI wiring. Steps 6–7 require
+Steps 1-3 can proceed without the S2 dependency (use stub cell IDs for unit tests).
+Step 4 introduces the S2 crate. Step 5 is mechanical CLI wiring. Steps 6-7 require
 a Denmark dataset.

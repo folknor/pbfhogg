@@ -297,20 +297,20 @@ none can beat 720 MB/s × 37 GB ≈ 51 s I/O alone.
 **The only remaining lever is reading fewer bytes.** Two options
 sketched (not measured, ~10% total improvement ceiling):
 
-1. Delta-encoded varint coords (3–4× smaller file). Projected stage 4
+1. Delta-encoded varint coords (3-4× smaller file). Projected stage 4
    save ~27 s wall. New on-disk format, new decode path in stage 4,
    stage 2 emits per-way deltas.
 2. Wire-format-ready payloads (stage 4 splices bytes, no per-ref
-   encode/reassemble). Projected save ~8–10 s wall. Couples stage 2
+   encode/reassemble). Projected save ~8-10 s wall. Couples stage 2
    to PBF wire format.
 
-Combined: Europe 392 → ~350–360 s; planet 1,075 → ~950–1,000 s.
+Combined: Europe 392 → ~350-360 s; planet 1,075 → ~950-1,000 s.
 Reasonable to ship or defer.
 
 **Blob-ordered coord payload prototype 2026-04-14 (commits a13a6a8,
 e9e1d77, 7738642).** Built as a measurement-first prototype before
 committing to a stage-3 integration, per the lesson that desk
-estimates on this code path over-predict by 5–10×.
+estimates on this code path over-predict by 5-10×.
 
 Scope — three commits:
 
@@ -348,9 +348,9 @@ Measured results (Europe, commit `7738642`, UUID `99f6b8bc`):
 | `s4_way_delta_encode_ms` cumul | 52,000 | 0 | eliminated |
 
 **Compression ratio: 1.81× (37.5 GB → 20.8 GB).** Confirmed at both
-Denmark (486 MB → 268 MB, same ratio) and Europe. The 3–4× estimate
+Denmark (486 MB → 268 MB, same ratio) and Europe. The 3-4× estimate
 was wrong: absolute lat/lon values (first ref per way) remain 5-byte
-varints, and typical 1-km-scale deltas are 2–3 bytes. This format's
+varints, and typical 1-km-scale deltas are 2-3 bytes. This format's
 ceiling is ~1.8×, not higher.
 
 **Correctness: SHA256 match** between baseline and prototype output
@@ -370,14 +370,14 @@ this pass goes away.
 - Planet (scaling the measured stage-4 coord-work saving):
   982 s → **~900 s (−8%)**.
 
-Substantially less than the 15% I projected when assuming 3–4×
+Substantially less than the 15% I projected when assuming 3-4×
 compression. Closer to my worst-case "might be ±0" from the
 same-day regression lesson.
 
 **What the prototype answered:**
 
 1. Format is sound; bit-identical output.
-2. Compression ratio is 1.81×, not 3–4×.
+2. Compression ratio is 1.81×, not 3-4×.
 3. Stage 4 I/O reduction works: coord read cumul dropped 5×.
 4. `s4_way_delta_encode_ms` can be eliminated entirely via
    wire-format-ready payloads.

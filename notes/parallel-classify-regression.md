@@ -155,7 +155,7 @@ bbox, `--bench 1` single sample, UUID `2d028196`:**
 **Per the round-4 decision tree (step 0, `:160-176`):**
 
 - < ~25 GB → ship as-is, ceiling is fine in practice ← **we are here**
-- 25–28 GB → accept (Option 4) defensible
+- 25-28 GB → accept (Option 4) defensible
 - \> 28 GB → implement reusable packet pool
 
 **Why the Europe×2.6 projection was wrong by 2.4×:** peak anon is

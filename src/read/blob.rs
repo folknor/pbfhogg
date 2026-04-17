@@ -1071,16 +1071,18 @@ impl BlobReader<BufReader<File>> {
     /// ```
     pub fn seekable_from_path<P: AsRef<Path>>(path: P) -> Result<BlobReader<BufReader<File>>> {
         let f = File::open(path.as_ref())?;
-        // Use a 256KB BufReader for the same reasons as from_path above:
-        // PBF blobs are 16-32KB compressed, so the default 8KB buffer causes 2-4
-        // syscalls per blob. 256KB fits several blobs per read and dramatically
-        // reduces syscall overhead on sequential iteration.
+        // Use a 16 MB BufReader. PBF blobs are 16-32KB compressed, so the
+        // previous 256 KB buffer still refilled every ~10 blobs, capping
+        // syscall-count amortization and kernel readahead opportunity.
+        // Europe check_refs schedule-walk hotpath (UUID 07d4d92b) showed
+        // p95 = 222 µs on next_header_with_data_offset - the refill tail
+        // was dominating. Bumping to 16 MB ~60× reduces refill frequency
+        // and lets the kernel dispatch larger sequential reads.
         //
-        // Although seekable_from_path supports seeking, in practice callers that need
-        // random access use IndexedReader (which has no BufReader). This path is
-        // mostly used for sequential iteration with occasional seek-back, where the
-        // large buffer is still beneficial.
-        let buf_reader = BufReader::with_capacity(256 * 1024, f);
+        // Callers that need random access use IndexedReader (no BufReader).
+        // This path is for sequential iteration with occasional seek-back,
+        // where the large buffer is purely additive.
+        let buf_reader = BufReader::with_capacity(16 * 1024 * 1024, f);
         Self::new_seekable(buf_reader)
     }
 }

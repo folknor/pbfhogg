@@ -71,8 +71,9 @@ A four-stage serial chain with three disk-materialized intermediates and no stag
 | Europe | `d3e13ed` (pre-#8) | 333 s | 30.9 s | 36.0 s | 92.9 s | 32.2 s | 18.3 s | 14.3 s | 90.6 s |
 | Europe | `e497e54` (post-#8) | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
 | Planet | `4f059b67` (pre-#8) | 867.7 s | — | 148.5 s | 266.6 s | 100.2 s | 46.4 s | — | 231.6 s |
+| Planet | `7904a95` (post-#4/#8/#9L1) | **698.1 s** | 16.9 s | 112.8 s | 235.2 s | 85.7 s | **1.4 s** | 6.0 s | 215.6 s |
 
-Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet post-#8 not yet measured.
+Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet (commit `7904a95`, UUID `123f70f1`): cumulative `867.7 s → 698.1 s` (−19.5%); finalize/router `46.4 s → 1.4 s` (−97%, #8); stage 1 −24%, stage 2 −12%, stage 3 −14%, stage 4 −7%; relation scan now 6.0 s (#9 L1).
 
 ---
 

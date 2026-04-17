@@ -47,7 +47,7 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `renumber` | 3m14s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
 | `extract --smart` (Europe bbox) | 4m42s | 11.17 GB | three-pass, multipolygon-complete |
 | `build-geocode-index` | 20m55s | 29.5 GB | reverse geocoding index, S2 cells (pass-1.5 transient peak) |
-| `add-locations-to-ways --index-type external` | 15m53s | **8.7 GB** | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~256 GB temp disk |
+| `add-locations-to-ways --index-type external` | 11m38s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md).
 

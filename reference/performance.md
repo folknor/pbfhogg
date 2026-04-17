@@ -599,6 +599,30 @@ Steady state: `apply-changes --locations-on-ways` (daily diffs).
 | add-locations-to-ways (external) | 400s (6.7m) | — |
 | **Total bootstrap** | **~8.5m** | — |
 
+### ALTW external optimization arc (post-3d977a0)
+
+Cumulative effect of the four landed seam deletions in
+`notes/altw-structural-reports.md` (#8 router, #4 stage-2 de-ranking,
+#9 L1 metadata-driven relation scan, plus their predecessors).
+
+| Commit | Change | Europe | Planet |
+|--------|--------|-------:|-------:|
+| `3d977a0` | Pre-structural-reports baseline | 400s | 953s |
+| `4f059b67` | (pre-#8 planet baseline in structural reports) | — | 867.7s |
+| `d3e13ed` | (pre-#8 Europe baseline in structural reports) | 333s | — |
+| `e497e54` | #8 `BlobLocationRouter` (finalize consolidation removed) | 320.5s | — |
+| `f1a4ada` | #4 stage-2 blob-local rank counter + drop rank index | 308.0s | — |
+| `6d71053` | #9 L1 metadata-driven relation scan | 291.6s | — |
+| `7904a95` | (current, #3/#11 attempted and reverted — bench `123f70f1`) | 291.6s | **698.1s** |
+
+Planet drop `867.7s → 698.1s` (**−19.5%**) confirms the
+stage-2/relation-scan wins scale more strongly with tuple count than
+the Europe numbers suggest. Phase deltas vs `4f059b67` planet baseline:
+stage 1 `148.5s → 112.8s` (−24%), stage 2 `266.6s → 235.2s` (−12%),
+stage 3 `100.2s → 85.7s` (−14%), finalize/router `46.4s → 1.4s` (−97%,
+all of #8), relation scan down to 6.0s (#9 L1), stage 4 `231.6s →
+215.6s` (−7%).
+
 ## build-geocode-index
 
 Reverse geocoding index build. 4-pass pipeline: nodes (address points + dense

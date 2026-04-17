@@ -431,6 +431,7 @@ impl PrimitiveBlock {
 
     /// Like [`from_vec`] but reuses caller-provided scratch buffers.
     /// Sequential loops call this to avoid per-block scratch allocation.
+    #[hotpath::measure]
     pub(crate) fn from_vec_with_scratch(
         mut buffer: Vec<u8>,
         st_scratch: &mut Vec<(u32, u32)>,

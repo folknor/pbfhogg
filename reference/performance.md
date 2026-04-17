@@ -15,15 +15,15 @@ Consolidated runtime measurements across datasets and commands.
 
 | Dataset | Raw PBF | Indexed PBF | ALTW PBF | Elements |
 |---------|---------|-------------|----------|----------|
-| Malta | 8 MB | 8 MB | — | ~1M |
-| Greater London | 122 MB | 122 MB | — | ~17M |
-| Denmark | 461 MB | 465 MB | — | 59M |
-| Switzerland | 524 MB | — | — | — |
-| Norway | 1.4 GB | 1.4 GB | — | — |
-| Japan | 2.4 GB | 2.4 GB | — | 344M |
-| Germany | 4.5 GB | 4.5 GB | — | — |
-| North America | 18.8 GB | 18.8 GB | — | 2.58B |
-| Europe | 32.4 GB | 33.6 GB | — | 4.2B (3.7B nodes, 454M ways, 8.2M rels) |
+| Malta | 8 MB | 8 MB | - | ~1M |
+| Greater London | 122 MB | 122 MB | - | ~17M |
+| Denmark | 461 MB | 465 MB | - | 59M |
+| Switzerland | 524 MB | - | - | - |
+| Norway | 1.4 GB | 1.4 GB | - | - |
+| Japan | 2.4 GB | 2.4 GB | - | 344M |
+| Germany | 4.5 GB | 4.5 GB | - | - |
+| North America | 18.8 GB | 18.8 GB | - | 2.58B |
+| Europe | 32.4 GB | 33.6 GB | - | 4.2B (3.7B nodes, 454M ways, 8.2M rels) |
 | Planet | 87.3 GB | 87.7 GB | 88.4 GB | 11.6B (10.4B nodes, 1.17B ways, 14.1M rels) |
 
 ## Cat passthrough (indexdata generation)
@@ -35,14 +35,14 @@ Commit `69a127f`, plantasjen.
 
 | Dataset | Size | Buffered | `--direct-io` | File size overhead |
 |---------|------|----------|---------------|--------------------|
-| Denmark | 461 MB | **2.8s** | — | — |
-| Europe | 32.4 GB | — | 112s* | +3.8% |
+| Denmark | 461 MB | **2.8s** | - | - |
+| Europe | 32.4 GB | - | 112s* | +3.8% |
 | Planet | 87 GB | **497s** (8m17s) | 520s (+5%) | +0.5% |
 
 \* Europe used `--type node,way,relation` (filtered path, full decode+re-encode),
 not passthrough. Passthrough not yet measured for europe.
 
-Buffered wins for passthrough — sequential single-file I/O benefits from page
+Buffered wins for passthrough - sequential single-file I/O benefits from page
 cache prefetch. `--direct-io` adds alignment overhead without the concurrent
 read/write pattern that makes it faster for merge.
 
@@ -76,7 +76,7 @@ Commit `d387301` (multi-dataset), plantasjen.
 | Denmark | 487 MB | 8.1s | 16.8s | 10.0s | 7.3s | 7.4s | 7.3s |
 | Norway | 1.4 GB | 21.3s | 44.0s | 25.7s | 18.9s | 19.2s | 18.9s |
 | Japan | 2.4 GB | 38.5s | 79.2s | 47.0s | 34.8s | 35.0s | 34.4s |
-| Germany | 4.7 GB | 81.3s | — | — | 71.7s | — | — |
+| Germany | 4.7 GB | 81.3s | - | - | 71.7s | - | - |
 
 With pipelined writes, all compression modes converge to the decode + wire-format
 serialization floor. Sync zlib:6 is 2.3x slower; pipelined hides the cost.
@@ -91,15 +91,15 @@ Best results per dataset. Commit `a6ebbfe` (NA), `a65a198` (multi-region),
 
 | Dataset | Size | buffered+none | buffered+zlib | uring+none | uring+zlib |
 |---------|------|---------------|---------------|------------|------------|
-| Malta | 9 MB | 14 ms | 42 ms | — | — |
-| Greater London | 124 MB | 140 ms | 333 ms | — | — |
-| Denmark | 487 MB | 218 ms | 331 ms | — | — |
-| Switzerland | 529 MB | 561 ms | 1.22s | — | — |
-| Norway | 1.4 GB | 549 ms | 747 ms | — | — |
-| Japan | 2.4 GB | 1.87s | 2.88s | — | — |
+| Malta | 9 MB | 14 ms | 42 ms | - | - |
+| Greater London | 124 MB | 140 ms | 333 ms | - | - |
+| Denmark | 487 MB | 218 ms | 331 ms | - | - |
+| Switzerland | 529 MB | 561 ms | 1.22s | - | - |
+| Norway | 1.4 GB | 549 ms | 747 ms | - | - |
+| Japan | 2.4 GB | 1.87s | 2.88s | - | - |
 | Germany | 4.7 GB | 3.42s | 5.34s | 4.4s | 9.6s |
 | North America | 18.8 GB | 14.9s | 17.3s | **11.9s** | 15.2s |
-| Planet | 87 GB | 532s | 753s | — | — |
+| Planet | 87 GB | 532s | 753s | - | - |
 
 Germany (4.7 GB, 146K-change daily diff): rewrite fraction 18.4%.
 North America (18.8 GB, 645K-change daily diff): 303K passthrough / 19.6K
@@ -118,7 +118,7 @@ Commit `b90e8ef`: use `elements_skip_metadata()` in `block_overlaps_diff`
 Germany hotpath (commit `1b10f18`, plantasjen):
 - apply-changes-zlib: **6942ms → 5928ms (-15%)**
 
-Larger improvement than expected — Germany's 18.4% rewrite fraction means
+Larger improvement than expected - Germany's 18.4% rewrite fraction means
 more blobs reach the precise `block_overlaps_diff` check (which decodes all
 elements to test IDs against the diff). Skipping metadata decode saves ~1s
 across ~11K precise-check invocations.
@@ -150,11 +150,11 @@ Output: 88.4 GB (+0.7% from embedded way-node coordinates).
 |----------|------|
 | Buffered | **5773s** (96m) |
 
-Planet on 30 GB host with 8 GB swap — memory-latency-bound (page faults on
+Planet on 30 GB host with 8 GB swap - memory-latency-bound (page faults on
 sparse mmap index), not compute-bound. Production host (64 GB RAM) should be
 well under an hour.
 
-`--direct-io` provides no benefit for ALTW — workload is compute/memory-bound,
+`--direct-io` provides no benefit for ALTW - workload is compute/memory-bound,
 not I/O-bound. Sequential I/O benefits from page cache prefetch.
 
 ### Dense vs Sparse vs External index (plantasjen)
@@ -162,9 +162,9 @@ not I/O-bound. Sequential I/O benefits from page cache prefetch.
 | Dataset | Dense | Sparse | External | Commit |
 |---------|-------|--------|----------|--------|
 | Denmark (465 MB) | **6.8s** | 14.1s | 14s | `ee9b19f` |
-| Japan (2.4 GB) | **42s** | — | — | `b3e8bf7` (node scanner) |
+| Japan (2.4 GB) | **42s** | - | - | `b3e8bf7` (node scanner) |
 | Europe (33.6 GB) | 2,940s (49m)* | 6,453s (107m) | **400s (6.7 min)** | `3d977a0` |
-| Planet (87.7 GB) | 5,773s (96m)* | — | **953s (15.9 min)**, 8.7 GB peak anon | `3d977a0` |
+| Planet (87.7 GB) | 5,773s (96m)* | - | **953s (15.9 min)**, 8.7 GB peak anon | `3d977a0` |
 
 *Dense at Europe scale thrashes on 30 GB host (mmap working set ~16 GB > available
 RAM). Japan 42s is with node-only scanner for pass 1 (commit `b3e8bf7`, previously
@@ -231,7 +231,7 @@ item #8.
 | Stage 2 (node join) | 91.0s | 7.57 GB peak | unchanged; overall RSS peak |
 | Stage 3 (slot reorder) | 33.6s | 7.50 GB peak | unchanged; emits per-worker tmps (not finalized into a single file) |
 | **Router build** | **0.163s** | 3.07 GB peak | Replaces finalize: walks manifests + straddler staging, encodes straddlers into RAM |
-| Relation scan | 21.0s | 3.14 GB peak | `collect_relation_member_node_ids()` — single-sample variance vs baseline |
+| Relation scan | 21.0s | 3.14 GB peak | `collect_relation_member_node_ids()` - single-sample variance vs baseline |
 | Stage 4 (assembly) | 91.7s | 3.40 GB peak | `BlobLocationRouter::pread_blob_payload` routes to worker tmps or in-RAM straddlers |
 | **Total** | **320.5s** | | −12.5 s vs `d3e13ed` on single `--bench 1` sample (UUID `4268196a`) |
 
@@ -255,17 +255,17 @@ why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
 
 | Version | Denmark | Europe | Planet | Commit |
 |---------|---------|--------|--------|--------|
-| Original (256x re-read) | 302s | — | — | `034422c` |
-| Single-pass merge | 25s | 2,060s | — | `a334c72` |
-| + fadvise + mmap coord_slots | 22s | 1,824s | — | `165cbb2` |
-| Node-only scanner + scatter buffer | 14s | 921s | — | `ee9b19f` |
-| + blob skip + pool reuse | 14s | ~901s | — | `d272b49` |
-| P2b/P2c parallel assembly | — | 608s | — | `6b09796` |
+| Original (256x re-read) | 302s | - | - | `034422c` |
+| Single-pass merge | 25s | 2,060s | - | `a334c72` |
+| + fadvise + mmap coord_slots | 22s | 1,824s | - | `165cbb2` |
+| Node-only scanner + scatter buffer | 14s | 921s | - | `ee9b19f` |
+| + blob skip + pool reuse | 14s | ~901s | - | `d272b49` |
+| P2b/P2c parallel assembly | - | 608s | - | `6b09796` |
 | External radix permutation (full) | 14s | 422s | 1,462s | `b0a5fb8` |
-| Stage 1B overlap + misc | — | 392s | 1,075s | `091fc5b` |
+| Stage 1B overlap + misc | - | 392s | 1,075s | `091fc5b` |
 | **coord_payloads integrated** | **7.4s** | **400s** | **953s** | **`3d977a0`** |
-| **+ shared blob metadata scan** | — | **333s** | — | **`d3e13ed`** |
-| **+ BlobLocationRouter (no finalize consolidation)** | — | **320.5s** | — | **`e497e54`** |
+| **+ shared blob metadata scan** | - | **333s** | - | **`d3e13ed`** |
+| **+ BlobLocationRouter (no finalize consolidation)** | - | **320.5s** | - | **`e497e54`** |
 
 The coord_payloads integration (2026-04-14) was pursued primarily for
 non-wall benefits. Planet measured −29 s wall as a pleasant surprise;
@@ -396,13 +396,13 @@ Previous commit data (commit `46f7388`):
 
 Planet-scale renumber via IdSetDense rank-based O(1) lookup (replaces
 the original 256-bucket radix partition). Wire-format splice rewriters
-for all three element types — pass 1 (DenseNodes), stage 2d (ways),
-and R2d (relations) — patch only the ID/ref fields and copy everything
+for all three element types - pass 1 (DenseNodes), stage 2d (ways),
+and R2d (relations) - patch only the ID/ref fields and copy everything
 else verbatim as raw bytes. No BlockBuilder, no PrimitiveBlock
 construction. Pass 1: 4 work-stealing workers. Stage 2d: 6 workers.
 R2d: parallel with inline rank() dispatch (relation_map replaced by
 `relation_id_set.rank()`). All member-ref lookups via
-`node_id_set.rank()` + `way_id_set.rank()` inline — no flat temp
+`node_id_set.rank()` + `way_id_set.rank()` inline - no flat temp
 files. Zero scratch disk usage. Single shared input fd across all
 phases. Atomic index dispatch (no `Arc<Mutex<Receiver>>`). Output
 defaults to zlib:1. `mallopt(M_ARENA_MAX, 2)` inside
@@ -422,7 +422,7 @@ Commit `6165394`, dirty `--force --bench 1`. Single-sample.
 | R1+R2A fused | 29 s | 1.04 GB | 2.7% |
 | R2B rel merge-join | 68 s | 2.03 GB | 6.2% |
 | R2C + R2D | 34 s | 1.04 GB | 3.1% |
-| **TOTAL** | **1,092 s (18.2 min)** | **7.32 GB** | — |
+| **TOTAL** | **1,092 s (18.2 min)** | **7.32 GB** | - |
 
 Stage 2b breakdown (cumulative across 2 workers):
   load_way_refs 276 s, radix_sort 243 s, load_node_map 101 s,
@@ -437,13 +437,13 @@ baseline (`c5d00c22`) exactly.
 | Commit | Change | Planet Time |
 |--------|--------|-------------|
 | `e156e97` | First planet measurement (sequential all stages) | **3,456 s (57.6 min)** |
-| `cc80442` | Stage 2b LSD radix sort | — (Denmark only) |
-| `a478ae8` | Halve map-bucket format (drop new_id field) | — |
-| `37ff902` | Stage 2b 2-worker bucket parallelism | — |
-| `8ec298c` | Pass 1 parallel decode (worker pool) | — |
-| `34a6b7c` | Stage 2d parallel decode (worker pool) | — |
-| `e7219f0` | Stage 2a parallel scan (worker pool) | — (OOM on planet, see below) |
-| `9695ad5` | Writer backpressure (permit pool) | — (still OOM) |
+| `cc80442` | Stage 2b LSD radix sort | - (Denmark only) |
+| `a478ae8` | Halve map-bucket format (drop new_id field) | - |
+| `37ff902` | Stage 2b 2-worker bucket parallelism | - |
+| `8ec298c` | Pass 1 parallel decode (worker pool) | - |
+| `34a6b7c` | Stage 2d parallel decode (worker pool) | - |
+| `e7219f0` | Stage 2a parallel scan (worker pool) | - (OOM on planet, see below) |
+| `9695ad5` | Writer backpressure (permit pool) | - (still OOM) |
 | `f607842` | Work-stealing dispatch for pass 1 + stage 2d | **2,033 s (33.9 min)** |
 | `d3da65f` | Two-cursor merge + PrimitiveBlock copy fix | **1,901 s (31.7 min)** |
 | `dc13a7b` | DenseNodes wire-format rewriter + 4 workers + mallopt | **1,468 s (24.5 min)** |
@@ -458,13 +458,13 @@ baseline (`c5d00c22`) exactly.
 | `94bf351` | Pass 1 back to 4 workers, fuse R1+R2A+R2B | **442 s (7.4 min)** |
 | `cbffb45` | Wire-format splice rewriter for R2d relations | **412 s (6.9 min)** |
 | `71bb548` | Parallel R2d (work-stealing + member-count sidecar) | **401 s (6.7 min)** |
-| `dd3f477` | zlib:1 output + IdSetDense::resolve() combined lookup | — |
-| `1b171f0` | Inline IdSetDense::set() during reframe, eliminate old_ids_out | — |
+| `dd3f477` | zlib:1 output + IdSetDense::resolve() combined lookup | - |
+| `1b171f0` | Inline IdSetDense::set() during reframe, eliminate old_ids_out | - |
 | `fefd357` | Cache blob schedules across all phases | **360 s (6.0 min)** |
-| `b71bae9` | Fuse relation resolve into R2d, eliminate all temp files, zero scratch disk | — |
-| `feb3099` | Denser rank() blocks (64B instead of 256B) + respect compression flag | — |
-| `6acb9eb` | Replace relation_map FxHashMap with IdSetDense (~500 MB → ~20 MB) | — |
-| `db49c92` | Open input file once, reuse fd across all phases | — |
+| `b71bae9` | Fuse relation resolve into R2d, eliminate all temp files, zero scratch disk | - |
+| `feb3099` | Denser rank() blocks (64B instead of 256B) + respect compression flag | - |
+| `6acb9eb` | Replace relation_map FxHashMap with IdSetDense (~500 MB → ~20 MB) | - |
+| `db49c92` | Open input file once, reuse fd across all phases | - |
 | `67c7960` | Atomic index dispatch + reframe_buf pre-reserve | **209 s (3m29s)** |
 | `cb99106` | Shared atomic IdSetDense (−54% memory), wire-format R1 scanner | **194 s (3m14s)** |
 
@@ -472,7 +472,7 @@ baseline (`c5d00c22`) exactly.
 (`brokkr verify renumber`, 306-relation orphan delta preserved exactly).
 Two intermediate planet runs OOM-killed at ~26 GB anon RSS due to
 reorder-buffer backlog from range-split dispatch and glibc arena
-fragmentation — resolved by work-stealing dispatch + `MALLOC_ARENA_MAX=2`.
+fragmentation - resolved by work-stealing dispatch + `MALLOC_ARENA_MAX=2`.
 
 ### Memory
 
@@ -486,12 +486,12 @@ caps glibc arena growth from cross-thread OwnedBlock `Vec<u8>` frees.
 
 | Phase | Duration | Peak Anon | Share |
 |---|---:|---:|---:|
-| Schedule scan | **16.6 s** | — | 9% |
+| Schedule scan | **16.6 s** | - | 9% |
 | PASS1 (4 workers, wire-format nodes) | **95.3 s** | 2.1 GB | 49% |
 | STAGE2D (6 workers, fused way resolve + wire-format ways) | **76.8 s** | 3.3 GB | 40% |
-| R1 (sequential wire-format relation ID scan) | **3.2 s** | — | 2% |
-| R2D (parallel wire-format relations, inline rank()) | **1.9 s** | — | 1% |
-| **TOTAL** | **194 s (3m14s)** | **3.3 GB** | — |
+| R1 (sequential wire-format relation ID scan) | **3.2 s** | - | 2% |
+| R2D (parallel wire-format relations, inline rank()) | **1.9 s** | - | 1% |
+| **TOTAL** | **194 s (3m14s)** | **3.3 GB** | - |
 
 ## Extract
 
@@ -502,7 +502,7 @@ Plantasjen. Best of 3 runs (or single-sample where noted), indexed PBFs.
 | Denmark | 487 MB | 2259 ms | 2399 ms | 2693 ms | `aacbe80` |
 | Japan | 2.4 GB | **3.8s** | **3.7s** | **4.7s** | `cadc3e6` |
 | Europe | 32.4 GB | **96.3s** | **164.9s** | **181.4s** | `cadc3e6` |
-| Planet † | 87.7 GB | — | — | **279s** | `cadc3e6` |
+| Planet † | 87.7 GB | - | - | **279s** | `cadc3e6` |
 
 † Planet smart extract: single-sample `--bench 1`, Europe bbox, UUID
 `2d028196`. Peak anon RSS 11.17 GB on 32 GB host (27.9 GB avail at run
@@ -515,7 +515,7 @@ Europe and Planet bbox `-25.0,34.0,45.0,72.0` (full-continent).
 
 Simple extract uses a 3-phase barrier pipeline with parallel classification
 and raw frame passthrough. Each phase (nodes, ways, relations) classifies
-blobs in parallel then writes matching raw frames via pread workers — no
+blobs in parallel then writes matching raw frames via pread workers - no
 decode+re-encode. Japan simple: 3.8s vs osmium 7.2s (1.9x faster). Europe
 simple: 96.3s (was 350s sequential, was OOM with pipelined reader).
 
@@ -531,7 +531,7 @@ full PrimitiveBlock lifecycle per worker.
 
 **PASS1 schedule reuse (commits `d4ea760`, `0b085b1`, 2026-04-10/11).** The
 parallel_classify_regression investigation discovered that every header
-scan running *after* PASS1's parallel allocator work was redundant —
+scan running *after* PASS1's parallel allocator work was redundant -
 `collect_pass1_generic` already scans the whole file once. By plumbing
 `full_way_schedule` and `pass3_blob_schedule` out of `collect_pass1_generic`
 via `Pass1Result` and consuming them via `mem::take` in PASS2/PASS3, smart
@@ -589,15 +589,15 @@ Steady state: `apply-changes --locations-on-ways` (daily diffs).
 |------|------|--------|
 | cat (indexdata generation) | 497s (8m) | 87.7 GB |
 | add-locations-to-ways (external) | 953s (15.9m) | 88.4 GB |
-| **Total bootstrap** | **~24m** | — |
+| **Total bootstrap** | **~24m** | - |
 
 ### Europe bootstrap (plantasjen, commit `3d977a0`)
 
 | Step | Time | Output |
 |------|------|--------|
 | cat (indexdata, `--type` filtered) | 112s | 33.6 GB |
-| add-locations-to-ways (external) | 400s (6.7m) | — |
-| **Total bootstrap** | **~8.5m** | — |
+| add-locations-to-ways (external) | 400s (6.7m) | - |
+| **Total bootstrap** | **~8.5m** | - |
 
 ### ALTW external optimization arc (post-3d977a0)
 
@@ -608,12 +608,12 @@ Cumulative effect of the four landed seam deletions in
 | Commit | Change | Europe | Planet |
 |--------|--------|-------:|-------:|
 | `3d977a0` | Pre-structural-reports baseline | 400s | 953s |
-| `4f059b67` | (pre-#8 planet baseline in structural reports) | — | 867.7s |
-| `d3e13ed` | (pre-#8 Europe baseline in structural reports) | 333s | — |
-| `e497e54` | #8 `BlobLocationRouter` (finalize consolidation removed) | 320.5s | — |
-| `f1a4ada` | #4 stage-2 blob-local rank counter + drop rank index | 308.0s | — |
-| `6d71053` | #9 L1 metadata-driven relation scan | 291.6s | — |
-| `7904a95` | (current, #3/#11 attempted and reverted — bench `123f70f1`) | 291.6s | **698.1s** |
+| `4f059b67` | (pre-#8 planet baseline in structural reports) | - | 867.7s |
+| `d3e13ed` | (pre-#8 Europe baseline in structural reports) | 333s | - |
+| `e497e54` | #8 `BlobLocationRouter` (finalize consolidation removed) | 320.5s | - |
+| `f1a4ada` | #4 stage-2 blob-local rank counter + drop rank index | 308.0s | - |
+| `6d71053` | #9 L1 metadata-driven relation scan | 291.6s | - |
+| `7904a95` | (current, #3/#11 attempted and reverted - bench `123f70f1`) | 291.6s | **698.1s** |
 
 Planet drop `867.7s → 698.1s` (**−19.5%**) confirms the
 stage-2/relation-scan wins scale more strongly with tuple count than
@@ -632,7 +632,7 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Dataset | PBF size | Time | Index size | Addr points | Streets | Admin | Commit |
 |---------|----------|------|------------|-------------|---------|-------|--------|
 | Denmark | 465 MB | **7.1s** | 172 MB | 2.6M | 314K | 2K | `f42da6e` |
-| Japan | 2.4 GB | **26.7s** | — | — | — | — | `c33e8cc` |
+| Japan | 2.4 GB | **26.7s** | - | - | - | - | `c33e8cc` |
 | Germany | 4.5 GB | **1813s** (30m) | ~1.8 GB | 19.8M | 3.3M | 43K | `ed34092` |
 
 ### Japan sidecar profile (commit `5776b67`, plantasjen, --bench --sidecar)
@@ -640,10 +640,10 @@ assembly + simplification), S2 cell assignment (fine level 17 + coarse level 14)
 | Phase | Duration | Peak RSS | Peak Anon | Disk Read | Disk Write | Majflt |
 |-------|----------|----------|-----------|-----------|------------|--------|
 | Pass 1 (relations) | 0.9s | 9 MB | 5 MB | 2.3 GB | 0 | 0 |
-| Pass 2 (nodes+ways) | 55-60s | **19 GB** | **325 MB** | — | — | 1.3M (plateau, no thrash) |
-| Pass 3 (S2 cells) | 1.9s | 352 MB | 273 MB | — | 539 MB | — |
+| Pass 2 (nodes+ways) | 55-60s | **19 GB** | **325 MB** | - | - | 1.3M (plateau, no thrash) |
+| Pass 3 (S2 cells) | 1.9s | 352 MB | 273 MB | - | 539 MB | - |
 
-Sequential reader (commit `5776b67`) keeps anon bounded at 325 MB — no
+Sequential reader (commit `5776b67`) keeps anon bounded at 325 MB - no
 PrimitiveBlock cross-thread retention. The 19 GB peak RSS is the DenseMmapIndex
 mmap (file-backed, fits in RAM at Japan scale). At Europe/planet scale this
 mmap would thrash (same as dense ALTW).
@@ -655,7 +655,7 @@ interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
 
 | Commit | Change | Time | Cumulative |
 |--------|--------|------|------------|
-| `d27f17e` | Baseline (4 scans, sequential for_each) | 21.4s | — |
+| `d27f17e` | Baseline (4 scans, sequential for_each) | 21.4s | - |
 | `e7a12e6` | 3 scans (reorder: relations first) | 18.5s | -14% |
 | `da4d939` | 2 scans (fused node+way, pipelined) | 10.9s | -49% |
 | `60df011` | Zero-alloc cover_segment + parallel S2 cells | 10.4s | -51% |
@@ -669,12 +669,12 @@ interpolation ways with `addr:interpolation` + `addr:street`, 71/78 resolved.
 |---|---|---|---|
 | After pass 1 (relations) | 223 MB | 1.8s | admin_relations + IdSetDense |
 | After pass 2 scan (nodes+ways) | **17.6 GB** | 572s | Dense node index mmap dominates |
-| After pass 2 drop (node index freed) | 168 MB | — | Pages evicted, data Vecs are modest |
+| After pass 2 drop (node index freed) | 168 MB | - | Pages evicted, data Vecs are modest |
 | After ring assembly | 428 MB | +12.7s | + admin polygons (43K) |
 | After interpolation resolution | 955 MB | +4.4s | + transient spatial index |
 | After cell assignment | **3.7 GB** | +10s | All cell entry Vecs materialized |
 
-Pipeline (`run_pipeline`) takes 556s / 94% — Germany is I/O + decompress bound
+Pipeline (`run_pipeline`) takes 556s / 94% - Germany is I/O + decompress bound
 at this scale. Main thread CPU averages 32% (waiting on pipeline).
 
 Key observations for planet-scale planning:
@@ -688,23 +688,23 @@ Key observations for planet-scale planning:
 
 ### Comparison with traccar-geocoder
 
-No directly comparable data — different hardware, different format, different
+No directly comparable data - different hardware, different format, different
 build architecture (traccar uses C++ with libosmium, single-threaded, all data
 in RAM). Numbers from the HN thread (2026-03-21):
 
 | Dataset | traccar-geocoder | pbfhogg | Notes |
 |---------|-----------------|---------|-------|
-| Australia/Oceania (~1.1 GB) | ~15 min (KomoD) | — | Not tested |
-| Germany (4.5 GB) | — | **9.8 min** | After optimization (was 30 min) |
-| Planet (~87 GB) | 8-10 hours (192 GB RAM) | — | Would OOM on 30 GB host |
+| Australia/Oceania (~1.1 GB) | ~15 min (KomoD) | - | Not tested |
+| Germany (4.5 GB) | - | **9.8 min** | After optimization (was 30 min) |
+| Planet (~87 GB) | 8-10 hours (192 GB RAM) | - | Would OOM on 30 GB host |
 
 Planet (validated): **1,255s (20.9 min), 29.5 GB peak anon RSS** in
 `GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`). The earlier
 17.8 GB figure under-reported: brokkr previously hid short-emitting phase
 markers from sidecar output, so PASS1_5's transient peak never surfaced.
-The peak itself has not changed — only its visibility. Our index is larger due to segment-level indexing (6 bytes
+The peak itself has not changed - only its visibility. Our index is larger due to segment-level indexing (6 bytes
 vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
-builder currently holds all intermediate data in RAM — planet requires
+builder currently holds all intermediate data in RAM - planet requires
 streaming to temp files (not yet implemented).
 
 traccar's index is more compact (18 GB planet) because it uses f32 coords,

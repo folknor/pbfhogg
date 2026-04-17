@@ -1,4 +1,4 @@
-//! Stage 2: Node join — parallel counting-sort per rank bucket, inline
+//! Stage 2: Node join - parallel counting-sort per rank bucket, inline
 //! per-bucket coordinate resolution from node blobs.
 //!
 //! Replaces the historical 82 GB `coords_by_rank` file pread with a direct
@@ -23,7 +23,7 @@ use super::{
 };
 
 // ---------------------------------------------------------------------------
-// Stage 2: Parallel node join — coord slice lookup
+// Stage 2: Parallel node join - coord slice lookup
 // ---------------------------------------------------------------------------
 
 struct LoaderScratch {
@@ -331,7 +331,7 @@ pub(super) fn stage2_node_join(
                 // rank_range_size; the last bucket may be smaller but
                 // never larger). The slice is fully zeroed at the start
                 // of each bucket and then populated only at slots where
-                // we decode a referenced node — the resolve loop below
+                // we decode a referenced node - the resolve loop below
                 // depends on (lat==0 && lon==0) as the missing-coord
                 // sentinel, so leftover bytes from a previous bucket
                 // would be silently misresolved as real coordinates.
@@ -385,7 +385,7 @@ pub(super) fn stage2_node_join(
                         //
                         // Correctness: the slice is reused across buckets
                         // by this worker, so it MUST be zeroed before the
-                        // fill loop — only positions where a referenced
+                        // fill loop - only positions where a referenced
                         // node lands get overwritten, and the resolve loop
                         // depends on (lat==0 && lon==0) as the missing
                         // sentinel. Without the zero, leftover bytes from
@@ -419,7 +419,7 @@ pub(super) fn stage2_node_join(
                         for blob in &mapping_ref[lo..hi] {
                             if blob.ref_count() == 0 { continue; }
                             // A blob is a straddler if it extends past
-                            // either bucket boundary — i.e. it will also
+                            // either bucket boundary - i.e. it will also
                             // be touched by an adjacent bucket worker.
                             if blob.ref_rank_start < bucket_rank_start
                                 || blob.ref_rank_end > bucket_rank_end
@@ -461,7 +461,7 @@ pub(super) fn stage2_node_join(
                             // order, so the referenced nodes in this blob
                             // occupy exactly [ref_rank_start, ref_rank_end).
                             // We assign ranks by incrementing `next_rank`
-                            // instead of calling `rank_if_set` per tuple —
+                            // instead of calling `rank_if_set` per tuple -
                             // membership becomes an O(1) `get()` bit test.
                             let mut next_rank = blob.ref_rank_start;
                             #[cfg(debug_assertions)]
@@ -483,7 +483,7 @@ pub(super) fn stage2_node_join(
                                 let rank = next_rank;
                                 next_rank += 1;
                                 if rank < bucket_rank_start || rank >= bucket_rank_end {
-                                    // Belongs to an adjacent bucket — skip.
+                                    // Belongs to an adjacent bucket - skip.
                                     continue;
                                 }
                                 #[allow(clippy::cast_possible_truncation)]

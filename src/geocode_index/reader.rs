@@ -27,7 +27,7 @@ pub struct ReverseResult<'a> {
     pub address: Option<AddressMatch<'a>>,
     pub street: Option<StreetMatch<'a>>,
     pub interpolation: Option<InterpolationMatch<'a>>,
-    /// One entry per admin level (2–11), smallest-area polygon at each level.
+    /// One entry per admin level (2-11), smallest-area polygon at each level.
     pub admin: Vec<AdminMatch<'a>>,
 }
 
@@ -145,7 +145,7 @@ impl<'a> Candidates<'a> {
 
 /// A memory-mapped reverse geocoding index reader.
 ///
-/// `Send + Sync` — all fields are `Mmap` (which is `Send + Sync`) or plain
+/// `Send + Sync` - all fields are `Mmap` (which is `Send + Sync`) or plain
 /// values.
 pub struct Reader {
     header: Header,

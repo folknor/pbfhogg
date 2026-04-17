@@ -102,7 +102,7 @@ fn query_copenhagen() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
         .expect("reader should open");
 
-    // 55.6761°N, 12.5683°E — Copenhagen City Hall / Rådhuspladsen
+    // 55.6761°N, 12.5683°E - Copenhagen City Hall / Rådhuspladsen
     let result = reader.query(55.6761, 12.5683);
 
     assert!(
@@ -140,7 +140,7 @@ fn query_rural_jutland() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
         .expect("reader should open");
 
-    // 57.5°N, 10.0°E — sparse area in northern Jutland
+    // 57.5°N, 10.0°E - sparse area in northern Jutland
     let result = reader.query(57.5, 10.0);
     let country = result.admin.iter().find(|a| a.admin_level == 2);
     assert!(country.is_some(), "rural point should resolve country");
@@ -157,7 +157,7 @@ fn query_north_sea() {
     let reader = pbfhogg::geocode_index::reader::Reader::open(&dir)
         .expect("reader should open");
 
-    // 56.0°N, 4.0°E — North Sea
+    // 56.0°N, 4.0°E - North Sea
     let result = reader.query(56.0, 4.0);
     assert!(result.address.is_none(), "no address in the North Sea");
     assert!(result.street.is_none(), "no street in the North Sea");

@@ -183,7 +183,7 @@ fn type_prefix_filter() {
         &[],
     );
 
-    // w/ prefix — only ways
+    // w/ prefix - only ways
     let stats = run_filter(&input, &output, &exprs(&["w/building=yes"]), true);
     let c = read_all_elements(&output);
 
@@ -355,7 +355,7 @@ fn multiple_expressions_or_semantics() {
         &[],
     );
 
-    // Both "amenity" and "shop" — OR semantics
+    // Both "amenity" and "shop" - OR semantics
     let stats = run_filter(&input, &output, &exprs(&["amenity", "shop"]), true);
     let c = read_all_elements(&output);
 

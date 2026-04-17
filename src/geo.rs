@@ -325,7 +325,7 @@ fn dp_mark(pts: &[(f64, f64)], start: usize, end: usize, epsilon: f64, keep: &mu
 /// decimicrodegrees). Segments are joined by matching endpoints. Returns
 /// closed rings as vectors of coordinate pairs. Unclosed chains are dropped.
 ///
-/// **Limitation:** This is a greedy assembler — it follows the first available
+/// **Limitation:** This is a greedy assembler - it follows the first available
 /// continuation at each endpoint without backtracking. On ambiguous endpoint
 /// graphs (where multiple unused segments share an endpoint), an unlucky
 /// branch can consume segments into a dead-end chain and prevent a valid
@@ -378,7 +378,7 @@ pub fn assemble_rings(segments: &[&[(i32, i32)]]) -> Vec<Vec<(i32, i32)>> {
                 .copied();
 
             let Some(next_idx) = next else {
-                break; // Dead end — chain is unclosed
+                break; // Dead end - chain is unclosed
             };
 
             used[next_idx] = true;

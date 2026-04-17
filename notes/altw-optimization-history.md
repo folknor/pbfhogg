@@ -138,7 +138,7 @@ exceeds physical memory.
 | Stage 1 (two-pass: IdSetDense + rank-bucketed emission) | 333s | 136s | −59% |
 | Stage 2 (pipelined counting-sort merge) | 612s | 469s | −23% |
 | Stage 3 (parallel pwrite scatter) | 247s | 167s | −32% |
-| Stage 4 (parallel P2c assembly + wire-format way reframe) | 269s | 280s | — |
+| Stage 4 (parallel P2c assembly + wire-format way reframe) | 269s | 280s | - |
 | **Total** | **1,462s** | **1,075s** | **−26%** |
 
 ### April 2026 optimization sprint
@@ -154,18 +154,18 @@ Peak anon: 16.7 GB → 8.7 GB → 5.9 GB (Europe, −65% from original).
 | Pipelined stage 2 bucket loader | `e1ba970` | stage 2: 218s → 181s |
 | Fused rank_if_set + parse-free bucket prep | `06f2a30` | stage 2: 181s → 140s |
 | Wire-format way reframe (stage 4) | `a705fde` | stage 4 assemble: −40% CPU |
-| Shard consolidation (reverted — net loss) | — | +67s overhead |
+| Shard consolidation (reverted - net loss) | - | +67s overhead |
 | Shrink rank record to 12 bytes | `cfa916f` | 25% I/O reduction stages 1B+2 |
 | File-backed coords_by_rank | `6293ade` | Eliminates streamed node merge |
 | Overlap stage 1B + coord pass | `b1bddd5` | Concurrent independent scans |
 | Parallel stage 2 (AtomicUsize dispatch, shared slot buckets) | `5e652f2`+`c7fdb4c` | stage 2: 124s → 91s (−27%) |
-| Stage 4 micro-opts (tried and reverted) | `70c87c1` → `3c59471` | flat — not arithmetic-bound |
+| Stage 4 micro-opts (tried and reverted) | `70c87c1` → `3c59471` | flat - not arithmetic-bound |
 
 **Parallel stage 2 details** (`5e652f2`, `c7fdb4c`): replaced sequential
 producer/consumer (loader thread + sync_channel + single consumer) with N
 workers via AtomicUsize dispatch. Shared 256 slot bucket files with per-bucket
 Mutex<BufWriter> (256 FDs total, FD-safe). Worker-local per-slot-bucket buffers
-flush at 256 KB threshold — avoids both the OOM from unbounded buffering
+flush at 256 KB threshold - avoids both the OOM from unbounded buffering
 (28.2 GB peak anon before fix) and the contention from per-entry locking
 (`s2_resolve_ms` 409s → 62s summed across 6 workers).
 
@@ -177,12 +177,12 @@ Split timer (commit `b99af0c`, UUID `d7a08d2f`) proves the bottleneck:
 
 | Experiment | Stage 4 | majflt | Result |
 |-----------|---------|--------|--------|
-| Baseline (MADV_SEQUENTIAL, 6 workers, work-stealing) | 141s | 374K | — |
-| Per-ref micro-opts: varint skip + batch reads | ~141s | — | Flat, reverted |
-| Per-blob pread replacing mmap | 145s | 19K | Flat — syscall overhead replaced fault overhead |
-| Contiguous partitioning + 3 workers | 405s | 466K | 3× regression — starved consumer |
-| MADV_RANDOM | 157s | 9,167K | Worse — killed readahead |
-| No madvise | 143s | 197K | Tied — fewest faults, kept as new default |
+| Baseline (MADV_SEQUENTIAL, 6 workers, work-stealing) | 141s | 374K | - |
+| Per-ref micro-opts: varint skip + batch reads | ~141s | - | Flat, reverted |
+| Per-blob pread replacing mmap | 145s | 19K | Flat - syscall overhead replaced fault overhead |
+| Contiguous partitioning + 3 workers | 405s | 466K | 3× regression - starved consumer |
+| MADV_RANDOM | 157s | 9,167K | Worse - killed readahead |
+| No madvise | 143s | 197K | Tied - fewest faults, kept as new default |
 
 **Conclusions**: stage 4 at ~141s is a structural floor for this architecture.
 6 workers are needed for CPU parallelism (decompress+reframe); fewer workers
@@ -196,7 +196,7 @@ way-ordered payloads that eliminate the 37 GB mmap entirely).
 **Fuse stage 2+3 (evaluated, ruled out)**: direct pwrite-scatter from stage 2
 into coord_slots would require either billions of 8-byte pwrites (pathological
 syscall cost) or 37 GB of in-memory scatter buffers. Rank order and slot order
-are unrelated — stage 3 exists precisely to bridge this gap with sequential I/O.
+are unrelated - stage 3 exists precisely to bridge this gap with sequential I/O.
 
 **Stage 1B write batching (tried and reverted 2026-04-14, commit `e16674b`)**:
 Replaced per-ref `write_all(12 bytes)` to `BufWriter` with per-bucket blob-local
@@ -211,11 +211,11 @@ per blob. Call count reduced 4.69B → 14.16M (-331×) as designed.
 | `s1b_scan_ms` | 9,990 | 35,490 | +25.5 s |
 | `s1b_rank_ms` | 113,625 | 134,535 | +20.9 s |
 
-BufWriter (256 KB capacity) was already the right batching layer — each
+BufWriter (256 KB capacity) was already the right batching layer - each
 per-ref `write_all` was a cheap 12-byte memcpy into the buffer, not a syscall.
 The staging layer added an extra memcpy (ref → `bucket_staging[bucket]` →
 BufWriter) and scattered writes across 256 `Vec<u8>` tails per blob, thrashing
-L1/TLB. All CPU-bound counters regressed simultaneously — consistent with
+L1/TLB. All CPU-bound counters regressed simultaneously - consistent with
 shared-resource contention, not write-call reduction. The TODO estimate
 (−6s wall) and multi-reviewer consensus (arch-claude, planet-claude,
 perf-codex) were both wrong because they extrapolated from cumulative
@@ -228,7 +228,7 @@ ideas were analyzed on paper and either rejected or downgraded. No
 benchmarks were run; the reasoning below is desk math about memory,
 coalescing ratios, and syscall primitives.
 
-1. **sort-then-coalesced-pwrite fuse** (`planet-claude` sketch) —
+1. **sort-then-coalesced-pwrite fuse** (`planet-claude` sketch) -
    rejected structurally. Stage 3 already does 256 pwrites, each
    150 MB, hitting the pwrite floor for a 37.5 GB positioned-write
    output. A rank bucket holds ~18M entries drawn from 4.69B slot
@@ -237,7 +237,7 @@ coalescing ratios, and syscall primitives.
    zero. Realistic coalescing ratio ~1×, giving ~3B+ pwrites vs a
    budget of ~240M. Cannot win under rank-bucketing.
 
-2. **grouped-by-local-rank emission in stage 1B** (`perf-codex` r1) —
+2. **grouped-by-local-rank emission in stage 1B** (`perf-codex` r1) -
    deferred, design drafted but not implemented. Naive version requires
    55 GB of per-worker per-bucket buffering (doesn't fit). Segmented
    version (~10 blobs buffered per worker, local counting-sort, k-way
@@ -247,13 +247,13 @@ coalescing ratios, and syscall primitives.
    predicted −6s and measured +22.9s, this number is not trustworthy
    without a run. Complexity is moderate-high.
 
-3. **pwritev scatter-gather** — not applicable. `pwritev` writes from
+3. **pwritev scatter-gather** - not applicable. `pwritev` writes from
    multiple source buffers into a **contiguous** file range; stage 3's
    one contiguous 150 MB buffer per bucket degenerates to `pwrite`.
    Would only help a design with many small discontinuous writes,
    which is exactly the design #1 rejected for other reasons.
 
-4. **io_uring SQPOLL + registered buffers + IOPOLL** — filed as future
+4. **io_uring SQPOLL + registered buffers + IOPOLL** - filed as future
    option. Only relevant for a design that legitimately has many small
    pwrites. Stage 3's current 256-pwrite floor doesn't qualify. Noted
    for completeness if a future structural change (e.g., way-ordered
@@ -267,7 +267,7 @@ bottleneck mental model for external_join is unreliable. Future
 estimates should be bounded by micro-benchmarks or skipped in favor
 of direct measurement on a small dataset.
 
-**Stage 4 bottleneck isolated 2026-04-14 — measurement-backed.**
+**Stage 4 bottleneck isolated 2026-04-14 - measurement-backed.**
 The 0330a9b per-blob-pread experiment already carried the diagnostic
 we needed. Its sidecar (UUID `44135291`) split `s4_way_coord_read_ms`
 into two counters:
@@ -312,7 +312,7 @@ e9e1d77, 7738642).** Built as a measurement-first prototype before
 committing to a stage-3 integration, per the lesson that desk
 estimates on this code path over-predict by 5-10×.
 
-Scope — three commits:
+Scope - three commits:
 
 1. **Per-way refcount sidecar** (stage 1A). Captures `refs.len()` per
    way during the existing `scan_way_refs` pass. Emits varint stream
@@ -329,7 +329,7 @@ Scope — three commits:
 3. **Stage 4 alternate path** (gated by `PBFHOGG_COORD_PAYLOADS_PROTOTYPE`
    env var). When enabled, each way-blob worker preads its blob's
    payload into a worker-local buffer and de-interleaves raw varint
-   bytes into PBF's `packed_lats` / `packed_lons` fields — no zigzag
+   bytes into PBF's `packed_lats` / `packed_lons` fields - no zigzag
    decode, no re-encode, because the payload byte layout matches PBF
    wire format 1:1. Combines "fewer bytes to read" (option 1) with
    "skip delta encode" (option 2) in a single format.
@@ -342,7 +342,7 @@ Measured results (Europe, commit `7738642`, UUID `99f6b8bc`):
 | Stage 1 | 81 s | 94 s | +13 s |
 | Stage 2 | 87 s | 88 s | +1 s |
 | Stage 3 | 51 s | 52 s | +1 s |
-| Transform pass | — | 65 s | — |
+| Transform pass | - | 65 s | - |
 | Stage 4 | 141 s | 130 s | **−11 s** |
 | `s4_way_coord_read_ms` cumul | 370,200 | 77,316 | −5× |
 | `s4_way_delta_encode_ms` cumul | 52,000 | 0 | eliminated |
@@ -361,7 +361,7 @@ equivalent to the mmap-read + delta-encode path.
 saves ~11 s wall (coord_read 62 s → 13 s, plus zero delta_encode).
 The transform pass costs 65 s wall end-to-end, dominated by the
 20.8 GB sequential output write to NVMe. This is the prototype tax
-— if stage 3 emitted coord_payloads directly (integrated design),
+- if stage 3 emitted coord_payloads directly (integrated design),
 this pass goes away.
 
 **Net projection if integrated:**
@@ -414,7 +414,7 @@ on top of the CPU and I/O wins.
 | Stage 1 | 81 s | 79 s | −2 s |
 | Stage 2 | 87 s | 90 s | +3 s |
 | Stage 3 | 51 s | 42.5 s | **−8.5 s** (no coord_slots pwrite) |
-| Finalize | — | 26.5 s | +26.5 s (new) |
+| Finalize | - | 26.5 s | +26.5 s (new) |
 | Stage 4 | 141 s | 129 s | **−12 s** (smaller coord read, no delta-encode) |
 
 **Planet stage breakdown (UUID `c021dd91`, commit `3d977a0`):**
@@ -424,7 +424,7 @@ on top of the CPU and I/O wins.
 | Stage 1 | 231 s | 232 s | +1 s |
 | Stage 2 | 235 s | 212 s | −23 s |
 | Stage 3 | 154 s | 108 s | **−46 s** (no coord_slots pwrite) |
-| Finalize | — | 68 s | +68 s (new) |
+| Finalize | - | 68 s | +68 s (new) |
 | Stage 4 | 291 s | 259 s | **−32 s** |
 
 **Non-wall-time benefits (all measured on planet, UUID `c021dd91`):**
@@ -432,13 +432,13 @@ on top of the CPU and I/O wins.
 | Metric | Baseline planet | Integrated planet | Δ |
 |---|---|---|---|
 | coord_slots file | 99 GB | 0 (not created) | eliminated |
-| coord_payloads file | — | 54.8 GB | (replaces coord_slots) |
+| coord_payloads file | - | 54.8 GB | (replaces coord_slots) |
 | Scratch peak | ~300 GB | ~256 GB | **−44 GB** |
 | `s3_bytes_written` (coord_slots pwrite) | 99 GB | 0 | eliminated |
 | `s4_majflt_delta` | 555,141 | 3,256 | **−99.4%** |
 | `s4_minflt_delta` | 3,170,288 | 1,026,905 | −68% |
 | `s4_way_delta_encode_ms` cumul | 68,582 | 0 | eliminated |
-| Stage 4 mmap virtual | 99 GB | — | eliminated |
+| Stage 4 mmap virtual | 99 GB | - | eliminated |
 
 The 99 GB coord_slots mmap across 6 workers was the dominant cause
 of cross-workload page-cache disruption in the baseline; integrated
@@ -447,23 +447,23 @@ Stage 4's major-fault count dropped by two orders of magnitude.
 
 **Verification**: `brokkr verify add-locations-to-ways --dataset
 denmark --mode external` with and without `PBFHOGG_COORD_SLOTS=1`
-(the escape hatch) produce bit-identical verify logs — integrated
+(the escape hatch) produce bit-identical verify logs - integrated
 default and pre-integration paths yield byte-for-byte identical
 output PBFs.
 
 **Ship structure (commits):**
 
-1. `77490b7` — extract per-blob delta-encode helper (Stage 1 of plan).
-2. `c96566f` — blob↔slot-bucket classification helper (Stage 2).
-3. `c12a642` — dual-emit stage 3 + finalize pass behind
+1. `77490b7` - extract per-blob delta-encode helper (Stage 1 of plan).
+2. `c96566f` - blob↔slot-bucket classification helper (Stage 2).
+3. `c12a642` - dual-emit stage 3 + finalize pass behind
    `PBFHOGG_COORD_PAYLOADS_INTEGRATED=1` env var (Stage 3).
-4. `3d977a0` — default flip to integrated, remove prototype transform
+4. `3d977a0` - default flip to integrated, remove prototype transform
    and `PBFHOGG_COORD_PAYLOADS_INTEGRATED` / `PBFHOGG_COORD_PAYLOADS_PROTOTYPE`
    env vars, add `PBFHOGG_COORD_SLOTS=1` pre-integration escape hatch
    (Stage 5).
 5. **Stage 6 cleanup (same-day):** dropped the `PBFHOGG_COORD_SLOTS`
    escape hatch and the entire `CoordSlots` struct + mmap path. Stage
-   3's `shared_file`/`/dev/null` dummy gone — the function no longer
+   3's `shared_file`/`/dev/null` dummy gone - the function no longer
    touches coord_slots at all. Stage 4's `assemble_block` Way branch
    becomes a hard error (it was already unreachable under the
    sorted-PBF + indexed-PBF requirement). Counters renamed
@@ -482,7 +482,7 @@ Key architectural changes:
   sparse i64 node IDs.
 - **Two-pass stage 1**: pass A builds shared atomic `IdSetDense` of referenced
   node IDs; pass B emits rank-bucketed records with `slot_pos` pre-computed
-  from sidecar prefix sums. Workers are fully independent — no global
+  from sidecar prefix sums. Workers are fully independent - no global
   sequential allocator.
 - **Wire-format way reframe**: stage 4 way blobs skip full PrimitiveBlock
   decode + BlockBuilder re-encode. Only decodes field 8 (refs) to count refs
@@ -505,7 +505,7 @@ Stage 4 sub-phase profiling (Europe, commit `b99af0c`, UUID `d7a08d2f`):
 
 The remaining stage 4 cost is memory-fault bound at ~141s on this hardware.
 Extensively tested: per-blob pread, contiguous partitioning, MADV_RANDOM,
-no-advice — none moved wall time. The coord_slots mmap access pattern (6
+no-advice - none moved wall time. The coord_slots mmap access pattern (6
 workers × 37 GB × scattered reads) is a structural bottleneck. Breaking it
 requires a fundamentally different coord representation, not read-primitive
 or scheduling changes.

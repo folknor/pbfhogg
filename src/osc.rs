@@ -16,7 +16,7 @@ use rustc_hash::FxHashMap;
 
 use crate::read::elements::MemberType;
 
-// Box<dyn Error> is intentional — OSC parsing is CLI-internal, callers only
+// Box<dyn Error> is intentional - OSC parsing is CLI-internal, callers only
 // display errors. String errors include the missing attribute name for context.
 type ParseResult<T> = Result<T, Box<dyn std::error::Error>>;
 

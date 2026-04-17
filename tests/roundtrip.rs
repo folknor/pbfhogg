@@ -140,7 +140,7 @@ fn roundtrip_dense_nodes_with_metadata() {
         _ => panic!("expected DenseNode"),
     }
 
-    // Node 2 — tagless
+    // Node 2 - tagless
     match &elements[1] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 2002);
@@ -155,7 +155,7 @@ fn roundtrip_dense_nodes_with_metadata() {
         _ => panic!("expected DenseNode"),
     }
 
-    // Node 3 — southern/western hemisphere
+    // Node 3 - southern/western hemisphere
     match &elements[2] {
         Element::DenseNode(dn) => {
             assert_eq!(dn.id(), 3003);
@@ -650,7 +650,7 @@ fn roundtrip_direct_io() {
         _ => panic!("expected Way"),
     }
 
-    // Verify exact file size — no padding left over
+    // Verify exact file size - no padding left over
     let meta = std::fs::metadata(&path).unwrap();
     assert!(meta.len() > 0, "file should not be empty");
 }
@@ -837,7 +837,7 @@ fn roundtrip_mixed_metadata() {
         writer.flush().unwrap();
     }
 
-    // Read back — all 3 nodes must decode without panic
+    // Read back - all 3 nodes must decode without panic
     let reader = BlobReader::new(Cursor::new(&buf));
     let blobs: Vec<_> = reader.map(|b| b.unwrap()).collect();
     let prim = match blobs[1].decode().unwrap() {

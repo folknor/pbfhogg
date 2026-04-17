@@ -1,4 +1,4 @@
-//! Stage 3: Slot reorder — emit per-blob coord_payloads via the integrated
+//! Stage 3: Slot reorder - emit per-blob coord_payloads via the integrated
 //! pipeline (the flat coord_slots intermediate was retired 2026-04).
 
 #[cfg(feature = "linux-direct-io")]
@@ -104,7 +104,7 @@ fn scatter_bucket_entries(
 }
 
 /// Pre-allocates the output file to `total_slots * 8` bytes (zero-filled
-/// by the OS). Empty buckets need no explicit zero-write — the file is
+/// by the OS). Empty buckets need no explicit zero-write - the file is
 /// already zeroed.
 #[hotpath::measure]
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
@@ -117,7 +117,7 @@ pub(super) fn stage3_slot_reorder(
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
     // keeps the smallest-bucket-width = range_size, which the caller
-    // sized so that range_size ≥ max_blob_slots — preserving the
+    // sized so that range_size ≥ max_blob_slots - preserving the
     // 2-piece straddler invariant for small inputs. (See
     // `ResolvedEntry::slot_bucket` for the matching routing logic.)
     let range_size = total_slots / slot_bucket_count as u64;

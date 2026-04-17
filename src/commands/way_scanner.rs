@@ -1,6 +1,6 @@
 //! Way-ref-only wire-format scanner for extracting way node references from PBF blobs.
 //!
-//! Bypasses [`PrimitiveBlock`] construction — no string table parsing,
+//! Bypasses [`PrimitiveBlock`] construction - no string table parsing,
 //! no group_ranges allocation. Only extracts way IDs and their node ref lists.
 //!
 //! Used by passes that only need `way.id()` + `way.refs()`:

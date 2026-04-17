@@ -28,7 +28,7 @@ Decode all 59M elements then write through `BlockBuilder` + `PbfWriter` to `/dev
 | zstd:3 | 8.1s | **6.2s** | pipelined hides compression cost |
 | zlib:6 | 14.5s | **6.3s** | 2.3x speedup from parallel compression |
 
-With pipelined writes, all compression modes converge to ~6.2s — the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies).
+With pipelined writes, all compression modes converge to ~6.2s - the decode + wire-format serialization floor. All element types are encoded directly to protobuf wire format using reusable scratch buffers (no per-element allocation, no external protobuf dependencies).
 
 ## CLI command benchmarks
 
@@ -121,7 +121,7 @@ At planet scale on a 30 GB machine, `external` is 3.9x faster than `dense` (24 m
 
 ### O_DIRECT for planet-scale I/O
 
-Planet-scale operations read and write 80 GB+, polluting the entire page cache. The `--direct-io` flag bypasses the page cache entirely. Wall time is typically unchanged at country scale (CPU-bound) — the benefit is cache hygiene at planet scale and avoiding eviction of useful data from co-resident processes.
+Planet-scale operations read and write 80 GB+, polluting the entire page cache. The `--direct-io` flag bypasses the page cache entirely. Wall time is typically unchanged at country scale (CPU-bound) - the benefit is cache hygiene at planet scale and avoiding eviction of useful data from co-resident processes.
 
 O_DIRECT wins for concurrent read/write patterns (merge). For sequential single-file passthrough (`cat`), buffered I/O is actually faster because the page cache prefetch helps.
 
@@ -133,9 +133,9 @@ The `--io-uring` flag replaces the synchronous writer thread with io_uring `Writ
 
 With pipelined writes (the production path), compression is dispatched to rayon and all modes converge to the decode + serialization floor. The choice mainly affects file size and downstream read speed:
 
-- `none` — fastest writes, largest files, ideal for intermediate files or erofs storage
-- `zlib` — standard PBF compression, compatible with all tools
-- `zstd` — better ratio and faster decompression, but not all consumers support it yet
+- `none` - fastest writes, largest files, ideal for intermediate files or erofs storage
+- `zlib` - standard PBF compression, compatible with all tools
+- `zstd` - better ratio and faster decompression, but not all consumers support it yet
 
 ## System
 

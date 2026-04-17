@@ -11,7 +11,7 @@ use protohoggr::{encode_bytes_field_always, encode_varint};
 /// Assemble a PrimitiveBlock protobuf from raw StringTable bytes,
 /// raw/re-encoded group bytes, and scalar fields.
 ///
-/// The output is the serialized PrimitiveBlock message (not framed — the caller
+/// The output is the serialized PrimitiveBlock message (not framed - the caller
 /// wraps it via `PbfWriter::write_primitive_block` or similar).
 ///
 /// # Arguments

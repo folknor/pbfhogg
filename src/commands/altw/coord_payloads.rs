@@ -4,7 +4,7 @@
 //! Each way blob's coordinates are delta-varint encoded and stored contiguously;
 //! stage 4 preads one payload per way blob instead of mmapping the flat
 //! coord_slots array. Measured compression is ~1.81× vs coord_slots (37.5 GB
-//! Europe → 20.8 GB; 99 GB planet projects to ~55 GB). The original 3–4×
+//! Europe → 20.8 GB; 99 GB planet projects to ~55 GB). The original 3-4×
 //! estimate did not account for OSM's moderate varint widths after delta
 //! encoding; see notes/altw-optimization-history.md for the reconciliation.
 //! The integration is pursued primarily for its non-wall benefits
@@ -48,7 +48,7 @@ use super::COORD_SLOT_SIZE;
 /// Two-piece state for a straddler blob in the integrated stage 3 path.
 ///
 /// Invariant: transitions `None → Some(Left|Right) → Some(Both)`.
-/// Workers never delta-encode straddler pieces — raw slot bytes only.
+/// Workers never delta-encode straddler pieces - raw slot bytes only.
 pub(super) enum StraddlerSlot {
     Left(Vec<u8>),
     Right(Vec<u8>),
@@ -397,7 +397,7 @@ pub(super) fn build_blob_location_router(
                     if per_way_rcs.blob_has_nonzero_refs(blob_idx)? {
                         return Err(format!(
                             "blob {blob_idx} has non-zero ref counts but no worker manifest \
-                             entry and no straddler staging — upstream bug"
+                             entry and no straddler staging - upstream bug"
                         )
                         .into());
                     }
@@ -663,7 +663,7 @@ mod tests {
         let rcs: &[u32] = &[];
         let mut out = vec![0xAAu8, 0xBBu8];
         encode_blob_payload(&cb, rcs, &mut out).expect("encode");
-        // Output unchanged — only the sentinel bytes we put in.
+        // Output unchanged - only the sentinel bytes we put in.
         assert_eq!(out, [0xAAu8, 0xBBu8]);
     }
 
@@ -763,10 +763,10 @@ mod tests {
     #[test]
     fn router_build_happy_path() {
         // 4 blobs:
-        //   blob 0: 2 ways [2,1] refs — fully-contained in worker 0
-        //   blob 1: 1 way [3] refs   — fully-contained in worker 1
-        //   blob 2: 1 way [2] refs   — straddler (Both)
-        //   blob 3: 0 ways           — zero-ref, no manifest, no straddler
+        //   blob 0: 2 ways [2,1] refs - fully-contained in worker 0
+        //   blob 1: 1 way [3] refs   - fully-contained in worker 1
+        //   blob 2: 1 way [2] refs   - straddler (Both)
+        //   blob 3: 0 ways           - zero-ref, no manifest, no straddler
         let coords_b0: &[(i32, i32)] = &[(10, 20), (30, 40), (50, 60)];
         let coords_b1: &[(i32, i32)] = &[(100, 200), (300, 400), (500, 600)];
         let coords_b2: &[(i32, i32)] = &[(1, 2), (3, 4)];
@@ -838,7 +838,7 @@ mod tests {
         router.pread_blob_payload(2, &mut buf).expect("pread 2");
         assert_eq!(reconstruct_coords(&buf, rcs_b2), coords_b2);
 
-        // blob 3: zero refs — payload is empty.
+        // blob 3: zero refs - payload is empty.
         router.pread_blob_payload(3, &mut buf).expect("pread 3");
         assert!(buf.is_empty(), "zero-ref blob payload must be empty");
     }

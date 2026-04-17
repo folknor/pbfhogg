@@ -1,6 +1,6 @@
 //! Node-only wire-format scanner for extracting (id, lat, lon) from PBF blobs.
 //!
-//! Bypasses [`PrimitiveBlock`] construction entirely — no string table parsing,
+//! Bypasses [`PrimitiveBlock`] construction entirely - no string table parsing,
 //! no group_ranges allocation, no UTF-8 validation. This eliminates the cross-thread
 //! alloc/free retention problem that causes 25+ GB heap accumulation at Europe/planet
 //! scale when using the pipelined reader.
@@ -15,7 +15,7 @@
 //! - **DenseNodes only.** Only parses PrimitiveGroup field 2 (DenseNodes). Non-dense
 //!   Node messages (field 1) are silently skipped. All modern PBF writers (osmium,
 //!   pbfhogg, Planetiler, osm2pgsql) use dense encoding exclusively. Pre-2012 PBFs
-//!   or hand-crafted test files may use non-dense nodes — those would produce missing
+//!   or hand-crafted test files may use non-dense nodes - those would produce missing
 //!   coordinates without error.
 //!
 //! - **Sorted PBF assumption.** The indexdata-based blob skip (`ElemKind::Node` check)
@@ -27,7 +27,7 @@
 
 use super::Result;
 
-/// Compact node coordinate tuple. 16 bytes — id (i64) + lat (i32) + lon (i32).
+/// Compact node coordinate tuple. 16 bytes - id (i64) + lat (i32) + lon (i32).
 #[derive(Clone, Copy)]
 pub(crate) struct NodeTuple {
     pub id: i64,
@@ -37,11 +37,11 @@ pub(crate) struct NodeTuple {
 
 /// Extract (id, lat, lon) tuples from decompressed PrimitiveBlock bytes.
 ///
-/// Zero heap allocations per block — reads wire format inline, appends to caller's Vec.
+/// Zero heap allocations per block - reads wire format inline, appends to caller's Vec.
 /// The caller owns the Vec and can clear+reuse it across blocks.
 ///
 /// Only parses DenseNodes (field 2 in PrimitiveGroup). Non-dense Node messages
-/// (field 1) are skipped — all modern PBFs use dense encoding exclusively.
+/// (field 1) are skipped - all modern PBFs use dense encoding exclusively.
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub(crate) fn extract_node_tuples(
     decompressed: &[u8],

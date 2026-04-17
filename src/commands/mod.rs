@@ -43,7 +43,7 @@ use crate::file_writer::FileWriter;
 use crate::writer::{Compression, PbfWriter};
 use crate::PrimitiveBlock;
 
-// Box<dyn Error> is intentional — commands are CLI internals, callers only display
+// Box<dyn Error> is intentional - commands are CLI internals, callers only display
 // errors and exit. Typed error enums would add complexity with no matching benefit.
 pub(crate) type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -565,7 +565,7 @@ pub(crate) fn parallel_classify_phase<S: Send, R: Send>(
 ///
 /// Use ONLY for sparse paths where per-worker `S` is bounded at planet
 /// scale (relation classify: ~68 MB per worker; relation closure members:
-/// ~13 MB per worker). NOT safe for dense paths — per-worker Vec or
+/// ~13 MB per worker). NOT safe for dense paths - per-worker Vec or
 /// IdSetDense accumulation is unbounded for node/way classify.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn parallel_classify_accumulate<S: Send>(
@@ -647,7 +647,7 @@ pub(crate) fn parallel_classify_accumulate<S: Send>(
     Ok(())
 }
 
-/// Warn if the input header declares `LocationsOnWays` — inline way-node
+/// Warn if the input header declares `LocationsOnWays` - inline way-node
 /// coordinates are not propagated through re-encoding.
 pub(crate) fn warn_locations_on_ways_loss(header: &crate::HeaderBlock) {
     if header.has_locations_on_ways() {
@@ -819,7 +819,7 @@ pub(crate) fn element_metadata<'a>(info: &crate::Info<'a>) -> Option<Metadata<'a
 /// Extract [`Metadata`] from a [`DenseNode`](crate::DenseNode).
 ///
 /// Returns `None` if the node has no info block. On `user()` error (string
-/// table corruption), defaults to empty string — consistent with the
+/// table corruption), defaults to empty string - consistent with the
 /// Node/Way/Relation path.
 pub(crate) fn dense_node_metadata<'a>(dn: &'a crate::DenseNode<'a>) -> Option<Metadata<'a>> {
     dn.info()
@@ -883,7 +883,7 @@ pub(crate) fn dense_node_raw_metadata(dn: &crate::DenseNode<'_>) -> Option<RawMe
 /// Returns `true` if indexdata is present, `false` if absent but `force` is set.
 /// The `reason` should be a complete sentence explaining why indexdata matters,
 /// e.g. "input PBF has no blob-level indexdata. Without indexdata, the type
-/// filter is a no-op — all blobs are decompressed (significantly slower)."
+/// filter is a no-op - all blobs are decompressed (significantly slower)."
 pub(crate) fn require_indexdata(
     path: &Path,
     direct_io: bool,
@@ -945,7 +945,7 @@ pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// OSM ID ordering — canonical sort order matching libosmium
+// OSM ID ordering - canonical sort order matching libosmium
 // ---------------------------------------------------------------------------
 
 /// Sort key for OSM element IDs in canonical order.
@@ -954,7 +954,7 @@ pub(crate) fn require_sorted_err(path: &Path, context: &str) -> Result<()> {
 /// then positive IDs (1, 2, 3, ...). Matches libosmium's sort comparator.
 ///
 /// For positive-only IDs (all production PBFs), this is equivalent to plain
-/// i64 comparison — the `(2, id)` tuple compares identically to raw `id`.
+/// i64 comparison - the `(2, id)` tuple compares identically to raw `id`.
 #[inline]
 pub(crate) fn osm_id_key(id: i64) -> (u8, i64) {
     if id > 0 {
@@ -1018,7 +1018,7 @@ pub(crate) fn blob_osm_first_id(min_id: i64, max_id: i64) -> i64 {
 
 /// Check if ALL OsmData blobs in a PBF have indexdata.
 ///
-/// Uses header-only reads (no decompression, no blob data I/O) — just
+/// Uses header-only reads (no decompression, no blob data I/O) - just
 /// blob headers + seeks. Returns false if any data blob lacks indexdata
 /// or if the file has no data blobs.
 pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
@@ -1163,7 +1163,7 @@ mod tests {
         })
         .expect("should not fail");
 
-        // 3, 3, 1 — block limit fires each time (3×2000=6000 >= 5000 too, but count hits first)
+        // 3, 3, 1 - block limit fires each time (3×2000=6000 >= 5000 too, but count hits first)
         assert_eq!(batch_sizes, vec![3, 3, 1]);
     }
 

@@ -14,7 +14,7 @@ use crate::commands::RawBlobFrame;
 /// Estimate a blob's in-flight memory cost for byte-budgeted batch sizing.
 ///
 /// For indexed blobs whose ID range doesn't overlap the diff, returns just
-/// the raw frame size (pure passthrough — no decompression needed).
+/// the raw frame size (pure passthrough - no decompression needed).
 /// For potential rewrite blobs, returns raw_size × 21 (raw + ~16× decompressed
 /// + ~5× rewrite output estimate).
 pub(super) fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> usize {
@@ -41,7 +41,7 @@ pub(super) fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> u
 /// returns false (no element in the block has a matching diff ID). In that
 /// case the blob is passed through raw, and the creates are emitted afterward
 /// by the gap-create logic, which means they may appear out of strict ID order
-/// relative to the passthrough block. This is intentional — rewriting an
+/// relative to the passthrough block. This is intentional - rewriting an
 /// otherwise unaffected block just to interleave pure creates would be wasted
 /// work. OSM consumers handle non-strictly-sorted IDs across block boundaries.
 pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> bool {
@@ -81,11 +81,11 @@ pub(super) fn element_kind(element: &Element<'_>) -> ElemKind {
 
 /// Classification result from Phase 1 parallel classify.
 pub(super) enum ClassifyResult {
-    /// No diff overlap — raw passthrough.
+    /// No diff overlap - raw passthrough.
     Passthrough(BlobIndex, bool),
-    /// Range overlapped but no element affected — raw passthrough.
+    /// Range overlapped but no element affected - raw passthrough.
     FalsePositive(BlobIndex, bool),
-    /// At least one element affected — needs rewrite.
+    /// At least one element affected - needs rewrite.
     NeedsRewrite(PrimitiveBlock, BlobIndex),
 }
 
@@ -154,7 +154,7 @@ pub(super) fn classify_only(
         None
     };
 
-    // Range overlaps — full parse + precise check.
+    // Range overlaps - full parse + precise check.
     let raw = std::mem::take(buf);
     let block =
         parse_primitive_block_from_bytes_owned(&Bytes::from(raw)).map_err(|e| e.to_string())?;

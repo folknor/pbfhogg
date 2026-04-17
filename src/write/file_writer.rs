@@ -20,7 +20,7 @@ fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
 /// A file writer that is either buffered (normal) or direct I/O (`O_DIRECT`).
 ///
 /// Implements [`Write`] by delegating to the active variant.
-// Not #[non_exhaustive] — variants are construction-controlled (users don't match on this).
+// Not #[non_exhaustive] - variants are construction-controlled (users don't match on this).
 pub enum FileWriter {
     /// Standard 256 KB `BufWriter<File>`.
     Buffered(BufWriter<File>),

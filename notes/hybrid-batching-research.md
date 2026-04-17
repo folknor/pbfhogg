@@ -26,20 +26,20 @@ Dispatcher thread              Workers (N threads)
 ```
 
 Contention points:
-1. `rx.lock()` — all N workers compete for the same mutex
-2. `guard.recv()` — channel receive under lock
-3. `result_tx.send()` — bounded channel, can block if consumer is slow
+1. `rx.lock()` - all N workers compete for the same mutex
+2. `guard.recv()` - channel receive under lock
+3. `result_tx.send()` - bounded channel, can block if consumer is slow
 
 ## Measured baselines (Europe, 35 GB, commit `75ad21d`, plantasjen)
 
 tags-filter-twopass: 105s total
-- Pass 1 (classify): 34s — `parallel_classify_phase`
+- Pass 1 (classify): 34s - `parallel_classify_phase`
 - Gap (closure + deps): 33s
-- Pass 2 (write): 37s — inline pread worker loop
+- Pass 2 (write): 37s - inline pread worker loop
 
 Pre-pread (commit `1e6e70c`): 366s (sequential BlobReader).
 The pread conversion was a 3.4x improvement. The "~8s regression"
-claim needs clarification — it may be relative to a theoretical
+claim needs clarification - it may be relative to a theoretical
 optimal, not a measured baseline.
 
 ## What hybrid batching means
@@ -91,7 +91,7 @@ more likely from:
 
 1. Measure first: run hotpath on tags-filter pass 2 to see where
    the 37s actually goes. If decode+write is 35s and overhead is 2s,
-   batching can recover at most 2s — not 8s.
+   batching can recover at most 2s - not 8s.
 
 2. If measurement shows overhead > 5s: implement batch drain.
    BATCH_SIZE = 8-16 (tuned by blob count / decode_threads / 4).
@@ -104,10 +104,10 @@ more likely from:
 ## Scope
 
 Applies to:
-- `parallel_classify_phase` (mod.rs) — classify paths
-- `parallel_classify_accumulate` (mod.rs) — accumulate paths
+- `parallel_classify_phase` (mod.rs) - classify paths
+- `parallel_classify_accumulate` (mod.rs) - accumulate paths
 - Tags-filter pass 2 write workers (tags_filter.rs)
-- Multi-extract write workers (extract.rs) — `multi_extract_pread_write`
+- Multi-extract write workers (extract.rs) - `multi_extract_pread_write`
 
 All share the same Mutex<Receiver> dispatch pattern.
 
@@ -118,5 +118,5 @@ All share the same Mutex<Receiver> dispatch pattern.
    does the 8s come from?
 2. Should we profile pass 2 specifically, or is the 37s already
    well-understood from existing hotpath data?
-3. Is there a simpler approach than batch drain — e.g., crossbeam
+3. Is there a simpler approach than batch drain - e.g., crossbeam
    channel (lock-free) instead of Mutex<mpsc::Receiver>?

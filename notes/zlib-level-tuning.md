@@ -2,16 +2,16 @@
 
 ## Current state
 
-Default: `Compression::Zlib(6)` — matches osmium's `Z_DEFAULT_COMPRESSION`.
+Default: `Compression::Zlib(6)` - matches osmium's `Z_DEFAULT_COMPRESSION`.
 User-configurable via `--compression zlib:N` (0-9). Backend: `zlib-rs`
 (pure Rust, faster than zlib-ng for decompression, 15-19% slower for
-sync compression — but pipelined mode is decode-bound so no difference).
+sync compression - but pipelined mode is decode-bound so no difference).
 
 ## The question
 
 For pipelined write, zlib compression runs on rayon workers in parallel.
 The writer thread is I/O-bound (sequential writes). The pipeline stalls
-when compression is slower than I/O — which happens at higher zlib levels.
+when compression is slower than I/O - which happens at higher zlib levels.
 
 At what level does compression become the bottleneck? What's the
 compression ratio vs throughput tradeoff?
@@ -57,7 +57,7 @@ constraint. The PBF is ~3-4x larger but write is I/O-limited.
    `brokkr cat --dataset denmark --compression zlib:1 --bench`
    Compare wall time, output size, compression CPU time.
 
-2. **Measure rayon worker utilization** at each level — are workers
+2. **Measure rayon worker utilization** at each level - are workers
    idle (I/O-bound) or saturated (CPU-bound)?
 
 3. **Consider adaptive level:** start at level 6, if worker queue

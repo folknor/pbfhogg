@@ -28,7 +28,7 @@ pub(super) enum BlobBucketIntersection {
 /// Empty blobs (slot range of length 0) are omitted.
 ///
 /// Returns `Err` if any intersecting blob's slot range is wider than
-/// the bucket's (structural assumption violated — indicates a bug upstream).
+/// the bucket's (structural assumption violated - indicates a bug upstream).
 pub(super) fn classify_blobs_in_bucket(
     bucket_start_slot: u64,
     bucket_end_slot: u64,
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn classify_blob_wider_than_bucket_errors() {
-        // Blob 0: [0, 100), bucket: [0, 10) — blob is 10x wider than bucket
+        // Blob 0: [0, 100), bucket: [0, 10) - blob is 10x wider than bucket
         let result = classify_blobs_in_bucket(0, 10, &[0], 100);
         assert!(result.is_err(), "expected Err for blob wider than bucket");
     }

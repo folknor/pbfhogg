@@ -205,7 +205,7 @@ pbfhogg tags-filter [OPTIONS] --output <OUTPUT> <FILE> [EXPRESSIONS]...
 
 ### diff
 
-Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering — deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
+Compare two PBF files and show differences. Uses content equality (coordinates, tags, refs, members) rather than version/timestamp ordering - deterministic regardless of metadata completeness (see [DEVIATIONS](DEVIATIONS.md#diff-content-equality-vs-version-ordering)).
 
 With `--format osc`, generates an OSC diff file instead of text output. Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are not valid with `--format osc`. OSC-only flags (`--increment-version`, `--update-timestamp`) are not valid with `--format text`.
 
@@ -229,7 +229,7 @@ pbfhogg diff [OPTIONS] <OLD> <NEW>
 | `--ignore-user` | Compatibility flag (already ignored by content-equality mode) |
 | `--direct-io` | Use O_DIRECT to bypass page cache |
 
-With `--format osc`, produces a lossless roundtrip — applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
+With `--format osc`, produces a lossless roundtrip - applying the derived OSC to the old PBF reproduces the new PBF exactly (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
 ### getid
 
@@ -281,9 +281,9 @@ pbfhogg getparents [OPTIONS] --output <OUTPUT> <FILE> [IDS]...
 
 Embed node coordinates in ways. Three index strategies:
 
-- **dense** (default) — Direct-mapped mmap array. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires ~30+ GB free memory to avoid page cache thrashing.
-- **sparse** — Planetiler-inspired chunk-indexed sparse array. Bounded memory (~540 MB). Slower than dense at all scales. No temp disk needed. Works on any PBF.
-- **external** — Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). 3.9x faster than dense at planet scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~300 GB at planet.
+- **dense** (default) - Direct-mapped mmap array. Fastest when the working set fits in RAM. At planet scale (~16 GB touched), requires ~30+ GB free memory to avoid page cache thrashing.
+- **sparse** - Planetiler-inspired chunk-indexed sparse array. Bounded memory (~540 MB). Slower than dense at all scales. No temp disk needed. Works on any PBF.
+- **external** - Double radix permutation via 4-stage pipeline. Bounded memory (~17 GB at planet). 3.9x faster than dense at planet scale. Requires sorted PBF (Sort.Type\_then\_ID) and indexdata. Uses ~112 GB temp disk at Europe, ~300 GB at planet.
 
 By default, untagged nodes not referenced by a relation are dropped from output.
 
@@ -386,28 +386,28 @@ Which commands support `--direct-io` (O_DIRECT bypass of page cache) and `--io-u
 
 | Command | Reads PBF | Writes PBF | `--direct-io` | `--io-uring` | Notes |
 |---------|:---------:|:----------:|:-------------:|:------------:|-------|
-| inspect | Yes | — | Yes | — | Read-only |
-| inspect tags | Yes | — | Yes | — | Read-only |
-| inspect --nodes | Yes | — | Yes | — | Read-only |
-| check --ids | Yes | — | Yes | — | Read-only |
-| check --refs | Yes | — | Yes | — | Read-only |
-| cat | Yes | Yes | Yes (R+W) | — | Passthrough + filtered paths |
+| inspect | Yes | - | Yes | - | Read-only |
+| inspect tags | Yes | - | Yes | - | Read-only |
+| inspect --nodes | Yes | - | Yes | - | Read-only |
+| check --ids | Yes | - | Yes | - | Read-only |
+| check --refs | Yes | - | Yes | - | Read-only |
+| cat | Yes | Yes | Yes (R+W) | - | Passthrough + filtered paths |
 | cat --dedupe | Yes | Yes | Yes (R+W) | Yes | Via merge-pbf path |
 | sort | Yes | Yes | Yes (R+W) | Yes | |
-| renumber | Yes | Yes | Yes (R+W) | — | |
-| extract | Yes | Yes | Yes (R+W) | — | All strategies |
-| tags-filter | Yes | Yes | Yes (R+W) | — | Both single-pass and two-pass |
-| getid | Yes | Yes | Yes (R+W) | — | Including --add-referenced |
-| getid --invert | Yes | Yes | Yes (R+W) | — | |
-| getparents | Yes | Yes | Yes (R+W) | — | |
-| time-filter | Yes | Yes | Yes (R+W) | — | |
-| add-locations-to-ways | Yes | Yes | Yes (R+W) | — | All index types |
+| renumber | Yes | Yes | Yes (R+W) | - | |
+| extract | Yes | Yes | Yes (R+W) | - | All strategies |
+| tags-filter | Yes | Yes | Yes (R+W) | - | Both single-pass and two-pass |
+| getid | Yes | Yes | Yes (R+W) | - | Including --add-referenced |
+| getid --invert | Yes | Yes | Yes (R+W) | - | |
+| getparents | Yes | Yes | Yes (R+W) | - | |
+| time-filter | Yes | Yes | Yes (R+W) | - | |
+| add-locations-to-ways | Yes | Yes | Yes (R+W) | - | All index types |
 | apply-changes | Yes | Yes | Yes (R+W) | Yes | Production merge path |
-| diff | Yes | — | Yes | — | Read-only (text output) |
-| diff --format osc | Yes | — | Yes | — | Read-only (OSC XML output) |
-| derive-changes (via `diff --format osc`) | Yes | — | Yes | — | Read-only (OSC XML output) |
-| build-geocode-index | Yes | — | Yes | — | Binary index output, not PBF |
-| merge-changes | — | — | — | — | OSC-only, no PBF I/O |
+| diff | Yes | - | Yes | - | Read-only (text output) |
+| diff --format osc | Yes | - | Yes | - | Read-only (OSC XML output) |
+| derive-changes (via `diff --format osc`) | Yes | - | Yes | - | Read-only (OSC XML output) |
+| build-geocode-index | Yes | - | Yes | - | Binary index output, not PBF |
+| merge-changes | - | - | - | - | OSC-only, no PBF I/O |
 
 **R+W** = `--direct-io` affects both PBF reads (via `BlobReader`) and PBF writes (via `PbfWriter`).
 **`--io-uring`** requires the `linux-io-uring` compile-time feature and sufficient `RLIMIT_MEMLOCK`.

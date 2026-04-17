@@ -129,7 +129,7 @@ enum Command {
     /// Renumber all element IDs sequentially, remapping cross-references.
     ///
     /// Input must be sorted. Negative IDs (JOSM editor-local staging
-    /// identifiers) are rejected — they must be resolved before renumbering.
+    /// identifiers) are rejected - they must be resolved before renumbering.
     Renumber {
         /// Input PBF file (must be sorted)
         file: PathBuf,
@@ -187,7 +187,7 @@ enum Command {
     },
     /// Compare two PBF files and show differences.
     ///
-    /// Uses content equality (coordinates, tags, refs, members) — not version/timestamp
+    /// Uses content equality (coordinates, tags, refs, members) - not version/timestamp
     /// ordering. This means diff output is deterministic regardless of whether metadata
     /// is present, partial, or absent in either input.
     Diff {
@@ -611,11 +611,11 @@ fn sniff_input_kind(path: &std::path::Path) -> std::io::Result<InputKind> {
         }
         Err(e) => return Err(e),
     }
-    // Gzip magic (1f 8b) — PBF is never gzip-wrapped, so this is OSC (.osc.gz)
+    // Gzip magic (1f 8b) - PBF is never gzip-wrapped, so this is OSC (.osc.gz)
     if buf[0] == 0x1f && buf[1] == 0x8b {
         return Ok(InputKind::Osc);
     }
-    // XML starts with '<' — this is OSC (.osc)
+    // XML starts with '<' - this is OSC (.osc)
     if buf[0] == b'<' {
         return Ok(InputKind::Osc);
     }
@@ -1847,7 +1847,7 @@ fn run_extract_config(
         overrides,
     )?;
     for (i, stats) in all_stats.iter().enumerate() {
-        eprint!("  [{}] {} — ", i + 1, slots[i].output.display());
+        eprint!("  [{}] {} - ", i + 1, slots[i].output.display());
         stats.print_summary();
     }
     Ok(())

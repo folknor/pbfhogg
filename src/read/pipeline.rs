@@ -68,7 +68,7 @@ impl Default for PipelineConfig {
 /// Each `PrimitiveBlock` allocates `WireStringTable::entries` (~10 KB) and
 /// `group_ranges` (~8 bytes) on a rayon decode thread. The consumer drops
 /// them on the calling thread. Neither glibc nor jemalloc returns these
-/// freed pages to the OS promptly — they accumulate as anonymous RSS.
+/// freed pages to the OS promptly - they accumulate as anonymous RSS.
 ///
 /// At 400K+ blocks (Europe/planet scale), this causes **25+ GB of heap
 /// retention** that the allocator holds as "free but mapped" memory.
@@ -124,7 +124,7 @@ where
             }
         });
 
-        // Stage 2: Dispatcher thread — fans out to dedicated pool for parallel decode.
+        // Stage 2: Dispatcher thread - fans out to dedicated pool for parallel decode.
         //
         // We use a dedicated rayon pool rather than the global rayon pool so that
         // the caller's own parallelism (e.g. geometry processing, tile generation)
@@ -221,7 +221,7 @@ where
         // Drop the original so the channel closes when all rayon task clones are done
         drop(decoded_tx);
 
-        // Stage 3: Reorder buffer on main thread — deliver blocks in file order.
+        // Stage 3: Reorder buffer on main thread - deliver blocks in file order.
         //
         // Reorder by sequence number and emit only contiguous ready items.
         // The underlying storage is VecDeque-based and bounded by decode_ahead.
@@ -244,7 +244,7 @@ where
                         block_fn(block)?;
                     }
                     Some(Err(e)) => return Err(e),
-                    None => {} // header or unknown blob — skip
+                    None => {} // header or unknown blob - skip
                 }
             }
         }

@@ -1,4 +1,4 @@
-//! PBF file writer — blob framing and compression.
+//! PBF file writer - blob framing and compression.
 //!
 //! Writes valid `.osm.pbf` files. The writer handles the low-level blob framing
 //! (4-byte header length, BlobHeader, compressed Blob) and delegates block
@@ -36,7 +36,7 @@ pub(crate) const WRITE_AHEAD: usize = 32;
 /// can be owned by rayon closures simultaneously (queued, being compressed,
 /// or waiting on the bounded output channel). Without this, `rayon::spawn`'s
 /// unbounded internal task queue grows without limit when the producer side
-/// out-runs compression throughput — exactly what happened in commit
+/// out-runs compression throughput - exactly what happened in commit
 /// `e7219f0` on planet when parallel pass 1 / stage 2a / stage 2d started
 /// emitting blocks faster than zlib:6 could drain them, killing pbfhogg via
 /// OOM at 26 GB anon RSS.
@@ -52,16 +52,16 @@ pub(crate) const PIPELINE_DISPATCH_PERMITS: usize = 64;
 pub enum Compression {
     /// No compression (raw bytes).
     None,
-    /// Zlib compression at the given level (0–9).
+    /// Zlib compression at the given level (0-9).
     /// Level 6 matches osmium's default (`Z_DEFAULT_COMPRESSION`).
     Zlib(u32),
-    /// Zstd compression at the given level (1–22, default 3).
+    /// Zstd compression at the given level (1-22, default 3).
     ///
     /// Zstd decompresses 3-5x faster than zlib at equivalent compression ratios,
     /// making it ideal for read-heavy workflows (planet imports, tile generation).
     /// Level 3 (zstd's default) provides a good balance of compression ratio and
     /// speed. Higher levels (e.g. 19) compress ~10-15% better but are much slower
-    /// to write — use for archival PBFs that will be read many times.
+    /// to write - use for archival PBFs that will be read many times.
     ///
     /// **Compatibility warning:** Not all PBF consumers support zstd yet. As of
     /// 2025, osmium, osm2pgsql, and most tools only read zlib-compressed PBFs.
@@ -179,7 +179,7 @@ impl FramedBlobParts {
 /// A chunk with its sequence number, ready for the writer thread.
 ///
 /// `data` is `io::Result<OutputChunk>` because framing runs on rayon workers
-/// and may fail asynchronously — the error is propagated in order via the
+/// and may fail asynchronously - the error is propagated in order via the
 /// reorder buffer so the writer thread surfaces it at the correct position.
 pub(crate) struct PipelineItem {
     pub(crate) seq: usize,
@@ -188,7 +188,7 @@ pub(crate) struct PipelineItem {
 
 /// A sink that consumes ordered [`OutputChunk`]s and writes them to a backend.
 ///
-/// Each backend is free to flatten, batch, or scatter-gather as it sees fit —
+/// Each backend is free to flatten, batch, or scatter-gather as it sees fit -
 /// the pipeline machinery only cares about ordering and error propagation.
 pub(crate) trait OutputSink {
     fn write_chunk(&mut self, chunk: OutputChunk) -> io::Result<()>;
@@ -272,7 +272,7 @@ impl OutputSink for FileOutputSink {
     }
 }
 
-/// Write pipeline state — active when using pipelined mode.
+/// Write pipeline state - active when using pipelined mode.
 struct WritePipeline {
     tx: SyncSender<PipelineItem>,
     seq: usize,
@@ -313,7 +313,7 @@ fn elapsed_ns_u64(start: std::time::Instant) -> u64 {
 /// After the first blob, all three buffers have sufficient capacity and
 /// subsequent calls reuse them without allocating. The zlib and zstd
 /// compressors are lazy-initialized on the first blob of each type and
-/// reused — avoiding ~312 KB (zlib) or ~512 KB (zstd) of compressor state
+/// reused - avoiding ~312 KB (zlib) or ~512 KB (zstd) of compressor state
 /// allocation per blob.
 struct FrameScratch {
     /// Blob protobuf body (raw/compressed data fields).
@@ -502,7 +502,7 @@ impl<W: Write> PbfWriter<W> {
     ///
     /// If `writer` is backed by a file, callers should wrap it in
     /// `BufWriter::with_capacity(256 * 1024, file)` for best performance.
-    /// PBF blobs are typically 16–64KB compressed, so the default 8KB
+    /// PBF blobs are typically 16-64KB compressed, so the default 8KB
     /// `BufWriter` causes excessive write syscalls. See [`to_path`](Self::to_path)
     /// which applies this automatically.
     pub fn new(writer: W, compression: Compression) -> Self {
@@ -621,7 +621,7 @@ impl<W: Write> PbfWriter<W> {
     ) -> io::Result<()> {
         let indexdata = index.serialize();
         if let Some(ref mut pipeline) = self.pipeline {
-            // Bound in-flight rayon dispatches — see the sibling
+            // Bound in-flight rayon dispatches - see the sibling
             // `write_primitive_block` above and the
             // `PIPELINE_DISPATCH_PERMITS` doc comment for why.
             let t_permit = std::time::Instant::now();
@@ -808,12 +808,12 @@ impl<W: Write> PbfWriter<W> {
     }
 
     // Panics on misuse (calling after pipeline consumed the writer). This is an
-    // internal invariant — all public callers go through write_blob/write_raw which
+    // internal invariant - all public callers go through write_blob/write_raw which
     // are only valid in sync mode or before pipeline handoff.
     fn writer_mut(&mut self) -> &mut W {
         self.writer
             .as_mut()
-            .expect("writer consumed by pipeline — call flush() first")
+            .expect("writer consumed by pipeline - call flush() first")
     }
 
     // wontfix(type-no-stringly): blob_type is &str matching protobuf wire format;
@@ -864,7 +864,7 @@ impl<W: Write> PbfWriter<W> {
         WRITER_METRICS
             .bytes_framed
             .fetch_add(total_len as u64, Relaxed);
-        // Write the 3 frame parts directly — no intermediate `out` Vec.
+        // Write the 3 frame parts directly - no intermediate `out` Vec.
         let writer = self.writer.as_mut().expect("writer consumed by pipeline");
         let t_write = std::time::Instant::now();
         writer.write_all(&header_len.to_be_bytes())?;
@@ -885,7 +885,7 @@ impl<W: Write> Drop for PbfWriter<W> {
         if let Some(mut pipeline) = self.pipeline.take() {
             drop(pipeline.tx);
             if let Some(handle) = pipeline.join_handle.take() {
-                // Best-effort join — errors can't be propagated from Drop.
+                // Best-effort join - errors can't be propagated from Drop.
                 // Callers should call flush() explicitly to get errors.
                 drop(handle.join());
             }
@@ -904,7 +904,7 @@ impl PbfWriter<FileWriter> {
     /// `in_fd` is the input file descriptor (from `FileReader::raw_fd()`).
     /// `offset` and `len` describe the framed blob's position in the input file.
     ///
-    /// Callers must not use this when the output writer is O_DIRECT — use
+    /// Callers must not use this when the output writer is O_DIRECT - use
     /// [`write_raw`](Self::write_raw) instead.
     pub fn write_raw_copy(
         &mut self,
@@ -930,7 +930,7 @@ impl PbfWriter<FileWriter> {
             record_send_wait(t_send);
             Ok(())
         } else {
-            // Same invariant as writer_mut — programming error if None.
+            // Same invariant as writer_mut - programming error if None.
             let out_fd = self
                 .writer
                 .as_mut()
@@ -1045,7 +1045,7 @@ fn copy_range_fallback(
     use std::os::unix::io::FromRawFd;
 
     let mut buf = vec![0u8; 256 * 1024];
-    // Wrap in ManuallyDrop so we don't close the fd when done — caller owns it.
+    // Wrap in ManuallyDrop so we don't close the fd when done - caller owns it.
     let mut out = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(out_fd) });
     // Read from in_fd using pread (doesn't change file position).
     while len > 0 {
@@ -1073,7 +1073,7 @@ fn copy_range_fallback(
 /// Compress and frame a blob into the complete PBF wire format:
 /// `[4-byte BE header_len][BlobHeader bytes][Blob bytes]`.
 ///
-/// Allocates fresh buffers — use only for one-off calls (e.g. header framing).
+/// Allocates fresh buffers - use only for one-off calls (e.g. header framing).
 /// For hot-path data blocks, use `frame_blob_into` (pipelined) or
 /// `write_framed_blob` (sync) which reuse scratch buffers.
 pub(crate) fn frame_blob(
@@ -1113,7 +1113,7 @@ pub(crate) fn frame_blob_pipelined(
 /// Compress and frame a blob using reusable scratch buffers.
 ///
 /// Returns an owned `Vec<u8>` suitable for sending through a pipeline channel.
-/// The scratch buffers are cleared and reused — after warmup, only the returned
+/// The scratch buffers are cleared and reused - after warmup, only the returned
 /// `out` Vec is allocated per call.
 ///
 /// NOTE: Buffer recycling pool was attempted to eliminate this per-call
@@ -1156,7 +1156,7 @@ fn frame_blob_into(
     // Clone (not swap) so `scratch.header_buf` / `scratch.blob_buf` retain
     // their high-water capacity across blobs. Swap would leave the scratch
     // with empty Vecs, forcing both buffers to re-grow from zero on every
-    // subsequent blob — breaking the reuse invariant documented above.
+    // subsequent blob - breaking the reuse invariant documented above.
     Ok(FramedBlobParts {
         prefix: header_len.to_be_bytes(),
         header: scratch.header_buf.clone(),
@@ -1251,7 +1251,7 @@ fn compress_zlib(
 /// bug in `get_size_in_network_byte_order` that rejects any BlobHeader > 127
 /// bytes. With indexdata (42 bytes) + tagdata (variable), rewritten blobs
 /// routinely exceed this. Filed as <https://github.com/osmcode/libosmium/issues/405>.
-/// Not a problem for pbfhogg's own reader or the production pipeline — only
+/// Not a problem for pbfhogg's own reader or the production pipeline - only
 /// affects users who open pbfhogg-generated PBFs with osmium-tool.
 fn encode_blob_header_into(
     blob_type: &str,
@@ -1269,7 +1269,7 @@ fn encode_blob_header_into(
     }
     // Field 3: datasize (int32 varint)
     encode_int32_field(buf, 3, datasize);
-    // Field 4: tagdata (optional bytes — per-blob tag key index)
+    // Field 4: tagdata (optional bytes - per-blob tag key index)
     if let Some(data) = tagdata {
         encode_bytes_field(buf, 4, data);
     }
@@ -1279,7 +1279,7 @@ fn encode_blob_header_into(
 ///
 /// Takes the raw compressed Blob protobuf bytes (from a passthrough frame) and
 /// builds a new frame `[4-byte header_len][BlobHeader][Blob]` with the indexdata
-/// field set. The Blob bytes are not modified — only the BlobHeader is rebuilt.
+/// field set. The Blob bytes are not modified - only the BlobHeader is rebuilt.
 ///
 /// This is used by merge to add blob-level index metadata to passthrough blobs
 /// so that subsequent merges can classify them without decompression.

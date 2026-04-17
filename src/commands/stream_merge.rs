@@ -1,6 +1,6 @@
 //! Streaming element cursor and merge-join for sorted PBF operations.
 //!
-//! Provides [`StreamingBlocks`] — a block-level cursor over a pipelined PBF
+//! Provides [`StreamingBlocks`] - a block-level cursor over a pipelined PBF
 //! reader that yields owned elements one at a time, handling block boundaries
 //! transparently. [`merge_join_phase`] runs a generic two-pointer merge-join
 //! over two cursors, used by `diff` and `derive_changes`.
@@ -12,7 +12,7 @@ use super::elements_xml::{OwnedMember, OwnedMetadata, OwnedNode, OwnedRelation, 
 use super::Result;
 
 // ---------------------------------------------------------------------------
-// StreamingBlocks — block-level cursor with stashing
+// StreamingBlocks - block-level cursor with stashing
 // ---------------------------------------------------------------------------
 
 /// Block source shared across all type phases of a streaming merge-join.
@@ -79,7 +79,7 @@ impl StreamingBlocks {
 ///
 /// Uses [`BlockType`] as a fast path (1-byte classification, no element parsing)
 /// to skip blocks of the wrong type. `Mixed` and `Empty` blocks always fall
-/// through to element-level conversion — mandatory for safety with malformed
+/// through to element-level conversion - mandatory for safety with malformed
 /// files that claim `Sort.Type_then_ID` but have mixed blocks.
 ///
 /// When a non-matching block is encountered, it is stashed for the next phase.
@@ -121,12 +121,12 @@ fn fill_buffer<T>(
 
         // If we saw wrong-type elements in a Mixed block but also got some
         // matching elements, we consumed the matching ones. The wrong-type
-        // elements are lost — but in a properly sorted PBF this never happens
+        // elements are lost - but in a properly sorted PBF this never happens
         // (blocks are single-type). For truly mixed blocks, this is acceptable
         // lossy behavior consistent with requiring sorted input.
 
         if buffer.is_empty() {
-            // Empty block or all elements were wrong type — skip and try next.
+            // Empty block or all elements were wrong type - skip and try next.
             if wrong_type_seen {
                 // We consumed the block but got nothing. The wrong-type elements
                 // are from a later phase, but we can't stash a partially consumed
@@ -134,7 +134,7 @@ fn fill_buffer<T>(
                 // nominally sorted PBFs. Continue to the next block.
                 continue;
             }
-            // Truly empty block — keep going.
+            // Truly empty block - keep going.
             continue;
         }
 
@@ -238,7 +238,7 @@ pub(crate) fn convert_relation(element: &Element<'_>) -> Option<OwnedRelation> {
 }
 
 // ---------------------------------------------------------------------------
-// MergeJoinElement trait — shared accessors for the generic merge-join
+// MergeJoinElement trait - shared accessors for the generic merge-join
 // ---------------------------------------------------------------------------
 
 pub(crate) trait MergeJoinElement: Sized {
@@ -317,12 +317,12 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                 match super::osm_id_cmp(o.id(), n.id()) {
                     std::cmp::Ordering::Less => {
                         on_action(MergeJoinAction::OldOnly(o))?;
-        
+
                         old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                     }
                     std::cmp::Ordering::Greater => {
                         on_action(MergeJoinAction::NewOnly(n))?;
-        
+
                         new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
                     }
                     std::cmp::Ordering::Equal => {
@@ -331,7 +331,7 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
                         } else {
                             on_action(MergeJoinAction::Modified(o, n))?;
                         }
-        
+
                         old_elem = next_element(old_src, old_buf, T::is_block_type, T::convert)?;
                         new_elem = next_element(new_src, new_buf, T::is_block_type, T::convert)?;
                     }
@@ -343,7 +343,7 @@ pub(crate) fn merge_join_phase<T: MergeJoinElement>(
 }
 
 // ---------------------------------------------------------------------------
-// Borrowed element equality — zero-alloc comparison via iterators
+// Borrowed element equality - zero-alloc comparison via iterators
 // ---------------------------------------------------------------------------
 
 /// Extract ID from any Element variant.
@@ -368,7 +368,7 @@ pub(crate) fn element_version(e: &Element<'_>) -> Option<i32> {
 
 /// Compare two node elements (DenseNode or Node) by coords + tags.
 /// Handles all 4 cross-match combinations. Matches `nodes_equal` semantics:
-/// compares decimicro_lat, decimicro_lon, tags — NOT id or metadata.
+/// compares decimicro_lat, decimicro_lon, tags - NOT id or metadata.
 fn borrowed_nodes_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
     let (a_lat, a_lon) = match a {
         Element::DenseNode(dn) => (dn.decimicro_lat(), dn.decimicro_lon()),
@@ -460,7 +460,7 @@ fn borrowed_elements_equal(a: &Element<'_>, b: &Element<'_>) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Block-pair merge engine — blob-level comparison with borrowed elements
+// Block-pair merge engine - blob-level comparison with borrowed elements
 // ---------------------------------------------------------------------------
 
 /// Actions emitted by the block-pair merge engine.
@@ -508,7 +508,7 @@ struct BlockState {
     index: crate::blob_index::BlobIndex,
 }
 
-/// Undecoded blob with its index — held between blob read and decompress.
+/// Undecoded blob with its index - held between blob read and decompress.
 /// Used by v1 compressed-byte comparison: we read the blob, check its index,
 /// and optionally compare compressed bytes before deciding whether to decode.
 struct PendingBlob {
@@ -765,18 +765,18 @@ pub(crate) fn block_pair_merge_phase(
                     if op.index.max_id < np.index.min_id {
                         let os = decode_pending(op, &mut state.old_buf, &mut state.old_st, &mut state.old_gr)?;
                         emit_block(&os, true, on_action)?;
-                        // Stash new blob undecoded — next iteration can try v1 byte comparison.
+                        // Stash new blob undecoded - next iteration can try v1 byte comparison.
                         state.new_stash = Some(np.blob);
                         continue;
                     }
                     if np.index.max_id < op.index.min_id {
                         let ns = decode_pending(np, &mut state.new_buf, &mut state.new_st, &mut state.new_gr)?;
                         emit_block(&ns, false, on_action)?;
-                        // Stash old blob undecoded — next iteration can try v1 byte comparison.
+                        // Stash old blob undecoded - next iteration can try v1 byte comparison.
                         state.old_stash = Some(op.blob);
                         continue;
                     }
-                    // Overlapping — try compressed byte comparison (v1).
+                    // Overlapping - try compressed byte comparison (v1).
                     if skip_equal_blobs && blobs_byte_equal(&op, &np) {
                         on_action(BlockMergeAction::BlobEqual(op.index.count))?;
                         continue;
@@ -841,7 +841,7 @@ fn blobs_byte_equal(a: &PendingBlob, b: &PendingBlob) -> bool {
 /// Processes elements up to `merge_up_to` ID (inclusive). Elements beyond that
 /// boundary in either block are left unconsumed for the caller to handle.
 ///
-/// Returns `(old_consumed, new_consumed)` — the number of elements consumed
+/// Returns `(old_consumed, new_consumed)` - the number of elements consumed
 /// from each side, so the caller can update skip counts without re-scanning.
 fn element_merge_pair(
     old_block: &PrimitiveBlock,

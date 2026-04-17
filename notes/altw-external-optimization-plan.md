@@ -1,4 +1,4 @@
-# ALTW external join — historical probe record
+# ALTW external join - historical probe record
 
 Historical record of probes attempted on the `add-locations-to-ways --index-type external` path before the 2026-04-16 structural re-plan.
 
@@ -29,14 +29,14 @@ These are in tree and reflected in the baselines above:
 
 - `coords_by_rank` removal: stage 2 decodes node blobs directly via `NodeBlobInfo`
 - Stage-3 direct scatter from raw `ResolvedEntry` bytes (no `Vec<ResolvedEntry>` materialization)
-- Parallel finalize tail in `coord_payloads.rs` — per-blob pread+pwrite work-stealing
+- Parallel finalize tail in `coord_payloads.rs` - per-blob pread+pwrite work-stealing
 - Stage-4 per-way refcount sidecar consumption in the way reframe path
 - Stage-4 raw passthrough for relation blobs (always) and node blobs when `keep_untagged_nodes`
 - `PerWayRcs` lazy per-blob decode via blob-offset sidecar
 - Slot-bucket `ResolvedEntry` record shrunk 16 → 12 bytes: `fcd4fa2`
 - Shared header-scan sidecar replacing three header-only passes: `f864b64f`
 
-## Probes — summary
+## Probes - summary
 
 ### Rank-bucket sweep beyond 256
 
@@ -56,7 +56,7 @@ These are in tree and reflected in the baselines above:
 - UUIDs: Denmark `d285275e`, Japan `a065f776`, Europe `e03dff10`
 - Japan: `s2_slot_bytes_written` 5.66 → 4.25 GB (−25%); `s3_bytes_read` −25%; stage 2+3+finalize 9116 → 8529 ms (−6.4%)
 - Europe: scratch −25% on both sides; combined stage 2+3 flat; including finalize +0.6% (within gate)
-- Fault signal: Europe total major faults 378,816 → 249,097 (−34%); stage-4 majors 122,545 → 9,353 — less downstream page-cache pressure
+- Fault signal: Europe total major faults 378,816 → 249,097 (−34%); stage-4 majors 122,545 → 9,353 - less downstream page-cache pressure
 
 ### Epoch-spill / slot-space epochs (env-var-gated prototype)
 
@@ -64,11 +64,11 @@ These are in tree and reflected in the baselines above:
 - Europe E=4: won locally and on wall
 - Planet E=4: **OOMed**
 - Planet E=8: fit, but lost to same-commit normal
-- Verdict: shelved **as a narrow probe**. The structural re-plan's opportunity #1 is the non-timid version — delete the disk-backed `SlotBuckets` path entirely, auto-tune `num_epochs` against `/proc/meminfo`, collapse finalize into the final epoch's emit. The OOM at E=4 planet is evidence that the probe needed memory-conscious defaults, not evidence that the idea does not work.
+- Verdict: shelved **as a narrow probe**. The structural re-plan's opportunity #1 is the non-timid version - delete the disk-backed `SlotBuckets` path entirely, auto-tune `num_epochs` against `/proc/meminfo`, collapse finalize into the final epoch's emit. The OOM at E=4 planet is evidence that the probe needed memory-conscious defaults, not evidence that the idea does not work.
 
 ### Per-worker local `IdSetDense` in pass A
 
-- Europe: `s1a_idset_local_chunks = 8932` vs `s1a_idset_final_chunks = 406` — excessive fragmentation
+- Europe: `s1a_idset_local_chunks = 8932` vs `s1a_idset_final_chunks = 406` - excessive fragmentation
 - Verdict: shelved on this design.
 
 ### Stage-1 pass-A direct-set fusion / pass-B ranked-vector fusion
@@ -79,10 +79,10 @@ These are in tree and reflected in the baselines above:
 
 - Implementation: `e16674b` (land), `950c22d` (revert), 2026-04-14
 - Europe stage 1: 77.0 → 99.9 s (+30%); every CPU-bound counter regressed together (`s1b_scan_ms`, `s1b_rank_ms`, `s1b_encode_write_ms`)
-- `write_all` call count: 4.69 B → 14.16 M (−331×, as designed) — but the syscall was never the cost
+- `write_all` call count: 4.69 B → 14.16 M (−331×, as designed) - but the syscall was never the cost
 - Root cause: `BufWriter` was already amortizing syscalls; the staging layer added an extra memcpy and scattered writes across 256 `Vec<u8>` tails, thrashing L1/TLB
-- Lesson: `s1b_encode_write_ms` cumulative looked like a syscall pile-up but was a `BufWriter`-amortized memcpy. **Cumulative-ms numbers are not evidence of a bottleneck — measurement is.** Reviewer consensus is not either.
-- Verdict: shelved *as framed*. The re-plan's #3 (node-ID scratch spool) is a different mechanism — replaces pass B's zlib decompression entirely, rather than reshaping an already-cheap write path.
+- Lesson: `s1b_encode_write_ms` cumulative looked like a syscall pile-up but was a `BufWriter`-amortized memcpy. **Cumulative-ms numbers are not evidence of a bottleneck - measurement is.** Reviewer consensus is not either.
+- Verdict: shelved *as framed*. The re-plan's #3 (node-ID scratch spool) is a different mechanism - replaces pass B's zlib decompression entirely, rather than reshaping an already-cheap write path.
 
 ### Stage-2 hot-loop batch (monotonic rank + callback node scanner)
 
@@ -94,11 +94,11 @@ These are in tree and reflected in the baselines above:
 ### Stage-4 wire-format DenseNodes filter
 
 - Implementation: `4910fd9`
-- Denmark correctness: `pbfhogg diff --summary --suppress-common` reported `same=10175884 different=0`. MD5 differed because the encoding shape changed without changing semantic content — MD5 was the wrong gate for this item.
+- Denmark correctness: `pbfhogg diff --summary --suppress-common` reported `same=10175884 different=0`. MD5 differed because the encoding shape changed without changing semantic content - MD5 was the wrong gate for this item.
 - Japan: `s4_nonway_assemble_ms` 1113 → 557 ms (−50%); `EXTJOIN_STAGE4` 9002 → 8759 ms (−2.7%)
-- Europe (normal `7ab12b2a` vs wire `d0ffd614`): `s4_nonway_assemble_ms` 78501 → 36940 (−53%); `s4_assemble_ms` 520947 → 426199 (−18%); but `EXTJOIN_STAGE4` 122.7 → 127.6 s (worse); `s4_send_ms` cumulative 560971 → 671809 — freed worker CPU refilled the writer queue
+- Europe (normal `7ab12b2a` vs wire `d0ffd614`): `s4_nonway_assemble_ms` 78501 → 36940 (−53%); `s4_assemble_ms` 520947 → 426199 (−18%); but `EXTJOIN_STAGE4` 122.7 → 127.6 s (worse); `s4_send_ms` cumulative 560971 → 671809 - freed worker CPU refilled the writer queue
 - Europe `zstd:1` (normal `e3f3ec1b` vs wire `774fe74b`): `s4_nonway_assemble_ms` −13%; `EXTJOIN_STAGE4` −1.3%; total wall 5m40s → 5m48s (worse)
-- Verdict: shelved. **Writer-ceiling diagnostic retained as evidence** for re-plan #2 — real stage-4-local CPU wins are invisible on wall under a writer-bound output mode.
+- Verdict: shelved. **Writer-ceiling diagnostic retained as evidence** for re-plan #2 - real stage-4-local CPU wins are invisible on wall under a writer-bound output mode.
 
 ### Stage-1B grouped-by-local-rank emission
 
@@ -132,5 +132,5 @@ These are in tree and reflected in the baselines above:
 
 - Stage 2 decodes the kept node-blob set to populate bucket-local `coord_slice`; stage 4 decodes the same kept node blobs again on the non-way path
 - Planet cumulative work: `s2_node_decompress_ms = 192356`; stage 4 processes all 32835 / 32835 node blobs again
-- Verdict at the time: deferred structural item, not a next-sprint candidate. Fusing is architecturally awkward — stage 2 is rank-bucket ordered while stage 4 is file-ordered and consumer/writer-bound
+- Verdict at the time: deferred structural item, not a next-sprint candidate. Fusing is architecturally awkward - stage 2 is rank-bucket ordered while stage 4 is file-ordered and consumer/writer-bound
 - Reopened as re-plan opportunity #6.

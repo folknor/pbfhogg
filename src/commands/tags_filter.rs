@@ -164,7 +164,7 @@ pub fn tags_filter(
     if !opts.invert {
         require_indexdata(input, opts.direct_io, opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, type and tag key \
-             filters are no-ops — all blobs are decompressed (significantly slower).")?;
+             filters are no-ops - all blobs are decompressed (significantly slower).")?;
     }
 
     let expressions = parse_expressions(opts.expression_strs)?;
@@ -290,7 +290,7 @@ fn tags_filter_single_pass(
     crate::debug::emit_marker("TAGSFILTER_SCAN_START");
     let reader = ElementReader::open(input, direct_io)?;
     super::warn_locations_on_ways_loss(reader.header());
-    // Blob-level filtering can't help in invert mode — we want non-matching blobs.
+    // Blob-level filtering can't help in invert mode - we want non-matching blobs.
     let reader = if invert {
         reader
     } else {
@@ -705,7 +705,7 @@ fn tags_filter_two_pass(
     drop(header_reader);
     let mut writer = writer_from_header(output, compression, &header, true, overrides, |hb| hb, direct_io, false)?;
 
-    // Build pass 2 schedule. Skip blob types not needed (type filter only —
+    // Build pass 2 schedule. Skip blob types not needed (type filter only -
     // no tag index filtering because elements can be included via relation
     // closure without having the matching tag key).
     let blob_filter: Option<BlobFilter> = if invert {
@@ -727,7 +727,7 @@ fn tags_filter_two_pass(
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
 
         // Type-only filter: skip blob types not needed (no tag index filtering
-        // in pass 2 — elements can be included via relation closure without
+        // in pass 2 - elements can be included via relation closure without
         // having the matching tag key).
         if let Some(ref filter) = blob_filter {
             if let Some(idx) = hdr.index() {
@@ -757,7 +757,7 @@ fn tags_filter_two_pass(
     };
 
     // pread-from-workers: parallel decode + filter + write with reorder buffer.
-    // No raw passthrough — tag-based all-match detection requires a per-blob
+    // No raw passthrough - tag-based all-match detection requires a per-blob
     // wire-format ID scanner (see TODO.md "Tags-filter raw passthrough via
     // lightweight ID scanner"). Pread workers are kept for planet safety
     // (no cross-thread PrimitiveBlock retention).
@@ -911,7 +911,7 @@ fn collect_relation_member_closure(
 ) -> Result<RelationClosureSummary> {
     let mut summary = RelationClosureSummary::default();
 
-    // Build schedule once — reused across convergence iterations.
+    // Build schedule once - reused across convergence iterations.
     let (schedule, shared_file) = super::build_classify_schedule(
         input, Some(crate::blob_index::ElemKind::Relation),
     )?;
@@ -926,7 +926,7 @@ fn collect_relation_member_closure(
         let mut added_relations = 0_u64;
 
         // Classify phase: workers read included_relation_ids (immutable).
-        // Results collected into a Vec — merge phase runs after with mutable access.
+        // Results collected into a Vec - merge phase runs after with mutable access.
         let mut results: Vec<ClosureResult> = Vec::new();
         super::parallel_classify_accumulate(
             &shared_file,

@@ -152,7 +152,7 @@ impl BlobIndex {
 ///
 /// When a `BlobFilter` is set on an [`ElementReader`](crate::ElementReader),
 /// the pipeline skips decompressing blobs whose element type (from indexdata)
-/// does not match the filter. Files without indexdata are unaffected — all
+/// does not match the filter. Files without indexdata are unaffected - all
 /// blobs pass through.
 ///
 /// # Example
@@ -279,7 +279,7 @@ impl BlobFilter {
     ///
     /// Returns true (conservative) if no tag filter is set. When both keys and
     /// prefixes are configured, the blob passes if ANY key OR ANY prefix matches
-    /// (union semantics — each expression contributes either a key or prefix).
+    /// (union semantics - each expression contributes either a key or prefix).
     pub(crate) fn wants_tag_index(&self, tag_index: &TagIndex) -> bool {
         if let Some(ref keys) = self.required_tag_keys
             && tag_index.has_any_key(keys)
@@ -353,7 +353,7 @@ pub(crate) fn scan_block_ids(raw: &[u8]) -> Option<BlobIndex> {
             result = Some(match result {
                 None => scan,
                 Some(mut prev) => {
-                    // Mixed-type blobs cannot be safely indexed — the fast paths
+                    // Mixed-type blobs cannot be safely indexed - the fast paths
                     // (raw passthrough, ID-range skip) trust `kind` as exact.
                     // Return None so mixed blobs fall through to full decode.
                     if prev.kind != scan.kind {
@@ -412,7 +412,7 @@ fn scan_primitive_group(
                 return scan_repeated_element_ids(first_msg, &mut cur, 4, ElemKind::Relation);
             }
             (1, 2) => {
-                // Node (field 1, length-delimited) — rare, non-dense
+                // Node (field 1, length-delimited) - rare, non-dense
                 let first_msg = cur.read_len_delimited().ok()?;
                 return scan_repeated_element_ids(first_msg, &mut cur, 1, ElemKind::Node);
             }
@@ -477,7 +477,7 @@ fn scan_dense_nodes(
         return None;
     }
 
-    // Process coordinates (optional — v1-only files may lack them in theory,
+    // Process coordinates (optional - v1-only files may lack them in theory,
     // but in practice all DenseNodes have lat/lon).
     let bbox = if let (Some(lats), Some(lons)) = (lat_data, lon_data) {
         let gran = i64::from(granularity);
@@ -809,7 +809,7 @@ fn scan_dense_node_tag_keys(raw: &[u8], key_indices: &mut std::collections::Hash
                             key_indices.insert(val);
                             is_key = false;
                         } else {
-                            // Value — skip
+                            // Value - skip
                             is_key = true;
                         }
                     } else {

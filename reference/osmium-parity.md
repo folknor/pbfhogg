@@ -1,7 +1,7 @@
 # Migrating from osmium-tool to pbfhogg
 
 This guide maps osmium-tool commands and flags to their pbfhogg equivalents.
-If you're already familiar with osmium, you should feel at home — most commands
+If you're already familiar with osmium, you should feel at home - most commands
 have the same names and flags, with a few consolidations that reduce the total
 command count.
 
@@ -31,7 +31,7 @@ command count.
 ## Consolidated commands
 
 pbfhogg merges several osmium commands that do closely related things. The
-underlying functionality is identical — only the CLI entrypoint changed.
+underlying functionality is identical - only the CLI entrypoint changed.
 
 ### check-refs is now `check`
 
@@ -89,7 +89,7 @@ Text-only flags (`-c`, `-v`, `-s`, `-q`, `-t`) are rejected with `--format osc`,
 and vice versa for `--increment-version` / `--update-timestamp`.
 
 **Lossless deletes:** pbfhogg's `diff --format osc` produces a perfect roundtrip
-— applying the derived OSC to the old PBF reproduces the new PBF exactly.
+- applying the derived OSC to the old PBF reproduces the new PBF exactly.
 osmium's `derive-changes` can lose deletes when the deleted element is absent
 from both input files (see [DEVIATIONS](DEVIATIONS.md#derive-changes-lossless-delete-roundtrip)).
 
@@ -106,7 +106,7 @@ osmium merge -o merged.pbf a.pbf b.pbf c.pbf
 pbfhogg cat --dedupe -o merged.pbf a.pbf b.pbf c.pbf
 ```
 
-All inputs must be sorted. Unsorted input is a hard error — run `pbfhogg sort`
+All inputs must be sorted. Unsorted input is a hard error - run `pbfhogg sort`
 first if needed.
 
 ### tags-count is now `inspect tags`
@@ -158,9 +158,9 @@ pbfhogg inspect --json input.pbf
 
 pbfhogg's `inspect` also includes capabilities not in osmium:
 
-- `--indexed` — check if a PBF has blob-level indexdata (exit code 0/1)
-- `--nodes` — coordinate statistics for compression analysis
-- `--anomalies` — highlight unusual blocks
+- `--indexed` - check if a PBF has blob-level indexdata (exit code 0/1)
+- `--nodes` - coordinate statistics for compression analysis
+- `--anomalies` - highlight unusual blocks
 
 ## Flag differences
 

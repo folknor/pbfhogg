@@ -404,7 +404,7 @@ fn increment_version_bumps_delete_versions() {
     let osc = dir.path().join("changes.osc.gz");
 
     // Old has node 1 (v3), node 2 (v5), way 10 (v2).
-    // New has only node 1 (v3) — node 2 and way 10 are deleted.
+    // New has only node 1 (v3) - node 2 and way 10 are deleted.
     write_versioned_pbf(&old, &[
         (1, 100_000_000, 200_000_000, 3),
         (2, 110_000_000, 210_000_000, 5),
@@ -458,7 +458,7 @@ fn increment_version_and_update_timestamp_combined() {
     let osc = dir.path().join("changes.osc.gz");
 
     // Old has node 1 (v2) and way 10 (v4).
-    // New has neither — both are deleted.
+    // New has neither - both are deleted.
     write_versioned_pbf(&old, &[
         (1, 100_000_000, 200_000_000, 2),
     ], &[

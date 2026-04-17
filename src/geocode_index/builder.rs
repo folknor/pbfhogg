@@ -264,7 +264,7 @@ impl Pass2State<'_> {
             .collect();
         if coords.is_empty() { return Ok(()); }
 
-        // Admin way geometry — move coords if no other consumer needs them
+        // Admin way geometry - move coords if no other consumer needs them
         if is_admin_way && !is_street && !is_building_addr && !is_interp {
             self.way_geom.insert(way_id, coords);
             return Ok(());
@@ -273,7 +273,7 @@ impl Pass2State<'_> {
             self.way_geom.insert(way_id, coords.clone());
         }
 
-        // Interpolation ways — write nodes to file, keep slim metadata
+        // Interpolation ways - write nodes to file, keep slim metadata
         if is_interp {
             if coords.len() >= 2 {
                 let itype = match interp.unwrap_or("") {
@@ -299,7 +299,7 @@ impl Pass2State<'_> {
             return Ok(());
         }
 
-        // Building addresses (centroid) — stream to addr_points.bin
+        // Building addresses (centroid) - stream to addr_points.bin
         if is_building_addr {
             let (sum_lat, sum_lon) = coords.iter()
                 .fold((0i64, 0i64), |acc, &(lat, lon)| {
@@ -325,7 +325,7 @@ impl Pass2State<'_> {
             self.addr_point_count += 1;
         }
 
-        // Streets — stream to street_ways.bin + street_nodes.bin
+        // Streets - stream to street_ways.bin + street_nodes.bin
         if is_street && coords.len() >= 2 {
             #[allow(clippy::cast_possible_truncation)]
             let nc = coords.len().min(u16::MAX as usize) as u16;
@@ -396,7 +396,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let mut interp_ways: Vec<SlimInterpWay> = Vec::new();
 
     // -----------------------------------------------------------------------
-    // Pass 1: Relations — collect admin boundary metadata + way member IDs
+    // Pass 1: Relations - collect admin boundary metadata + way member IDs
     // (Runs first so we know which way IDs to collect in pass 3.)
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_START");
@@ -635,7 +635,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
                 match element {
                     Element::DenseNode(node) => state.process_dense_node(&node)?,
                     Element::Way(way) => state.process_way(&way)?,
-                    _ => {} // Node (non-dense) — rare, ignore
+                    _ => {} // Node (non-dense) - rare, ignore
                 }
             }
         } // for blob_result
@@ -1109,8 +1109,8 @@ fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
 /// the segment passes through at the given level.
 ///
 /// Calls `emit(cell_id)` for each unique cell the segment crosses. No heap
-/// allocation — uses a small stack buffer for deduplication (most segments
-/// cross 1–4 cells).
+/// allocation - uses a small stack buffer for deduplication (most segments
+/// cross 1-4 cells).
 fn cover_segment(
     lat1_e7: i32, lon1_e7: i32,
     lat2_e7: i32, lon2_e7: i32,
@@ -1145,7 +1145,7 @@ fn cover_segment(
     #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
     let steps = ((seg_len_deg / step_deg).ceil() as usize).clamp(2, 256);
 
-    // Stack-based dedup for the common case (1–8 cells per segment)
+    // Stack-based dedup for the common case (1-8 cells per segment)
     let mut seen = [0u64; 8];
     seen[0] = c1.0;
     let mut seen_count = 1usize;
@@ -1277,7 +1277,7 @@ fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
     }
     std::fs::create_dir_all(&bucket_dir)?;
 
-    // Open 256 bucket writers (lazy — most will be used)
+    // Open 256 bucket writers (lazy - most will be used)
     let mut bucket_writers: Vec<Option<BufWriter<std::fs::File>>> = (0..NUM_BUCKETS)
         .map(|_| None)
         .collect();
@@ -1343,7 +1343,7 @@ fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u32> {
         chunk_start = chunk_end;
     }
 
-    // Interpolation — collect per-way entries, then distribute with proper error propagation
+    // Interpolation - collect per-way entries, then distribute with proper error propagation
     for (way_idx, iw) in interp_ways.iter().enumerate() {
         let nc = iw.node_count as usize;
         if nc < 2 { continue; }
@@ -1557,7 +1557,7 @@ fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<Adm
             if edge_cells.contains(&cell.0) { continue; }
 
             let center_ll = s2::latlng::LatLng::from(cell);
-            // Test with holes — cells inside enclaves are NOT interior
+            // Test with holes - cells inside enclaves are NOT interior
             if crate::geo::point_in_polygon(
                 center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64, &hole_slices,
             ) {
@@ -1625,10 +1625,10 @@ mod tests {
 
     #[test]
     fn cover_segment_same_cell() {
-        // Two very close points in Copenhagen — should be in the same S2 cell at level 17.
+        // Two very close points in Copenhagen - should be in the same S2 cell at level 17.
         let lat1 = 556_762_000; // 55.6762
         let lon1 = 125_683_000; // 12.5683
-        let lat2 = 556_762_100; // 55.67621 — ~0.1m away
+        let lat2 = 556_762_100; // 55.67621 - ~0.1m away
         let lon2 = 125_683_100;
 
         let mut cells = Vec::new();
@@ -1639,11 +1639,11 @@ mod tests {
 
     #[test]
     fn cover_segment_cross_cell() {
-        // Two points about 1km apart — should cross multiple S2 cells at level 17.
+        // Two points about 1km apart - should cross multiple S2 cells at level 17.
         // Level 17 cells are roughly 150m on a side.
         let lat1 = 556_700_000; // 55.6700
         let lon1 = 125_600_000; // 12.5600
-        let lat2 = 556_800_000; // 55.6800 — ~1.1km north
+        let lat2 = 556_800_000; // 55.6800 - ~1.1km north
         let lon2 = 125_700_000; // 12.5700
 
         let mut cells = Vec::new();

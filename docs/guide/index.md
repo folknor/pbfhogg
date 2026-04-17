@@ -43,14 +43,14 @@ pbfhogg apply-changes denmark.osm.pbf changes.osc.gz -o updated.osm.pbf
 
 - **Read** PBF files sequentially, in parallel, or with a 3-stage pipelined decoder
 - **Write** valid PBF files with dense node packing, delta encoding, and configurable compression
-- **Blob passthrough** — unmodified blobs are copied as raw bytes, no decompression needed
-- **Blob indexdata** — element type, ID range, and spatial bbox embedded per blob for fast filtering
-- **25+ CLI commands** — inspect, sort, extract, merge, diff, tags-filter, getid, and more
+- **Blob passthrough** - unmodified blobs are copied as raw bytes, no decompression needed
+- **Blob indexdata** - element type, ID range, and spatial bbox embedded per blob for fast filtering
+- **25+ CLI commands** - inspect, sort, extract, merge, diff, tags-filter, getid, and more
 - **Cross-validated** against osmium on all commands
 
 ## Next Steps
 
-- [Reading PBF Files](./reading) — ElementReader API, read modes, blob filtering
-- [Writing PBF Files](./writing) — BlockBuilder, PbfWriter, compression options
-- [Indexdata](./indexdata) — what it is, how to generate it, which commands use it
-- [Performance](./performance) — benchmarks, optimization tips, planet-scale considerations
+- [Reading PBF Files](./reading) - ElementReader API, read modes, blob filtering
+- [Writing PBF Files](./writing) - BlockBuilder, PbfWriter, compression options
+- [Indexdata](./indexdata) - what it is, how to generate it, which commands use it
+- [Performance](./performance) - benchmarks, optimization tips, planet-scale considerations

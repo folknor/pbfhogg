@@ -10,7 +10,7 @@ use pbfhogg::MemberId;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Helpers (diff-specific — shared helpers are in tests/common/mod.rs)
+// Helpers (diff-specific - shared helpers are in tests/common/mod.rs)
 // ---------------------------------------------------------------------------
 
 fn run_diff(old: &Path, new: &Path, options: &DiffOptions) -> (String, pbfhogg::diff::DiffStats) {
@@ -601,7 +601,7 @@ fn type_filter_way_skips_phases() {
     let (text, stats) = run_diff(&old, &new, &opts);
 
     // Only way elements should appear in output.
-    // Line format: <prefix><type_char><id> — prefix is at index 0, type char at index 1.
+    // Line format: <prefix><type_char><id> - prefix is at index 0, type char at index 1.
     for line in text.lines() {
         if line.is_empty() {
             continue;

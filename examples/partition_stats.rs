@@ -56,7 +56,7 @@ fn main() {
     let mut blob_count: u64 = 0;
 
     // We need per-blob granularity. Use into_blocks_pipelined and treat each
-    // PrimitiveBlock as one blob (which it is — one blob = one block).
+    // PrimitiveBlock as one blob (which it is - one blob = one block).
     for block in reader.into_blocks_pipelined() {
         let block = block.expect("failed to read block");
         current_blob_refs.clear();

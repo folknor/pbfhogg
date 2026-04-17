@@ -25,7 +25,7 @@ enum ElementsAvailable {
 }
 
 /// Returns true if the given set contains at least one value that is inside the given range.
-// Takes RangeInclusive by value intentionally — it's 16 bytes (two i64s), copy is
+// Takes RangeInclusive by value intentionally - it's 16 bytes (two i64s), copy is
 // cheaper than indirection. BTreeSet::range accepts both owned and borrowed.
 fn range_included(range: RangeInclusive<i64>, node_ids: &BTreeSet<i64>) -> bool {
     node_ids.range(range).next().is_some()
@@ -153,7 +153,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
             // descriptive IO error so callers get a clear message rather than a panic.
             let offset = offset.ok_or_else(|| {
                 crate::error::new_error(crate::error::ErrorKind::Io(std::io::Error::other(
-                    // Starts with type name intentionally — it IS a proper noun here.
+                    // Starts with type name intentionally - it IS a proper noun here.
                     "IndexedReader requires a seekable BlobReader with offset tracking",
                 )))
             })?;
@@ -175,7 +175,7 @@ impl<R: Read + Seek + Send> IndexedReader<R> {
 
     /// Check element IDs of this block. Record min and max for every node, way and relation.
     ///
-    /// This is an ID-only consumer — it iterates all elements but only calls `.id()`.
+    /// This is an ID-only consumer - it iterates all elements but only calls `.id()`.
     /// A lightweight "scan mode" that skips protobuf parsing of tags, coordinates, refs,
     /// and metadata was considered but deemed not worth the complexity: this runs once per
     /// `IndexedReader` session (during `create_index`), not in a hot loop. The full parse
@@ -420,7 +420,7 @@ impl IndexedReader<File> {
         // BufReader is intentionally NOT used here. IndexedReader performs random
         // seeks to jump between blobs (e.g. first pass reads ways, second pass seeks
         // back to read dependent nodes). A large read-ahead buffer would be wasted
-        // on every seek — the buffered data would be discarded immediately.
+        // on every seek - the buffered data would be discarded immediately.
         //
         // This was investigated and confirmed: adding BufReader here showed no
         // improvement and slightly increased memory overhead. See commit a38c258.

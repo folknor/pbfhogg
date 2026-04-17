@@ -177,7 +177,7 @@ fn inspect_json_combined_flags() {
     // locations still null (not requested)
     assert!(json["locations"].is_null());
 
-    // Verify deterministic key set — all top-level keys present
+    // Verify deterministic key set - all top-level keys present
     let obj = json.as_object().expect("value");
     for key in &[
         "schema_version", "file", "file_size", "header", "indexed",

@@ -32,7 +32,7 @@ pbfhogg cat input.pbf | pbfhogg add-locations-to-ways - -o altw.pbf
 But:
 1. **Multi-pass commands can't pipe.** ALTW, extract (complete/smart),
    tags-filter (two-pass) all make multiple passes over the input.
-   A pipe is single-pass — can't seek back.
+   A pipe is single-pass - can't seek back.
 2. **Parallel decode needs random access.** `parallel_classify_phase`
    uses pread for parallel blob access. Pipes are sequential.
 3. **Backpressure.** If the producer is faster than the consumer, the
@@ -47,12 +47,12 @@ and the output of one is the input of the other:
 
 | Producer | Consumer | Composable? | Bottleneck |
 |----------|----------|-------------|------------|
-| cat (indexdata) | ALTW | No — ALTW is multi-pass |
-| cat (indexdata) | apply-changes | Partially — merge is single-pass on base |
-| ALTW | build-geocode-index | No — geocode is multi-pass |
-| ALTW | extract simple | No — extract uses pread |
+| cat (indexdata) | ALTW | No - ALTW is multi-pass |
+| cat (indexdata) | apply-changes | Partially - merge is single-pass on base |
+| ALTW | build-geocode-index | No - geocode is multi-pass |
+| ALTW | extract simple | No - extract uses pread |
 | apply-changes | cat (indexdata) | Yes! Both single-pass |
-| cat (type filter) | any consumer | Yes — single-pass |
+| cat (type filter) | any consumer | Yes - single-pass |
 
 The only clearly composable pair is `apply-changes → cat` (add indexdata
 to the merge output). This saves one full PBF write+read (~87 GB).
@@ -83,9 +83,9 @@ trait BlockStream {
 }
 
 enum StreamItem {
-    /// Decoded PrimitiveBlock — consumer can iterate elements.
+    /// Decoded PrimitiveBlock - consumer can iterate elements.
     Decoded(PrimitiveBlock),
-    /// Raw compressed blob — consumer can write directly.
+    /// Raw compressed blob - consumer can write directly.
     RawBlob(Vec<u8>, BlobIndex),
 }
 ```
@@ -96,22 +96,22 @@ accept `impl BlockStream` as an alternative to reading from disk.
 
 ### Which commands could produce a BlockStream?
 
-- `cat` (type filter): yes — single-pass, yields filtered blocks
-- `apply-changes`: yes — single-pass merge, yields merged blocks
-- `sort`: yes — single-pass output after permutation
-- `extract simple`: partially — the classification is multi-pass,
+- `cat` (type filter): yes - single-pass, yields filtered blocks
+- `apply-changes`: yes - single-pass merge, yields merged blocks
+- `sort`: yes - single-pass output after permutation
+- `extract simple`: partially - the classification is multi-pass,
   but the write phase is single-pass
 
 ### Which commands could consume a BlockStream?
 
-- `cat` (indexdata): yes — single-pass passthrough, adds indexdata
-- `build-geocode-index`: no — multi-pass (4 passes over the data)
-- `add-locations-to-ways`: no — multi-pass (dense: 2 passes,
+- `cat` (indexdata): yes - single-pass passthrough, adds indexdata
+- `build-geocode-index`: no - multi-pass (4 passes over the data)
+- `add-locations-to-ways`: no - multi-pass (dense: 2 passes,
   external: 4 stages with random access)
-- `extract`: no — multi-pass with pread
-- `inspect`: yes — single-pass scan
-- `check-refs`: yes — single-pass scan
-- `diff`: partially — single-pass per type, but needs two inputs
+- `extract`: no - multi-pass with pread
+- `inspect`: yes - single-pass scan
+- `check-refs`: yes - single-pass scan
+- `diff`: partially - single-pass per type, but needs two inputs
 
 ### Composable pipelines
 
@@ -122,9 +122,9 @@ need random access or multiple passes over the same data.
 **Feasible compositions:**
 1. `apply-changes → cat (indexdata)`: merge output → add indexdata.
    Saves one 87 GB write+read. Implementation: merge's output path
-   already produces blob bytes — add indexdata scanning inline.
+   already produces blob bytes - add indexdata scanning inline.
 2. `cat (type filter) → inspect/check-refs`: filter → analyze.
-   Saves one write+read. Minor — inspection is fast anyway.
+   Saves one write+read. Minor - inspection is fast anyway.
 3. `sort → cat (indexdata)`: sort output → add indexdata.
    Saves one write+read.
 
@@ -141,7 +141,7 @@ framework and captures the most valuable composition.
 
 `apply-changes` already writes via `PbfWriter`, which already
 computes indexdata for every `write_primitive_block_owned` call. The
-output PBF already has indexdata embedded. Wait — let me check:
+output PBF already has indexdata embedded. Wait - let me check:
 
 Actually, looking at the code, `write_primitive_block_owned` accepts
 a pre-computed `BlobIndex` and embeds it as indexdata. The merge
@@ -149,7 +149,7 @@ command calls `take_owned()` on BlockBuilder which returns the
 serialized block + computed BlobIndex. So the merge output already
 has indexdata.
 
-**The `apply-changes → cat` composition is already unnecessary** —
+**The `apply-changes → cat` composition is already unnecessary** -
 merge already produces indexed PBFs. The `cat` step for indexdata
 was needed for the initial planet import (raw Geofabrik PBF → indexed),
 not for the daily merge pipeline.
@@ -158,11 +158,11 @@ not for the daily merge pipeline.
 
 The streaming composition opportunity is smaller than it appears:
 
-1. **Merge already produces indexed output** — no `cat` step needed
+1. **Merge already produces indexed output** - no `cat` step needed
    in the daily pipeline
-2. **Multi-pass commands can't consume streams** — ALTW, extract,
+2. **Multi-pass commands can't consume streams** - ALTW, extract,
    geocode builder all need random access
-3. **The initial `cat` for indexdata is a one-time cost** — once the
+3. **The initial `cat` for indexdata is a one-time cost** - once the
    planet PBF is indexed, the merge output preserves indexdata
 
 The remaining composition opportunity is:
@@ -190,7 +190,7 @@ Instead of composition, the remaining I/O reduction opportunities are:
 2. **Shared mmap**: commands that read the same PBF multiple times
    benefit from the page cache. The first read is I/O-bound, but
    subsequent reads hit cached pages. This already works transparently
-   — no code changes needed.
+   - no code changes needed.
 
 3. **Zstd for internal PBFs**: 3-5x faster decompress means the
    multi-pass commands spend less time on each pass. See

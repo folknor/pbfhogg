@@ -21,7 +21,7 @@ use super::{PAGE_SIZE, alloc_page_aligned};
 const BUF_CAPACITY: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
-// AlignedBuffer — page-aligned heap allocation
+// AlignedBuffer - page-aligned heap allocation
 // ---------------------------------------------------------------------------
 
 /// A page-aligned byte buffer for O_DIRECT I/O.
@@ -195,7 +195,7 @@ impl Write for DirectWriter {
 
 impl Drop for DirectWriter {
     fn drop(&mut self) {
-        // Best-effort flush — errors can't be propagated from Drop.
+        // Best-effort flush - errors can't be propagated from Drop.
         // Callers should call flush() explicitly to get errors.
         drop(self.flush_final());
     }

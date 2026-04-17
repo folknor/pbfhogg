@@ -78,7 +78,7 @@ pub fn cat(
         for file in files {
             require_indexdata(file, direct_io, force,
                 "input PBF has no blob-level indexdata. Without indexdata, the type \
-                 filter is a no-op — all blobs are decompressed (significantly slower).")?;
+                 filter is a no-op - all blobs are decompressed (significantly slower).")?;
         }
     }
 
@@ -134,16 +134,16 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
                 BlobKind::OsmHeader => {}
                 BlobKind::OsmData => {
                     if frame.index.is_some() {
-                        // Already has indexdata — pass through as-is.
+                        // Already has indexdata - pass through as-is.
                         writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                     } else {
-                        // No indexdata — decompress to scan IDs/tags, reframe with index.
+                        // No indexdata - decompress to scan IDs/tags, reframe with index.
                         let blob_bytes = frame.blob_bytes();
                         decompress_blob_data_into(blob_bytes, &mut decompress_buf)?;
                         let index = match scan_block_ids(&decompress_buf) {
                             Some(idx) => idx,
                             None => {
-                                // Unrecognized block — pass through without indexdata.
+                                // Unrecognized block - pass through without indexdata.
                                 writer.write_raw_owned(std::mem::take(&mut frame.frame_bytes))?;
                                 decompress_buf.clear();
                                 blobs += 1;
@@ -180,7 +180,7 @@ fn cat_passthrough(files: &[&Path], output: &Path, compression: Compression, dir
 // ---------------------------------------------------------------------------
 
 /// Type-filtered cat via raw frame passthrough. Matching blobs (by indexdata
-/// ElemKind) are written as-is — zero decompression, zero re-encoding.
+/// ElemKind) are written as-is - zero decompression, zero re-encoding.
 /// Non-matching blobs are skipped. Blobs without indexdata fall back to full
 /// decode + re-encode.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]

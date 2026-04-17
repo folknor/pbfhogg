@@ -74,7 +74,7 @@ for (i, blocks) in result.region_blocks.iter().enumerate() {
 }
 ```
 
-## Status — DONE (commit `9f72bcf`)
+## Status - DONE (commit `9f72bcf`)
 
 Steps 1-3 shipped. `multi_extract_pread_write` in `src/commands/extract.rs`
 replaces all three sequential write phases. Denmark 5-region: 6.7s → 2.1s
@@ -87,7 +87,7 @@ future optimizations.
 
 ## Implementation steps
 
-### Step 1: Extract multi-extract write loop into a function — DONE
+### Step 1: Extract multi-extract write loop into a function - DONE
 
 Currently, each write phase (nodes/ways/relations) has an inline
 BlobReader loop. Extract into a shared function:
@@ -107,7 +107,7 @@ fn multi_extract_write_phase(
 ) -> Result<()>;
 ```
 
-### Step 2: Build schedule from indexdata — DONE
+### Step 2: Build schedule from indexdata - DONE
 
 The schedule is the same as what `build_classify_schedule` produces.
 Multi-extract already builds node/way/relation schedules for the
@@ -117,7 +117,7 @@ classification phases. Reuse those schedules for the write phases
 Actually, looking at the current code, the classification schedules
 are `Vec<(usize, u64, usize)>` tuples, but the write phases need
 to iterate all blobs of a given type (not just the ones in the
-schedule). Wait — the write phases DO filter by type:
+schedule). Wait - the write phases DO filter by type:
 
 ```rust
 if let Some(idx) = blob.index() {
@@ -130,7 +130,7 @@ So the schedule for the write phase is the same as the classification
 schedule. We can reuse the `node_schedule`, `way_schedule`,
 `relation_schedule` vectors.
 
-### Step 3: Convert to pread-from-workers — DONE
+### Step 3: Convert to pread-from-workers - DONE
 
 Replace the sequential BlobReader loop with the pread pattern:
 
@@ -209,7 +209,7 @@ show it's the bottleneck.
 
 ## Relationship to other work
 
-- Pattern from `pread_execute` in single-extract — needs a new
+- Pattern from `pread_execute` in single-extract - needs a new
   function but the dispatcher/worker/consumer architecture is identical
 - Blocked by: nothing (can start immediately)
 - Enables: raw passthrough optimization (step 4)
@@ -219,7 +219,7 @@ show it's the bottleneck.
 
 ## Review feedback (April 2026, Opus reviewer)
 
-- **`pread_execute` reuse:** NEEDS_REDESIGN — can't reuse directly
+- **`pread_execute` reuse:** NEEDS_REDESIGN - can't reuse directly
   (hardcoded for single region), but the pattern is well-established.
   Write a new `multi_extract_pread_write` function with the same
   dispatcher/worker/consumer shape.
@@ -234,4 +234,4 @@ show it's the bottleneck.
 - **BlobBbox at schedule time:** FEASIBLE. `BlobDesc.bbox` already
   populated from indexdata.
 - **Memory at N=50:** ~200 MB builder overhead across 8 workers.
-  Acceptable. N=100+ approaches 400 MB — worth monitoring.
+  Acceptable. N=100+ approaches 400 MB - worth monitoring.

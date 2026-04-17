@@ -38,12 +38,12 @@ const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 ///
 /// **Safety:** This is a write-side-only data structure. All strings inserted
 /// come from the caller's in-process data (tag keys, tag values, role strings,
-/// user names) — never from untrusted PBF input. There is no risk of
+/// user names) - never from untrusted PBF input. There is no risk of
 /// HashDoS attacks, which is the sole reason the standard library defaults to
 /// the slower SipHash-1-3 hasher.
 ///
 /// **Performance:** FxHash is a simple, non-cryptographic hash (multiply +
-/// rotate) that is substantially faster than SipHash for short strings — which
+/// rotate) that is substantially faster than SipHash for short strings - which
 /// is exactly what OSM tag keys/values are (typically 3-30 bytes: "name",
 /// "highway", "building", "residential", etc.). The string table is on the hot
 /// path of PBF writing: every tag on every element does a hash lookup + possible
@@ -63,7 +63,7 @@ const MAX_ENTITIES_PER_BLOCK: usize = 8000;
 ///   but wrapping an IndexMap would still need a fast hasher, and we already
 ///   maintain the ordered Vec separately. Switching would add a dependency for
 ///   no net benefit.
-/// - Custom perfect hashing: Not viable because the string set is dynamic —
+/// - Custom perfect hashing: Not viable because the string set is dynamic -
 ///   we do not know all strings upfront.
 struct StringTable {
     strings: Vec<Rc<str>>,
@@ -87,7 +87,7 @@ impl StringTable {
     ///
     /// ## Fast path (cache hit, ~99% of calls)
     ///
-    /// `self.index.get(s)` looks up the `&str` directly via the `Borrow` trait —
+    /// `self.index.get(s)` looks up the `&str` directly via the `Borrow` trait -
     /// no allocation, just FxHash + probe. This is the hot path: a typical 8000-
     /// element block has ~1200 unique strings but ~16,000+ add() calls, so the
     /// vast majority are cache hits.
@@ -96,14 +96,14 @@ impl StringTable {
     ///
     /// On the first occurrence of a string, allocates a single `Rc<str>` shared
     /// between the HashMap key and the Vec entry. `Rc::clone` is just a refcount
-    /// bump — one heap allocation per unique string total.
+    /// bump - one heap allocation per unique string total.
     #[allow(clippy::cast_possible_truncation)]
     fn add(&mut self, s: &str) -> u32 {
-        // Fast path: string already interned — hash-only lookup, no allocation.
+        // Fast path: string already interned - hash-only lookup, no allocation.
         if let Some(&idx) = self.index.get(s) {
             return idx;
         }
-        // Slow path: first occurrence — single Rc<str> allocation, shared
+        // Slow path: first occurrence - single Rc<str> allocation, shared
         // between the Vec and HashMap (Rc::clone is just a refcount bump).
         let next_idx = self.strings.len() as u32;
         let rc: Rc<str> = Rc::from(s);
@@ -205,7 +205,7 @@ fn member_type_value(mt: MemberType) -> i32 {
         MemberType::Node => 0,
         MemberType::Way => 1,
         MemberType::Relation => 2,
-        // Unknown member types from newer PBF producers — round-trip as Node
+        // Unknown member types from newer PBF producers - round-trip as Node
         // since the protobuf enum has no "unknown" value. Callers should filter
         // these out before writing if lossless preservation is needed.
         MemberType::Unknown(_) => 0,
@@ -223,7 +223,7 @@ fn member_type_value(mt: MemberType) -> i32 {
 /// and [`take`](Self::take) should be called to serialize and reset.
 ///
 /// Each block contains only one element type (nodes OR ways OR relations).
-/// Adding a different type when the block is non-empty will panic — the
+/// Adding a different type when the block is non-empty will panic - the
 /// caller must flush first.
 pub struct BlockBuilder {
     string_table: StringTable,
@@ -280,7 +280,7 @@ pub struct BlockBuilder {
     packed_lon_scratch: Vec<u8>,  // way location lon encoding (single-pass)
     info_scratch: Vec<u8>,        // Info sub-message body
 
-    // Reusable encode buffer for take() — avoids allocating a fresh Vec<u8> per block.
+    // Reusable encode buffer for take() - avoids allocating a fresh Vec<u8> per block.
     encode_buf: Vec<u8>,
 
     // True when the string table has been pre-seeded from an input block (merge only).
@@ -336,7 +336,7 @@ impl BlockBuilder {
             dense_ids: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
             dense_lats: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
             dense_lons: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
-            // Interleaved key/val string indices plus delimiters — see doc comment above.
+            // Interleaved key/val string indices plus delimiters - see doc comment above.
             dense_keys_vals: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK * 2),
 
             // Pre-allocate dense metadata vectors to max block size.
@@ -349,7 +349,7 @@ impl BlockBuilder {
             dense_visibles: Vec::with_capacity(MAX_ENTITIES_PER_BLOCK),
             has_dense_metadata: false,
 
-            // Delta encoding state — reset to zero for each new block.
+            // Delta encoding state - reset to zero for each new block.
             last_dense_id: 0,
             last_dense_lat: 0,
             last_dense_lon: 0,
@@ -358,7 +358,7 @@ impl BlockBuilder {
             last_dense_uid: 0,
             last_dense_user_sid: 0,
 
-            // Wire-format scratch buffers — left at zero capacity since
+            // Wire-format scratch buffers - left at zero capacity since
             // way/relation blocks will grow as needed, and dense-node blocks
             // never use them.
             group_buf: Vec::new(),
@@ -486,7 +486,7 @@ impl BlockBuilder {
         }
         self.dense_keys_vals.push(0);
 
-        // Metadata — maintain parallel arrays with dense_ids.
+        // Metadata - maintain parallel arrays with dense_ids.
         // When mixing nodes with and without metadata in the same block
         // (e.g. merge: base nodes have metadata, OSC replacements don't),
         // we must keep all DenseInfo arrays the same length as dense_ids.
@@ -514,21 +514,21 @@ impl BlockBuilder {
         // Version is NOT delta-encoded
         self.dense_versions.push(meta.version);
 
-        // Timestamp — delta-encoded
+        // Timestamp - delta-encoded
         self.dense_timestamps
             .push(meta.timestamp - self.last_dense_timestamp);
         self.last_dense_timestamp = meta.timestamp;
 
-        // Changeset — delta-encoded
+        // Changeset - delta-encoded
         self.dense_changesets
             .push(meta.changeset - self.last_dense_changeset);
         self.last_dense_changeset = meta.changeset;
 
-        // UID — delta-encoded
+        // UID - delta-encoded
         self.dense_uids.push(meta.uid - self.last_dense_uid);
         self.last_dense_uid = meta.uid;
 
-        // User SID — delta-encoded
+        // User SID - delta-encoded
         let user_sid = self.string_table.add(meta.user) as i32;
         self.dense_user_sids
             .push(user_sid - self.last_dense_user_sid);
@@ -731,7 +731,7 @@ impl BlockBuilder {
         self.last_dense_lon = lon;
         self.track_coords(decimicro_lat, decimicro_lon);
 
-        // Tags: write raw indices directly — no StringTable::add()
+        // Tags: write raw indices directly - no StringTable::add()
         for (key_sid, val_sid) in raw_tags {
             #[allow(clippy::cast_sign_loss)]
             self.tag_key_indices.insert(key_sid as u32);
@@ -1000,7 +1000,7 @@ impl BlockBuilder {
     /// BlobHeader tag key index. This eliminates the need for the writer to
     /// rescan the serialized bytes via `scan_block_ids` and `scan_block_tags`.
     ///
-    /// Unlike `take()`, this does not reuse the encode buffer across calls —
+    /// Unlike `take()`, this does not reuse the encode buffer across calls -
     /// each call yields a fresh `Vec` and the internal buffer restarts empty.
     /// The total allocation is the same as `take()` + `to_vec()` but the
     /// `memcpy` is eliminated.
@@ -1166,17 +1166,17 @@ fn encode_info_to(
     meta: &Metadata<'_>,
 ) {
     info.clear();
-    // Field 1: version (optional int32) — always present
+    // Field 1: version (optional int32) - always present
     encode_optional_int32(info, 1, meta.version);
-    // Field 2: timestamp (optional int64) — always present
+    // Field 2: timestamp (optional int64) - always present
     encode_optional_int64(info, 2, meta.timestamp);
-    // Field 3: changeset (optional int64) — always present
+    // Field 3: changeset (optional int64) - always present
     encode_optional_int64(info, 3, meta.changeset);
-    // Field 4: uid (optional int32) — always present
+    // Field 4: uid (optional int32) - always present
     encode_optional_int32(info, 4, meta.uid);
-    // Field 5: user_sid (optional uint32) — always present
+    // Field 5: user_sid (optional uint32) - always present
     encode_optional_uint32(info, 5, string_table.add(meta.user));
-    // Field 6: visible (optional bool) — only emit when false
+    // Field 6: visible (optional bool) - only emit when false
     // When visible=true, the current code leaves info.visible as None (prost skips it).
     // When visible=false, it sets Some(false), and prost writes tag + varint(0).
     if !meta.visible {
@@ -1548,7 +1548,7 @@ impl<'a> HeaderBuilder<'a> {
     /// Create a header builder pre-populated with bbox and replication metadata
     /// from an existing [`HeaderBlock`].
     ///
-    /// Optional features (including `Sort.Type_then_ID`) are **not** copied —
+    /// Optional features (including `Sort.Type_then_ID`) are **not** copied -
     /// call [`.sorted()`](Self::sorted) explicitly if the output should declare
     /// sorted order.
     #[must_use]
@@ -1592,7 +1592,7 @@ impl<'a> HeaderBuilder<'a> {
         self
     }
 
-    /// Declare `Sort.Type_then_ID` — elements are sorted by type then by ID.
+    /// Declare `Sort.Type_then_ID` - elements are sorted by type then by ID.
     #[must_use]
     pub fn sorted(mut self) -> Self {
         self.sorted = true;

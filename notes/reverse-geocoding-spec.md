@@ -6,18 +6,18 @@ design direction).
 **Note: implementation deviated from this spec.** Node coordinates use a compact
 rank-indexed array (via `IdSetDense` rank) instead of the spec's `DenseMmapIndex`.
 Pass 4 (S2 cell assignment) uses 256 temp-file buckets instead of external merge
-sort. Actual peak anon RSS is **29.5 GB** (planet, commit `7e9c2e9`, 2026-04-17) vs the spec's ~14.5 GB budget — the peak lands in `GEOCODE_PASS1_5` (referenced-node collect), not in the `DenseMmapIndex` mmap. The earlier 17.8 GB figure under-reported because brokkr's sidecar previously hid short-emitting phase markers. See [geocode-build-opportunities.md](geocode-build-opportunities.md) for the breakdown.
+sort. Actual peak anon RSS is **29.5 GB** (planet, commit `7e9c2e9`, 2026-04-17) vs the spec's ~14.5 GB budget - the peak lands in `GEOCODE_PASS1_5` (referenced-node collect), not in the `DenseMmapIndex` mmap. The earlier 17.8 GB figure under-reported because brokkr's sidecar previously hid short-emitting phase markers. See [geocode-build-opportunities.md](geocode-build-opportunities.md) for the breakdown.
 
 ## 1. Scope
 
 This spec covers two deliverables:
 
-1. **`build-geocode-index`** — a new pbfhogg CLI command that reads an OSM PBF and
+1. **`build-geocode-index`** - a new pbfhogg CLI command that reads an OSM PBF and
    writes a set of binary index files optimized for reverse geocoding queries.
    Gated behind the `commands` feature (same as other CLI commands).
-2. **`pbfhogg::geocode_index`** — a library module with two parts:
+2. **`pbfhogg::geocode_index`** - a library module with two parts:
    - **Reader** (`Reader::query`, `Reader::candidates`): gated behind the
-     `geocode-reader` feature. This is what nidhogg links against — it does not
+     `geocode-reader` feature. This is what nidhogg links against - it does not
      pull in `roaring`, `serde_json`, or builder code.
    - **Builder** (the build pipeline): gated behind `commands`, which implies
      `geocode-reader`.
@@ -59,7 +59,7 @@ irrelevant blobs.
 
 Read the PBF header. Verify indexdata is present (or `--force`). Record the
 `osmosis_replication_sequence_number` and `osmosis_replication_timestamp` if available
-— these are written into the index header for staleness detection.
+- these are written into the index header for staleness detection.
 
 ### 3.1. Pass 1: Nodes
 
@@ -76,7 +76,7 @@ Read the PBF header. Verify indexdata is present (or `--force`). Record the
 - **Node coordinate index:** All node coordinates for way resolution in pass 2.
   Uses the same strategy as `add-locations-to-ways`: a `DenseMmapIndex`
   (file-backed mmap, `index[node_id] = (lat_e7, lon_e7)`) for the default path.
-  This is the dominant memory cost — ~16 GB touched for planet after blob
+  This is the dominant memory cost - ~16 GB touched for planet after blob
   filtering.
 
 **Memory budget:** ~16 GB virtual for the dense node index (same as ALTW). The
@@ -117,19 +117,19 @@ to temporary files. Per-block scratch is bounded by the ALTW batch budget patter
 
 This pass assembles administrative boundary polygons. It follows a two-scan approach:
 
-**Scan 3a — Collect boundary relations:**
+**Scan 3a - Collect boundary relations:**
 Stream relations. For each relation with `boundary=administrative` (admin_level
 2-10) or `boundary=postal_code` (treated as level 11):
 - Record the relation ID, admin_level, name, and country_code (ISO 3166-1:alpha2
   from `ISO3166-1:alpha2` tag, for admin_level=2 only).
 - Collect all way member IDs into an `IdSetDense`, recording the role (`outer`,
   `inner`, or empty) per member per relation. Both outer and inner members are
-  needed — inner rings define holes (enclaves, exclusion zones) that must be
+  needed - inner rings define holes (enclaves, exclusion zones) that must be
   subtracted during point-in-polygon testing. Without inner rings, queries inside
   enclaves (e.g., Vatican City within Rome) would incorrectly match the enclosing
   boundary.
 
-**Scan 3b — Resolve way geometries:**
+**Scan 3b - Resolve way geometries:**
 Re-scan way blobs (blob filter: `BlobFilter::only_ways()`). For each way whose
 ID is in the collected set, resolve node coordinates from the dense index and
 store the way geometry.
@@ -143,7 +143,7 @@ matching, grouped by role. This reuses the ring assembly algorithm from nidhogg'
   mapping quantized endpoints to segment indices.
 - Trace rings by following endpoint chains.
 - Classify outer rings as exterior and inner rings as holes by role assignment
-  (not signed area alone — the role tag is authoritative per OSM conventions).
+  (not signed area alone - the role tag is authoritative per OSM conventions).
 
 **Polygon simplification:**
 Apply Douglas-Peucker to each assembled ring with a vertex cap
@@ -152,13 +152,13 @@ point-in-polygon cost for complex boundaries like Norway's coastline.
 
 **Memory budget:** The `IdSetDense` for way member IDs is small (~100K ways for
 planet boundaries). The assembled polygons for all admin boundaries fit in memory
-— there are ~300K admin boundary relations for planet, but after simplification
+- there are ~300K admin boundary relations for planet, but after simplification
 the total vertex count is bounded (~150M vertices worst case before simplification,
 ~50M after). The dense node index can be unmapped after this pass.
 
 ### 3.4. Pass 4: S2 cell assignment and index construction
 
-No PBF reading — this pass operates on the temporary files from passes 1-3.
+No PBF reading - this pass operates on the temporary files from passes 1-3.
 
 **For each address point:**
 Compute cell IDs at both `street_level` and `coarse_level`. Record
@@ -168,11 +168,11 @@ Compute cell IDs at both `street_level` and `coarse_level`. Record
 For each consecutive node pair (segment), compute the S2 cell covering at both
 `street_level` and `coarse_level`. Record `(cell_id, way_index, segment_index)`
 for each covered cell in both maps. Each segment maps to ~1 cell at level 17,
-so there is no need for per-way deduplication — each (cell, way, segment) tuple
+so there is no need for per-way deduplication - each (cell, way, segment) tuple
 is naturally unique.
 
 **For each interpolation way:**
-Same as streets — cover each segment at both levels, recording segment refs.
+Same as streets - cover each segment at both levels, recording segment refs.
 
 **For each admin polygon:**
 Compute edge and interior cell sets at `admin_level`:
@@ -197,12 +197,12 @@ Interior cells are marked with the high-bit flag (0x8000_0000) in the entry list
 
 **Interior cell semantics:** The high bit is a **hint**, not proof of
 containment. The reader **still performs a point-in-polygon test** on
-interior-flagged cells — the same test as edge cells. The difference is
+interior-flagged cells - the same test as edge cells. The difference is
 priority: interior cells are tested first, and the reader can skip remaining
 candidates at the same admin level once a match is confirmed (since interior
 cells are far from boundaries, the first match is almost always correct). This
 avoids the correctness problem of skipping ray-casting entirely while still
-getting most of the performance benefit — interior cells are the common case,
+getting most of the performance benefit - interior cells are the common case,
 and PIP on a simplified polygon is cheap.
 
 The worst case for a false interior-flag is wasted work (testing a polygon
@@ -241,7 +241,7 @@ For each interpolation way, resolve the house numbers at each endpoint:
 3. **Prefer coordinate-coincident points:** If an address point has the same
    coordinates (within 1 decimicrodegree) as the interpolation endpoint, prefer
    it. In OSM, interpolation way endpoints are typically placed on the address
-   nodes they reference. This is a heuristic — coordinate coincidence is not
+   nodes they reference. This is a heuristic - coordinate coincidence is not
    node identity (address records don't retain source node IDs), but it works
    well in practice.
 4. **Fall back to nearest:** Among same-street candidates within the search radius,
@@ -274,7 +274,7 @@ methods.
 `street_nodes.bin` (~24 GB) and `street_entries.bin` (~9 GB, due to segment-level
 indexing). All other offset fields are **u32**.
 
-### 4.0. `geocode_header.bin` — Index header
+### 4.0. `geocode_header.bin` - Index header
 
 Fixed-size, 128 bytes (64 bytes used, 64 bytes reserved for future fields
 without a format version bump):
@@ -304,7 +304,7 @@ without a format version bump):
 The reader checks magic + version on load and rejects mismatches. The cell levels
 and search radius are stored so the reader doesn't need to assume defaults.
 
-### 4.1. `geo_cells.bin` — Merged street-level cell index
+### 4.1. `geo_cells.bin` - Merged street-level cell index
 
 Sorted by cell_id. One entry per unique cell. Binary-searchable.
 
@@ -322,7 +322,7 @@ planet scale (6 bytes each = ~9 GB), exceeding the u32 4 GB limit. Address
 and interpolation entry offsets remain u32 (addr_entries ~2 GB,
 interp_entries ~400 MB).
 
-### 4.2. `street_entries.bin` — Street segment refs per cell
+### 4.2. `street_entries.bin` - Street segment refs per cell
 
 Variable-length records, packed sequentially. Each record referenced by a byte
 offset from `geo_cells.bin`. Entries point to **segments** (pairs of consecutive
@@ -345,16 +345,16 @@ At query time, the reader reads exactly 2 nodes (16 bytes) from
 `way.node_offset + (segment_index + 1) * 8`. No full-polyline iteration, no
 per-way dedup hash table. The way header is only read for the street name.
 
-### 4.3. `addr_entries.bin` — Address point IDs per cell
+### 4.3. `addr_entries.bin` - Address point IDs per cell
 
 | Type | Field |
 |------|-------|
 | `u16` | Entry count (N) |
 | `[u32; N]` | Address point indices (into `addr_points.bin`) |
 
-Address points are single points — no segment indexing needed.
+Address points are single points - no segment indexing needed.
 
-### 4.4. `interp_entries.bin` — Interpolation segment refs per cell
+### 4.4. `interp_entries.bin` - Interpolation segment refs per cell
 
 Same segment-level layout as street entries:
 
@@ -365,7 +365,7 @@ Same segment-level layout as street entries:
 
 For interpolation, computing the house number requires way-level context
 (total length, start/end house numbers). The interpolation path:
-1. Read 2 nodes for the matched segment (distance check) — same as streets.
+1. Read 2 nodes for the matched segment (distance check) - same as streets.
 2. For the nearest interpolation hit only (in `query()`) or on demand (via
    `Reader::interpolate()` for `candidates()` users), read the way header
    from `interp_ways.bin` for start/end numbers and total node count.
@@ -378,18 +378,18 @@ For interpolation, computing the house number requires way-level context
 **Entry count overflow (sections 4.2-4.4):** The u16 entry count limits each cell
 to 65535 entries. At level 17 (~77m cells) with segment-level indexing, each
 segment maps to ~1 cell, so the count per cell is bounded by the number of
-segments intersecting a 77m area — well under 65535 even in dense urban areas.
+segments intersecting a 77m area - well under 65535 even in dense urban areas.
 The builder emits a debug assertion if any cell exceeds this, and truncates with
 a warning if triggered.
 
 ### 4.4a. Coarse-level fallback index
 
 In rural areas (e.g., northern Scandinavia), the nearest named street can be
-500m+ from a query point — beyond the ~230m reach of the 9-cell level-17
+500m+ from a query point - beyond the ~230m reach of the 9-cell level-17
 neighborhood. A coarse fallback index at level 14 (~620m cells, 9-cell
 neighborhood covers ~1.8 km) handles these cases.
 
-**`coarse_geo_cells.bin`** — same layout as `geo_cells.bin` (24 bytes/record)
+**`coarse_geo_cells.bin`** - same layout as `geo_cells.bin` (24 bytes/record)
 but indexed at `coarse_level` (default 14):
 
 | Offset | Type | Field |
@@ -400,20 +400,20 @@ but indexed at `coarse_level` (default 14):
 | 20 | `u32` | Byte offset into `coarse_interp_entries.bin` |
 
 **`coarse_street_entries.bin`**, **`coarse_addr_entries.bin`**,
-**`coarse_interp_entries.bin`** — same variable-length layout as their
+**`coarse_interp_entries.bin`** - same variable-length layout as their
 fine-level counterparts (segment refs for streets/interp, u32 indices for
 addresses). They reference the same underlying data files.
 
-The builder generates both fine and coarse cell indices in pass 4 — each
+The builder generates both fine and coarse cell indices in pass 4 - each
 geometry is assigned cells at both levels. The coarse cell index file itself is
 small (~800 MB vs ~7 GB for fine, since level 14 has ~8x fewer cells). However,
 the coarse **entry files** are roughly the same size as the fine entry files
-because every segment appears once at each level — the entries are just grouped
+because every segment appears once at each level - the entries are just grouped
 into fewer, larger cells. This is a deliberate space-for-coverage tradeoff:
 the coarse index roughly doubles the entry file storage (~12 GB at planet) to
 cover rural areas where the fine level's 9-cell neighborhood is too narrow.
 
-### 4.5. `street_ways.bin` — Street way geometry
+### 4.5. `street_ways.bin` - Street way geometry
 
 Fixed-size header per way, followed by variable node data in `street_nodes.bin`:
 
@@ -426,10 +426,10 @@ Fixed-size header per way, followed by variable node data in `street_nodes.bin`:
 Record size: **14 bytes**.
 
 Node offset is u64 because `street_nodes.bin` reaches ~24 GB at planet scale.
-u16 for node count (max 65535) instead of traccar-geocoder's u8 (max 255) —
+u16 for node count (max 65535) instead of traccar-geocoder's u8 (max 255) -
 some OSM ways have >255 nodes.
 
-### 4.6. `street_nodes.bin` — Street way node coordinates
+### 4.6. `street_nodes.bin` - Street way node coordinates
 
 All street way nodes, concatenated. Each way's nodes are contiguous:
 
@@ -440,7 +440,7 @@ All street way nodes, concatenated. Each way's nodes are contiguous:
 
 Record size: **8 bytes** per node.
 
-### 4.7. `addr_points.bin` — Address points
+### 4.7. `addr_points.bin` - Address points
 
 Fixed-size records:
 
@@ -460,7 +460,7 @@ data in OSM; individual elements often carry `addr:postcode` directly. At query
 time, if no `boundary=postal_code` polygon contains the query point, the reader
 falls back to the postcode of the nearest address point.
 
-### 4.8. `interp_ways.bin` — Interpolation way metadata
+### 4.8. `interp_ways.bin` - Interpolation way metadata
 
 | Offset | Type | Field |
 |--------|------|-------|
@@ -476,11 +476,11 @@ Record size: **23 bytes**.
 Node offset is u64 for consistency with street_ways (interp_nodes.bin is small,
 but using u32 here would be a format inconsistency that invites bugs).
 
-### 4.9. `interp_nodes.bin` — Interpolation way node coordinates
+### 4.9. `interp_nodes.bin` - Interpolation way node coordinates
 
 Same layout as `street_nodes.bin`: `(i32 lat, i32 lon)` pairs, **8 bytes** each.
 
-### 4.10. `admin_cells.bin` — Admin boundary cell index
+### 4.10. `admin_cells.bin` - Admin boundary cell index
 
 Sorted by cell_id. Binary-searchable:
 
@@ -491,7 +491,7 @@ Sorted by cell_id. Binary-searchable:
 
 Record size: **12 bytes**.
 
-### 4.11. `admin_entries.bin` — Admin polygon IDs per cell
+### 4.11. `admin_entries.bin` - Admin polygon IDs per cell
 
 Variable-length records:
 
@@ -505,7 +505,7 @@ polygon is likely to contain query points in this cell. The reader still
 performs point-in-polygon on these entries but tests them first and can skip
 remaining same-level candidates once confirmed. See section 3.4 for semantics.
 
-### 4.12. `admin_polygons.bin` — Admin boundary metadata
+### 4.12. `admin_polygons.bin` - Admin boundary metadata
 
 | Offset | Type | Field |
 |--------|------|-------|
@@ -523,7 +523,7 @@ Fields are ordered largest-first to avoid alignment padding. Vertex count is u32
 to allow bypassing simplification (`--max-admin-vertices 0`); with the default cap
 of 500, u16 would suffice, but u32 keeps the format general.
 
-### 4.13. `admin_vertices.bin` — Admin polygon vertices
+### 4.13. `admin_vertices.bin` - Admin polygon vertices
 
 All polygon vertices, concatenated. Each polygon's vertices are contiguous.
 Exterior ring first, then holes (if any), separated by a sentinel
@@ -536,7 +536,7 @@ Exterior ring first, then holes (if any), separated by a sentinel
 
 Record size: **8 bytes** per vertex.
 
-### 4.14. `strings.bin` — Global string pool
+### 4.14. `strings.bin` - Global string pool
 
 Null-terminated UTF-8 strings, concatenated. Every string reference in the index
 is a u32 byte offset into this file. Offset 0 is always an empty string (`\0`).
@@ -571,7 +571,7 @@ traccar-geocoder's 18 GB. The main cost drivers: segment-level street entries
 at both fine and coarse levels (~9 GB each = ~18 GB for street entries alone),
 postcode per address point (20 vs 16 bytes), and wider record formats (u16
 node counts, u64 node offsets). The coarse entry files are roughly the same
-size as the fine entry files because every segment appears once at each level —
+size as the fine entry files because every segment appears once at each level -
 the coarse level has fewer cells but more entries per cell.
 
 The tradeoff is accepted: segment indexing eliminates per-way polyline iteration
@@ -593,7 +593,7 @@ pub mod geocode_index {
     pub struct Reader { /* private */ }
 
     /// Result of a reverse geocoding query. Borrows strings from the
-    /// Reader's mmap'd string pool — zero allocation on the query path.
+    /// Reader's mmap'd string pool - zero allocation on the query path.
     pub struct ReverseResult<'a> {
         /// Nearest address point, if any within search radius.
         pub address: Option<AddressMatch<'a>>,
@@ -641,7 +641,7 @@ pub mod geocode_index {
 ```
 
 All string fields are `&'a str` referencing the mmap'd `strings.bin` via the
-Reader's lifetime. This makes `query()` allocation-free — the only work is
+Reader's lifetime. This makes `query()` allocation-free - the only work is
 binary search, distance math, and point-in-polygon. Callers that need owned
 strings (e.g., for JSON serialization) copy at the point of use.
 
@@ -669,7 +669,7 @@ impl Reader {
 
     /// Query with default ranking: nearest address, nearest street, nearest
     /// interpolation, smallest-area admin per level, postcode fallback.
-    /// Allocation-free fast path — does not materialize all candidates.
+    /// Allocation-free fast path - does not materialize all candidates.
     /// Equivalent in result to `self.candidates(lat, lon).into_result(self)`.
     pub fn query(&self, lat: f64, lon: f64) -> ReverseResult<'_>;
 
@@ -682,7 +682,7 @@ impl Reader {
 }
 
 /// Raw candidates from a spatial lookup. Unranked, untruncated.
-/// Uses Vec — callers choosing the low-level API accept the allocation.
+/// Uses Vec - callers choosing the low-level API accept the allocation.
 pub struct Candidates<'a> {
     /// All address points within search radius, with distances.
     pub addresses: Vec<AddressMatch<'a>>,
@@ -690,10 +690,10 @@ pub struct Candidates<'a> {
     /// Name is resolved for every candidate (way header read per hit).
     pub streets: Vec<StreetMatch<'a>>,
     /// All interpolation segment hits within search radius.
-    /// House numbers are NOT computed — use Reader::interpolate() to
+    /// House numbers are NOT computed - use Reader::interpolate() to
     /// resolve a specific candidate into a house number.
     pub interpolations: Vec<InterpolationCandidate<'a>>,
-    /// All admin polygons containing the query point — may include
+    /// All admin polygons containing the query point - may include
     /// multiple polygons at the same admin level (e.g., overlapping
     /// municipal boundaries). Not collapsed to one-per-level.
     pub admin: Vec<AdminMatch<'a>>,
@@ -729,7 +729,7 @@ impl Reader {
 ```
 
 `candidates()` returns all matches within the applicable search radius (fine
-or coarse). It uses `Vec` — callers choosing the low-level API accept the
+or coarse). It uses `Vec` - callers choosing the low-level API accept the
 allocation cost. Admin matches use `ArrayVec<_, 10>` since admin levels are
 bounded (2-11).
 
@@ -739,7 +739,7 @@ It calls `interpolate()` only for the single nearest interpolation hit.
 
 `candidates()` reads the way header (for street name) for every retained
 street/interpolation hit. This is one 14-byte read per candidate from the
-mmap'd file — cheap compared to the distance math.
+mmap'd file - cheap compared to the distance math.
 
 nidhogg can call `candidates()` directly to implement custom ranking (e.g.,
 prefer a specific admin level, apply language-specific street name preferences,
@@ -749,16 +749,16 @@ or combine with forward-geocoding signals).
 
 `Reader::query(lat, lon)`:
 
-**Step 1 — Fine street-level lookup:**
+**Step 1 - Fine street-level lookup:**
 ```
 cell = S2CellID::from(LatLng::from_degrees(lat, lon)).parent(street_level)
 cells = [cell] + cell.all_neighbors(street_level)   // 9 cells
 ```
 
-**Step 2 — For each cell, binary search `geo_cells.bin`:**
+**Step 2 - For each cell, binary search `geo_cells.bin`:**
 If found, read offsets for street_entries, addr_entries, interp_entries.
 
-**Step 3 — Score candidates (fine level):**
+**Step 3 - Score candidates (fine level):**
 
 Address points: for each entry, compute approximate distance using the cos
 projection formula:
@@ -775,7 +775,7 @@ point-to-segment distance (project query point onto segment, clamp parameter
 to [0, 1]). Track nearest segment + snap point. Read the way header (name)
 only for the nearest match.
 
-No deduplication hash table is needed — segment refs are unique per cell.
+No deduplication hash table is needed - segment refs are unique per cell.
 A segment spanning a cell boundary appears in both cells' entry lists, but
 each entry is a distinct (way, segment) pair. The same segment may be
 evaluated twice across neighboring cells, but this is at most 2x work per
@@ -791,12 +791,12 @@ number = start + round(t * (end - start))
 // For type == even or odd:
 number = start + 2 * round(t * (end - start) / 2)
 ```
-The even/odd formula preserves the parity of `start` naturally — OSM even
+The even/odd formula preserves the parity of `start` naturally - OSM even
 interpolation ways have even start/end values, and odd ways have odd values.
 The step size of 2 with rounding to the nearest multiple keeps the output on
 the correct parity without an additional +1 offset.
 
-**Step 3a — Coarse fallback (if no street or address found):**
+**Step 3a - Coarse fallback (if no street or address found):**
 If the fine-level search found no street and no address, repeat steps 1-3
 against the coarse index (`coarse_geo_cells.bin` and its entry files) at
 `coarse_level` (default 14), using the **coarse search radius** (default
@@ -808,7 +808,7 @@ only, 75m radius) while covering rural areas where the nearest named street
 may be 500m+ away. The coarse search radius is stored separately in the header
 (`coarse_search_radius`) and can be tuned independently.
 
-**Step 4 — Admin lookup:**
+**Step 4 - Admin lookup:**
 ```
 cell = S2CellID::from(LatLng).parent(admin_level)
 cells = [cell] + cell.all_neighbors(admin_level)
@@ -823,7 +823,7 @@ For each cell, binary search `admin_cells.bin`. For each polygon entry:
 For each admin level (2-11), keep the smallest-area polygon that contains the
 query point (handles nested boundaries like city within state).
 
-**Step 5 — Assemble `ReverseResult<'_>`.**
+**Step 5 - Assemble `ReverseResult<'_>`.**
 
 If no admin match at level 11 (postal code boundary) was found but the nearest
 address point has a non-empty `postcode` field, use that as the postcode in the
@@ -922,19 +922,19 @@ commands = ["roaring", "serde_json", "geocode-reader"] # full CLI including buil
 
 The `geocode-reader` feature gates `pbfhogg::geocode_index::Reader` and its
 dependencies (`s2` for cell ID computation at query time). nidhogg depends on
-`pbfhogg` with `features = ["geocode-reader"]` — it does not need `roaring`,
+`pbfhogg` with `features = ["geocode-reader"]` - it does not need `roaring`,
 `serde_json`, or the builder. The builder is gated behind `commands` as usual.
 
 The `s2` crate provides:
-- `CellID::from(LatLng).parent(level)` — cell ID computation
-- `CellID::all_neighbors(level)` — 8 neighbors for query expansion
-- `RegionCoverer` — line segment covering (for street/interpolation cell assignment)
+- `CellID::from(LatLng).parent(level)` - cell ID computation
+- `CellID::all_neighbors(level)` - 8 neighbors for query expansion
+- `RegionCoverer` - line segment covering (for street/interpolation cell assignment)
 
 The `s2` crate at v0.0.13 is the only maintained Rust S2 implementation. Its core
 APIs (CellID, LatLng, neighbors) are stable and used in production by
 traccar-geocoder. If `RegionCoverer` proves insufficient for segment covering, the
 fallback is to compute cell IDs for both segment endpoints and, if they differ, walk
-intermediate points along the segment to find all crossed cells — this is ~50 lines
+intermediate points along the segment to find all crossed cells - this is ~50 lines
 of code and only needed during the build, not at query time.
 
 If the crate becomes unmaintained, vendoring the ~200 lines for cell ID computation
@@ -969,7 +969,7 @@ restarts.
 |---------|----------|
 | Missing index file | `Reader::open` returns `Err` |
 | Header magic/version mismatch | `Reader::open` returns `Err` |
-| Corrupt index (truncated file) | Undefined — mmap reads may return garbage. A post-build validation step (section 9) catches this before serving. |
+| Corrupt index (truncated file) | Undefined - mmap reads may return garbage. A post-build validation step (section 9) catches this before serving. |
 
 ## 9. Validation strategy
 
@@ -1018,18 +1018,18 @@ interpolation and edge-case polygon containment).
 
 ## 10. Implementation order
 
-1. **`src/geo.rs`** — Extract geometry primitives from extract.rs. Add
+1. **`src/geo.rs`** - Extract geometry primitives from extract.rs. Add
    `simplify_ring`, `assemble_rings`, distance functions. Unit tests.
-2. **`src/geocode_index/format.rs`** — Define the on-disk format structs, header,
+2. **`src/geocode_index/format.rs`** - Define the on-disk format structs, header,
    magic, version. Manual byte-level `from_bytes` / `to_bytes` methods (not
-   `#[repr(C)]` transmutation — see section 4 serialization approach).
-3. **`src/geocode_index/reader.rs`** — `Reader::open`, `Reader::query`. Unit tests
+   `#[repr(C)]` transmutation - see section 4 serialization approach).
+3. **`src/geocode_index/reader.rs`** - `Reader::open`, `Reader::query`. Unit tests
    with synthetic index.
-4. **`src/geocode_index/builder.rs`** — The four-pass build pipeline. String pool.
+4. **`src/geocode_index/builder.rs`** - The four-pass build pipeline. String pool.
    Cell assignment. Index writing.
-5. **`cli/src/main.rs`** — `BuildGeocodeIndex` command variant. Wire up CLI args.
-6. **Integration tests** — Denmark round-trip.
-7. **Benchmarking** — Add `brokkr bench commands build-geocode-index` support.
+5. **`cli/src/main.rs`** - `BuildGeocodeIndex` command variant. Wire up CLI args.
+6. **Integration tests** - Denmark round-trip.
+7. **Benchmarking** - Add `brokkr bench commands build-geocode-index` support.
    Measure Denmark build time and query latency.
 
 Steps 1-3 can proceed without the S2 dependency (use stub cell IDs for unit tests).

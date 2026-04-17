@@ -332,7 +332,7 @@ pub struct AdminPolygon {
     /// Only populated for admin_level=2 boundaries. The builder interns
     /// the 2-char code (e.g., "DK") into the string pool.
     pub country_code_offset: u32,
-    /// Admin level 2–11.
+    /// Admin level 2-11.
     pub admin_level: u8,
 }
 
@@ -726,7 +726,7 @@ mod tests {
     fn parse_polygon_rings_short_ring_dropped() {
         // A ring with fewer than 3 vertices gets dropped
         let coords = vec![
-            nc(10, 20), nc(30, 40), // 2 vertices — too short
+            nc(10, 20), nc(30, 40), // 2 vertices - too short
         ];
         let (exterior, holes) = parse_polygon_rings(coords.into_iter());
         assert!(exterior.is_empty());

@@ -2,8 +2,8 @@
 
 This document has two parts:
 
-1. **Pipeline inventory** — all read, write, and command pipelines in the codebase, how they compose, and which commands use them.
-2. **Author's production pipeline** — the specific deployment that drives pbfhogg's development: planet-scale PBF refresh feeding tile generation and reverse geocoding.
+1. **Pipeline inventory** - all read, write, and command pipelines in the codebase, how they compose, and which commands use them.
+2. **Author's production pipeline** - the specific deployment that drives pbfhogg's development: planet-scale PBF refresh feeding tile generation and reverse geocoding.
 
 ---
 
@@ -11,7 +11,7 @@ This document has two parts:
 
 ### Pipelined Read
 
-**3-stage pipeline** — `src/read/pipeline.rs`, driven by `ElementReader`
+**3-stage pipeline** - `src/read/pipeline.rs`, driven by `ElementReader`
 
 | Stage | Thread | Work | Buffer |
 |-------|--------|------|--------|
@@ -20,9 +20,9 @@ This document has two parts:
 | 3. Reorder | Caller's thread | `ReorderBuffer` restores file order, delivers blocks to consumer | 32-slot decode-ahead |
 
 Entry points:
-- `ElementReader::for_each_pipelined()` — element-level callback
-- `ElementReader::for_each_block_pipelined()` — owned `PrimitiveBlock` callback
-- `ElementReader::into_blocks_pipelined()` — returns `Iterator<Item = Result<PrimitiveBlock>>`
+- `ElementReader::for_each_pipelined()` - element-level callback
+- `ElementReader::for_each_block_pipelined()` - owned `PrimitiveBlock` callback
+- `ElementReader::into_blocks_pipelined()` - returns `Iterator<Item = Result<PrimitiveBlock>>`
 
 Used by most commands. See Sequential Read below for exceptions.
 
@@ -31,8 +31,8 @@ Used by most commands. See Sequential Read below for exceptions.
 Single-threaded: `BlobReader` → decompress → `PrimitiveBlock` on the calling thread. ~6x slower than pipelined, but avoids cross-thread allocation/free churn.
 
 Used by:
-- `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) — two files read in lockstep
-- `tags-count` — avoids 25+ GB heap retention at planet scale
+- `diff` / `derive-changes` (via `StreamingBlocks::new_sequential()`) - two files read in lockstep
+- `tags-count` - avoids 25+ GB heap retention at planet scale
 
 ### Blob Filtering (pre-decode)
 
@@ -48,7 +48,7 @@ Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-fil
 
 ### Pipelined Write
 
-**Parallel compression with sequential output** — `src/write/writer.rs`
+**Parallel compression with sequential output** - `src/write/writer.rs`
 
 | Stage | Thread | Work |
 |-------|--------|------|
@@ -56,15 +56,15 @@ Applied via `ElementReader::with_blob_filter()`. Used by `cat --type`, `tags-fil
 | 2. Reorder + write | Dedicated writer thread | `ReorderBuffer` (32-slot write-ahead), writes to `FileWriter` |
 
 Output modes:
-- `PbfWriter::to_path()` — buffered I/O
-- `PbfWriter::to_path_direct()` — O_DIRECT (Linux, `linux-direct-io` feature)
-- `PbfWriter::to_path_uring()` — io_uring with registered buffers (Linux, `linux-io-uring` feature)
+- `PbfWriter::to_path()` - buffered I/O
+- `PbfWriter::to_path_direct()` - O_DIRECT (Linux, `linux-direct-io` feature)
+- `PbfWriter::to_path_uring()` - io_uring with registered buffers (Linux, `linux-io-uring` feature)
 
-Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chunks()` — zero decompression/recompression, uses `copy_file_range` on Linux.
+Special: raw passthrough for unmodified blobs via `write_raw()` / `write_raw_chunks()` - zero decompression/recompression, uses `copy_file_range` on Linux.
 
 ### io_uring Writer
 
-`src/write/uring_writer.rs` — replaces the buffered writer thread when `--io-uring` is set.
+`src/write/uring_writer.rs` - replaces the buffered writer thread when `--io-uring` is set.
 
 64 × 256 KB page-aligned registered buffers. Accumulates data, submits `WriteFixed` SQEs when a buffer fills, reaps CQEs to recycle buffers. Supports `CopyRange` for passthrough blobs.
 
@@ -72,18 +72,18 @@ Used by `sort`, `cat --dedupe`, `apply-changes`.
 
 ### Block Builder
 
-`src/write/block_builder.rs` — accumulates elements into PBF blocks.
+`src/write/block_builder.rs` - accumulates elements into PBF blocks.
 
 - Max 8000 entities per block, one element type per block
 - `StringTable` with `FxHashMap<Rc<str>, u32>` dedup
 - Reusable wire scratch buffers (`wire.rs` encoding primitives)
-- Output: `OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>)` — serialized data + index + optional tagdata
+- Output: `OwnedBlock = (Vec<u8>, BlobIndex, Option<Vec<u8>>)` - serialized data + index + optional tagdata
 
 Used by all commands that produce PBF output.
 
 ### Node-Only Wire Scanner
 
-`src/commands/node_scanner.rs` — parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
+`src/commands/node_scanner.rs` - parses `DenseNodes` directly from decompressed wire format, bypassing `PrimitiveBlock` construction. Zero per-block heap allocation. Extracts `(id, lat, lon)` tuples.
 
 Used internally by external join (stage 2), ALTW dense/sparse (pass 1), and merge `--locations-on-ways`.
 
@@ -114,9 +114,9 @@ Two-pass blob-level permutation sort.
 Single-pass batch pipeline applying an OSC diff to a sorted PBF. OSC parsed into `CompactDiffOverlay` (arena-packed, `FxHashMap` index). `DiffRanges` enables O(log n) overlap checks.
 
 3 phases per batch:
-1. **Parallel classify** (rayon) — indexdata fast-path skips ~92% of blobs at Denmark scale
-2. **Sequential assign** — passthrough / false-positive / rewrite decision per blob
-3. **Streaming rewrite + output** — rayon tasks own their `PrimitiveBlock`, results reordered for sequential output. Gap creates interleaved at sorted positions.
+1. **Parallel classify** (rayon) - indexdata fast-path skips ~92% of blobs at Denmark scale
+2. **Sequential assign** - passthrough / false-positive / rewrite decision per blob
+3. **Streaming rewrite + output** - rayon tasks own their `PrimitiveBlock`, results reordered for sequential output. Gap creates interleaved at sorted positions.
 
 Optional `--locations-on-ways`: preserves/updates inline way-node coordinates through the merge.
 
@@ -130,9 +130,9 @@ Two-pointer merge-join over two sorted PBFs via `StreamingBlocks` (sequential re
 ### extract
 
 Geographic extraction with three strategies:
-- `--simple` — single pass, blob-filter by bbox, may leave dangling refs
-- Default (complete-ways) — two passes: pass 1 collects way-referenced node IDs, pass 2 emits all
-- `--smart` — three passes: also completes multipolygon/boundary relation members
+- `--simple` - single pass, blob-filter by bbox, may leave dangling refs
+- Default (complete-ways) - two passes: pass 1 collects way-referenced node IDs, pass 2 emits all
+- `--smart` - three passes: also completes multipolygon/boundary relation members
 
 Multi-extract via `--config` JSON: single pass producing multiple output files.
 
@@ -177,7 +177,7 @@ Single-pass grouped snapshot: maintains `PendingGroup` per object, emits latest 
 
 ### inspect
 
-Header-only scan (fast path on indexed PBFs — reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
+Header-only scan (fast path on indexed PBFs - reads blob headers without decompression). Selective decode on demand for `--nodes`, `--blocks`, or element display.
 
 ### check
 
@@ -204,7 +204,7 @@ OSC-only: merges multiple OSC XML files into one. Optional `--simplify` keeps on
 
 ## Author's Production Pipeline
 
-_The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation — it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
+_The following describes the specific deployment that drives pbfhogg's development. It documents how the author uses pbfhogg in a planet-scale OSM refresh pipeline feeding tile generation and reverse geocoding. It is not part of the library's public API or general documentation - it records operational context, allocation budgets, and performance measurements specific to this ecosystem._
 
 **Production pipeline** (runs every planet refresh cycle):
 ```
@@ -223,104 +223,104 @@ the initial enriched PBF. Subsequent daily diffs maintain coordinates automatica
 surviving base ways forward raw lat/lon bytes, OSC ways look up node coordinates
 from a sparse index built from the diff and base PBF.
 
-**`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) — a one-time fix, not a recurring step.
+**`sort` is not in the pipeline.** Geofabrik and planet PBFs are always `Sort.Type_then_ID`, and every pipeline step preserves sorted order: `cat` copies blobs in input order, `merge` interleaves upserts at sorted positions, `add-locations-to-ways` passes through or decodes without reordering. The `sort` command exists for repairing unsorted PBFs from other tools (osmosis, custom exporters) - a one-time fix, not a recurring step.
 
 The two downstream consumers are:
-- **elivagar** (`~/Programs/elivagar`) — vector tile generator. Reads the enriched PBF (with inline way coordinates via `Way::node_locations()`) to produce PMTiles. Pre-processing with `add-locations-to-ways` eliminates elivagar's node store (~44 GB at planet scale), dropping peak RSS from ~65-75 GB to ~15-20 GB.
-- **nidhogg** (`~/Programs/nidhogg`) — planet refresh service. Reads the planet PBF for data ingest, then merges daily OSC diffs to keep it current.
+- **elivagar** (`~/Programs/elivagar`) - vector tile generator. Reads the enriched PBF (with inline way coordinates via `Way::node_locations()`) to produce PMTiles. Pre-processing with `add-locations-to-ways` eliminates elivagar's node store (~44 GB at planet scale), dropping peak RSS from ~65-75 GB to ~15-20 GB.
+- **nidhogg** (`~/Programs/nidhogg`) - planet refresh service. Reads the planet PBF for data ingest, then merges daily OSC diffs to keep it current.
 
 ## Downstream Consumers
 
-**Elivagar** — tile generation (read-only)
+**Elivagar** - tile generation (read-only)
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
 - Only uses the **read pipeline**; no writes
 - Entry: `ElementReader::from_path()` → `.into_blocks_pipelined()` → iterates owned `PrimitiveBlock`s
 - Sends way blocks to a worker thread via `SyncSender<PrimitiveBlock>` (bounded queue of 1)
 - API surface: `node.id()`, `.decimicro_lat()`, `.decimicro_lon()`, `.tags()`, `way.id()`, `.refs()`, `.node_locations()`, `.tags()`, `rel.id()`, `.tags()`, `.members()`
-- `Way::node_locations()` yields `WayNodeLocation` (lat/lon) from enriched PBFs — eliminates the node coordinate store entirely
+- `Way::node_locations()` yields `WayNodeLocation` (lat/lon) from enriched PBFs - eliminates the node coordinate store entirely
 - Also uses `protohoggr` directly for MVT/PMTiles protobuf encoding (unrelated to PBF I/O)
 - File: `~/Programs/elivagar/src/pipeline.rs:340-605`
 
-**Nidhogg** — planet refresh pipeline (read + merge)
+**Nidhogg** - planet refresh pipeline (read + merge)
 - `Cargo.toml`: `pbfhogg = { path = "../pbfhogg" }` (default features = `commands`)
-- **Read path**: `ElementReader::from_path()` → `.for_each_pipelined(|element| ...)` — two-pass ingest
+- **Read path**: `ElementReader::from_path()` → `.for_each_pipelined(|element| ...)` - two-pass ingest
   - File: `~/Programs/nidhogg/src/ingest/mod.rs:72-324`
 - **Merge path**: delegates entirely to `pbfhogg::merge::merge(base, osc, output, &MergeOptions { .. })`
   - File: `~/Programs/nidhogg/src/merge.rs:6`
   - Currently: zlib compression, no direct_io/io_uring, no locations_on_ways
   - TODO: enable `locations_on_ways: true` once the enriched PBF is bootstrapped
-- **No direct BlockBuilder/PbfWriter usage** — nidhogg never constructs PBF blocks itself
+- **No direct BlockBuilder/PbfWriter usage** - nidhogg never constructs PBF blocks itself
 - Also reads PBF headers via `BlobReader::from_path()` → `.to_headerblock()` for replication state
   - File: `~/Programs/nidhogg/src/update.rs:95-114`
 
 ## Cargo Features in Play
 
 Both consumers use default features. In practice:
-- `commands` feature: **enabled** (brings in `roaring`, `serde_json`, `s2` — needed for merge + geocode builder)
+- `commands` feature: **enabled** (brings in `roaring`, `serde_json`, `s2` - needed for merge + geocode builder)
 - `geocode-reader` feature: **implied by `commands`**. nidhogg can alternatively depend on just `geocode-reader` for the reverse geocoding reader without pulling in `roaring`/`serde_json`.
 - `linux-direct-io`: **disabled** (nidhogg passes `false`)
 - `linux-io-uring`: **disabled** (nidhogg passes `false`)
 - Zlib backend: **zlib-rs** (hardcoded, pure Rust, via flate2)
-- Zstd: available but **unused** — nidhogg hardcodes `Compression::Zlib(6)`
+- Zstd: available but **unused** - nidhogg hardcodes `Compression::Zlib(6)`
 
 ## Pipeline 1: Pipelined Read (both consumers)
 
 All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
-**3-stage pipeline** — `src/pipeline.rs`
+**3-stage pipeline** - `src/pipeline.rs`
 1. **I/O thread**: reads raw compressed blobs (~32KB each) sequentially, sends via channel (READ_AHEAD=16 slots)
 2. **Rayon decode pool**: parallel decompress + parse. Thread count = `available_parallelism() - 2`
-   - `decompress_blob()` — thread-local `flate2::Decompress` with `reset(true)`, reused per thread
-   - `DecompressPool` — returns `Vec<u8>` to pool on drop instead of freeing
-   - `PooledBuffer` wrapper — custom Drop via `Bytes::from_owner`
+   - `decompress_blob()` - thread-local `flate2::Decompress` with `reset(true)`, reused per thread
+   - `DecompressPool` - returns `Vec<u8>` to pool on drop instead of freeing
+   - `PooledBuffer` wrapper - custom Drop via `Bytes::from_owner`
 3. **Reorder buffer**: `VecDeque<Option<PrimitiveBlock>>` restores file order
 
-**PrimitiveBlock ownership** — `src/read/block.rs`:
+**PrimitiveBlock ownership** - `src/read/block.rs`:
 - Owns `Bytes` buffer (decompressed ~1.4 MB) + `WireBlock<'static>` (self-referential, unsafe transmute)
-- `WireBlock::parse()` — builds `WireStringTable` and `group_ranges` as inline (offset, count) into the decompressed buffer — zero separate allocation
+- `WireBlock::parse()` - builds `WireStringTable` and `group_ranges` as inline (offset, count) into the decompressed buffer - zero separate allocation
 - `to_primitiveblock_inline()` with pool recycling: reuses `PrimitiveBlock` across blobs (string table Vec, group Vecs) via `clear_and_reuse()`
 
-**Element iteration** — zero-copy, zero-alloc:
-- `WireGroup` lazy scanner — scans protobuf on-the-fly
-- Tag/ref iterators use `PackedSint64Iter`/`PackedUint32Iter` from protohoggr — decode varints from raw bytes, no Vec
+**Element iteration** - zero-copy, zero-alloc:
+- `WireGroup` lazy scanner - scans protobuf on-the-fly
+- Tag/ref iterators use `PackedSint64Iter`/`PackedUint32Iter` from protohoggr - decode varints from raw bytes, no Vec
 
 **Key allocation sites per blob (read path):**
 - Decompression buffer: ~1.4 MB (pooled, reused)
-- `WireStringTable`: inline (offset, count) into decompressed buffer — zero separate allocation
-- `WireBlock` group_ranges: inline (offset, count) into decompressed buffer — zero separate allocation
+- `WireStringTable`: inline (offset, count) into decompressed buffer - zero separate allocation
+- `WireBlock` group_ranges: inline (offset, count) into decompressed buffer - zero separate allocation
 - Element wrappers: stack-allocated (~24 bytes each)
 
 ## Pipeline 2: Merge (nidhogg only)
 
-**Entry**: `src/commands/merge.rs` — `merge(base, osc, output, &MergeOptions, &HeaderOverrides)`
+**Entry**: `src/commands/merge.rs` - `merge(base, osc, output, &MergeOptions, &HeaderOverrides)`
 
-**OSC diff parsing**: `src/osc.rs` — `CompactDiffOverlay` with arena-packed binary layouts (`Vec<u8>` per type), `FxHashMap<i64, u32>` index (byte offsets into arenas), `StringInterner` for tag keys/roles, `HashSet<i64>` for deletes. 40-60% less memory than per-element HashMap. Typical Denmark diff: ~300KB compressed, ~50K entries.
+**OSC diff parsing**: `src/osc.rs` - `CompactDiffOverlay` with arena-packed binary layouts (`Vec<u8>` per type), `FxHashMap<i64, u32>` index (byte offsets into arenas), `StringInterner` for tag keys/roles, `HashSet<i64>` for deletes. 40-60% less memory than per-element HashMap. Typical Denmark diff: ~300KB compressed, ~50K entries.
 
-**DiffRanges**: `src/commands/merge.rs:231` — pre-sorted `Vec<i64>` per element type (separate vecs for all-IDs and upsert-only-IDs) for O(log n) overlap checks via `partition_point`. Wrapped in `Arc` for sharing across rayon tasks.
+**DiffRanges**: `src/commands/merge.rs:231` - pre-sorted `Vec<i64>` per element type (separate vecs for all-IDs and upsert-only-IDs) for O(log n) overlap checks via `partition_point`. Wrapped in `Arc` for sharing across rayon tasks.
 
-**Reader thread**: dedicated `std::thread::spawn` with `sync_channel::<RawBlobFrame>(128)` read-ahead. Decouples I/O from processing — while the main thread runs classify/rewrite/output on the current batch, the reader pre-fills the next.
+**Reader thread**: dedicated `std::thread::spawn` with `sync_channel::<RawBlobFrame>(128)` read-ahead. Decouples I/O from processing - while the main thread runs classify/rewrite/output on the current batch, the reader pre-fills the next.
 
 **Byte-budgeted batch processing** (`BATCH_BYTE_BUDGET=128MB`, `BATCH_MIN_BLOBS=8`, `BATCH_MAX_BLOBS=128`). `estimate_blob_cost()` returns raw frame size for passthrough blobs, `raw * 21` for potential rewrites (raw + ~16x decompressed + ~5x rewrite estimate). Batches fill via `try_recv` until the byte budget or max blob count is reached.
 
 **3-phase pipeline per batch:**
 
-- **Phase 1 — Parallel classify** (rayon `par_iter`):
-  - `classify_only()` — `merge.rs:935`
+- **Phase 1 - Parallel classify** (rayon `par_iter`):
+  - `classify_only()` - `merge.rs:935`
   - Fast path (index hit): blob has indexdata → `DiffRanges::range_overlaps()` → false = `Passthrough`. **Zero decompression.**
   - Medium path (scan): decompress into reusable `Vec<u8>`, `scan_block_ids()` for min/max ID
   - Slow path (precise): full `PrimitiveBlock` parse, `block_overlaps_diff()` checks each element ID against diff
 
-- **Phase 2 — Sequential assign** (main thread):
+- **Phase 2 - Sequential assign** (main thread):
   - Assigns each blob to `BatchSlot::Passthrough | FalsePositive | Rewrite`
-  - For rewrites: binary search (`partition_point`) into sorted upsert IDs computes `upsert_range: (usize, usize)` — range indices into the DiffRanges upsert vec (no per-job Vec copy)
+  - For rewrites: binary search (`partition_point`) into sorted upsert IDs computes `upsert_range: (usize, usize)` - range indices into the DiffRanges upsert vec (no per-job Vec copy)
   - Builds `RewriteJob { block: PrimitiveBlock, kind: ElemKind, upsert_range: (usize, usize) }`
 
-- **Phase 3+4 — Streaming rewrite + output** (`rayon::spawn` + bounded `sync_channel`):
+- **Phase 3+4 - Streaming rewrite + output** (`rayon::spawn` + bounded `sync_channel`):
   - Each rewrite job is dispatched via `rayon::spawn`, owning its `RewriteJob` (including `PrimitiveBlock`). Channel bounded to `rayon::current_num_threads().min(rewrite_count)`.
-  - `rewrite_block_parallel()` — `merge.rs:760` — allocates a local `BlockBuilder` per task, pre-seeds string table from base block, iterates elements, skips deleted, applies modifications, interleaves creates at sorted positions via `&upserts[range.0..range.1]`. Returns `RewriteOutput { blocks: Vec<OwnedBlock>, stats }`.
+  - `rewrite_block_parallel()` - `merge.rs:760` - allocates a local `BlockBuilder` per task, pre-seeds string table from base block, iterates elements, skips deleted, applies modifications, interleaves creates at sorted positions via `&upserts[range.0..range.1]`. Returns `RewriteOutput { blocks: Vec<OwnedBlock>, stats }`.
   - PrimitiveBlock freed as soon as each task completes (not held until all finish).
   - Main thread processes slots in file order. Out-of-order rewrite results buffered in `received: Vec<Option<RewriteOutput>>`, consumed when their slot is reached.
-  - Passthrough: `coalesce_passthrough()` — accumulates consecutive raw frames in `passthrough_buf`, flushed as single `write_raw_owned()` (move semantics). On `linux-direct-io` with `copy_file_range`, passthrough uses kernel-space copy instead.
+  - Passthrough: `coalesce_passthrough()` - accumulates consecutive raw frames in `passthrough_buf`, flushed as single `write_raw_owned()` (move semantics). On `linux-direct-io` with `copy_file_range`, passthrough uses kernel-space copy instead.
   - Rewrite: flush passthrough buf, then write each `OwnedBlock` via `write_primitive_block_owned()` (move, no copy)
   - Gap creates between blobs: `emit_gap_creates()` via `BlockBuilder`
 
@@ -331,36 +331,36 @@ All source PBFs are zlib-compressed (Geofabrik/AWS). Every read decompresses.
 
 ## Pipeline 3: Cat (pbfhogg CLI, used to generate indexed PBFs)
 
-**Entry**: `src/commands/cat.rs` — `cat(files, output, type_filter, &CleanAttrs, compression, direct_io, force, &HeaderOverrides)`
+**Entry**: `src/commands/cat.rs` - `cat(files, output, type_filter, &CleanAttrs, compression, direct_io, force, &HeaderOverrides)`
 
-**No type filter** (passthrough) — reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. **No decompress/compress.**
+**No type filter** (passthrough) - reads raw blob frames, adds indexdata via `reframe_raw_with_index()`, writes raw. **No decompress/compress.**
 
-**With type filter** — full decode → `BlockBuilder` → re-encode → compress. Same allocation pattern as merge rewrite path. `CleanAttrs` optionally strips metadata attributes (version, timestamp, changeset, uid, user).
+**With type filter** - full decode → `BlockBuilder` → re-encode → compress. Same allocation pattern as merge rewrite path. `CleanAttrs` optionally strips metadata attributes (version, timestamp, changeset, uid, user).
 
-**Dedupe mode** (`--dedupe`) — K-way sorted merge of multiple PBFs with blob-level passthrough and exact-duplicate deduplication. All inputs must be sorted.
+**Dedupe mode** (`--dedupe`) - K-way sorted merge of multiple PBFs with blob-level passthrough and exact-duplicate deduplication. All inputs must be sorted.
 
 ## Pipeline 4: Add-locations-to-ways (enrichment step)
 
-**Entry**: `src/commands/add_locations_to_ways.rs` — `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides, index_type)`
+**Entry**: `src/commands/add_locations_to_ways.rs` - `add_locations_to_ways(input, output, keep_untagged_nodes, compression, direct_io, force, &HeaderOverrides, index_type)`
 
 Three index strategies that embeds node coordinates directly into way elements:
 
 - **`Dense`** (`DenseMmapIndex`): file-backed anonymous mmap, 8 bytes/slot, direct addressing by node ID. 128 GB virtual address space, ~16 GB touched at planet (after pass 0 filtering). Fastest when working set fits in RAM.
-- **`Sparse`** (`SparseArrayIndex`): Planetiler-inspired chunk-indexed sparse array (chunk size 256). RAM: `offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk: compact packed (lat, lon) values file via read-only mmap (~16 GB for planet). Way lookups use batched sorted access — collect all node refs from a batch, sort by file offset, sequential scan into `FxHashMap`, then process blocks with pre-resolved coordinates. Memory-bounded for planet on low-RAM hosts.
+- **`Sparse`** (`SparseArrayIndex`): Planetiler-inspired chunk-indexed sparse array (chunk size 256). RAM: `offsets` Vec<u64> + `start_pad` Vec<u8> (~540 MB at planet). On-disk: compact packed (lat, lon) values file via read-only mmap (~16 GB for planet). Way lookups use batched sorted access - collect all node refs from a batch, sort by file offset, sequential scan into `FxHashMap`, then process blocks with pre-resolved coordinates. Memory-bounded for planet on low-RAM hosts.
 - **`External`** (`external_join`): double radix permutation via temp disk. Bounded memory (~1.4 GB stages 1-3, ~2.1 GB stage 4 at Europe). See Pipeline 4b below.
 
 ### Dense/Sparse path (2-pass + pass 0)
 
-**Pass 0 — Way-referenced node IDs (both index types):**
+**Pass 0 - Way-referenced node IDs (both index types):**
 - Scans way blobs to build `IdSetDense` bitset (~1.6 GB for planet's ~2B unique way-node refs)
 - Dense: filters which mmap slots to populate. Sparse: determines which nodes to store.
 
-**Pass 1 — Node index building:**
-- Node-only wire scanner (`extract_node_tuples`) — bypasses PrimitiveBlock, zero per-block heap alloc
-- **Dense path**: `par_iter` over `NodeTuple` batches. `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step — writes are lock-free.
+**Pass 1 - Node index building:**
+- Node-only wire scanner (`extract_node_tuples`) - bypasses PrimitiveBlock, zero per-block heap alloc
+- **Dense path**: `par_iter` over `NodeTuple` batches. `SharedDenseWriter` holds raw `*mut u8` into the mmap (`Send + Sync`). Each rayon task writes to disjoint 8-byte slots (`base + node_id * 8`). No merge step - writes are lock-free.
 - **Sparse path**: sequential insertion via node-only scanner into chunk-indexed temp file.
 
-**Pass 2 — Output with locations on ways:**
+**Pass 2 - Output with locations on ways:**
 - **Indexed PBF (fast path)**: reads raw blob frames, classifies by `BlobIndex.kind` from BlobHeader indexdata
   - Node blobs + `keep_untagged=true` → `write_raw_owned` (passthrough, zero decode)
   - Node blobs + `keep_untagged=false` → decompress → filter untagged → re-encode
@@ -382,27 +382,27 @@ Three index strategies that embeds node coordinates directly into way elements:
 4-stage sequential I/O pipeline with bounded memory. No mmap, no random access.
 Requires sorted PBF with indexdata. Uses temp disk (~4 GB Denmark, ~112 GB Europe).
 
-**Stage 1 — Way pass** (sequential BlobReader + DecompressPool):
+**Stage 1 - Way pass** (sequential BlobReader + DecompressPool):
 - Reads way blobs via indexdata filter, iterates way refs
 - Emits `(node_id, slot_pos)` COO pairs into 256 node buckets (radix by high byte of node_id)
 - Anon: 70 MB at Europe scale
 
-**Stage 2 — Node join** (P2b-v2, pread-from-workers):
+**Stage 2 - Node join** (P2b-v2, pread-from-workers):
 - IO thread reads only blob headers (~50 bytes), filters to node blobs via indexdata
 - Sends lightweight descriptors `(seq, data_offset, data_size)` to worker threads
 - Workers `pread` blob data from shared `Arc<File>`, decompress via `decompress_blob_raw()`,
-  extract `NodeTuple`s — all alloc/free thread-local, zero cross-thread ownership
+  extract `NodeTuple`s - all alloc/free thread-local, zero cross-thread ownership
 - Workers call `fadvise(DONTNEED)` after each pread (worker-side eviction)
 - Consumer reorders via `ReorderBuffer`, merge-joins against one sorted COO bucket at a time
 - Emits `(slot_pos, lat, lon)` resolved entries into 256 slot buckets
 - Anon: 1.4 GB at Europe scale (bucket sort data, irreducible)
 - Europe: 216s (was 301s sequential, -28%)
 
-**Stage 3 — Slot reorder** (scatter buffer):
+**Stage 3 - Slot reorder** (scatter buffer):
 - Per slot bucket: load resolved entries, scatter by slot_pos into zeroed buffer, write_all
 - Eliminates sort + reduces syscalls (15x speedup over sorted pwrite)
 
-**Stage 4 — Assembly** (P2c, pread-from-workers):
+**Stage 4 - Assembly** (P2c, pread-from-workers):
 - Header-only pre-scan builds blob schedule with pre-computed slot_starts
   (from ref count sidecar written in stage 1)
 - Dedicated worker threads pread + decompress + PrimitiveBlock + assemble
@@ -432,34 +432,34 @@ Temp disk is the main constraint at planet scale. The 256 node buckets hold all
 `(node_id, slot_pos)` COO pairs (16 bytes each, ~13B pairs = ~208 GB), plus 256
 slot buckets with resolved `(slot_pos, lat, lon)` entries (16 bytes each), plus
 the final coord_slots file (8 bytes per ref). Total ~300 GB scratch. Cleaned up
-on completion (or crash — `ScratchDir` has `Drop` impl).
+on completion (or crash - `ScratchDir` has `Drop` impl).
 
 ## Write Side (shared by merge rewrite + cat filtered + add-locations-to-ways)
 
-**BlockBuilder** — `src/write/block_builder.rs`:
+**BlockBuilder** - `src/write/block_builder.rs`:
 - Dense node vectors pre-allocated to 8000 (MAX_ENTITIES_PER_BLOCK)
-- String table: `FxHashMap<Rc<str>, u32>` + `Vec<Rc<str>>` — one `Rc<str>` alloc per unique string, shared between map key and vec entry
-- Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` — grow once, reused
-- `encode_buf` — serialized output, moved via `std::mem::take` (zero copy)
-- `take_owned()` — returns `(Vec<u8>, BlobIndex, Option<Vec<u8>>)`
+- String table: `FxHashMap<Rc<str>, u32>` + `Vec<Rc<str>>` - one `Rc<str>` alloc per unique string, shared between map key and vec entry
+- Wire scratch buffers: `group_buf`, `elem_scratch`, `packed_scratch`, `info_scratch` - grow once, reused
+- `encode_buf` - serialized output, moved via `std::mem::take` (zero copy)
+- `take_owned()` - returns `(Vec<u8>, BlobIndex, Option<Vec<u8>>)`
 
-**PbfWriter** — `src/write/writer.rs`:
-- `FrameScratch` — `blob_buf`, `header_buf`, `compress_buf`, lazy-init `Compress`/`zstd::Compressor`
-- Thread-local `PIPELINE_SCRATCH` — per-rayon-thread, reused across blobs
-- `frame_blob_into()` — allocates **one Vec per blob** for final framed output (exact capacity)
-- `compress_zlib()` — `flate2::Compress` with `reset()`, reuses `compress_buf`
-- Pipelined writer thread — VecDeque reorder buffer (WRITE_AHEAD=32)
+**PbfWriter** - `src/write/writer.rs`:
+- `FrameScratch` - `blob_buf`, `header_buf`, `compress_buf`, lazy-init `Compress`/`zstd::Compressor`
+- Thread-local `PIPELINE_SCRATCH` - per-rayon-thread, reused across blobs
+- `frame_blob_into()` - allocates **one Vec per blob** for final framed output (exact capacity)
+- `compress_zlib()` - `flate2::Compress` with `reset()`, reuses `compress_buf`
+- Pipelined writer thread - VecDeque reorder buffer (WRITE_AHEAD=32)
 
 ## Compression Summary
 
 | Path | Decompress | Compress | Backend |
 |---|---|---|---|
-| Read (all ingest) | every blob | — | zlib-rs via flate2 |
-| Merge passthrough | none (~92% DK) | none | — |
+| Read (all ingest) | every blob | - | zlib-rs via flate2 |
+| Merge passthrough | none (~92% DK) | none | - |
 | Merge rewrite | yes | zlib:6 | zlib-rs via flate2 |
-| Cat passthrough | none | none | — |
+| Cat passthrough | none | none | - |
 | Cat filtered | every blob | zlib (default) | zlib-rs via flate2 |
-| add-locations-to-ways passthrough | none (~89% keep-untagged) | none | — |
+| add-locations-to-ways passthrough | none (~89% keep-untagged) | none | - |
 | add-locations-to-ways decode | yes (way blobs + filtered nodes) | zlib (default) | zlib-rs via flate2 |
 
 ## Benchmark Context (commit `a6ebbfe`)

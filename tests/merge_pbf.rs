@@ -67,7 +67,7 @@ fn merge_overlapping_nodes_dedup() {
     let b = dir.path().join("b.osm.pbf");
     let output = dir.path().join("output.osm.pbf");
 
-    // Both files contain nodes 2 and 3 (exact duplicates — same id, no metadata = version 0)
+    // Both files contain nodes 2 and 3 (exact duplicates - same id, no metadata = version 0)
     write_test_pbf_sorted(
         &a,
         &[
@@ -228,7 +228,7 @@ fn merge_empty_files() {
     assert_eq!(stats.duplicates_removed, 0);
 }
 
-/// F60: Three files with overlapping ID ranges — exercises 3-way heap merge.
+/// F60: Three files with overlapping ID ranges - exercises 3-way heap merge.
 #[test]
 fn merge_three_files_overlapping_ids() {
     let dir = TempDir::new().expect("tempdir");
@@ -239,7 +239,7 @@ fn merge_three_files_overlapping_ids() {
 
     // Three files with overlapping node ID ranges:
     // A: 1, 3, 5    B: 2, 3, 4    C: 3, 5, 6
-    // Node 3 appears in all three, node 5 in A+C — tests 3-way dedup
+    // Node 3 appears in all three, node 5 in A+C - tests 3-way dedup
     write_test_pbf_sorted(
         &a,
         &[

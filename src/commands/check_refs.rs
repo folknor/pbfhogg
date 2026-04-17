@@ -32,7 +32,7 @@ pub struct RefCheckResult {
     /// the same missing relation.
     pub missing_relation_member_occurrences: u64,
     /// Every missing reference occurrence (populated when `show_ids` is true).
-    /// Not deduplicated — each occurrence is a separate entry.
+    /// Not deduplicated - each occurrence is a separate entry.
     pub missing_refs: Vec<MissingRef>,
 }
 
@@ -69,8 +69,8 @@ impl RefCheckResult {
 /// # Why this is NOT an ID-only consumer
 ///
 /// Despite appearances, check_refs needs more than just element IDs:
-/// - Way node refs (`w.refs()`) — the delta-decoded refs array
-/// - Relation member IDs and types (`r.members()`) — the memids and types arrays
+/// - Way node refs (`w.refs()`) - the delta-decoded refs array
+/// - Relation member IDs and types (`r.members()`) - the memids and types arrays
 ///
 /// A pure "ID-only scan mode" that skips refs/members would not work here.
 /// A selective parse that skips stringtable, tags, coordinates, and metadata
@@ -94,7 +94,7 @@ impl RefCheckResult {
 /// The `i64→u64` mapping uses `i64::cast_unsigned()`. Planet files from official
 /// servers contain only positive IDs, so the cast is lossless. Files with negative
 /// IDs (e.g. from JOSM for uncommitted elements) will wrap to the upper half
-/// of `u64` space, which is fine for set membership tests — the mapping just
+/// of `u64` space, which is fine for set membership tests - the mapping just
 /// needs to be injective, not order-preserving.
 ///
 /// RoaringTreemap (not RoaringBitmap) is required because RoaringBitmap only
@@ -106,7 +106,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     crate::debug::emit_marker("CHECKREFS_SCAN_START");
     // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
     // retention (25+ GB at Europe/planet scale). check-refs does lightweight
-    // per-element work (RoaringTreemap inserts) — the pipelined reader's
+    // per-element work (RoaringTreemap inserts) - the pipelined reader's
     // parallel decode creates cross-thread churn that dominates at scale.
     // See notes/cross-pipeline-optimization-plan.md.
     let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
@@ -227,12 +227,12 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                             MemberId::Relation(id) => {
                                 deferred_relation_refs.push(id .cast_unsigned());
                                 if show_ids {
-                                    // Deferred — store relation ID for later resolution
+                                    // Deferred - store relation ID for later resolution
                                     // We store the referencing relation ID alongside
                                     deferred_relation_ref_sources.push(rid);
                                 }
                             }
-                            // Unknown member types from newer PBF producers —
+                            // Unknown member types from newer PBF producers -
                             // skip for ref-checking since we don't know what
                             // collection to check against.
                             MemberId::Unknown(_, _) => {}

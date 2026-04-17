@@ -46,14 +46,14 @@ userspace flush.
 This is deliberate policy, not accidental drift:
 
 - added in commit `1c04b5e` (`Fsync output files after writing for crash durability`)
-- documented externally as “`--fsync` always enabled” in
+- documented externally as "`--fsync` always enabled" in
   [reference/osmium-parity.md](../reference/osmium-parity.md)
 - chosen partly to align buffered / direct output with the `io_uring` writer,
   which already did a final `sync_all()`
 
 What is *not* currently well documented is the exact product invariant this is
-meant to protect beyond the generic “crash durability” wording, or what the
-real measured cost is on today’s workloads.
+meant to protect beyond the generic "crash durability" wording, or what the
+real measured cost is on today's workloads.
 
 ## Current measured signals
 
@@ -89,8 +89,8 @@ The ALTW work established a second truth:
 
 So this plan treats the write path as two related rails:
 
-- **generic writer rail** — framing, compression, channeling, file backends
-- **command integration rail** — whether a command is actually gated by the
+- **generic writer rail** - framing, compression, channeling, file backends
+- **command integration rail** - whether a command is actually gated by the
   writer on the target workload
 
 ### Existing measured backend facts
@@ -143,8 +143,8 @@ Hidden dev-only helper:
 - `PBFHOGG_WRITE_SKIP_SYNC_ALL=1`
   - keep this as a measurement aid, not a user-facing feature
   - use it only for tiny real-file A/Bs where the question is:
-    - “is this small tail just durability policy noise?”
-    - “how much lower is the no-durability floor on this harness?”
+    - "is this small tail just durability policy noise?"
+    - "how much lower is the no-durability floor on this harness?"
   - specifically useful for:
     - Denmark `cat` / merge / `apply-changes` tail checks
     - later `fdatasync` vs `sync_all` work
@@ -155,20 +155,20 @@ Hidden dev-only helper:
 
 ### Dataset ladder
 
-**Denmark** — correctness, smoke tests, tiny-end tail checks, very local file
+**Denmark** - correctness, smoke tests, tiny-end tail checks, very local file
 backend questions.
 
-**Japan** — first real gate for writer-local CPU/compression work. Large enough
+**Japan** - first real gate for writer-local CPU/compression work. Large enough
 to show framing/compression differences without paying Europe costs.
 
-**Europe** — first real gate for:
+**Europe** - first real gate for:
 
 - real-file backend behavior
 - `io_uring`
 - any command-level writer bottleneck question
 - any change whose only value appears once page cache / writeback matter
 
-**Planet** — only for ship/no-ship or when the whole point is "does this hold
+**Planet** - only for ship/no-ship or when the whole point is "does this hold
 at planet?"
 
 ## Instrumentation gaps
@@ -223,15 +223,15 @@ Do not spend time here again unless a precondition changes:
     <https://trifectatech.org/blog/zlib-rs-is-faster-than-c/>.
   - so the "swap for a faster zlib" lever is essentially closed. Only
     `libdeflate` (non-api-compatible, one-shot, different algorithm tier)
-    remains — see item 2b, which is a *revisit* rather than a new idea.
+    remains - see item 2b, which is a *revisit* rather than a new idea.
 - `libdeflate` as the zlib compressor in pipelined mode at Denmark scale
-  - three-commit arc Feb 27 — Mar 1, 2026:
+  - three-commit arc Feb 27 - Mar 1, 2026:
     - `4a55c88` added `libdeflater` feature flag
     - `2cd6ed6` measured: sync `zlib:6` `24.4 s → 12.7 s` (`1.92×`),
       pipelined Denmark `6.9 s → 6.7 s` (essentially flat)
     - `d180d62` removed, citing "pipelined mode is decode-bound" plus
       "zero C dependencies for compression, one backend everywhere"
-  - the *sync* `1.92×` win is banked — that is not the shelved piece
+  - the *sync* `1.92×` win is banked - that is not the shelved piece
   - the *pipelined* null result is shelved **only at Denmark scale**.
     The benchmark commit is explicit that decode, not compression, was
     the wall ("decode is the bottleneck at Denmark scale"). Denmark is
@@ -288,9 +288,9 @@ Questions to answer:
 
 - What exact invariant is the current always-fsync policy meant to guarantee?
   Examples:
-  - “successful command exit means bytes are on stable storage”
-  - “output files must survive power loss without a caller-managed fsync”
-  - “match osmium `--fsync` semantics by default”
+  - "successful command exit means bytes are on stable storage"
+  - "output files must survive power loss without a caller-managed fsync"
+  - "match osmium `--fsync` semantics by default"
 - Does that invariant still matter for all write commands?
 - What is the real cost on current hardware and datasets?
 - If the invariant is still desired, keep it and stop.
@@ -327,9 +327,9 @@ Result (2026-04-16):
 - invariant recovered:
   - commit `1c04b5e` explicitly framed this as crash durability
   - `reference/osmium-parity.md` documents the repo policy as
-    “`--fsync` always enabled”
+    "`--fsync` always enabled"
   - so the current invariant is effectively:
-    “successful command exit means the output has crossed a durability barrier”
+    "successful command exit means the output has crossed a durability barrier"
 - measured on Denmark `cat` via same-commit A/B using the hidden
   `PBFHOGG_WRITE_SKIP_SYNC_ALL=1` benchmark bypass from `1ea2844`:
   - buffered baseline `8976e31f`: `2901 ms`,
@@ -350,15 +350,15 @@ Result (2026-04-16):
     in place for now
 - decision:
   - keep repo-wide durability semantics as the default
-  - do not spend more time on “remove `sync_all` entirely”
+  - do not spend more time on "remove `sync_all` entirely"
   - if we revisit this line, it should be as a narrower item:
     `fdatasync` vs `sync_all`, or a more explicit durability policy surface
 
 Why second:
 
 - The code inspection already found real policy history (`1c04b5e`,
-  `reference/osmium-parity.md`), so this is no longer a speculative “maybe we
-  forgot why this exists” item.
+  `reference/osmium-parity.md`), so this is no longer a speculative "maybe we
+  forgot why this exists" item.
 - It is still conceptually simple and can be answered on a small dataset before
   any deeper writer tuning.
 
@@ -452,7 +452,7 @@ Result (2026-04-16):
   - pipelined mode is effectively flat across this whole matrix on Denmark and
     Japan
   - Japan pipelined spread is only about `2.3%` best-to-worst, so the generic
-    pipelined preset question does **not** clear the plan’s `>= 5%` gate
+    pipelined preset question does **not** clear the plan's `>= 5%` gate
 - decision:
   - no generic pipelined preset change from `bench write`
   - keep the narrower lesson that sync mode strongly disfavors `zlib:6`
@@ -474,7 +474,7 @@ the full context. The short version:
 - sync mode win is already *measured and banked*: `zlib:6` `24.4 s →
   12.7 s` (`1.92×`)
 - pipelined mode was measured flat (`6.9 s → 6.7 s`), but only at
-  **Denmark** — the smoke tier — where the bench commit itself noted
+  **Denmark** - the smoke tier - where the bench commit itself noted
   decode was the wall, not compression
 - removal also cited a policy goal ("zero C dependencies for
   compression, one backend everywhere"); that policy is a separate
@@ -485,15 +485,15 @@ etc.) is essentially closed as an alternative: `zlib-rs` is already at
 or near the top of that family for both compression and decompression
 (source in *Measured and shelved*). `libdeflate` is the only remaining
 tier-change lever, and specifically because it is *not* api-compatible
-(one-shot, whole-buffer, different algorithm) — which is a natural fit
+(one-shot, whole-buffer, different algorithm) - which is a natural fit
 for PBF blobs but means it cannot replace the read path's streaming
 decompressor.
 
 Hypothesis:
 
-- On a command where compression is actually on the critical path —
+- On a command where compression is actually on the critical path -
   planet `apply-changes` is the concrete target, with its
-  **~92 % rewrite ratio** per [reference/pipeline.md](../reference/pipeline.md) —
+  **~92 % rewrite ratio** per [reference/pipeline.md](../reference/pipeline.md) -
   the pipelined path is compression-bound rather than decode-bound, and
   the sync-mode `1.92×` compression speedup translates into a
   measurable wall win. Denmark's null result is a dataset-scale
@@ -534,7 +534,7 @@ Keep gate:
   necessarily same magnitude), **and**
 - peak RSS delta fits the planet host's budget
 - **and** the "zero C deps" policy is actively revisited and accepted,
-  not silently overridden — this is a standing policy from `d180d62`,
+  not silently overridden - this is a standing policy from `d180d62`,
   not just a measurement question
 
 Discard gate:
@@ -685,8 +685,8 @@ Hypothesis:
 
 - `uring_writer` calls `submit()` once per SQE today, so each frame crosses
   into the kernel via its own `io_uring_enter` syscall. Batching several
-  SQEs per enter — either by waiting until the SQ has some threshold of
-  entries, or until the incoming channel is briefly idle — would halve or
+  SQEs per enter - either by waiting until the SQ has some threshold of
+  entries, or until the incoming channel is briefly idle - would halve or
   quarter that syscall rate at high throughput.
 - `reap_cqes(false)` is already opportunistic. Submission is eagerly
   paired with each push, making the two sides asymmetric.
@@ -720,7 +720,7 @@ Discard gate:
 
 Why separate from item 5:
 
-- item 5 is integration — whether commands should expose `--io-uring`
+- item 5 is integration - whether commands should expose `--io-uring`
   more widely. This is an internal submission-strategy change that only
   matters once a command is actually on the `io_uring` path.
 
@@ -760,10 +760,10 @@ particular they should not jump item 0.
 
 The one shared framing observation worth stating plainly before the items:
 a compressed blob in the pipelined path currently exists in four distinct
-owned regions between the compressor and the kernel — `compress_buf`
+owned regions between the compressor and the kernel - `compress_buf`
 (compressor output), `blob_buf` (protobuf-framed body), `out`
 (`4 B length | BlobHeader | Blob` concatenation), and the `BufWriter`
-internal buffer — with a memcpy across each boundary. Several items below
+internal buffer - with a memcpy across each boundary. Several items below
 attack that chain from different angles.
 
 ### 7. Vectored-write restructure of the writer thread
@@ -779,9 +779,9 @@ Hypothesis:
   existing purely for concatenation, not for framing or compression.
 - Changing the pipeline channel payload from `Vec<u8>` to a small
   `(prefix_header, blob_body: Vec<u8>)` or equivalent slice set, and
-  having the writer thread call `writev(2)` — bypassing `BufWriter` for
-  the vectored path — removes both the concat and the `BufWriter` copy.
-- Distinct from the shelved mutex-pool buffer recycling work — this does
+  having the writer thread call `writev(2)` - bypassing `BufWriter` for
+  the vectored path - removes both the concat and the `BufWriter` copy.
+- Distinct from the shelved mutex-pool buffer recycling work - this does
   not recycle buffers, it removes the copy that motivated recycling in
   the first place.
 
@@ -882,7 +882,7 @@ Hypothesis:
   the OSMHeader synchronously in the constructor. That forces callers to
   know the header (bbox, required-features, required string list,
   writing-program, replication metadata) before the first blob is produced
-  — which is the wrong direction for callers that want to compute bbox
+  - which is the wrong direction for callers that want to compute bbox
   from data or record counts in the header.
 - Reserving a fixed-size slot at file offset 0 (say `1 KiB`, padded with
   an ignored OSMData blob if the real header ends up shorter) and writing
@@ -962,7 +962,7 @@ Metrics:
 - buffered write call count
 - `writer_flush_ns`
 - `sync_all` time
-- page-cache pressure (informal — `free -m` or `/proc/meminfo:Dirty`
+- page-cache pressure (informal - `free -m` or `/proc/meminfo:Dirty`
   before / after)
 
 Keep gate:
@@ -1003,8 +1003,8 @@ Hypothesis:
   output offsets can be computed as blobs are produced without waiting
   for a writer thread. Multiple writer threads could each `pwrite` their
   own slot in parallel, removing the writer-thread serialization point.
-- With compression, this is infeasible without an extra phase — output
-  size is unknown until the compressor returns — so this rail only
+- With compression, this is infeasible without an extra phase - output
+  size is unknown until the compressor returns - so this rail only
   applies to the `None` path.
 
 Code surface:
@@ -1029,7 +1029,7 @@ Metrics:
 Keep gate:
 
 - Europe `Compression::None` wall improves `>= 10 %` (this is a
-  complex change — small wins do not justify the offset-reservation
+  complex change - small wins do not justify the offset-reservation
   protocol)
 
 Discard gate:
@@ -1056,16 +1056,16 @@ Hypothesis:
   panic when the pipeline has consumed the writer.
 - A two-type split (`PbfWriter<W: Write>` sync-only, generic; and
   `PipelinedPbfWriter` `FileWriter`-specific, parallel) plus a unified
-  pair of entries — `write_block(OwnedBlock)` and
+  pair of entries - `write_block(OwnedBlock)` and
   `write_passthrough(Passthrough)` where `Passthrough` is an enum of
-  `FramedBytes` / `FramedChunks` / `CopyRange` — removes the
+  `FramedBytes` / `FramedChunks` / `CopyRange` - removes the
   generic / pipelined mismatch, drops the `writer_mut` panic, and
   pushes all callers onto the `_owned` fast paths.
 
 Code surface:
 
 - `src/write/writer.rs` (type split, method consolidation)
-- all callers — but nearly every one already uses `_owned` variants
+- all callers - but nearly every one already uses `_owned` variants
   and goes through `BlockBuilder`, so the migration is largely
   mechanical
 
@@ -1099,15 +1099,15 @@ Why here:
 These came out of the same fresh code read and are worth recording so
 they are not rediscovered from scratch. None should be pursued until
 the measured backlog (items 0-6) has surfaced concrete signal that one
-of them could address — and none should be confused with the
+of them could address - and none should be confused with the
 **measured and shelved** list earlier in this note, which represents
 work that has already been tried.
 
 - **Per-worker SPSC buffer recycling.** Distinct from the shelved
   `Arc<Mutex<Vec<Vec<u8>>>>` pool (regressed at `+12 %`, `2bf438c`).
-  The hypothesis here is that an SPSC lock-free queue per worker —
+  The hypothesis here is that an SPSC lock-free queue per worker -
   with the writer thread returning drained buffers via a matching
-  reverse channel — dodges the cross-thread contention that sank the
+  reverse channel - dodges the cross-thread contention that sank the
   mutex pool. Only worth prototyping if item 7 (vectored write)
   leaves a meaningful allocator cost on the hot path.
 - **Registered-buffer `io_uring` framing.** Today the `io_uring`
@@ -1126,7 +1126,7 @@ work that has already been tried.
 - **Zstd internal multi-threading (`CCtx::nb_workers`).** Useful only
   at high levels (`zstd:19`+) on archival-style one-shots where
   single-block compression throughput is the wall. The steady pipeline
-  is many small blobs in parallel — already saturated — so this is
+  is many small blobs in parallel - already saturated - so this is
   archival-rail only.
 - **Inline `BlockBuilder` → framer.** `BlockBuilder`'s `encode_buf`
   could reserve space for a `4 B` length prefix and the BlobHeader at
@@ -1144,7 +1144,7 @@ work that has already been tried.
 - **Inline the three `write_all` calls in the sync framing path.**
   `write_framed_blob` calls `write_all` three times (length / header /
   blob). `BufWriter` already combines them internally, so the saving
-  is one vtable dispatch plus one buffer-state check per blob — pure
+  is one vtable dispatch plus one buffer-state check per blob - pure
   microopt, worth noting only because item 7 would naturally collapse
   them anyway.
 - **`fdatasync` instead of `fsync`.** If item 1 keeps durability but
@@ -1179,7 +1179,7 @@ command-specific bench hunt.
 Items `2b`, `5b`, `7`-`11` and the *Hypotheticals not yet measured*
 bullet list all remain parked behind item 0. They represent expansion
 of the backlog from a fresh code read, not a reordering of the measured
-work above — none of them should jump into the sprint without item 0
+work above - none of them should jump into the sprint without item 0
 counters saying so.
 
 ## Current state

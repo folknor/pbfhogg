@@ -164,10 +164,10 @@ fn print_histogram(label: &str, stats: &CoordStats) {
 pub fn node_stats(path: &Path, direct_io: bool, force: bool) -> Result<NodeStatsReport> {
     require_indexdata(path, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, the node-only \
-         filter is a no-op — all blobs are decompressed (significantly slower).")?;
+         filter is a no-op - all blobs are decompressed (significantly slower).")?;
 
     // Sequential reader to avoid PrimitiveBlock cross-thread retention
-    // at planet scale (520K+ blobs). Diagnostic command — single-threaded
+    // at planet scale (520K+ blobs). Diagnostic command - single-threaded
     // decode is acceptable.
     let mut blob_reader = crate::blob::BlobReader::open(path, direct_io)?;
     blob_reader.set_parse_indexdata(true);

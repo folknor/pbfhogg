@@ -1,4 +1,4 @@
-//! Stage 4: Assembly — emit enriched PBF.
+//! Stage 4: Assembly - emit enriched PBF.
 //!
 //! Re-reads the PBF, attaches coordinates from per-blob coord_payloads preads
 //! to ways.
@@ -255,7 +255,7 @@ pub(super) fn stage4_assembly(
     type DecodedItem = (usize, crate::error::Result<(Vec<OwnedBlock>, Stats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<BlobDescriptor>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
-    // Channel capacity 32 — the 256-depth A/B probe confirmed that
+    // Channel capacity 32 - the 256-depth A/B probe confirmed that
     // `s4_send_ms` pressure is steady-state consumer/compression
     // saturation, not burst absorption. A deeper channel just moves
     // the wait into the writer pipeline with no wall change.
@@ -660,7 +660,7 @@ pub(super) fn stage4_assembly(
         }
 
         // Final drain for passthrough tails: if the schedule ends on
-        // passthrough items (common — relations sit at EOF in sorted
+        // passthrough items (common - relations sit at EOF in sorted
         // PBFs) there's no trailing decode push to trigger the last
         // pop_ready, so do it here.
         drain(
@@ -786,7 +786,7 @@ fn assemble_block(
                 // here means the input violates one of those invariants
                 // (e.g. a way inside a non-Way-indexed blob). The integrated
                 // path produces coord_payloads keyed by way-blob index only,
-                // so there is no coordinate source for an out-of-band way —
+                // so there is no coordinate source for an out-of-band way -
                 // error out rather than silently emit (0,0).
                 return Err(format!(
                     "way {} appeared in a non-way-indexed blob; ALTW external \
@@ -934,7 +934,7 @@ fn reframe_way_blob_with_locations(
     scratch.scalar_fields.clear();
     let mut stringtable_range: Option<(usize, usize)> = None;
 
-    // Level 1: PrimitiveBlock — find string table + groups.
+    // Level 1: PrimitiveBlock - find string table + groups.
     let t_block = std::time::Instant::now();
     let mut cursor = Cursor::new(decompressed);
     while let Some((field, wire_type)) = cursor.read_tag().map_err(|e| format!("reframe block: {e}"))? {
@@ -1003,7 +1003,7 @@ fn reframe_way_blob_with_locations(
         let mut gr_cursor = Cursor::new(group_bytes);
         while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| format!("reframe gfield: {e}"))? {
             if field == 3 && wire_type == WIRE_LEN {
-                // Way submessage — splice locations.
+                // Way submessage - splice locations.
                 let way_bytes = gr_cursor.read_len_delimited().map_err(|e| format!("reframe way: {e}"))?;
 
                 if sidecar_way_idx >= expected_ways_usize {
@@ -1082,7 +1082,7 @@ fn reframe_way_blob_with_locations(
                 protohoggr::encode_bytes_field(&mut scratch.group_out, 3, &scratch.reframed_way);
                 total_ways += 1;
             } else {
-                // Non-way field in the group — copy verbatim.
+                // Non-way field in the group - copy verbatim.
                 let t_copy = std::time::Instant::now();
                 let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| format!("reframe gskip: {e}"))?;
                 protohoggr::encode_tag(&mut scratch.group_out, field, wire_type);

@@ -243,7 +243,7 @@ fn build_blob_index(
                 header = Some(decode_blob_to_headerblock(&blob_buf)?);
             }
             BlobKind::OsmData if has_indexdata => {
-                // Indexdata already in BlobHeader — skip blob payload entirely
+                // Indexdata already in BlobHeader - skip blob payload entirely
                 reader.skip(data_size as u64)?;
                 #[allow(clippy::unwrap_used)]
                 entries.push(BlobEntry {
@@ -255,7 +255,7 @@ fn build_blob_index(
                 });
             }
             BlobKind::OsmData => {
-                // No indexdata — must decompress and scan for element IDs
+                // No indexdata - must decompress and scan for element IDs
                 blob_buf.resize(data_size, 0);
                 reader.read_exact(&mut blob_buf)?;
                 decompress_blob_data_into(&blob_buf, &mut decompress_buf)?;
@@ -274,7 +274,7 @@ fn build_blob_index(
                 });
             }
             _ => {
-                // Unknown or duplicate header blob — skip payload
+                // Unknown or duplicate header blob - skip payload
                 reader.skip(data_size as u64)?;
             }
         }
@@ -333,7 +333,7 @@ fn write_passthrough_blob(
     use_copy_range: bool,
 ) -> Result<()> {
     if entry.has_indexdata {
-        // Already has indexdata — pure passthrough
+        // Already has indexdata - pure passthrough
         #[cfg(feature = "linux-direct-io")]
         if use_copy_range {
             writer.write_raw_copy(input_fd, entry.file_offset, entry.frame_len)?;

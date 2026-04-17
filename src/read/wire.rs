@@ -12,7 +12,7 @@ pub(crate) use protohoggr::{
 use crate::error::Result;
 
 // ---------------------------------------------------------------------------
-// WireStringTable — zero-copy indexed string table
+// WireStringTable - zero-copy indexed string table
 // ---------------------------------------------------------------------------
 
 /// String table storing buffer-relative offsets as inline LE bytes in the
@@ -82,10 +82,10 @@ impl<'a> WireStringTable<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// WireBlock — parsed PrimitiveBlock
+// WireBlock - parsed PrimitiveBlock
 // ---------------------------------------------------------------------------
 
-/// Parsed PrimitiveBlock — the root message of each data blob.
+/// Parsed PrimitiveBlock - the root message of each data blob.
 ///
 /// All fields borrow from `buffer` (the decompressed blob bytes). Group data
 /// and string table entries are stored as buffer-relative `(offset, length)`
@@ -133,7 +133,7 @@ impl<'a> WireBlock<'a> {
     /// Like [`parse_and_inline`] but reuses caller-provided scratch buffers
     /// to avoid per-block allocation. The scratch Vecs are cleared at the start
     /// and may grow to accommodate the block's string table and group entries.
-    /// Between blocks, the capacity is retained — no malloc/free after the
+    /// Between blocks, the capacity is retained - no malloc/free after the
     /// first few blocks.
     #[hotpath::measure]
     #[allow(clippy::cast_possible_truncation)]
@@ -284,7 +284,7 @@ impl<'a> WireBlock<'a> {
     }
 }
 
-/// Metadata from `WireBlock::parse_and_inline`. Stored on the stack — no heap.
+/// Metadata from `WireBlock::parse_and_inline`. Stored on the stack - no heap.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct WireBlockMeta {
     pub proto_len: u32,
@@ -302,10 +302,10 @@ pub(crate) struct WireBlockMeta {
 }
 
 // ---------------------------------------------------------------------------
-// WireGroup — lazy PrimitiveGroup scanner
+// WireGroup - lazy PrimitiveGroup scanner
 // ---------------------------------------------------------------------------
 
-/// Lazy PrimitiveGroup scanner — yields raw sub-message bytes by element type.
+/// Lazy PrimitiveGroup scanner - yields raw sub-message bytes by element type.
 ///
 /// Does not parse eagerly; each accessor (`nodes()`, `dense()`, `ways()`,
 /// `relations()`) scans the group's wire format for the target field number.
@@ -348,7 +348,7 @@ impl<'a> WireGroup<'a> {
 }
 
 // ---------------------------------------------------------------------------
-// WireMessageIter — yields sub-message byte slices for a given field number
+// WireMessageIter - yields sub-message byte slices for a given field number
 // ---------------------------------------------------------------------------
 
 /// Iterator over length-delimited sub-messages matching a specific field number.
@@ -616,7 +616,7 @@ impl<'a> WireDenseInfo<'a> {
     }
 }
 
-/// Parsed Info sub-message — all scalars, no byte references needed.
+/// Parsed Info sub-message - all scalars, no byte references needed.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct WireInfo {
     pub version: Option<i32>,
@@ -662,7 +662,7 @@ impl WireInfo {
 }
 
 // ---------------------------------------------------------------------------
-// Unit tests — OSM-specific parsers only. Primitive tests live in protohoggr.
+// Unit tests - OSM-specific parsers only. Primitive tests live in protohoggr.
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]

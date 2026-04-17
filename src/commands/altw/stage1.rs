@@ -5,7 +5,7 @@
 //!   Node blob mapping: header-only walk of node blobs that records each
 //!     blob's referenced-rank range using IdSetDense::rank queries on the
 //!     blob's indexdata `(min_id, max_id)`. Replaces the historical 82 GB
-//!     `coords_by_rank` file — stage 2 reads node blobs directly.
+//!     `coords_by_rank` file - stage 2 reads node blobs directly.
 
 use std::io::{BufWriter, Write as _};
 use std::path::Path;
@@ -241,7 +241,7 @@ pub(super) fn stage1_pass_a(
 /// stage 2 uses to find which blobs cover each rank bucket.
 ///
 /// Replaces the historical 82 GB `coords_by_rank` file. No decompression
-/// happens here — for each node blob we read its indexdata `(min_id, max_id)`
+/// happens here - for each node blob we read its indexdata `(min_id, max_id)`
 /// and call `IdSetDense::rank` to compute the half-open referenced-rank range
 /// `[ref_rank_start, ref_rank_end)`. Adjacent blobs' ranges are non-overlapping
 /// and monotonic in rank because the input PBF is sorted by node ID.
@@ -262,7 +262,7 @@ pub(super) fn build_node_blob_mapping(
         }
         // count_below() is the safe variant of rank() that handles IDs past
         // the highest allocated chunk (which can happen when a node blob's
-        // max_id sits in a chunk that contains no referenced nodes — rank()
+        // max_id sits in a chunk that contains no referenced nodes - rank()
         // would panic on the chunks[] index). Returns count of set IDs
         // strictly less than the argument, so this yields the half-open
         // referenced-rank range over [min_id, max_id].
@@ -550,7 +550,7 @@ pub(super) fn stage1_way_pass(
     }
     crate::debug::emit_marker("EXTJOIN_S1_PASS_B_END");
 
-    // Build the per-blob rank mapping (header-only walk + rank queries —
+    // Build the per-blob rank mapping (header-only walk + rank queries -
     // no decompression).
     let node_blob_mapping = build_node_blob_mapping(blob_meta, &node_id_set)?;
 

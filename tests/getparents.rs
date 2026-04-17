@@ -182,7 +182,7 @@ fn empty_result() {
         &[],
     );
 
-    // Node 999 doesn't exist — no parents found
+    // Node 999 doesn't exist - no parents found
     let id_set = parse_ids(&ids(&["n999"])).expect("parse ids");
     let stats = getparents(&input, &output, &id_set, &default_opts(), Compression::default(), false, &pbfhogg::HeaderOverrides::default()).expect("getparents");
 

@@ -840,7 +840,7 @@ impl InspectReport {
             if anomalies_only {
                 let selected = anomaly_blocks(infos);
                 println!(
-                    "Block anomalies ({} of {} — <50% or >150% of per-type median):",
+                    "Block anomalies ({} of {} - <50% or >150% of per-type median):",
                     selected.len(),
                     infos.len()
                 );

@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * PBF read benchmark using Planetiler's OsmInputFile.
- * Counts all nodes, ways, and relations — same workload as pbfhogg's bench_read.
+ * Counts all nodes, ways, and relations - same workload as pbfhogg's bench_read.
  *
  * Usage: java -cp planetiler.jar:. BenchPbfRead <file.osm.pbf> [runs]
  */

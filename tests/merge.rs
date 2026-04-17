@@ -21,7 +21,7 @@ use pbfhogg::{BlobDecode, BlobReader, Element, MemberType};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
-// Helpers (merge-specific — shared helpers are in tests/common/mod.rs)
+// Helpers (merge-specific - shared helpers are in tests/common/mod.rs)
 // ---------------------------------------------------------------------------
 
 fn write_osc(path: &Path, xml: &str) {
@@ -149,7 +149,7 @@ fn merge_create_between_existing_ids() {
     // All 5 nodes present in output.
     // Note: creates that fall within a passthrough blob's ID range are emitted
     // after the passthrough blob, not interleaved at their sorted position.
-    // This is intentional — the merge optimizes for throughput by passing
+    // This is intentional - the merge optimizes for throughput by passing
     // unaffected blobs through without decompression/rewriting. Pure creates
     // (IDs not in the base PBF) don't require rewriting existing blocks.
     // OSM consumers handle blocks with non-strictly-sorted IDs across blocks.
@@ -517,7 +517,7 @@ fn merge_all_types() {
 }
 
 /// Diff deletes every element in a block. The rewrite should produce no
-/// output for that block — tests that the merge doesn't emit empty blocks
+/// output for that block - tests that the merge doesn't emit empty blocks
 /// or corrupt the output stream when an entire block is eliminated.
 #[test]
 fn merge_delete_entire_block() {
@@ -638,7 +638,7 @@ fn merge_stats_accuracy() {
 
 /// Verify that metadata (version/timestamp/changeset/uid/user) from base PBF
 /// nodes survives a merge. The OSC parser doesn't extract metadata, so OSC
-/// replacement nodes get default metadata — but unchanged base nodes must
+/// replacement nodes get default metadata - but unchanged base nodes must
 /// preserve their original version/timestamp/changeset/uid/user.
 #[test]
 fn merge_metadata_preservation() {
@@ -1039,7 +1039,7 @@ fn merge_locations_on_ways_basic() {
     assert!(stats.loc_nodes_needed > 0, "should need node coords");
     assert_eq!(stats.loc_missing, 0, "all nodes should be found");
 
-    // Read output header — should have LocationsOnWays
+    // Read output header - should have LocationsOnWays
     let header = common::read_header(&output);
     assert!(header.has_locations_on_ways(), "output must have LocationsOnWays");
 
@@ -1504,7 +1504,7 @@ fn merge_basic_create_modify_delete_uring() {
 }
 
 // ---------------------------------------------------------------------------
-// F47: Gap creates — verify creates with IDs between base blob ranges
+// F47: Gap creates - verify creates with IDs between base blob ranges
 // ---------------------------------------------------------------------------
 
 /// F47: Create elements with IDs that fall in gaps between base blobs.
@@ -1531,7 +1531,7 @@ fn merge_gap_creates_between_blobs() {
         &[],
     );
 
-    // Diff: creates in gaps — node 5 before base, node 15 between 10-20,
+    // Diff: creates in gaps - node 5 before base, node 15 between 10-20,
     // node 35 after base. Way 50 before base, way 150 between 100-200.
     write_osc(&osc, r#"<?xml version="1.0" encoding="UTF-8"?>
 <osmChange version="0.6">
@@ -1555,7 +1555,7 @@ fn merge_gap_creates_between_blobs() {
 
     // All nodes present. Gap create 5 emitted before base blob.
     // Creates 15 and 35 fall within/after the passthrough blob range
-    // and are emitted after the passthrough blob (intentional — the merge
+    // and are emitted after the passthrough blob (intentional - the merge
     // optimizes for throughput by passing through unaffected blobs raw).
     let nids = node_ids(&c);
     assert_eq!(nids.len(), 6);
@@ -1582,7 +1582,7 @@ fn merge_gap_creates_between_blobs() {
 }
 
 // ---------------------------------------------------------------------------
-// F48: Type transitions — Node→Relation with no Ways in base
+// F48: Type transitions - Node→Relation with no Ways in base
 // ---------------------------------------------------------------------------
 
 /// F48: Base has only nodes and relations (no ways). Diff creates ways.
@@ -1635,7 +1635,7 @@ fn merge_type_transition_node_to_relation_skipping_ways() {
     // All nodes from base
     assert_eq!(node_ids(&c), vec![1, 2]);
 
-    // Ways from diff — must be present (flushed during type transition)
+    // Ways from diff - must be present (flushed during type transition)
     assert_eq!(way_ids(&c), vec![50, 51]);
 
     // Relation from base

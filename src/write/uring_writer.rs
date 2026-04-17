@@ -67,7 +67,7 @@ const BUF_SIZE: usize = 256 * 1024;
 const NUM_BUFS: u16 = 64;
 
 // ---------------------------------------------------------------------------
-// AlignedBufferPool — contiguous page-aligned allocation with free-list
+// AlignedBufferPool - contiguous page-aligned allocation with free-list
 // ---------------------------------------------------------------------------
 
 /// A pool of page-aligned buffers for io_uring registered I/O.
@@ -135,7 +135,7 @@ impl Drop for AlignedBufferPool {
 }
 
 // ---------------------------------------------------------------------------
-// UringState — io_uring ring + buffered accumulation
+// UringState - io_uring ring + buffered accumulation
 // ---------------------------------------------------------------------------
 
 /// Manages the io_uring ring and buffered write accumulation.
@@ -178,7 +178,7 @@ impl UringState {
                 self.current_buf = Some(idx);
                 self.current_len = 0;
             }
-            // Safety: current_buf is Some — we just ensured it above.
+            // Safety: current_buf is Some - we just ensured it above.
             let buf_idx = match self.current_buf {
                 Some(idx) => idx,
                 None => return Err(io::Error::other("no current buffer")),
@@ -220,7 +220,7 @@ impl UringState {
     ///
     /// Handles O_DIRECT page-alignment padding, advances `write_offset` and
     /// `in_flight`. Releases the buffer immediately if `data_len` is zero.
-    /// Does **not** update `logical_size` — the caller is responsible.
+    /// Does **not** update `logical_size` - the caller is responsible.
     #[allow(clippy::cast_possible_truncation)] // aligned_len as u32/u64, buf_idx as u64: bounded by BUF_SIZE/NUM_BUFS
     fn submit_buffer(&mut self, buf_idx: u16, data_len: usize) -> io::Result<()> {
         if data_len == 0 {
@@ -276,7 +276,7 @@ impl UringState {
     /// Register the input file descriptor at `IN_FD_IDX` for `ReadFixed` CopyRange.
     ///
     /// Only registers on the first call; subsequent calls are no-ops.
-    /// Drains all in-flight SQEs first — the kernel may hold references to the
+    /// Drains all in-flight SQEs first - the kernel may hold references to the
     /// file table during I/O processing. The stall is bounded by the header
     /// write (1 partial buffer, <1ms for merge).
     #[cfg(feature = "linux-direct-io")]
@@ -317,7 +317,7 @@ impl UringState {
             }
         }
 
-        // ReadFixed SQE — linked to the next SQE via IO_LINK.
+        // ReadFixed SQE - linked to the next SQE via IO_LINK.
         let read_sqe = opcode::ReadFixed::new(
             Fixed(IN_FD_IDX),
             buf_ptr,
@@ -329,7 +329,7 @@ impl UringState {
         .flags(io_uring::squeue::Flags::IO_LINK)
         .user_data((len as u64) << 16 | buf_idx as u64 | READ_FLAG);
 
-        // WriteFixed SQE — executed only if the read succeeds.
+        // WriteFixed SQE - executed only if the read succeeds.
         let write_sqe = opcode::WriteFixed::new(
             Fixed(OUT_FD_IDX),
             buf_ptr.cast_const(),
@@ -389,7 +389,7 @@ impl UringState {
                 return Ok(());
             }
         }
-        // SQ full — wait for the kernel to drain entries, then retry.
+        // SQ full - wait for the kernel to drain entries, then retry.
         self.ring
             .submitter()
             .squeue_wait()
@@ -419,7 +419,7 @@ impl UringState {
                 if sq.capacity() - sq.len() >= 2 {
                     break;
                 }
-                // Drop without pushing — publishes unchanged tail (no-op).
+                // Drop without pushing - publishes unchanged tail (no-op).
             }
             self.ring
                 .submitter()
@@ -444,7 +444,7 @@ impl UringState {
     ///
     /// Handles both write-only CQEs and linked ReadFixed+WriteFixed pairs:
     /// - Write CQEs (bit 15 clear): validate result and release the buffer.
-    /// - Read CQEs (bit 15 set): validate result but do NOT release — the
+    /// - Read CQEs (bit 15 set): validate result but do NOT release - the
     ///   linked WriteFixed still references the buffer.
     /// - Canceled write CQEs (`-ECANCELED`): the linked read already failed
     ///   and released the buffer; skip without double-releasing.
@@ -477,7 +477,7 @@ impl UringState {
 
             if ud_is_read(ud) {
                 // Read CQE from a linked ReadFixed+WriteFixed chain.
-                // Don't release — the linked WriteFixed still needs this buffer.
+                // Don't release - the linked WriteFixed still needs this buffer.
                 if result < 0 {
                     // Read failed. Release buffer here; the linked write CQE
                     // will arrive as -ECANCELED and skip release.
@@ -491,7 +491,7 @@ impl UringState {
                     )));
                 }
             } else {
-                // Write CQE — either standalone WriteFixed or from a linked chain.
+                // Write CQE - either standalone WriteFixed or from a linked chain.
                 if result == -libc::ECANCELED {
                     // Write was canceled because the linked read failed.
                     // Buffer was already released in the read CQE error path.
@@ -547,7 +547,7 @@ const fn round_up_to_page(n: usize) -> usize {
 ///
 /// Registers the input fd on first use, then submits linked SQE pairs that
 /// read from the input file directly into registered buffers and write them
-/// to the output — fully async, no syscalls in userspace beyond `io_uring_enter`.
+/// to the output - fully async, no syscalls in userspace beyond `io_uring_enter`.
 #[cfg(feature = "linux-direct-io")]
 #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 fn handle_copy_range_uring(
@@ -584,7 +584,7 @@ fn handle_copy_range_uring(
 /// Opens the output file with `O_DIRECT`, creates an io_uring instance,
 /// registers the fd and buffer pool. Init errors are sent back via `init_tx`
 /// so the constructor can propagate them immediately.
-#[allow(clippy::needless_pass_by_value)] // Thread entry point — owned values required for move closure.
+#[allow(clippy::needless_pass_by_value)] // Thread entry point - owned values required for move closure.
 pub(crate) fn uring_writer_thread(
     rx: Receiver<PipelineItem>,
     path: PathBuf,
@@ -651,7 +651,7 @@ fn uring_init_and_run(
         .custom_flags(libc::O_DIRECT)
         .open(path)?;
 
-    // Step 4: Register fds — 2 slots: [0]=output, [1]=placeholder for input (CopyRange).
+    // Step 4: Register fds - 2 slots: [0]=output, [1]=placeholder for input (CopyRange).
     // Slot 1 is filled lazily via register_files_update on first CopyRange.
     ring.submitter()
         .register_files(&[file.as_raw_fd(), -1])

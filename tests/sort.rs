@@ -74,7 +74,7 @@ fn write_type_unsorted_pbf(path: &Path) {
 
     let mut bb = BlockBuilder::new();
 
-    // Ways first (wrong order — should come after nodes)
+    // Ways first (wrong order - should come after nodes)
     bb.add_way(100, [("highway", "residential")], &[1, 2, 3], None);
     bb.add_way(200, [("highway", "primary")], &[4, 5, 6], None);
     if let Some(bytes) = bb.take().expect("take") {

@@ -20,7 +20,7 @@ const PAGE_SIZE: usize = 4096;
 const BUF_CAPACITY: usize = 256 * 1024;
 
 // ---------------------------------------------------------------------------
-// AlignedReadBuffer — page-aligned heap allocation for reads
+// AlignedReadBuffer - page-aligned heap allocation for reads
 // ---------------------------------------------------------------------------
 
 /// A page-aligned byte buffer for O_DIRECT reads.
@@ -162,7 +162,7 @@ impl DirectReader {
             }
             self.buf.consume(gap);
         } else {
-            // Already aligned — just clear the buffer so next read refills.
+            // Already aligned - just clear the buffer so next read refills.
             self.buf.pos = 0;
             self.buf.len = 0;
         }
@@ -197,7 +197,7 @@ impl Read for DirectReader {
             return Ok(n);
         }
 
-        // Buffer exhausted — refill from fd.
+        // Buffer exhausted - refill from fd.
         if self.eof {
             return Ok(0);
         }

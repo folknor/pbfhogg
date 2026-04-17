@@ -1,10 +1,10 @@
-# parallel_classify_phase regression — investigation summary
+# parallel_classify_phase regression - investigation summary
 
 **Status (2026-04-11): CLOSED.** Wall-time improvement shipped (~29% on
 Europe smart extract, confirmed +17% on complete and +15% on simple via
 the same `0b085b1` schedule reuse). Planet smart extract measured at
 **11.17 GB peak anon / 279 s wall** on commit `cadc3e6` (UUID `2d028196`,
-plantasjen, 27.9 GB avail, Europe bbox) — the Europe×2.6 = 26-28 GB
+plantasjen, 27.9 GB avail, Europe bbox) - the Europe×2.6 = 26-28 GB
 projection was wrong by ~2.4×, because peak anon is dominated by PASS3
 write work (bbox-sized) and not by PASS1 scanning the input file.
 Per the decision tree in "Planet ceiling" below, planet < 25 GB → **ship
@@ -27,7 +27,7 @@ Five commits across two days, in order:
 | `0b085b1` | **Smart PASS3 + complete PASS2 schedule reuse**: plumb full `Vec<BlobDesc>` (`pass3_blob_schedule`) out of `collect_pass1_generic` alongside the way schedule. Add `pread_write_pass_with_schedule` variant that takes a pre-built schedule. Both `extract_smart` and `extract_complete_ways` use it via `mem::take`. Also adds `emit_mallinfo2` helper and snapshots at marker boundaries. | **~180 sec (−29%)** |
 
 **The pattern across the wall improvements:** every header scan that ran
-*after* PASS1's parallel allocator work was redundant — `collect_pass1_generic`
+*after* PASS1's parallel allocator work was redundant - `collect_pass1_generic`
 already scans the whole file once. By plumbing the per-phase schedules out of
 PASS1's existing scan, smart extract now does ONE file scan instead of
 THREE. That alone is the 29% wall improvement.
@@ -49,7 +49,7 @@ MI_POST_BLOB_SCHEDULE:  arena=10.16 GB   hblkhd=3.16 GB   uordblks=1.97 GB   for
 
 **Glibc's tracked heap state across the burst window is essentially
 constant.** `arena` (brk-managed) doesn't grow. `hblkhd` (mmap chunks)
-doesn't grow. `uordblks` (live allocations) grows by 33 MB — that's exactly
+doesn't grow. `uordblks` (live allocations) grows by 33 MB - that's exactly
 the schedule Vec we expected. The allocator's view is steady.
 
 **But the sidecar's `RssAnon` (from `/proc/self/status`) shows the same
@@ -62,7 +62,7 @@ window peaking at ~10 GB anon.** That's because:
    They're reserved address space but not yet faulted in. The kernel doesn't
    count them as `RssAnon` until something writes to them.
 3. **The post-PASS1 scan loop allocates ~few MB of small Vecs**, but those
-   allocations come from glibc's free-list — which is scattered across the
+   allocations come from glibc's free-list - which is scattered across the
    entire 8 GB free area in arbitrary places.
 4. **Each "fresh" small allocation from a previously-untouched free-list
    slot triggers a page fault**, the kernel allocates a physical page, the
@@ -71,7 +71,7 @@ window peaking at ~10 GB anon.** That's because:
    touched and becomes resident.** That's the "burst": 6 GB of cold pages
    becoming hot.
 6. **glibc's accounting doesn't change** because nothing new is being
-   allocated — the same fordblks pages that were already in the free-list
+   allocated - the same fordblks pages that were already in the free-list
    are still in the free-list, just now resident in physical memory.
 
 **Two implications for what the 6 GB transient actually is:**
@@ -83,7 +83,7 @@ window peaking at ~10 GB anon.** That's because:
 - **It's the working set of any post-PASS1 phase that touches the
   pre-existing free-list.** Header scans trigger it because they make many
   small allocations from various free-list slots. `parallel_classify_phase`
-  triggers it for the same reason — per-blob `Vec<i64>` results flowing
+  triggers it for the same reason - per-blob `Vec<i64>` results flowing
   through the channel are many small allocations. Both produce the same
   cascade.
 
@@ -108,7 +108,7 @@ In rough chronological order, with the experiments that disproved each:
    (visible in subsequent phases as ~2 GB lower peaks), but the
    `SMART_PASS2_SCHEDULE` burst was unchanged. The 4.6-second cost of the
    trim wasn't worth the modest savings. Not "allocator lag" in the simple
-   sense — `malloc_trim` only releases the *top* of the arena, not scattered
+   sense - `malloc_trim` only releases the *top* of the arena, not scattered
    free-list pages.
 
 3. **Indexdata parsing** (`set_parse_indexdata(true)` in
@@ -117,7 +117,7 @@ In rough chronological order, with the experiments that disproved each:
 
 4. **The `build_classify_schedule` function code itself**. Bypassing the
    function entirely (commit `d4ea760`'s schedule reuse) eliminated its
-   peak — but only because the same allocation pattern then surfaced in
+   peak - but only because the same allocation pattern then surfaced in
    `build_blob_schedule` instead. Both functions are header scans, both
    trigger the cascade, the burst follows whichever scan happens first
    after PASS1.
@@ -134,10 +134,10 @@ In rough chronological order, with the experiments that disproved each:
    ~1-2 MB. There's no obvious allocation site for 6 GB.
 
 The mallinfo2 data finally produced a confident answer that fits all the
-ruled-out hypotheses: the 6 GB is *not* an allocation at all — it's first-
+ruled-out hypotheses: the 6 GB is *not* an allocation at all - it's first-
 touch faulting of pre-existing reserved address space.
 
-## Planet ceiling — MEASURED 2026-04-11, ship as-is
+## Planet ceiling - MEASURED 2026-04-11, ship as-is
 
 **Planet smart extract, commit `cadc3e6`, plantasjen 32 GB host, Europe
 bbox, `--bench 1` single sample, UUID `2d028196`:**
@@ -164,7 +164,7 @@ Europe bbox in both runs), not by PASS1 scanning the input file. PASS1's
 cold-arena cascade added only +0.46 GB of anon going from europe-dataset
 to planet-dataset, even though `fordblks` bloat grew from 10.93 GB →
 13.41 GB and total arena reservation grew from 13.21 GB → 19.07 GB. Most
-of the extra reserved free-list pages never got first-touched — the
+of the extra reserved free-list pages never got first-touched - the
 cascade mechanism is real but its magnitude is gated by what downstream
 consumers actually touch, not by the size of the reserved pool.
 
@@ -178,7 +178,7 @@ consumers actually touch, not by the size of the reserved pool.
   working set and could push peak anon higher by faulting in more of
   the 13.4 GB fordblks pool. If extract-on-planet ever becomes a
   recurring operation for bboxes larger than Europe, re-measure.
-  Whole-planet bbox isn't a real workload — `cat` passthrough is the
+  Whole-planet bbox isn't a real workload - `cat` passthrough is the
   right tool for that.
 - 32 GB host (27.9 GB avail at run start). Smaller hosts (e.g., 16 GB)
   would need a re-measurement; the headroom calculation is host-specific.
@@ -189,10 +189,10 @@ have been benchmarked multiple times in this project and don't behave the
 way reasoning about their `madvise(DONTNEED)` policy would suggest. They
 were also removed from the CLI feature flags because they broke
 `--all-features` builds via duplicate `#[global_allocator]` definitions.
-Meta has restarted active jemalloc development — revisit if the planet
+Meta has restarted active jemalloc development - revisit if the planet
 measurement becomes tight for some other reason.
 
-## Historical mitigation menu (NOT NEEDED — preserved as investigation context)
+## Historical mitigation menu (NOT NEEDED - preserved as investigation context)
 
 The round-4 reviewer consensus below predates the planet measurement
 above. None of these options need to be implemented given the 11.17 GB
@@ -205,7 +205,7 @@ referencing in future investigations.
 ### Step 0: measure planet before implementing anything ✅ DONE 2026-04-11
 
 **Result: 11.17 GB peak anon, 279 s wall, commit `cadc3e6`, UUID
-`2d028196`** — see "Planet ceiling" section above for the full table
+`2d028196`** - see "Planet ceiling" section above for the full table
 and mechanism analysis. Decision tree landed in the < 25 GB bucket
 (ship as-is). Round-4 reviewers were correct that step 0 was the most
 important action: the original projection was off by 2.4× and would
@@ -260,7 +260,7 @@ Two reviewers (perf/codex and arch/codex) independently proposed this
 as a partner to the packet pool:
 
 - Use `u32` where legal instead of `i64` for IDs that fit (node/way IDs
-  within a 32-bit range — many real datasets)
+  within a 32-bit range - many real datasets)
 - Delta-pack sorted IDs within a blob (classify results are monotonic
   within a blob because blobs are sorted)
 - Or bucket local IDs/ranges before sending
@@ -284,7 +284,7 @@ understanding does NOT rescue per-worker `IdSetDense` accumulation.**
 Per-worker accumulation replaces "cold-page residency cascade" with
 "real live state that scales with result cardinality and chunk spread."
 For dense node/way classify paths, that live state still hits the
-planet-safety concerns from round 1 — it just does so via a different
+planet-safety concerns from round 1 - it just does so via a different
 mechanism.
 
 The only reviewer dissent (planet/claude) framed Option 3 as a 30-
@@ -347,7 +347,7 @@ cost of 4.6 seconds wall time. We reverted it because "it costs
 With the 29% wall improvement already shipped (254s → 180s), 4.6
 seconds is ~2.5% of total wall, and the 2 GB reclaim is meaningful
 headroom on a 30 GB host. **Worth reconsidering as a shipped partial
-mitigation** — not a fix for the ceiling, but a guaranteed ~2 GB
+mitigation** - not a fix for the ceiling, but a guaranteed ~2 GB
 cushion at a 2.5% wall cost. Take this if the planet bench shows the
 ceiling is tight-but-fitting and you want a safety margin.
 
@@ -392,35 +392,35 @@ changes.
 
 For future investigators, the relevant call sites and data structures:
 
-- `src/commands/extract.rs:2397` — `Pass1Result` struct with `way_schedule`
+- `src/commands/extract.rs:2397` - `Pass1Result` struct with `way_schedule`
   and `pass3_blob_schedule` fields
-- `src/commands/extract.rs:~2566` — `collect_pass1_generic`'s sorted-path
+- `src/commands/extract.rs:~2566` - `collect_pass1_generic`'s sorted-path
   scan loop building both schedules
-- `src/commands/extract.rs:~2898` — `extract_smart` PASS2 consuming the
+- `src/commands/extract.rs:~2898` - `extract_smart` PASS2 consuming the
   way schedule via `mem::take`, with fallback to `build_classify_schedule`
-- `src/commands/extract.rs:~2992` — `extract_smart` PASS3 consuming the
+- `src/commands/extract.rs:~2992` - `extract_smart` PASS3 consuming the
   blob schedule via `mem::take`, with fallback to `pread_write_pass`
-- `src/commands/extract.rs:~2384` — `extract_complete_ways` PASS2 doing
+- `src/commands/extract.rs:~2384` - `extract_complete_ways` PASS2 doing
   the same blob-schedule reuse
-- `src/commands/extract.rs:1700-1750` — `pread_write_pass` and
+- `src/commands/extract.rs:1700-1750` - `pread_write_pass` and
   `pread_write_pass_with_schedule`
-- `src/commands/mod.rs:418-468` — `build_classify_schedule` with the
+- `src/commands/mod.rs:418-468` - `build_classify_schedule` with the
   three sub-phase markers
-- `src/debug.rs:24-66` — `emit_counter` and `emit_mallinfo2` helpers
+- `src/debug.rs:24-66` - `emit_counter` and `emit_mallinfo2` helpers
 
 ## Stored sidecar UUIDs (in `.brokkr/results.db`)
 
-- `f420c5fd` — Europe smart, `fc17b51`, original pre-refactor baseline
-- `01de22bb` — Europe smart, `5ca2df9`, post-`parallel_classify_phase`
+- `f420c5fd` - Europe smart, `fc17b51`, original pre-refactor baseline
+- `01de22bb` - Europe smart, `5ca2df9`, post-`parallel_classify_phase`
   refactor (the original "10 GB peak" measurement that started the
   investigation)
-- `0c60ec88` — Europe smart, `cc19d26`, `--bench 3` variance check showing
+- `0c60ec88` - Europe smart, `cc19d26`, `--bench 3` variance check showing
   the post-fix peak is real, not noise
-- `8ac56b15` — Europe smart, `51f820d`, first run with the new sub-phase
+- `8ac56b15` - Europe smart, `51f820d`, first run with the new sub-phase
   markers (the "burst is in PREAD_WRITE_BLOB_SCHEDULE" finding)
-- `9b6fe6cc` — Europe smart, `d4ea760` + `MALLOC_ARENA_MAX=1` env var
+- `9b6fe6cc` - Europe smart, `d4ea760` + `MALLOC_ARENA_MAX=1` env var
   (the per-thread arena falsification)
-- `4eccb6f3` — Japan smart, `51f820d`, `--alloc` per-function attribution
+- `4eccb6f3` - Japan smart, `51f820d`, `--alloc` per-function attribution
 
 The four `--force` runs from rounds 2-3 (malloc_trim, narrow markers,
 parse_indexdata=false, schedule reuse) are not in the DB. Their data is
@@ -436,7 +436,7 @@ A few process points that emerged from the wrong turns:
    round-1 brief skipped straight to "this must be the per-worker
    `IdSetDense` accumulation." The sub-phase markers added in round 3
    immediately showed the burst was elsewhere. Sub-phase markers are
-   nearly free at runtime — the bias should be toward adding them, not
+   nearly free at runtime - the bias should be toward adding them, not
    reasoning about peaks attributed to coarse phases.
 
 2. **Walk every claim in a brief through your own measurement table
@@ -454,7 +454,7 @@ A few process points that emerged from the wrong turns:
    are correct. Cumulative bytes flow through one function while peak
    anon RSS climbs in another, because the peak is about *touching*
    pages, not allocating them. When the two views disagree, neither is
-   wrong — the question to ask is "which one is the planet blocker."
+   wrong - the question to ask is "which one is the planet blocker."
 
 4. **`mallinfo2` is the right diagnostic for "is this allocator state or
    first-touch faulting".** It's ~20 LoC of instrumentation and gives a

@@ -23,7 +23,7 @@ use pbfhogg::writer::{Compression, PbfWriter};
 use pbfhogg::{BlobDecode, BlobReader, Element, ElementReader, MemberId};
 
 // ---------------------------------------------------------------------------
-// Test element structs — lightweight descriptions of OSM elements for building
+// Test element structs - lightweight descriptions of OSM elements for building
 // test PBF files. These mirror the PBF data model but use static strings for
 // convenience.
 // ---------------------------------------------------------------------------
@@ -62,7 +62,7 @@ pub struct TestMember {
 }
 
 // ---------------------------------------------------------------------------
-// PBF writing helper — builds a complete PBF file from test element slices.
+// PBF writing helper - builds a complete PBF file from test element slices.
 // ---------------------------------------------------------------------------
 
 /// Write a complete PBF file containing the given nodes, ways, and relations.
@@ -181,7 +181,7 @@ pub fn read_header(path: &Path) -> pbfhogg::HeaderBlock {
 }
 
 // ---------------------------------------------------------------------------
-// PBF reading helpers — "with coords" variant
+// PBF reading helpers - "with coords" variant
 // ---------------------------------------------------------------------------
 
 /// Collected PBF elements including node coordinates. Used by merge and
@@ -287,7 +287,7 @@ pub fn relation_ids_with_coords(c: &PbfContentsWithCoords) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// PBF reading helpers — "id only" variant (no coordinates on nodes)
+// PBF reading helpers - "id only" variant (no coordinates on nodes)
 // ---------------------------------------------------------------------------
 
 /// Collected PBF elements without node coordinates. Used by extract, getid,
@@ -372,7 +372,7 @@ pub fn relation_ids_id_only(c: &PbfContentsIdOnly) -> Vec<i64> {
 }
 
 // ---------------------------------------------------------------------------
-// PBF reading helpers — "normalized" variant for element-equivalence cross-checks
+// PBF reading helpers - "normalized" variant for element-equivalence cross-checks
 // ---------------------------------------------------------------------------
 //
 // Used by tests that need to assert two PBFs contain the same elements without

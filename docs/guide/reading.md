@@ -61,12 +61,12 @@ if let Some(bbox) = reader.header().bbox() {
 | Method | Order | Use case |
 |--------|-------|----------|
 | `for_each` | File order | Sequential processing, order-dependent consumers |
-| `for_each_pipelined` | File order | Fastest ordered read — parallel decompression overlapping I/O |
+| `for_each_pipelined` | File order | Fastest ordered read - parallel decompression overlapping I/O |
 | `for_each_block_pipelined` | File order | Consumers that need owned `PrimitiveBlock`s for parallel per-block processing |
-| `into_blocks_pipelined` | File order | Iterator interface — early exit, zipping two files |
+| `into_blocks_pipelined` | File order | Iterator interface - early exit, zipping two files |
 | `par_map_reduce` | Arbitrary | Aggregation (counts, statistics) where order doesn't matter |
 
-### for_each — sequential
+### for_each - sequential
 
 Decodes on the calling thread with no background I/O. Simplest interface, but 6x slower than pipelined on large files. Good for correctness baselines and small files.
 
@@ -86,7 +86,7 @@ println!("Number of ways: {ways}");
 # Ok::<(), std::io::Error>(())
 ```
 
-### for_each_pipelined — fastest ordered read
+### for_each_pipelined - fastest ordered read
 
 Uses a 3-stage pipeline (I/O thread, rayon decode pool, reorder buffer) to overlap reading, decompression, and element processing while preserving file order. Same `FnMut` signature as `for_each`. This is the production hot path.
 
@@ -107,7 +107,7 @@ println!("Nodes: {node_count}");
 # Ok::<(), std::io::Error>(())
 ```
 
-### par_map_reduce — parallel aggregation
+### par_map_reduce - parallel aggregation
 
 Distributes blobs across rayon workers in unspecified order. Best for aggregation where order does not matter. Takes three closures: map, identity, and reduce.
 
@@ -128,7 +128,7 @@ println!("Number of ways: {ways}");
 # Ok::<(), std::io::Error>(())
 ```
 
-### for_each_block_pipelined — block-level access
+### for_each_block_pipelined - block-level access
 
 Delivers owned `PrimitiveBlock`s in file order. The consumer can send blocks to other threads for parallel processing, enabling overlapped I/O + decode + consumer parallelism without blocking the pipeline.
 
@@ -149,7 +149,7 @@ println!("Total elements: {total}");
 # Ok::<(), std::io::Error>(())
 ```
 
-### into_blocks_pipelined — iterator interface
+### into_blocks_pipelined - iterator interface
 
 Returns an `Iterator<Item = Result<PrimitiveBlock>>` backed by a background pipeline thread. Supports early exit, zipping two files, and interleaving work. Requires `R: 'static` (`ElementReader<FileReader>` from `from_path` satisfies this).
 
@@ -270,9 +270,9 @@ Both `Node` and `DenseNode` provide:
 | `tags()` | Iterator over `(key, value)` string pairs |
 | `members()` | Iterator over relation members with `member_id` (typed: `MemberId::Node`, `MemberId::Way`, `MemberId::Relation`) and `role()` |
 
-## BlobReader — low-level access
+## BlobReader - low-level access
 
-`BlobReader` provides blob-level access to the PBF file. Each blob is a compressed chunk containing a `PrimitiveBlock` (typically 8000 elements). Most library consumers should use `ElementReader` instead — `BlobReader` is for when you need raw blob frames, file seeking, or multi-pass scanning.
+`BlobReader` provides blob-level access to the PBF file. Each blob is a compressed chunk containing a `PrimitiveBlock` (typically 8000 elements). Most library consumers should use `ElementReader` instead - `BlobReader` is for when you need raw blob frames, file seeking, or multi-pass scanning.
 
 ```rust
 use pbfhogg::{BlobReader, BlobType};
@@ -291,7 +291,7 @@ for blob in &mut reader {
 
 `BlobReader::open(path, true)` opens with O_DIRECT, same as `ElementReader::open`.
 
-## IndexedReader — filtered reads
+## IndexedReader - filtered reads
 
 `IndexedReader` builds an in-memory index of blob positions and ID ranges, then seeks directly to relevant blobs. Useful when you need specific elements by ID from a large file.
 

@@ -69,16 +69,16 @@ mod tests {
     fn out_of_order_push() {
         let mut rb = ReorderBuffer::with_capacity(4);
 
-        // Push 1 first — can't pop yet (0 missing)
+        // Push 1 first - can't pop yet (0 missing)
         rb.push(1, "b");
         assert_eq!(rb.pop_ready(), None);
 
-        // Push 0 — now 0 and 1 are contiguous
+        // Push 0 - now 0 and 1 are contiguous
         rb.push(0, "a");
         assert_eq!(rb.pop_ready(), Some("a"));
         assert_eq!(rb.pop_ready(), Some("b"));
 
-        // Push 2 — immediately ready
+        // Push 2 - immediately ready
         rb.push(2, "c");
         assert_eq!(rb.pop_ready(), Some("c"));
         assert_eq!(rb.pop_ready(), None);

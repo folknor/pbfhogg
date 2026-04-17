@@ -56,7 +56,7 @@ impl DecompressPool {
     }
 
     /// Pop a buffer from the pool, or return an empty Vec if the pool is empty.
-    // wontfix(type-result-fallible): .ok() on Mutex::lock() — poisoning means another
+    // wontfix(type-result-fallible): .ok() on Mutex::lock() - poisoning means another
     // thread panicked; falling back to a fresh Vec is the correct recovery here.
     pub fn get(&self) -> Vec<u8> {
         self.buffers
@@ -105,7 +105,7 @@ impl Drop for PooledBuffer {
     }
 }
 
-/// Get a decompression buffer — from the pool if available, otherwise fresh.
+/// Get a decompression buffer - from the pool if available, otherwise fresh.
 fn pool_get(pool: Option<&Arc<DecompressPool>>, capacity: usize) -> Vec<u8> {
     match pool {
         Some(p) => {
@@ -124,7 +124,7 @@ pub(crate) fn pool_get_pub(pool: &Arc<DecompressPool>, capacity: usize) -> Vec<u
     buf
 }
 
-/// Wrap decoded bytes as `Bytes` — returning to pool on drop if pooled.
+/// Wrap decoded bytes as `Bytes` - returning to pool on drop if pooled.
 pub(crate) fn pool_wrap(decoded: Vec<u8>, pool: Option<&Arc<DecompressPool>>) -> Bytes {
     match pool {
         Some(p) => Bytes::from_owner(PooledBuffer {
@@ -161,7 +161,7 @@ fn zlib_decompress_into(compressed: &[u8], buf: &mut Vec<u8>) -> Result<()> {
             if matches!(status, flate2::Status::StreamEnd) {
                 break;
             }
-            // Output buffer was full — grow and retry.
+            // Output buffer was full - grow and retry.
             if buf.len() == buf.capacity() {
                 buf.reserve(buf.len().max(4096));
             }
@@ -206,7 +206,7 @@ impl WireBlobHeader {
     /// Parse a BlobHeader from raw protobuf bytes.
     ///
     /// When `parse_tagdata` is `false`, field 4 (tagdata) is skipped instead of
-    /// allocated. Most read paths don't need tagdata — only tag-filtered reads
+    /// allocated. Most read paths don't need tagdata - only tag-filtered reads
     /// and merge/sort passthrough use it.
     ///
     /// When `parse_indexdata` is `false`, field 2 (indexdata) is skipped instead
@@ -236,7 +236,7 @@ impl WireBlobHeader {
                     };
                 }
                 2 if parse_indexdata => {
-                    // indexdata: bytes (len-delimited) — accept v1 (26) or v2 (42) sizes
+                    // indexdata: bytes (len-delimited) - accept v1 (26) or v2 (42) sizes
                     let bytes = cursor.read_len_delimited()?;
                     let len = bytes.len();
                     if len == crate::blob_index::INDEX_SIZE || len == 26 {
@@ -468,7 +468,7 @@ impl Blob {
     ///
     /// The buffer is cleared and refilled. Callers typically pass ownership
     /// to `PrimitiveBlock::from_vec_with_scratch(std::mem::take(&mut buf))`
-    /// which leaves `buf` empty — the next call will re-allocate. This trades
+    /// which leaves `buf` empty - the next call will re-allocate. This trades
     /// per-blob allocation (~220 KB) for eliminating the 1.5 MB Bytes→Vec copy
     /// that the old `decompress_pooled()` + `new_with_scratch()` path incurred.
     pub(crate) fn decompress_into(&self, buf: &mut Vec<u8>) -> Result<()> {
@@ -478,7 +478,7 @@ impl Blob {
     /// Returns the blob-level index from the header's `indexdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed indexdata automatically. Third-party PBFs
-    /// (Geofabrik, osmium) typically do not — this returns `None` for those.
+    /// (Geofabrik, osmium) typically do not - this returns `None` for those.
     pub(crate) fn index(&self) -> Option<crate::blob_index::BlobIndex> {
         self.header
             .indexdata
@@ -503,7 +503,7 @@ impl Blob {
     /// Returns the per-blob tag key index from the header's `tagdata` field, if present.
     ///
     /// PBFs written by pbfhogg embed tag key data automatically. Third-party PBFs
-    /// do not — this returns `None` for those.
+    /// do not - this returns `None` for those.
     pub(crate) fn tag_index(&self) -> Option<crate::blob_index::TagIndex> {
         self.header
             .tagdata
@@ -596,7 +596,7 @@ pub struct BlobReader<R: Read + Send> {
     /// File descriptor for fadvise(DONTNEED) after each blob read. When set,
     /// the reader evicts page cache pages behind the read head, preventing
     /// sequential reads from accumulating the entire file in RSS.
-    /// Only set for buffered FileReader — O_DIRECT has no pages to evict.
+    /// Only set for buffered FileReader - O_DIRECT has no pages to evict.
     #[cfg(target_os = "linux")]
     evict_fd: Option<std::os::unix::io::RawFd>,
 }
@@ -844,7 +844,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
         // copied into owned buffers (blob_data Vec above), the kernel's cached
         // pages for the consumed byte range are never accessed again. Advising
         // DONTNEED prevents sequential reads from accumulating the entire file
-        // in RSS — critical for 30+ GB PBFs on memory-constrained hosts.
+        // in RSS - critical for 30+ GB PBFs on memory-constrained hosts.
         #[cfg(target_os = "linux")]
         if let Some(fd) = self.evict_fd
             && let Some(offset) = self.offset

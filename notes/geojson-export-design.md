@@ -2,7 +2,7 @@
 
 ## Goal
 
-`pbfhogg export` — streaming PBF → GeoJSON/GeoJSONSeq. The bridge to
+`pbfhogg export` - streaming PBF → GeoJSON/GeoJSONSeq. The bridge to
 the GIS ecosystem. Every OSM analyst needs this; currently requires
 ogr2ogr, osmium-export, or osm2pgsql + PostGIS.
 
@@ -11,7 +11,7 @@ ogr2ogr, osmium-export, or osm2pgsql + PostGIS.
 ### GeoJSONSeq (primary, line-delimited)
 
 One GeoJSON Feature per line, newline-delimited (RFC 8142). No wrapping
-FeatureCollection. Streamable — each line is independently valid JSON.
+FeatureCollection. Streamable - each line is independently valid JSON.
 
 ```
 {"type":"Feature","geometry":{"type":"Point","coordinates":[12.5,55.6]},"properties":{"name":"Copenhagen"}}
@@ -55,9 +55,9 @@ Ways with `area=yes` or certain tag keys (building, landuse, natural,
 leisure, amenity) are polygons. All others are linestrings.
 
 **Requires coordinates.** Two sources:
-1. **ALTW-enriched PBF** — `Way::node_locations()` provides inline
+1. **ALTW-enriched PBF** - `Way::node_locations()` provides inline
    coordinates. No external lookup needed.
-2. **Raw PBF + dense index** — build a node coordinate index (same as
+2. **Raw PBF + dense index** - build a node coordinate index (same as
    ALTW), then look up coordinates per way ref. Memory-intensive.
 
 For v1, require ALTW-enriched input. This keeps the implementation
@@ -109,12 +109,12 @@ pbfhogg export --expressions "highway" enriched.osm.pbf > highways.geojsonseq
 
 ### Key selection
 
-`--properties name,highway,surface` — only include specified keys in
+`--properties name,highway,surface` - only include specified keys in
 the output properties. Reduces file size significantly.
 
 ### Type filter
 
-`--type node` / `--type way` / `--type relation` — same as other commands.
+`--type node` / `--type way` / `--type relation` - same as other commands.
 
 ## Architecture
 
@@ -142,29 +142,29 @@ Implementation:
 
 Use `serde_json` (already a dependency) for property serialization.
 Coordinates can be written directly (avoid `serde_json::Value` overhead
-for geometry — format `[lon,lat]` strings directly).
+for geometry - format `[lon,lat]` strings directly).
 
 ### Performance considerations
 
-- **No parallel decode for v1** — sequential streaming is simpler and
+- **No parallel decode for v1** - sequential streaming is simpler and
   GeoJSON writing is I/O-bound (text output is verbose)
-- **Coordinate formatting** — `format!("{:.7}", coord)` is slow per
+- **Coordinate formatting** - `format!("{:.7}", coord)` is slow per
   element. Use `ryu` or `dtoa` for fast float-to-string. Or use the
   existing `format_coord` in `elements_xml.rs` which strips trailing
   zeros.
-- **String escaping** — tag values may contain JSON-special characters
+- **String escaping** - tag values may contain JSON-special characters
   (quotes, backslashes, control chars). Must use proper JSON escaping.
   `serde_json` handles this correctly.
-- **Memory** — streaming output means O(1) memory (one element at a time).
+- **Memory** - streaming output means O(1) memory (one element at a time).
   No need to buffer the entire feature collection.
 
 ## Relationship to existing code
 
-- `src/geo.rs` — point-in-polygon, ring assembly, simplification
-- `src/commands/tag_expr.rs` — tag expression parsing and matching
-- `src/commands/elements_xml.rs` — coordinate formatting, metadata access
-- `src/commands/extract.rs` — spatial bbox filtering (reuse `BboxInt`)
-- `Way::node_locations()` — inline coordinate access from ALTW PBFs
+- `src/geo.rs` - point-in-polygon, ring assembly, simplification
+- `src/commands/tag_expr.rs` - tag expression parsing and matching
+- `src/commands/elements_xml.rs` - coordinate formatting, metadata access
+- `src/commands/extract.rs` - spatial bbox filtering (reuse `BboxInt`)
+- `Way::node_locations()` - inline coordinate access from ALTW PBFs
 
 ## Open questions
 

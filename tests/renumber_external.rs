@@ -215,7 +215,7 @@ fn renumber_relations_end_to_end() {
 
 #[test]
 fn renumber_relation_forward_ref() {
-    // Rel 500 references rel 600 (forward ref — target appears later
+    // Rel 500 references rel 600 (forward ref - target appears later
     // in sort order). R1 collects all IDs before R2d resolves.
     let dir = TempDir::new().expect("tempdir");
     let input = dir.path().join("input.osm.pbf");

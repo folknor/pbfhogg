@@ -2,7 +2,7 @@
 
 ## Inspecting a PBF file
 
-Get an overview of any PBF file — block breakdown, element counts, ordering analysis:
+Get an overview of any PBF file - block breakdown, element counts, ordering analysis:
 
 ```sh
 pbfhogg inspect denmark.osm.pbf
@@ -34,7 +34,7 @@ Many commands are faster with blob-level indexdata. Generate an indexed PBF with
 pbfhogg cat denmark-raw.osm.pbf -o denmark.osm.pbf
 ```
 
-This passthrough path adds indexdata without re-compressing blobs — minimal memory, suitable for planet-scale files (87 GB planet in ~8 minutes). No `--type` flag means passthrough; adding `-t` does full decode and re-encode.
+This passthrough path adds indexdata without re-compressing blobs - minimal memory, suitable for planet-scale files (87 GB planet in ~8 minutes). No `--type` flag means passthrough; adding `-t` does full decode and re-encode.
 
 ## Extracting a region
 
@@ -112,7 +112,7 @@ pbfhogg getid denmark.osm.pbf -o filtered.osm.pbf --invert n123 w456
 
 ## The --force flag
 
-Commands that benefit from indexdata (`apply-changes`, `sort`, `extract`, `tags-filter`, `getid`, `add-locations-to-ways`, and others) will error if the input PBF lacks it. Pass `--force` to proceed without indexdata — the command will work but use slower fallback paths:
+Commands that benefit from indexdata (`apply-changes`, `sort`, `extract`, `tags-filter`, `getid`, `add-locations-to-ways`, and others) will error if the input PBF lacks it. Pass `--force` to proceed without indexdata - the command will work but use slower fallback paths:
 
 ```sh
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force

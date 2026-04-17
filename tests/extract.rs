@@ -482,7 +482,7 @@ fn smart_ignores_non_qualifying_relations() {
     let stats = extract(&input, &output, &region, ExtractStrategy::Smart, true, &CleanAttrs::default(), Compression::default(), false, true, &pbfhogg::HeaderOverrides::default()).expect("extract");
     let c = read_all_elements(&output);
 
-    // type=route should NOT trigger smart behavior — way 11 stays excluded
+    // type=route should NOT trigger smart behavior - way 11 stays excluded
     assert_eq!(way_ids(&c), vec![10, 12]);
     // Relation 302 is still included (it has way 10 as member, which is matched)
     assert_eq!(relation_ids(&c), vec![302]);
@@ -522,7 +522,7 @@ fn write_multi_blob_pbf(path: &std::path::Path) {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
-    // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) — far from Copenhagen
+    // Blob 2: Stockholm area (lat ~59.3, lon ~18.0) - far from Copenhagen
     for i in 11..=20_i64 {
         bb.add_node(i, 593_000_000 + i as i32 * 1000, 180_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
     }
@@ -530,7 +530,7 @@ fn write_multi_blob_pbf(path: &std::path::Path) {
         writer.write_primitive_block(bytes).expect("write block");
     }
 
-    // Blob 3: Berlin area (lat ~52.5, lon ~13.4) — far from Copenhagen
+    // Blob 3: Berlin area (lat ~52.5, lon ~13.4) - far from Copenhagen
     for i in 21..=30_i64 {
         bb.add_node(i, 525_000_000 + i as i32 * 1000, 134_000_000 + i as i32 * 1000, std::iter::empty::<(&str, &str)>(), None);
     }
@@ -579,7 +579,7 @@ fn spatial_filter_skips_distant_blobs() {
 }
 
 // ---------------------------------------------------------------------------
-// Single-pass sorted tests — verify that the sorted fast path produces
+// Single-pass sorted tests - verify that the sorted fast path produces
 // identical results to the two-pass unsorted path.
 // ---------------------------------------------------------------------------
 
@@ -780,7 +780,7 @@ fn multi_extract_two_bbox_regions() {
     assert_eq!(relation_ids(&ca), vec![100]);
     assert_eq!(all_stats[0].nodes_in_bbox, 2);
 
-    // Extract B: node 4 in bbox; way 11 refs [2,4] — only node 4 is in B's bbox
+    // Extract B: node 4 in bbox; way 11 refs [2,4] - only node 4 is in B's bbox
     // so way 11 matches. Relation 101 has member node 4.
     let cb = read_all_elements(&out_b);
     assert_eq!(node_ids(&cb), vec![4]);

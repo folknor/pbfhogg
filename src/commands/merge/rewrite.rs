@@ -420,7 +420,7 @@ fn emit_create_local(
 
 /// Rewrite a block in parallel: same element-by-element logic as `rewrite_block`,
 /// but flushes to local `Vec<Vec<u8>>` instead of `PbfWriter`. Interleaves
-/// upserts at their sorted positions within the block — IDs that match base
+/// upserts at their sorted positions within the block - IDs that match base
 /// elements are modifications (handled by normal element processing); IDs that
 /// don't match are creates (emitted by the cursor).
 #[allow(clippy::too_many_lines)]
@@ -868,7 +868,7 @@ pub fn merge(
             }
         }
 
-        // Location index is pre-filled and immutable — just reference it.
+        // Location index is pre-filled and immutable - just reference it.
 
         // Phase 3+4: Spawn parallel rewrites, then stream output in file order.
         // Each rayon task owns its RewriteJob (including PrimitiveBlock), freeing
@@ -902,7 +902,7 @@ pub fn merge(
                     loc_clone.as_deref(),
                 )
                 .map_err(|e| e.to_string());
-                // job (PrimitiveBlock) dropped here — freed before other tasks finish
+                // job (PrimitiveBlock) dropped here - freed before other tasks finish
                 drop(tx.send((job_idx, result)));
             });
         }
@@ -1020,7 +1020,7 @@ pub fn merge(
                     stats.bytes_rewritten += rewrite_bytes;
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;
-                    // output dropped here — RewriteOutput freed immediately
+                    // output dropped here - RewriteOutput freed immediately
 
                     // Advance cursor past blob's OSM-last (inline upserts handled by rewrite)
                     let last = crate::commands::blob_osm_last_key(min_id, max_id);
@@ -1067,7 +1067,7 @@ pub fn merge(
 
     // Trailing creates: flush remaining upserts per type.
     // When last_type is None (no blobs at all), cursors are at 0 so all types
-    // are flushed in full — equivalent to the previous dedicated else-branch.
+    // are flushed in full - equivalent to the previous dedicated else-branch.
     #[cfg(feature = "hotpath")]
     let trailing_start = std::time::Instant::now();
     let types_to_flush = match last_type {

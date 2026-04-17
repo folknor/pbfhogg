@@ -4,7 +4,7 @@
 //!
 //! Provides a managed scratch directory (auto-cleanup on drop) and a set of
 //! buffered bucket writers with flush-sync-fadvise-close semantics. Payload
-//! encoding and the radix-bucket index derivation are left to the caller —
+//! encoding and the radix-bucket index derivation are left to the caller -
 //! different commands use different pair shapes.
 //!
 //! Moved here from `src/commands/external_join.rs` during the renumber planet
@@ -72,7 +72,7 @@ impl Drop for ScratchDir {
 /// buffered at 256 KB.
 ///
 /// Fields are `pub(crate)` so callers can perform direct writes inside hot
-/// loops without an extra method-dispatch hop — the original `external_join`
+/// loops without an extra method-dispatch hop - the original `external_join`
 /// code pattern. See the stage-1 loop in `external_join::stage1_way_pass` for
 /// the canonical call shape.
 pub(crate) struct BucketWriters {

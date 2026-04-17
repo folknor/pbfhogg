@@ -58,7 +58,7 @@ impl DeriveChangesStats {
 /// written as gzipped OsmChange XML. Memory is bounded by the number of
 /// changed elements, not total input size.
 ///
-/// Requires both inputs to declare `Sort.Type_then_ID` — returns an
+/// Requires both inputs to declare `Sort.Type_then_ID` - returns an
 /// actionable error if either is unsorted.
 #[hotpath::measure]
 pub fn derive_changes(
@@ -114,7 +114,7 @@ pub fn derive_changes(
 }
 
 // ---------------------------------------------------------------------------
-// Streaming change sink — writes element XML directly to temp files
+// Streaming change sink - writes element XML directly to temp files
 // ---------------------------------------------------------------------------
 
 struct ChangeSink {
@@ -204,7 +204,7 @@ impl ChangeSink {
 }
 
 /// Extract just id + metadata from a borrowed element for delete output.
-/// Avoids full owned conversion (no tag/ref cloning — deletes only need id + version).
+/// Avoids full owned conversion (no tag/ref cloning - deletes only need id + version).
 fn extract_delete_info(elem: &crate::Element<'_>, kind: ElemKind) -> Option<(&'static str, i64, Option<OwnedMetadata>)> {
     match (kind, elem) {
         (ElemKind::Node, crate::Element::DenseNode(dn)) => Some(("node", dn.id(),

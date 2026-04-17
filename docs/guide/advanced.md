@@ -24,7 +24,7 @@ Planet-scale operations read and write 80 GB+, polluting the entire page cache a
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --direct-io
 ```
 
-O_DIRECT requires a real filesystem (not tmpfs). Wall time is typically unchanged at country scale (CPU-bound) — the benefit is cache hygiene at planet scale. For sequential single-file passthrough (`cat`), buffered I/O is actually faster because the page cache prefetch helps. `--direct-io` wins for concurrent read/write patterns like merge.
+O_DIRECT requires a real filesystem (not tmpfs). Wall time is typically unchanged at country scale (CPU-bound) - the benefit is cache hygiene at planet scale. For sequential single-file passthrough (`cat`), buffered I/O is actually faster because the page cache prefetch helps. `--direct-io` wins for concurrent read/write patterns like merge.
 
 ## io_uring writes
 
@@ -34,7 +34,7 @@ The `linux-io-uring` feature replaces the synchronous writer thread with io_urin
 pbfhogg apply-changes base.osm.pbf changes.osc.gz -o output.osm.pbf --io-uring
 ```
 
-At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up — io_uring overhead dominates when the page cache absorbs everything.
+At North America scale (18.8 GB), io_uring + `--compression none` is 20% faster than buffered writes (11.9s vs 14.9s). Below ~4 GB input size, buffered writes keep up - io_uring overhead dominates when the page cache absorbs everything.
 
 ## Compression modes
 
@@ -96,10 +96,10 @@ Without `-R` (default mode), `tags-filter` resolves matched relation members tra
 With `-R` (omit-referenced), only directly matched elements are emitted. This is a single pass and significantly faster, but the output may have dangling references.
 
 ```sh
-# Full resolution (default) — complete output
+# Full resolution (default) - complete output
 pbfhogg tags-filter denmark.osm.pbf -o highways.osm.pbf "highway=primary"
 
-# Direct matches only — faster but may have dangling refs
+# Direct matches only - faster but may have dangling refs
 pbfhogg tags-filter denmark.osm.pbf -o highways.osm.pbf -R "highway=primary"
 ```
 

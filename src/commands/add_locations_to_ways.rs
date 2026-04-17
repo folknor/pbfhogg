@@ -106,11 +106,11 @@ const DENSE_INDEX_DEFAULT_CAPACITY: usize = 16_000_000_000;
 /// Backed by a temporary file (created and immediately unlinked). The OS
 /// manages physical memory via page cache: under memory pressure, clean
 /// pages are evicted and re-read from disk on demand. This allows the index
-/// to exceed physical RAM without OOM — at planet scale (~68 GB touched),
+/// to exceed physical RAM without OOM - at planet scale (~68 GB touched),
 /// the kernel pages data in/out transparently.
 ///
 /// Sentinel: `(0, 0)` means unset. ~116 nodes at exactly null island (0°N, 0°E)
-/// will appear as missing — acceptable ambiguity for diagnostic counters.
+/// will appear as missing - acceptable ambiguity for diagnostic counters.
 pub(crate) struct DenseMmapIndex {
     mmap: memmap2::MmapMut,
     _file: std::fs::File,
@@ -169,7 +169,7 @@ impl DenseMmapIndex {
                     temp_path.display()
                 )
             })?;
-        // Unlink immediately — fd keeps the file alive, OS cleans up on close/crash.
+        // Unlink immediately - fd keeps the file alive, OS cleans up on close/crash.
         // Ignore errors: unlink failure is non-fatal (file just won't auto-clean).
         drop(std::fs::remove_file(&temp_path));
         file.set_len(byte_len as u64).map_err(|e| {
@@ -388,7 +388,7 @@ fn build_node_index_sparse(
     let mut byte_pos: u64 = 0;
     let mut prev_id: i64 = -1;
 
-    // Grow on demand — avoids 450 MB upfront allocation for small datasets.
+    // Grow on demand - avoids 450 MB upfront allocation for small datasets.
 
     // Node-only sequential scanner: bypasses PrimitiveBlock construction to avoid
     // cross-thread alloc/free retention (25+ GB at Europe/planet scale).
@@ -547,7 +547,7 @@ struct BlobHeaderInfo {
 /// Read just the BlobHeader (phase 1). Returns `None` at EOF.
 ///
 /// Advances `file_offset` by the header portion only (4 + header_len).
-/// The blob data is NOT read — call `read_blob_data` or `skip_blob_data` next.
+/// The blob data is NOT read - call `read_blob_data` or `skip_blob_data` next.
 fn read_blob_header(
     reader: &mut FileReader,
     file_offset: &mut u64,
@@ -752,7 +752,7 @@ pub fn add_locations_to_ways(
         index_type
     };
 
-    // External join has its own pipeline — dispatch early.
+    // External join has its own pipeline - dispatch early.
     if index_type == IndexType::External {
         return super::altw::external_join(
             input,
@@ -846,7 +846,7 @@ fn build_node_index(
 /// Build the dense mmap index in parallel. Each rayon task writes directly
 /// to disjoint mmap slots via `SharedDenseWriter`.
 ///
-/// Only nodes present in `referenced` are inserted — at planet scale this
+/// Only nodes present in `referenced` are inserted - at planet scale this
 /// reduces touched pages from ~80 GB (all 10.4B nodes) to ~16 GB (~2B
 /// way-referenced nodes).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
@@ -918,7 +918,7 @@ fn build_node_index_dense(
 ///
 /// Scans only way blobs (via `BlobFilter`) and builds a bitset of every node
 /// ID that appears in any way's refs list. At planet scale (~2B unique node
-/// refs), this costs ~1.6 GB — far less than indexing all 10.4B nodes.
+/// refs), this costs ~1.6 GB - far less than indexing all 10.4B nodes.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
     // Way-ref scanner: bypasses PrimitiveBlock construction (no string table,
@@ -953,7 +953,7 @@ fn collect_way_referenced_node_ids(input: &Path, direct_io: bool) -> Result<IdSe
 /// Collect all node IDs referenced by relation members.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(crate) fn collect_relation_member_node_ids(input: &Path, direct_io: bool) -> Result<IdSetDense> {
-    // Sequential reader — only ~2K relation blobs at Europe scale, so retention
+    // Sequential reader - only ~2K relation blobs at Europe scale, so retention
     // is negligible, but sequential is consistent with the other collection passes.
     let mut blob_reader = crate::blob::BlobReader::open(input, direct_io)?;
     blob_reader.set_parse_indexdata(true);
@@ -1493,7 +1493,7 @@ fn write_output_passthrough(
                 coalesce_passthrough(&mut frame, &mut passthrough_chunks);
             }
         } else {
-            // Flush any pending copy range before decoding — the next passthrough
+            // Flush any pending copy range before decoding - the next passthrough
             // blob may not be contiguous with the previous one (decode blobs in
             // between break contiguity).
             #[cfg(feature = "linux-direct-io")]

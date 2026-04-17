@@ -10,7 +10,7 @@ pub(crate) use super::elements_xml::OwnedMember;
 use super::Result;
 
 // ---------------------------------------------------------------------------
-// Owned element types — Vec fields are kept (not Box<[T]>) because these are
+// Owned element types - Vec fields are kept (not Box<[T]>) because these are
 // transient allocations: decoded, processed, re-encoded per overlap run or
 // sweep-merge pass. They are not long-lived.
 // ---------------------------------------------------------------------------
@@ -53,7 +53,7 @@ pub(crate) enum OwnedElement {
 }
 
 // ---------------------------------------------------------------------------
-// Ord impls — compare by ID via osm_id_cmp, then version ascending as tiebreaker
+// Ord impls - compare by ID via osm_id_cmp, then version ascending as tiebreaker
 // ---------------------------------------------------------------------------
 
 /// Extract version from optional metadata (0 if absent).
@@ -148,7 +148,7 @@ pub(crate) fn owned_to_metadata(meta: Option<&OwnedMetadata>) -> Option<Metadata
 }
 
 // ---------------------------------------------------------------------------
-// Read functions — convert parsed elements to owned
+// Read functions - convert parsed elements to owned
 // ---------------------------------------------------------------------------
 
 pub(crate) fn read_dense_node(dn: &crate::DenseNode<'_>) -> OwnedNode {
@@ -260,7 +260,7 @@ pub(crate) fn read_relation(r: &crate::Relation<'_>) -> OwnedRelation {
 }
 
 // ---------------------------------------------------------------------------
-// Write functions — write owned elements to BlockBuilder + PbfWriter
+// Write functions - write owned elements to BlockBuilder + PbfWriter
 // ---------------------------------------------------------------------------
 
 pub(crate) fn write_single_node(

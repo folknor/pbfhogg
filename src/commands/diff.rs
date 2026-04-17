@@ -170,7 +170,7 @@ impl DiffMeta for OwnedRelation {
 ///
 /// Streams through both files in constant memory (~3 MB overhead per cursor)
 /// using pipelined block iterators. Requires both inputs to declare
-/// `Sort.Type_then_ID` — returns an actionable error if either is unsorted.
+/// `Sort.Type_then_ID` - returns an actionable error if either is unsorted.
 #[allow(clippy::too_many_lines)]
 #[hotpath::measure]
 pub fn diff(
@@ -560,7 +560,7 @@ fn write_tag_diff(
     old_tags: &[(String, String)],
     new_tags: &[(String, String)],
 ) -> Result<()> {
-    // Linear scan — elements typically have 2-5 tags, faster than HashMap.
+    // Linear scan - elements typically have 2-5 tags, faster than HashMap.
     // Removed: in old but not in new
     for (k, v) in old_tags {
         if !new_tags.iter().any(|(nk, _)| nk == k) {

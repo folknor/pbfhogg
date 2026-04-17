@@ -184,7 +184,7 @@ fn write_pbf_copy(input: &Path, output: &Path) {
 }
 
 #[test]
-#[ignore] // 54s on Denmark — run with: cargo test -- --ignored
+#[ignore] // 54s on Denmark - run with: cargo test -- --ignored
 fn roundtrip_denmark() {
     let dk = denmark_path();
     let out = output_path();

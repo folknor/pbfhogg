@@ -3,7 +3,7 @@
 //! The in-memory `renumber` module allocates three `FxHashMap<i64, i64>`
 //! tables whose combined size on planet is ~278 GB, which OOM-kills any
 //! host under ~300 GB RAM. This module uses `IdSetDense` bitsets with
-//! rank-based O(1) lookup for all three element types — no hash maps,
+//! rank-based O(1) lookup for all three element types - no hash maps,
 //! no temp files, no mmaps.
 //!
 //! ## Architecture
@@ -13,7 +13,7 @@
 //!   merged after pass 1 and a rank index built for O(1) new-id lookup.
 //! - **Stage 2d**: parallel wire-format way splice rewriter (6
 //!   work-stealing workers). Resolves way refs inline via
-//!   `node_id_set.rank()` during the splice — no intermediate files.
+//!   `node_id_set.rank()` during the splice - no intermediate files.
 //!   Per-worker `IdSetDense` for `way_id_set`, merged after stage 2d.
 //! - **R1**: sequential relation scan to collect all relation IDs into
 //!   a third `IdSetDense` bitset + rank index.
@@ -91,7 +91,7 @@ pub fn renumber_external(
     // pass1/stage2d worker threads and freed on rayon compression
     // threads cause glibc arena accumulation growing to ~26 GB anon
     // RSS on planet. With 2 arenas the peak stays under 1 GB.
-    // Scoped to this command — other pbfhogg commands are unaffected.
+    // Scoped to this command - other pbfhogg commands are unaffected.
     #[cfg(target_os = "linux")]
     unsafe {
         libc::mallopt(libc::M_ARENA_MAX, 2);
@@ -115,7 +115,7 @@ pub fn renumber_external(
             .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
         header_blob.to_headerblock()?
     };
-    // Default to zlib:1 for external renumber — the compression pipeline
+    // Default to zlib:1 for external renumber - the compression pipeline
     // is on the critical path for pass 1 and stage 2d, and zlib:6 adds
     // ~22 s of backpressure at planet scale for ~15% smaller output.
     // Respect explicit caller overrides (e.g. --compression zlib:6).
@@ -135,7 +135,7 @@ pub fn renumber_external(
         orphan_refs: 0,
     };
 
-    // Single shared input fd for all phases — pread is concurrent-safe.
+    // Single shared input fd for all phases - pread is concurrent-safe.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
             .map_err(|e| format!("failed to open {}: {e}", input.display()))?,
@@ -161,7 +161,7 @@ pub fn renumber_external(
     // bounded channel. Main thread reorders by seq and writes output.
     let pass1_total_nodes: u64 = pass1_schedule.iter().map(|t| t.element_count).sum();
 
-    // Single shared IdSetDense — pre-allocate all chunks for the max
+    // Single shared IdSetDense - pre-allocate all chunks for the max
     // node ID so workers can use set_atomic(&self) concurrently.
     let max_node_id = pass1_schedule.last().map_or(0, |t| t.max_id);
     let mut node_id_set = super::id_set_dense::IdSetDense::new();
@@ -190,7 +190,7 @@ pub fn renumber_external(
 
     crate::debug::emit_marker("RENUMBER_EXT_PASS1_END");
 
-    // ---- Build rank index (no merge needed — single shared bitset) ----
+    // ---- Build rank index (no merge needed - single shared bitset) ----
     let t_rank = std::time::Instant::now();
     node_id_set.build_rank_index();
     #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
@@ -284,7 +284,7 @@ pub fn renumber_external(
 
 
 // ---------------------------------------------------------------------------
-// Stage 2d: parallel way rewrite — fused ref resolve + wire-format splice
+// Stage 2d: parallel way rewrite - fused ref resolve + wire-format splice
 // ---------------------------------------------------------------------------
 
 /// Parallel stage 2d: fused way resolve + wire-format rewrite.
@@ -523,7 +523,7 @@ fn stage2d_worker(
 }
 
 // ---------------------------------------------------------------------------
-// Pass 1: parallel node scan — worker pool with work-stealing dispatch
+// Pass 1: parallel node scan - worker pool with work-stealing dispatch
 // ---------------------------------------------------------------------------
 
 /// Per-blob task for the parallel pass pool. `seq` is the filtered-index
@@ -575,7 +575,7 @@ fn build_all_blob_schedules(
         }
         let Some(idx) = hdr.index() else {
             return Err(
-                "renumber requires an indexed PBF — run `pbfhogg cat` to add \
+                "renumber requires an indexed PBF - run `pbfhogg cat` to add \
                  indexdata or use the indexed variant"
                     .into(),
             );
@@ -626,7 +626,7 @@ fn pass1_parallel_scan(
 
     // Pre-compute per-blob base new_id = start + sum(element_count[..seq]).
     // Workers look up `base_new_ids[task.seq]` instead of maintaining a
-    // sequential counter — they may process tasks in any order.
+    // sequential counter - they may process tasks in any order.
     let mut base_new_ids: Vec<i64> = Vec::with_capacity(schedule.len());
     let mut cursor = start_node_id;
     for task in schedule {
@@ -872,7 +872,7 @@ fn reframe_dense_with_new_ids(
     id_set: &super::id_set_dense::IdSetDense,
     check_negative_ids: bool,
     output: &mut Vec<u8>,
-    // Reusable scratch buffers — hoisted to worker level.
+    // Reusable scratch buffers - hoisted to worker level.
     group_ranges_scratch: &mut Vec<(usize, usize)>,
     scalar_fields_scratch: &mut Vec<u8>,
     other_fields_scratch: &mut Vec<u8>,
@@ -956,7 +956,7 @@ fn reframe_dense_with_new_ids(
         let id_bytes = id_field.ok_or("reframe: no packed ID field in DenseNodes")?;
 
         // Decode old ID deltas → absolute old IDs. Set bits in
-        // id_set inline — no intermediate Vec.
+        // id_set inline - no intermediate Vec.
         let mut old_id: i64 = 0;
         let mut id_cursor = Cursor::new(id_bytes);
         let mut group_node_count: u64 = 0;
@@ -1070,10 +1070,10 @@ fn reframe_ways_with_new_ids(
         let mut gr_cursor = Cursor::new(group_bytes);
         while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| e.to_string())? {
             if field == 3 && wire_type == WIRE_LEN {
-                // Way submessage — splice-reframe it.
+                // Way submessage - splice-reframe it.
                 // Find byte positions of field 1 (id) and field 8 (refs)
                 // in way_bytes. Everything else is copied as contiguous
-                // verbatim byte ranges — no per-field parse+re-encode.
+                // verbatim byte ranges - no per-field parse+re-encode.
                 let way_bytes = gr_cursor.read_len_delimited().map_err(|e| e.to_string())?;
 
                 // (tag_start, value_end) for fields we're replacing.
@@ -1177,7 +1177,7 @@ fn reframe_ways_with_new_ids(
                 current_new_id += 1;
                 total_ways += 1;
             } else {
-                // Non-way field in the group — copy verbatim.
+                // Non-way field in the group - copy verbatim.
                 let raw = gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
                 protohoggr::encode_tag(group_scratch, field, wire_type);
                 group_scratch.extend_from_slice(raw);
@@ -1208,7 +1208,7 @@ fn reframe_ways_with_new_ids(
 ///   2 = relation → `relation_id_set.resolve(old_id, start_relation_id)`
 ///   other = unknown (preserve old absolute ID unchanged)
 ///
-/// One `prev_new_id` accumulator tracks across ALL member types — the
+/// One `prev_new_id` accumulator tracks across ALL member types - the
 /// delta encoding is over the interleaved stream, not per-type.
 ///
 /// Returns `(relation_count, min_new_id, max_new_id)`.
@@ -1276,7 +1276,7 @@ fn reframe_relations_with_new_ids(
         let mut gr_cursor = Cursor::new(group_bytes);
         while let Some((field, wire_type)) = gr_cursor.read_tag().map_err(|e| e.to_string())? {
             if field == 4 && wire_type == WIRE_LEN {
-                // Relation submessage — splice-reframe it.
+                // Relation submessage - splice-reframe it.
                 let rel_bytes = gr_cursor.read_len_delimited().map_err(|e| e.to_string())?;
 
                 // Scan relation fields to find byte ranges for id and memids.
@@ -1304,7 +1304,7 @@ fn reframe_relations_with_new_ids(
                         }
                         (10, WIRE_LEN) => {
                             types_data = rel_cursor.read_len_delimited().map_err(|e| e.to_string())?;
-                            // Not patched — just captured for dispatch.
+                            // Not patched - just captured for dispatch.
                         }
                         _ => {
                             rel_cursor.read_raw_field(rt).map_err(|e| e.to_string())?;
@@ -1360,7 +1360,7 @@ fn reframe_relations_with_new_ids(
                             0 => (node_id_set.resolve(old_abs_id, start_node_id), !node_id_set.get(old_abs_id)),
                             1 => (way_id_set.resolve(old_abs_id, start_way_id), !way_id_set.get(old_abs_id)),
                             2 => (relation_id_set.resolve(old_abs_id, start_relation_id), !relation_id_set.get(old_abs_id)),
-                            _ => (old_abs_id, false), // unknown type — preserve
+                            _ => (old_abs_id, false), // unknown type - preserve
                         };
                         if is_orphan {
                             orphan_refs += 1;
@@ -1383,7 +1383,7 @@ fn reframe_relations_with_new_ids(
                 reframed_rel_scratch.clear();
 
                 if let Some(memids_r) = memids_range {
-                    // Two replacement fields — sort by position, splice.
+                    // Two replacement fields - sort by position, splice.
                     let (first, second) = if id_r.0 < memids_r.0 {
                         (id_r, memids_r)
                     } else {
@@ -1409,7 +1409,7 @@ fn reframe_relations_with_new_ids(
                     // Bytes after second replaced field.
                     reframed_rel_scratch.extend_from_slice(&rel_bytes[second.1..]);
                 } else {
-                    // No memids field (zero-member relation) — only patch id.
+                    // No memids field (zero-member relation) - only patch id.
                     reframed_rel_scratch.extend_from_slice(&rel_bytes[..id_r.0]);
                     protohoggr::encode_int64_field(reframed_rel_scratch, 1, new_rel_id);
                     reframed_rel_scratch.extend_from_slice(&rel_bytes[id_r.1..]);
@@ -1418,7 +1418,7 @@ fn reframe_relations_with_new_ids(
                 protohoggr::encode_bytes_field(group_scratch, 4, reframed_rel_scratch);
                 total_relations += 1;
             } else {
-                // Non-relation field in the group — drop it to match
+                // Non-relation field in the group - drop it to match
                 // current R2d behavior (only relations are emitted).
                 gr_cursor.read_raw_field(wire_type).map_err(|e| e.to_string())?;
             }
@@ -1439,7 +1439,7 @@ fn reframe_relations_with_new_ids(
 // ---------------------------------------------------------------------------
 
 /// R1 pass: collect relation IDs into an `IdSetDense` bitset.
-/// New IDs are derived via `start_relation_id + rank(old_id)` —
+/// New IDs are derived via `start_relation_id + rank(old_id)` -
 /// no explicit mapping needed.
 #[hotpath::measure]
 fn relation_r1_collect_ids(
@@ -1494,7 +1494,7 @@ fn relation_r1_collect_ids(
             let mut gcursor = Cursor::new(group_bytes);
             while let Some((field, wire_type)) = gcursor.read_tag().map_err(|e| format!("R1 gfield: {e}"))? {
                 if field == 4 && wire_type == WIRE_LEN {
-                    // Relation submessage — extract field 1 (id).
+                    // Relation submessage - extract field 1 (id).
                     let rel_bytes = gcursor.read_len_delimited().map_err(|e| format!("R1 rel: {e}"))?;
                     let mut rcursor = Cursor::new(rel_bytes);
                     while let Some((rf, rt)) = rcursor.read_tag().map_err(|e| format!("R1 rfield: {e}"))? {
@@ -1502,7 +1502,7 @@ fn relation_r1_collect_ids(
                             let rel_id = rcursor.read_varint_i64().map_err(|e| format!("R1 id: {e}"))?;
                             reject_negative_id(rel_id, "relation")?;
                             relation_id_set.set(rel_id);
-                            // id is always field 1, first in the message — skip the rest.
+                            // id is always field 1, first in the message - skip the rest.
                             break;
                         }
                         rcursor.skip_field(rt).map_err(|e| format!("R1 rskip: {e}"))?;
@@ -1534,7 +1534,7 @@ fn relation_r1_collect_ids(
 /// Parallel R2d: wire-format splice rewriter for relation blobs.
 /// Work-stealing dispatch with ReorderBuffer, same pattern as pass 1
 /// and stage 2d. Each worker resolves node/way member refs inline via
-/// `resolve()` — no flat files, no mmaps, no sidecar.
+/// `resolve()` - no flat files, no mmaps, no sidecar.
 #[hotpath::measure]
 #[allow(
     clippy::too_many_arguments,

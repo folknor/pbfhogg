@@ -59,7 +59,7 @@ pub(super) const COORD_SLOT_SIZE: usize = 8;
 /// the input PBF and the half-open rank range `[ref_rank_start, ref_rank_end)`
 /// of referenced nodes it contains.
 ///
-/// Computed without decoding any blob — uses indexdata `(min_id, max_id)`
+/// Computed without decoding any blob - uses indexdata `(min_id, max_id)`
 /// + `IdSetDense::rank` queries. Adjacent blobs' ranges are non-overlapping
 /// and monotonic in rank (because the input PBF is sorted by node ID and
 /// rank is monotonic in ID). Each rank bucket maps to a contiguous run of
@@ -122,8 +122,8 @@ impl ResolvedEntry {
     /// Uses floor division for `range_size` so the last bucket *absorbs*
     /// the remainder (and is wider than the others) instead of being
     /// truncated. This keeps every bucket's width ≥ `range_size`, which
-    /// — together with the `slot_bucket_count = total_slots / max_blob_slots`
-    /// floor in `external_join` — preserves the 2-piece straddler
+    /// - together with the `slot_bucket_count = total_slots / max_blob_slots`
+    /// floor in `external_join` - preserves the 2-piece straddler
     /// invariant for all input sizes. Out-of-range high slot_pos values
     /// (that would land past the nominal last bucket because the last
     /// is wider) get clamped to `slot_bucket_count - 1`.
@@ -322,7 +322,7 @@ pub fn external_join(
     crate::debug::emit_marker("EXTJOIN_STAGE2_END");
 
     // Free the IdSetDense (~2 GB RSS at planet) and the per-blob mapping
-    // — both were stage 2 inputs only, nothing downstream reads them.
+    // - both were stage 2 inputs only, nothing downstream reads them.
     drop(node_id_set);
     drop(node_blob_mapping);
 

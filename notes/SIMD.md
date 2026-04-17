@@ -1,6 +1,6 @@
 # P3-20: SIMD Varint Decode/Encode in protohoggr
 
-**Status: CLOSED — not worth pursuing.** Scalar beats SIMD in all scenarios.
+**Status: CLOSED - not worth pursuing.** Scalar beats SIMD in all scenarios.
 See [Microbenchmark Results](#microbenchmark-results-protohoggr-go-no-go) and
 [Verdict](#verdict).
 
@@ -44,17 +44,17 @@ Dense nodes dominate: 76.5 B varints (64%) from id/lat/lon + metadata alone.
 ### Decode (protohoggr/src/lib.rs)
 
 ```
-Cursor::read_varint()        — 1-byte fast path, then byte-at-a-time loop
-PackedIter::next()           — wraps Cursor::read_varint(), yields u64
-PackedSint64Iter::next()     — zigzag_decode_64 on top
-PackedInt32Iter::next()      — truncating cast on top
+Cursor::read_varint()        - 1-byte fast path, then byte-at-a-time loop
+PackedIter::next()           - wraps Cursor::read_varint(), yields u64
+PackedSint64Iter::next()     - zigzag_decode_64 on top
+PackedInt32Iter::next()      - truncating cast on top
 ```
 
 The Iterator-based API is consumed by:
 
 - **DenseNodeIter** (dense.rs): zips 3× PackedSint64Iter (id/lat/lon deltas)
   + DenseNodeInfoIter (5 more packed iterators) + tag cursor scan. This is the
-  single hottest varint consumer — 8.5 B nodes × 9.35 varints = ~80 B.
+  single hottest varint consumer - 8.5 B nodes × 9.35 varints = ~80 B.
 - **WayRefIter** (elements.rs): PackedSint64Iter over delta-encoded node refs.
 - **WayNodeLocationIter** (elements.rs): 2× PackedSint64Iter (lat/lon deltas).
 - **RelationMemberIter** (elements.rs): 3× packed iterators (roles/ids/types).
@@ -63,10 +63,10 @@ The Iterator-based API is consumed by:
 ### Encode (protohoggr/src/lib.rs + block_builder.rs)
 
 ```
-encode_varint(buf, value)     — byte-at-a-time push loop into Vec<u8>
-encode_packed_sint64(...)     — loop over &[i64], zigzag + encode_varint each
-encode_packed_int32(...)      — loop over &[i32], encode_varint each
-encode_packed_sint32(...)     — loop over &[i32], zigzag + encode_varint each
+encode_varint(buf, value)     - byte-at-a-time push loop into Vec<u8>
+encode_packed_sint64(...)     - loop over &[i64], zigzag + encode_varint each
+encode_packed_int32(...)      - loop over &[i32], encode_varint each
+encode_packed_sint32(...)     - loop over &[i32], zigzag + encode_varint each
 ```
 
 Write-side hot spots in block_builder.rs:
@@ -85,14 +85,14 @@ Write-side hot spots in block_builder.rs:
 stable Rust, 109 commits).
 
 **Decode API:**
-- `decode(slice) -> Result<(u64, usize)>` — single, SSSE3
-- `decode_two_unsafe(ptr) -> (u64, u64, usize)` — SSSE3
-- `decode_four_unsafe(ptr) -> (u64, u64, u64, u64, usize)` — SSSE3
-- `decode_zigzag(slice) -> Result<(i64, usize)>` — convenience wrapper
+- `decode(slice) -> Result<(u64, usize)>` - single, SSSE3
+- `decode_two_unsafe(ptr) -> (u64, u64, usize)` - SSSE3
+- `decode_four_unsafe(ptr) -> (u64, u64, u64, u64, usize)` - SSSE3
+- `decode_zigzag(slice) -> Result<(i64, usize)>` - convenience wrapper
 
 **Encode API:**
-- `encode_to_slice(value, slice) -> usize` — SSE2
-- `encode_zigzag(value) -> Vec<u8>` — convenience wrapper
+- `encode_to_slice(value, slice) -> usize` - SSE2
+- `encode_zigzag(value) -> Vec<u8>` - convenience wrapper
 - No batch encode function.
 
 **Benchmark claims:** 330 M u64 decodes/s, 360 M u32 encodes/s (i7-8850H).
@@ -142,10 +142,10 @@ consumed. We can buffer these inside PackedIter transparently.
 
 ```
 PackedIter (with simd feature):
-  cursor: Cursor<'a>          — unchanged
-  buf: [u64; 4]               — decode buffer (stack-allocated)
-  buf_pos: u8                 — next index to yield from buf
-  buf_len: u8                 — valid entries in buf (0-4)
+  cursor: Cursor<'a>          - unchanged
+  buf: [u64; 4]               - decode buffer (stack-allocated)
+  buf_pos: u8                 - next index to yield from buf
+  buf_len: u8                 - valid entries in buf (0-4)
 ```
 
 `Iterator::next()` logic:
@@ -165,12 +165,12 @@ correctness.
 readable bytes from its start position (it loads an `__m128i`). For packed
 fields that are the last field in a block, the underlying `Bytes` buffer may
 not have 16 bytes of readable slack beyond the packed data. Options:
-- Check `remaining >= 16` before SIMD path (correct but conservative — falls
+- Check `remaining >= 16` before SIMD path (correct but conservative - falls
   back to scalar for the last few varints in every packed field)
 - Use the safe `decode()` function which does bounds checking (slower but no
   safety margin needed)
 - Ensure decompression buffers always have 16 bytes of padding (requires
-  changes to DecompressPool — invasive)
+  changes to DecompressPool - invasive)
 
 The `remaining >= 16` check is the pragmatic choice. For a typical packed field
 of 8000 sint64 deltas averaging ~2 bytes each = ~16 KB, we only fall back to
@@ -291,7 +291,7 @@ PackedIter's API doesn't change.
 
 Decompression dominates (66.5%). Wire parsing (includes varint decode for
 message fields) is only 5%. The ~28% gap between instrumented functions and
-wall time is the consumer callback (element iteration + tag counting) —
+wall time is the consumer callback (element iteration + tag counting) -
 includes `PackedIter` varint decode of tags, delta accumulation, string
 table lookups. Not separately instrumented.
 
@@ -344,20 +344,20 @@ The hotpath instrumentation captures function-level timing but does NOT
 instrument the inner `PackedIter`/`PackedSint64Iter` iteration. Varint
 decode time is split across two uninstrumented locations:
 
-1. **Read-side element iteration** — `DenseNodeIter::next()` calls
+1. **Read-side element iteration** - `DenseNodeIter::next()` calls
    `PackedSint64Iter::next()` for id/lat/lon deltas. This happens inside
    the consumer callback (the gap between `decompress_blob + wire::parse`
    and total wall time). In tags-count, this gap is ~1.5s.
 
-2. **`wire::parse`** — parses protobuf message fields (field tags +
+2. **`wire::parse`** - parses protobuf message fields (field tags +
    length-delimited reads). Some varint decode here, but mostly
    `read_varint` for tags and `read_len_delimited` for field boundaries.
    At 274ms for tags-count, this is a small fraction.
 
 On the encode side, varint encode is embedded in:
-- `add_node` (69 ns/call × 52.5M = 3.63s) — per-element delta + varint
-- `add_way` (248 ns/call × 6.6M = 1.64s) — per-element delta + varint
-- `take_owned` (288 µs/call × 7,374 = 2.12s) — bulk `encode_packed_*`
+- `add_node` (69 ns/call × 52.5M = 3.63s) - per-element delta + varint
+- `add_way` (248 ns/call × 6.6M = 1.64s) - per-element delta + varint
+- `take_owned` (288 µs/call × 7,374 = 2.12s) - bulk `encode_packed_*`
 
 ### Revised estimates
 
@@ -367,7 +367,7 @@ hotpath data tells a different story:
 **Read side:** Decompression is 30-67% of wall time. `wire::parse` (the
 only instrumented varint site) is 1-5%. The uninstrumented element
 iteration gap is ~25-30%, but that includes delta accumulation, string
-table lookups, tag iteration — not just varint decode. Realistic varint
+table lookups, tag iteration - not just varint decode. Realistic varint
 decode fraction: **~10-15% of sequential read wall time** (most of the
 element iteration gap is PackedIter, but the per-element work around it
 is comparable).
@@ -390,12 +390,12 @@ whether it's the bottleneck.
 | Merge (passthrough) | <2% | <1% | negligible |
 
 At planet scale (160× Denmark), the write sync-none savings would be
-~96-160s — still meaningful but much less than the original ~175s estimate.
+~96-160s - still meaningful but much less than the original ~175s estimate.
 
 ## Microbenchmark Results (protohoggr, go / no-go)
 
 Criterion benchmarks in protohoggr comparing scalar (current) vs varint-simd.
-Test data: 8000 sint64 values, two scenarios — small deltas (1-byte varints,
+Test data: 8000 sint64 values, two scenarios - small deltas (1-byte varints,
 typical of dense node id/lat/lon) and large deltas (3-byte varints, typical
 of way refs).
 
@@ -444,7 +444,7 @@ The SIMD setup overhead exactly cancels the per-varint savings.
 
 On the encode side, scalar's `buf.push((value as u8) | 0x80)` loop benefits
 from the same branch prediction. The SIMD encode_to_slice must do SSE2
-operations (shift, mask, shuffle) regardless of varint length — it can't
+operations (shift, mask, shuffle) regardless of varint length - it can't
 short-circuit the 1-byte case.
 
 ## Verdict
@@ -470,7 +470,7 @@ are negative.
   time) or improving parallelism.
 - For the encode side, the `add_node` (69 ns/call) and `take_owned`
   (288 µs/call) paths could benefit from reducing string table overhead,
-  delta computation, or memory management — not varint encode speed.
+  delta computation, or memory management - not varint encode speed.
 - Option 3 (scalar multi-byte fast paths) is also unlikely to help given
   that the 1-byte fast path already covers the dominant case and the
   branch predictor handles the 2-3 byte cases efficiently.
@@ -515,7 +515,7 @@ if cur < end {
 }
 ```
 
-This does NOT work for varint decode (stateful — we need exact start
+This does NOT work for varint decode (stateful - we need exact start
 positions). But the insight is useful: any idempotent SIMD scan can use
 overlapping loads to avoid scalar tails.
 
@@ -555,7 +555,7 @@ return true;
 
 The `AtomicPtr` trampoline pattern (memchr + simd-json) is the most
 sophisticated: first call probes CPUID and atomically replaces the function
-pointer, all subsequent calls load with `Ordering::Relaxed` — effectively
+pointer, all subsequent calls load with `Ordering::Relaxed` - effectively
 zero overhead. simd-json's version:
 
 ```rust
@@ -648,14 +648,14 @@ module-level free functions (`load_unaligned`, `op_or`, `op_and`, `set1`,
 modules. The core algorithm is written once in a macro and works with all
 backends because it only calls these abstracted functions.
 
-The scalar fallback uses `type DataType = [u32; 4]` — a plain array that
+The scalar fallback uses `type DataType = [u32; 4]` - a plain array that
 mirrors SIMD lane layout. All operations are element-wise loops. Same
 macro-generated code works on both SIMD and scalar.
 
 **For protohoggr:** We don't need a full Vector trait since varint-simd
 handles the intrinsics. But if we hand-roll (Option 2), memchr's trait is
 the right abstraction level. For portability to non-x86, bitpacking's
-`DataType = [u64; 4]` scalar fallback is a good pattern — write the batch
+`DataType = [u64; 4]` scalar fallback is a good pattern - write the batch
 decode algorithm once, it works with and without SIMD.
 
 ---
@@ -676,12 +676,12 @@ The `DeltaIntegrate` sink additionally performs prefix-sum integration
 before storing.
 
 Decode processes blocks in 32 unrolled iterations, each producing one
-`DataType` (4 integers). There is NO tail handling — the API requires
+`DataType` (4 integers). There is NO tail handling - the API requires
 exact block-size inputs and panics otherwise.
 
 **For protohoggr:** Our chunked PackedIter is the equivalent of the Sink
 pattern, but with built-in tail handling. The `[u64; 4]` stack buffer in
-PackedIter plays the role of the Sink's output — SIMD fills it in batches,
+PackedIter plays the role of the Sink's output - SIMD fills it in batches,
 Iterator drains it one at a time.
 
 ---
@@ -705,7 +705,7 @@ structural char detection. We only need to test bit 7 of each byte:
 ```rust
 // Load 16 bytes of packed varint data
 let chunk = _mm_loadu_si128(ptr);
-// Extract MSB (continuation bit) of each byte — one instruction
+// Extract MSB (continuation bit) of each byte - one instruction
 let mask = _mm_movemask_epi8(chunk) as u32;
 // Invert: 1 = varint terminates here (MSB=0)
 let term_mask = !mask & 0xFFFF;
@@ -715,7 +715,7 @@ let count = term_mask.count_ones();
 
 No shuffle tables needed for the *scanning* step. PSHUFB is only needed for
 the *rearrangement* step (gathering payload bytes, stripping continuation
-bits) — and varint-simd already handles that.
+bits) - and varint-simd already handles that.
 
 **The `flatten_bits` pattern** for extracting positions from a bitmask:
 
@@ -782,14 +782,14 @@ All four crates follow the same pattern:
 ```
 src/
   arch/  (or impls/)
-    generic/        — algorithm parameterized by Vector trait or DataType
+    generic/        - algorithm parameterized by Vector trait or DataType
     x86_64/
-      sse2.rs       — thin wrapper, #[target_feature], calls generic
-      avx2.rs       — thin wrapper, #[target_feature], calls generic
+      sse2.rs       - thin wrapper, #[target_feature], calls generic
+      avx2.rs       - thin wrapper, #[target_feature], calls generic
     aarch64/
-      neon.rs       — thin wrapper, #[target_feature], calls generic
-    scalar.rs       — fallback, same interface, no SIMD
-  cpu_features.rs   — centralized detection + caching
+      neon.rs       - thin wrapper, #[target_feature], calls generic
+    scalar.rs       - fallback, same interface, no SIMD
+  cpu_features.rs   - centralized detection + caching
 ```
 
 Architecture-specific modules are `#[cfg]`-gated at the `mod` declaration.
@@ -797,7 +797,7 @@ The generic code uses `#[inline(always)]` to be inlined into the
 target_feature wrapper, inheriting its codegen.
 
 **For protohoggr:** Same structure if we hand-roll (Option 2). With
-varint-simd (Option 1), the structure is simpler — just a `cfg`-gated
+varint-simd (Option 1), the structure is simpler - just a `cfg`-gated
 SIMD path inside PackedIter's existing module.
 
 ## Risk Assessment
@@ -835,16 +835,16 @@ SIMD path inside PackedIter's existing module.
 ## References
 
 ### SIMD varint
-- [varint-simd](https://github.com/as-com/varint-simd) — SIMD LEB128 for Rust (v0.4.1, stable, SSSE3)
-- [Stream VByte (Bazhenov)](https://www.bazhenov.me/posts/rust-stream-vbyte-varint-decoding/) — SIMD integer compression (incompatible wire format, but good background)
+- [varint-simd](https://github.com/as-com/varint-simd) - SIMD LEB128 for Rust (v0.4.1, stable, SSSE3)
+- [Stream VByte (Bazhenov)](https://www.bazhenov.me/posts/rust-stream-vbyte-varint-decoding/) - SIMD integer compression (incompatible wire format, but good background)
 
 ### Reference crates analyzed
-- [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) — feature detection, auto-vectorization hints, `unsafe_op_in_unsafe_fn` discipline
-- [memchr](https://github.com/BurntSushi/memchr) — buffer tail safety, `Vector`/`MoveMask` trait abstraction, `#[target_feature]` propagation pattern
-- [bitpacking](https://github.com/quickwit-oss/bitpacking) — batch-then-iterate Sink pattern, abstracted DataType ops, runtime enum dispatch
-- [simd-json](https://github.com/simd-lite/simd-json) — bitmask-first architecture, `movemask` for byte scanning, `AtomicPtr` trampoline, write-past-end trick
+- [zlib-rs](https://github.com/trifectatechfoundation/zlib-rs) - feature detection, auto-vectorization hints, `unsafe_op_in_unsafe_fn` discipline
+- [memchr](https://github.com/BurntSushi/memchr) - buffer tail safety, `Vector`/`MoveMask` trait abstraction, `#[target_feature]` propagation pattern
+- [bitpacking](https://github.com/quickwit-oss/bitpacking) - batch-then-iterate Sink pattern, abstracted DataType ops, runtime enum dispatch
+- [simd-json](https://github.com/simd-lite/simd-json) - bitmask-first architecture, `movemask` for byte scanning, `AtomicPtr` trampoline, write-past-end trick
 
 ### Prior analysis (deleted, recoverable from git)
-- notes/perf-review/box3-wire-parsing.md (commit 1e90eb2^) — varint volume analysis
-- notes/perf-review/box6-block-builder.md (commit 1e90eb2^) — encode-side floor analysis
-- notes/perf-review/cross-reference-synthesis.md (commit 1e90eb2^) — P3-20 priority listing
+- notes/perf-review/box3-wire-parsing.md (commit 1e90eb2^) - varint volume analysis
+- notes/perf-review/box6-block-builder.md (commit 1e90eb2^) - encode-side floor analysis
+- notes/perf-review/cross-reference-synthesis.md (commit 1e90eb2^) - P3-20 priority listing

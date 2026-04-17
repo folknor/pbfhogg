@@ -296,7 +296,7 @@ fn blobreader_seek_raw() {
     let blob = reader.next().unwrap().unwrap();
     assert_eq!(blob.get_type(), BlobType::OsmHeader);
 
-    // Seek to end — next should return None (clean EOF)
+    // Seek to end - next should return None (clean EOF)
     let end_pos = reader.seek_raw(SeekFrom::End(0)).unwrap();
     assert!(end_pos > 0);
     assert!(reader.next().is_none());

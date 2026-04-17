@@ -5,8 +5,8 @@
 Prototype shipped (commit `e0b0780`). `DenseNodeColumns` in
 `src/read/columnar.rs` batch-decodes IDs, lats, lons into contiguous
 arrays. Two classification methods:
-- `collect_matching_ids_bbox` — single-region bbox, output to Vec
-- `collect_matching_ids_multi_bbox` — N-region bbox, output to Vec
+- `collect_matching_ids_bbox` - single-region bbox, output to Vec
+- `collect_matching_ids_multi_bbox` - N-region bbox, output to Vec
 
 Used in:
 - Single-extract node classification for bbox regions (Vec path)
@@ -18,7 +18,7 @@ confirming they were unused in production. Direct IdSetDense::set() in
 tight loops caused 29x regression vs Vec::push() due to random chunk
 access. See "IdSetDense accumulation findings" below.
 
-ASM inspection confirms LLVM does NOT autovectorize the bbox loop —
+ASM inspection confirms LLVM does NOT autovectorize the bbox loop -
 the `push()` side effect prevents it. Explicit AVX2 intrinsics are
 the only path. The multi-bbox loop is a better SIMD target: N region
 tests per node amortizes setup.
@@ -40,7 +40,7 @@ tests per node amortizes setup.
 | `parallel_classify_phase` | 5.0 GB (48.8%) | Not in top 10 |
 
 The single-extract alloc reduction comes from per-worker accumulation
-in `parallel_classify_phase` — workers accumulate Vec<i64> across all
+in `parallel_classify_phase` - workers accumulate Vec<i64> across all
 blobs and send once at completion. No per-blob allocation through the
 channel.
 
@@ -50,20 +50,20 @@ Workers now own persistent state `S` via `worker_init`. The classify
 closure mutates `S` without returning per-blob results. Merge receives
 the final `S` once per worker at scope exit.
 
-For hot paths (node/way classify): S = Vec or Vec<Vec> — sequential
+For hot paths (node/way classify): S = Vec or Vec<Vec> - sequential
 push, cache-friendly, consumer iterates into IdSetDense.
 
 For sparse paths (relation classify, way dep scans, geocode): S =
-IdSetDense — direct set() is fine since filter work dominates and
+IdSetDense - direct set() is fine since filter work dominates and
 match counts are low. Merge uses `IdSetDense::merge` (bitwise OR,
 zero-copy for non-overlapping chunks).
 
 ## IdSetDense accumulation findings (commit `e94c3c8`)
 
 Direct `IdSetDense::set()` in tight classify loops:
-- **Alloc: 20.5 MB** (down from 8.7 GB) — 99.8% reduction
-- **Node classify: 20.5s** (up from 713ms) — 29x regression
-- **Way classify: 3.7s** (up from 943ms) — 4x regression
+- **Alloc: 20.5 MB** (down from 8.7 GB) - 99.8% reduction
+- **Node classify: 20.5s** (up from 713ms) - 29x regression
+- **Way classify: 3.7s** (up from 943ms) - 4x regression
 
 Root cause: `IdSetDense::set()` does chunk lookup + byte offset +
 bitmask per ID (random access). `Vec::push()` is sequential append
@@ -79,14 +79,14 @@ Perf reviewer consensus (2 reviewers):
 
 ## Integration opportunities
 
-### 1. Multi-extract node classification — DONE
+### 1. Multi-extract node classification - DONE
 
 `collect_matching_ids_multi_bbox` tests each node against all N
 bboxes in one pass over contiguous i32 lat/lon arrays. Per-worker
 `DenseNodeColumns` + `Vec<Vec<i64>>` reused across blobs. Polygon
 regions fall back to element-by-element.
 
-### 2-5. ALTW, external join, geocode, node stats — NOT GOOD TARGETS
+### 2-5. ALTW, external join, geocode, node stats - NOT GOOD TARGETS
 
 See previous analysis (unchanged). Wire-format scanners and tag-based
 filtering make columnar inapplicable.
@@ -123,8 +123,8 @@ at planet scale). Only pathological for whole-planet identity extract.
 **API: restore two-type-parameter signature.** `S` for persistent
 scratch (DenseNodeColumns, etc.), `R` for per-blob results (Vec<i64>).
 Workers send `R` per blob, keep `S` across blobs. Two functions:
-- `parallel_classify_phase<S, R>` — per-blob sends with scratch
-- `parallel_classify_accumulate<S>` — per-worker accumulation (current)
+- `parallel_classify_phase<S, R>` - per-blob sends with scratch
+- `parallel_classify_accumulate<S>` - per-worker accumulation (current)
 
 ### Per-path planet memory analysis
 
@@ -141,7 +141,7 @@ Workers send `R` per blob, keep `S` across blobs. Two functions:
 | Way dep node refs (smart extract, `extract.rs:2813`) | IdSetDense | 1.5 GB+ (measured at Europe, see below) | **No** | Per-blob send |
 | Geocode referenced nodes | IdSetDense | 1.5 GB (estimated, not measured) | Likely No, untested | Measure before deciding |
 
-### Superseded — see notes/parallel-classify-regression.md
+### Superseded - see notes/parallel-classify-regression.md
 
 The "Resolved" framing below (the per-call-site way-dep table, the
 chunk-spread model, the planet-blocker prediction) was the 2026-04-09

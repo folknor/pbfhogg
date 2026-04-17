@@ -1,4 +1,4 @@
-//! Columnar dense node decode — batch decode IDs, lats, lons into contiguous
+//! Columnar dense node decode - batch decode IDs, lats, lons into contiguous
 //! arrays for cache-friendly classification passes.
 //!
 //! The PBF wire format already stores dense nodes as three parallel packed
@@ -9,7 +9,7 @@
 
 use super::wire::{PackedSint64Iter, WireDenseNodes};
 
-/// Decoded dense node columns — contiguous arrays of IDs and coordinates.
+/// Decoded dense node columns - contiguous arrays of IDs and coordinates.
 ///
 /// All three arrays have the same length (`count`). Coordinates are in
 /// decimicrodegrees (10^-7 degrees), matching `DenseNode::decimicro_lat/lon`.
@@ -50,7 +50,7 @@ impl DenseNodeColumns {
     /// Delta-decodes IDs, lats, lons and converts coordinates to
     /// decimicrodegrees using the block's granularity and offsets.
     ///
-    /// **Does not clear** — call `clear()` before the first group if needed.
+    /// **Does not clear** - call `clear()` before the first group if needed.
     /// This allows multiple dense groups in a single block to be appended.
     #[allow(clippy::cast_possible_truncation)]
     pub fn decode_append(
@@ -146,7 +146,7 @@ impl DenseNodeColumns {
     ///
     /// Uses branchless bitwise AND for the 4 comparisons to enable
     /// autovectorization. The comparison loop is a pure function over
-    /// contiguous i32 arrays — no data-dependent branches.
+    /// contiguous i32 arrays - no data-dependent branches.
     #[inline]
     pub fn collect_matching_ids_bbox(
         &self,
@@ -163,7 +163,7 @@ impl DenseNodeColumns {
 
         for i in 0..n {
             // Branchless: bitwise AND instead of short-circuit &&.
-            // All four comparisons execute unconditionally — enables
+            // All four comparisons execute unconditionally - enables
             // autovectorization (no data-dependent branches).
             let hit = (lats[i] >= min_lat) as u8
                     & (lats[i] <= max_lat) as u8

@@ -5,7 +5,7 @@
 Planet-scale PBF files (87 GB) contain ~430K node blobs. To find elements
 in a geographic region, the current approach scans every blob header
 sequentially to check its spatial bbox against the query bbox. With v2
-indexdata, this avoids decompression for non-matching blobs — but still
+indexdata, this avoids decompression for non-matching blobs - but still
 requires reading all headers.
 
 For a small bbox query (e.g., "all nodes in Copenhagen" from a planet
@@ -30,11 +30,11 @@ with no sequential scan.
 ```
 
 **Savings:** step 1 drops from ~0.5s to ~1ms for planet. For Denmark
-(~7K blobs), step 1 is ~5ms — negligible. The spatial index only
+(~7K blobs), step 1 is ~5ms - negligible. The spatial index only
 matters at planet scale.
 
 But step 1 is only 0.5s out of a total extract time of ~100-200s at
-planet scale. The improvement is **0.25-0.5%** — not worth the
+planet scale. The improvement is **0.25-0.5%** - not worth the
 complexity on its own.
 
 ## When spatial indexing becomes valuable
@@ -47,7 +47,7 @@ scan on every query adds up. A spatial index makes each query O(log N).
 
 Current usage: pbfhogg is a batch processing tool. There's no
 persistent server mode. The geocode reader (`geocode_index::Reader`)
-is the closest thing — but it has its own spatial index (S2 cells).
+is the closest thing - but it has its own spatial index (S2 cells).
 
 ### 2. Tiny queries on huge files
 
@@ -55,19 +55,19 @@ Extracting a single city from a planet PBF: the query bbox covers
 < 0.001% of the file. Without a spatial index, we still scan 100%
 of headers. With an index, we jump directly to the relevant blobs.
 
-But `extract` already handles this efficiently — the header scan is
+But `extract` already handles this efficiently - the header scan is
 fast (~0.5s) and the real work is in decoding the matching blobs.
 
 ### 3. Way and relation spatial queries
 
 Currently, only node blobs have spatial bboxes (v2 indexdata). Ways
-and relations have no spatial information — spatial queries must
+and relations have no spatial information - spatial queries must
 decode them to check coordinates. If way blobs also had spatial
 bboxes (computed from their node coordinates during ALTW), a spatial
 index over way blobs would enable direct spatial queries for ways.
 
 However, way IDs are chronological (not geographic), so way blob
-bboxes would be large — recent-ID blobs span most of the mapped world.
+bboxes would be large - recent-ID blobs span most of the mapped world.
 Estimated skip rates: ~30% for Denmark, ~45% for Copenhagen, not the
 50-80% one might hope for. Geography-sorted way blobs (Hilbert curve)
 would give 90%+ skip but breaks Sort.Type_then_ID ordering. See
@@ -82,7 +82,7 @@ the blob bboxes enables O(N × log R) via R-tree query for each blob,
 or O(R × log N) via querying the tree for each region.
 
 This is the same problem as the spatial index TODO item for
-multi-extract regions — but applied to blobs instead of elements.
+multi-extract regions - but applied to blobs instead of elements.
 
 ## Design options
 
@@ -98,7 +98,7 @@ planet.osm.pbf.spatial    # R-tree over blob offsets + bboxes
 (blob_offset, blob_size, bbox) tuples in an R-tree layout.
 
 **Pros:**
-- No PBF format changes — any tool can generate the sidecar
+- No PBF format changes - any tool can generate the sidecar
 - Can be regenerated independently
 - Works with existing PBFs
 
@@ -125,14 +125,14 @@ the R-tree serialization. Readers that don't understand it would skip
 it (unknown blob type).
 
 **Pros:**
-- Self-contained — one file
+- Self-contained - one file
 - Generated during `cat` (indexdata generation pass)
 - Unknown blob types are safely skipped by other tools
 
 **Cons:**
 - Non-standard PBF extension (no other tool would generate or use it)
 - The index must reference blob offsets that are determined at write
-  time — requires a two-pass write or post-write fixup
+  time - requires a two-pass write or post-write fixup
 
 ### Option C: Embedded in existing indexdata
 
@@ -156,17 +156,17 @@ offsets whose bbox intersects that cell.
 **Cons:**
 - Wasted space for ocean cells (80%+ of cells have no blobs)
 - Large blobs (spanning many cells) are stored in many cell lists
-- Not adaptive — poor for very small or very large query regions
+- Not adaptive - poor for very small or very large query regions
 
-**Variant: sparse grid** — only store cells that have blobs.
+**Variant: sparse grid** - only store cells that have blobs.
 Use a hash map or sorted array of (cell_id, blob_list) pairs.
 ~50K-100K populated cells for planet, ~500 KB index size.
 
 ### Recommendation
 
-**Option A (sidecar)** for pragmatic reasons — no PBF format changes,
+**Option A (sidecar)** for pragmatic reasons - no PBF format changes,
 works with any existing PBF, can be generated independently. Use the
-sparse grid variant (Option D) for simplicity — R-tree is overkill
+sparse grid variant (Option D) for simplicity - R-tree is overkill
 for ~430K blobs with ~50K-100K distinct grid cells.
 
 **Option B (in-PBF)** is cleaner long-term but requires the two-pass
@@ -218,17 +218,17 @@ post-ALTW `cat` can compute bboxes for way blobs and include them in
 the spatial index.
 
 For simple extract, this would eliminate the way classification pass
-entirely for blobs outside the extract region — no decompression needed.
+entirely for blobs outside the extract region - no decompression needed.
 
 ## Relationship to other work
 
-- **v2 indexdata** already stores node blob bboxes — the spatial index
+- **v2 indexdata** already stores node blob bboxes - the spatial index
   aggregates these into a queryable structure
-- **Multi-extract spatial index** (TODO.md) is for regions, not blobs —
+- **Multi-extract spatial index** (TODO.md) is for regions, not blobs -
   complementary but different
-- **Way blob bboxes** depend on ALTW enrichment — the spatial index for
+- **Way blob bboxes** depend on ALTW enrichment - the spatial index for
   ways requires LocationsOnWays data or a separate coordinate lookup
-- **Geocode index** uses S2 cells for spatial lookup — the PBF spatial
+- **Geocode index** uses S2 cells for spatial lookup - the PBF spatial
   index uses a simpler grid because blob bboxes are larger than individual
   elements
 
@@ -241,7 +241,7 @@ entirely for blobs outside the extract region — no decompression needed.
 | Multi-extract 100 regions | 0.5s scan × 100 | 0.1s total | 99.8% scan reduction |
 | Way spatial skip (with way bboxes) | decode all way blobs | skip ~30% (Denmark) | ~30% decode reduction |
 
-Way blob spatial skip is limited by chronological ID ordering — see
+Way blob spatial skip is limited by chronological ID ordering - see
 [way-blob-bbox-speculation.md](way-blob-bbox-speculation.md). The
 transformative change would be geography-sorted way blobs (90%+ skip)
 but that breaks Sort.Type_then_ID. Multi-extract benefits most

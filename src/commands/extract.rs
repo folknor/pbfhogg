@@ -82,7 +82,7 @@ fn spatial_blob_filter(bbox_int: &BboxInt) -> BlobFilter {
 }
 
 /// Parse a bbox string in osmium convention: `minlon,minlat,maxlon,maxlat`.
-// String errors are intentional for CLI arg parsing — the bad input value is more
+// String errors are intentional for CLI arg parsing - the bad input value is more
 // useful to users than the underlying ParseFloatError ("invalid float literal").
 pub fn parse_bbox(s: &str) -> Result<Bbox> {
     let parts: Vec<&str> = s.split(',').collect();
@@ -164,7 +164,7 @@ impl Region {
 
     /// Fast containment test using decimicrodegree integer coordinates.
     ///
-    /// For bbox regions, uses pure integer comparison (4 i32 compares) — avoids
+    /// For bbox regions, uses pure integer comparison (4 i32 compares) - avoids
     /// the i64→f64 conversion that `contains()` requires per node. For polygon
     /// regions, the bbox fast-rejection uses integers; only points passing the
     /// bbox test fall through to the f64 polygon ray-casting (with i32→f64
@@ -209,7 +209,7 @@ fn polygon_rings_contains(poly: &PolygonRings, px: f64, py: f64) -> bool {
         .any(|hole| crate::geo::point_in_ring_with_antimeridian(px, py, hole))
 }
 
-// Delegate to geo module — used by tests and polygon_bbox_f64
+// Delegate to geo module - used by tests and polygon_bbox_f64
 use crate::geo::ring_crosses_antimeridian;
 
 // ---------------------------------------------------------------------------
@@ -710,7 +710,7 @@ fn try_extract_multi_single_pass(
             if !spatial_filter.wants_index(&idx) { continue; }
             match idx.kind {
                 crate::blob_index::ElemKind::Node => {
-                    // Raw passthrough is only sound for bbox regions — polygon
+                    // Raw passthrough is only sound for bbox regions - polygon
                     // regions can exclude nodes inside the bbox but outside the
                     // polygon boundary or inside holes.
                     let mut contained_in: Vec<usize> = Vec::new();
@@ -733,7 +733,7 @@ fn try_extract_multi_single_pass(
                 crate::blob_index::ElemKind::Relation => relation_schedule.push((seq, data_offset, data_size)),
             }
         } else {
-            // No indexdata — include in all schedules (conservative).
+            // No indexdata - include in all schedules (conservative).
             node_blob_info.push(NodeBlobInfo { contained_in: Vec::new(), frame_offset, frame_size: 0, count: 0 });
             node_schedule.push((seq, data_offset, data_size));
             way_schedule.push((seq, data_offset, data_size));
@@ -1079,7 +1079,7 @@ pub fn extract(
     if !matches!(strategy, ExtractStrategy::Simple) {
         require_indexdata(input, direct_io, force,
             "input PBF has no blob-level indexdata. Without indexdata, the spatial bbox \
-             filter is a no-op — all blobs are decompressed (significantly slower).")?;
+             filter is a no-op - all blobs are decompressed (significantly slower).")?;
     }
     let result = match strategy {
         ExtractStrategy::Simple => extract_simple(input, output, region, set_bounds, clean, compression, direct_io, overrides),
@@ -1135,7 +1135,7 @@ where
 
     if schedule.is_empty() { return Ok(()); }
 
-    // Blobs fully contained in ALL N regions skip decode entirely — write raw
+    // Blobs fully contained in ALL N regions skip decode entirely - write raw
     // frame to all N writers. Other blobs go through parallel decode workers.
     let mut decode_items: Vec<(usize, u64, usize)> = Vec::new();
     let mut passthrough_items: Vec<(usize, u64, usize, u64)> = Vec::new();
@@ -1535,7 +1535,7 @@ where
     if schedule.is_empty() { return Ok(()); }
 
     // Shared file for pread. Uses buffered (non-O_DIRECT) I/O because O_DIRECT
-    // requires aligned buffers for pread, which we don't have — our read buffers
+    // requires aligned buffers for pread, which we don't have - our read buffers
     // are plain Vec<u8> without alignment guarantees.
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
@@ -1627,7 +1627,7 @@ where
         drop(desc_rx);
         drop(result_tx);
 
-        // Consumer: merge two streams — worker OwnedBlocks + passthrough raw frames.
+        // Consumer: merge two streams - worker OwnedBlocks + passthrough raw frames.
         // Both use the reorder buffer keyed by global sequence number.
         // Passthrough blobs: consumer reads raw frame directly, writes via write_raw_owned.
         // Worker blobs: consumer receives OwnedBlocks, writes via write_primitive_block_owned.
@@ -1698,7 +1698,7 @@ where
 }
 
 /// Convenience: build schedule + execute + flush. Used by complete/smart write passes.
-/// Flushes the writer after execution (assumes single-use — don't call on a writer
+/// Flushes the writer after execution (assumes single-use - don't call on a writer
 /// that will be reused for subsequent phases).
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn pread_write_pass<F>(
@@ -1757,7 +1757,7 @@ where
 ///
 /// Returns `true` if any element in the block matched (the block should be
 /// included in the write batch). Returns `false` if the block is empty for
-/// this extract — callers can skip it to avoid parsing elements with full
+/// this extract - callers can skip it to avoid parsing elements with full
 /// metadata in the write path.
 ///
 /// Uses `block_type()` (1 byte per group) to branch by type phase,
@@ -1813,10 +1813,10 @@ fn classify_block_simple(
             }
         }
         BlockType::Empty => {
-            // Empty blocks have no elements — skip.
+            // Empty blocks have no elements - skip.
         }
         BlockType::Mixed => {
-            // Fallback for mixed blocks — check all element types.
+            // Fallback for mixed blocks - check all element types.
             for element in block.elements_skip_metadata() {
                 match &element {
                     Element::DenseNode(dn)
@@ -1851,7 +1851,7 @@ fn classify_block_simple(
 
 #[allow(clippy::too_many_arguments)]
 fn extract_simple(input: &Path, output: &Path, region: &Region, set_bounds: bool, clean: &CleanAttrs, compression: Compression, direct_io: bool, overrides: &HeaderOverrides) -> Result<ExtractStats> {
-    // Check if input is sorted — if so, classify + write in a single file pass.
+    // Check if input is sorted - if so, classify + write in a single file pass.
     // We need a quick header check without keeping the reader open. Use BlobReader
     // to read just the first blob (header).
     let is_sorted = {
@@ -2017,13 +2017,13 @@ fn extract_simple_single_pass(
                     if let Some(ref filter_bbox) = spatial_filter.node_bbox {
                         match d.bbox {
                             Some(ref bb) => filter_bbox.intersects(bb),
-                            None => true, // no bbox in indexdata — must include
+                            None => true, // no bbox in indexdata - must include
                         }
                     } else {
                         true // no spatial filter configured
                     }
                 }
-                None => true, // no indexdata — must include
+                None => true, // no indexdata - must include
                 _ => false,
             }
         })
@@ -2032,7 +2032,7 @@ fn extract_simple_single_pass(
     // because we can't determine their type without decompressing. Each phase's
     // classify closure only processes its matching element type, so elements of
     // other types are silently skipped. This means non-indexed blobs are
-    // decompressed up to 3 times — acceptable since indexed PBFs (production
+    // decompressed up to 3 times - acceptable since indexed PBFs (production
     // path) always have kind set and this path is only reachable via --force.
     let way_schedule: Vec<&BlobDesc> = full_schedule.iter()
         .filter(|d| matches!(d.kind, Some(crate::blob_index::ElemKind::Way) | None))
@@ -2438,7 +2438,7 @@ struct Pass1Result {
 ///   multipolygon/boundary relations
 trait RelationHandler {
     /// Whether workers should collect extra way/node member IDs from smart
-    /// relations (multipolygon/boundary). Compile-time constant — the compiler
+    /// relations (multipolygon/boundary). Compile-time constant - the compiler
     /// eliminates the dead branch in `CompleteRelationHandler`.
     const COLLECT_MEMBER_IDS: bool;
 

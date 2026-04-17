@@ -9,7 +9,7 @@ use quick_xml::Writer;
 use crate::MemberId;
 
 // ---------------------------------------------------------------------------
-// Owned element types — Vec fields are not converted to Box<[T]> because these
+// Owned element types - Vec fields are not converted to Box<[T]> because these
 // are low-volume types (derive_changes/diff output), not hot-path allocations.
 // ---------------------------------------------------------------------------
 
@@ -271,7 +271,7 @@ fn write_borrowed_tags_xml<'a, W: std::io::Write>(
 }
 
 // ---------------------------------------------------------------------------
-// Borrowed element XML writing — zero-clone path for derive_changes
+// Borrowed element XML writing - zero-clone path for derive_changes
 // ---------------------------------------------------------------------------
 
 /// Write a borrowed `Element` as XML. Avoids the owned conversion path

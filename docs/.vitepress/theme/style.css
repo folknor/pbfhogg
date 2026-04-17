@@ -11,7 +11,7 @@
  * Change --vp-c-brand-* per project to give each site its own accent.
  * These map to VitePress's built-in color system.
  * ──────────────────────────────────────────────────────────────────────── */
-/* ── Pbfhogg — Blood & Iron palette ──────────────────────────────────── */
+/* ── Pbfhogg - Blood & Iron palette ──────────────────────────────────── */
 
 :root {
   --vp-c-brand-1: #a82020;
@@ -35,7 +35,7 @@
   --vp-c-text-2: #3a4a3f;
   --vp-c-text-3: #6a7a6f;
 
-  /* alt buttons — forest-tinted */
+  /* alt buttons - forest-tinted */
   --vp-button-alt-bg: #d4cec4;
   --vp-button-alt-hover-bg: #c6bfb4;
   --vp-button-alt-text: #1b2e21;
@@ -564,7 +564,7 @@ body {
     padding-left: 0 !important;
   }
 
-  /* No padding-top needed — the sticky nav is in the document flow now */
+  /* No padding-top needed - the sticky nav is in the document flow now */
   .VPContent.has-sidebar {
     padding-top: 0 !important;
     padding-left: calc(var(--vp-sidebar-width) + 2rem) !important;
@@ -917,7 +917,7 @@ body {
     ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
 }
 
-/* ── Headings — Jomhuria ───────────────────────────────────────────────── *
+/* ── Headings - Jomhuria ───────────────────────────────────────────────── *
  * Jomhuria's glyphs sit high in the em box and render visually small,
  * so we scale font-size by ~1.8× and tighten line-height / bottom spacing
  * to keep the rhythm consistent with body text.
@@ -943,7 +943,7 @@ body {
 .vp-doc h5 { font-size: 1.8rem;   margin-bottom: -0.1em; }
 .vp-doc h6 { font-size: 1.625rem; margin-bottom: -0.1em; }
 
-/* Jomhuria glyphs sit high in the em box — nudge the # anchor to match */
+/* Jomhuria glyphs sit high in the em box - nudge the # anchor to match */
 .vp-doc .header-anchor {
   top: 0.025em;
   margin-left: -0.6em;

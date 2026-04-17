@@ -4,9 +4,9 @@
 
 Writing a PBF file involves three components:
 
-1. **HeaderBuilder** — constructs the PBF header (bounding box, sort flag, replication metadata)
-2. **BlockBuilder** — accumulates elements (nodes, ways, relations) and serializes them into `PrimitiveBlock` bytes
-3. **PbfWriter** — handles blob framing, compression, and file output
+1. **HeaderBuilder** - constructs the PBF header (bounding box, sort flag, replication metadata)
+2. **BlockBuilder** - accumulates elements (nodes, ways, relations) and serializes them into `PrimitiveBlock` bytes
+3. **PbfWriter** - handles blob framing, compression, and file output
 
 ## HeaderBuilder
 
@@ -146,7 +146,7 @@ bb.add_relation(
 );
 ```
 
-### take — flushing blocks
+### take - flushing blocks
 
 `take()` serializes the accumulated elements and returns the block bytes. Returns `None` if the builder is empty. The builder is reset after `take()` and can be reused.
 
@@ -189,7 +189,7 @@ bb.add_node(1, 556_761_000, 125_683_000, [("name", "Copenhagen")], Some(&meta));
 
 `PbfWriter` handles blob framing, compression, and file output. It supports four modes.
 
-### to_path — pipelined parallel compression
+### to_path - pipelined parallel compression
 
 The production write path. Compresses blobs in parallel using rayon, with a dedicated writer thread that reorders results back into sequence order.
 
@@ -219,7 +219,7 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-### to_path_direct — O_DIRECT writes
+### to_path_direct - O_DIRECT writes
 
 Bypasses the page cache. Prevents cache pollution at planet scale (80 GB+ output). Requires the `linux-direct-io` feature and a real filesystem (not tmpfs).
 
@@ -238,7 +238,7 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-### to_path_uring — io_uring writes
+### to_path_uring - io_uring writes
 
 Uses io_uring `WriteFixed` with pre-registered page-aligned buffers. 20% faster than buffered writes above ~4 GB input size. Requires the `linux-io-uring` feature and Linux 5.1+ with sufficient `RLIMIT_MEMLOCK`.
 
@@ -257,7 +257,7 @@ writer.flush()?;
 # Ok::<(), std::io::Error>(())
 ```
 
-### new — synchronous mode
+### new - synchronous mode
 
 For tests, small PBFs, or any `Write` implementation (in-memory buffers, network streams). No background threads, no rayon.
 
@@ -311,7 +311,7 @@ Zlib uses `zlib-rs` (pure Rust, no C compiler needed).
 
 ### Raw passthrough
 
-`write_raw` accepts pre-framed blob bytes (header + compressed data) and passes them through without decompression or re-compression. This is how commands like `apply-changes` and `sort` achieve near-zero overhead for unmodified blobs — they copy the raw bytes from the input file directly into the output.
+`write_raw` accepts pre-framed blob bytes (header + compressed data) and passes them through without decompression or re-compression. This is how commands like `apply-changes` and `sort` achieve near-zero overhead for unmodified blobs - they copy the raw bytes from the input file directly into the output.
 
 ## Complete example
 

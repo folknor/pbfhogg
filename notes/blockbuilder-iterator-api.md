@@ -4,7 +4,7 @@
 
 `add_node`, `add_way`, `add_way_with_locations` tags params changed from
 `&[(&str, &str)]` to `impl IntoIterator<Item = (&str, &str)>`. Dual
-packed buffer (`packed_vals_scratch`) enables single-pass encoding —
+packed buffer (`packed_vals_scratch`) enables single-pass encoding -
 no Clone needed.
 
 ## What remains
@@ -17,7 +17,7 @@ memids field 9, types field 10).
 
 This eliminates per-element `Vec<MemberData>` allocations in callers like
 `write_single_relation` in `elements_pbf.rs`. Same pattern as the tag
-iterator migration — callers that currently `.collect()` into a temp Vec
+iterator migration - callers that currently `.collect()` into a temp Vec
 would pass owned member iterators directly.
 
 Impact depends on whether relation-heavy paths (merge, sort, diff) are

@@ -6,7 +6,7 @@ Full geocode index rebuild from planet PBF takes 1,255s (20.9 min) and
 **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`,
 2026-04-17). The earlier 17.8 GB figure under-reported: brokkr previously
 suppressed short-emitting phase markers from sidecar output, so PASS1_5's
-transient peak never showed up. The peak itself has not changed — only its
+transient peak never showed up. The peak itself has not changed - only its
 visibility. A daily diff changes ~5-30M elements, but most geocode-
 relevant data (admin boundaries, street geometries, address points) is
 stable. Rebuilding from scratch every day wastes 99%+ of the work.
@@ -15,16 +15,16 @@ stable. Rebuilding from scratch every day wastes 99%+ of the work.
 
 4 passes over the PBF, each a full file scan:
 
-1. **Pass 1: Relations** — collect admin boundary polygons (boundary=
+1. **Pass 1: Relations** - collect admin boundary polygons (boundary=
    administrative with admin_level). Extract way member IDs for geometry
    assembly. ~17M relations scanned, ~200K admin boundaries collected.
 
-2. **Pass 1.5: Referenced node collection** — scan ways to collect node
+2. **Pass 1.5: Referenced node collection** - scan ways to collect node
    IDs referenced by admin boundary ways + street ways + interpolation
    ways. Builds an `IdSetDense` for pass 2 filtering. Planet-scale
    memory optimization: only stores node IDs that are needed.
 
-3. **Pass 2: Nodes + Ways (fused)** — single scan, two outputs:
+3. **Pass 2: Nodes + Ways (fused)** - single scan, two outputs:
    - Address points: nodes with `addr:housenumber` tag
    - Street ways: ways with `highway` tag (excluding footway etc.)
    - Interpolation ways: ways with `addr:interpolation` tag
@@ -32,7 +32,7 @@ stable. Rebuilding from scratch every day wastes 99%+ of the work.
      (same pattern as ALTW's `IdSetDense` rank + dense array)
    Admin boundary way coordinates resolved via the rank-indexed array.
 
-4. **Pass 3: S2 cell assignment** — bucket addr points, streets, and
+4. **Pass 3: S2 cell assignment** - bucket addr points, streets, and
    interpolation ways by S2 cell. 256 temp-file buckets per cell level.
    Merge buckets into final cell index files. Interpolation endpoint
    resolution via spatial join against address points.
@@ -78,7 +78,7 @@ patch the existing index files in place.
 - Deleted ways: mark as deleted.
 
 **For admin boundaries (relations):**
-- Modified boundaries: rare but expensive — need to reassemble the
+- Modified boundaries: rare but expensive - need to reassemble the
   polygon from member ways, recompute S2 cell assignments, update
   the admin polygon entry + all affected cell entries.
 
@@ -86,10 +86,10 @@ patch the existing index files in place.
 1. **S2 cell reassignment:** if a street way moves to a different S2
    cell, the old cell must be updated (remove entry) and the new cell
    must be updated (add entry). The current format uses sorted arrays
-   per cell — insertion/deletion requires shifting.
+   per cell - insertion/deletion requires shifting.
 2. **String pool updates:** new street names, address values must be
    added to the string pool. Existing strings are referenced by offset
-   — can't be moved.
+   - can't be moved.
 3. **Compaction:** after many patches, the index files accumulate
    tombstones and fragmentation. Need periodic full rebuild to compact.
 
@@ -169,7 +169,7 @@ those cells. The unaffected cells are copied from the old index.
 ## Prerequisites
 
 - The geocode index format already has `replication_sequence` and
-  `replication_timestamp` in the header — designed for this use case.
+  `replication_timestamp` in the header - designed for this use case.
 - `apply-changes` is already validated at planet scale (762s, 1.8 GB).
 - OSC parsing exists in `src/osc.rs` (`parse_osc_file`).
 
@@ -182,7 +182,7 @@ those cells. The unaffected cells are copied from the old index.
 
 ## Review feedback (April 2026, Opus reviewer)
 
-### Approach 3: BLOCKING issue — no element ID dedup
+### Approach 3: BLOCKING issue - no element ID dedup
 
 The index format does NOT store OSM element IDs in any record type.
 `AddrPoint` has (lat, lon, housenumber_offset, ...) but no node ID.
@@ -203,7 +203,7 @@ are superseded by delta entries. A modified address point would appear
 ### Approach 4: NEEDS_DESIGN items
 
 - **Cell boundaries not independently addressable.** Cell data is
-  contiguous in shared files — rebuilding one cell shifts all
+  contiguous in shared files - rebuilding one cell shifts all
   subsequent offsets. Effectively requires rewriting every file
   end-to-end with selective changes. This is a filtered-copy, not
   an in-place patch.
@@ -213,7 +213,7 @@ are superseded by delta entries. A modified address point would appear
 
 ### Other findings
 
-- **Admin boundary changes:** 1-5/day globally — rare enough to
+- **Admin boundary changes:** 1-5/day globally - rare enough to
   trigger full rebuild on admin geometry change. Name-only changes
   are cheap.
 - **Interpolation spatial join:** Delta builder must re-run the

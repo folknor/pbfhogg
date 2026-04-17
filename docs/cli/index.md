@@ -32,9 +32,9 @@ The binary is called `pbfhogg`. Requires Rust 1.87+.
 
 Most write commands accept:
 
-- `-o, --output <FILE>` — output file
-- `--compression <SPEC>` — `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
-- `--direct-io` — bypass page cache (Linux, requires `linux-direct-io` feature)
-- `--force` — proceed without indexdata (slower)
+- `-o, --output <FILE>` - output file
+- `--compression <SPEC>` - `none`, `zlib` (default), `zstd`, or with level (`zlib:9`, `zstd:19`)
+- `--direct-io` - bypass page cache (Linux, requires `linux-direct-io` feature)
+- `--force` - proceed without indexdata (slower)
 
 See [Commands](./commands) for the full reference.

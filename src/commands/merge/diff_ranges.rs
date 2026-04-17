@@ -5,9 +5,9 @@ use crate::osc::CompactDiffOverlay;
 
 /// Pre-computed sorted ID vectors from the diff, for fast overlap checks.
 ///
-/// `node_ids`/`way_ids`/`rel_ids` include both upserts and deletes — used
+/// `node_ids`/`way_ids`/`rel_ids` include both upserts and deletes - used
 /// for range overlap checks. `node_upserts`/`way_upserts`/`rel_upserts`
-/// contain only create/modify IDs (no deletes) — used for inline assignment
+/// contain only create/modify IDs (no deletes) - used for inline assignment
 /// and gap create tracking.
 pub(super) struct DiffRanges {
     /// Sorted node IDs affected by the diff (upserts + deletes).
@@ -75,7 +75,7 @@ impl DiffRanges {
     /// Check if any affected ID of the given type falls within [min_id, max_id].
     ///
     /// This is a coarse range check used during blob classification. A true
-    /// result means the blob *might* need rewriting — it still gets a secondary
+    /// result means the blob *might* need rewriting - it still gets a secondary
     /// check via `block_overlaps_diff` after full parsing. A false result means
     /// the blob is safe for raw passthrough (no diff IDs in its range at all).
     pub(super) fn range_overlaps(&self, kind: ElemKind, min_id: i64, max_id: i64) -> bool {

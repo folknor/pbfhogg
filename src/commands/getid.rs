@@ -49,7 +49,7 @@ impl DefaultType {
 }
 
 /// Parse an ID spec like "n123", "w456", "r789".
-// String errors are intentional — shows the bad input value, which is more helpful
+// String errors are intentional - shows the bad input value, which is more helpful
 // for CLI users than the underlying ParseIntError.
 fn parse_id_spec(spec: &str, default_type: Option<DefaultType>) -> Result<(char, i64)> {
     if spec.len() < 2 {
@@ -129,7 +129,7 @@ pub fn parse_ids_from_file_with_default_type(
 /// Collect all element IDs from a PBF file.
 ///
 /// Reads every node, way, and relation in the file and adds its ID to the
-/// returned `IdSet`. No member or reference IDs are collected — only
+/// returned `IdSet`. No member or reference IDs are collected - only
 /// top-level element IDs (matching osmium's `--id-osm-file` behavior).
 pub fn parse_ids_from_pbf(path: &Path, _direct_io: bool) -> Result<IdSet> {
     let mut set = IdSet {
@@ -235,7 +235,7 @@ pub fn getid(
 ) -> Result<GetidStats> {
     require_indexdata(input, direct_io, force,
         "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-         based on requested ID types is a no-op — all blobs are decompressed \
+         based on requested ID types is a no-op - all blobs are decompressed \
          (significantly slower).")?;
 
     let result = if opts.add_referenced {

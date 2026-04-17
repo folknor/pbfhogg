@@ -6,7 +6,7 @@ use std::str;
 use std::str::Utf8Error;
 
 // Error data structures are modeled on the `csv` crate by BurntSushi.
-// Manual Display/StdError impls are intentional — avoids a thiserror dependency
+// Manual Display/StdError impls are intentional - avoids a thiserror dependency
 // for a small, stable enum that rarely changes.
 
 #[cold]
@@ -109,7 +109,7 @@ impl From<Error> for io::Error {
 
 // Removed deprecated `description()` (deprecated since Rust 1.42) and `cause()` (deprecated
 // since Rust 1.33). Callers should use the `Display` impl (below) for human-readable error
-// messages — it covers all ErrorKind variants. The `source()` method is the modern replacement
+// messages - it covers all ErrorKind variants. The `source()` method is the modern replacement
 // for `cause()` with the same semantics. BlobError variants have no underlying source error,
 // so they return None.
 impl StdError for Error {

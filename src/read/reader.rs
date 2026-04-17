@@ -115,13 +115,13 @@ impl<R: Read + Send> ElementReader<R> {
         &self.header
     }
 
-    /// Decodes the PBF structure sequentially on the calling thread — no background I/O,
+    /// Decodes the PBF structure sequentially on the calling thread - no background I/O,
     /// no rayon, no channels. Elements are delivered in file order. If
     /// [`header().is_sorted()`](HeaderBlock::is_sorted) returns `true`, nodes are guaranteed
     /// to arrive in ascending ID order.
     ///
     /// This is **6x slower** than [`for_each_pipelined`](Self::for_each_pipelined) on large
-    /// files. Prefer `for_each_pipelined` for production workloads — it has the same
+    /// files. Prefer `for_each_pipelined` for production workloads - it has the same
     /// `FnMut` signature and file-order guarantee but overlaps I/O with parallel
     /// decompression. Use this method when you need simplicity (no `'static` bound on
     /// the reader) or as a correctness baseline for testing.
@@ -175,7 +175,7 @@ impl<R: Read + Send> ElementReader<R> {
                         f(element);
                     });
                 }
-                Ok(_) => {} // Unknown blobs — header already consumed at construction
+                Ok(_) => {} // Unknown blobs - header already consumed at construction
                 Err(e) => return Err(e),
             }
         }
@@ -281,7 +281,7 @@ impl<R: Read + Send> ElementReader<R> {
             );
             if let Err(e) = result {
                 // Deliver the error as the last iterator item.
-                // Ignore send failure — consumer may have already dropped.
+                // Ignore send failure - consumer may have already dropped.
                 drop(tx.send(Err(e)));
             }
         });
@@ -417,7 +417,7 @@ impl<R: Read + Send> ElementReader<R> {
         // Blobs are still compressed at this stage (~16-64KB each), so the Vec
         // holds only the compressed data. The header blob was already consumed
         // at construction time, so only data and unknown blobs remain.
-        // Skip indexdata parsing — par_map_reduce never calls blob.index().
+        // Skip indexdata parsing - par_map_reduce never calls blob.index().
         self.blob_iter.set_parse_indexdata(false);
         let blobs = collect_osm_data_blobs(self.blob_iter)?;
 
@@ -565,7 +565,7 @@ impl Iterator for PipelinedBlocks {
 
 impl Drop for PipelinedBlocks {
     fn drop(&mut self) {
-        // Close the channel first — signals the pipeline to shut down.
+        // Close the channel first - signals the pipeline to shut down.
         drop(self.rx.take());
         // Join the background thread (waits for pipeline cleanup).
         if let Some(h) = self.handle.take() {

@@ -21,7 +21,7 @@ pub struct TagCount {
 /// Sort order for tag count results.
 #[derive(Clone, Copy, Default)]
 pub enum TagCountSort {
-    /// Count descending (most frequent first) — default.
+    /// Count descending (most frequent first) - default.
     #[default]
     CountDesc,
     /// Count ascending (least frequent first).
@@ -53,7 +53,7 @@ pub struct TagCountOptions<'a> {
 /// expression are counted (same syntax as `tags-filter`).
 ///
 /// Uses sequential BlobReader to avoid cross-thread PrimitiveBlock
-/// retention at planet scale. Diagnostic command — single-threaded
+/// retention at planet scale. Diagnostic command - single-threaded
 /// decode is acceptable.
 #[hotpath::measure]
 pub fn tags_count(
@@ -63,7 +63,7 @@ pub fn tags_count(
     if opts.type_filter.is_some() {
         require_indexdata(path, opts.direct_io, opts.force,
             "input PBF has no blob-level indexdata. Without indexdata, the type filter \
-             is a no-op — all blobs are decompressed (significantly slower).")?;
+             is a no-op - all blobs are decompressed (significantly slower).")?;
     }
 
     let expressions = if opts.expressions.is_empty() {
@@ -73,7 +73,7 @@ pub fn tags_count(
     };
 
     // Sequential reader to avoid PrimitiveBlock cross-thread retention
-    // at planet scale (520K+ blobs). Diagnostic command — single-threaded
+    // at planet scale (520K+ blobs). Diagnostic command - single-threaded
     // decode is acceptable.
     let tf = TypeFilter::from_single(opts.type_filter);
     let blob_filter = match opts.type_filter {

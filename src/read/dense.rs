@@ -237,7 +237,7 @@ impl<'a> Iterator for DenseNodeIter<'a> {
 ///
 /// **Osmosis sentinel values:** Osmosis writes -1 for version and changeset
 /// when metadata is absent. These fields use plain `i32`/`i64` (not `Option`)
-/// because they are decoded from packed arrays in the dense node hot path —
+/// because they are decoded from packed arrays in the dense node hot path -
 /// changing to `Option` would add overhead to the tightest loop in the library.
 /// The -1 sentinel is instead normalized at write/conversion boundaries
 /// (see `dense_node_metadata`, `dense_node_raw_metadata`, sort's
@@ -417,7 +417,7 @@ impl Iterator for DenseRawTagIter<'_> {
         if self.cursor.is_empty() {
             return None;
         }
-        // wontfix(type-result-fallible): same as DenseTagIter — Iterator constrains return type
+        // wontfix(type-result-fallible): same as DenseTagIter - Iterator constrains return type
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
         let key = self.cursor.read_varint().ok()? as i32;
         #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]

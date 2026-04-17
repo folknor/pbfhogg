@@ -1,4 +1,4 @@
-//! CLI integration tests — invoke the `pbfhogg` binary via `std::process::Command`.
+//! CLI integration tests - invoke the `pbfhogg` binary via `std::process::Command`.
 //!
 //! These tests verify that the CLI dispatches correctly, flags are accepted,
 //! and feature-gated flags produce clear error messages when the feature is

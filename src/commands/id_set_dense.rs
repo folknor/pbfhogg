@@ -72,7 +72,7 @@ impl IdSetDense {
 
     /// Atomically set a bit. Requires `pre_allocate()` to have been called
     /// with a `max_id` >= `id`. Safe for concurrent use from multiple threads
-    /// via `&self` (no `&mut` needed). Uses `Relaxed` ordering — callers must
+    /// via `&self` (no `&mut` needed). Uses `Relaxed` ordering - callers must
     /// synchronize (e.g. thread join) before reading via `get()` or `rank()`.
     ///
     /// # Safety
@@ -87,7 +87,7 @@ impl IdSetDense {
         let bit = 1u8 << (id & 7);
         // SAFETY: AtomicU8 and u8 have identical size/alignment. The chunk
         // is pre-allocated and lives for the duration of the parallel phase.
-        // Relaxed ordering is sufficient — we only need visibility after
+        // Relaxed ordering is sufficient - we only need visibility after
         // the thread::scope join barrier.
         let atomic = unsafe { &*(std::ptr::addr_of!(chunk[offset]).cast::<std::sync::atomic::AtomicU8>()) };
         atomic.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
@@ -305,7 +305,7 @@ impl IdSetDense {
             return id; // not set → orphan
         }
 
-        // Bit is set — compute rank.
+        // Bit is set - compute rank.
         let chunk_prefix = self.rank_chunk_prefix.as_ref()
             .expect("resolve() called without build_rank_index()");
         let block_prefix = self.rank_block_prefix.as_ref()
@@ -396,7 +396,7 @@ impl IdSetDense {
         Some(r)
     }
 
-    /// Count of set IDs strictly less than `id`. Safe for any `i64` —
+    /// Count of set IDs strictly less than `id`. Safe for any `i64` -
     /// arguments below zero return 0, arguments past the highest allocated
     /// chunk return `total_count()`. Unlike `rank()`, never panics on
     /// out-of-range inputs.
@@ -438,7 +438,7 @@ impl IdSetDense {
     /// Drop the rank-index prefix arrays built by `build_rank_index()`. After
     /// this call, `rank()`, `rank_if_set()`, `resolve()`, `count_below()`,
     /// `count_in_range()`, and `total_count()` all fail (panic or return
-    /// `None`). The bitmap itself (chunk storage) is retained — `get()`,
+    /// `None`). The bitmap itself (chunk storage) is retained - `get()`,
     /// `set()`, and `has_any()` still work.
     ///
     /// Used by stage 2 of the external ALTW join to free ~100 MB of rank
@@ -693,7 +693,7 @@ mod tests {
     fn rank_if_set_without_rank_index_returns_none() {
         let mut s = IdSetDense::new();
         s.set(42);
-        // No build_rank_index() — rank_if_set returns None because
+        // No build_rank_index() - rank_if_set returns None because
         // rank prefix arrays are None.
         assert_eq!(s.rank_if_set(42), None);
     }

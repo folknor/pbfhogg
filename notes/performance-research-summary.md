@@ -5,17 +5,17 @@ detailed analysis documents where available.
 
 ## Tier 1: High impact, ready to implement
 
-### Block-pair merge-join for diff/derive_changes — SHIPPED
+### Block-pair merge-join for diff/derive_changes - SHIPPED
 
 **Result:** Japan diff: 86.4s → 52.9s (39% faster), 80.7 GB → 40.6 GB
 cumulative alloc (50% less). Commit `66990c3`.
 **Documents:** fill-buffer-optimization.md and block-pair-merge-join-plan.md
-(deleted — v1+v2 shipped, v3 tracked in TODO.md)
+(deleted - v1+v2 shipped, v3 tracked in TODO.md)
 **What:** Replaced element-level merge-join with block-level comparison.
 Non-overlapping blocks skip via indexdata min/max ID ranges.
 Overlapping blocks use borrowed elements (no String allocation for the
 98.8% Equal path). Falls back to existing `fill_buffer` path for
-non-indexed PBFs. Remaining 24.1 GB alloc is protobuf parsing — v1
+non-indexed PBFs. Remaining 24.1 GB alloc is protobuf parsing - v1
 compressed byte comparison would skip decode for matching blocks.
 **Affects:** `diff`, `derive_changes` (both use `stream_merge.rs`)
 
@@ -26,7 +26,7 @@ compressed byte comparison would skip decode for matching blocks.
 **What:** Convert sequential BlobReader to pread-from-workers in the
 3 write phases. Workers decode in parallel, consumer routes to N writers.
 Reuses existing `pread_execute` infrastructure from single-extract.
-**Risk:** Low — same pattern already proven in single-extract.
+**Risk:** Low - same pattern already proven in single-extract.
 
 ## Tier 2: Moderate impact, benchmarks needed
 
@@ -65,7 +65,7 @@ the classify loop is only 2.8% of extract time.
 **Impact:** Prevents OOM on 30 GB hosts for specific commands.
 **Document:** [pipelined-reader-retention.md](pipelined-reader-retention.md)
 **What:** Convert `renumber` and `cat --type` to sequential BlobReader +
-DecompressPool. Mechanical — same pattern as node_stats/tags_count.
+DecompressPool. Mechanical - same pattern as node_stats/tags_count.
 6 remaining paths audited, 2 production-relevant.
 
 ### SIMD batch varint decode
@@ -73,7 +73,7 @@ DecompressPool. Mechanical — same pattern as node_stats/tags_count.
 **Impact:** Potentially 2x for varint-dominated paths at planet scale.
 **Document:** [SIMD.md](SIMD.md) (individual SIMD closed)
 **What:** Individual varint: scalar wins. Batch decode into contiguous
-arrays (columnar) is a different problem — not yet benchmarked.
+arrays (columnar) is a different problem - not yet benchmarked.
 119B varints at planet scale, 64% from dense nodes.
 **Prerequisite:** Columnar layout must be stabilized first so batch
 decode has a consumer.
@@ -88,7 +88,7 @@ Tag expression filtering, bbox filtering, property key selection.
 ## Completed in this session
 
 ### Code changes
-- `inspect --show` — new feature for single element lookup
+- `inspect --show` - new feature for single element lookup
 - `inspect`: `new_with_scratch` + `elements_skip_metadata()` (non-extended)
 - `time_filter`: `take_owned` + `write_primitive_block_owned`
 - `multi-extract`: `new_with_scratch` in 3 write phases
@@ -100,10 +100,10 @@ Tag expression filtering, bbox filtering, property key selection.
 - jemalloc/mimalloc features removed (fix CLI `--all-features` build)
 
 ### Research documents (7 new)
-1. fill-buffer-optimization.md — block-pair merge-join design
-2. zlib-level-tuning.md — write path compression analysis
-3. multi-extract-optimization.md — 6 optimization opportunities
-4. columnar-integration.md — expansion beyond extract
-5. pipelined-reader-retention.md — cross-thread audit
-6. geojson-export-design.md — export v1 design
-7. performance-research-summary.md — this document
+1. fill-buffer-optimization.md - block-pair merge-join design
+2. zlib-level-tuning.md - write path compression analysis
+3. multi-extract-optimization.md - 6 optimization opportunities
+4. columnar-integration.md - expansion beyond extract
+5. pipelined-reader-retention.md - cross-thread audit
+6. geojson-export-design.md - export v1 design
+7. performance-research-summary.md - this document

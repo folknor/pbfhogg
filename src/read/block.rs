@@ -321,20 +321,20 @@ fn classify_group(data: &[u8]) -> BlockType {
 ///
 /// The block owns the decompressed bytes (`Bytes`) and contains a `WireBlock`
 /// that borrows from them. The `WireBlock` stores only scalar values and byte
-/// offset/length pairs — no `Vec<i64>` or `Vec<Bytes>` for packed fields.
+/// offset/length pairs - no `Vec<i64>` or `Vec<Bytes>` for packed fields.
 /// Element iteration decodes packed varints on-the-fly from the buffer.
 ///
 /// # Stringtable UTF-8 invariant
 ///
 /// At construction time (`new()`), every entry in the block's stringtable is validated
 /// with `std::str::from_utf8()`. This means all subsequent stringtable lookups
-/// (`str_from_stringtable()`) can use `from_utf8_unchecked` — eliminating 16-48K
+/// (`str_from_stringtable()`) can use `from_utf8_unchecked` - eliminating 16-48K
 /// redundant UTF-8 validations per block (8000 elements × 2-6 tag lookups each).
 ///
 /// # Why `PrimitiveBlock` does not implement `Clone`
 ///
 /// No code in the crate needs to clone a `PrimitiveBlock`. For shared access, use
-/// `Arc<PrimitiveBlock>` — a single atomic increment regardless of block size.
+/// `Arc<PrimitiveBlock>` - a single atomic increment regardless of block size.
 pub struct PrimitiveBlock {
     /// Owns the decompressed protobuf bytes.
     #[allow(dead_code)]
@@ -343,10 +343,10 @@ pub struct PrimitiveBlock {
     ///
     /// # Safety
     ///
-    /// The `'static` lifetime is a lie — `block` actually borrows from `buffer`.
+    /// The `'static` lifetime is a lie - `block` actually borrows from `buffer`.
     /// This is safe because:
     /// 1. `buffer` is `Bytes` (immutable, reference-counted), never mutated.
-    /// 2. `buffer` and `block` live in the same struct — `block` cannot outlive `buffer`.
+    /// 2. `buffer` and `block` live in the same struct - `block` cannot outlive `buffer`.
     /// 3. `PrimitiveBlock` is not `Clone`, preventing accidental separation.
     /// 4. All public access goes through `&self`, tying the real lifetime to the borrow.
     block: WireBlock<'static>,
@@ -455,7 +455,7 @@ impl PrimitiveBlock {
 
     /// Returns the size of the decompressed protobuf payload in bytes.
     ///
-    /// This is the raw decompressed data backing this block — useful for
+    /// This is the raw decompressed data backing this block - useful for
     /// byte-budget accounting in batched processing pipelines. When inline
     /// entries are used, returns the original protobuf size (not the extended
     /// buffer).
@@ -465,7 +465,7 @@ impl PrimitiveBlock {
 
     /// Returns the element type contained in this block.
     ///
-    /// Inspects only the first protobuf field tag of each group — typically a
+    /// Inspects only the first protobuf field tag of each group - typically a
     /// single byte read per group. No elements are decoded.
     ///
     /// In sorted PBFs, each block is single-type, so this returns one of
@@ -503,7 +503,7 @@ impl PrimitiveBlock {
     }
 
     /// Returns the raw protobuf bytes of a PrimitiveGroup by index.
-    /// Scaffolding for future per-group raw passthrough — see
+    /// Scaffolding for future per-group raw passthrough - see
     /// `notes/raw-group-passthrough.md` and `frame_raw_block` in
     /// `src/write/raw_passthrough.rs`.
     #[allow(dead_code)]
@@ -556,7 +556,7 @@ impl PrimitiveBlock {
     /// are converted to decimicrodegrees. Returns the number of nodes decoded.
     ///
     /// Handles blocks with multiple dense groups (appends across groups).
-    /// Non-dense Node messages are NOT included — use element-by-element
+    /// Non-dense Node messages are NOT included - use element-by-element
     /// iteration for blocks that may contain plain Node groups.
     ///
     /// This is the columnar alternative to iterating `elements()` / `elements_skip_metadata()`
@@ -889,7 +889,7 @@ impl<'a> Iterator for GroupRelationIter<'a> {
 
 /// Look up a stringtable entry by index, returning it as a `&str`.
 ///
-/// Uses `from_utf8_unchecked` — the safety relies on the invariant established
+/// Uses `from_utf8_unchecked` - the safety relies on the invariant established
 /// by `PrimitiveBlock::new()`, which validates every stringtable entry at
 /// construction time.
 pub(crate) fn str_from_stringtable<'a>(block: &'a WireBlock<'_>, index: usize) -> Result<&'a str> {

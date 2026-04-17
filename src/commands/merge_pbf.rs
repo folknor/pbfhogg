@@ -2,7 +2,7 @@
 //!
 //! Two-pass blob-level merge:
 //!   Pass 1: Build blob index from all input files
-//!   Pass 2: Write in sorted order — passthrough for non-overlapping blobs,
+//!   Pass 2: Write in sorted order - passthrough for non-overlapping blobs,
 //!           decode + sweep merge with dedup for overlapping blobs.
 //!
 //! Exact duplicates (same type, ID, version) across input files are removed.
@@ -463,7 +463,7 @@ fn write_overlap_run(
 }
 
 // ---------------------------------------------------------------------------
-// Sweep merge per element type — with dedup
+// Sweep merge per element type - with dedup
 // ---------------------------------------------------------------------------
 
 /// Generic sweep merge: heap-based merge of overlapping blob entries with

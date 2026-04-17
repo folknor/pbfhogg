@@ -7,7 +7,7 @@ are assigned **chronologically** (sequential at creation time), not
 geographically. A blob containing ways 100,000,000-100,008,000 has
 ways created within a few-hour window by mappers worldwide.
 
-**Consequence:** way blob bboxes would typically span large areas —
+**Consequence:** way blob bboxes would typically span large areas -
 potentially the entire mapped world for recent-ID blobs (active
 mapping happens globally). Only old-ID blobs (early OSM history, pre-
 2010, predominantly European mapping) would have tight geographic
@@ -54,11 +54,11 @@ small regions).
 
 ## Impact by pipeline step (speculative)
 
-### extract simple — MODERATE win
+### extract simple - MODERATE win
 
 Current planet extract (Europe bbox): ~200s total.
 - Node classification: ~13s (parallel pread, blob-level spatial skip)
-- Way classification: ~80s (parallel pread, NO spatial skip — must
+- Way classification: ~80s (parallel pread, NO spatial skip - must
   decode all way blobs to check refs against bbox_node_ids)
 - Relation classification: ~10s
 - Write phase: ~100s
@@ -70,13 +70,13 @@ For Copenhagen (small bbox): ~40% skip → 80s → ~48s. **Saving: ~32s.**
 
 Not transformative but meaningful for small extracts from planet.
 
-### extract complete/smart — MODERATE win
+### extract complete/smart - MODERATE win
 
 Same initial classification benefit. The dependency expansion passes
 still process matching ways, so the benefit is bounded by the initial
 spatial filter.
 
-### multi-extract — GOOD win
+### multi-extract - GOOD win
 
 For 10 regions covering ~30% of world area, the union bbox might
 cover 60% of the world. ~40% of way blobs could skip for ALL regions.
@@ -90,29 +90,29 @@ could be 70-80%.
 The multi-extract benefit scales with the number of regions because
 the per-region checking is amortized across the single file read.
 
-### build-geocode-index — NO win
+### build-geocode-index - NO win
 
 Geocode builder processes the entire PBF. No spatial filtering.
 
-### add-locations-to-ways — NO win
+### add-locations-to-ways - NO win
 
 ALTW processes all ways. No spatial filtering.
 
-### apply-changes (merge) — NO win
+### apply-changes (merge) - NO win
 
 Merge is ID-based, not spatial.
 
-### tags-filter — SMALL win (potential)
+### tags-filter - SMALL win (potential)
 
 If tags-filter added spatial bbox filtering (currently not supported),
 way blob bboxes would enable spatial skip. But tags-filter is tag-based,
 not spatial. A `--bbox` flag for tags-filter would unlock this.
 
-### diff/derive_changes — NO win
+### diff/derive_changes - NO win
 
 Diff is ID-based merge-join, not spatial.
 
-### inspect --show — SMALL win (single element lookup)
+### inspect --show - SMALL win (single element lookup)
 
 Could skip way blobs whose spatial bbox doesn't contain the target
 location. But `--show` uses ID-based lookup (via indexdata min/max ID),
@@ -179,6 +179,6 @@ Way blob spatial bboxes help most for:
 3. **Spatial-sorted PBFs** (dramatic improvement but breaks ID ordering)
 
 They help least for:
-1. **Large region extracts** (Europe from planet — low skip rate)
+1. **Large region extracts** (Europe from planet - low skip rate)
 2. **Non-spatial commands** (merge, diff, tags-filter, ALTW, geocode)
 3. **Already-extracted regional files** (Denmark PBF already has tight bboxes)

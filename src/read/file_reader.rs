@@ -14,7 +14,7 @@ use std::path::Path;
 use super::direct_reader::DirectReader;
 
 /// A file reader that selects between buffered and O_DIRECT I/O at runtime.
-// Not #[non_exhaustive] — variants are construction-controlled (users don't match on this).
+// Not #[non_exhaustive] - variants are construction-controlled (users don't match on this).
 pub enum FileReader {
     /// Standard buffered reader (256 KB buffer).
     Buffered(BufReader<File>),
@@ -33,7 +33,7 @@ impl FileReader {
         #[cfg(all(target_os = "linux", any(feature = "linux-direct-io", feature = "linux-io-uring")))]
         {
             use std::os::unix::io::AsRawFd;
-            // Advisory hint for sequential readahead — matches osmium's approach.
+            // Advisory hint for sequential readahead - matches osmium's approach.
             // SAFETY: valid fd, advisory-only, no-op on failure.
             unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
         }

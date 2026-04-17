@@ -1,7 +1,7 @@
 //! Relation-member node-ID collection for ALTW external join.
 //!
 //! The generic `collect_relation_member_node_ids` in `add_locations_to_ways.rs`
-//! reads every blob sequentially via `BlobReader::next()` — at planet scale
+//! reads every blob sequentially via `BlobReader::next()` - at planet scale
 //! that's ~100 GB of compressed bytes preread (not decompressed) just to find
 //! the ~2K relation blobs. External join already has a full `BlobMeta` table,
 //! so this variant preads only the relation blobs directly and decompresses

@@ -10,9 +10,9 @@ There are two types of embedded metadata:
 
 A 42-byte fixed-size blob per BlobHeader containing:
 
-- **Element type** (`ElemKind`) — whether the blob contains nodes, ways, or relations
-- **ID range** — minimum and maximum element ID in the blob
-- **Spatial bounding box** — min/max latitude and longitude in decimicrodegrees (`i32` coordinates)
+- **Element type** (`ElemKind`) - whether the blob contains nodes, ways, or relations
+- **ID range** - minimum and maximum element ID in the blob
+- **Spatial bounding box** - min/max latitude and longitude in decimicrodegrees (`i32` coordinates)
 
 This enables O(1) blob classification. For example, `apply-changes` determines which blobs are affected by a changeset by comparing ID ranges, passing through ~92% of blobs as raw bytes without decompression.
 
@@ -39,7 +39,7 @@ Indexdata generation timings (commit `69a127f`):
 | Planet | 87 GB | **497s** (8m17s) | 520s (+5%) |
 | Denmark | 461 MB | **2.8s** | -- |
 
-Buffered I/O wins for this workload — sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
+Buffered I/O wins for this workload - sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
 
 When `cat` is invoked with a `--type` flag (e.g., `cat -t way`), it also embeds indexdata but does full decode and re-encode of every block.
 
@@ -47,16 +47,16 @@ When `cat` is invoked with a `--type` flag (e.g., `cat -t way`), it also embeds 
 
 These commands will error if the input PBF lacks indexdata:
 
-- `apply-changes` — blob classification for merge
-- `sort` — blob-level permutation for sorted inputs
-- `add-locations-to-ways` — parallel node index building, blob passthrough
-- `extract` (complete-ways and smart strategies) — spatial blob filtering
-- `tags-filter` — skips blobs lacking required tag keys
-- `getid` — skips blobs whose ID range has no intersection with requested IDs
-- `cat --type` — skips non-matching blob types entirely
-- `inspect tags --type` — type-filtered tag counting
-- `inspect --nodes` — node coordinate analysis
-- `build-geocode-index` — multi-pass pipeline with type filtering
+- `apply-changes` - blob classification for merge
+- `sort` - blob-level permutation for sorted inputs
+- `add-locations-to-ways` - parallel node index building, blob passthrough
+- `extract` (complete-ways and smart strategies) - spatial blob filtering
+- `tags-filter` - skips blobs lacking required tag keys
+- `getid` - skips blobs whose ID range has no intersection with requested IDs
+- `cat --type` - skips non-matching blob types entirely
+- `inspect tags --type` - type-filtered tag counting
+- `inspect --nodes` - node coordinate analysis
+- `build-geocode-index` - multi-pass pipeline with type filtering
 
 ## The --force flag
 
@@ -66,7 +66,7 @@ Pass `--force` to any command to skip the indexdata check and proceed with a raw
 pbfhogg sort raw-input.osm.pbf -o sorted.osm.pbf --force
 ```
 
-Commands will work but use slower fallback paths — they must decompress every blob to determine its contents instead of reading the blob header metadata.
+Commands will work but use slower fallback paths - they must decompress every blob to determine its contents instead of reading the blob header metadata.
 
 The recommended workflow is to generate an indexed PBF once with `pbfhogg cat`, then use it for all subsequent operations.
 
@@ -83,7 +83,7 @@ On the read side, `BlobReader` parses these fields from the `BlobHeader` before 
 
 Indexdata and tagdata are transparent extensions. The protobuf wire format specification requires parsers to silently skip unknown fields, so any standard PBF reader (osmium, osm2pgsql, Planetiler, etc.) can read indexed PBFs without modification. No `optional_features` header declaration is added.
 
-PBFs from other tools (without indexdata) are fully supported by pbfhogg — they just don't benefit from the fast classification paths. Blobs without tagdata always pass tag filters (conservative behavior).
+PBFs from other tools (without indexdata) are fully supported by pbfhogg - they just don't benefit from the fast classification paths. Blobs without tagdata always pass tag filters (conservative behavior).
 
 ## Checking for indexdata
 

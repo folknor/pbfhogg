@@ -29,12 +29,12 @@ pub fn emit_counter(name: &str, value: i64) {
 /// during the post-PASS1 header scan burst investigation.
 ///
 /// Fields emitted:
-/// - `<prefix>_arena`     — total brk-managed heap size in bytes
-/// - `<prefix>_hblks`     — count of mmap-managed chunks
-/// - `<prefix>_hblkhd`    — total bytes in mmap-managed chunks
-/// - `<prefix>_uordblks`  — bytes allocated in normal blocks (live)
-/// - `<prefix>_fordblks`  — bytes free in normal blocks (free-list)
-/// - `<prefix>_keepcost`  — top-most releasable block in arena
+/// - `<prefix>_arena`     - total brk-managed heap size in bytes
+/// - `<prefix>_hblks`     - count of mmap-managed chunks
+/// - `<prefix>_hblkhd`    - total bytes in mmap-managed chunks
+/// - `<prefix>_uordblks`  - bytes allocated in normal blocks (live)
+/// - `<prefix>_fordblks`  - bytes free in normal blocks (free-list)
+/// - `<prefix>_keepcost`  - top-most releasable block in arena
 ///
 /// On non-glibc platforms this is a no-op.
 #[cfg(target_os = "linux")]

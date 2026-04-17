@@ -718,12 +718,14 @@ fn check_type_order(
         }
     };
 
+    // Canonical order is nodes < ways < relations (by file offset). The two
+    // pairwise checks below are sufficient: node<way and way<rel give
+    // node<rel transitively. A third (max_rel vs min_node) would fire on
+    // every correctly-ordered file.
     let max_node = node_sched.iter().map(|(_, o, _)| *o).max();
     let min_way = way_sched.iter().map(|(_, o, _)| *o).min();
     let max_way = way_sched.iter().map(|(_, o, _)| *o).max();
     let min_rel = rel_sched.iter().map(|(_, o, _)| *o).min();
-    let max_rel = rel_sched.iter().map(|(_, o, _)| *o).max();
-    let min_node = node_sched.iter().map(|(_, o, _)| *o).min();
 
     if let (Some(mn), Some(mw)) = (max_node, min_way)
         && mn > mw
@@ -734,10 +736,5 @@ fn check_type_order(
         && mw > mr
     {
         record("way", "relation", violations, total_violations);
-    }
-    if let (Some(mr), Some(mnd)) = (max_rel, min_node)
-        && mr > mnd
-    {
-        record("relation", "node", violations, total_violations);
     }
 }

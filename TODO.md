@@ -31,9 +31,9 @@ active optimization plans):
 
 | Lines | File | Active plan proximity |
 |------:|------|------|
-| 3793 | `src/commands/extract.rs` | ✓ extract smart/complete (strong), multi-extract (recent) |
+| ~~3793~~ | ~~`src/commands/extract.rs`~~ — split 2026-04-17, now `src/commands/extract/` (6 files) | ✓ extract smart/complete (strong), multi-extract (recent) |
 | ~~1957~~ | ~~`src/commands/inspect.rs`~~ — split 2026-04-17, now `src/commands/inspect/` (7 files) | — |
-| 1758 | `src/geocode_index/builder.rs` | ✓ build-geocode-index (active plan) |
+| ~~1758~~ | ~~`src/geocode_index/builder.rs`~~ — split 2026-04-17, now `src/geocode_index/builder/` (8 files) | ✓ build-geocode-index (active plan) |
 | ~~1705~~ | ~~`src/commands/renumber_external.rs`~~ — split 2026-04-17, now `src/commands/renumber_external/` (6 files) | renumber regression (open investigation) |
 | 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
@@ -50,27 +50,28 @@ active optimization plans):
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):
 
-- [ ] **`src/commands/extract.rs` (3793 lines) - MUST split before next extract round.**
-  Natural seams: `extract.rs` dispatcher + types + `pub fn extract_multi`,
-  `extract/simple.rs` (`extract_simple` + `extract_simple_single_pass`
-  + `try_extract_multi_single_pass` + `multi_extract_pread_write{,_nodes}`),
-  `extract/complete.rs` (`extract_complete_ways` + related helpers),
-  `extract/smart.rs` (`extract_smart` + PASS1/PASS2/PASS3 + `collect_pass1_generic`),
-  `extract/common.rs` (BlobDesc, `build_blob_schedule_with_passthrough`,
-  `pread_execute`, `pread_write_pass*`, `write_consumer_item`,
-  `flush_local`, shared `ExtractStats` printer, `Region` / `BboxInt` / polygon
-  helpers). Shared instrumentation markers (`EXTRACT_SCAN_START`,
-  `EXTRACT_SCHEDULE_SCAN_*`) stay with the dispatcher or common module.
-- [ ] **`src/geocode_index/builder.rs` (1758 lines) - MUST split before build-geocode-index optimization.**
-  Natural seams: `builder/mod.rs` (entrypoint + `BuildConfig` + `BuildStats`),
-  `builder/pass1.rs` (relation metadata scan + admin rel collection),
-  `builder/pass1_5.rs` (referenced-node collection via `parallel_classify_accumulate`),
-  `builder/pass2.rs` (fused nodes + ways scan, way geometry / addr / interp writes),
-  `builder/pass3_fine.rs` + `builder/pass3_coarse.rs` (S2 cell aggregation),
-  `builder/admin.rs` (`assemble_admin_polygons`, `write_admin_index`),
-  `builder/interp.rs` (`resolve_interpolation_endpoints_mmap` and helpers),
-  `builder/strings.rs` (StringPool). The new KNOWN LIMITATION comments
-  should stay attached to the structs / resolve site they annotate.
+- [x] ~~**`src/commands/extract.rs` (3793 lines)**~~ - **DONE 2026-04-17.**
+  Split into 6 files under `src/commands/extract/` via general-purpose
+  subagent (second attempt after the first bombed): `mod.rs` (1231,
+  public API + dispatcher + GeoJSON/config parsing + all unit tests),
+  `common.rs` (491, shared helpers: `BboxInt`, `BlobDesc`,
+  `build_blob_schedule{,_with_passthrough}`, `pread_execute`,
+  `pread_write_pass{,_with_schedule}`, `ExtractPass2IdSets`,
+  `extract_block_pass2`), `simple.rs` (625), `multi.rs` (785),
+  `complete.rs` (87), `smart.rs` (652, with the `RelationHandler` trait
+  + `Pass1Result` + `collect_pass1_generic` reused by `complete.rs`).
+- [x] ~~**`src/geocode_index/builder.rs` (1758 lines)**~~ - **DONE 2026-04-17.**
+  Split into 8 files under `src/geocode_index/builder/` via general-purpose
+  subagent: `mod.rs` (338, `pub fn build_geocode_index` + `BuildConfig` +
+  `BuildStats` + orchestration), `strings.rs` (40, `StringPool`),
+  `pass1.rs` (97, relation scan), `pass1_5.rs` (83, referenced-node
+  collection with the borderline-safety-envelope CAVEAT preserved),
+  `pass2.rs` (459, fused nodes+ways with the Null Island + SlimInterpWay
+  + u16-node_count KNOWN LIMITATION / INVARIANT comments),
+  `admin.rs` (167, polygon assembly + admin u16 INVARIANT),
+  `interp.rs` (155, endpoint resolution with sentinel-ambiguity comment),
+  `pass3.rs` (579, S2 cell aggregation + Stage B three u16 INVARIANTs +
+  `cover_segment` tests).
 - [x] ~~**`src/commands/inspect.rs` (1957 lines)**~~ - **DONE 2026-04-17.**
   Split into 7 files under `src/commands/inspect/` via general-purpose subagent:
   `mod.rs` (14 lines, re-exports), `types.rs` (519, stats + `InspectReport`),

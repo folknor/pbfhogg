@@ -862,23 +862,30 @@ fn try_extract_multi_single_pass(
     crate::debug::emit_marker("MULTI_NODE_WRITE_END");
 
     // Phase 2: Parallel way classification → N matched_way_ids.
+    //
+    // Per-worker scratch `Vec<Vec<i64>>` is cleared (not dropped) between
+    // blocks so the inner `Vec<i64>` capacity amortizes across the ~N blobs
+    // each worker processes — the same pattern used by the node classify
+    // phase above (see `|| vec![Vec::<i64>::new(); n]` there). Pre-
+    // instrumentation Japan 5-region bench showed this phase at 892 ms
+    // with the prior `|| ()` + per-block `vec![Vec::new(); n]` allocation.
     crate::debug::emit_marker("MULTI_WAY_CLASSIFY_START");
     parallel_classify_phase(
         &shared_file,
         &way_schedule,
-        || (),
-        |block, _s| {
-            let mut region_ids: Vec<Vec<i64>> = vec![Vec::new(); n];
+        || vec![Vec::<i64>::new(); n],
+        |block, scratch: &mut Vec<Vec<i64>>| {
+            for v in scratch.iter_mut() { v.clear(); }
             for element in block.elements_skip_metadata() {
                 if let Element::Way(w) = &element {
                     for i in 0..n {
                         if w.refs().any(|r| bbox_node_ids[i].get(r)) {
-                            region_ids[i].push(w.id());
+                            scratch[i].push(w.id());
                         }
                     }
                 }
             }
-            region_ids
+            scratch.iter_mut().map(|v| v.drain(..).collect::<Vec<i64>>()).collect::<Vec<_>>()
         },
         |_seq, region_ids| {
             for (i, ids) in region_ids.into_iter().enumerate() {

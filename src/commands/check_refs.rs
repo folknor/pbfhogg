@@ -152,17 +152,18 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     let mut st_scratch: Vec<(u32, u32)> = Vec::new();
     let mut gr_scratch: Vec<(u32, u32)> = Vec::new();
 
-    // Per-sub-operation wall-time accumulators (unconditional).
-    // Accumulated per-blob / per-element-kind-transition rather than per-op
-    // to keep Instant::now() overhead negligible (~100K calls at planet).
-    let mut pread_ms: u128 = 0;
-    let mut decompress_ms: u128 = 0;
-    let mut block_build_ms: u128 = 0;
-    let mut node_insert_ms: u128 = 0;
-    let mut way_insert_ms: u128 = 0;
-    let mut way_ref_check_ms: u128 = 0;
-    let mut rel_insert_ms: u128 = 0;
-    let mut rel_member_check_ms: u128 = 0;
+    // Per-sub-operation wall-time accumulators in nanoseconds.
+    // `.elapsed().as_millis()` per-op truncates to 0 for anything under 1 ms
+    // (every node_insert is ~70 ns; summing those as millis never escapes 0).
+    // Accumulate nanos, divide to millis at emit time.
+    let mut pread_ns: u128 = 0;
+    let mut decompress_ns: u128 = 0;
+    let mut block_build_ns: u128 = 0;
+    let mut node_insert_ns: u128 = 0;
+    let mut way_insert_ns: u128 = 0;
+    let mut way_ref_check_ns: u128 = 0;
+    let mut rel_insert_ns: u128 = 0;
+    let mut rel_member_check_ns: u128 = 0;
 
     // Structural counters for yardstick validation.
     let mut node_blobs: u64 = 0;
@@ -186,7 +187,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     loop {
         let t_pread = Instant::now();
         let next = blob_reader.next();
-        pread_ms += t_pread.elapsed().as_millis();
+        pread_ns += t_pread.elapsed().as_nanos();
         let blob = match next {
             None => break,
             Some(r) => r?,
@@ -203,13 +204,13 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         }
         let t_dec = Instant::now();
         blob.decompress_into(&mut decompress_buf)?;
-        decompress_ms += t_dec.elapsed().as_millis();
+        decompress_ns += t_dec.elapsed().as_nanos();
         total_bytes_decompressed += decompress_buf.len() as u64;
         let t_build = Instant::now();
         let block = crate::block::PrimitiveBlock::from_vec_with_scratch(
             std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
         )?;
-        block_build_ms += t_build.elapsed().as_millis();
+        block_build_ns += t_build.elapsed().as_nanos();
 
         // Per-blob kind tally via blob.index() when available; falls back
         // to first-element inspection below via current_phase updates.
@@ -254,13 +255,13 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
             Element::DenseNode(dn) => {
                 let t = Instant::now();
                 node_ids.insert(dn.id() .cast_unsigned());
-                node_insert_ms += t.elapsed().as_millis();
+                node_insert_ns += t.elapsed().as_nanos();
                 result.node_count += 1;
             }
             Element::Node(n) => {
                 let t = Instant::now();
                 node_ids.insert(n.id() .cast_unsigned());
-                node_insert_ms += t.elapsed().as_millis();
+                node_insert_ns += t.elapsed().as_nanos();
                 result.node_count += 1;
             }
             Element::Way(w) => {
@@ -268,7 +269,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                 if check_relations {
                     let t = Instant::now();
                     way_ids.insert(wid .cast_unsigned());
-                    way_insert_ms += t.elapsed().as_millis();
+                    way_insert_ns += t.elapsed().as_nanos();
                 }
                 result.way_count += 1;
                 let t_refs = Instant::now();
@@ -285,14 +286,14 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                         }
                     }
                 }
-                way_ref_check_ms += t_refs.elapsed().as_millis();
+                way_ref_check_ns += t_refs.elapsed().as_nanos();
             }
             Element::Relation(r) => {
                 let rid = r.id();
                 if check_relations {
                     let t = Instant::now();
                     relation_ids.insert(rid .cast_unsigned());
-                    rel_insert_ms += t.elapsed().as_millis();
+                    rel_insert_ns += t.elapsed().as_nanos();
                 }
                 result.relation_count += 1;
                 if check_relations {
@@ -340,7 +341,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
                             MemberId::Unknown(_, _) => {}
                         }
                     }
-                    rel_member_check_ms += t_mem.elapsed().as_millis();
+                    rel_member_check_ns += t_mem.elapsed().as_nanos();
                 }
             }
         }
@@ -392,7 +393,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         result.missing_relation_members = missing_relation_members_set.len();
         result.missing_relation_member_occurrences = occurrences;
     }
-    let deferred_resolve_ms = t_deferred.elapsed().as_millis();
+    let deferred_resolve_ns = t_deferred.elapsed().as_nanos();
     crate::debug::emit_marker("CHECKREFS_DEFERRED_RESOLVE_END");
 
     result.missing_refs = missing_refs;
@@ -409,16 +410,18 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
         crate::debug::emit_counter("checkrefs_missing_node_members", result.missing_node_members as i64);
         crate::debug::emit_counter("checkrefs_missing_relation_members", result.missing_relation_members as i64);
 
-        // Per-sub-operation wall-time breakdown.
-        crate::debug::emit_counter("checkrefs_pread_ms", pread_ms as i64);
-        crate::debug::emit_counter("checkrefs_decompress_ms", decompress_ms as i64);
-        crate::debug::emit_counter("checkrefs_block_build_ms", block_build_ms as i64);
-        crate::debug::emit_counter("checkrefs_node_insert_ms", node_insert_ms as i64);
-        crate::debug::emit_counter("checkrefs_way_insert_ms", way_insert_ms as i64);
-        crate::debug::emit_counter("checkrefs_way_ref_check_ms", way_ref_check_ms as i64);
-        crate::debug::emit_counter("checkrefs_rel_insert_ms", rel_insert_ms as i64);
-        crate::debug::emit_counter("checkrefs_rel_member_check_ms", rel_member_check_ms as i64);
-        crate::debug::emit_counter("checkrefs_deferred_resolve_ms", deferred_resolve_ms as i64);
+        // Per-sub-operation wall-time breakdown. Accumulated as nanos,
+        // converted to millis for the sidecar counters.
+        let ns_to_ms = |ns: u128| (ns / 1_000_000) as i64;
+        crate::debug::emit_counter("checkrefs_pread_ms", ns_to_ms(pread_ns));
+        crate::debug::emit_counter("checkrefs_decompress_ms", ns_to_ms(decompress_ns));
+        crate::debug::emit_counter("checkrefs_block_build_ms", ns_to_ms(block_build_ns));
+        crate::debug::emit_counter("checkrefs_node_insert_ms", ns_to_ms(node_insert_ns));
+        crate::debug::emit_counter("checkrefs_way_insert_ms", ns_to_ms(way_insert_ns));
+        crate::debug::emit_counter("checkrefs_way_ref_check_ms", ns_to_ms(way_ref_check_ns));
+        crate::debug::emit_counter("checkrefs_rel_insert_ms", ns_to_ms(rel_insert_ns));
+        crate::debug::emit_counter("checkrefs_rel_member_check_ms", ns_to_ms(rel_member_check_ns));
+        crate::debug::emit_counter("checkrefs_deferred_resolve_ms", ns_to_ms(deferred_resolve_ns));
 
         // Structural counters (validate yardstick + plan cost model).
         crate::debug::emit_counter("checkrefs_node_blobs", node_blobs as i64);

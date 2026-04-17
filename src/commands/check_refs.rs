@@ -7,7 +7,7 @@ use crate::blob_index::ElemKind;
 use crate::{Element, MemberId};
 
 use super::id_set_dense::IdSetDense;
-use super::{build_classify_schedule, parallel_classify_phase, Result};
+use super::{build_classify_schedules_split, parallel_classify_phase, Result};
 
 /// A single missing reference entry (populated when `show_ids` is true).
 pub struct MissingRef {
@@ -182,12 +182,19 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     let mut rel_way_members_checked: u64 = 0;
     let mut rel_rel_members_deferred: u64 = 0;
 
+    // Single header-chain walk building all three per-kind schedules at
+    // once. At Europe scale the header walk is ~15 s; three separate
+    // `build_classify_schedule` calls would triple that cost.
+    let (node_schedule, way_schedule, rel_schedule, shared_file) =
+        build_classify_schedules_split(path)?;
+    let node_blobs = node_schedule.len() as u64;
+    let way_blobs = way_schedule.len() as u64;
+    let relation_blobs_total = rel_schedule.len() as u64;
+
     // ------------------------------------------------------------------
     // Phase 1 — node scan. Workers populate `node_ids` via `set_atomic`.
     // ------------------------------------------------------------------
     crate::debug::emit_marker("CHECKREFS_NODES_START");
-    let (node_schedule, shared_file) = build_classify_schedule(path, Some(ElemKind::Node))?;
-    let node_blobs = node_schedule.len() as u64;
     {
         let node_ids_ref = &node_ids;
         parallel_classify_phase(
@@ -225,8 +232,6 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // collect per-blob missing-ref vecs.
     // ------------------------------------------------------------------
     crate::debug::emit_marker("CHECKREFS_WAYS_START");
-    let (way_schedule, _) = build_classify_schedule(path, Some(ElemKind::Way))?;
-    let way_blobs = way_schedule.len() as u64;
     {
         let node_ids_ref = &node_ids;
         let way_ids_ref = &way_ids;
@@ -279,11 +284,9 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     // both `node_ids` and `way_ids`, write `relation_ids`, and collect
     // per-blob missing/deferred vecs.
     // ------------------------------------------------------------------
-    let mut relation_blobs: u64 = 0;
+    let relation_blobs: u64 = if check_relations { relation_blobs_total } else { 0 };
     if check_relations {
         crate::debug::emit_marker("CHECKREFS_RELATIONS_START");
-        let (rel_schedule, _) = build_classify_schedule(path, Some(ElemKind::Relation))?;
-        relation_blobs = rel_schedule.len() as u64;
         {
             let node_ids_ref = &node_ids;
             let way_ids_ref = &way_ids;

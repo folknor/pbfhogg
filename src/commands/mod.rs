@@ -464,6 +464,71 @@ pub(crate) fn build_classify_schedule(
     Ok((schedule, shared_file))
 }
 
+/// Like [`build_classify_schedule`] but returns three per-kind schedules
+/// from a single header pass. At planet / Europe scale the header walk is
+/// itself ~15 s; callers that need all three kinds (currently `check_refs`)
+/// would otherwise pay that cost three times.
+///
+/// Blobs lacking indexdata are included in all three schedules (matching
+/// the per-kind behaviour of `build_classify_schedule(.., Some(kind))`,
+/// which only skips blobs whose indexdata reports a mismatched kind).
+/// Each schedule's `seq` is local to that schedule (so each is a valid
+/// contiguous 0..n range ready for `parallel_classify_phase`).
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
+pub(crate) fn build_classify_schedules_split(
+    input: &std::path::Path,
+) -> Result<(
+    Vec<(usize, u64, usize)>,
+    Vec<(usize, u64, usize)>,
+    Vec<(usize, u64, usize)>,
+    std::sync::Arc<std::fs::File>,
+)> {
+    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_START");
+    let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
+    scanner.set_parse_indexdata(true);
+    scanner.next_header_skip_blob()
+        .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
+    crate::debug::emit_marker("SCHEDULE_SCANNER_OPEN_END");
+
+    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_START");
+    let mut nodes: Vec<(usize, u64, usize)> = Vec::new();
+    let mut ways: Vec<(usize, u64, usize)> = Vec::new();
+    let mut rels: Vec<(usize, u64, usize)> = Vec::new();
+    while let Some(result_item) = scanner.next_header_with_data_offset() {
+        let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+        if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
+        match hdr.index().map(|i| i.kind) {
+            Some(crate::blob_index::ElemKind::Node) => {
+                nodes.push((nodes.len(), data_offset, data_size));
+            }
+            Some(crate::blob_index::ElemKind::Way) => {
+                ways.push((ways.len(), data_offset, data_size));
+            }
+            Some(crate::blob_index::ElemKind::Relation) => {
+                rels.push((rels.len(), data_offset, data_size));
+            }
+            None => {
+                // Unindexed: visible to every kind filter in the legacy path,
+                // so replicate to all three schedules here.
+                nodes.push((nodes.len(), data_offset, data_size));
+                ways.push((ways.len(), data_offset, data_size));
+                rels.push((rels.len(), data_offset, data_size));
+            }
+        }
+    }
+    crate::debug::emit_marker("SCHEDULE_SCAN_LOOP_END");
+
+    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_START");
+    drop(scanner);
+    let shared_file = std::sync::Arc::new(
+        std::fs::File::open(input)
+            .map_err(|e| format!("failed to open {}: {e}", input.display()))?
+    );
+    crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
+
+    Ok((nodes, ways, rels, shared_file))
+}
+
 /// Run a parallel classification phase: pread workers decompress and classify
 /// blobs, sending compact results to a consumer that merges them into ID sets.
 ///

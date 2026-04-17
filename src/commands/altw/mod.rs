@@ -232,8 +232,15 @@ pub fn external_join(
     let unique_nodes = stage1_out.unique_nodes;
     let rank_bucket_counts = stage1_out.rank_bucket_counts;
     let num_shard_workers = stage1_out.num_shard_workers;
-    let node_id_set = stage1_out.node_id_set;
+    let mut node_id_set = stage1_out.node_id_set;
     let node_blob_mapping = stage1_out.node_blob_mapping;
+
+    // Stage 2 only needs membership bits (`get()`) now that per-node
+    // `rank_if_set()` is replaced by a blob-local rank counter seeded from
+    // `NodeBlobInfo.ref_rank_start`. Drop the rank-prefix metadata (~100 MB
+    // at planet scale) before stage 2 starts so it doesn't pollute cache
+    // through the hot decode loop.
+    node_id_set.drop_rank_index();
 
     // Compute slot_bucket_count: scale down from NUM_BUCKETS so that
     // every bucket can fit at least one full blob's slot range. This

@@ -456,10 +456,32 @@ pub(super) fn stage2_node_join(
                             node_extract_ns_ref.fetch_add(t_ex.elapsed().as_nanos() as u64, Relaxed);
 
                             let t_rk = std::time::Instant::now();
+                            // Blob-local rank assignment: node blobs are
+                            // ID-sorted and `extract_node_tuples` emits in ID
+                            // order, so the referenced nodes in this blob
+                            // occupy exactly [ref_rank_start, ref_rank_end).
+                            // We assign ranks by incrementing `next_rank`
+                            // instead of calling `rank_if_set` per tuple —
+                            // membership becomes an O(1) `get()` bit test.
+                            let mut next_rank = blob.ref_rank_start;
+                            #[cfg(debug_assertions)]
+                            let mut prev_id: Option<i64> = None;
                             for &NodeTuple { id, lat, lon } in &node_tuples {
-                                let Some(rank) = id_set_ref.rank_if_set(id) else {
+                                #[cfg(debug_assertions)]
+                                {
+                                    if let Some(p) = prev_id {
+                                        debug_assert!(
+                                            id >= p,
+                                            "extract_node_tuples non-monotonic: {p} then {id}",
+                                        );
+                                    }
+                                    prev_id = Some(id);
+                                }
+                                if !id_set_ref.get(id) {
                                     continue;
-                                };
+                                }
+                                let rank = next_rank;
+                                next_rank += 1;
                                 if rank < bucket_rank_start || rank >= bucket_rank_end {
                                     // Belongs to an adjacent bucket — skip.
                                     continue;
@@ -470,6 +492,12 @@ pub(super) fn stage2_node_join(
                                 coord_slice[off..off + 4].copy_from_slice(&lat.to_le_bytes());
                                 coord_slice[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
                             }
+                            debug_assert_eq!(
+                                next_rank, blob.ref_rank_end,
+                                "blob-local rank drift: expected {} hits, got {}",
+                                blob.ref_count(),
+                                next_rank - blob.ref_rank_start,
+                            );
                             #[allow(clippy::cast_possible_truncation)]
                             node_rank_ref.fetch_add(t_rk.elapsed().as_millis() as u64, Relaxed);
                             #[allow(clippy::cast_possible_truncation)]

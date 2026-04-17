@@ -435,6 +435,19 @@ impl IdSetDense {
         after_max - self.count_below(min_id)
     }
 
+    /// Drop the rank-index prefix arrays built by `build_rank_index()`. After
+    /// this call, `rank()`, `rank_if_set()`, `resolve()`, `count_below()`,
+    /// `count_in_range()`, and `total_count()` all fail (panic or return
+    /// `None`). The bitmap itself (chunk storage) is retained — `get()`,
+    /// `set()`, and `has_any()` still work.
+    ///
+    /// Used by stage 2 of the external ALTW join to free ~100 MB of rank
+    /// metadata once all rank consumers in stage 1 are finished.
+    pub fn drop_rank_index(&mut self) {
+        self.rank_chunk_prefix = None;
+        self.rank_block_prefix = None;
+    }
+
     /// Returns the total number of set IDs. Requires `build_rank_index()`.
     pub fn total_count(&self) -> u64 {
         let prefix = self.rank_chunk_prefix.as_ref()
@@ -658,6 +671,22 @@ mod tests {
         assert_eq!(s.count_below(0), 0);
         assert_eq!(s.count_below(5), 0);
         assert_eq!(s.count_below(6), 1);
+    }
+
+    #[test]
+    fn drop_rank_index_frees_metadata_but_keeps_bitmap() {
+        let mut s = IdSetDense::new();
+        s.set(5);
+        s.set(10);
+        s.build_rank_index();
+        assert_eq!(s.rank_if_set(5), Some(0));
+        s.drop_rank_index();
+        // Bitmap still works.
+        assert!(s.get(5));
+        assert!(s.get(10));
+        assert!(!s.get(7));
+        // Rank queries return None.
+        assert_eq!(s.rank_if_set(5), None);
     }
 
     #[test]

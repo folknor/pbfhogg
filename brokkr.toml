@@ -1,5 +1,8 @@
 project = "pbfhogg"
 
+# Env variables that match these are captured by brokkr during runs and stored in the database.
+capture_env = ["PBFHOGG*", "MALLOC*"]
+
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.
 # Unknown hostnames fall back to defaults: data="data", scratch="data/scratch".

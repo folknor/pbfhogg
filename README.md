@@ -49,7 +49,7 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `build-geocode-index` | 20m55s | 29.5 GB | reverse geocoding index, S2 cells (pass-1.5 transient peak) |
 | `add-locations-to-ways --index-type external` | 11m38s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 
-Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md).
+Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
 
 ## Usage
 

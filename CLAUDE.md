@@ -33,9 +33,18 @@ brokkr <command> [--dataset D] --direct-io      # pass --direct-io to pbfhogg
 brokkr <command> [--dataset D] --io-uring       # pass --io-uring to pbfhogg
 ```
 
-`--stop MARKER` requires a measured mode. Kills process after the named marker. Example: `brokkr renumber --dataset planet --bench 1 --stop RENUMBER_EXT_STAGE2D_END`.
+`--stop MARKER` requires a measured mode. Kills process after the named marker. Accepts three spellings: verbatim (`--stop RENUMBER_EXT_STAGE2D_END`), the `-` sigil (`--stop -RENUMBER_EXT_STAGE2D` → resolves to `RENUMBER_EXT_STAGE2D_END`), and the bare-name fallback (`--stop RENUMBER_EXT_STAGE2D` → also resolves to `RENUMBER_EXT_STAGE2D_END`; the sidecar log line shows the resolved form).
 
 Markers are point-in-time bookmarks - the FIFO protocol is `<timestamp_us> <name>` per marker, nothing else. The default `brokkr sidecar <uuid>` view segments the stream between consecutive markers; `brokkr sidecar <uuid> --durations` is the one view that opts into the `FOO_START` / `FOO_END` pairing convention for duration math.
+
+### Sidecar conventions
+
+Brokkr is convention-free at the protocol layer. Two optional naming conventions unlock richer views:
+
+- **`FOO_START` / `FOO_END` marker pairs** drive `--durations` (per-span wall time) and anchor `--stop` alias resolution. Emit both markers around any phase you want to time.
+- **`WAIT_<CATEGORY>_START` / `WAIT_<CATEGORY>_END` stall spans** drive `brokkr sidecar <uuid> --stalls`. Wrap blocking points (channel sends, spill waits, backpressure) in marker pairs whose name begins `WAIT_`. `--stalls` sums durations by category and reports each as a fraction of run wall-clock. Categories are free-form — pick names that match the blocking points you want to attribute (`WAIT_WRITER`, `WAIT_PAYLOAD`, `WAIT_SPILL`, etc.). Runs from before the convention simply report "no WAIT_* marker pairs" rather than empty output.
+
+Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count — derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
 `--bench N` runs N times, stores best. Default `--bench 3`. Requires clean git tree (ignoring `*.md` and `.brokkr/results.db`); `--force` overrides (results not stored).
 

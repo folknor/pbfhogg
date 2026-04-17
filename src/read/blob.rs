@@ -981,6 +981,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     /// On success, returns the [`BlobHeader`] and the byte offset of the header which can also be
     /// used as an offset for reading the entire [`Blob`] (including header).
     #[allow(clippy::cast_sign_loss)]
+    #[hotpath::measure]
     pub fn next_header_skip_blob(&mut self) -> Option<Result<(BlobHeader, Option<ByteOffset>)>> {
         // Stop iteration if there was an error.
         if !self.last_blob_ok {
@@ -1013,6 +1014,7 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     /// Returns `(BlobHeader, frame_offset, data_offset, data_size)`.
     /// `frame_offset` is the start of the 4-byte length prefix (for raw frame passthrough).
     /// `data_offset` is the start of the Blob protobuf (for pread workers).
+    #[hotpath::measure]
     pub(crate) fn next_header_with_data_offset(&mut self) -> Option<Result<(BlobHeader, u64, u64, usize)>> {
         if !self.last_blob_ok {
             return None;
@@ -1168,6 +1170,7 @@ fn decompress_parsed_blob_into(blob: &WireBlob, buf: &mut Vec<u8>) -> Result<()>
 /// constructing intermediate `WireBlob` or `Bytes` objects. Used by parallel
 /// pipelines where workers read blob data via pread and need all alloc/free
 /// to stay thread-local.
+#[hotpath::measure]
 pub(crate) fn decompress_blob_raw(raw_blob: &[u8], buf: &mut Vec<u8>) -> Result<()> {
     use super::wire::Cursor;
     buf.clear();

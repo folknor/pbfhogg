@@ -444,6 +444,7 @@ impl PrimitiveBlock {
     /// Like [`from_vec`] but wraps the buffer with pool recycling.
     /// Workers in `parallel_classify_phase` call this
     /// with loop-local scratch to avoid per-block allocation.
+    #[hotpath::measure]
     pub(crate) fn from_vec_pooled_with_scratch(
         mut buffer: Vec<u8>,
         pool: &std::sync::Arc<crate::blob::DecompressPool>,

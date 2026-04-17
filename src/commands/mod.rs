@@ -461,6 +461,8 @@ pub(crate) fn build_classify_schedule(
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
+    #[allow(clippy::cast_possible_wrap)]
+    crate::debug::emit_counter("schedule_blobs", schedule.len() as i64);
     Ok((schedule, shared_file))
 }
 
@@ -526,6 +528,12 @@ pub(crate) fn build_classify_schedules_split(
     );
     crate::debug::emit_marker("SCHEDULE_SCANNER_DROP_END");
 
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("schedule_node_blobs", nodes.len() as i64);
+        crate::debug::emit_counter("schedule_way_blobs", ways.len() as i64);
+        crate::debug::emit_counter("schedule_relation_blobs", rels.len() as i64);
+    }
     Ok((nodes, ways, rels, shared_file))
 }
 

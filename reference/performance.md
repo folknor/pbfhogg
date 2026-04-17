@@ -656,6 +656,73 @@ Denmark -14% (2625→2259ms), Japan -8% (12,619→11,643ms). Single-pass
 classification on sorted input eliminates the second file read. Superseded
 by the parallel classify + raw frame passthrough architecture.
 
+## Multi-extract
+
+Single-pass simple strategy on sorted input: read PBF once, classify each
+element against N regions, write to N sync-mode PbfWriters. 3-phase
+barrier (nodes → ways → relations) with per-region `IdSetDense` +
+`BlockBuilder`. 5 disjoint longitude strips per configured bench.
+
+| Dataset | 5-region wall | Commit | UUID | Mode |
+|---------|--------------:|--------|------|------|
+| Japan   | **7.7 s**  | `b7cd0e4` | `08fefe51` | `--bench 3` |
+| Europe  | **799.9 s** | `b7cd0e4` | `c1ff6ec9` | `--bench 1` |
+| Planet  | 965 s   | `7e9c2e9` | `1cd62e90` | `--bench` (pre-instrumentation) |
+
+### Europe phase breakdown (commit `b7cd0e4`, UUID `c1ff6ec9`, plantasjen, `--bench 1`)
+
+First full breakdown after the 2026-04-17 instrumentation landing
+(commit `1e8d37b`) added `MULTI_EXTRACT_START/END`,
+`MULTI_SCHEDULE_SCAN_START/END`, and eight `multi_extract_*` counters.
+The schedule-scan phase was invisible in sidecar `--durations` before
+this.
+
+| Phase | Wall | % of total |
+|---|---:|---:|
+| MULTI_SCHEDULE_SCAN (header walk, 3 schedules + `NodeBlobInfo`) | 26.0 s | 3.3 % |
+| MULTI_NODE_CLASSIFY | 15.8 s | 2.0 % |
+| **MULTI_NODE_WRITE** | **413.4 s** | **51.7 %** |
+| MULTI_WAY_CLASSIFY | 13.7 s | 1.7 % |
+| **MULTI_WAY_WRITE** | **317.5 s** | **39.7 %** |
+| MULTI_REL_CLASSIFY | 0.9 s | 0.1 % |
+| MULTI_REL_WRITE | 12.1 s | 1.5 % |
+| **MULTI_EXTRACT total** | **799.4 s** | 100 % |
+
+Write phases dominate Europe: `NODE_WRITE` (52 %) + `WAY_WRITE` (40 %) =
+92 % of wall. These are the real optimization targets. `SCHEDULE_SCAN`'s
+26 s is the `BlobReader::seek_raw` BufReader-discard issue (see
+TODO.md Performance section) showing up; ~10× amplification vs raw file
+size at the default 256 KB buffer.
+
+Counters emitted (UUID `c1ff6ec9` values):
+- `multi_extract_region_count=5`
+- `multi_extract_node_blobs`, `multi_extract_way_blobs`,
+  `multi_extract_relation_blobs` (schedule sizes)
+- `multi_extract_nodes_written`, `multi_extract_ways_written`,
+  `multi_extract_relations_written` (cross-region totals)
+
+### Way-classify scratch reuse (commit `b7cd0e4`, 2026-04-17)
+
+The way-classify phase used `|| ()` as its per-worker init and
+allocated `vec![Vec::<i64>::new(); n]` fresh inside the classify
+closure on every blob, letting each inner `Vec<i64>` grow through
+repeated doublings on each block rather than amortizing capacity
+across the ~N blobs each decode worker processes. Fix swapped to the
+same pattern the node classify phase already uses (per-worker scratch
+cleared-not-dropped between blocks, drained into the return value).
+
+| Scope | WAY_CLASSIFY pre-fix | WAY_CLASSIFY post-fix | Δ |
+|---|---:|---:|---:|
+| Japan 5-region | 892 ms (`8bc1773f`) | 848 ms (`08fefe51`) | **-44 ms / -5 %** |
+| Europe 5-region | (no paired pre-fix bench) | 13,675 ms (`c1ff6ec9`) | — |
+
+Japan phase delta is within the 5-10 % range expected from the
+mechanism (fewer growth reallocations per inner `Vec<i64>`). Europe
+was not paired-benched because the targeted phase is only 1.7 % of
+wall — a near-perfect phase speedup would still be within single-shot
+noise on total. No regression on either scale. The fix is of interest
+at planet scale only if multi-extract becomes a recurring workload.
+
 ## Tags-filter
 
 Two-pass architecture: pass 1 classifies blobs in parallel (parallel

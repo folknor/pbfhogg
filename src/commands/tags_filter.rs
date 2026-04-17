@@ -534,6 +534,7 @@ fn tags_filter_two_pass(
     drop(header_reader);
 
     // Build schedule from header-only scan.
+    crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.set_parse_tagdata(true);
@@ -580,6 +581,13 @@ fn tags_filter_two_pass(
         eprintln!("[tags-filter] {blobs_skipped_by_tag} blobs skipped by tag index");
     }
     drop(scanner);
+    crate::debug::emit_marker("TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("tagsfilter_single_pass_schedule_blobs", schedule.len() as i64);
+        crate::debug::emit_counter("tagsfilter_single_pass_tagidx_skipped_blobs", blobs_skipped_by_tag as i64);
+    }
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)
@@ -714,6 +722,7 @@ fn tags_filter_two_pass(
         Some(BlobFilter::new(true, has_included_way, has_included_relation))
     };
 
+    crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.set_parse_tagdata(true);
@@ -741,6 +750,13 @@ fn tags_filter_two_pass(
         schedule.push((data_offset, data_size));
     }
     drop(scanner);
+    crate::debug::emit_marker("TAGSFILTER_PASS2_SCHEDULE_SCAN_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("tagsfilter_pass2_schedule_blobs", schedule.len() as i64);
+        crate::debug::emit_counter("tagsfilter_pass2_skipped_blobs", blobs_skipped as i64);
+    }
 
     if blobs_skipped > 0 {
         eprintln!("[tags-filter] pass 2: {blobs_skipped} blobs skipped by type/tag index");

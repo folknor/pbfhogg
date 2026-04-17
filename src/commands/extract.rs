@@ -1516,12 +1516,14 @@ fn build_blob_schedule_with_passthrough(
     input: &Path,
     extract_bbox: Option<&crate::BlobBbox>,
 ) -> Result<Vec<BlobDesc>> {
+    crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.next_header_skip_blob()
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut schedule = Vec::new();
+    let mut passthrough_node_blobs: u64 = 0;
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
@@ -1535,6 +1537,7 @@ fn build_blob_schedule_with_passthrough(
                 && i.bbox.as_ref().is_some_and(|bb| ebbox.contains(bb))
             )
         });
+        if raw_passthrough { passthrough_node_blobs += 1; }
 
         let bbox = idx.as_ref().and_then(|i| i.bbox);
         let count = idx.as_ref().map_or(0, |i| i.count);
@@ -1542,6 +1545,13 @@ fn build_blob_schedule_with_passthrough(
         #[allow(clippy::cast_possible_truncation)]
         let frame_size = (data_offset - frame_offset) as usize + data_size;
         schedule.push(BlobDesc { frame_offset, frame_size, offset: data_offset, size: data_size, kind, bbox, count, raw_passthrough });
+    }
+    crate::debug::emit_marker("EXTRACT_SCHEDULE_SCAN_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("extract_schedule_blobs", schedule.len() as i64);
+        crate::debug::emit_counter("extract_schedule_passthrough_node_blobs", passthrough_node_blobs as i64);
     }
     Ok(schedule)
 }
@@ -2611,6 +2621,7 @@ fn collect_pass1_generic<H: RelationHandler>(
     drop(decompress_buf);
 
     // Build per-type schedules from header-only scan.
+    crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.next_header_skip_blob()
@@ -2669,6 +2680,16 @@ fn collect_pass1_generic<H: RelationHandler>(
         seq += 1;
     }
     drop(scanner);
+    crate::debug::emit_marker("SMART_PASS1_SCHEDULE_SCAN_END");
+
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("smart_pass1_node_blobs", node_schedule.len() as i64);
+        crate::debug::emit_counter("smart_pass1_way_blobs", way_schedule.len() as i64);
+        crate::debug::emit_counter("smart_pass1_relation_blobs", relation_schedule.len() as i64);
+        crate::debug::emit_counter("smart_pass1_full_way_blobs", full_way_schedule.len() as i64);
+        crate::debug::emit_counter("smart_pass1_pass3_blobs", pass3_blob_schedule.len() as i64);
+    }
 
     let shared_file = std::sync::Arc::new(
         std::fs::File::open(input)

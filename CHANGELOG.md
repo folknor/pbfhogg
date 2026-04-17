@@ -23,6 +23,42 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
 - **extract** (smart/complete): reuse PASS1 blob schedule in subsequent passes, reducing redundant index scans. PASS2 way deps converted to per-blob send.
 - **derive-changes**: stream output to temp files instead of buffering all changes in memory.
 - **renumber**: forward-ref relation bug fixed via two-pass structure. Negative ID guard added.
+- **multi-extract**: per-worker `Vec<Vec<i64>>` scratch in way classify (was
+  `|| ()` init with per-block `vec![Vec::new(); n]`). Inner `Vec<i64>`
+  capacities now amortize across the ~N blobs each decode worker
+  processes, same pattern as the node classify phase. Japan 5-region
+  `MULTI_WAY_CLASSIFY` phase 892 ms → 848 ms (-5%).
+- **multi-extract**: sidecar instrumentation gaps filled.
+  `MULTI_EXTRACT_START/END` brackets the whole single-pass function;
+  `MULTI_SCHEDULE_SCAN_START/END` brackets the pre-phase blob-header
+  walk (previously invisible, measured 26 s at Europe); eight
+  `multi_extract_*` counters emitted at completion (region count, 3
+  schedule sizes, 3 cross-region element-written totals).
+- **Schedule-scan instrumentation sweep**: header-walk brackets and
+  blob-count counters added to every `BlobReader::seekable_from_path`
+  caller in preparation for the `seek_raw` BufReader-discard fix (see
+  `notes/seek-raw-audit.md`).
+  - `build_classify_schedule` / `build_classify_schedules_split`
+    (`src/commands/mod.rs`): `schedule_blobs` and
+    `schedule_{node,way,relation}_blobs` counters (the markers were
+    already present from prior work).
+  - `scan_blob_metadata` (`src/commands/altw/blob_meta.rs`):
+    `ALTW_BLOB_META_SCAN_START/END` bracket, `hotpath::measure`
+    annotation, `altw_meta_{node,way,relation}_blobs` counters — was
+    entirely uninstrumented before.
+  - `tags_filter` single-pass: `TAGSFILTER_SINGLE_PASS_SCHEDULE_SCAN_START/END`
+    bracket, `tagsfilter_single_pass_schedule_blobs` +
+    `tagsfilter_single_pass_tagidx_skipped_blobs` counters.
+  - `tags_filter` two-pass: `TAGSFILTER_PASS2_SCHEDULE_SCAN_START/END`
+    bracket, `tagsfilter_pass2_schedule_blobs` +
+    `tagsfilter_pass2_skipped_blobs` counters.
+  - `extract` `build_blob_schedule_with_passthrough`:
+    `EXTRACT_SCHEDULE_SCAN_START/END` bracket,
+    `extract_schedule_blobs` +
+    `extract_schedule_passthrough_node_blobs` counters.
+  - `extract_smart` PASS1 schedule builder:
+    `SMART_PASS1_SCHEDULE_SCAN_START/END` bracket, five
+    `smart_pass1_*_blobs` counters (node/way/relation/full_way/pass3).
 
 ### Documentation
 
@@ -84,6 +120,14 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
   Pass 1.5 call site as the borderline exemplar. Pass 1.5 call site cross-
   links back to the contract and to the rewrite item in
   `notes/geocode-build-opportunities.md`.
+- **Multi-extract performance reference**: new `## Multi-extract` section
+  in `reference/performance.md` with the first full Europe phase
+  breakdown (UUID `c1ff6ec9`) — `NODE_WRITE` 52% + `WAY_WRITE` 40% = 92%
+  of wall, with `MULTI_SCHEDULE_SCAN` surfacing the 26 s
+  `BlobReader::seek_raw` amplification. `notes/multi-extract-optimization.md`
+  refreshed with current numbers and priority order. Shipped-and-superseded
+  `notes/multi-extract-parallel-write-plan.md` (parallel write phases,
+  landed commit `9f72bcf` in 2026-04) deleted.
 
 ### Testing
 

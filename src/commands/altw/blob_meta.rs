@@ -24,10 +24,12 @@ pub(super) struct BlobMeta {
 
 /// Scan all OsmData blob headers once and retain only the metadata ALTW
 /// external join actually reuses later.
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn scan_blob_metadata(
     input: &Path,
     parse_tagdata: bool,
 ) -> Result<Vec<BlobMeta>> {
+    crate::debug::emit_marker("ALTW_BLOB_META_SCAN_START");
     let mut scanner = crate::blob::BlobReader::seekable_from_path(input)?;
     scanner.set_parse_indexdata(true);
     scanner.set_parse_tagdata(parse_tagdata);
@@ -35,6 +37,9 @@ pub(super) fn scan_blob_metadata(
         .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
     let mut metas = Vec::new();
+    let mut node_blobs: u64 = 0;
+    let mut way_blobs: u64 = 0;
+    let mut relation_blobs: u64 = 0;
     while let Some(result) = scanner.next_header_with_data_offset() {
         let (hdr, frame_offset, data_offset, data_size) = result?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
@@ -48,6 +53,11 @@ pub(super) fn scan_blob_metadata(
         } else {
             false
         };
+        match idx.kind {
+            ElemKind::Node => node_blobs += 1,
+            ElemKind::Way => way_blobs += 1,
+            ElemKind::Relation => relation_blobs += 1,
+        }
         metas.push(BlobMeta {
             frame_offset,
             data_offset,
@@ -60,6 +70,13 @@ pub(super) fn scan_blob_metadata(
             has_tags,
         });
     }
+    crate::debug::emit_marker("ALTW_BLOB_META_SCAN_END");
 
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("altw_meta_node_blobs", node_blobs as i64);
+        crate::debug::emit_counter("altw_meta_way_blobs", way_blobs as i64);
+        crate::debug::emit_counter("altw_meta_relation_blobs", relation_blobs as i64);
+    }
     Ok(metas)
 }

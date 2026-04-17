@@ -231,7 +231,9 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 
 From 21.5 GB churn at Japan post-swap to 1.8 GB at Europe post-parallel — all the per-op incremental allocation is gone; only the one-shot pre-alloc remains.
 
-**Cross-validation:** osmium parity still passes on Denmark across all four check paths (ways-only + nodes/ways/rels in relations) after each step. Planet confirmation bench deferred until a quiet-host window.
+**Cross-validation:** osmium parity still passes on Denmark across all four check paths (ways-only + nodes/ways/rels in relations) after each step.
+
+**Planet confirmation (UUID `862547e4`, commit `0d71b3b`, 2026-04-17, plantasjen):** **1225 s → 72.5 s = 16.9× speedup.** Plan target was 6–10 min; measured 1 min 12 s, roughly 5–8× under the plan floor. Phase breakdown: SCHEDULE_SCAN_LOOP 16.8 s, NODES parallel 35.4 s, WAYS parallel 20.2 s. Peak RSS 2.17 GB, p95 2.13 GB, 0 major page faults - comfortable on a 27 GB host.
 
 **Off-plan discoveries logged in `TODO.md` Performance section:** `BlobReader::seek_raw` goes through stdlib `Seek::seek` which always discards the `BufReader` buffer; fixing this to use `BufReader::seek_relative` is codebase-wide perf work beyond check-refs scope. Buffer-size tuning alone is unsafe without that fix (verified: 16 MB buffer caused a 13× regression when the seek path still discards per blob; reverted in `86761d6`).
 

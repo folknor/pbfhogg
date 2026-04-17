@@ -284,6 +284,99 @@ three repeated header passes into one reusable `BlobMeta` vector).
 See [altw-optimization-history.md](../notes/altw-optimization-history.md)
 for the full investigation and memory optimization research log.
 
+## Check commands (post-optimization)
+
+Optimization history for `check --refs` and `check --ids --full`. Both
+followed the same two-step arc that dropped planet-equivalent workloads
+from tens of minutes to under two minutes: swap per-type `RoaringTreemap`
+for `IdSetDense`, then three-phase parallelize via `parallel_classify_phase`.
+The `roaring` crate dependency was dropped entirely from pbfhogg after
+these landed.
+
+### check --refs (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17, plantasjen)
+
+Sequential main-thread consumer pegged at 100 % CPU on `RoaringTreemap::insert`
+pre-swap. Step #1 swapped to `IdSetDense` (O(1) insert/contains, purpose-built
+for dense-monotonic OSM IDs). Step #2 parallelized via `build_classify_schedules_split`
+(one header walk, per-kind schedules) + three `parallel_classify_phase` phases.
+
+| Dataset | Pre-swap | Post-swap (seq) | Post-parallel | Cumulative |
+|---------|---------:|----------------:|--------------:|-----------:|
+| Japan   | 56.7 s `09484939` | 33.1 s `1fd77d78` | **2.1 s** `4a347e3b` | 27× |
+| Europe  | 426.2 s `fb042f27` | — | **33.6 s** `70ff6c5d` | 12.7× |
+| Planet  | 1225 s (`7e9c2e9` baseline) | — | **72.5 s** `862547e4` | **16.9×** |
+
+Europe phase breakdown post-parallel (UUID `70ff6c5d`):
+
+| Phase | Wall |
+|---|---:|
+| SCHEDULE_SCAN_LOOP (one header walk, all kinds) | 14.8 s |
+| CHECKREFS_NODES (parallel scan) | 11.2 s |
+| CHECKREFS_WAYS (parallel scan) | 7.4 s |
+| **Total** | **33.6 s** |
+
+Planet phase breakdown post-parallel (UUID `862547e4`):
+
+| Phase | Wall |
+|---|---:|
+| SCHEDULE_SCAN_LOOP (one header walk, 92 GB file) | 16.8 s |
+| CHECKREFS_NODES (parallel scan) | 35.4 s |
+| CHECKREFS_WAYS (parallel scan) | 20.2 s |
+| CHECKREFS_DEFERRED_RESOLVE | 0 ms |
+| **Total** | **72.4 s** |
+
+Planet memory: peak 2.17 GB, p95 2.13 GB, p50 1.13 GB, 0 major page faults.
+Pre-allocated `IdSetDense` for 14 B node IDs (1.6 GB resident for the
+duration of phases 1+2) is the dominant contributor.
+
+Plan target was 6–10 min at planet (from the original
+[notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md)
+post-step-#2 projection). Measured 1 min 12 s, ~5-8× under the plan floor.
+
+Full plan, hotpath attribution, alloc breakdown, and off-plan investigations
+live in [notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md).
+
+### check --ids --full (commits `855b3b2`, `0d71b3b`, 2026-04-17, plantasjen)
+
+Only remaining `roaring` consumer before the swap. Streaming mode (default
+`check --ids`) was constant-memory and unchanged; `--full` mode allocated
+per-type `RoaringTreemap`s for duplicate detection. Swap mirrors
+check-refs step #1 (adds `IdSetDense::set_if_new` / `set_atomic_if_new`
+methods for the "is this ID new?" signal that `RoaringTreemap::insert`
+previously provided). Parallel rewrite mirrors check-refs step #2; uses
+the widened `parallel_classify_phase` merge signature (`FnMut(usize, R)`)
+for seq-ordered cross-blob monotonicity checks.
+
+| Dataset | Pre-swap | Post-swap (seq) | Post-parallel | Cumulative |
+|---------|---------:|----------------:|--------------:|-----------:|
+| Europe  | 312.6 s `6ca113a8` | 172.0 s `32d8a631` | **52.7 s** `31ca231d` | 5.9× |
+| Planet  | — | — | **93.2 s** `2f52252d` | n/a (pre-swap not benched) |
+
+Planet phase breakdown (UUID `2f52252d`):
+
+| Phase | Wall |
+|---|---:|
+| pre-schedule setup (`ElementReader::open` + 3× `IdSetDense::pre_allocate` ~1.86 GB) | 22.2 s |
+| SCHEDULE_SCAN_LOOP (one-pass header walk, 92 GB file) | 16.8 s |
+| VERIFYIDS_NODES parallel scan | 36.6 s |
+| VERIFYIDS_WAYS parallel scan | 17.0 s |
+| VERIFYIDS_RELATIONS parallel scan | 0.5 s |
+| **Total** | **93.1 s** |
+
+Planet memory (UUID `2f52252d`, 932 /proc samples):
+
+| Metric | Value |
+|---|---:|
+| Peak RSS | 2.22 GB |
+| p95 RSS | 2.15 GB |
+| p50 RSS | 644 MB |
+| Major page faults | 0 (never touched swap) |
+| Host available | ~27 GB |
+
+`IdSetDense::pre_allocate` is ID-space bounded (14 B nodes + 1.5 B ways +
+25 M relations ≈ 1.86 GB), not population-bounded, so planet peak RSS is
+~the same as Europe.
+
 ## CLI commands
 
 Commit `aacbe80`, plantasjen. Best of 3 runs.

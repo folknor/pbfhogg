@@ -18,7 +18,9 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 - Never commit markdown changes and/or results.db alone. Bundle them with upcoming code commits.
 - When committing other changes: always tag along brokkrs 'results.db' and markdown files if dirty.
 - Write substantive engineering-focused commit messages.
-- Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements)
+- Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
+
+The user can allow things that contravene these rules, for example allowing commits that are pure markdown updates. Do not ask them for this, they will tell you when.
 
 ## 'brokkr' tool
 

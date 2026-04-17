@@ -42,7 +42,8 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `cat` (indexdata generation) | 8m17s | ~200 MB | rewrites BlobHeader without re-compressing |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
 | `getid` | 1m6s | 833 MB | multi-blob ID resolution via indexdata |
-| `check --refs` | 20m25s | 1.73 GB | full referential integrity over 11.6B elements |
+| `check --refs` | **1m12s** | **2.17 GB** | referential integrity over 11.6B elements |
+| `check --ids --full` | **1m33s** | **2.22 GB** | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
 | `apply-changes` (daily diff, zlib) | 12m33s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
 | `renumber` | 3m14s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
 | `extract --smart` (Europe bbox) | 4m42s | 11.17 GB | three-pass, multipolygon-complete |

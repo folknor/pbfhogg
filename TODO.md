@@ -72,21 +72,22 @@ large deltas vs the README.md planet table.
   ambiguous; the new number is the honest two-pass measurement. If we
   want both in README, label them `-R` vs default explicitly.
 
-- [ ] **`cat --type way` planet regression is real - 43.7 s → 73.8 s (+69%).**
-  Same workload (bare `--type way`, indexed planet), same dataset.
-  Baseline `8ebb563e` (commit `46e8764`, 2026-03-29) 43.3 s; `16107a76`
-  (commit `573ef71`, 2026-03-30) 43.7 s. Current `127fdf1e` sidecar:
-  CAT_SCAN_START 52.2 s + CAT_SCAN_END 21.5 s = 73.5 s wall; 95 GB read +
-  28 GB written. Between `573ef71` and `28fd26c` the write path saw a
-  batched-writev sink (`4ed7e52`), runtime-tunable thresholds
-  (`4a68c52`), metrics rework (`8d349c2`, `687d81e`, `985f76c`,
-  `213136f`), permit pool (`9695ad5`), `OutputChunk`/`OutputSink` API
-  (`603385e`), and a `fallocate` hint (`985f76c`). Write-path is the
-  prime suspect; also possible the per-element-alloc elimination
-  (`b45b731`) or `fc17b51` columnar decode regressed the decompress-scan
-  side. Bisect candidates in rough order of likelihood: `603385e`,
-  `4ed7e52`, `9695ad5`, `b45b731`. `brokkr <cmd> --commit <hash>` does
-  git-worktree checkout internally (safe for `.brokkr/results.db`).
+- [ ] **`cat --type way` planet regression - 54 s -> 74 s cold (+37%).**
+  The README 43.7 s baseline was `--bench 3` (warm best-of-3); today's
+  single-shot `--bench 1` at the same commit `573ef71` is 53.9 s cold
+  (UUID `2a5c6c3b`). True cold-vs-cold regression is 54 s -> 74 s, not
+  44 s -> 74 s.
+
+  Narrowed bisect window: **`573ef71..a496e81`**. Probe at `a496e81`
+  (UUID `a58333e3`) already measured 73.8 s - identical to current
+  `28fd26c` - so the regression predates `a496e81` and is NOT in any of
+  the write-path commits (`603385e`, `4ed7e52`, `9695ad5`, `b45b731`,
+  etc.) that followed. The suspect window is 40-ish commits between
+  `573ef71` (2026-03-30, 54 s) and `a496e81` (protohoggr 0.4.0 bump,
+  74 s); the intermediate commits that pinned protohoggr 0.2.1/0.3.0
+  should now build against crates.io since the path-dep was removed.
+  Phase breakdown at current tip: CAT_SCAN_START 52.2 s + CAT_SCAN_END
+  21.5 s, 95 GB read + 28 GB written.
 - [ ] **Rerun `add-locations-to-ways --index-type external` planet** - the
   2026-04-17 overnight hit EMFILE (`rank-W13-047: Too many open files`)
   during stage-1 shard creation. Stage 1 opens `num_shard_workers *

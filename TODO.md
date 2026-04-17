@@ -61,6 +61,7 @@ large deltas vs the README.md planet table.
 | `getid --invert` | 83s | 89.1s | +7% | `3edfefb5` |
 | `cat` (indexdata generation) | 497s | 477.1s | -4% | `d7857f19` |
 | `diff --format osc` (osc 4913, cache hit) | (no planet row) | 6245.2s (~104m) | n/a | `aaaf31ec` |
+| `renumber` (see below) | 194s (--bench 3) | 213.8s (--bench 1) | **+10%** | `b19cd297` |
 
 - [x] **`tags-filter highway=primary` is NOT a regression, workload changed.**
   Baseline `0e44e017` (commit `7818c0f`, 2026-03-29) used `-R
@@ -166,6 +167,49 @@ large deltas vs the README.md planet table.
   new 6245s / 104m planet number wants a home (likely alongside the
   other planet rows). Deferred until the regressions above are resolved
   so the table lands in one coherent update.
+
+- [ ] **`renumber` planet regression - open, needs apples-to-apples
+  bisect.** README row at `reference/performance.md` reads **194s
+  (3m14s), 3.3 GB peak anon** at commit `cb99106` (2026-04-13,
+  `f9098cab`, `--bench 3` best-of-3). 2026-04-17 correctness-sweep
+  validation bench at commit `7634712` (`b19cd297`, `--bench 1` single
+  shot) measured **213.8s / 3.29 GB**. Cross-checked against the
+  immediate predecessor `89c5740` at same `--bench 1` methodology
+  (`df08958f`): **207.4s / 3.26 GB**. So the gap splits three ways:
+  - **+3.1% (+6.4s)** attributable to commit `7634712`, which
+    diagnostic-panic-ified `IdSetDense::set_atomic` /
+    `set_atomic_if_new`. This is within single-shot variance (CLAUDE.md
+    cites 10-15% drift as normal on `--bench 1`) and RSS matches
+    baseline within 1%. Not a real regression but should stay on the
+    radar - `set_atomic` is called per-node during pass 1, hot path.
+  - **+6.9% (+13.4s)** pre-existing drift in the `cb99106..89c5740`
+    window (40+ commits across read, write, verify_ids, altw,
+    check_refs paths). This is the real bisect target.
+  - **Some fraction** of the remaining gap is `--bench 1` vs `--bench 3`
+    methodology. Best-of-3 trims first-run cold-cache penalties that
+    single-shot doesn't see.
+
+  **Investigation steps:**
+  1. Re-measure current tip with `--bench 3` for like-for-like vs the
+     194s baseline. Expect ~205-210s best-of-3 if the drift is real.
+  2. If `--bench 3` confirms a real regression, bisect across
+     `cb99106..7634712` (40+ commits). The write-path churn between
+     `603385e..1ea2844` (new `OutputSink` API, batched writev sink,
+     fallocate hint, sync_all bypass) is the most likely culprit - all
+     of those landed in the renumber-unaffected window but may share
+     inlining / codegen boundaries.
+  3. Confirm `set_atomic` diagnostic panic didn't leak into codegen: a
+     spot `cargo rustc -- --emit=asm` on `renumber_external.rs` pass 1
+     loop between `89c5740` and `7634712` should show unchanged
+     inner-loop asm (the `chunk_for_atomic` helper is `#[inline]` and
+     the extra bounds check should be elided against the existing Vec
+     bounds check).
+
+  Similar methodology / pattern to the `cat --type way` investigation
+  above. UUIDs:
+  - `f9098cab` cb99106 2026-04-13 --bench 3 194.2s (baseline)
+  - `df08958f` 89c5740 2026-04-17 --bench 1 207.4s (predecessor)
+  - `b19cd297` 7634712 2026-04-17 --bench 1 213.8s (current tip)
 
 ## Next up (2026-04-13)
 

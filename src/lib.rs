@@ -137,8 +137,8 @@ pub(crate) mod reorder_buffer;
 
 // Explicit re-exports: flat public API (`pbfhogg::Element`, `pbfhogg::BlobReader`, etc.)
 pub use read::blob::{
-    Blob, BlobDecode, BlobHeader, BlobReader, BlobType, ByteOffset, MAX_BLOB_HEADER_SIZE,
-    MAX_BLOB_MESSAGE_SIZE,
+    Blob, BlobDecode, BlobHeader, BlobReader, BlobReaderSource, BlobType, ByteOffset,
+    MAX_BLOB_HEADER_SIZE, MAX_BLOB_MESSAGE_SIZE,
 };
 pub use read::block::{
     BlockElementsIter, BlockType, GroupIter, GroupNodeIter, GroupRelationIter, GroupWayIter,

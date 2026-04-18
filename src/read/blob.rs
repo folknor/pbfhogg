@@ -575,6 +575,43 @@ impl BlobHeader {
     }
 }
 
+/// Underlying source for [`BlobReader`] that supports seeking.
+///
+/// Provides a fast path for relative skips that preserves any internal buffer
+/// (e.g. `BufReader`'s read-ahead). The default `skip_relative` falls through to
+/// `Seek::seek(SeekFrom::Current(_))`, which is correct but discards any buffer
+/// on `BufReader` — the cause of the all-blobs-scan amplification documented in
+/// `notes/seek-raw-audit.md`. Override for buffered readers to keep the buffer
+/// when the target lies within the buffered window.
+///
+/// Implemented for `BufReader<R: Read + Seek>` (uses `BufReader::seek_relative`),
+/// `File` (default), and `Cursor<T: AsRef<[u8]>>` (default — seeks on `Cursor`
+/// are pure cursor-position bumps, no fd cost). Library users who pass a
+/// different reader type to [`BlobReader::new_seekable`] can opt in by writing
+/// `impl BlobReaderSource for MyReader {}` — the default impl is correct but
+/// pays the `Seek::seek` discard cost on every header walk.
+pub trait BlobReaderSource: Read + Seek {
+    /// Skip relative to the current position. Default impl falls through to
+    /// `Seek::seek(SeekFrom::Current(offset))`. Override for buffered sources
+    /// to avoid discarding the buffer when the target is in-range.
+    fn skip_relative(&mut self, offset: i64) -> std::io::Result<()> {
+        self.seek(SeekFrom::Current(offset)).map(|_| ())
+    }
+}
+
+impl<R: Read + Seek> BlobReaderSource for BufReader<R> {
+    fn skip_relative(&mut self, offset: i64) -> std::io::Result<()> {
+        // Preserves the BufReader's internal buffer when the target lies inside
+        // the buffered window; falls back to discard+lseek otherwise. At the
+        // 256 KB buffer used by `seekable_from_path`, this collapses ~10× file-
+        // size amplification on header-walk paths to roughly the file size.
+        BufReader::seek_relative(self, offset)
+    }
+}
+
+impl BlobReaderSource for File {}
+impl<T: AsRef<[u8]>> BlobReaderSource for Cursor<T> {}
+
 /// A reader for PBF files that allows iterating over [`Blob`]s.
 // wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
 #[derive(Clone, Debug)]
@@ -866,7 +903,7 @@ impl<R: Read + Send> Iterator for BlobReader<R> {
     }
 }
 
-impl<R: Read + Seek + Send> BlobReader<R> {
+impl<R: BlobReaderSource + Send> BlobReader<R> {
     /// Creates a new `BlobReader` from the given reader that is seekable and will be initialized
     /// with a valid offset.
     ///
@@ -963,11 +1000,43 @@ impl<R: Read + Seek + Send> BlobReader<R> {
     }
 
     /// Seek to an offset in bytes. (See `std::io::Seek`)
+    ///
+    /// Note: this calls `Seek::seek` directly, which on `BufReader` discards
+    /// the internal buffer regardless of the target. For the common header-walk
+    /// pattern of "skip the just-read blob body forward", use the internal
+    /// `skip_blob_body` helper which routes through [`BlobReaderSource::skip_relative`]
+    /// to preserve the buffer when possible.
     pub fn seek_raw(&mut self, pos: SeekFrom) -> Result<u64> {
         match self.reader.seek(pos) {
             Ok(offset) => {
                 self.offset = Some(ByteOffset(offset));
                 Ok(offset)
+            }
+            Err(e) => {
+                self.offset = None;
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Skip `n` bytes forward from the current position, updating the running
+    /// offset. Used by the iterator-style header walks
+    /// (`next_header_skip_blob`, `next_header_with_data_offset`) to skip past
+    /// the just-read blob body without discarding the `BufReader` buffer.
+    ///
+    /// Routes through [`BlobReaderSource::skip_relative`], which the `BufReader`
+    /// impl satisfies via `BufReader::seek_relative`. For non-buffered readers
+    /// (`File`, `Cursor`) the default impl is `Seek::seek`, which is already
+    /// optimal for those types.
+    fn skip_blob_body(&mut self, n: u64) -> Result<()> {
+        // header.datasize is i32 in the protobuf; capped at MAX_BLOB_HEADER_SIZE
+        // upstream. Comfortably fits in i64.
+        #[allow(clippy::cast_possible_wrap)]
+        let signed = n as i64;
+        match self.reader.skip_relative(signed) {
+            Ok(()) => {
+                self.offset = self.offset.map(|x| ByteOffset(x.0 + n));
+                Ok(())
             }
             Err(e) => {
                 self.offset = None;
@@ -997,8 +1066,10 @@ impl<R: Read + Seek + Send> BlobReader<R> {
             None => return None,
         };
 
-        // skip blob (which also adjusts self.offset)
-        if let Err(err) = self.seek_raw(SeekFrom::Current(header.datasize as i64)) {
+        // Skip blob body via skip_relative-aware helper (preserves BufReader
+        // buffer when in-range; falls back to Seek::seek otherwise).
+        #[allow(clippy::cast_sign_loss)]
+        if let Err(err) = self.skip_blob_body(header.datasize as u64) {
             self.last_blob_ok = false;
             return Some(Err(err));
         }
@@ -1042,8 +1113,10 @@ impl<R: Read + Seek + Send> BlobReader<R> {
         #[allow(clippy::cast_sign_loss)]
         let data_size = header.datasize as usize;
 
-        // Skip past blob data.
-        if let Err(err) = self.seek_raw(SeekFrom::Current(header.datasize as i64)) {
+        // Skip blob body via skip_relative-aware helper (preserves BufReader
+        // buffer when in-range; falls back to Seek::seek otherwise).
+        #[allow(clippy::cast_sign_loss)]
+        if let Err(err) = self.skip_blob_body(header.datasize as u64) {
             self.last_blob_ok = false;
             return Some(Err(err));
         }

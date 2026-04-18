@@ -1,7 +1,7 @@
 //! Speed up searches by using an index
 
 use crate::error::Result;
-use super::blob::{BlobReader, BlobType, ByteOffset};
+use super::blob::{BlobReader, BlobReaderSource, BlobType, ByteOffset};
 use super::block::PrimitiveBlock;
 use super::elements::{Element, Way};
 use std::collections::BTreeSet;
@@ -100,12 +100,12 @@ impl BlobInfo {
 /// It chooses an efficient method for navigating the PBF structure to achieve this in reasonable
 /// time and with reasonable memory.
 // wontfix(type-generic-bounds): bounds on struct match osmpbf API and document intent
-pub struct IndexedReader<R: Read + Seek + Send> {
+pub struct IndexedReader<R: BlobReaderSource + Send> {
     reader: BlobReader<R>,
     index: Vec<BlobInfo>,
 }
 
-impl<R: Read + Seek + Send> IndexedReader<R> {
+impl<R: BlobReaderSource + Send> IndexedReader<R> {
     /// Creates a new `IndexedReader`.
     ///
     /// # Example

@@ -28,6 +28,7 @@ impl NodeLocationIndex {
     /// 1. Collects all node IDs referenced by OSC ways
     /// 2. Seeds coordinates from OSC nodes (creates/modifications)
     /// 3. Remaining needed IDs stored for base PBF extraction
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn build_from_diff(diff: &CompactDiffOverlay) -> Self {
         // Collect all node IDs referenced by OSC ways
         let mut all_needed: FxHashSet<i64> = FxHashSet::default();
@@ -91,6 +92,7 @@ impl NodeLocationIndex {
     /// overlap needed IDs. Matching blobs use the node scanner (no
     /// PrimitiveBlock construction). Exits early once all needed IDs are found.
     /// Returns `(nodes_found, blobs_scanned)`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn prefill_from_base(
         &mut self,
         base_pbf: &Path,
@@ -108,6 +110,9 @@ impl NodeLocationIndex {
         let mut group_starts = Vec::new();
         let mut nodes_found: u64 = 0;
         let mut blobs_scanned: u64 = 0;
+        let mut blobs_skipped_non_node: u64 = 0;
+        let mut blobs_skipped_range: u64 = 0;
+        let mut early_exit = false;
 
         for blob_result in &mut reader {
             let blob = blob_result?;
@@ -118,9 +123,11 @@ impl NodeLocationIndex {
                 // Skip non-node blobs and node blobs outside needed range
                 if idx.kind != ElemKind::Node {
                     // Sorted PBF: once past nodes, no more node blobs
+                    blobs_skipped_non_node += 1;
                     break;
                 }
                 if !self.overlaps_needed(idx.min_id, idx.max_id) {
+                    blobs_skipped_range += 1;
                     continue;
                 }
             }
@@ -139,8 +146,27 @@ impl NodeLocationIndex {
             }
             blobs_scanned += 1;
             if self.all_found() {
+                early_exit = true;
                 break;
             }
+        }
+
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("merge_prefill_nodes_found", nodes_found as i64);
+            crate::debug::emit_counter("merge_prefill_blobs_scanned", blobs_scanned as i64);
+            crate::debug::emit_counter(
+                "merge_prefill_blobs_skipped_non_node",
+                blobs_skipped_non_node as i64,
+            );
+            crate::debug::emit_counter(
+                "merge_prefill_blobs_skipped_range",
+                blobs_skipped_range as i64,
+            );
+            crate::debug::emit_counter(
+                "merge_prefill_early_exit",
+                i64::from(early_exit),
+            );
         }
 
         Ok((nodes_found, blobs_scanned))

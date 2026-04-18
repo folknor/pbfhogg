@@ -25,6 +25,7 @@ pub(super) struct DiffRanges {
 }
 
 impl DiffRanges {
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn from_diff(diff: &CompactDiffOverlay) -> Self {
         let mut node_ids: Vec<i64> = diff
             .node_ids()

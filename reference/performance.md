@@ -343,13 +343,21 @@ that genuinely costs. Not a release blocker and not in the critical
 planet-pipeline path (once-per-schema renumber, not a steady-state
 command), so shelving for now.
 
-Three planet rows in the README table (`check --ids --full` 1m33s,
-`apply-changes` 12m33s, `build-geocode-index` 20m55s) were not
-re-benched this round: the first tripped over a script-level
-argv-passing bug, the second needs an explicit `--osc-seq` now that
-eight daily diffs are configured, and the third OOM-killed on the
-first attempt in Pass 1.5. All three are queued for the next overnight
-(`overnight.sh`).
+Three planet rows in the README table (`check --ids --full`,
+`apply-changes`, `build-geocode-index`) were not re-benched in the
+first round. All three have since been resolved:
+
+- `check --ids --full`: re-benched at `ef6ce09` (`c498fff0`,
+  `--bench 1`), **69.5 s / 1m10s**, down from the old tainted 1m33s
+  row. Untainted - carries both post-fix short-circuit + seek-raw
+  patches. See the `check --ids --full` section below for the
+  post-fix row.
+- `apply-changes` (daily diff, `--osc-seq 4920`): re-benched at
+  `ef6ce09` (`8e940f71`, `--bench 1`), **756.3 s / 12m36s**, inside
+  noise of the prior 753 s buffered+zlib planet row. No drift.
+- `build-geocode-index`: cleared separately via the full optimisation
+  arc (commit `82db8ed`, UUID `b4b25c05`, **432.9 s / 7m12s**). Not
+  part of the refresh round - the arc landed independently.
 
 #### Europe ALTW phase breakdown (the cleanest signal)
 
@@ -502,6 +510,13 @@ for seq-ordered cross-blob monotonicity checks.
 |---------|---------:|----------------:|--------------:|-----------:|
 | Europe  | 312.6 s `6ca113a8` [TAINTED] | 172.0 s `32d8a631` [TAINTED] | **52.7 s** `31ca231d` [TAINTED] | 5.9× |
 | Planet  | - | - | **93.2 s** `2f52252d` [TAINTED] | n/a (pre-swap not benched) |
+
+Post-fix planet re-bench (commit `ef6ce09`, 2026-04-18, UUID
+`c498fff0`, `--bench 1`): **69.5 s / 1m10s**, carrying both the
+`ca6711e` short-circuit fix and the `aa3147c` `BlobReaderSource`
+seek-raw fix. Untainted replacement for the 93.2 s row; the 23.7 s
+drop is consistent with the ~20 s short-circuit saving observed on
+other `has_indexdata`-gated subcommands (`getid`, `cat`).
 
 Planet phase breakdown (UUID `2f52252d`) [TAINTED]:
 

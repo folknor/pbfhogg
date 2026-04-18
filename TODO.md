@@ -65,12 +65,16 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Open issues
 
-- [ ] **Finish the two planet rows still pending from 2026-04-18** -
-  `check --ids --full` (argv-passing bug in `overnight.sh`, fixed) and
-  `apply-changes` (now needs `--osc-seq 4920` - planet has 8 daily
-  diffs configured). `build-geocode-index` cleared separately at
-  432.9 s via the full optimisation arc (commit `82db8ed`, UUID
-  `b4b25c05`).
+- [x] ~~**Finish the two planet rows still pending from 2026-04-18**~~ -
+  both re-benched at `ef6ce09` via `overnight.sh` round 2 (2026-04-18).
+  `check --ids --full`: **69.5 s / 1m10s** (UUID `c498fff0`),
+  down from the tainted 1m33s row - untainted, carries both the
+  `ca6711e` short-circuit and `aa3147c` seek-raw fixes.
+  `apply-changes --osc-seq 4920`: **756.3 s / 12m36s**
+  (UUID `8e940f71`), no meaningful drift vs the prior 753 s
+  buffered+zlib row. `build-geocode-index` was cleared separately
+  via the optimisation arc (432.9 s, commit `82db8ed`, UUID
+  `b4b25c05`) and never needed re-bench in this round.
 - [x] ~~**Add a planet `diff --format osc` row (two-independent-snapshots scenario) to `reference/performance.md`.**~~
   Added 2026-04-18 as a new `## Diff between independent snapshots`
   section: planet 47-day snapshot pair (UUIDs `42aedca1` default,

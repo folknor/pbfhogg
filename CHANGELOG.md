@@ -13,7 +13,7 @@
 - **renumber**: complete external-join rewrite. Planet 204.5s (3m25s), 3.3 GB peak anon RSS, zero temp disk. Negative input IDs now rejected with a clear error. Orphan refs - way refs and relation members absent from the input - are counted and surfaced in the summary.
 - **add-locations-to-ways `--index-type external`**: major rewrite. `coord_payloads` direct emission replaces the `coord_slots` mmap, rank-bucketed counting sort replaces comparison sort, stage-4 raw passthrough for non-way blobs, file-backed `coords_by_rank` scatter. Planet 1,462s → 661s (-55%).
 - **check --refs**: three-phase parallel scan via `parallel_classify_phase` after swapping `RoaringTreemap` → `IdSetDense`. Planet 1,225s → 70.2s (17.5×); Europe 426.2s → 33.6s (12.7×); Japan 56.7s → 2.1s (27×). Peak RSS 2.17 GB (pre-allocated `IdSetDense` for 14B node IDs).
-- **check --ids --full**: parallel three-phase scan mirroring `check --refs`. Europe 312.6s → 52.7s (5.9×). Planet: 93.2s (no pre-swap baseline). Streaming (non-`--full`) mode unchanged.
+- **check --ids --full**: parallel three-phase scan mirroring `check --refs`. Europe 312.6s → 52.7s (5.9×). Planet: 69.5s / 1m10s at `ef6ce09` (no pre-swap baseline). Streaming (non-`--full`) mode unchanged.
 - **extract** (smart / complete / simple): reuse PASS1 blob schedule in subsequent passes. Europe smart 254s → 181s (-29%), complete -17%, simple -15%.
 - **getparents**: skip node-only blobs via `BlobFilter` when `--add-self` doesn't need nodes (~85% of blobs at planet scale).
 - **derive-changes**: streams output to temp files instead of buffering all changes in memory - constant memory regardless of diff size.

@@ -144,25 +144,66 @@ fn percentiles_u32(data: &mut [u32]) -> (u32, u32, u32) {
     (data[len / 2], data[len * 95 / 100], data[len * 99 / 100])
 }
 
-/// Per-phase wall time accumulation across all batches.
-#[cfg(feature = "hotpath")]
+/// Per-phase wall time accumulation across all batches. Always on - the
+/// accumulation cost is a handful of `Instant::now()` calls per batch
+/// (~10 ns each), amortised to zero against ~100 batches at planet scale.
+/// Emitted as sidecar counters at the end of `merge()`.
 pub(super) struct PhaseTimers {
     pub(super) osc_parse: std::time::Duration,
+    pub(super) diffranges: std::time::Duration,
+    pub(super) prefill: std::time::Duration,
+    pub(super) header_read: std::time::Duration,
+    pub(super) writer_setup: std::time::Duration,
     pub(super) classify_total: std::time::Duration,
-    pub(super) rewrite_total: std::time::Duration,
-    pub(super) output_total: std::time::Duration,
+    pub(super) phase2_inline_total: std::time::Duration,
+    pub(super) rewrite_spawn_total: std::time::Duration,
+    pub(super) rewrite_recv_total: std::time::Duration,
+    pub(super) output_write_total: std::time::Duration,
+    pub(super) passthrough_write_total: std::time::Duration,
     pub(super) trailing_creates: std::time::Duration,
+    pub(super) final_flush: std::time::Duration,
 }
 
-#[cfg(feature = "hotpath")]
 impl PhaseTimers {
     pub(super) fn new() -> Self {
         Self {
             osc_parse: std::time::Duration::ZERO,
+            diffranges: std::time::Duration::ZERO,
+            prefill: std::time::Duration::ZERO,
+            header_read: std::time::Duration::ZERO,
+            writer_setup: std::time::Duration::ZERO,
             classify_total: std::time::Duration::ZERO,
-            rewrite_total: std::time::Duration::ZERO,
-            output_total: std::time::Duration::ZERO,
+            phase2_inline_total: std::time::Duration::ZERO,
+            rewrite_spawn_total: std::time::Duration::ZERO,
+            rewrite_recv_total: std::time::Duration::ZERO,
+            output_write_total: std::time::Duration::ZERO,
+            passthrough_write_total: std::time::Duration::ZERO,
             trailing_creates: std::time::Duration::ZERO,
+            final_flush: std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Cross-thread stall accumulator. The reader thread bumps `reader_send_us`
+/// when a `try_send` fails and it blocks on the full channel; the main thread
+/// bumps `consumer_recv_us` when `collect_batch` blocks on an empty channel,
+/// and `rewrite_recv_us` when the output loop blocks waiting for a rewrite
+/// result. All three surface as sidecar counters for attribution of
+/// reader-bound vs consumer-bound vs writer-bound wall time.
+pub(super) struct StallAccumulator {
+    pub(super) reader_send_us: std::sync::atomic::AtomicU64,
+    pub(super) consumer_recv_us: std::sync::atomic::AtomicU64,
+    pub(super) rewrite_recv_us: std::sync::atomic::AtomicU64,
+    pub(super) writer_call_us: std::sync::atomic::AtomicU64,
+}
+
+impl StallAccumulator {
+    pub(super) fn new() -> Self {
+        Self {
+            reader_send_us: std::sync::atomic::AtomicU64::new(0),
+            consumer_recv_us: std::sync::atomic::AtomicU64::new(0),
+            rewrite_recv_us: std::sync::atomic::AtomicU64::new(0),
+            writer_call_us: std::sync::atomic::AtomicU64::new(0),
         }
     }
 }

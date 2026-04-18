@@ -30,9 +30,9 @@ use super::classify::{
 };
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::node_locations::NodeLocationIndex;
-use super::stats::MergeStats;
+use super::stats::{MergeStats, PhaseTimers, StallAccumulator};
 #[cfg(feature = "hotpath")]
-use super::stats::{PhaseRss, PhaseTimers, read_rss_kb};
+use super::stats::{PhaseRss, read_rss_kb};
 
 use super::Result;
 
@@ -294,9 +294,15 @@ fn read_header(
 
 /// Spawn a reader thread that streams raw data frames over a bounded channel.
 /// Skips the OSMHeader blob and any non-OsmData blobs.
+///
+/// The `stalls` accumulator receives per-send wait time whenever the bounded
+/// channel is full and the reader must block; this drives `WAIT_READER_SEND`
+/// attribution in `brokkr sidecar --stalls` and the `merge_reader_send_wait_us`
+/// sidecar counter.
 fn spawn_reader_thread(
     base_pbf: &Path,
     direct_io: bool,
+    stalls: Arc<StallAccumulator>,
 ) -> (
     std::thread::JoinHandle<std::result::Result<(), String>>,
     mpsc::Receiver<RawBlobFrame>,
@@ -304,9 +310,12 @@ fn spawn_reader_thread(
     let base_path = base_pbf.to_path_buf();
     let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
     let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
+        crate::debug::emit_marker("MERGE_READER_START");
         let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
         let mut file_offset: u64 = 0;
         let mut past_header = false;
+        let mut frames_sent: u64 = 0;
+        let mut blocked_sends: u64 = 0;
         while let Some(frame) =
             read_raw_frame(&mut reader, &mut file_offset).map_err(|e| e.to_string())?
         {
@@ -317,10 +326,36 @@ fn spawn_reader_thread(
             if !past_header || frame.blob_type != BlobKind::OsmData {
                 continue;
             }
-            if frame_tx.send(frame).is_err() {
-                break;
+            // Fast path: try a non-blocking send. Only pay the marker +
+            // atomic-increment cost when the channel is actually full.
+            match frame_tx.try_send(frame) {
+                Ok(()) => {}
+                Err(mpsc::TrySendError::Full(frame)) => {
+                    crate::debug::emit_marker("WAIT_READER_SEND_START");
+                    let t0 = std::time::Instant::now();
+                    let res = frame_tx.send(frame);
+                    let elapsed_us = u64::try_from(t0.elapsed().as_micros())
+                        .unwrap_or(u64::MAX);
+                    stalls.reader_send_us.fetch_add(
+                        elapsed_us,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    crate::debug::emit_marker("WAIT_READER_SEND_END");
+                    blocked_sends += 1;
+                    if res.is_err() {
+                        break;
+                    }
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
+            frames_sent += 1;
         }
+        #[allow(clippy::cast_possible_wrap)]
+        {
+            crate::debug::emit_counter("merge_reader_frames_sent", frames_sent as i64);
+            crate::debug::emit_counter("merge_reader_blocked_sends", blocked_sends as i64);
+        }
+        crate::debug::emit_marker("MERGE_READER_END");
         Ok(())
     });
     (handle, frame_rx)
@@ -328,11 +363,19 @@ fn spawn_reader_thread(
 
 /// Collect a byte-budgeted batch of raw frames from the reader channel.
 /// Returns the estimated in-flight byte cost of the batch.
+///
+/// When the channel drains before the batch is big enough to start work, the
+/// blocking `recv()` fallback is wrapped in a `WAIT_CONSUMER_RECV_*` span and
+/// its elapsed time goes into `stalls.consumer_recv_us`. This is how we
+/// distinguish "reader thread is the bottleneck" (big consumer_recv_us, zero
+/// reader_send_us) from "consumer is the bottleneck" (the inverse) without
+/// guessing from wall-clock.
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn collect_batch(
     frame_rx: &mpsc::Receiver<RawBlobFrame>,
     ranges: &DiffRanges,
     batch: &mut Vec<RawBlobFrame>,
+    stalls: &StallAccumulator,
 ) -> usize {
     use super::classify::estimate_blob_cost;
     batch.clear();
@@ -348,7 +391,17 @@ fn collect_batch(
             }
             Err(mpsc::TryRecvError::Empty) => {
                 if batch.is_empty() {
-                    match frame_rx.recv() {
+                    crate::debug::emit_marker("WAIT_CONSUMER_RECV_START");
+                    let t0 = std::time::Instant::now();
+                    let res = frame_rx.recv();
+                    let elapsed_us = u64::try_from(t0.elapsed().as_micros())
+                        .unwrap_or(u64::MAX);
+                    stalls.consumer_recv_us.fetch_add(
+                        elapsed_us,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    crate::debug::emit_marker("WAIT_CONSUMER_RECV_END");
+                    match res {
                         Ok(frame) => {
                             batch_bytes += estimate_blob_cost(&frame, ranges);
                             batch.push(frame);
@@ -424,7 +477,7 @@ fn emit_create_local(
 /// elements are modifications (handled by normal element processing); IDs that
 /// don't match are creates (emitted by the cursor).
 #[allow(clippy::too_many_lines)]
-#[hotpath::measure]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn rewrite_block_parallel(
     block: &PrimitiveBlock,
     diff: &CompactDiffOverlay,
@@ -698,7 +751,7 @@ pub struct MergeOptions {
 /// Returns an error if the base PBF or OSC file cannot be read, the output
 /// file cannot be written, or if any PBF parsing/encoding fails.
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::cast_precision_loss)]
-#[hotpath::measure]
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub fn merge(
     base_pbf: &Path,
     osc_file: &Path,
@@ -711,9 +764,11 @@ pub fn merge(
         "base PBF has no blob-level indexdata. Without indexdata, every blob must be \
          decompressed to classify elements (significantly slower).")?;
 
+    let mut phase_timers = PhaseTimers::new();
+    let stalls = Arc::new(StallAccumulator::new());
+
     // Step 1: Parse the diff
     crate::debug::emit_marker("MERGE_DIFFPARSE_START");
-    #[cfg(feature = "hotpath")]
     let osc_start = std::time::Instant::now();
     eprintln!("Parsing OSC diff: {}", osc_file.display());
     let diff = Arc::new(parse_osc_file(osc_file)?);
@@ -727,12 +782,7 @@ pub fn merge(
         "CompactDiffOverlay heap estimate: {:.1} MB",
         diff_heap_bytes as f64 / (1024.0 * 1024.0),
     );
-    #[cfg(feature = "hotpath")]
-    let mut phase_timers = PhaseTimers::new();
-    #[cfg(feature = "hotpath")]
-    {
-        phase_timers.osc_parse = osc_start.elapsed();
-    }
+    phase_timers.osc_parse = osc_start.elapsed();
     #[cfg(feature = "hotpath")]
     let mut phase_rss = PhaseRss::new();
     #[cfg(feature = "hotpath")]
@@ -743,7 +793,11 @@ pub fn merge(
     crate::debug::emit_marker("MERGE_DIFFPARSE_END");
 
     // Step 2: Pre-compute sorted ID ranges for fast overlap checking
+    crate::debug::emit_marker("MERGE_DIFFRANGES_START");
+    let diffranges_start = std::time::Instant::now();
     let ranges = Arc::new(DiffRanges::from_diff(&diff));
+    phase_timers.diffranges = diffranges_start.elapsed();
+    crate::debug::emit_marker("MERGE_DIFFRANGES_END");
     eprintln!(
         "Diff ID ranges: {} node IDs, {} way IDs, {} rel IDs",
         ranges.node_ids.len(), ranges.way_ids.len(), ranges.rel_ids.len(),
@@ -754,8 +808,12 @@ pub fn merge(
     // wrap in Arc for read-only sharing across all rewrite tasks (no
     // per-batch cloning).
     let (loc_map, loc_stats) = if locations_on_ways {
+        crate::debug::emit_marker("MERGE_PREFILL_START");
+        let prefill_start = std::time::Instant::now();
         let mut idx = NodeLocationIndex::build_from_diff(&diff);
         let (from_base, blobs_scanned) = idx.prefill_from_base(base_pbf, direct_io)?;
+        phase_timers.prefill = prefill_start.elapsed();
+        crate::debug::emit_marker("MERGE_PREFILL_END");
         let missing = idx.needed_set.len() as u64;
         let total = idx.locations.len() as u64 + missing;
         let from_diff = total - from_base - missing;
@@ -769,9 +827,15 @@ pub fn merge(
     };
 
     // Step 3: Read header from base PBF (for writer setup)
+    crate::debug::emit_marker("MERGE_HEADER_READ_START");
+    let header_start = std::time::Instant::now();
     let header_bytes = read_header(base_pbf, direct_io, locations_on_ways, overrides)?;
+    phase_timers.header_read = header_start.elapsed();
+    crate::debug::emit_marker("MERGE_HEADER_READ_END");
 
     // Step 4: Create pipelined writer
+    crate::debug::emit_marker("MERGE_WRITER_SETUP_START");
+    let writer_setup_start = std::time::Instant::now();
     let mut writer = writer_from_header_bytes(
         output_pbf,
         compression,
@@ -779,10 +843,13 @@ pub fn merge(
         direct_io,
         io_uring,
     )?;
+    phase_timers.writer_setup = writer_setup_start.elapsed();
+    crate::debug::emit_marker("MERGE_WRITER_SETUP_END");
 
     // Step 5: Spawn reader thread with read-ahead
     crate::debug::emit_marker("MERGE_LOOP_START");
-    let (reader_thread, frame_rx) = spawn_reader_thread(base_pbf, direct_io);
+    let (reader_thread, frame_rx) =
+        spawn_reader_thread(base_pbf, direct_io, Arc::clone(&stalls));
 
     // Open second handle for copy_file_range.
     // The main thread owns the primary FileReader; this handle provides the fd
@@ -811,14 +878,15 @@ pub fn merge(
     // of individual channel sends into far fewer.
     let mut passthrough_chunks: Vec<Vec<u8>> = Vec::new();
 
+    let mut batch_count: u64 = 0;
     loop {
-        let batch_bytes = collect_batch(&frame_rx, &ranges, &mut batch);
+        let batch_bytes = collect_batch(&frame_rx, &ranges, &mut batch, &stalls);
         if batch.is_empty() {
             break;
         }
+        batch_count += 1;
 
         // Phase 1: Parallel classify
-        #[cfg(feature = "hotpath")]
         let phase1_start = std::time::Instant::now();
         let classify_results: Vec<std::result::Result<ClassifyResult, String>> = batch
             .par_iter()
@@ -827,9 +895,9 @@ pub fn merge(
                 |buf, frame| classify_only(frame, &ranges, &diff, buf),
             )
             .collect();
+        phase_timers.classify_total += phase1_start.elapsed();
         #[cfg(feature = "hotpath")]
         {
-            phase_timers.classify_total += phase1_start.elapsed();
             let rss = read_rss_kb();
             if rss > phase_rss.classify_max {
                 phase_rss.classify_max = rss;
@@ -837,6 +905,7 @@ pub fn merge(
         }
 
         // Phase 2: Sequential inline upsert assignment (O(log n) per blob)
+        let phase2_start = std::time::Instant::now();
         let mut slots: Vec<BatchSlot> = Vec::with_capacity(batch.len());
         let mut rewrite_jobs: Vec<RewriteJob> = Vec::new();
 
@@ -868,6 +937,8 @@ pub fn merge(
             }
         }
 
+        phase_timers.phase2_inline_total += phase2_start.elapsed();
+
         // Location index is pre-filled and immutable - just reference it.
 
         // Phase 3+4: Spawn parallel rewrites, then stream output in file order.
@@ -875,7 +946,6 @@ pub fn merge(
         // memory as soon as the task completes rather than holding all blocks until
         // all rewrites finish. The main thread processes slots in order, receiving
         // rewrite results from the channel on demand.
-        #[cfg(feature = "hotpath")]
         let phase34_start = std::time::Instant::now();
 
         let rewrite_count = rewrite_jobs.len();
@@ -884,6 +954,7 @@ pub fn merge(
                 rayon::current_num_threads().min(rewrite_count.max(1)),
             );
 
+        let spawn_start = std::time::Instant::now();
         for (job_idx, job) in rewrite_jobs.into_iter().enumerate() {
             let tx = rewrite_tx.clone();
             let diff_clone = Arc::clone(&diff);
@@ -907,6 +978,7 @@ pub fn merge(
             });
         }
         drop(rewrite_tx); // close channel when all cloned senders are done
+        phase_timers.rewrite_spawn_total += spawn_start.elapsed();
 
         // Streaming drain: process slots in file order, receiving rewrite results
         // from the channel as needed. Out-of-order arrivals are buffered in
@@ -961,12 +1033,21 @@ pub fn merge(
                     if use_copy_range {
                         // copy_file_range path: flush coalesced buffer first,
                         // then do kernel-space copy (can't coalesce across copy_file_range)
+                        let t_flush = std::time::Instant::now();
                         flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+                        phase_timers.passthrough_write_total += t_flush.elapsed();
+                        let t_copy = std::time::Instant::now();
                         writer.write_raw_copy(
                             input_fd,
                             batch[i].file_offset,
                             batch[i].frame_bytes.len() as u64,
                         )?;
+                        let copy_us = u64::try_from(t_copy.elapsed().as_micros())
+                            .unwrap_or(u64::MAX);
+                        stalls.writer_call_us.fetch_add(
+                            copy_us,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                     }
                     #[cfg(feature = "linux-direct-io")]
                     if !use_copy_range {
@@ -999,7 +1080,13 @@ pub fn merge(
                 }
                 BatchSlot::Rewrite { job_index, index: _ } => {
                     // Wait for this rewrite result, buffering out-of-order arrivals
+                    let recv_start = std::time::Instant::now();
+                    let mut first_wait = true;
                     while received[*job_index].is_none() {
+                        if first_wait {
+                            crate::debug::emit_marker("WAIT_REWRITE_RESULT_START");
+                            first_wait = false;
+                        }
                         let (idx, result) = rewrite_rx.recv()
                             .map_err(|_| -> Box<dyn std::error::Error> {
                                 "rewrite channel closed unexpectedly".into()
@@ -1008,15 +1095,36 @@ pub fn merge(
                             result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
                         );
                     }
+                    if !first_wait {
+                        crate::debug::emit_marker("WAIT_REWRITE_RESULT_END");
+                    }
+                    let recv_elapsed_us = u64::try_from(recv_start.elapsed().as_micros())
+                        .unwrap_or(u64::MAX);
+                    stalls.rewrite_recv_us.fetch_add(
+                        recv_elapsed_us,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    phase_timers.rewrite_recv_total += recv_start.elapsed();
+                    let t_flush = std::time::Instant::now();
                     flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+                    phase_timers.passthrough_write_total += t_flush.elapsed();
                     let mut output = received[*job_index]
                         .take()
                         .ok_or("rewrite output missing")?;
                     let mut rewrite_bytes: u64 = 0;
+                    let t_write = std::time::Instant::now();
                     for (block_bytes, index, tagdata) in output.blocks.drain(..) {
                         rewrite_bytes += block_bytes.len() as u64;
                         writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                     }
+                    let write_elapsed = t_write.elapsed();
+                    phase_timers.output_write_total += write_elapsed;
+                    let write_us = u64::try_from(write_elapsed.as_micros())
+                        .unwrap_or(u64::MAX);
+                    stalls.writer_call_us.fetch_add(
+                        write_us,
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
                     stats.bytes_rewritten += rewrite_bytes;
                     stats.merge_from(&output.stats);
                     stats.blobs_rewritten += 1;
@@ -1043,12 +1151,15 @@ pub fn merge(
         }
 
         // Flush any remaining coalesced passthrough bytes at batch boundary
+        let t_flush = std::time::Instant::now();
         flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;
+        phase_timers.passthrough_write_total += t_flush.elapsed();
+        // phase34_start bound - leave for reference; the per-step
+        // accumulators above capture the actual rewrite/output/recv costs
+        // directly. Retain only the RSS probe under hotpath.
+        let _ = phase34_start;
         #[cfg(feature = "hotpath")]
         {
-            let elapsed = phase34_start.elapsed();
-            phase_timers.rewrite_total += elapsed;
-            phase_timers.output_total += elapsed;
             let rss = read_rss_kb();
             if rss > phase_rss.rewrite_max {
                 phase_rss.rewrite_max = rss;
@@ -1068,7 +1179,7 @@ pub fn merge(
     // Trailing creates: flush remaining upserts per type.
     // When last_type is None (no blobs at all), cursors are at 0 so all types
     // are flushed in full - equivalent to the previous dedicated else-branch.
-    #[cfg(feature = "hotpath")]
+    crate::debug::emit_marker("MERGE_TRAILING_CREATES_START");
     let trailing_start = std::time::Instant::now();
     let types_to_flush = match last_type {
         None | Some(ElemKind::Node) => &[ElemKind::Node, ElemKind::Way, ElemKind::Relation][..],
@@ -1084,13 +1195,14 @@ pub fn merge(
         }
         flush_block(&mut bb, &mut writer)?;
     }
+    phase_timers.trailing_creates = trailing_start.elapsed();
+    crate::debug::emit_marker("MERGE_TRAILING_CREATES_END");
 
-    #[cfg(feature = "hotpath")]
-    {
-        phase_timers.trailing_creates = trailing_start.elapsed();
-    }
-
+    crate::debug::emit_marker("MERGE_FINAL_FLUSH_START");
+    let flush_start = std::time::Instant::now();
     writer.flush()?;
+    phase_timers.final_flush = flush_start.elapsed();
+    crate::debug::emit_marker("MERGE_FINAL_FLUSH_END");
     crate::debug::emit_marker("MERGE_LOOP_END");
     #[cfg(feature = "hotpath")]
     {
@@ -1107,24 +1219,130 @@ pub fn merge(
 
     stats.print_summary();
 
-    #[allow(clippy::cast_possible_wrap)]
+    #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
     {
+        // Shape counters.
         crate::debug::emit_counter("merge_blobs_passthrough", stats.blobs_passthrough as i64);
         crate::debug::emit_counter("merge_blobs_rewritten", stats.blobs_rewritten as i64);
+        crate::debug::emit_counter("merge_blobs_index_hit", stats.blobs_index_hit as i64);
+        crate::debug::emit_counter("merge_blobs_scan_only", stats.blobs_scan_only as i64);
         crate::debug::emit_counter("merge_total_elements", stats.total_elements() as i64);
         crate::debug::emit_counter("merge_deleted", stats.deleted as i64);
         crate::debug::emit_counter("merge_diff_nodes", stats.diff_nodes as i64);
         crate::debug::emit_counter("merge_diff_ways", stats.diff_ways as i64);
         crate::debug::emit_counter("merge_diff_relations", stats.diff_relations as i64);
+        crate::debug::emit_counter("merge_batches_total", batch_count as i64);
+        crate::debug::emit_counter("merge_bytes_passthrough", stats.bytes_passthrough as i64);
+        crate::debug::emit_counter("merge_bytes_rewritten", stats.bytes_rewritten as i64);
+        crate::debug::emit_counter("merge_diff_heap_bytes", stats.diff_heap_bytes as i64);
+
+        // Phase wall times (ms). Every entry here is an always-on accumulator;
+        // the sum approximates total `merge()` wall excluding pure framework
+        // overhead. Divergence between sum-of-phases and MERGE total indicates
+        // unaccounted-for work and should drive new phase markers.
+        crate::debug::emit_counter(
+            "merge_osc_parse_ms",
+            phase_timers.osc_parse.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_diffranges_ms",
+            phase_timers.diffranges.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_prefill_ms",
+            phase_timers.prefill.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_header_read_ms",
+            phase_timers.header_read.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_writer_setup_ms",
+            phase_timers.writer_setup.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_classify_total_ms",
+            phase_timers.classify_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_phase2_inline_total_ms",
+            phase_timers.phase2_inline_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_rewrite_spawn_total_ms",
+            phase_timers.rewrite_spawn_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_rewrite_recv_total_ms",
+            phase_timers.rewrite_recv_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_output_write_total_ms",
+            phase_timers.output_write_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_passthrough_write_total_ms",
+            phase_timers.passthrough_write_total.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_trailing_creates_ms",
+            phase_timers.trailing_creates.as_millis() as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_final_flush_ms",
+            phase_timers.final_flush.as_millis() as i64,
+        );
+
+        // Stall attribution - each counter names the *blocking point*. Big
+        // reader_send_us and small consumer_recv_us means consumer is the
+        // bottleneck; the inverse means the reader thread is. writer_call_us
+        // is cumulative time in writer.write_* calls, capturing compression
+        // and queue-push backpressure from the merge perspective.
+        crate::debug::emit_counter(
+            "merge_reader_send_wait_us",
+            stalls.reader_send_us.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_consumer_recv_wait_us",
+            stalls.consumer_recv_us.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_rewrite_recv_wait_us",
+            stalls.rewrite_recv_us.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_writer_call_us",
+            stalls.writer_call_us.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+
+        // Locations-on-ways - only populated when the flag is on.
+        if loc_map.is_some() {
+            crate::debug::emit_counter("merge_loc_needed", stats.loc_nodes_needed as i64);
+            crate::debug::emit_counter("merge_loc_from_diff", stats.loc_nodes_from_diff as i64);
+            crate::debug::emit_counter("merge_loc_from_base", stats.loc_nodes_from_base as i64);
+            crate::debug::emit_counter("merge_loc_missing", stats.loc_missing as i64);
+            crate::debug::emit_counter(
+                "merge_loc_node_blobs_scanned",
+                stats.loc_node_blobs_scanned as i64,
+            );
+        }
     }
 
     #[cfg(feature = "hotpath")]
     {
         eprintln!("osc_parse_ms={}", phase_timers.osc_parse.as_millis());
+        eprintln!("diffranges_ms={}", phase_timers.diffranges.as_millis());
+        eprintln!("prefill_ms={}", phase_timers.prefill.as_millis());
+        eprintln!("header_read_ms={}", phase_timers.header_read.as_millis());
+        eprintln!("writer_setup_ms={}", phase_timers.writer_setup.as_millis());
         eprintln!("classify_total_ms={}", phase_timers.classify_total.as_millis());
-        eprintln!("rewrite_total_ms={}", phase_timers.rewrite_total.as_millis());
-        eprintln!("output_total_ms={}", phase_timers.output_total.as_millis());
+        eprintln!("phase2_inline_total_ms={}", phase_timers.phase2_inline_total.as_millis());
+        eprintln!("rewrite_spawn_total_ms={}", phase_timers.rewrite_spawn_total.as_millis());
+        eprintln!("rewrite_recv_total_ms={}", phase_timers.rewrite_recv_total.as_millis());
+        eprintln!("output_write_total_ms={}", phase_timers.output_write_total.as_millis());
+        eprintln!("passthrough_write_total_ms={}", phase_timers.passthrough_write_total.as_millis());
         eprintln!("trailing_creates_ms={}", phase_timers.trailing_creates.as_millis());
+        eprintln!("final_flush_ms={}", phase_timers.final_flush.as_millis());
         eprintln!("phase_rss_after_osc_kb={}", phase_rss.after_osc_parse);
         eprintln!("phase_rss_classify_max_kb={}", phase_rss.classify_max);
         eprintln!("phase_rss_rewrite_max_kb={}", phase_rss.rewrite_max);

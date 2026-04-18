@@ -338,31 +338,19 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
     let mut total_cells: u32 = 0;
     let mut prev_cell_id: u64 = 0;
 
-    // Parallel read + parse + sort for all 256 buckets (plan item #3).
-    // The group + write phase stays serial on the main thread so the
-    // output files stay byte-stable and the running `*_byte_offset`
-    // counters advance deterministically. Memory: each bucket's parsed
-    // entries live in the `Vec<Vec<ParsedBucketEntry>>` between parallel
-    // join and serial consumption — peak is roughly the full Stage A
-    // output volume (Germany ~25 MB, Europe ~125 MB, planet ~300 MB),
-    // acceptable for the parallel-wall win.
-    let sorted_buckets: Vec<Vec<ParsedBucketEntry>> = (0..NUM_BUCKETS)
-        .into_par_iter()
-        .map(|bucket_idx| -> std::io::Result<Vec<ParsedBucketEntry>> {
-            let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
-            if !bucket_path.exists() { return Ok(Vec::new()); }
-            let data = std::fs::read(&bucket_path)?;
-            std::fs::remove_file(&bucket_path)?;
-            if data.is_empty() { return Ok(Vec::new()); }
-            let mut entries = parse_bucket_file(&data);
-            drop(data);
-            entries.sort_unstable_by_key(|e| e.cell_id);
-            Ok(entries)
-        })
-        .collect::<std::io::Result<_>>()?;
+    for bucket_idx in 0..NUM_BUCKETS {
+        let bucket_path = bucket_dir.join(format!("{bucket_idx:03}"));
+        if !bucket_path.exists() { continue; }
 
-    for entries in &sorted_buckets {
-        if entries.is_empty() { continue; }
+        let data = std::fs::read(&bucket_path)?;
+        std::fs::remove_file(&bucket_path)?;
+        if data.is_empty() { continue; }
+
+        let mut entries = parse_bucket_file(&data);
+        drop(data); // free the raw bytes
+
+        // Sort by cell_id
+        entries.sort_unstable_by_key(|e| e.cell_id);
 
         // Group by cell_id and write merged output
         let mut i = 0;

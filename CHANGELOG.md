@@ -47,6 +47,7 @@
 | check --ids --full | Europe 35 GB | 52.7s | -83% (5.9×) |
 | extract --smart | Europe 35 GB | 181s | -29% |
 | derive-changes | - | streaming | constant memory |
+| diff (two independent planet snapshots) | Planet 87 GB | 2225s (37m) | 55 MB peak, streaming merge-join |
 
 ## 0.2.0 - 2026-04-09
 

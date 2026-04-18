@@ -49,6 +49,7 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 | `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 | `apply-changes` (daily diff, zlib) | 12m33s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
 | `build-geocode-index` | **7m12s** | ~25 GB | reverse geocoding index, S2 cells (pass-3 stage-B transient peak) |
+| `diff --format osc` (two independent 47-day-apart planets) | 37m06s | **55 MB** | streaming merge-join, full decode both sides, produces OSC changeset |
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
 

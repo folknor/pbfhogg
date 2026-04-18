@@ -1056,6 +1056,43 @@ Query latency not yet benchmarked. Both architectures use the same algorithm
 (S2 cell neighborhood + binary search + distance scoring on mmap'd data), so
 sub-millisecond latency is expected.
 
+## Diff between independent snapshots
+
+The pbfhogg CLI command is `diff` (single command). Its performance
+shape depends on the inputs: two PBFs with byte-level blob overlap
+(e.g. one derived from the other via `apply-changes`) trigger a
+byte-equal fast-path that skips decode for unchanged blobs; two
+independent snapshots (e.g. Geofabrik planets weeks apart) have no
+byte-level overlap and require full decode on both sides. This
+section captures the full-decode scenario.
+
+Brokkr distinguishes the two input shapes via `brokkr diff` (which
+applies an OSC to the base first so the fast-path engages) vs
+`brokkr diff-snapshots` (which feeds two independent PBFs). Same
+pbfhogg CLI underneath; different measurement.
+
+### Planet (87 GB input, 93 GB output snapshot, 47-day apart)
+
+Commit `7e9c2e9`, plantasjen, `--bench 1`. `from=base` is the
+2026-02-23 planet; `to=20260411` is the corresponding April-11
+snapshot registered under the planet dataset's snapshot key.
+
+| UUID | Args | Wall | Peak anon RSS |
+|---|---|---:|---:|
+| `42aedca1` | `--from base --to 20260411` (default text summary) | 2150.9 s (35m51s) | - |
+| `53900d5f` | `--from base --to 20260411 --format osc` | 2225.6 s (37m06s) | **54.9 MB** |
+
+`diff` is a streaming merge-join between the two sorted PBF readers -
+no bulk in-memory structures - so peak anon stays tiny (~55 MB)
+regardless of input size. Single-threaded at 1.0 avg cores; 229 GB
+disk read + 15 GB OSC output write. Safe on any host.
+
+Both runs are at commit `7e9c2e9`, which is inside the 2026-04-18
+TAINTED window (`4ce7e93..c0ae9a7`) - wall carries the unaccounted
+`has_indexdata` O(N) all-blobs-scan cost; RSS and sub-phase data are
+unaffected. Re-measure post-`aa3147c` when a fresh planet snapshot
+pair becomes interesting.
+
 ## `--direct-io` impact summary
 
 | Workload | Bottleneck | `--direct-io` effect |

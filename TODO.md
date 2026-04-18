@@ -6,7 +6,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [x] ~~**[notes/altw-as-renumber.md](notes/altw-as-renumber.md)**~~ - **EXPERIMENT FAILED (2026-04-16).** Implemented as `src/commands/altw_v2.rs`, OOM-killed at Europe. Measured unique-referenced count was 3.6 B → 29 GB coord table (plan estimated 2 B / 16 GB at planet; real planet ~10 B / ~80 GB). The in-RAM-coord-table thesis is disproven for Europe+; the existing 4-stage external-sort shape is load-bearing and correct. See the plan document's top-of-file notice for the post-mortem. **Active ALTW work moves to** [notes/altw-structural-reports.md](notes/altw-structural-reports.md) **(specific-seam items).**
 
-- [ ] **[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)** - `build-geocode-index`. Current: **1346 s / 14.59 GB RSS** at planet. Target: **~10-12 min / same RSS**. Single-threaded Pass 2 is the dominant phase; `mallopt(M_ARENA_MAX, 2)` + parallel node/way split unlocks it. Plus parallelizing Pass 3 stage B and fusing fine+coarse cell computation.
+- [x] ~~**[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)**~~ - `build-geocode-index`. **ARC LANDED 2026-04-18.** Planet 1,255 s (20.9 min, TAINTED baseline) -> **432.9 s (7m12s)**, -65 % / 2.9x. Pass 1.5 peak anon 29.5 GB -> 3.0 GB (-90 %); governing peak migrated to Pass 3 Stage B at ~25 GB, comfortable on 27 GB hosts. All 10 ranked items (#1 Phase 2a+2b, #2, #3, #4, #5, #6, #7, #8, plus header-walk consolidation and direct coord_mmap writes) shipped. Remaining follow-ups in the note: #4 "needs another pass" (fused Stage A delivered only 2.8 s at Europe vs the 40-60 s planet prediction), Pass 2 interp resolve still sequential at 30.6 s planet, interpolation endpoint CSR for RSS hygiene.
 
 - [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Steps #1 + #2 landed (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s (16.9×)** at UUID `862547e4`, ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) not needed at current numbers.
 
@@ -16,25 +16,11 @@ Measurement-first on every one: turn on `#[cfg(feature = "hotpath")]` counters (
 
 ## Split oversized source files (blocker for upcoming optimization work)
 
-Fifteen `.rs` files under `src/` are over 1000 lines. Two of them
-(`src/commands/extract.rs` at **3793 lines** and
-`src/geocode_index/builder.rs` at **1758 lines**) are the direct targets
-of plans above (build-geocode-index, extract smart/complete/simple
-optimizations). Splitting these two BEFORE diving into the next round
-of optimization work makes the diffs reviewable and the blast radius
-legible; trying to land `mallopt(M_ARENA_MAX, 2)` + parallel node/way
-split into a 1.8 K-line file is a recipe for merge pain and review
-fatigue.
-
 Rank-ordered by urgency (measured in total lines and proximity to
 active optimization plans):
 
 | Lines | File | Active plan proximity |
 |------:|------|------|
-| ~~3793~~ | ~~`src/commands/extract.rs`~~ - split 2026-04-17, now `src/commands/extract/` (6 files) | ✓ extract smart/complete (strong), multi-extract (recent) |
-| ~~1957~~ | ~~`src/commands/inspect.rs`~~ - split 2026-04-17, now `src/commands/inspect/` (7 files) | - |
-| ~~1758~~ | ~~`src/geocode_index/builder.rs`~~ - split 2026-04-17, now `src/geocode_index/builder/` (8 files) | ✓ build-geocode-index (active plan) |
-| ~~1705~~ | ~~`src/commands/renumber_external.rs`~~ - split 2026-04-17, now `src/commands/renumber_external/` (6 files) | renumber regression (open investigation) |
 | 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
 | 1506 | `src/osc.rs` | - |
@@ -50,48 +36,6 @@ active optimization plans):
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):
 
-- [x] ~~**`src/commands/extract.rs` (3793 lines)**~~ - **DONE 2026-04-17.**
-  Split into 6 files under `src/commands/extract/` via general-purpose
-  subagent (second attempt after the first bombed): `mod.rs` (1231,
-  public API + dispatcher + GeoJSON/config parsing + all unit tests),
-  `common.rs` (491, shared helpers: `BboxInt`, `BlobDesc`,
-  `build_blob_schedule{,_with_passthrough}`, `pread_execute`,
-  `pread_write_pass{,_with_schedule}`, `ExtractPass2IdSets`,
-  `extract_block_pass2`), `simple.rs` (625), `multi.rs` (785),
-  `complete.rs` (87), `smart.rs` (652, with the `RelationHandler` trait
-  + `Pass1Result` + `collect_pass1_generic` reused by `complete.rs`).
-- [x] ~~**`src/geocode_index/builder.rs` (1758 lines)**~~ - **DONE 2026-04-17.**
-  Split into 8 files under `src/geocode_index/builder/` via general-purpose
-  subagent: `mod.rs` (338, `pub fn build_geocode_index` + `BuildConfig` +
-  `BuildStats` + orchestration), `strings.rs` (40, `StringPool`),
-  `pass1.rs` (97, relation scan), `pass1_5.rs` (83, referenced-node
-  collection with the borderline-safety-envelope CAVEAT preserved),
-  `pass2.rs` (459, fused nodes+ways with the Null Island + SlimInterpWay
-  + u16-node_count KNOWN LIMITATION / INVARIANT comments),
-  `admin.rs` (167, polygon assembly + admin u16 INVARIANT),
-  `interp.rs` (155, endpoint resolution with sentinel-ambiguity comment),
-  `pass3.rs` (579, S2 cell aggregation + Stage B three u16 INVARIANTs +
-  `cover_segment` tests).
-- [x] ~~**`src/commands/inspect.rs` (1957 lines)**~~ - **DONE 2026-04-17.**
-  Split into 7 files under `src/commands/inspect/` via general-purpose subagent:
-  `mod.rs` (14 lines, re-exports), `types.rs` (519, stats + `InspectReport`),
-  `scan.rs` (357, index-only + full-decode scan loops),
-  `report.rs` (547, human-readable output), `json.rs` (243, feature-gated
-  JSON output), `show_element.rs` (237, single-element lookup),
-  `format.rs` (81, pure formatters).
-- [x] ~~**`src/commands/renumber_external.rs` (1705 lines)**~~ - **DONE 2026-04-17.**
-  Split into 6 files under `src/commands/renumber_external/` via subagent:
-  `mod.rs` (318, entry + orchestration + `StageCounters`),
-  `schedule.rs` (79, `build_all_blob_schedules` + `BlobTask`),
-  `pass1.rs` (224, parallel node scan), `stage2.rs` (247, stage 2d way assembly),
-  `relations.rs` (300, fused R1 / R2d relation rewrite),
-  `wire_rewrite.rs` (595, protobuf wire-format ID rewriters for
-  DenseNodes / Ways / Relations).
-- [ ] **Remaining >1000 line files** - split opportunistically when the
-  next feature or optimization touches them. Don't mass-refactor; pay the
-  split cost as each file becomes hot.
-
-Splitting discipline:
 - One file per commit. Don't bundle multiple splits.
 - No behavior changes in a split commit - pure move + module wiring.
 - Preserve `#[cfg_attr(feature = "hotpath", hotpath::measure)]` / marker
@@ -99,22 +43,6 @@ Splitting discipline:
   are findable by name.
 - Run `brokkr check` after each move to catch unused-import drift.
 - Update `notes/` cross-references if line numbers change substantially.
-
-## Correctness concerns spotted while spelunking
-
-Surfaced during the optimization-plan reviews above. All six closed on 2026-04-17 - the silent-truncation ones with hard errors at the write site, the sentinel collisions with documentation (a real fix is a presence bitmap; not worth it until observed in production).
-
-- [x] ~~**Geocode Stage B silently truncates cell entries to 65535**~~ - **DONE (2026-04-17).** All four Stage B sites (street/addr/interp per-cell entries and admin entries in `write_admin_index`) now hard-error with a diagnostic naming the offending cell and pointing at the u32+FORMAT_VERSION bump path if the cap is ever legitimately hit. Replaces `.min(u16::MAX as usize)` silent truncation. Byte-offset bookkeeping tightened to trust the `u16::try_from` guard instead of re-applying `.min()`.
-
-- [x] ~~**Geocode Pass 1.5 may violate the `parallel_classify_accumulate` contract**~~ - **DONE (2026-04-17).** Contract comment rewritten to describe three tiers (safe sparse / borderline / unsafe dense) with the geocode Pass 1.5 call site as the borderline exemplar, 1.3 GB worst-case per-worker bitmap bound stated explicitly, and a cross-link to the `notes/geocode-build-opportunities.md` rewrite item. Pass 1.5 call site annotated with the same caveat and the long-term `parallel_classify_phase` target shape.
-
-- [x] ~~**`(0, 0)` coord sentinel collides with Null Island**~~ - **DONE (2026-04-17).** Both sites (`src/geocode_index/builder.rs` way-coord resolution, `src/commands/altw/stage2.rs` `is_resolved`) now carry matching `KNOWN LIMITATION` comments cross-linking to each other and pointing at the presence-bitmap fix shape. Code behavior unchanged - observed frequency too low to justify the extra pass yet.
-
-- [x] ~~**`IdSetDense::set_atomic` panics on indexdata max_id mismatch**~~ - **DONE (2026-04-17).** `set_atomic` / `set_atomic_if_new` now route through a shared `chunk_for_atomic` helper that produces a detailed panic message naming the offending ID, the pre-allocated upper bound, and the most likely root causes (indexdata mismatch, hard-coded cap overshoot, missing `pre_allocate`). Panic preserved rather than converting to `Result` - the hot path can't afford `Result`, and a diagnostic panic is strictly better than the old opaque `.expect("not pre-allocated")`. `pre_allocate` doc now spells out the contract the callers are expected to uphold.
-
-- [x] ~~**`u16` truncation of way `node_count` in geocode**~~ - **DONE (2026-04-17).** Both `StreetWay.node_count` and `InterpWay.node_count` write sites converted from `.min(u16::MAX)` to `u16::try_from(...)` with a diagnostic error pointing at the 2 000-ref OSM convention cap. Unreachable today, but fails loud if the convention ever shifts.
-
-- [x] ~~**Interpolation way `(start_number = 0, end_number = 0)` is both unresolved-sentinel and valid input**~~ - **DONE (2026-04-17).** `SlimInterpWay` struct doc, the init site, and the resolve site all carry matching `KNOWN LIMITATION` comments describing the sentinel collision with house number 0 and the `resolved: bool` + FORMAT_VERSION-bump fix shape. Behavior unchanged - edge case is too rare to justify the format bump.
 
 ## Important: ignored tests
 
@@ -137,21 +65,25 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Open issues
 
-- [x] ~~**Rerun `add-locations-to-ways --index-type external` planet**~~ -
-  Done 2026-04-18 at commit `aee7727`, `--bench 3`, UUID `a406d77e`:
-  **661.2 s / 11m01s** with `ulimit -n 8192` in `overnight.sh`. The
-  earlier EMFILE (`rank-W13-047: Too many open files`) was ulimit-driven;
-  raising the soft FD cap unblocked it. README row updated.
-- [ ] **Finish the three planet rows that didn't land on 2026-04-18** -
-  `check --ids --full` (argv-passing bug in `overnight.sh`, fixed),
+- [ ] **Finish the two planet rows still pending from 2026-04-18** -
+  `check --ids --full` (argv-passing bug in `overnight.sh`, fixed) and
   `apply-changes` (now needs `--osc-seq 4920` - planet has 8 daily
-  diffs configured), and `build-geocode-index` (OOM-killed in Pass 1.5
-  at 1m34s on the first attempt; retry in isolation). All three
-  queued in the trimmed `overnight.sh` for the next overnight run.
-- [ ] **Add a planet `diff --format osc` row** somewhere - currently only
-  the Denmark 73.1s value at `reference/performance.md:352` exists. The
-  new 6245s / 104m planet number wants a home (likely alongside the
-  other planet rows).
+  diffs configured). `build-geocode-index` cleared separately at
+  432.9 s via the full optimisation arc (commit `82db8ed`, UUID
+  `b4b25c05`).
+- [x] ~~**Add a planet `diff --format osc` row (two-independent-snapshots scenario) to `reference/performance.md`.**~~
+  Added 2026-04-18 as a new `## Diff between independent snapshots`
+  section: planet 47-day snapshot pair (UUIDs `42aedca1` default,
+  `53900d5f` --format osc), both at commit `7e9c2e9`, ~2150-2225 s /
+  35-37 min, tainted by the has_indexdata regression window. The prior
+  TODO cited "Denmark 73.1s at reference/performance.md:352" and a
+  "6245s / 104m planet" number - both incorrect. The 73.1 s row is in
+  the Japan CLI commands table (line 597), and the 6245 s planet
+  number doesn't match anything in results.db (nearest runs are the
+  ~2150-2225 s pair noted above). The pbfhogg CLI is `diff` (single
+  command); brokkr wraps it as either `brokkr diff` (apply-changes
+  fast-path) or `brokkr diff-snapshots` (full decode both sides) to
+  distinguish the two input shapes.
 
 ## Next up (2026-04-13)
 
@@ -763,11 +695,6 @@ optimizations (block-pipelined + skip_metadata, tag-first classification,
 FxHash, pass fusion, clone/alloc cleanup) to other commands.
 
 **getid** (moderate impact, low risk):
-- [x] Replace `dep_node_ids: BTreeSet<i64>` with `IdSetDense` in `getid_with_refs`.
-  O(log n) → O(1) per node lookup. Also removed dead `strip_tags_ids` parameter.
-  Commit `a704f5c`.
-- [x] Use `elements_skip_metadata()` in `getid_with_refs` pass 1 and
-  `parse_ids_from_pbf`. Commits `a704f5c`, `58e38d8`.
 - [ ] Audit pass fusion for `--add-referenced` / `--invert` flows - checked:
   cannot fuse (pass 2 needs complete dep_node_ids before deciding which nodes
   to emit). Two-pass structure is inherent to the data dependency.

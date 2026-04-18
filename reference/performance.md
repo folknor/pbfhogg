@@ -2,6 +2,16 @@
 
 Consolidated runtime measurements across datasets and commands.
 
+> **TAINTED BENCHMARKS WARNING (2026-04-18).** Bench numbers measured at any
+> commit in `4ce7e93..c0ae9a7` (Apr 9–17 2026) on the affected commands
+> (`add-locations-to-ways`, `build-geocode-index`, `cat --type`/`--dedupe`,
+> `check-ids`, `diff`, `extract` non-simple, `getid`, `inspect --nodes`/`--tags`,
+> `sort`, `tags-filter` non-invert) carry an unaccounted O(N) all-blobs-scan
+> cost from a `has_indexdata` / `check_sorted_and_indexed` regression that was
+> in effect during that window. Affected entries are marked `[TAINTED]`
+> below — re-measure before relying on them. See `find_tainted_runs.py`
+> for the full row list.
+
 ## Host: plantasjen
 
 - CPU: AMD (details via `brokkr env`)
@@ -178,7 +188,7 @@ anon RSS at Europe scale via 4-stage radix join pipeline (node-only wire
 scanner for stage 2, scatter buffer for stage 3, sequential reader for
 stage 4).
 
-Current Europe external baseline on `main` (commit `e497e54`): **320.5s**
+Current Europe external baseline on `main` (commit `e497e54`): **320.5s** [TAINTED]
 (`5m21s`, UUID `4268196a`). Previous baseline `d3e13ed` was 333s; the
 `e497e54` change replaces the `finalize_coord_payloads` consolidation
 phase with an in-RAM `BlobLocationRouter` (see the stage-breakdown tables
@@ -217,7 +227,7 @@ header-only walks in stage 1 and stage 4.
 | Stage 4 (assembly) | 90.6s | 3.25 GB peak | Way reframe + node decode/filter + relation passthrough |
 | **Total** | **333s** | | |
 
-### External join stage breakdown (Europe, commit `e497e54`, plantasjen)
+### External join stage breakdown (Europe, commit `e497e54`, plantasjen) [TAINTED]
 
 The finalize phase is replaced by an in-RAM routing table: worker tmp
 files stay open and stage 4 preads directly from the right fd. No more
@@ -233,7 +243,7 @@ item #8.
 | **Router build** | **0.163s** | 3.07 GB peak | Replaces finalize: walks manifests + straddler staging, encodes straddlers into RAM |
 | Relation scan | 21.0s | 3.14 GB peak | `collect_relation_member_node_ids()` - single-sample variance vs baseline |
 | Stage 4 (assembly) | 91.7s | 3.40 GB peak | `BlobLocationRouter::pread_blob_payload` routes to worker tmps or in-RAM straddlers |
-| **Total** | **320.5s** | | −12.5 s vs `d3e13ed` on single `--bench 1` sample (UUID `4268196a`) |
+| **Total** | **320.5s** [TAINTED] | | −12.5 s vs `d3e13ed` on single `--bench 1` sample (UUID `4268196a`) |
 
 Direct phase saving is unambiguous: `18.3 s → 0.163 s` on finalize. Single-sample
 wall delta is smaller than the phase saving because relation-scan and stage-4 wobble
@@ -336,7 +346,7 @@ post-step-#2 projection). Measured 1 min 12 s, ~5-8× under the plan floor.
 Full plan, hotpath attribution, alloc breakdown, and off-plan investigations
 live in [notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md).
 
-### check --ids --full (commits `855b3b2`, `0d71b3b`, 2026-04-17, plantasjen)
+### check --ids --full (commits `855b3b2`, `0d71b3b`, 2026-04-17, plantasjen) [TAINTED]
 
 Only remaining `roaring` consumer before the swap. Streaming mode (default
 `check --ids`) was constant-memory and unchanged; `--full` mode allocated
@@ -349,10 +359,10 @@ for seq-ordered cross-blob monotonicity checks.
 
 | Dataset | Pre-swap | Post-swap (seq) | Post-parallel | Cumulative |
 |---------|---------:|----------------:|--------------:|-----------:|
-| Europe  | 312.6 s `6ca113a8` | 172.0 s `32d8a631` | **52.7 s** `31ca231d` | 5.9× |
-| Planet  | — | — | **93.2 s** `2f52252d` | n/a (pre-swap not benched) |
+| Europe  | 312.6 s `6ca113a8` [TAINTED] | 172.0 s `32d8a631` [TAINTED] | **52.7 s** `31ca231d` [TAINTED] | 5.9× |
+| Planet  | — | — | **93.2 s** `2f52252d` [TAINTED] | n/a (pre-swap not benched) |
 
-Planet phase breakdown (UUID `2f52252d`):
+Planet phase breakdown (UUID `2f52252d`) [TAINTED]:
 
 | Phase | Wall |
 |---|---:|
@@ -363,7 +373,7 @@ Planet phase breakdown (UUID `2f52252d`):
 | VERIFYIDS_RELATIONS parallel scan | 0.5 s |
 | **Total** | **93.1 s** |
 
-Planet memory (UUID `2f52252d`, 932 /proc samples):
+Planet memory (UUID `2f52252d`, 932 /proc samples) [TAINTED]:
 
 | Metric | Value |
 |---|---:|
@@ -398,7 +408,7 @@ Commit `aacbe80`, plantasjen. Best of 3 runs.
 | cat --type way | 239 ms |
 | merge-changes | 107 ms |
 | inspect-tags | 1.61s |
-| diff --format osc | 1.6s (`1a42c27`) |
+| diff --format osc | 1.6s (`1a42c27`) [TAINTED] |
 | inspect-nodes | 1.73s |
 | check --ids | 1.87s |
 | getid --invert | 0.5s |
@@ -771,10 +781,10 @@ Cumulative effect of the four landed seam deletions in
 | `3d977a0` | Pre-structural-reports baseline | 400s | 953s |
 | `4f059b67` | (pre-#8 planet baseline in structural reports) | - | 867.7s |
 | `d3e13ed` | (pre-#8 Europe baseline in structural reports) | 333s | - |
-| `e497e54` | #8 `BlobLocationRouter` (finalize consolidation removed) | 320.5s | - |
-| `f1a4ada` | #4 stage-2 blob-local rank counter + drop rank index | 308.0s | - |
-| `6d71053` | #9 L1 metadata-driven relation scan | 291.6s | - |
-| `7904a95` | (current, #3/#11 attempted and reverted - bench `123f70f1`) | 291.6s | **698.1s** |
+| `e497e54` | #8 `BlobLocationRouter` (finalize consolidation removed) | 320.5s [TAINTED] | - |
+| `f1a4ada` | #4 stage-2 blob-local rank counter + drop rank index | 308.0s [TAINTED] | - |
+| `6d71053` | #9 L1 metadata-driven relation scan | 291.6s [TAINTED] | - |
+| `7904a95` | (current, #3/#11 attempted and reverted - bench `123f70f1`) | 291.6s [TAINTED] | **698.1s** [TAINTED] |
 
 Planet drop `867.7s → 698.1s` (**−19.5%**) confirms the
 stage-2/relation-scan wins scale more strongly with tuple count than
@@ -860,7 +870,8 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Planet (~87 GB) | 8-10 hours (192 GB RAM) | - | Would OOM on 30 GB host |
 
 Planet (validated): **1,255s (20.9 min), 29.5 GB peak anon RSS** in
-`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`). The earlier
+`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`) [TAINTED — wall
+inflated by all-blobs-scan regression; RSS unaffected]. The earlier
 17.8 GB figure under-reported: brokkr previously hid short-emitting phase
 markers from sidecar output, so PASS1_5's transient peak never surfaced.
 The peak itself has not changed - only its visibility. Our index is larger due to segment-level indexing (6 bytes

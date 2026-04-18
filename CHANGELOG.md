@@ -77,6 +77,25 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
 
 ### Bug fixes
 
+- **`has_indexdata` / `check_sorted_and_indexed` O(N) regression (shipped
+  in v0.2.0).** Commit `4ce7e93` (2026-04-09, ~3.5 h before the v0.2.0 tag)
+  changed both probes from a first-OsmData-blob short-circuit to a full
+  scan of every blob header in the file, ostensibly to detect partially-
+  indexed PBFs up front. Restored to short-circuit. Affected eight CLI
+  subcommands unconditionally (`sort`, `getid`, `add-locations-to-ways`,
+  `build-geocode-index`, `diff` including `--format osc`, `inspect --nodes`,
+  `cat --dedupe`, `check-ids`) plus five conditionally (`cat --type`,
+  `extract` non-simple, `tags-filter` non-invert, `inspect --tags --type`).
+  Inflation was several seconds on small datasets and ~20 s on planet,
+  proportionally severe for short-running commands: planet `cat --type way`
+  measured 73.8 s with regression vs 43.9 s post-fix (-41 %), matching the
+  README's pre-regression 44 s baseline. Tolerance for partially-indexed
+  PBFs is already in the consuming paths (`build_classify_schedules_split`
+  treats unindexed blobs as visible to every kind filter), so the up-front
+  guard was over-defensive. All 29 affected benchmark rows in
+  `.brokkr/results.db` were invalidated; tainted citations in
+  `reference/performance.md` and seven `notes/*.md` files annotated
+  `[TAINTED]` pending re-measurement.
 - 19 bugs fixed from post-release code review (F1-F22, F23-F32, F33-F40).
 - `dp_count_range`: use clamped segment distance matching `dp_mark`.
 - `decompress_blob_raw` lifetime bound, `RelMember` error type.

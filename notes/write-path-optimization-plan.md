@@ -981,7 +981,7 @@ Current status:
 - a hidden-hook probe was tried briefly in `985f76c`
 - Europe ALTW external `--compression none` probe:
   - nearby no-hint reference `0d253e44`: `300.1s`
-  - hinted run `1fc20b79`: `303.2s`
+  - hinted run `1fc20b79`: `303.2s` [TAINTED]
 - conclusion:
   - no obvious large win from preallocation alone
   - not worth a same-commit A/B

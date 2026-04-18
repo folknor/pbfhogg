@@ -88,11 +88,11 @@ UUIDs with commit hashes (as of 2026-04-17, plantasjen):
 | Command | Japan | Europe | Planet | Published baseline |
 |---------|-------|--------|--------|--------------------|
 | check-refs | `4a347e3b` 2.1 s | `70ff6c5d` 33.6 s | `862547e4` 72.5 s | README:45, perf.md:296-337 |
-| check-ids --full | — | `31ca231d` 52.7 s | `2f52252d` 93.2 s | perf.md:339-379 |
-| tags-filter | `0b2db566` 4.9 s | `9562d82b` 112.2 s | `d71445a6` 153.2 s | README:43, perf.md:726-741 |
+| check-ids --full | — | `31ca231d` 52.7 s [TAINTED] | `2f52252d` 93.2 s [TAINTED] | perf.md:339-379 |
+| tags-filter | `0b2db566` 4.9 s | `9562d82b` 112.2 s | `d71445a6` 153.2 s [TAINTED] | README:43, perf.md:726-741 |
 | extract --smart | `397da7c1` 4.7 s | `48ca6bbb` 181.4 s | `2d028196` 279 s | README:49, perf.md:590-657 |
 | multi-extract | `08fefe51` 7.7 s | `c1ff6ec9` 799.9 s | `1cd62e90` 965 s | perf.md:659-725 |
-| add-locations-to-ways external | `1d4913fc` 39.7 s | `85464a37` 293.1 s | `123f70f1` 698.1 s | README:51, perf.md:126-287 |
+| add-locations-to-ways external | `1d4913fc` 39.7 s | `85464a37` 293.1 s [TAINTED] | `123f70f1` 698.1 s [TAINTED] | README:51, perf.md:126-287 |
 | renumber | `2ee186c7` 6.1 s | `873dfdfe` 78.4 s | `f9098cab` 194.2 s | README:48, perf.md:489-588 |
 
 ## Blast-radius expectations
@@ -120,7 +120,7 @@ Total bench cost: **~22-25 min** serial on plantasjen.
    181.4 s. Hits three extract callers simultaneously (simple, complete,
    smart share `build_blob_schedule_with_passthrough`).
 2. **Planet `add-locations-to-ways --index-type external`** (12 min) —
-   UUID `123f70f1` baseline 698.1 s. Largest absolute expected win.
+   UUID `123f70f1` baseline 698.1 s [TAINTED]. Largest absolute expected win.
    Exercises `scan_blob_metadata`.
 3. **Europe `tags-filter highway=primary`** (2 min) — UUID `9562d82b`
    baseline 112.2 s. Both single-pass and two-pass paths.

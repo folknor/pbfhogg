@@ -1113,26 +1113,24 @@ pub(crate) fn blob_osm_first_id(min_id: i64, max_id: i64) -> i64 {
     }
 }
 
-/// Check if ALL OsmData blobs in a PBF have indexdata.
+/// Check if the first OsmData blob in a PBF has indexdata.
 ///
-/// Uses header-only reads (no decompression, no blob data I/O) - just
-/// blob headers + seeks. Returns false if any data blob lacks indexdata
-/// or if the file has no data blobs.
+/// O(1) header-only probe: reads blob headers until the first OsmData
+/// blob and returns whether it carries indexdata. Returns false if the
+/// file has no data blobs. Trusts the first blob to be representative;
+/// partially-indexed PBFs surface as a mid-run error at the consuming
+/// site rather than being detected up front.
 pub fn has_indexdata(path: &Path, direct_io: bool) -> Result<bool> {
     let mut reader = FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    let mut saw_data = false;
     while let Some(info) = read_blob_header_only(&mut reader, &mut offset)? {
         if matches!(info.blob_type, BlobKind::OsmData) {
-            saw_data = true;
-            if info.index.is_none() {
-                return Ok(false);
-            }
+            return Ok(info.index.is_some());
         }
         reader.skip(info.data_size as u64)?;
         offset += info.data_size as u64;
     }
-    Ok(saw_data)
+    Ok(false)
 }
 
 /// Format a Unix epoch timestamp (seconds) as ISO 8601 UTC string.

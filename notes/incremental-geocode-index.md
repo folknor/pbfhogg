@@ -2,7 +2,8 @@
 
 ## Problem
 
-Full geocode index rebuild from planet PBF takes 1,255s (20.9 min) and
+Full geocode index rebuild from planet PBF takes 1,255s (20.9 min) [TAINTED — wall
+inflated by all-blobs-scan regression in `4ce7e93..c0ae9a7`; RSS unaffected] and
 **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`,
 2026-04-17). The earlier 17.8 GB figure under-reported: brokkr previously
 suppressed short-emitting phase markers from sidecar output, so PASS1_5's

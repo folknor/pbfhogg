@@ -33,8 +33,9 @@ use crate::{Element, MemberType};
 /// Returns `(is_sorted, has_indexdata)`.
 ///
 /// The sorted flag comes from the OsmHeader blob (first blob, needs full
-/// read + decompress). Indexdata is verified on ALL data blobs via a
-/// header-only scan (no decompression, just blob header reads + seeks).
+/// read + decompress). Indexdata is probed from the first OsmData blob
+/// only - O(1) header read. Partially-indexed PBFs surface as a mid-run
+/// error at the consuming site rather than being detected up front.
 pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(bool, bool)> {
     use crate::blob::BlobKind;
 
@@ -55,28 +56,20 @@ pub(crate) fn check_sorted_and_indexed(path: &Path, direct_io: bool) -> Result<(
         s
     };
 
-    // Pass 2: header-only scan of all blobs to verify every OsmData blob
-    // has indexdata. Reads only blob headers (~100 bytes each), seeks past
-    // blob data. Planet-scale cost: sequential seek through file, no I/O
-    // on blob payloads.
+    // Pass 2: O(1) header-only probe of the first OsmData blob.
     let mut reader = crate::file_reader::FileReader::open(path, direct_io)?;
     let mut offset = 0u64;
-    let mut indexed = true;
-    let mut saw_data = false;
+    let mut indexed = false;
 
     while let Some(info) = super::read_blob_header_only(&mut reader, &mut offset)? {
         if matches!(info.blob_type, BlobKind::OsmData) {
-            saw_data = true;
-            if info.index.is_none() {
-                indexed = false;
-                break;
-            }
+            indexed = info.index.is_some();
+            break;
         }
         reader.skip(info.data_size as u64)?;
         offset += info.data_size as u64;
     }
 
-    if !saw_data { indexed = false; }
     Ok((sorted, indexed))
 }
 

@@ -1,6 +1,12 @@
 # Geocode index builder - optimization plan
 
-Target: `pbfhogg build-geocode-index` on planet. Current: 20m55s (1255 s) wall, **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`, 2026-04-17). Phase peaks (anon): PASS1 12 MB, **PASS1_5 29.5 GB**, PASS2 13.9 GB, PASS3 10.4 GB. Earlier numbers in this note (14.59 GB / 17.8 GB) under-reported the peak: brokkr previously hid short-emitting phase markers from sidecar output, so PASS1_5's transient peak never surfaced. The peak itself has not regressed - only its visibility.
+> **TAINTED BENCHMARKS WARNING (2026-04-18).** The 1255 s planet wall below
+> (commit `7e9c2e9`, UUID `1c70850916824749bf1d68ef8970189e`) was measured
+> under the all-blobs-scan regression in `has_indexdata` (live in
+> `4ce7e93..c0ae9a7`). RSS / phase-peak data is unaffected. Re-measure
+> wall before relying on the per-phase totals below.
+
+Target: `pbfhogg build-geocode-index` on planet. Current: 20m55s (1255 s) wall [TAINTED], **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`, 2026-04-17). Phase peaks (anon): PASS1 12 MB, **PASS1_5 29.5 GB**, PASS2 13.9 GB, PASS3 10.4 GB. Earlier numbers in this note (14.59 GB / 17.8 GB) under-reported the peak: brokkr previously hid short-emitting phase markers from sidecar output, so PASS1_5's transient peak never surfaced. The peak itself has not regressed - only its visibility.
 
 ## Thesis
 
@@ -12,14 +18,14 @@ No internal API needs rewriting. `IdSetDense`, `PrimitiveBlock`, `parallel_class
 
 ## Yardstick
 
-| Phase | Wall (measured `7e9c2e9`) | Peak Anon | Notes |
+| Phase | Wall (measured `7e9c2e9`) [TAINTED — wall only] | Peak Anon | Notes |
 |---|---:|---:|---|
 | Pass 1 (relations) | 42 s | 12 MB | sequential, tiny input fraction |
 | Pass 1.5 (referenced-node collect) | **167 s** | **29.5 GB** | parallel, full `PrimitiveBlock` decode - actual peak, previously hidden by brokkr's short-marker filter |
 | Schedule scanner | 16 s | 12 MB | between passes |
 | Pass 2 (fused nodes + ways) | **881 s** | 13.9 GB | **single-threaded** (mallopt fix not yet applied here) |
 | Pass 3 (cell assignment, both levels) | 141 s | 10.4 GB | rayon compute + sequential bucket merge, run twice |
-| **Total** | **1255 s** | **29.5 GB peak** | |
+| **Total** | **1255 s** [TAINTED] | **29.5 GB peak** | |
 
 Breakdown ground-truthed by sidecar markers (`1c708509`). Pass 2 still holds ~70 % of wall and is the headline target. Pass 1.5 is now the **memory** target - its peak is what governs whether the build fits on a 30 GB host without swap.
 

@@ -112,7 +112,7 @@ pub fn time_filter(
 // History path: pending-group state machine on a parallel-decode reader.
 // ---------------------------------------------------------------------------
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn time_filter_history(
     reader: ElementReader<crate::file_reader::FileReader>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -198,7 +198,7 @@ fn time_filter_history(
 // explicitly), and writes surviving elements straight into a local
 // BlockBuilder via reference. Consumer drains batch results in order.
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn time_filter_snapshot(
     reader: ElementReader<crate::file_reader::FileReader>,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
@@ -220,6 +220,7 @@ fn time_filter_snapshot(
     Ok(stats)
 }
 
+#[hotpath::measure]
 fn process_snapshot_batch(
     batch: &[PrimitiveBlock],
     cutoff_timestamp: i64,
@@ -253,7 +254,7 @@ fn process_snapshot_batch(
 
 type OwnedBlockTriple = crate::block_builder::OwnedBlock;
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn filter_block_snapshot(
     block: &PrimitiveBlock,
     cutoff_timestamp: i64,
@@ -385,7 +386,7 @@ fn relation_visible(r: &Relation<'_>) -> bool {
     r.info().visible()
 }
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn flush_group(
     group: PendingGroup,
     bb: &mut BlockBuilder,
@@ -407,7 +408,7 @@ fn flush_group(
     Ok(())
 }
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn write_owned_element(
     bb: &mut BlockBuilder,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
@@ -471,7 +472,7 @@ fn relation_timestamp(r: &Relation<'_>) -> i64 {
     r.info().milli_timestamp().unwrap_or(0) / 1000
 }
 
-#[cfg_attr(feature = "hotpath", hotpath::measure)]
+#[hotpath::measure]
 fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
     match element {
         Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)),

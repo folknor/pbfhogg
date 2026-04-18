@@ -177,7 +177,6 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let referenced_nodes = pass1_5::run_pass1_5(
         &way_schedule, max_node_id, &shared_file, &needed_admin_ways,
     )?;
-    drop(way_schedule);
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
@@ -206,10 +205,11 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         addr_points_mmap,
         interp_nodes_mmap,
     } = pass2::run_pass2(
-        config, &node_schedule, &shared_file,
+        config, &node_schedule, &way_schedule, &shared_file,
         needed_admin_ways, referenced_nodes, &mut strings,
     )?;
     drop(node_schedule);
+    drop(way_schedule);
     drop(shared_file);
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
 

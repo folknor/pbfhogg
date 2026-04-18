@@ -256,50 +256,66 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
     }
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_END");
 
-    // Address points
+    // Address points — parallel per-point cell classification (plan item #5).
+    // Chunked like streets to bound peak memory in the intermediate
+    // `Vec<(cid, idx)>`; the single-threaded distribute step then walks each
+    // chunk's entries and writes to bucket files. Same shape as streets above.
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_START");
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
         let chunk_end = (chunk_start + ADDR_CHUNK).min(addr_count);
-        for idx in chunk_start..chunk_end {
-            if let Some(pt) = read_addr_point_mmap(addr_points_mmap, idx as u32) {
+        let addr_entries: Vec<(u64, u32)> = (chunk_start..chunk_end)
+            .into_par_iter()
+            .filter_map(|idx| {
+                let pt = read_addr_point_mmap(addr_points_mmap, idx as u32)?;
                 let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
                 let cid = CellID::from(ll).parent(level as u64).0;
-                let b = bucket_for_cell(cid);
-                ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
-                write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_ADDR, idx as u32, 0)?;
-            }
+                Some((cid, idx as u32))
+            })
+            .collect();
+        for &(cid, idx) in &addr_entries {
+            let b = bucket_for_cell(cid);
+            ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
+            write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_ADDR, idx, 0)?;
         }
         chunk_start = chunk_end;
     }
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_END");
 
-    // Interpolation - collect per-way entries, then distribute with proper error propagation
+    // Interpolation — parallel per-way segment cell classification (plan
+    // item #5). Same shape as streets: flat_map over ways, collect
+    // `(cid, way_idx, seg_idx)` entries, then single-threaded distribute.
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
-    for (way_idx, iw) in interp_ways.iter().enumerate() {
-        let nc = iw.node_count as usize;
-        if nc < 2 { continue; }
-        let mut way_entries: Vec<(u64, u32, u16)> = Vec::new();
-        for seg_idx in 0..nc - 1 {
-            let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
-            let off2 = off1 + NODE_COORD_SIZE;
-            if let (Some(n1), Some(n2)) = (
-                read_node_at(interp_nodes_mmap, off1 as u64),
-                read_node_at(interp_nodes_mmap, off2 as u64),
-            ) {
-                cover_segment(n1.0, n1.1, n2.0, n2.1, level, |cid| {
-                    way_entries.push((cid, way_idx as u32, seg_idx as u16));
-                });
+    let interp_entries: Vec<(u64, u32, u16)> = (0..interp_ways.len())
+        .into_par_iter()
+        .flat_map_iter(|way_idx| {
+            let iw = &interp_ways[way_idx];
+            let nc = iw.node_count as usize;
+            let mut out = Vec::new();
+            if nc >= 2 {
+                out.reserve(nc * 2);
+                for seg_idx in 0..nc - 1 {
+                    let off1 = iw.node_file_offset as usize + seg_idx * NODE_COORD_SIZE;
+                    let off2 = off1 + NODE_COORD_SIZE;
+                    if let (Some(n1), Some(n2)) = (
+                        read_node_at(interp_nodes_mmap, off1 as u64),
+                        read_node_at(interp_nodes_mmap, off2 as u64),
+                    ) {
+                        cover_segment(n1.0, n1.1, n2.0, n2.1, level, |cid| {
+                            out.push((cid, way_idx as u32, seg_idx as u16));
+                        });
+                    }
+                }
             }
-        }
-        for &(cid, wi, si) in &way_entries {
-            let b = bucket_for_cell(cid);
-            ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
-            write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_INTERP, wi, si)?;
-        }
+            out.into_iter()
+        })
+        .collect();
+    for &(cid, wi, si) in &interp_entries {
+        let b = bucket_for_cell(cid);
+        ensure_bucket_writer(&mut bucket_writers, b, &bucket_dir)?;
+        write_bucket_record(bucket_writers[b].as_mut().expect("ensured"), cid, ENTRY_TYPE_INTERP, wi, si)?;
     }
-
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
 
     // Flush and drop all bucket writers
@@ -460,68 +476,84 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 pub(super) fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8) -> Vec<AdminCellEntry> {
-    let mut entries = Vec::new();
+    use rayon::prelude::*;
 
-    for (poly_idx, poly) in polygons.iter().enumerate() {
-        // Parse vertices into rings (exterior + holes) separated by RING_SENTINEL
-        let (ext_f64, hole_rings) = parse_polygon_rings(&poly.vertices);
-        if ext_f64.len() < 3 { continue; }
+    // Per-polygon work is independent: edge-cell cover + centroid flood-fill
+    // read the polygon vertices in isolation and produce a disjoint set of
+    // `AdminCellEntry`s. `par_iter().flat_map_iter().collect()` preserves
+    // input ordering so downstream `entries.sort_unstable_by_key(cell_id)`
+    // in `write_admin_index` gives a byte-identical result to the sequential
+    // path. Plan item #6 — Europe admin flood-fill was 10.7 s sequential
+    // (UUID bf8f2038); expected ~5× on 12 cores.
+    polygons.par_iter().enumerate().flat_map_iter(|(poly_idx, poly)| {
+        admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()
+    }).collect()
+}
 
-        let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
+#[allow(clippy::cast_possible_truncation)]
+fn admin_cells_for_polygon(
+    poly_idx: usize,
+    poly: &AssembledPolygon,
+    admin_level: u8,
+) -> Vec<AdminCellEntry> {
+    // Parse vertices into rings (exterior + holes) separated by RING_SENTINEL
+    let (ext_f64, hole_rings) = parse_polygon_rings(&poly.vertices);
+    if ext_f64.len() < 3 { return Vec::new(); }
 
-        // Edge cells: cover each ring segment using cover_segment
-        let mut edge_cells = rustc_hash::FxHashSet::default();
-        for v in poly.vertices.windows(2) {
-            if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
-            cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level, |cid| {
-                edge_cells.insert(cid);
+    let hole_slices: Vec<&[(f64, f64)]> = hole_rings.iter().map(Vec::as_slice).collect();
+
+    // Edge cells: cover each ring segment using cover_segment
+    let mut edge_cells = rustc_hash::FxHashSet::default();
+    for v in poly.vertices.windows(2) {
+        if v[0] == RING_SENTINEL || v[1] == RING_SENTINEL { continue; }
+        cover_segment(v[0].lat_e7, v[0].lon_e7, v[1].lat_e7, v[1].lon_e7, admin_level, |cid| {
+            edge_cells.insert(cid);
+        });
+    }
+
+    let mut entries: Vec<AdminCellEntry> = edge_cells.iter()
+        .map(|&cid| AdminCellEntry { cell_id: cid, poly_index: poly_idx as u32, is_interior: false })
+        .collect();
+
+    // Interior cells: flood-fill from centroid using point_in_polygon (with holes)
+    let exterior_end = poly.vertices.iter()
+        .position(|v| *v == RING_SENTINEL)
+        .unwrap_or(poly.vertices.len());
+    let exterior = &poly.vertices[..exterior_end];
+    if exterior.len() < 3 { return entries; }
+
+    let (sum_lat, sum_lon, count) = exterior.iter()
+        .fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
+            (sl + v.lat_e7 as i64, sn + v.lon_e7 as i64, c + 1)
+        });
+    if count == 0 { return entries; }
+    let clat = sum_lat as f64 / count as f64 * 1e-7;
+    let clon = sum_lon as f64 / count as f64 * 1e-7;
+
+    // Centroid must be inside the polygon (exterior AND not in any hole)
+    if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) { return entries; }
+
+    let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
+    let mut visited = rustc_hash::FxHashSet::default();
+    let mut queue = std::collections::VecDeque::new();
+    visited.insert(seed.0);
+    queue.push_back(seed);
+
+    while let Some(cell) = queue.pop_front() {
+        if edge_cells.contains(&cell.0) { continue; }
+
+        let center_ll = s2::latlng::LatLng::from(cell);
+        // Test with holes - cells inside enclaves are NOT interior
+        if crate::geo::point_in_polygon(
+            center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64, &hole_slices,
+        ) {
+            entries.push(AdminCellEntry {
+                cell_id: cell.0, poly_index: poly_idx as u32, is_interior: true,
             });
-        }
-
-        for &cid in &edge_cells {
-            entries.push(AdminCellEntry { cell_id: cid, poly_index: poly_idx as u32, is_interior: false });
-        }
-
-        // Interior cells: flood-fill from centroid using point_in_polygon (with holes)
-        let exterior_end = poly.vertices.iter()
-            .position(|v| *v == RING_SENTINEL)
-            .unwrap_or(poly.vertices.len());
-        let exterior = &poly.vertices[..exterior_end];
-        if exterior.len() < 3 { continue; }
-
-        let (sum_lat, sum_lon, count) = exterior.iter()
-            .fold((0i64, 0i64, 0i64), |(sl, sn, c), v| {
-                (sl + v.lat_e7 as i64, sn + v.lon_e7 as i64, c + 1)
-            });
-        if count == 0 { continue; }
-        let clat = sum_lat as f64 / count as f64 * 1e-7;
-        let clon = sum_lon as f64 / count as f64 * 1e-7;
-
-        // Centroid must be inside the polygon (exterior AND not in any hole)
-        if !crate::geo::point_in_polygon(clon, clat, &ext_f64, &hole_slices) { continue; }
-
-        let seed = CellID::from(LatLng::from_degrees(clat, clon)).parent(admin_level as u64);
-        let mut visited = rustc_hash::FxHashSet::default();
-        let mut queue = std::collections::VecDeque::new();
-        visited.insert(seed.0);
-        queue.push_back(seed);
-
-        while let Some(cell) = queue.pop_front() {
-            if edge_cells.contains(&cell.0) { continue; }
-
-            let center_ll = s2::latlng::LatLng::from(cell);
-            // Test with holes - cells inside enclaves are NOT interior
-            if crate::geo::point_in_polygon(
-                center_ll.lng.deg(), center_ll.lat.deg(), &ext_f64, &hole_slices,
-            ) {
-                entries.push(AdminCellEntry {
-                    cell_id: cell.0, poly_index: poly_idx as u32, is_interior: true,
-                });
-                for n in cell.all_neighbors(admin_level as u64) {
-                    if !visited.contains(&n.0) {
-                        visited.insert(n.0);
-                        queue.push_back(n);
-                    }
+            for n in cell.all_neighbors(admin_level as u64) {
+                if !visited.contains(&n.0) {
+                    visited.insert(n.0);
+                    queue.push_back(n);
                 }
             }
         }

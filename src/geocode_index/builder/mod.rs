@@ -83,6 +83,19 @@ pub struct BuildStats {
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
 #[hotpath::measure]
 pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
+    // Cap glibc arenas at 2 to prevent cross-thread free fragmentation in
+    // the Pass 2a pread worker pool. Without this, PrimitiveBlock Vec<u8>s
+    // allocated on decode workers and freed on the main-thread merge path
+    // cause arena accumulation growing to 25+ GB anon RSS at planet scale
+    // (documented rationale for the previous sequential-Pass-2 choice).
+    // Scoped to this command; other pbfhogg paths unaffected. Same prelude
+    // used by renumber_external / check_refs / verify_ids for the same
+    // reason.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::mallopt(libc::M_ARENA_MAX, 2);
+    }
+
     let start_time = std::time::Instant::now();
 
     // Guard against silently overwriting an existing index

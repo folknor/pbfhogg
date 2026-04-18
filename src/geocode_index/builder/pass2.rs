@@ -1,9 +1,26 @@
 //! Pass 2: fused nodes + ways scan.
 //!
 //! Sorted PBFs (Sort.Type_then_ID) guarantee all node blobs come before
-//! way blobs. A single sequential scan processes nodes first (populating
-//! the dense coordinate index for referenced nodes + address points), then
-//! ways (streets, buildings, interpolation, admin geometry).
+//! way blobs, so Pass 2 splits cleanly into a node phase (Phase 2a) and
+//! a way phase (Phase 2b).
+//!
+//! - **Phase 2a** is parallel: workers decode node blobs via
+//!   [`parallel_classify_phase`], build per-blob `Vec`s of (rank, lat, lon)
+//!   coord-writes plus pending `AddrPoint`s (with owned strings), and
+//!   send them to the main thread in blob-sequence order. The main thread
+//!   applies coord writes to `coord_mmap` (safe because ranks are disjoint),
+//!   interns strings into the shared `StringPool`, and streams `AddrPoint`s
+//!   to `addr_points.bin`. The heavy decompression and decode work fans
+//!   out across cores; string interning and `coord_mmap` writes stay on
+//!   the main thread so no `StringPool` / mmap synchronisation is needed.
+//!
+//! - **Phase 2b** is still sequential: way blobs are processed in a single
+//!   loop that classifies each way (street / building-addr / interp /
+//!   admin-geometry), resolves coordinates via `referenced_nodes.rank()`
+//!   into the `coord_mmap` populated by Phase 2a, and streams outputs to
+//!   the street / interp / addr files plus the in-memory `way_geom` map.
+//!   Way parallelisation is the next-layer follow-up (see
+//!   `notes/geocode-build-opportunities.md` item #1 Phase 2b).
 
 use std::io::{BufWriter, Write};
 
@@ -53,11 +70,37 @@ pub(super) struct SlimInterpWay {
 }
 
 // ---------------------------------------------------------------------------
-// Pass 2 helper state
+// Phase 2a: parallel node scan
 // ---------------------------------------------------------------------------
 
-/// Mutable state shared by node and way processing in pass 2.
-struct Pass2State<'a> {
+/// Per-blob output from Phase 2a workers: coord writes (one per referenced
+/// node) and pending `AddrPoint`s (for nodes with addr:housenumber +
+/// addr:street tags). Strings are owned so the main thread can intern them
+/// into the shared `StringPool` at merge time — workers can't touch
+/// `StringPool` directly without serialising on a mutex.
+#[derive(Default)]
+struct NodeBlobOut {
+    coord_writes: Vec<(u64, i32, i32)>,
+    addr_points: Vec<PendingAddrPoint>,
+}
+
+struct PendingAddrPoint {
+    lat_e7: i32,
+    lon_e7: i32,
+    hn: Box<str>,
+    st: Box<str>,
+    pc: Option<Box<str>>,
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b helper state (sequential way scan only)
+// ---------------------------------------------------------------------------
+
+/// Mutable state for the sequential Phase 2b way loop. Phase 2a has already
+/// populated `coord_mmap` and `addr_points_out` with node-derived entries;
+/// Phase 2b reads `coord_mmap` to resolve way refs and appends to
+/// `addr_points_out` for building centroids.
+struct Pass2bState<'a> {
     coord_mmap: &'a mut memmap2::MmapMut,
     referenced_nodes: &'a crate::commands::id_set_dense::IdSetDense,
     needed_admin_ways: &'a crate::commands::id_set_dense::IdSetDense,
@@ -69,7 +112,7 @@ struct Pass2State<'a> {
     street_nodes_out: &'a mut BufWriter<std::fs::File>,
     addr_points_out: &'a mut BufWriter<std::fs::File>,
     interp_nodes_out: &'a mut BufWriter<std::fs::File>,
-    // Running counters
+    // Running counters (carried in from Phase 2a)
     street_node_offset: u64,
     interp_node_offset: u64,
     addr_point_count: u32,
@@ -78,48 +121,7 @@ struct Pass2State<'a> {
     first_addr_lon_e7: i32,
 }
 
-impl Pass2State<'_> {
-    /// Process a dense node: store coordinates for referenced nodes and
-    /// write address points for nodes with addr:housenumber + addr:street.
-    fn process_dense_node(&mut self, node: &crate::dense::DenseNode<'_>) -> Result<()> {
-        let lat_e7 = node.decimicro_lat();
-        let lon_e7 = node.decimicro_lon();
-        if self.referenced_nodes.get(node.id()) {
-            #[allow(clippy::cast_possible_truncation)]
-            let r = self.referenced_nodes.rank(node.id()) as usize;
-            let off = r * 8;
-            self.coord_mmap[off..off + 4].copy_from_slice(&lat_e7.to_le_bytes());
-            self.coord_mmap[off + 4..off + 8].copy_from_slice(&lon_e7.to_le_bytes());
-        }
-
-        let mut hn: Option<&str> = None;
-        let mut st: Option<&str> = None;
-        let mut pc: Option<&str> = None;
-        for (k, v) in node.tags() {
-            match k {
-                "addr:housenumber" => hn = Some(v),
-                "addr:street" => st = Some(v),
-                "addr:postcode" => pc = Some(v),
-                _ => {}
-            }
-        }
-        if let (Some(h), Some(s)) = (hn, st) {
-            let ap = AddrPoint {
-                lat_e7, lon_e7,
-                housenumber_offset: self.strings.intern(h),
-                street_offset: self.strings.intern(s),
-                postcode_offset: pc.map_or(0, |p| self.strings.intern(p)),
-            };
-            self.addr_points_out.write_all(&ap.to_bytes())?;
-            if self.addr_point_count == 0 {
-                self.first_addr_lat_e7 = lat_e7;
-                self.first_addr_lon_e7 = lon_e7;
-            }
-            self.addr_point_count += 1;
-        }
-        Ok(())
-    }
-
+impl Pass2bState<'_> {
     /// Process a way: classify by tags, resolve coordinates, and write to
     /// the appropriate output (admin geometry, interpolation, building
     /// address, or street).
@@ -349,7 +351,117 @@ pub(super) fn run_pass2(
         std::fs::File::create(config.output_dir.join(FILE_INTERP_NODES))?,
     );
 
-    let mut state = Pass2State {
+    // State that Phase 2a populates and Phase 2b carries forward.
+    let mut addr_point_count: u32 = 0;
+    let mut first_addr_lat_e7: i32 = 0;
+    let mut first_addr_lon_e7: i32 = 0;
+
+    // ---------------- Phase 2a: parallel node scan ----------------
+    //
+    // Workers decode node blobs via `parallel_classify_phase`; each returns
+    // a `NodeBlobOut` with the `(rank, lat, lon)` coord writes for
+    // referenced nodes and a `Vec<PendingAddrPoint>` for addr-tagged nodes.
+    // The main thread applies coord_mmap writes (safe: disjoint ranks),
+    // interns strings into the shared `StringPool`, and streams
+    // `AddrPoint`s to `addr_points.bin` in blob-sequence order.
+    //
+    // Why strings are owned (`Box<str>`) rather than kept as `&str` into
+    // the PrimitiveBlock: `PrimitiveBlock` is dropped inside the worker at
+    // the end of each blob, so any `&str` borrows expire before the main
+    // thread sees them. 3 short strings per addr point × ~Germany-scale
+    // (19.8 M addr points) × ~10-20 byte each ≈ 500-700 MB peak in-flight,
+    // but `parallel_classify_phase` caps the worker→merge channel at 32
+    // blobs so the live footprint is much smaller (~tens of MB).
+    crate::debug::emit_marker("GEOCODE_PASS2A_START");
+    {
+        let (node_schedule, shared_file) = crate::commands::build_classify_schedule(
+            &config.input_path, Some(crate::blob_index::ElemKind::Node),
+        )?;
+
+        let referenced_ref = &referenced_nodes;
+        let coord_mmap_ref = &mut *coord_mmap;
+        let mut merge_err: Option<std::io::Error> = None;
+        crate::commands::parallel_classify_phase(
+            &shared_file,
+            &node_schedule,
+            NodeBlobOut::default,
+            |block, state: &mut NodeBlobOut| -> NodeBlobOut {
+                for element in block.elements_skip_metadata() {
+                    if let Element::DenseNode(node) = element {
+                        let lat_e7 = node.decimicro_lat();
+                        let lon_e7 = node.decimicro_lon();
+                        if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
+                            state.coord_writes.push((rank, lat_e7, lon_e7));
+                        }
+                        let mut hn: Option<&str> = None;
+                        let mut st: Option<&str> = None;
+                        let mut pc: Option<&str> = None;
+                        for (k, v) in node.tags() {
+                            match k {
+                                "addr:housenumber" => hn = Some(v),
+                                "addr:street" => st = Some(v),
+                                "addr:postcode" => pc = Some(v),
+                                _ => {}
+                            }
+                        }
+                        if let (Some(h), Some(s)) = (hn, st) {
+                            state.addr_points.push(PendingAddrPoint {
+                                lat_e7, lon_e7,
+                                hn: h.into(),
+                                st: s.into(),
+                                pc: pc.map(Into::into),
+                            });
+                        }
+                    }
+                }
+                std::mem::take(state)
+            },
+            |_seq, out| {
+                if merge_err.is_some() { return; }
+                for (rank, lat, lon) in out.coord_writes {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let off = (rank as usize) * 8;
+                    coord_mmap_ref[off..off + 4].copy_from_slice(&lat.to_le_bytes());
+                    coord_mmap_ref[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
+                }
+                for pap in out.addr_points {
+                    let hn_off = strings.intern(&pap.hn);
+                    let st_off = strings.intern(&pap.st);
+                    let pc_off = pap.pc.as_deref().map_or(0, |s| strings.intern(s));
+                    let ap = AddrPoint {
+                        lat_e7: pap.lat_e7, lon_e7: pap.lon_e7,
+                        housenumber_offset: hn_off,
+                        street_offset: st_off,
+                        postcode_offset: pc_off,
+                    };
+                    if let Err(e) = addr_points_out.write_all(&ap.to_bytes()) {
+                        merge_err = Some(e);
+                        return;
+                    }
+                    if addr_point_count == 0 {
+                        first_addr_lat_e7 = pap.lat_e7;
+                        first_addr_lon_e7 = pap.lon_e7;
+                    }
+                    addr_point_count += 1;
+                }
+            },
+        )?;
+        if let Some(e) = merge_err {
+            return Err(e.into());
+        }
+    }
+    crate::debug::emit_marker("GEOCODE_PASS2A_END");
+
+    // ---------------- Phase 2b: sequential way scan ----------------
+    //
+    // Sequential decode of way blobs only. Ways read `coord_mmap` (populated
+    // by Phase 2a) via `referenced_nodes.rank()` to resolve refs, and emit
+    // to street / interp / addr / way_geom outputs. Kept sequential for now
+    // — see `notes/geocode-build-opportunities.md` item #1 Phase 2b for
+    // the planned parallel way scan (per-worker tmp files + offset-patched
+    // concatenation for `street_ways.bin` / `street_nodes.bin` /
+    // `interp_nodes.bin` / the way-local portion of `addr_points.bin`).
+    let mut state = Pass2bState {
         coord_mmap: &mut coord_mmap,
         referenced_nodes: &referenced_nodes,
         needed_admin_ways: &needed_admin_ways,
@@ -362,20 +474,14 @@ pub(super) fn run_pass2(
         interp_nodes_out: &mut interp_nodes_out,
         street_node_offset: 0,
         interp_node_offset: 0,
-        addr_point_count: 0,
+        addr_point_count,
         street_way_count: 0,
-        first_addr_lat_e7: 0,
-        first_addr_lon_e7: 0,
+        first_addr_lat_e7,
+        first_addr_lon_e7,
     };
 
-    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_LOOP_START");
+    crate::debug::emit_marker("GEOCODE_PASS2B_SCAN_LOOP_START");
     {
-        // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
-        // retention (25+ GB at Europe/planet scale). The fused node+way scan
-        // needs full PrimitiveBlock (for tag access), so we can't use the
-        // node-only scanner here. But sequential decode keeps all alloc/free
-        // on one thread, bounding heap to ~1.6 GB.
-        // See notes/cross-pipeline-optimization-plan.md.
         let mut blob_reader = crate::blob::BlobReader::open(&config.input_path, config.direct_io)?;
         blob_reader.set_parse_indexdata(true);
         blob_reader.next()
@@ -389,8 +495,10 @@ pub(super) fn run_pass2(
             if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
                 continue;
             }
+            // Only process way blobs in Phase 2b; nodes handled by Phase 2a,
+            // relations irrelevant to Pass 2.
             if let Some(idx) = blob.index() {
-                if matches!(idx.kind, crate::blob_index::ElemKind::Relation) {
+                if !matches!(idx.kind, crate::blob_index::ElemKind::Way) {
                     continue;
                 }
             }
@@ -399,17 +507,15 @@ pub(super) fn run_pass2(
                 std::mem::take(&mut decompress_buf), &mut st_scratch, &mut gr_scratch,
             )?;
             for element in block.elements_skip_metadata() {
-                match element {
-                    Element::DenseNode(node) => state.process_dense_node(&node)?,
-                    Element::Way(way) => state.process_way(&way)?,
-                    _ => {} // Node (non-dense) - rare, ignore
+                if let Element::Way(way) = element {
+                    state.process_way(&way)?;
                 }
             }
-        } // for blob_result
+        }
     }
-    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_LOOP_END");
+    crate::debug::emit_marker("GEOCODE_PASS2B_SCAN_LOOP_END");
 
-    let Pass2State {
+    let Pass2bState {
         addr_point_count, street_way_count,
         first_addr_lat_e7, first_addr_lon_e7,
         ..

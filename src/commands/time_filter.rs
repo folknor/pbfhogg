@@ -24,8 +24,8 @@ use super::elements_pbf::{
 use super::{
     BATCH_SIZE, HeaderOverrides, Result, dense_node_metadata, drain_batch_results,
     element_metadata, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, for_each_primitive_block_batch, require_sorted,
-    warn_locations_on_ways_loss, writer_from_header,
+    ensure_way_capacity_local, flush_local, for_each_primitive_block_batch_budgeted,
+    require_sorted, warn_locations_on_ways_loss, writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData};
 use crate::writer::{Compression, PbfWriter};
@@ -80,6 +80,14 @@ pub fn time_filter(
     direct_io: bool,
     overrides: &HeaderOverrides,
 ) -> Result<TimeFilterStats> {
+    // Do NOT mallopt(M_ARENA_MAX, 2) here. That pattern works for
+    // renumber_external (whose workers do low-alloc wire-format splice)
+    // but regresses time-filter hard (workers do full BlockBuilder
+    // re-encode, which is allocation-heavy - arena-lock contention
+    // dominates the fragmentation win). Measured 2026-04-19: wall
+    // 95.1 s -> 160.4 s (+69 %), peak anon 20 GB -> 24.8 GB (+24 %),
+    // avg cores 20.4 -> 14.1 on Europe --bench 1. Different command
+    // class, different allocator knob.
     let reader = ElementReader::open(input, direct_io)?;
     require_sorted(reader.header(), input, "Input history PBF")?;
     warn_locations_on_ways_loss(reader.header());
@@ -213,9 +221,22 @@ fn time_filter_snapshot(
     };
 
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
-    for_each_primitive_block_batch(reader.into_blocks_pipelined(), BATCH_SIZE, |batch| {
+    // Byte-bounded batches cap in-flight decoded-block bytes directly,
+    // which is the dominant anon-RSS source at scale. Europe iter 2
+    // (count-only BATCH_SIZE=64) peaked at 20 GB anon on a 35 GB input;
+    // the 128 MB byte cap below flushes batches around 16 blocks instead
+    // of 64 when decoded blocks are ~8 MB each, keeping the batch-level
+    // working set predictable regardless of input blob size.
+    const SNAPSHOT_BATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
+    let mut process = |batch: &[PrimitiveBlock]| -> Result<()> {
         process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats)
-    })?;
+    };
+    for_each_primitive_block_batch_budgeted(
+        reader.into_blocks_pipelined(),
+        BATCH_SIZE,
+        Some(SNAPSHOT_BATCH_MAX_BYTES),
+        &mut process,
+    )?;
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_END");
     Ok(stats)
 }

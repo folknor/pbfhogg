@@ -95,8 +95,8 @@ Splitting discipline:
 - One file per commit. Don't bundle multiple splits.
 - No behavior changes in a split commit - pure move + module wiring.
 - Preserve `#[cfg_attr(feature = "hotpath", hotpath::measure)]` / marker
-  / counter coverage verbatim. Instrumentation audits (like
-  `notes/seek-raw-audit.md`) assume the functions are findable by name.
+  / counter coverage verbatim. Cross-cutting audits assume the functions
+  are findable by name.
 - Run `brokkr check` after each move to catch unused-import drift.
 - Update `notes/` cross-references if line numbers change substantially.
 
@@ -256,7 +256,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   the `BufReader` impl to call `BufReader::seek_relative`. The audit's
   stated "specialize `impl BlobReader<BufReader<R>>`" approach didn't
   compile (Rust forbids inherent method specialization on stable). Per-
-  caller wall deltas in `notes/seek-raw-fix-implementation.md`. Library
+  caller wall deltas in `reference/performance.md`. Library
   API impact: `new_seekable<R>` and `IndexedReader::new<R>` bounds widen
   from `R: Read + Seek + Send` to `R: BlobReaderSource + Send` —
   one-line workaround for downstream library users with non-standard R.

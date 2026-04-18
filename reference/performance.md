@@ -261,11 +261,48 @@ The shared metadata pass replaced three separate scans on Europe:
 Net: about **87s** of repeated scan work collapsed to about **31s**, which is
 why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
 
-### External join stage breakdown (Europe, commit `aa3147c`, plantasjen) — post `seek_raw` fix
+### `seek_raw` BufReader-discard fix (2026-04-18, commit `aa3147c`)
 
-`BlobReader`'s header-walk path now preserves the `BufReader` buffer
-(see [seek-raw-fix-implementation.md](../notes/seek-raw-fix-implementation.md)).
-Meta scan halves; downstream stages get warmer page cache.
+`BlobReader::seek_raw(SeekFrom::Current(_))` was the hot-path "skip past
+just-read blob body." Stdlib `Seek::seek` on `BufReader<File>` always
+discards the buffer, so every blob-body skip forced a buffer refill
+(~10× file-size read amplification at the default 256 KB buffer).
+Fixed via a public `BlobReaderSource` trait: default `skip_relative`
+falls through to `Seek::seek` (correct, slow), `BufReader<R>` impl
+overrides to call `BufReader::seek_relative` (preserves buffer when
+in-range). Internal hot-path methods (`next_header_skip_blob`,
+`next_header_with_data_offset`) route through a new `skip_blob_body`
+helper using the trait. Public `seek_raw(SeekFrom)` API unchanged for
+absolute-seek case. Bound widening on `BlobReader::new_seekable` and
+`IndexedReader::new` is the public-API impact (one-line workaround for
+downstream library users with non-standard reader types).
+
+Per-caller wall deltas (`--bench 1` single-shot, plantasjen, 2026-04-18):
+
+| Caller / Command | Dataset | Pre-fix `ca6711e` | Post-fix `aa3147c` | Δ | Pre-UUID | Post-UUID |
+|---|---|---:|---:|---:|---|---|
+| extract --smart | Europe | 211.2 s | 195.2 s | **−16.0 s, −7.6 %** | `f7c2ccda` | `1bd5bbdf` |
+| add-locations-to-ways --index-type external | Europe | 286.3 s | 270.7 s | **−15.6 s, −5.5 %** | `5233ed39` | `555de261` |
+| add-locations-to-ways --index-type external | Planet | (skipped¹) | 700.6 s | within noise² | — | `e30f7ddc` |
+| tags-filter | Europe | 91.7 s | 93.1 s | within noise (+1.5 %) | `2244b6e4` | `ea9d2440` |
+| renumber | Planet | 218.6 s | 206.7 s | **−11.9 s, −5.4 %**³ | `ae91b114` | `878e7a99` |
+
+¹ Planet ALTW pre-fix bench skipped to save the 12 min re-bench;
+the inferred regression-fix-only baseline is the README's 698 s minus
+~20 s of all-blobs-scan overhead ≈ 678 s.
+² Planet META_SCAN is only 2.5 % of total wall, so even though the
+phase shows the expected per-phase win at 17.5 s post-fix (vs ~30 s
+pre-fix on this code path), the wall delta sits inside `--bench 1`
+variance.
+³ Renumber's −5.4 % is larger than the audit's 1–2 % prediction;
+unclear whether real or noise without `--bench 3` repeat. Not a
+regression in any case.
+
+#### Europe ALTW phase breakdown (the cleanest signal)
+
+`EXTJOIN_META_SCAN` is the only ALTW phase that walks blob headers; all
+other stages use direct `pread` on the file (no `BlobReader`, no
+`seek_raw`).
 
 | Phase | Time (post-fix) | Time (pre-fix `ca6711e`) | Δ |
 |-------|----------------:|-------------------------:|---:|

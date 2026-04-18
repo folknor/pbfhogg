@@ -36,8 +36,8 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
   schedule sizes, 3 cross-region element-written totals).
 - **Schedule-scan instrumentation sweep**: header-walk brackets and
   blob-count counters added to every `BlobReader::seekable_from_path`
-  caller in preparation for the `seek_raw` BufReader-discard fix (see
-  `notes/seek-raw-audit.md`).
+  caller in preparation for the `seek_raw` BufReader-discard fix
+  (landed in commit `aa3147c`; see `reference/performance.md`).
   - `build_classify_schedule` / `build_classify_schedules_split`
     (`src/commands/mod.rs`): `schedule_blobs` and
     `schedule_{node,way,relation}_blobs` counters (the markers were
@@ -97,7 +97,7 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
     (within noise); renumber planet `218.6 s → 206.7 s` (−5.4 %, larger
     than the audit's 1–2 % prediction but within `--bench 1` variance).
     Full caller table + Europe phase breakdown in
-    `notes/seek-raw-fix-implementation.md`.
+    `reference/performance.md` under the `seek_raw` section.
 - `IdSetDense`: rank-indexed lookup (`resolve()`), denser 64B rank blocks, atomic set support, negative-ID guard. Migrated all `IdSet` (BTreeSet) call sites to `IdSetDense` for O(1) lookups.
 - `PbfWriter`: rayon dispatch bounded by permit pool to prevent unbounded in-flight blob accumulation.
 - `external_radix`: shared `ScratchDir` + `BucketWriters` module extracted for reuse across external-join commands.

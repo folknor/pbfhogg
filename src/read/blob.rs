@@ -580,8 +580,8 @@ impl BlobHeader {
 /// Provides a fast path for relative skips that preserves any internal buffer
 /// (e.g. `BufReader`'s read-ahead). The default `skip_relative` falls through to
 /// `Seek::seek(SeekFrom::Current(_))`, which is correct but discards any buffer
-/// on `BufReader` — the cause of the all-blobs-scan amplification documented in
-/// `notes/seek-raw-audit.md`. Override for buffered readers to keep the buffer
+/// on `BufReader` — the cause of the ~10× header-walk read amplification this
+/// trait exists to eliminate. Override for buffered readers to keep the buffer
 /// when the target lies within the buffered window.
 ///
 /// Implemented for `BufReader<R: Read + Seek>` (uses `BufReader::seek_relative`),

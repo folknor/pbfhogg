@@ -4,7 +4,6 @@ use bytes::Bytes;
 
 use crate::blob::{decompress_blob_data_into, parse_primitive_block_from_bytes_owned};
 use crate::blob_index::{self, BlobIndex, ElemKind};
-use crate::osc::CompactDiffOverlay;
 use crate::{Element, PrimitiveBlock};
 
 use super::diff_ranges::DiffRanges;
@@ -35,8 +34,16 @@ pub(super) fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> u
 ///
 /// This is the secondary, precise overlap check. It runs after `classify_blob`
 /// returned `MayOverlap` (the coarse range check found diff IDs within the
-/// blob's [min_id, max_id]). This function iterates actual element IDs in the
-/// parsed block and checks them against the diff's HashMap/HashSet.
+/// blob's [min_id, max_id]). This function walks actual element IDs in the
+/// parsed block and sorted-merges against the `DiffRanges` sorted ID vectors
+/// (which already combine deletes + upserts per kind).
+///
+/// Sorted-merge has a per-kind cursor that only advances forward. Since block
+/// elements within a kind are sorted and `DiffRanges` IDs are sorted by
+/// `osm_id_cmp`, the cursor visits at most the sub-slice of diff IDs spanning
+/// the block's ID range. At planet with ~8 000 elements/blob this collapses
+/// ~16 000 hash lookups (measured 614 us/blob via `FxHashSet::contains`) to
+/// a handful of tuple compares per element.
 ///
 /// **Key distinction from `range_overlaps`**: a diff with only pure creates
 /// (new IDs not present in the base PBF) can cause `range_overlaps` to return
@@ -47,27 +54,26 @@ pub(super) fn estimate_blob_cost(frame: &RawBlobFrame, ranges: &DiffRanges) -> u
 /// relative to the passthrough block. This is intentional - rewriting an
 /// otherwise unaffected block just to interleave pure creates would be wasted
 /// work. OSM consumers handle non-strictly-sorted IDs across block boundaries.
-pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, diff: &CompactDiffOverlay) -> bool {
+pub(super) fn block_overlaps_diff(block: &PrimitiveBlock, ranges: &DiffRanges) -> bool {
+    use std::cmp::Ordering;
+
+    let mut node_cursor: usize = 0;
+    let mut way_cursor: usize = 0;
+    let mut rel_cursor: usize = 0;
+
     for element in block.elements_skip_metadata() {
-        let dominated = match &element {
-            Element::DenseNode(dn) => {
-                let id = dn.id();
-                diff.deleted_nodes.contains(&id) || diff.has_node(id)
-            }
-            Element::Node(n) => {
-                let id = n.id();
-                diff.deleted_nodes.contains(&id) || diff.has_node(id)
-            }
-            Element::Way(w) => {
-                let id = w.id();
-                diff.deleted_ways.contains(&id) || diff.has_way(id)
-            }
-            Element::Relation(r) => {
-                let id = r.id();
-                diff.deleted_relations.contains(&id) || diff.has_relation(id)
-            }
+        let (cursor, sorted, id) = match &element {
+            Element::DenseNode(dn) => (&mut node_cursor, &ranges.node_ids[..], dn.id()),
+            Element::Node(n) => (&mut node_cursor, &ranges.node_ids[..], n.id()),
+            Element::Way(w) => (&mut way_cursor, &ranges.way_ids[..], w.id()),
+            Element::Relation(r) => (&mut rel_cursor, &ranges.rel_ids[..], r.id()),
         };
-        if dominated {
+        while *cursor < sorted.len()
+            && crate::commands::osm_id_cmp(sorted[*cursor], id) == Ordering::Less
+        {
+            *cursor += 1;
+        }
+        if *cursor < sorted.len() && sorted[*cursor] == id {
             return true;
         }
     }
@@ -133,7 +139,6 @@ fn fallback_index(block: &PrimitiveBlock) -> BlobIndex {
 pub(super) fn classify_only(
     frame: &RawBlobFrame,
     ranges: &DiffRanges,
-    diff: &CompactDiffOverlay,
     buf: &mut Vec<u8>,
     counters: &ClassifyCounters,
 ) -> std::result::Result<ClassifyResult, String> {
@@ -147,7 +152,7 @@ pub(super) fn classify_only(
         return Ok(ClassifyResult::Passthrough(*idx, has_indexdata));
     }
 
-    // Slow path: decompress + lightweight scan.
+    // Slow path: decompress.
     let t_decompress = std::time::Instant::now();
     decompress_blob_data_into(frame.blob_bytes(), buf).map_err(|e| e.to_string())?;
     counters.decompress_ns.fetch_add(
@@ -155,19 +160,24 @@ pub(super) fn classify_only(
         Ordering::Relaxed,
     );
 
-    let t_scan = std::time::Instant::now();
-    let scan = blob_index::scan_block_ids(buf);
-    counters.scan_ns.fetch_add(
-        u64::try_from(t_scan.elapsed().as_nanos()).unwrap_or(u64::MAX),
-        Ordering::Relaxed,
-    );
-
-    let scan = if let Some(scan) = scan {
-        if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
+    // Lightweight scan: only useful when indexdata is absent. When indexdata
+    // is present and said "overlap" (we wouldn't be here otherwise), the
+    // scan's tighter range would still overlap - measured 0 `scan_pass`
+    // hits at planet. Skip the call entirely.
+    let scan = if frame.index.is_none() {
+        let t_scan = std::time::Instant::now();
+        let scan = blob_index::scan_block_ids(buf);
+        counters.scan_ns.fetch_add(
+            u64::try_from(t_scan.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if let Some(ref s) = scan
+            && !ranges.range_overlaps(s.kind, s.min_id, s.max_id)
+        {
             counters.blobs_scan_pass.fetch_add(1, Ordering::Relaxed);
-            return Ok(ClassifyResult::Passthrough(scan, has_indexdata));
+            return Ok(ClassifyResult::Passthrough(*s, has_indexdata));
         }
-        Some(scan)
+        scan
     } else {
         None
     };
@@ -182,10 +192,14 @@ pub(super) fn classify_only(
         Ordering::Relaxed,
     );
 
-    let index = scan.unwrap_or_else(|| fallback_index(&block));
+    // Prefer scan (tighter) when we have it; fall back to frame indexdata or
+    // a fabricated index from the parsed block.
+    let index = scan
+        .or(frame.index)
+        .unwrap_or_else(|| fallback_index(&block));
 
     let t_precise = std::time::Instant::now();
-    let overlaps = block_overlaps_diff(&block, diff);
+    let overlaps = block_overlaps_diff(&block, ranges);
     counters.precise_ns.fetch_add(
         u64::try_from(t_precise.elapsed().as_nanos()).unwrap_or(u64::MAX),
         Ordering::Relaxed,

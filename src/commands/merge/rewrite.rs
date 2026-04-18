@@ -893,7 +893,7 @@ pub fn merge(
             .par_iter()
             .map_init(
                 Vec::new,
-                |buf, frame| classify_only(frame, &ranges, &diff, buf, &classify_counters),
+                |buf, frame| classify_only(frame, &ranges, buf, &classify_counters),
             )
             .collect();
         phase_timers.classify_total += phase1_start.elapsed();

@@ -479,45 +479,62 @@ The classifier runs three paths per blob (see [classify.rs:129](../src/commands/
 
 **FalsePositive has no explicit counter.** The delta subtraction works today but obscures a distinct path - these blobs pay the full-parse cost for nothing. Worth tracking directly.
 
-#### Instrumentation plan (landing first)
+#### Instrumentation landed (`b769996`) and measured (UUID `e49b6182`)
 
-The blob counts above tell us *how many* blobs take each path but not *how much time* each path burns. The conflation above also hides scan-path vs fast-path. Before picking an optimization, add:
+New per-path counters: `merge_blobs_classify_{fastpath,scan_pass,false_positive,rewrite}` (explicit blob counts) and `merge_classify_{decompress,scan,parse,precise}_ns` (cumulative ns summed across rayon workers, divided by observed parallelism to back out wall share). Fast-path is not instrumented (few-ns range check; atomic-add would dominate).
 
-- **Per-path blob counters** (explicit, not derived):
-  - `merge_blobs_classify_fastpath` - Passthrough reached before decompress.
-  - `merge_blobs_classify_scan_pass` - Passthrough reached via `scan_block_ids` after decompress.
-  - `merge_blobs_classify_false_positive` - Decompressed + full-parsed + precise check said no.
-  - `merge_blobs_classify_rewrite` - kept as alias of existing `merge_blobs_rewritten` for completeness.
-- **Per-path cumulative CPU** (via atomic counters accumulating `Instant::elapsed()` on rayon workers):
-  - `merge_classify_decompress_ns` - time in `decompress_blob_data_into`.
-  - `merge_classify_scan_ns` - time in `blob_index::scan_block_ids`.
-  - `merge_classify_parse_ns` - time in `parse_primitive_block_from_bytes_owned`.
-  - `merge_classify_precise_ns` - time in `block_overlaps_diff`.
-  - Fast-path is a few-ns range check - not instrumented; the difference between `merge_classify_total_ms × cores` and the sum of the above approximates it.
+Planet run at `b769996`, 2026-04-18, plantasjen, `--bench 1`, `--compression none`. Wall: **136.8 s** (a further ~8 s drop vs `52c2c4b`'s 144.4 s, likely run-to-run variance). Classify phase wall: **71.1 s**.
 
-These are cumulative CPU (nanoseconds summed across rayon workers). Divide by observed parallelism from `merge_classify_total_ms × decode_threads` to back out per-path wall contribution.
+**Per-sub-step cumulative CPU:**
 
-Deliberately leaving out scan/parse-body decomposition for now - can add later if the first measurement points somewhere finer.
+| Sub-step | Cumulative CPU | % of classify CPU |
+|---|---:|---:|
+| `merge_classify_decompress_ns` | **206.3 s** | **70.0 %** |
+| `merge_classify_precise_ns`    | 56.9 s       | 19.3 % |
+| `merge_classify_parse_ns`      | 21.1 s       | 7.2 % |
+| `merge_classify_scan_ns`       | 10.7 s       | 3.6 % |
+| **Total measured CPU**         | **295.0 s**  | |
 
-#### Candidate optimizations (to be picked after measurement)
+**Per-path blob counts** (explicit):
 
-In decreasing likelihood of landing first:
+| Path | Blobs | % of 197 585 |
+|---|---:|---:|
+| `fastpath` | 104 908 | 53.1 % |
+| `scan_pass` | **0** | 0.0 % |
+| `false_positive` | 15 224 | 7.7 % |
+| `rewrite` | 77 453 | 39.2 % |
 
-1. **Lightweight precise-ID scan for FalsePositive** - the 15 k blobs that decompress + full-parse + find no matching element currently pay the same cost as rewrites. A wire-format ID scan (node/way/relation IDs without StringTable parsing, analogous to `extract_node_tuples`) could replace `parse_primitive_block_from_bytes_owned` on this path. Expected win: depends on how much of classify CPU is full-parse time. Instrumentation will tell.
-2. **Defer full parse for rewrites** - the 77 k rewrite blobs currently parse in classify (Phase 1), then hand the `PrimitiveBlock` to rewrite (Phase 3). If the parse happened in Phase 3 instead, classify wall shrinks by whatever the parse share is. Downside: Phase 3 gets more per-blob work; needs proportional rewrite-worker capacity.
-3. **Merge with #3 (parallel reader)** - if the reader disappears and workers pread+classify in one stage, classify stops being a discrete main-thread phase at all. Biggest restructure but tackles classify + rewrite-recv + reader stall simultaneously. Only worth it if (1) and (2) don't close the gap.
+**Findings:**
 
-Risk: low for #1, medium for #2 (needs the rewrite worker pool to handle the added work without stalling), high for #3 (main-loop restructure; see the existing #3 wrinkles).
+1. **Classify is CPU-undersaturated, not CPU-bound.** 295 s of rayon-worker CPU in 71 s of main-thread wall = **4.15 cores average** (out of 22 available). The phase is wall-limited by how work reaches rayon, not by raw work volume. With 15 864 batches averaging 12.5 blobs/batch, most per-batch `par_iter` calls can't use more than a handful of cores before running out of work. **This is the biggest lever.**
+2. **Decompress is 70 % of classify CPU.** Nothing to optimise inside the decompress call (zlib is zlib); what matters is how many blobs reach it. The 92 677 slow-path blobs (FalsePositive + rewrite) each cost ~2.23 ms to decompress; there's no way to skip decompress if we need the bytes for rewrite or precise check.
+3. **`scan_block_ids` is pure waste at planet: 0 `scan_pass` hits, 10.7 s CPU burned.** When indexdata is present and said overlap, `scan_block_ids` returns a range that always overlaps too (indexdata is already tight on pbfhogg-emitted PBFs). Skipping the scan when we already have indexdata saves 10.7 s CPU / 4.15 cores ≈ **2.6 s wall**. Trivial fix.
+4. **Precise check (`block_overlaps_diff`) costs 57 s CPU** - more than parse (21 s). 92 677 calls x 614 us avg. Driven by `HashSet::contains` over diff IDs for every element in the block. Candidates: iterate diff IDs against the block's sorted element IDs (linear merge) instead; or replace `FxHashSet` lookup with `IdSetDense` for the diff nodes/ways/relations if dense enough; or do a wire-format ID scan that avoids materialising `PrimitiveBlock` at all.
+5. **Parse is only 21 s CPU (7 %)** - smaller than expected. Deferring parse to Phase 3 would save barely 5 s wall at current parallelism. Not worth the refactor on its own.
+
+#### Revised ranking (post-measurement)
+
+By estimated wall impact at planet, assuming current ~4.15 cores classify utilisation (numbers change if item 1 lands first):
+
+| # | Change | Est. wall save | Risk | Notes |
+|---|---|---:|---|---|
+| 1 | **Classify parallelism: cash in the CPU slack** | **~25-35 s** | medium | Bigger/coarser batches, or pipeline restructure so classify isn't per-batch main-thread serial. See sub-proposal below. |
+| 2 | Skip `scan_block_ids` when indexdata was present | **~2.6 s** | trivial | Drop the scan call when `frame.index.is_some()`; rely solely on the precise check. Cheap first win. |
+| 3 | Wire-format FalsePositive scan | **~3.4 s** | low | Replace parse+precise for 15 k blobs with a lightweight ID-only wire walk (analogous to `extract_node_tuples` but for way/relation IDs). Saves ~5 s parse CPU + ~9 s precise CPU. |
+| 4 | Reduce `block_overlaps_diff` per-call cost | unknown | low-med | 57 s CPU total. Try linear sorted-merge vs HashSet lookups; or dense ID sets. Needs a micro-bench before committing. |
+| 5 | Pipeline restructure (subsumes reader #3) | ~40-60 s | high | Collapses reader → classify → rewrite into one work-stealing pipeline. Also tackles rewrite-recv (43 s wall, 30 %). Only after items 1-4. |
+
+Item 1 detail: the cheapest experiment is to bump `BATCH_MIN_BLOBS` / widen `BATCH_BYTE_BUDGET` so each `par_iter` has more work. Risk is memory: peak in-flight bytes grows with batch size. Likely safe under the 1.8-2.5 GB budget documented below. If that doesn't saturate cores, the only remaining fix is pipeline restructure (item 5). Instrument first by emitting per-batch classify CPU and per-batch blob count, so we can tell which `par_iter` calls leave cores idle.
 
 ## Overall expected savings
 
 Under `--compression none` at planet:
 
-- #2 alone: **landed, measured -10.5 s wall (154.9 s -> 144.4 s on `52c2c4b`).** Pre-measurement estimate was 30-60 s; the actual save was smaller because measured prefill wall at planet (20.5 s) was itself smaller than the pre-measurement 30-60 s upper bound, and #2 takes ~30 % of that rather than eliminating it entirely.
-- #2 + #3: with #3 still to land, remaining headroom comes from classify and rewrite-recv (now the top buckets), plus the reader stall. At planet, `merge_reader_send_wait_us=14.0 s` sets a ceiling on what #3 (reader parallelisation) can contribute to wall-clock, since that's how long the downstream consumer is already blocked by full frame channel waits.
-- Classify (49 % wall) and rewrite-recv (30 % wall) are now the targets with the largest ceilings. No concrete plan in this doc yet; will need a dedicated section once we pick an approach.
+- #2 (parallel prefill): **landed, measured -10.5 s wall (154.9 s -> 144.4 s on `52c2c4b`).**
+- Post-measurement (UUID `e49b6182` at `b769996` landed instrumentation, 136.8 s wall) the top lever is classify parallelism (~25-35 s ceiling if we can get from 4.15 to ~10 used cores during the phase). Combined with scan-skip (~2.6 s) and FalsePositive wire scan (~3.4 s), the near-term classify budget is ~30-40 s wall saved.
+- Rewrite-recv is 43.7 s wall / 30 % at planet - same ceiling unchanged. Addressing it requires the pipeline restructure (item 5) which also subsumes reader #3.
 
-Updated primary target: **~115-125 s at planet (`--compression none`)** from 144.4 s post-#2, once classify and rewrite-recv are addressed. A naive #3 (parallel reader) alone is probably worth another -5 to -10 s on top of #2.
+Updated primary target: **~95-110 s at planet (`--compression none`)** from 136.8 s, once classify parallelism + scan-skip + FalsePositive scan land. With pipeline restructure on top, **~75-90 s** becomes plausible.
 
 ## What to leave alone
 
@@ -533,11 +550,14 @@ Updated primary target: **~115-125 s at planet (`--compression none`)** from 144
 
 ## Plan of attack
 
-1. ~~**Enable `#[cfg(feature = "hotpath")]` per-phase timers unconditionally**~~ **Done:** per-phase counters are already always-on at planet, measurement on `b7ed0e1`/`52c2c4b` ground-truths the breakdown.
-2. ~~**Land #2 first** - parallel `prefill_from_base`.~~ **Landed 2026-04-18 (`52c2c4b`), planet -10.5 s wall.** Cross-validated on Denmark via `brokkr verify merge --dataset denmark`.
-3. **Land #4 instrumentation** - per-path classify counters + cumulative-ns timers. No behaviour change; one planet bench run to get the decomposition, then pick an optimization.
-4. **Land one of #4's candidate optimizations** - picked by the instrumentation run. Most likely the lightweight precise-ID scan for FalsePositive, or deferred parse for rewrites.
-5. **Land #3** - parallel pread schedule replacing the reader thread. Post-#2 ceiling from `merge_reader_send_wait_us=14.0 s` at planet; may merge with or be subsumed by #4's restructure candidate.
+1. ~~**Enable `#[cfg(feature = "hotpath")]` per-phase timers unconditionally**~~ **Done.**
+2. ~~**Land parallel prefill (#2).**~~ **Landed 2026-04-18 (`52c2c4b`), planet -10.5 s wall.**
+3. ~~**Land classify instrumentation (#4).**~~ **Landed 2026-04-18 (`b769996`).** Measurement at UUID `e49b6182` - findings in #4 section above.
+4. **Skip `scan_block_ids` when indexdata was present** - trivial fix, est. -2.6 s wall.
+5. **Bump classify batch size** - experiment with larger `BATCH_BYTE_BUDGET` / `BATCH_MIN_BLOBS` to cash in the CPU slack. Est. -25-35 s wall if it moves observed classify utilisation from 4.15 to ~10 cores.
+6. **Wire-format FalsePositive precise scan** - replace parse + precise for 15 k FalsePositive blobs. Est. -3.4 s wall.
+7. **Investigate `block_overlaps_diff` per-call cost** - 57 s CPU; sorted-merge or `IdSetDense` alternatives. Wall save uncertain; measure before committing.
+8. **Pipeline restructure** - collapses reader + classify + rewrite-recv into one work-stealing pipeline. Subsumes reader #3. Biggest-risk change, target once 4-7 are measured.
 
 Cross-validation: `brokkr verify merge --dataset denmark` (note: name is `merge`, not `apply-changes` - the subcommand in `brokkr verify` predates the rename). Otherwise: identical output PBF byte-for-byte after the primary merge batch; tail creates that get out-of-order under the existing implementation would be the same out-of-order set. Element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback.
 

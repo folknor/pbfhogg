@@ -29,20 +29,263 @@ Target after this plan: **~6-9 min at planet under `--compression none`**, RSS u
 | `apply-changes --locations-on-ways` (current, `--compression none`) | 8m52s | 1.8 GB | ~80 % blob rewrite ratio on daily OSC |
 | `apply-changes --locations-on-ways` (current, `--compression zlib`) | 12m33s | 1.8 GB | as above with zlib encode (osmium-interop default) |
 
-Inferred per-phase breakdown for a daily planet OSC under `--compression none`:
+## Measured: Europe altw + `--locations-on-ways --compression none`
 
-| Phase | Est. wall | Parallelized? | Dominant cost |
-|---|---:|---|---|
-| OSC parse + `DiffRanges` build | ~10-30 s | no | small input |
-| `NodeLocationIndex::prefill_from_base` | **~30-100 s** | **no (sequential)** | single-threaded node-blob decompress |
-| Reader thread (sequential pread of 87 GB) | **~50-150 s** | **no (single thread)** | `FileReader` + blob-header parse |
-| Phase 1 classify (~80 % blobs decompress) | ~100-250 s | yes (rayon) | zlib decompress |
-| Phase 3 rewrite (~80 % blobs re-encode) | ~50-150 s | yes (rayon) | `BlockBuilder` + tag work |
-| Phase 4 output (no compression) | ~30-60 s | yes (writer thread) | NVMe write throughput |
-| Writer flush | ~5 s | - | trivial |
-| **Sum** | ~275-745 s | | 532 s (none) / 753 s (zlib) lands inside this band; zlib at the high end |
+Commit `b4f45ff`, 2026-04-18, plantasjen. UUID `f0af4170`, `--bench 1`.
+Europe altw (38 GB), OSC seq 4715 (planet-scale daily diff applied to a
+regional extract - see the missing-node note below).
+Total wall: **46.1 s**.
 
-Two single-threaded stretches (~80-250 s combined) and input decompression (~100-250 s) are the main targets.
+### Per-phase wall (from always-on sidecar counters)
+
+| Phase | Wall (ms) | % of wall | Parallelised? | Counter |
+|---|---:|---:|---|---|
+| OSC parse | 1 860 | 4.0 % | no | `merge_osc_parse_ms` |
+| `DiffRanges::from_diff` | 59 | 0.1 % | no | `merge_diffranges_ms` |
+| `NodeLocationIndex::prefill_from_base` | **5 819** | **12.6 %** | no (sequential) | `merge_prefill_ms` |
+| Header read + writer setup | ~0 | - | no | `merge_header_read_ms`, `merge_writer_setup_ms` |
+| Phase 1 classify (cumulative) | **19 767** | **42.9 %** | yes (rayon) | `merge_classify_total_ms` |
+| Phase 2 inline assignment (cumulative) | 54 | 0.1 % | no (sequential) | `merge_phase2_inline_total_ms` |
+| Phase 3 rewrite spawn (cumulative) | 145 | 0.3 % | - | `merge_rewrite_spawn_total_ms` |
+| Phase 4 rewrite recv + dispatch (cumulative) | **13 651** | **29.6 %** | main thread blocks on rayon | `merge_rewrite_recv_total_ms` |
+| Phase 4 output write (cumulative) | 110 | 0.2 % | - | `merge_output_write_total_ms` |
+| Passthrough write (cumulative) | 14 | 0.0 % | - | `merge_passthrough_write_total_ms` |
+| Trailing creates | 1 | 0.0 % | no | `merge_trailing_creates_ms` |
+| Final writer flush | 1 354 | 2.9 % | - | `merge_final_flush_ms` |
+| **Sum of phases** | **~42 800** | **~93 %** | | |
+
+Unaccounted ~3.3 s (~7 %) is thread startup/join, OSC file I/O before
+the parse marker, and stderr printing. Not a target.
+
+### Stall attribution (from WAIT_* spans + atomic accumulators)
+
+| Stall | Total | % of wall | Meaning |
+|---|---:|---:|---|
+| `merge_rewrite_recv_wait_us` | 13.50 s | 29.3 % | main thread blocked on rayon rewrite results |
+| `merge_reader_send_wait_us` | 1.47 s | 3.2 % | reader thread blocked on full frame channel |
+| `merge_consumer_recv_wait_us` | 1.44 s | 3.1 % | `collect_batch` blocked on empty frame channel |
+| `merge_writer_call_us` | 1.14 s | 2.5 % | time spent in `writer.write_*` calls |
+
+Writer-internal stalls (from the writer's own counters):
+
+| Counter | Total | Comment |
+|---|---:|---|
+| `writer_recv_wait_ns` | 19.6 s | reorder-buffer thread waiting for inputs - writer isn't the bottleneck |
+| `writer_compress_ns` | 8.6 s | cumulative framing/encode (note: `none` compression still frames wire bytes) |
+| `writer_write_ns` | 15.2 s | actual disk writes |
+| `writer_flush_ns` | 1.35 s | matches `merge_final_flush_ms` |
+
+### Shape counters
+
+| Counter | Value |
+|---|---:|
+| `merge_batches_total` | 14 744 |
+| `merge_reader_frames_sent` | 514 664 |
+| `merge_reader_blocked_sends` | 2 533 (0.49 %) |
+| `merge_blobs_passthrough` | 473 706 |
+| `merge_blobs_rewritten` | 40 958 |
+| `merge_blobs_index_hit` | 451 231 |
+| `merge_bytes_passthrough` | 20.8 GB |
+| `merge_bytes_rewritten` | 26.4 GB (56 % rewrite ratio) |
+
+### Prefill shape
+
+| Counter | Value |
+|---|---:|
+| `merge_loc_needed` | 3 576 070 |
+| `merge_loc_from_diff` | 731 618 |
+| `merge_loc_from_base` | 37 585 |
+| `merge_loc_missing` | **2 806 867 (78 %)** |
+| `merge_prefill_blobs_scanned` | 95 071 |
+| `merge_prefill_blobs_skipped_range` | 361 872 (79 % skip rate) |
+| `merge_prefill_early_exit` | 0 |
+
+**Missing-node caveat.** Europe's OSC (seq 4715) is a full-planet daily
+diff, not a regional one. Most referenced nodes are outside Europe's
+extract bbox and won't be in the base PBF. The 78 % missing rate is
+expected for this dataset combination, not a bug. It does mean prefill
+is doing less useful work than it would on a planet run, where the
+OSC and the base cover the same extent.
+
+### What this changes vs the inferred breakdown
+
+Plan-level intuition held for the order of magnitude (prefill slow,
+reader single-threaded), but the proportions shifted:
+
+- **Classify is the dominant phase, not prefill or rewrite-encode.**
+  19.8 s / 43 % of wall. The plan's "leave alone" recommendation
+  deserves revisiting. Candidate: reduce per-blob decompress cost
+  (pipelined decompress reuses buffers), or skip more blobs via
+  better blob-index fast paths.
+- **Main thread spends 30 % of wall blocked on rayon rewrite
+  results.** `merge_rewrite_recv_wait_us` and
+  `merge_rewrite_recv_total_ms` both land at ~13.5 s. The plan framed
+  rewrite-encode as a rayon-parallel phase to leave alone; actually
+  its wall-clock contribution from the main thread's point of view is
+  second only to classify. Faster rewrites, or more rewrite workers,
+  are worth considering.
+- **Prefill is 5.8 s on Europe, not the 30-100 s predicted for
+  planet.** Scaling by file size (87/38 = 2.3×) predicts ~13 s on
+  planet; scaling by node count (10.4 B / 3.7 B = 2.8×) predicts ~16 s.
+  Plan #2 estimate was 30-60 s. Either the estimate was generous or
+  the Europe OSC touches fewer nodes proportionally. Either way, plan
+  #2's ceiling is probably ~10-20 s saved at planet, not 30-60 s.
+- **Reader thread stalls only 3 % of wall.** The plan estimated
+  reader wall at 50-150 s (planet). On Europe only 1.47 s stalled; if
+  the whole reader walked 46 s at ~830 MB/s it would take ~45 s, but
+  the reader runs concurrently with the consumer, so its wall doesn't
+  add. Plan #3's payoff on `--compression none` looks modest; under
+  zlib-output (where classify + rewrite + writer get slower) the
+  reader still isn't the critical path.
+
+### Revised ranked targets (post-measurement)
+
+1. **Classify** (19.8 s @ Europe, 43 % wall) - newly elevated. Was "leave alone" in the inferred plan; measurement says it's the biggest bucket.
+2. **Rewrite throughput** (13.65 s @ Europe, 30 % wall) - consumer blocked on rayon results. Also not originally on the plan's ranked list.
+3. **Prefill** (5.8 s, 13 %) - plan #2 target; confirmed sub-optimal but smaller ceiling than estimated.
+4. **Reader parallelisation** (1.47 s stall, 3 %) - plan #3 target; payoff small on `--compression none` at Europe scale.
+5. **zlib:1 default** - plan #1. Moot in production (uses `none`). Leave for opportunistic pickup.
+
+Items #1 and #2 weren't on the ranked opportunities list in the
+inferred plan. Before committing to implementation order, the next
+measurement should separate classify's work into its three fast
+paths (indexdata hit / scan-only / precise decompress) to see whether
+the 19.8 s is dominated by decompress of the 8 % of blobs that get
+rewritten, or by the scan-only path across the 92 % that pass through.
+
+## Hotpath: per-function cumulative CPU (Europe altw, 2026-04-18)
+
+Two runs at commit `b4f45ff`, `--hotpath` mode. Totals are cumulative
+wall across all calls; `% Total` is cumulative vs primary-thread wall,
+so values >100 % mean the function saw parallel execution across
+multiple cores.
+
+### `--compression none` (UUID `e583036e`, 60.5 s wall)
+
+| Function | Calls | Avg | Total | % wall |
+|---|---:|---:|---:|---:|
+| `merge::classify::classify_only` | 514,636 | 192 µs | **98.7 s** | 163 % |
+| `merge::rewrite::rewrite_block_parallel` | 40,921 | 1.65 ms | **67.4 s** | 111 % |
+| `pbfhogg::commands::read_raw_frame` | 514,667 | 96 µs | 49.3 s | 82 % |
+| `write::writer::frame_blob_into` | 61,670 | 220 µs | 13.6 s | 22 % |
+| `write::block_builder::take_owned` | 61,675 | 151 µs | 9.3 s | 15 % |
+| `merge::rewrite::collect_batch` | 15,312 | 545 µs | 8.4 s | 14 % |
+| `read::block::new` | 63,406 | 96 µs | 6.1 s | 10 % |
+| `merge::node_locations::prefill_from_base` | 1 | **5.94 s** | 5.94 s | **10 %** |
+
+### `--compression zlib:6` (UUID `ff3b07aa`, 56.7 s wall - different cache state)
+
+| Function | Calls | Avg | Total | % wall |
+|---|---:|---:|---:|---:|
+| `write::writer::frame_blob_into` | 61,686 | 10.1 ms | **625 s** | 1104 % |
+| `merge::classify::classify_only` | 514,651 | 225 µs | 115.7 s | 204 % |
+| `merge::rewrite::rewrite_block_parallel` | 40,942 | 2.06 ms | 84.4 s | 149 % |
+| `pbfhogg::commands::read_raw_frame` | 514,667 | 83 µs | 42.8 s | 75 % |
+| `write::block_builder::take_owned` | 61,695 | 191 µs | 11.8 s | 21 % |
+| `read::block::new` | 63,420 | 115 µs | 7.3 s | 13 % |
+| `merge::node_locations::prefill_from_base` | 1 | **5.85 s** | 5.85 s | 10 % |
+| `read::blob::decompress_into` | 95,071 | 43 µs | 4.1 s | 7 % |
+
+Delta from none → zlib:
+
+- `frame_blob_into`: **13.6 s → 625 s** (+611 s CPU). Pure zlib encode cost, parallel.
+- `classify_only`: 99 s → 116 s (+17 s CPU). **Classify doesn't encode anything** - the delta is core contention, see the "zlib vs none" section.
+- `rewrite_block_parallel`: 67 s → 84 s (+17 s CPU). Same mechanism.
+- `prefill_from_base`: unchanged at ~5.9 s. Runs before the main pipeline, no contention.
+
+## Alloc: per-function cumulative bytes (Europe altw, 2026-04-18)
+
+UUID `4d4d9954`, commit `b4f45ff`, `--alloc` mode (`hotpath-alloc`
+feature), default `--compression` (zlib:6). 60.8 s wall. Total
+allocations ~291 GB across the run; peak RSS 1.1 GB - the allocator
+turns bytes over fast, doesn't retain.
+
+| Function | Calls | Avg | Total | % total |
+|---|---:|---:|---:|---:|
+| `merge::rewrite::rewrite_block_parallel` | 40,936 | 2.0 MB | **80.7 GB** | 27.7 % |
+| `read::wire::parse_and_inline_with_scratch` | 63,423 | 860 KB | **52.0 GB** | 17.9 % |
+| `merge::classify::classify_only` | 514,654 | 83.5 KB | 41.0 GB | 14.1 % |
+| `commands::read_raw_frame` | 514,667 | 74.1 KB | 36.4 GB | 12.5 % |
+| `write::block_builder::take_owned` | 61,690 | 563 KB | 33.1 GB | 11.4 % |
+| `read::block::new` | 63,423 | 411 KB | 24.9 GB | 8.6 % |
+| `write::writer::frame_blob_into` | 61,683 | 281 KB | 16.5 GB | 5.7 % |
+| `merge::node_locations::prefill_from_base` | 1 | **2.9 GB** | 2.9 GB | 1.0 % |
+| `read::blob::parse` | 971,613 | 901 B | 835 MB | 0.3 % |
+
+Signals:
+
+- **`parse_and_inline_with_scratch` at 860 KB per call** is the most
+  surprising row - the "with_scratch" variant suggests scratch reuse
+  already happened, but 52 GB cumulative shows the scratch doesn't
+  cover every per-call vec. Worth auditing which vecs inside the
+  function are still fresh per call.
+- **`rewrite_block_parallel` at 2 MB per call × 41 k calls = 80.7 GB**
+  is the largest single-callsite bucket. Per-call BlockBuilder (`task_bb`
+  at rewrite.rs:958), output `Vec<OwnedBlock>`, stats - all per-task
+  greenfield. This is the biggest arena / scratch pool target.
+- **`classify_only` at 83 KB per call × 514 k calls = 41 GB** adds up
+  from the per-call decompress buffer + wire scan scratch. Already
+  uses `map_init` with a reusable buffer for decompress; the 41 GB
+  says other per-call vecs are leaking (probably inside
+  `scan_block_ids`, `scan_block_tags`, or the full-parse fallback).
+- **`prefill_from_base` at 2.9 GB in one call** is the `NodeLocationIndex`
+  - `locations: FxHashMap<i64, (i32,i32)>` + `needed_set: FxHashSet<i64>`.
+  Sparse, expected, planet-scale still comfortable under host budget.
+
+## Zlib vs none: where does the 8 s go?
+
+Directly comparable `--bench 1` runs, same commit, same file, same cache
+state window:
+
+| UUID | Compression | Wall |
+|---|---|---:|
+| `f0af4170` | none | **46.1 s** |
+| `570dfa69` | zlib:6 | **54.2 s** |
+
+Zlib costs +8.1 s wall. Counter deltas:
+
+| Counter | none | zlib:6 | Δ |
+|---|---:|---:|---:|
+| `merge_classify_total_ms` | 19,767 | 27,204 | **+7.4 s** |
+| `merge_rewrite_recv_total_ms` | 13,651 | 13,895 | +0.2 s |
+| `merge_prefill_ms` | 5,819 | 6,268 | +0.5 s |
+| `merge_osc_parse_ms` | 1,860 | 1,955 | +0.1 s |
+| `merge_final_flush_ms` | 1,354 | 1,179 | −0.2 s |
+| `writer_compress_ns` | 8.6 s | **637.5 s** | +629 s CPU (parallel) |
+| `merge_reader_send_wait_us` | 1.47 s | 8.63 s | +7.2 s stall |
+| `writer_reorder_high_water` | 133 | **1797** | **13× deeper** |
+| `writer_bytes_framed` | 26.6 GB | 17.3 GB | zlib output 35 % smaller |
+
+**Classify takes +7.4 s under zlib even though classify doesn't
+compress anything.** This is core contention: rayon workers decoding
+blobs for classify compete for cores with rayon workers compressing
+blocks for the writer. Under `none` the compression pool does almost
+nothing; under zlib:6 it burns 629 s cumulative CPU (parallel) and
+eats into classify's decode bandwidth. The reader-send stall at 8.6 s
+(vs 1.5 s under none) is a second-order effect: consumer is slower, so
+the frame channel stays full longer.
+
+The writer's reorder high-water at 1797 (vs 133) says zlib produces
+highly out-of-order completions - compression workers finish blobs in
+variable time, the reorder buffer queues them until the file-order
+consumer catches up. Not a bottleneck per se, just a shape change.
+
+**Implications for ranking:**
+
+- Confirms `--compression none` is the right production default (plan's
+  existing position).
+- **New rank-#1-adjacent candidate: separate rayon pool for writer
+  compression.** Today the pipelined writer uses the global rayon pool,
+  same pool as classify + rewrite. Isolating the compression pool
+  (dedicated thread pool, N = min(cores, 4)) would let classify keep
+  all cores when compression is under-utilised (current `--compression
+  none` shape) and would prevent zlib runs from slowing classify. Fixes
+  the hidden cross-phase interaction even when the user doesn't opt
+  into `none`. Net: estimated 5-7 s save on Europe under zlib, smaller
+  under none.
+- The zlib:1 default (plan #5) remains opportunistic - lower win than
+  the pool-separation idea above and with the same output-compatibility
+  caveat.
 
 ## Current architecture (reference)
 

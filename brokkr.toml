@@ -188,18 +188,23 @@ seq = 4714
 [plantasjen.datasets.planet]
 origin = "planet.openstreetmap.org"
 download_date = "2026-03-07"
+# seq 4912 = daily-replication boundary at 2026-02-23 00:00 UTC.
+# PBF repl timestamp is 2026-02-23 01:00 UTC (1h past the boundary) - filename date matches cutoff.
 
 [plantasjen.datasets.planet.pbf.indexed]
 file = "planet-20260223-with-indexdata.osm.pbf"
 xxhash = "3ce64c662db10ed2c551ad2737144df1"
+seq = 4912
 
 [plantasjen.datasets.planet.pbf.altw]
 file = "planet-20260223-altw.osm.pbf"
 xxhash = "e83b43b8b1883efcc252e47b5c275535"
+seq = 4912
 
 [plantasjen.datasets.planet.pbf.raw]
 file = "planet-20260223.osm.pbf"
 xxhash = "ad3c909d39350709d0918f1f78e1a94d"
+seq = 4912
 
 [dm6]
 data = "data"
@@ -246,14 +251,19 @@ xxhash = "92a56b4225b91f6b44150a69fe8e4679"
 
 [plantasjen.datasets.planet.snapshot.20260411]
 download_date = "2026-04-11"
+# seq 4954 = daily-replication boundary at 2026-04-06 00:00 UTC.
+# PBF repl timestamp is 2026-04-06 00:00:02 UTC - filename date (20260411) is the publish date,
+# 5 days AFTER the actual replication cutoff.
 
 [plantasjen.datasets.planet.snapshot.20260411.pbf.raw]
 file = "planet-20260411.osm.pbf"
 xxhash = "f59b934d548446df7716b0163edc0126"
+seq = 4954
 
 [plantasjen.datasets.planet.snapshot.20260411.pbf.indexed]
 file = "planet-20260411-with-indexdata.osm.pbf"
 xxhash = "7facb6386ff18bba38b176ee720fec62"
+seq = 4954
 
 [dm6.datasets.denmark]
 origin = "Geofabrik"

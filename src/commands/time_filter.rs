@@ -81,7 +81,12 @@ pub fn time_filter(
     let mut flush_error: Result<()> = Ok(());
 
     crate::debug::emit_marker("TIMEFILTER_START");
-    reader.for_each(|element| {
+    // Parallel decode via the 3-stage pipelined reader (IO -> rayon decode ->
+    // reorder). Element order across blocks is preserved by the reorder stage,
+    // which is load-bearing: the pending-group state machine below depends on
+    // sorted traversal to know when a group ends. Re-encode and group
+    // selection remain sequential on this thread.
+    reader.for_each_pipelined(|element| {
         if flush_error.is_err() {
             return;
         }

@@ -1079,31 +1079,53 @@ pub fn merge(
                     stats.blob_sizes.push(frame_len as u32);
                 }
                 BatchSlot::Rewrite { job_index, index: _ } => {
-                    // Wait for this rewrite result, buffering out-of-order arrivals
+                    // Wait for this rewrite result, buffering out-of-order arrivals.
+                    // Fast path: try_recv first. Only emit WAIT_* markers and
+                    // accumulate stall time when we actually fall through to a
+                    // blocking recv - otherwise a run with hundreds of finished-
+                    // early rayon tasks would flood the sidecar with zero-width
+                    // WAIT_REWRITE_RESULT pairs.
                     let recv_start = std::time::Instant::now();
-                    let mut first_wait = true;
+                    let mut emitted_wait = false;
                     while received[*job_index].is_none() {
-                        if first_wait {
-                            crate::debug::emit_marker("WAIT_REWRITE_RESULT_START");
-                            first_wait = false;
+                        match rewrite_rx.try_recv() {
+                            Ok((idx, result)) => {
+                                received[idx] = Some(
+                                    result.map_err(|e| -> Box<dyn std::error::Error> {
+                                        e.into()
+                                    })?,
+                                );
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {
+                                if !emitted_wait {
+                                    crate::debug::emit_marker("WAIT_REWRITE_RESULT_START");
+                                    emitted_wait = true;
+                                }
+                                let t_block = std::time::Instant::now();
+                                let (idx, result) = rewrite_rx.recv()
+                                    .map_err(|_| -> Box<dyn std::error::Error> {
+                                        "rewrite channel closed unexpectedly".into()
+                                    })?;
+                                let block_us = u64::try_from(t_block.elapsed().as_micros())
+                                    .unwrap_or(u64::MAX);
+                                stalls.rewrite_recv_us.fetch_add(
+                                    block_us,
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
+                                received[idx] = Some(
+                                    result.map_err(|e| -> Box<dyn std::error::Error> {
+                                        e.into()
+                                    })?,
+                                );
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                return Err("rewrite channel closed unexpectedly".into());
+                            }
                         }
-                        let (idx, result) = rewrite_rx.recv()
-                            .map_err(|_| -> Box<dyn std::error::Error> {
-                                "rewrite channel closed unexpectedly".into()
-                            })?;
-                        received[idx] = Some(
-                            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
-                        );
                     }
-                    if !first_wait {
+                    if emitted_wait {
                         crate::debug::emit_marker("WAIT_REWRITE_RESULT_END");
                     }
-                    let recv_elapsed_us = u64::try_from(recv_start.elapsed().as_micros())
-                        .unwrap_or(u64::MAX);
-                    stalls.rewrite_recv_us.fetch_add(
-                        recv_elapsed_us,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
                     phase_timers.rewrite_recv_total += recv_start.elapsed();
                     let t_flush = std::time::Instant::now();
                     flush_passthrough_buf(&mut passthrough_chunks, &mut writer)?;

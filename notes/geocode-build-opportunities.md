@@ -40,6 +40,114 @@ Breakdown ground-truthed by sidecar markers (`1c708509`). Pass 2 still holds ~70
 
 Target after this plan: **~10-12 min wall at planet, RSS reduced from 29.5 GB Pass 1.5 peak to <16 GB.**
 
+## Development baseline (Germany, commit `c977b97`, 2026-04-18, plantasjen)
+
+Germany is the primary iteration dataset: Pass 2 scan is long enough (40+ s)
+for `--bench 1` to resolve parallelization wins above noise, but short enough
+to iterate multiple times per hour. Denmark (~7 s) is the correctness gate
+(`diff -r` against baseline); Europe (~520 s) is pre-landing confirmation;
+planet is publish-only. Baseline measurements at the instrumentation commit:
+
+| Mode | UUID | Wall |
+|---|---|---:|
+| `--bench 1` | `e89b1691` | **71.1 s** |
+| `--hotpath` | `90a746dd` | 72.2 s |
+| `--alloc` | `0cc2ac56` | 70.3 s |
+
+### Phase breakdown (Germany `--hotpath`, UUID `90a746dd`)
+
+| Function | Calls | Wall | % of total |
+|---|---:|---:|---:|
+| `run_pass2` | 1 | **42.3 s** | **58.7 %** |
+| `run_pass1_5` | 1 | 9.1 s | 12.6 % |
+| `bucketed_cell_assignment` | 2 | 7.0 s | 9.7 % |
+| `assemble_admin_polygons` | 1 | 6.8 s | 9.5 % |
+| `resolve_interpolation_endpoints_mmap` | 1 | 3.2 s | 4.5 % |
+| `run_pass1` | 1 | 2.3 s | 3.2 % |
+| Remainder (writes, header, smoke test) | — | ~1.5 s | ~2 % |
+
+**Inside `run_pass2` (dominant cost is zlib, not tag/coord work):**
+
+| Inner function | Calls | Wall | % of Pass 2 |
+|---|---:|---:|---:|
+| `decompress_into` | 62 350 | 14.0 s | 33 % |
+| `decompress_blob_raw` | 8 696 | 11.5 s | 27 % |
+| **Combined zlib decompression** | | **25.5 s** | **60 %** |
+| PrimitiveBlock parse + classify + coord lookup + streaming writes | | ~17 s | 40 % |
+
+Structural confirmation for item #1: **parallelizing Pass 2 is primarily
+parallelizing decompression.** At 6 cores with arena contention overhead,
+an 80 % parallel win on the 42 s Pass 2 scan is ~34 s saved: Germany wall
+71 s → ~37 s, a −48 % reduction. At planet scale the same ratio on an
+881 s Pass 2 is ~700 s saved: 1 255 s → ~550 s, **within the plan's
+10-12 min target** from item #1 alone.
+
+### Allocation profile (Germany `--alloc`, UUID `0cc2ac56`)
+
+Total: **46.6 GB allocated, 80.9 GB deallocated** during the run (the
+deallocation-over-allocation spread is accurate — most allocations free
+before the next blob's allocations land; steady-state RSS tracks the
+difference, not the sum).
+
+| Function | Calls | Exclusive alloc | % |
+|---|---:|---:|---:|
+| `parse_and_inline_with_scratch` | 71 157 | 20.1 GB | 46.4 % |
+| `decompress_into` | 62 350 | 9.9 GB | 22.9 % |
+| `run_pass2` (non-nested) | 1 | 7.1 GB | 16.4 % |
+| `bucketed_cell_assignment` (non-nested) | 2 | 3.3 GB | 7.7 % |
+| `assemble_admin_polygons` | 1 | 1.5 GB | 3.5 % |
+| `resolve_interpolation_endpoints_mmap` | 1 | 683 MB | 1.5 % |
+| `assign_admin_cells` | 1 | 490 MB | 1.1 % |
+| `run_pass1` | 1 | 180 MB | 0.4 % |
+
+~30 GB of the 46 GB churn lives in wire-parse + zlib-decompress scratch per
+blob — exactly the cross-thread alloc/free pattern that `mallopt(M_ARENA_MAX, 2)`
+bounds in `renumber_external`. Parallelizing Pass 2 without the mallopt
+prelude risks the 25+ GB arena blowup explicitly called out in the
+sequential-choice rationale at [pass2.rs:369-374](../src/geocode_index/builder/pass2.rs#L369).
+
+### Memory peaks (Germany `--bench 1` sidecar, UUID `e89b1691`)
+
+| Phase | Peak anon RSS |
+|---|---:|
+| `GEOCODE_PASS1` | 232 MB |
+| `GEOCODE_PASS1_5_SCAN` | **20.3 GB** |
+| `GEOCODE_PASS2_RANK_INDEX` | 2.77 GB |
+| `GEOCODE_PASS2_SCAN_LOOP` | 3.86 GB |
+| `GEOCODE_PASS2_FLUSH_MMAP` | 3.55 GB |
+| `GEOCODE_PASS2_ADMIN_ASSEMBLY` | 505 MB |
+| `GEOCODE_PASS2_INTERP_RESOLVE` | 830 MB |
+| `GEOCODE_PASS3_STAGEB` (fine) | 1.98 GB |
+| `GEOCODE_PASS3_STAGEB` (coarse) | 1.68 GB |
+
+**The 20.3 GB Pass 1.5 peak on a 4.7 GB input is the most urgent finding.**
+It scales to the 29.5 GB planet peak and validates item #7's "load-bearing
+for 30 GB hosts, not optional" framing. Per-worker `IdSetDense` chunks
+grow independently because worker-local allocations aren't bounded by the
+final merged set size; Germany's 116 M referenced nodes × 6-8 workers ×
+full planet ID range produces the bloat. Landing item #7 (shared-atomic
+`IdSetDense` populated via `set_atomic`, following the `renumber_external.rs:166-179`
+pattern) should drop Pass 1.5 peak from 20.3 GB to ~3-4 GB on Germany
+(≈ the final `referenced_nodes` size plus decode residency).
+
+**Sequencing implication.** The original plan's step order was
+"instrument → #1 → #3+#4 → #2 → #5+#6 → #7 revisit". The updated sidecar
+data pushes #7 ahead of #1: without the Pass 1.5 shrink, the 27 GB-RAM
+iteration host just OOM-killed the first planet re-bench attempt at 1m34s
+in Pass 1.5 (overnight.sh round 1). #7 is a small diff on a well-understood
+pattern (the `set_atomic` / `rank_if_set` path is already used by
+renumber_external, check_refs, verify_ids) and is the prerequisite for
+any reliable planet iteration on this host.
+
+### Shape counts (Germany)
+
+- 116.3 M referenced nodes (compact index 930 MB)
+- 19.8 M address points
+- 3.3 M street ways
+- 78 interpolation ways
+- 43 K admin polygons
+- 512 K unique strings (7.5 MB strings data)
+
 ## Current architecture (for reference)
 
 **Pass 1** [(builder.rs:402)](../src/geocode_index/builder.rs#L402). Sequential scan of relation blobs via `ElementReader::for_each_block_pipelined` with `BlobFilter::only_relations()`. Collects `RawAdminRelation` list (admin + postal boundaries) and builds `needed_admin_ways` `IdSetDense` from member way IDs. Output volume is small.

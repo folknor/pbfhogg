@@ -314,20 +314,22 @@ impl ReaderScheduleEntry {
     }
 }
 
-/// Header-only walk of the base PBF to build a per-blob pread schedule.
-/// Runs on the manager thread before workers start, so the cost (one
-/// sequential BufReader pass skipping blob bodies) is not charged to
-/// per-worker wall.
-fn build_reader_schedule(
+/// Sequential header-only walk that dispatches each OsmData blob's schedule
+/// entry into `dispatch_tx` as it's parsed. Runs concurrently with the pread
+/// workers - they pull entries from the dispatch channel and start processing
+/// as soon as the scanner produces them. Returns the number of OsmData
+/// entries dispatched.
+fn scan_and_dispatch(
     base_pbf: &Path,
     direct_io: bool,
-) -> std::result::Result<(Vec<ReaderScheduleEntry>, Arc<std::fs::File>), String> {
+    dispatch_tx: &mpsc::SyncSender<(usize, ReaderScheduleEntry)>,
+) -> std::result::Result<usize, String> {
     use std::io::Read as _;
 
     let mut reader = FileReader::open(base_pbf, direct_io).map_err(|e| e.to_string())?;
     let mut file_offset: u64 = 0;
-    let mut schedule: Vec<ReaderScheduleEntry> = Vec::new();
     let mut past_header = false;
+    let mut seq: usize = 0;
 
     loop {
         let frame_start = file_offset;
@@ -360,21 +362,21 @@ fn build_reader_schedule(
             continue;
         }
 
-        schedule.push(ReaderScheduleEntry {
+        let entry = ReaderScheduleEntry {
             frame_offset: frame_start,
             blob_offset,
             data_size,
             index,
             tagdata,
-        });
+        };
+        if dispatch_tx.send((seq, entry)).is_err() {
+            // Workers have shut down (e.g. downstream error). Stop scanning.
+            break;
+        }
+        seq += 1;
     }
 
-    drop(reader);
-    let shared_file = Arc::new(
-        std::fs::File::open(base_pbf)
-            .map_err(|e| format!("failed to open {}: {e}", base_pbf.display()))?,
-    );
-    Ok((schedule, shared_file))
+    Ok(seq)
 }
 
 /// Parallel reader: header-only schedule scan + N pread workers + a reorder
@@ -405,36 +407,70 @@ fn spawn_parallel_reader(
 
     let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
         use std::os::unix::fs::FileExt as _;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::Ordering;
         use std::sync::Mutex;
 
-        crate::debug::emit_marker("MERGE_READER_SCHEDULE_START");
-        let (schedule, shared_file) = build_reader_schedule(&base_path, direct_io)?;
-        crate::debug::emit_marker("MERGE_READER_SCHEDULE_END");
+        let shared_file = Arc::new(
+            std::fs::File::open(&base_path)
+                .map_err(|e| format!("failed to open {}: {e}", base_path.display()))?,
+        );
 
-        let schedule_len = schedule.len();
-        let schedule = Arc::new(schedule);
         crate::debug::emit_marker("MERGE_READER_START");
 
         let decode_threads = std::thread::available_parallelism()
             .map(|n| n.get().saturating_sub(2).max(1))
             .unwrap_or(4);
 
+        let (dispatch_tx, dispatch_rx) =
+            mpsc::sync_channel::<(usize, ReaderScheduleEntry)>(decode_threads * 4);
+        let dispatch_rx = Arc::new(Mutex::new(dispatch_rx));
+
         let (worker_tx, worker_rx) =
             mpsc::sync_channel::<(usize, RawBlobFrame)>(decode_threads * 4);
 
-        let next_idx = AtomicUsize::new(0);
         let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let scanned: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
         let mut frames_sent: u64 = 0;
         let mut blocked_sends: u64 = 0;
 
         std::thread::scope(|scope| {
+            // Scanner thread: walks headers sequentially, streams entries
+            // into the dispatch channel as they're parsed. Workers start
+            // pread'ing the first entry as soon as it's dispatched; the
+            // scanner doesn't need to complete before the main loop sees
+            // frames.
+            {
+                let dispatch_tx = dispatch_tx.clone();
+                let first_err = &first_err;
+                let scanned = &scanned;
+                let base_path = base_path.clone();
+                scope.spawn(move || {
+                    crate::debug::emit_marker("MERGE_READER_SCAN_START");
+                    match scan_and_dispatch(&base_path, direct_io, &dispatch_tx) {
+                        Ok(count) => {
+                            scanned.store(count, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let mut slot = first_err
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                        }
+                    }
+                    crate::debug::emit_marker("MERGE_READER_SCAN_END");
+                });
+            }
+            drop(dispatch_tx);
+
+            // Pread workers: pull (seq, entry) from dispatch, pread the
+            // frame, send (seq, frame) to the reorder pump.
             for _ in 0..decode_threads {
+                let rx = Arc::clone(&dispatch_rx);
                 let tx = worker_tx.clone();
-                let schedule = Arc::clone(&schedule);
                 let file = Arc::clone(&shared_file);
-                let next_idx = &next_idx;
                 let first_err = &first_err;
                 scope.spawn(move || {
                     let mut read_buf: Vec<u8> = Vec::new();
@@ -446,19 +482,20 @@ fn spawn_parallel_reader(
                         {
                             return;
                         }
-                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
-                        if idx >= schedule.len() {
-                            break;
-                        }
-                        let entry = schedule[idx].clone();
+                        let (seq, entry) = {
+                            let guard =
+                                rx.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match guard.recv() {
+                                Ok(d) => d,
+                                Err(_) => return,
+                            }
+                        };
                         let frame_len = entry.frame_len();
                         read_buf.resize(frame_len, 0);
-                        let pread_res = file
+                        if let Err(e) = file
                             .read_exact_at(&mut read_buf, entry.frame_offset)
-                            .map_err(|e| {
-                                format!("pread at {}: {e}", entry.frame_offset)
-                            });
-                        if let Err(e) = pread_res {
+                            .map_err(|e| format!("pread at {}: {e}", entry.frame_offset))
+                        {
                             let mut slot = first_err
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -475,17 +512,18 @@ fn spawn_parallel_reader(
                             tagdata: entry.tagdata,
                             file_offset: entry.frame_offset,
                         };
-                        if tx.send((idx, frame)).is_err() {
+                        if tx.send((seq, frame)).is_err() {
                             return;
                         }
                     }
                 });
             }
+            drop(dispatch_rx);
             drop(worker_tx);
 
-            // Reorder pump: re-establish file order before delivering frames.
-            // Pending depth is bounded by `decode_threads` since that's the
-            // max number of in-flight preads.
+            // Reorder pump runs on the manager thread. Pending depth is
+            // bounded by `decode_threads` since that's the max number of
+            // in-flight preads.
             let mut reorder: ReorderBuffer<RawBlobFrame> =
                 ReorderBuffer::with_capacity(decode_threads * 2);
             while let Ok((seq, frame)) = worker_rx.recv() {
@@ -532,7 +570,10 @@ fn spawn_parallel_reader(
                 "merge_reader_decode_threads",
                 decode_threads as i64,
             );
-            crate::debug::emit_counter("merge_reader_schedule_len", schedule_len as i64);
+            crate::debug::emit_counter(
+                "merge_reader_schedule_len",
+                scanned.load(Ordering::Relaxed) as i64,
+            );
         }
         crate::debug::emit_marker("MERGE_READER_END");
         Ok(())

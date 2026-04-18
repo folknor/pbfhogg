@@ -43,6 +43,16 @@ pub(super) fn read_node_at(mmap: &[u8], byte_offset: u64) -> Option<(i32, i32)> 
 /// Resolve start/end house numbers for interpolation ways by matching
 /// their endpoints against nearby address points with the same street name.
 /// Reads address points from mmap'd addr_points.bin.
+///
+/// Two parallel phases:
+/// - Build the `cell_to_addrs` spatial index from all addr points via
+///   rayon fold+reduce (per-worker partial FxHashMap, merged at the end).
+///   Planet has ~150M addr points so sequential insertion dominates the
+///   function wall; parallelising this is most of the win.
+/// - Resolve each interp way's endpoints against the index via
+///   `par_iter_mut()` with an `AtomicU32` resolved-count. Per-way work is
+///   independent (shared `cell_to_addrs` is immutable, per-way `iw`
+///   mutations are disjoint).
 #[allow(clippy::cast_possible_truncation)]
 #[hotpath::measure]
 pub(super) fn resolve_interpolation_endpoints_mmap(
@@ -52,45 +62,68 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
     strings: &StringPool,
     street_level: u8,
 ) -> u32 {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     let addr_count = addr_mmap.len() / ADDR_POINT_SIZE;
     if interp_ways.is_empty() || addr_count == 0 {
         return 0;
     }
 
-    // Build spatial index: S2 cell -> list of addr point indices
-    let mut cell_to_addrs: FxHashMap<u64, Vec<u32>> = FxHashMap::default();
-    for idx in 0..addr_count {
-        if let Some(pt) = read_addr_point_mmap(addr_mmap, idx as u32) {
-            let ll = LatLng::from_degrees(pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7);
-            let cell = CellID::from(ll).parent(street_level as u64).0;
-            cell_to_addrs.entry(cell).or_default().push(idx as u32);
-        }
-    }
+    // Phase 1: build spatial index S2 cell -> Vec<addr_idx>.
+    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_START");
+    let cell_to_addrs: FxHashMap<u64, Vec<u32>> = (0..addr_count)
+        .into_par_iter()
+        .fold(
+            FxHashMap::<u64, Vec<u32>>::default,
+            |mut acc, idx| {
+                if let Some(pt) = read_addr_point_mmap(addr_mmap, idx as u32) {
+                    let ll = LatLng::from_degrees(
+                        pt.lat_e7 as f64 * 1e-7, pt.lon_e7 as f64 * 1e-7,
+                    );
+                    let cell = CellID::from(ll).parent(street_level as u64).0;
+                    acc.entry(cell).or_default().push(idx as u32);
+                }
+                acc
+            },
+        )
+        .reduce(
+            FxHashMap::<u64, Vec<u32>>::default,
+            |mut a, b| {
+                for (k, mut v) in b {
+                    a.entry(k).or_default().append(&mut v);
+                }
+                a
+            },
+        );
+    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_INDEX_END");
 
-    let mut resolved = 0u32;
-
-    for iw in interp_ways.iter_mut() {
-        if iw.node_count < 2 { continue; }
+    // Phase 2: resolve endpoints per way.
+    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_START");
+    let resolved = AtomicU32::new(0);
+    let cell_to_addrs_ref = &cell_to_addrs;
+    interp_ways.par_iter_mut().for_each(|iw| {
+        if iw.node_count < 2 { return; }
 
         let Some(start_coord) = read_node_at(interp_nodes_mmap, iw.node_file_offset) else {
-            continue;
+            return;
         };
         let last_offset = iw.node_file_offset + (iw.node_count as u64 - 1) * NODE_COORD_SIZE as u64;
         let Some(end_coord) = read_node_at(interp_nodes_mmap, last_offset) else {
-            continue;
+            return;
         };
 
         let start_hn = find_endpoint_house_number_mmap(
-            start_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
+            start_coord, iw.street_offset, addr_mmap, strings, cell_to_addrs_ref, street_level,
         );
         let end_hn = find_endpoint_house_number_mmap(
-            end_coord, iw.street_offset, addr_mmap, strings, &cell_to_addrs, street_level,
+            end_coord, iw.street_offset, addr_mmap, strings, cell_to_addrs_ref, street_level,
         );
 
         if let (Some(s), Some(e)) = (start_hn, end_hn) {
             iw.start_number = s;
             iw.end_number = e;
-            resolved += 1;
+            resolved.fetch_add(1, Ordering::Relaxed);
         }
         // KNOWN LIMITATION: if either endpoint fails to match an addr point,
         // we leave `start_number = 0, end_number = 0`. That collides with a
@@ -98,9 +131,10 @@ pub(super) fn resolve_interpolation_endpoints_mmap(
         // number 0. See `SlimInterpWay` doc. If this becomes an observed
         // correctness problem, introduce a `resolved: bool` persisted into
         // `InterpWay` and bump `FORMAT_VERSION`.
-    }
+    });
+    crate::debug::emit_marker("GEOCODE_INTERP_RESOLVE_ENDPOINTS_END");
 
-    resolved
+    resolved.load(Ordering::Relaxed)
 }
 
 /// Find the house number of an address point near an interpolation endpoint.

@@ -16,7 +16,7 @@ Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mos
 
 The 12m33s zlib / 8m52s none is the real cost of rewriting 70-90 % of a planet's blobs with locations preserved, not an artefact of a wrong shape.
 
-The wins are **two incremental parallelizations** of the remaining single-threaded stretches: `NodeLocationIndex::prefill_from_base`, and the reader thread. Compression-level tuning is out of scope here; production runs with `--compression none`.
+The wins fall in two phases. **Phase 1 (landed, infrastructure):** parallel `NodeLocationIndex::prefill_from_base`; streaming parallel reader; classify-path instrumentation. Took 154.9 s -> 140.3 s and surfaced the real bottleneck via measurement. **Phase 2 (pending, structural):** replace the per-batch `par_iter().collect()` + serial main-thread drain with a streaming pipeline that fuses classify + rewrite on the same worker; main thread off the critical path. See the "External review synthesis" section - two independent reviewers converged on 40-55 s wall at planet as the realistic floor. Compression-level tuning is out of scope here; production runs with `--compression none`.
 
 No internal API rewrites. `IdSetDense` is not used here (location index is a sparse HashMap keyed by node ID, which is right for the sparse-lookup pattern). `PbfWriter` is used correctly. `parallel_classify_accumulate` and `pass1_parallel_scan` are the patterns to reuse.
 
@@ -531,10 +531,280 @@ Item 1 detail: the cheapest experiment is to bump `BATCH_MIN_BLOBS` / widen `BAT
 Under `--compression none` at planet:
 
 - #2 (parallel prefill): **landed, measured -10.5 s wall (154.9 s -> 144.4 s on `52c2c4b`).**
-- Post-measurement (UUID `e49b6182` at `b769996` landed instrumentation, 136.8 s wall) the top lever is classify parallelism (~25-35 s ceiling if we can get from 4.15 to ~10 used cores during the phase). Combined with scan-skip (~2.6 s) and FalsePositive wire scan (~3.4 s), the near-term classify budget is ~30-40 s wall saved.
-- Rewrite-recv is 43.7 s wall / 30 % at planet - same ceiling unchanged. Addressing it requires the pipeline restructure (item 5) which also subsumes reader #3.
+- Scan-skip + sorted-merge: landed (`da1c45e`), ~-2 s wall (mostly variance).
+- Parallel reader + merge batch budget: landed (`c97d6b5`, `bfac63b`), net zero wall. Kept as infrastructure for the streaming rewrite.
 
-Updated primary target: **~95-110 s at planet (`--compression none`)** from 136.8 s, once classify parallelism + scan-skip + FalsePositive scan land. With pipeline restructure on top, **~75-90 s** becomes plausible.
+Updated primary target after the **external-review-driven streaming pipeline + fuse classify+rewrite** (next planned move): **40-55 s wall at planet daily OSC** (`--compression none`), from the current 140.3 s. CPU-budget floor from reviewer 2: classify CPU 270 s / 22 cores = 12.3 s classify wall under the streaming shape, plus ~3-4 s rewrite, plus pre-loop phases (~10 s) and writer wall-bound work running in parallel (~30 s). See "External review synthesis" section above.
+
+**Weekly OSC end-state estimate (reviewer 2):** **70-90 s wall at planet weekly OSC** with streaming + worker-emits-framed (Q2) + prefill fusion (Q4) + parallel OSC parse (Q7). Current weekly (linear scaling of serial phases) probably ~250 s+.
+
+**Follow-up wins on top of the streaming rewrite:**
+
+- Worker-emits-framed-bytes: frees the `PIPELINE_DISPATCH_PERMITS=64` cap, small commit after streaming. More valuable under zlib and at weekly scale.
+- Prefill fusion: -5 s at daily, -30 s+ at weekly. Clean local change after streaming lands.
+- Splice-in-place for low-touch rewrites: ~1.5-2 s daily; less valuable at weekly.
+- Parallel OSC parse: only matters at weekly scale (20-30 s).
+
+## External review synthesis (2026-04-18)
+
+Two independent reviewers (`perf` / `arch` / `planet` archetypes) converged strongly on the same diagnosis and next move after seeing the planet post-parallel-reader plateau at 140.3 s. Their writeups are extensive; this section folds the claims, reasoning, and follow-up ideas into one place so we don't lose them.
+
+### Diagnosis: the 4.1-core classify plateau is self-inflicted
+
+The shape of the main loop (one `batch.par_iter().collect()` followed by a serialised drain in file order) has two structural properties that together cap classify wall:
+
+1. **Per-batch Amdahl on classify.** `par_iter().collect()` returns only when the slowest blob in the batch finishes. Batches mix a handful of heavy overlap blobs (decompress + precise, ~2 ms each) with many cheap fastpath blobs (ns each). Rayon schedules the heavy ones one-per-core; remaining cores sit idle waiting for the tail blob. At ~5-6 heavy blobs per batch, effective utilisation is ~5-6 cores - matching the measured 295 s CPU / 72.5 s wall = 4.1 cores.
+2. **Phase-exclusive pool usage.** Within a batch: classify runs (pool busy on classify), then rewrites run (pool busy on rewrites), then the main thread walks slots in order. By the time the next classify starts, all previous rewrites have drained. Neither phase overlaps with itself or with the next batch. Each phase sees 22 cores in principle but each is individually bounded by its own barrier.
+
+**Direct consequence:** batch size knobs can't fix this. Adding more items to a batch doesn't shrink the tail; measured at 128 MB -> 512 MB, classify wall was unchanged (72.5 s vs 70.3 s) and the bottleneck shifted to writer-permit pressure. The plateau is structural to the batch shape, not a rayon pathology.
+
+**Reviewer 2's CPU-budget lower bound:** classify CPU 270 s / 22 cores = **~12.3 s classify wall** if the barrier is removed. That, plus the rewrite recv stall disappearing (main thread off the critical path), yields an estimated **40-55 s wall at planet**, vs current 140 s - roughly 3x speedup vs the ~18 % that pipelined batches alone would give.
+
+### Primary rewrite: streaming pipeline, batches deleted
+
+Replace `collect_batch` + `par_iter().collect()` + the per-batch slot-drain with continuous stages connected by bounded ordered channels:
+
+```
+[Reader]  --RawBlobFrame (seq)-->
+  [Classifier pool: N workers]     each worker: decompress + precise check.
+                                   If NeedsRewrite, do the rewrite inline (fuse).
+                                   Emit (seq, ClassifiedItem) where ClassifiedItem =
+                                       { RawPassthrough(frame) | Rewritten(blocks, stats) }
+     --ClassifiedItem (seq)-->
+  [Reorder / gap-create actor]     single thread. Consumes in seq order.
+                                   Emits gap creates, handles type transitions,
+                                   forwards frames/blocks to writer pipeline.
+     --OutputChunk (seq)-->
+  [PbfWriter pipeline]             existing, unchanged.
+```
+
+**Why this is the right move, not "another" move:**
+
+- **No Amdahl barrier.** When worker A finishes its blob, it immediately pulls the next one. Cores stay busy as long as the reader has frames. Classify wall becomes `max(reader_bandwidth, 270 s / 22) ≈ 12-15 s`, vs 72.5 s today.
+- **Rewrite fuses into classify naturally.** Today's flow decodes a `PrimitiveBlock` in one worker, ships it back to main thread via `NeedsRewrite(PrimitiveBlock, BlobIndex)`, main thread does ~50 ns of `partition_point` upsert-range compute, then re-spawns into rayon, which schedules yet another worker to rewrite the block it already had. Two dispatches, one cross-thread `PrimitiveBlock` handoff, one temporary allocation alive across the gap. If a worker already decoded the block, let it finish the job - pass `Arc<DiffRanges>` + `Arc<CompactDiffOverlay>` to the worker and the inline upsert-range compute happens inline.
+- **Main thread leaves the critical path.** Today it owns type transitions, gap creates, passthrough coalescing, ordered rewrite-recv, passthrough flush, rewrite-block writes - a serial chain that shows up as `merge_rewrite_recv_total_ms = 39 s`. Under the new shape, a tiny dedicated reorder/gap-create actor owns only in-order sequencing + gap-create emission. Almost no CPU.
+- **Coalescing gets better, not worse.** The reorder actor coalesces consecutive `RawPassthrough` frames into a single `write_raw_chunks` - same `Vec<Vec<u8>>` output shape as today. Coalescing now runs per-run-of-passthroughs in file order, not per-batch-truncated. Batches today arbitrarily break up long passthrough runs.
+
+**CPU-budget walk (reviewer 2):**
+
+- Classify CPU: 270 s -> `270 / 22 = 12.3 s` wall
+- Rewrite CPU: (39 s recv is a lower bound on rewrite wall-in-pool today; real rewrite CPU probably 60-80 s) -> `3-4 s` wall with 22 cores
+- Prefill 4.9 s + OSC parse 4.9 s + header ~0 s = unchanged serial pre-phase
+- Writer wall: `--compression none` writes ~92 GB in ~30 s wall on decent NVMe, runs fully in parallel with classify
+
+**Realistic floor: 40-55 s.** We've been at 140 s.
+
+**Risk inventory and mitigations:**
+
+- **Gap-create ordering.** Gap creates must be emitted in a specific seq position (before the blob whose `min_id` exceeds the cursor). The reorder actor sees items in seq order, so it can inject gap-create blocks between forwarded items. Same invariant as today; moved to a different owner.
+- **Type transitions.** Same: the reorder actor owns the last-type state.
+- **Prefill** for `--locations-on-ways`: stays as a serial pre-phase before the pipeline starts. Already fast (~5 s) and its `Arc`'d output just gets handed to classifier workers.
+- **Backpressure / RSS.** Bound the `(seq, ClassifiedItem)` channel capacity **in bytes, not count**, since `Rewritten` items carry decoded + re-encoded data. A budget of ~1 GB in flight keeps us well under the 30 GB host limit.
+- **Error propagation.** Workers send `Result<ClassifiedItem, _>`; reorder actor propagates. Existing pattern in the codebase.
+- **Rayon pool partitioning.** The two reviewers diverge here (see Q3 follow-up subsection). Reviewer 1 recommends a dedicated rayon pool (~19 worker threads) following the [`src/read/pipeline.rs:127`](../src/read/pipeline.rs#L127) pattern. Reviewer 2 recommends the default global pool with work-stealing. Both agree reader, pread workers, and reorder actor run on dedicated (non-rayon) threads, and that "shared pool with priorities" is wrong. Decide at implementation time; for apply-changes specifically (no other concurrent rayon user) the two positions collapse to the same hardware assignment.
+
+**Scope.** Net delete of ~300 lines from rewrite.rs; net add of ~400 lines split across a new `streaming.rs` + reorder actor. Not a prototype - commit, measure, keep or revert.
+
+### Cheap disambiguation experiment (run this first)
+
+Before committing to the full rewrite, confirm the batch barrier is the real cause of the plateau. One commit, one bench, keep or revert:
+
+- Keep the outer loop, `collect_batch`, phase 2, phase 3, phase 4.
+- **Replace `par_iter().collect()` with `rayon::spawn` per blob + `mpsc::channel` + `ReorderBuffer`.** Keep batches intact otherwise.
+- Bench.
+
+**Predicted outcome (both reviewers):** classify wall drops from 72.5 s to `~270 s / 22 + reorder overhead ≈ 12-15 s`. If that happens, the plateau was the `par_iter().collect()` barrier and the full streaming rewrite is justified. If it doesn't drop meaningfully, the CPU time isn't scaling across cores for a different reason (memory bandwidth saturation, zstd lock contention, buffer allocator, etc.) and we need to dig into that before any structural change.
+
+**This experiment is ~70 % of the structural work for the full rewrite**, so if it confirms the hypothesis the full rewrite gets cheaper from there.
+
+### Follow-up wins (order by when they make sense)
+
+The streaming rewrite above is the headline. After it lands, these become the next targets:
+
+#### Worker emits framed bytes (both reviewers, Q2 follow-up)
+
+Highest-confidence follow-up after the streaming rewrite. Moves compression + framing into the classifier worker that already holds the uncompressed bytes. Details in the Q2 follow-up subsection above; ~50-line commit; works for `none`, `zlib`, and `zstd`. Extra payoff under zlib: removes the `PIPELINE_DISPATCH_PERMITS=64` cap that bottlenecks concurrent compressor tasks today.
+
+#### Prefill fusion into the streaming pipeline's node phase (reviewer 2, Q4 follow-up)
+
+Classifier workers decompressing node blobs opportunistically extract coords for IDs in `needed_set` into thread-local maps. Reorder actor detects the node→way transition and merges per-worker maps into `Arc<loc_map>` before gating way-blob workers. Details in Q4 follow-up subsection above. **Deletes the prefill phase entirely:** ~5 s at daily, ~30 s+ at weekly scale.
+
+#### Parallel OSC parse (reviewer 2, Q7 follow-up, weekly only)
+
+Only relevant if the standard pipeline processes a week of OSCs in one run. Single-threaded [`load_all_diffs`](../src/osc.rs#L1036) parse scales linearly with OSC count; at 7x it becomes a 30-40 s serial phase. Shape: parse each OSC concurrently into its own overlay, then merge overlays with newer-wins semantics. Each OSC is independent work. Estimated 20-30 s wall at weekly scale.
+
+#### Splice-in-place for low-touch rewrites (reviewer 2)
+
+In `rewrite_block_parallel` ([rewrite.rs:710-826](../src/commands/merge/rewrite.rs#L710)), every `NeedsRewrite` blob is **fully decoded and fully re-encoded**, even if only one of its ~8 000 elements is touched by the diff. At planet with a daily OSC, the modal "needs rewrite" blob has 1-3 affected elements out of 8 000.
+
+**The change.** For blobs where the precise check finds `<=K` affected elements (say K=64), splice: walk the raw decompressed wire bytes for the `DenseNodes` / `Ways` / `Relations` `PrimitiveGroup`, emit runs of unaffected elements raw (via the existing raw-group passthrough scaffolding at [`src/read/block.rs:507`](../src/read/block.rs#L507) + [`src/write/raw_passthrough.rs`](../src/write/raw_passthrough.rs#L1)), and only decode+re-encode the affected ones.
+
+**Budget.** Attacks the 25 s classify parse + the estimated 60-80 s rewrite CPU. Estimated save: **30-50 s CPU, ~1.5-2 s wall** on top of the streaming rewrite at daily scale. Not a headline, but sizeable.
+
+**Weekly scale: less valuable.** Rewrite blobs touch more elements per blob under a weekly OSC; the near-passthrough population (`<=K` affected elements) shrinks. If the standard cadence becomes weekly, this item demotes.
+
+**Don't land before the streaming rewrite** - the rewrite moves this code to a different owner and landing twice is waste.
+
+#### Steal `copy_file_range` coalescing from ALTW (reviewer 1)
+
+`add_locations_to_ways` already coalesces contiguous `copy_file_range` runs at [`src/commands/add_locations_to_ways.rs:1331`](../src/commands/add_locations_to_ways.rs#L1331). Merge still does per-blob `copy_file_range` writes at [rewrite.rs:1266](../src/commands/merge/rewrite.rs#L1266). Useful, secondary.
+
+#### Use the existing alloc-optimised parse path (reviewer 1)
+
+`classify_only` currently parses via [`src/read/blob.rs:1307`](../src/read/blob.rs#L1307) (`parse_primitive_block_from_bytes_owned`), but [`src/read/block.rs:432`](../src/read/block.rs#L432) exposes an alloc-optimised variant already used elsewhere. Small slow-path parse shave.
+
+#### Exact-membership metadata or sidecar (reviewer 1, conditional)
+
+Current on-disk metadata gives per-blob type + ID range only ([`src/blob_index.rs:56`](../src/blob_index.rs#L56)), so pure creates inside an existing blob range force slow-path decode - this is the documented FalsePositive case at [`src/commands/merge/classify.rs:48`](../src/commands/merge/classify.rs#L48).
+
+**Only worth pursuing if FalsePositives are a material share of slow-path work.** At planet today: 15 224 FalsePositive blobs / 92 677 slow-path = 16 %. Not negligible, but small next to the 77 453 rewrites that fundamentally need the slow path. A format/index project, not a quick cleanup.
+
+If pursued: either a wire-format exact-overlap scanner on decompressed bytes (skips full parse for FalsePositives) or a per-blob membership sketch in indexdata (rejects FalsePositives without decompress at all).
+
+#### Ideas explicitly ruled out
+
+- **Pre-built schedule sidecar.** Reviewer 2: "header walk at planet is ~1-2 s. Not the bottleneck. Skip." (Our measured scanner cost was 43 s when run as a pre-block, but that was specifically the blocking pre-scan shape - under the streaming reader and later streaming pipeline, the scanner runs concurrently with workers, and its wall cost is subsumed.)
+- **Separate thread pool for decompress alone.** Becomes moot under the streaming rewrite: classify and rewrite fuse, no seam to separate.
+- **Revert parallel reader or 512 MB batch budget.** Both reviewers: no. Parallel reader is needed infrastructure for the streaming pipeline. The 512 MB budget is neutral-at-worst and becomes irrelevant once batches go away - ripping it out costs us later.
+- **Writer-permit loosening.** The 20x `writer_permit_wait_ns` at 512 MB is a symptom of too-large coalesced flushes hitting a 32-deep channel, not an independent bottleneck. Fixed automatically when the reorder actor coalesces per-run rather than per-batch; runs are smaller and distributed in time.
+- **Compression-level tuning (zlib:1 default).** Out of scope for this workstream: production uses `--compression none`, the ecosystem default is zlib:6 and stays.
+
+### Recommended sequence (both reviewers agree)
+
+1. **Cheap disambiguation experiment.** `rayon::spawn` + `mpsc` + `ReorderBuffer` replacing `par_iter().collect()`, keep batches. One commit, one bench. If classify wall falls toward ~12-15 s, proceed. If not, pause and investigate non-scaling CPU (memory bandwidth, lock contention, allocator).
+2. **Full streaming pipeline + fuse classify+rewrite.** Same commit architecturally - don't land them separately. Expected 40-55 s wall.
+3. **Worker-emits-framed-bytes.** Small, high-confidence commit after the streaming rewrite. Removes the `PIPELINE_DISPATCH_PERMITS=64` cap on concurrent compressor tasks; frees the writer's second rayon dispatch. See the Q2 follow-up subsection.
+4. **Prefill fusion into the streaming pipeline's node phase.** Clean local change once streaming is in place. Deletes the prefill phase entirely (~5 s today, ~30 s+ at weekly scale). See the Q4 follow-up subsection.
+5. **(weekly OSC only) Parallel OSC parse.** New priority at weekly scale: single-threaded XML+gzip at 7x becomes a 30-40 s serial phase. Parallel-parse-then-merge-overlays is a real target. See the Q7 follow-up subsection.
+6. **Splice-in-place for low-touch rewrites.** ~1.5-2 s wall at daily. **Less valuable at weekly** (more elements touched per rewrite blob shrinks the near-passthrough population).
+7. **`copy_file_range` coalescing, alloc-optimised parse.** Opportunistic local shaves.
+8. **Writer path tuning** (direct-io vs `to_path_uring`): only after the streaming rewrite if bench points there. Don't start with "bigger internal queues" - that's a symptom-fix. See Q1 follow-up.
+
+After step 2, the next investigation target becomes reader throughput or writer pipeline - both currently invisible because the main-loop noise dominates.
+
+### Second review round (Q1-Q7 follow-ups)
+
+After the initial reports, a follow-up round probed seven targeted questions about the streaming rewrite's downstream implications. The answers refine the plan above; this subsection records the concrete new material. Where the two reviewers diverged, the divergence is noted.
+
+#### Q1: Writer as the new wall floor
+
+Both reviewers: **measure before optimising.** The existing writer stack is already well-shaped.
+
+Reviewer 1: "The existing writer stack is good enough to let the streaming rewrite land first, but only if rewritten blobs stop going through `write_primitive_block_owned`." The plumbing already has the right shapes: buffered/direct/io_uring selection in [`src/commands/mod.rs:864`](../src/commands/mod.rs#L864), bounded write-ahead + dispatch permits in [`src/write/writer.rs:31`](../src/write/writer.rs#L31), and an io_uring backend aimed at `Compression::None` on fast storage in [`src/write/writer.rs:408`](../src/write/writer.rs#L408) and [`src/write/uring_writer.rs:1`](../src/write/uring_writer.rs#L1). If the writer *does* become the new floor, the next pass in order: (1) preframed rewrite output (Q2), (2) contiguous passthrough `copy_file_range` coalescing like [`src/commands/add_locations_to_ways.rs:1331`](../src/commands/add_locations_to_ways.rs#L1331), (3) benchmark buffered vs io_uring on target NVMe. **Do not start with "bigger internal queues"** - if disk bandwidth is the wall, queue depth is rarely the real lever.
+
+Reviewer 2: NVMe ceiling gives 20-30 s for the 92 GB write. The `sync_channel(WRITE_AHEAD=32)` → writer_thread → `BufWriter(256 KB, File)` path is fine until the write queue is actually the bottleneck, which would show up as `pipeline_send_wait_ns` blowing up. If `bytes_written/s` sits near the NVMe ceiling after streaming lands, we're done for the `--compression none` case. If not, flip to `to_path_uring` (infrastructure is already there: `uring_writer.rs`, 64x256 KB registered buffers + `O_DIRECT`) before anything else. Bigger internal queues are a symptom-fix.
+
+Under `--compression zlib` the writer's CPU cost dominates anyway; the channel is almost never the bottleneck. Writer optimisation as a topic is mostly a `--compression none` concern.
+
+#### Q2: Worker emits framed bytes (`write_raw_owned`) instead of `OwnedBlock`
+
+Both reviewers: **do it.** Small-to-medium internal change, high-confidence win, works under all compression modes (not a `--compression none` trick).
+
+The key enabler already exists: [`frame_blob_pipelined`](../src/write/writer.rs#L1102) takes uncompressed bytes + compression + indexdata + tagdata on per-thread scratch and returns `FramedBlobParts`. This is exactly the shape the fused worker needs.
+
+**Minimal change (reviewer 1 + 2 agree):**
+
+- Change merge worker output from `Vec<OwnedBlock>` to `Vec<Vec<u8>>`.
+- In the worker, after `bb.take_owned()` yields `(block_bytes, index, tagdata)`, call `frame_blob_pipelined(&block_bytes, &compression, Some(&index.serialize()), tagdata.as_deref())?.into_vec()` and emit that `Vec<u8>` as the rewritten output.
+- The reorder actor forwards it via the existing raw-passthrough path ([`write_raw_owned`](../src/write/writer.rs#L715) / `write_raw_chunks`).
+
+**Why this is more valuable under zlib, not less (reviewer 2):** today every rewritten blob pays one `rayon::spawn` + one `PIPELINE_DISPATCH_PERMITS` acquire + compression + one channel send. Moving compression into the worker that already owns the uncompressed bytes saves the dispatch, saves the permit dance, and keeps the block resident on one core's L2/L3 from encode through frame. Under zlib the **64-permit pool was capping concurrency at ~64 in-flight rayon tasks**; fusing compression into the classifier pool lets all 22 workers run compression without that cap.
+
+**Public API doesn't move** - `write_primitive_block_owned` stays for callers that want compression dispatched internally; streaming-merge just stops using it.
+
+**Endpoint refinement (reviewer 1):** a crate-private `write_framed_parts_owned` that accepts `FramedBlobParts` directly would avoid the final `into_vec()` flatten copy. Still internal-only.
+
+**Don't land before the streaming rewrite** - land #1 first, this is a ~50-line commit once the worker exists.
+
+#### Q3: Pool partitioning - **divergence**
+
+This is the one place the reviewers give different recommendations. Both agree the reader scanner, pread workers, and reorder actor run on **dedicated (non-rayon) threads**. The disagreement is about the classify + rewrite + writer-compression work.
+
+**Reviewer 1:** dedicated rayon pool, not the global one. Pattern: [`src/read/pipeline.rs:127`](../src/read/pipeline.rs#L127) already shows the dedicated-pool shape; reuse it. Under `Compression::None`, size around **19 worker threads**, leaving 3 for reader/scanner, ordered emitter, and writer thread/kernel slack. Under zlib, either fuse compression into the blob workers (stay one dedicated pool) or use two distinct pools - but **do not use "one shared pool with priorities"** because rayon doesn't give the scheduling control that implies.
+
+**Reviewer 2:** single shared rayon pool for classify + rewrite + writer-compression. Work-stealing across one pool smoothes imbalance better than two pools with fixed capacities. Two pools create artificial capacity walls - if classify is quiet and writer-compress is backlogged, a split pool can't rebalance. The only thing worth sizing explicitly is pread worker count; `decode_threads = cores - 2` is fine.
+
+**Practical note.** Apply-changes has no other major rayon consumer running concurrently, so "dedicated pool with N threads" and "default global pool with N threads" collapse to the same hardware assignment in practice. The substantive difference is insulation-from-other-rayon-code, which isn't a concern here. **Decide at implementation time; not a high-stakes fork.** Both reviewers agree that "shared pool with priorities" is the wrong answer.
+
+#### Q4: Prefill overlap - **one fake win, one real win**
+
+Reviewer 1: don't overlap `prefill_from_base` with OSC parse. The skip logic at [`src/commands/merge/node_locations.rs:73`](../src/commands/merge/node_locations.rs#L73) needs a *complete, sorted* `needed_sorted` set, and the scan is one-way through the node section ([`node_locations.rs:121`](../src/commands/merge/node_locations.rs#L121)) - starting early with an incomplete set risks skipping a node blob that later turns out to be required, which is unrecoverable without a rescan. With multiple diffs it gets worse because later diffs overwrite earlier state ([`src/osc.rs:979`](../src/osc.rs#L979)). If parse time matters, the right move is upstream: squash diffs before merge, not overlap inside it.
+
+Reviewer 2: agrees the "overlap with OSC parse" framing is a ~1 s fake win. **But there's a larger, real win in a different shape** - *fuse prefill into the streaming pipeline's node phase*. In a sorted PBF, all node blobs precede all way blobs. The streaming pipeline decompresses every node blob that overlaps the diff anyway. Today prefill separately decompresses a subset of node blobs (those overlapping `needed_set`) purely to extract coordinates for LOW. The two passes read overlapping data.
+
+**The restructure.** While classifier workers process node blobs, they opportunistically extract coordinates for any ID in `needed_set` they encounter. Each worker accumulates into a thread-local `FxHashMap<i64, (i32, i32)>`. When the pipeline transitions from nodes to ways (reorder actor detects this in seq order), merge the worker maps into `Arc<loc_map>`, and gate way-blob workers on it being ready.
+
+**Gains.**
+
+- Deletes the prefill phase entirely - **5 s saved at daily**.
+- Decompresses fewer node blobs overall (blobs the pipeline was going to decompress anyway now do double duty).
+- **At weekly scale (Q7) where `needed_set` is ~7x larger, prefill would otherwise balloon from 5 s to 30+ s.** Fusion keeps it at approximately zero.
+
+**The dependency chain becomes:** OSC parse → refs collected → `Arc<needed_set>` handed to classifier workers → pipeline runs. The header walk for prefill's schedule disappears; workers decide opportunistically per-blob.
+
+**One real complication.** The node→way transition needs a barrier so no way worker starts before `loc_map` is finalised. The reorder actor detects the transition from the indexdata `blob.kind` change (trivially detectable in a sorted base PBF) and owns the barrier.
+
+**Reconciling with reviewer 1:** reviewer 1 declined the specific "overlap with OSC parse" shape because of the skip-logic concern. Reviewer 2's fusion shape sidesteps that concern entirely - the pipeline visits every node blob by necessity, so there's no risk of "skip a blob that turns out to be required". The two positions aren't contradictory.
+
+**Sequencing.** Land streaming without this first (keep prefill as a serial pre-phase). Then fuse it as a follow-up - ~5 s at daily, proportionally more at weekly.
+
+#### Q5: Trailing creates - no special case, both reviewers agree
+
+The reorder actor owns `UpsertCursors` and treats end-of-stream as the current trailing-create block at [`rewrite.rs:1435`](../src/commands/merge/rewrite.rs#L1435): once the last blob has been emitted, flush the remaining upserts for the current and later kinds.
+
+Reviewer 1 and reviewer 2 both note the existing `types_to_flush` match at [`rewrite.rs:1440-1453`](../src/commands/merge/rewrite.rs#L1440) already encodes the cases: `None` → flush all three, `Some(Node)` → flush Node+Way+Rel, etc. Port it verbatim to the actor's post-loop.
+
+**Testing target (reviewer 2):** an empty-base-PBF case where `last_type` stays `None` and the actor has to emit gap/trailing creates for all three kinds with no frames ever seen. Today's code handles this via the `None` arm; the actor needs to preserve it. Write a test for it.
+
+#### Q6: Backpressure budget - whole pipeline, with concrete carve-up
+
+Both reviewers: **~1 GB in flight is a whole-pipeline budget, not a single channel cap**, and backpressure must propagate all the way to the scanner or the classifier side will buffer indefinitely behind a slow writer.
+
+Reviewer 1: the current `WRITE_AHEAD=32` and `PIPELINE_DISPATCH_PERMITS=64` at [`src/write/writer.rs:31`](../src/write/writer.rs#L31) are count bounds, not a memory model. A single byte-credit budget across the whole graph is the right shape. If backpressure doesn't propagate to the reader scanner, the classifier side silently buffers.
+
+Reviewer 2: concrete carve-up of the ~1 GB budget across stages:
+
+| Stage | Channel | Capacity | Per-item UB | Budget |
+|---|---|---:|---|---:|
+| Reader → Classifier | `(seq, RawBlobFrame)` | 64 | ~1 MB compressed | 64 MB |
+| Classifier workers in flight | decompress buf + `PrimitiveBlock` + rewrite scratch | 22 | ~20 MB | 440 MB |
+| Classifier → Reorder | `(seq, ClassifiedItem)` | 64 | ~4 MB rewritten / 1 MB passthrough | ~128 MB |
+| Reorder → Writer | `PipelineItem` | `WRITE_AHEAD=32` | ~4 MB | 128 MB |
+| Writer buffered | `BufWriter` + uring buffers | - | - | ~16 MB |
+| **Total** | | | | **~780 MB** |
+
+Worst case; actual RSS is lower because many blobs are small. Leaves meaningful headroom under the 28 GB host limit.
+
+**Backpressure chain (reviewer 2):** writer thread can't keep up → its receiver fills → reorder actor's send blocks → reorder's receiver fills → classifier workers' send blocks → they stop pulling new frames → reader channel fills → pread workers' send blocks → they stop pulling from `dispatch_rx` → scanner's send on `dispatch_tx` blocks → scanner stops reading headers. Halts cleanly end-to-end **provided every channel is bounded.**
+
+**Failure mode to avoid (reviewer 2):** any unbounded channel or any `par_iter().collect()` pattern. `collect()` materialises the whole batch and breaks the bound. Streaming sidesteps this entirely; if it creeps back in later, flag it immediately - one unbounded buffer anywhere defeats the whole chain.
+
+**Per-worker unbounded accumulator caveat (reviewer 2).** Under the prefill-fusion change (Q4), the per-worker coord extraction map needs size discipline too. For planet daily/weekly, `needed_set` is bounded by OSC way-refs (at most millions of entries); not a practical concern at this scale, but worth the discipline.
+
+#### Q7: Weekly OSC - same first move, different priorities after
+
+Both reviewers: **streaming pipeline is still the right first move at weekly scale.** What changes is the priority order after it lands.
+
+**Reviewer 2's concrete changes from daily to weekly:**
+
+1. **OSC parse becomes a real phase.** Single-threaded XML + gzip at 7x data: probably 30-40 s serial. Today's 5 s hides; weekly's 35 s doesn't. [`load_all_diffs`](../src/osc.rs#L1036) parses files sequentially into one overlay - that sequential loop becomes a bottleneck. **Parallelise it:** parse each OSC concurrently into its own overlay, then merge overlays with newer-wins semantics. Each OSC is independent work. Merge pass is a few seconds over the combined overlays. Same story for `write_streaming` in [`merge_changes.rs:184`](../src/commands/merge_changes.rs#L184). This is a real target at weekly scale, separate from the streaming pipeline work.
+2. **`DiffRanges` scales linearly.** Sort-dedup of ~7x more IDs; still fast. Not a new bottleneck.
+3. **Passthrough-to-rewrite ratio shifts downward.** Today ~60 % passthrough at planet. Weekly planet: probably ~70-80 % passthrough blobs at most, but higher *rewrite* share per affected blob. More rewrites, fewer passthroughs, bigger rewrite CPU. The 4.1-core classify plateau gets proportionally worse (more heavy blobs per batch). **Case for streaming gets stronger** at weekly.
+4. **Prefill `needed_set` is ~7x larger.** More node blobs to scan, more `FxHashMap` pressure. **This is where Q4's fusion becomes critical** - prefill as a separate pass could balloon from 5 s to 30+ s, but fused into the pipeline's node phase it costs approximately nothing.
+5. **Writer output roughly unchanged in absolute bytes.** Still ~92 GB out. Writer is not more of a bottleneck weekly than daily.
+6. **Per-rewrite-blob cost goes up** - more elements per blob get modified. This hits the rewrite CPU budget. It also makes Q2 (worker-emits-framed) *more* valuable because more blobs go through the rewrite path.
+
+**Prioritisation shift at weekly scale:**
+
+- Streaming pipeline: **more valuable**, not less.
+- Worker-emits-framed (Q2): **more valuable** (more blobs benefit).
+- Prefill fusion (Q4): **more valuable** (avoids a 30+ s phase growth).
+- Parallel OSC parse: **a new priority** that doesn't exist at daily. Plausibly 20-30 s of headline wall to recover.
+- Splice-near-passthrough rewrites: **less valuable at weekly** - rewrite blobs touch more elements per blob, so the near-passthrough population shrinks. Demote.
+
+**Reviewer 1 note on weekly:** diff-squashing becomes genuinely interesting as a **formal upstream stage** rather than paying XML parse + overwrite churn inside the critical path every run. "Squash diffs to one final overlay / binary delta" can be a separate command that runs once per week and emits a single pre-merged diff file that apply-changes then consumes as if it were a daily. Orthogonal to the streaming rewrite but may be the right long-term shape if weekly is the standard cadence.
+
+**Reviewer 2's revised end-state estimate for weekly planet:** **70-90 s wall** with streaming + parallel OSC parse + prefill fusion + worker-framing. Current weekly (linear scaling of serial phases) probably ~250 s+.
 
 ## What to leave alone
 
@@ -553,11 +823,19 @@ Updated primary target: **~95-110 s at planet (`--compression none`)** from 136.
 1. ~~**Enable `#[cfg(feature = "hotpath")]` per-phase timers unconditionally**~~ **Done.**
 2. ~~**Land parallel prefill (#2).**~~ **Landed 2026-04-18 (`52c2c4b`), planet -10.5 s wall.**
 3. ~~**Land classify instrumentation (#4).**~~ **Landed 2026-04-18 (`b769996`).** Measurement at UUID `e49b6182` - findings in #4 section above.
-4. **Skip `scan_block_ids` when indexdata was present** - trivial fix, est. -2.6 s wall.
-5. **Bump classify batch size** - experiment with larger `BATCH_BYTE_BUDGET` / `BATCH_MIN_BLOBS` to cash in the CPU slack. Est. -25-35 s wall if it moves observed classify utilisation from 4.15 to ~10 cores.
-6. **Wire-format FalsePositive precise scan** - replace parse + precise for 15 k FalsePositive blobs. Est. -3.4 s wall.
-7. **Investigate `block_overlaps_diff` per-call cost** - 57 s CPU; sorted-merge or `IdSetDense` alternatives. Wall save uncertain; measure before committing.
-8. **Pipeline restructure** - collapses reader + classify + rewrite-recv into one work-stealing pipeline. Subsumes reader #3. Biggest-risk change, target once 4-7 are measured.
+4. ~~**Skip `scan_block_ids` when indexdata was present**~~ **Landed 2026-04-18 (`da1c45e`)**, saved 10.7 s CPU but only ~2 s wall (mostly lost to variance).
+5. ~~**Bump classify batch size**~~ **Landed 2026-04-18 (`bfac63b`) - 512 MB merge batch budget.** Raised average batch from ~13 to ~18 overlap blobs but classify wall was unchanged (72.5 s vs 70.3 s). **Diagnosis from external review: the plateau is structural to the batch barrier, not fixable with batch-size knobs** - see "External review synthesis" section.
+6. ~~**Parallel reader (#3)**~~ **Landed 2026-04-18 (`c97d6b5` streaming variant)**. Net-zero wall change vs sequential reader. Kept as infrastructure for the streaming pipeline below.
+7. **Cheap disambiguation experiment (next).** Replace `par_iter().collect()` with `rayon::spawn` per blob + `mpsc` + `ReorderBuffer`, keeping batches intact otherwise. One commit, one bench. Predicted outcome: classify wall drops from 72.5 s toward 12-15 s. Confirms (or disproves) the batch-barrier diagnosis before the full rewrite. See "Cheap disambiguation experiment" subsection.
+8. **Streaming pipeline + fuse classify+rewrite.** Delete the batch loop; replace with reader -> classifier-pool (fused decompress + precise + rewrite) -> reorder/gap-create actor -> writer. Main thread off the critical path. Estimated **40-55 s wall at planet daily** (from 140 s). See "Primary rewrite: streaming pipeline" subsection for risk inventory and CPU-budget walk.
+9. **Worker-emits-framed-bytes.** Small high-confidence commit after the streaming rewrite: change worker output from `Vec<OwnedBlock>` to `Vec<Vec<u8>>` framed via [`frame_blob_pipelined`](../src/write/writer.rs#L1102) on the worker. Frees the `PIPELINE_DISPATCH_PERMITS=64` cap; removes the writer's second rayon dispatch. See Q2 follow-up subsection.
+10. **Prefill fusion into streaming pipeline's node phase.** Classifier workers opportunistically extract coords for `needed_set` IDs while decompressing node blobs; reorder actor barriers the node→way transition and finalises `Arc<loc_map>`. Deletes prefill phase. Estimated **-5 s daily, -30 s+ weekly**. See Q4 follow-up subsection.
+11. **(weekly OSC only) Parallel OSC parse.** Parse each OSC concurrently into its own overlay; merge overlays newer-wins. Current [`load_all_diffs`](../src/osc.rs#L1036) serialises this. Estimated **-20-30 s wall at weekly scale**; no win at daily.
+12. **Splice-in-place for low-touch rewrites.** Follow-up to the streaming rewrite: for `NeedsRewrite` blobs with `<=K` affected elements, splice via raw-group passthrough instead of full decode + re-encode. Estimated **~1.5-2 s wall** at daily. Less valuable at weekly (more elements touched per rewrite blob).
+13. **`copy_file_range` coalescing from ALTW**, **alloc-optimised parse path** via [`src/read/block.rs:432`](../src/read/block.rs#L432). Opportunistic local shaves.
+14. **Writer path tuning** (direct-io vs `to_path_uring`). Only if post-streaming bench points there. Infrastructure is already wired in [`src/commands/mod.rs:864`](../src/commands/mod.rs#L864) + [`src/write/uring_writer.rs:1`](../src/write/uring_writer.rs#L1); flip the variant, don't grow queues.
+15. **Exact-membership metadata / sidecar.** Only if FalsePositives remain material after the streaming rewrite. Currently 16 % of slow-path blobs; not negligible but not headline either. Format/index project, not a quick cleanup.
+16. **Diff squashing as a formal upstream stage (reviewer 1, weekly only).** Consider making "squash N diffs to one final overlay / binary delta" a separate command that runs once per cadence and emits a single pre-merged diff that apply-changes then consumes as a daily. Orthogonal to the streaming rewrite but may be the right long-term shape if weekly is standard.
 
 Cross-validation: `brokkr verify merge --dataset denmark` (note: name is `merge`, not `apply-changes` - the subcommand in `brokkr verify` predates the rename). Otherwise: identical output PBF byte-for-byte after the primary merge batch; tail creates that get out-of-order under the existing implementation would be the same out-of-order set. Element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback.
 
@@ -577,6 +855,21 @@ Unchanged from current 1.8 GB, or slightly higher during phase #2 merge. Host bu
 
 **Sizing robustness note.** None of the structures above scale with `unique_referenced_nodes` the way the failed [altw-as-renumber](altw-as-renumber.md) `coord_table` did. `NodeLocationIndex` scales with the OSC's own node-ref set (daily-diff-sized, bounded), not with the base PBF's population. No structure here depends on an estimate of the planet-scale referenced-node count. That is why this plan's recommendations survive the 2026-04-16 ALTW reshape failure unchanged.
 
+### Memory budget (projected, post-streaming rewrite)
+
+Reviewer 2's carve-up of the ~1 GB in-flight pipeline budget (copy of the table from the Q6 follow-up subsection, duplicated here for discoverability):
+
+| Stage | Channel | Capacity | Per-item UB | Budget |
+|---|---|---:|---|---:|
+| Reader → Classifier | `(seq, RawBlobFrame)` | 64 | ~1 MB compressed | 64 MB |
+| Classifier workers in flight | decompress buf + `PrimitiveBlock` + rewrite scratch | 22 | ~20 MB | 440 MB |
+| Classifier → Reorder | `(seq, ClassifiedItem)` | 64 | ~4 MB rewritten / 1 MB passthrough | ~128 MB |
+| Reorder → Writer | `PipelineItem` | `WRITE_AHEAD=32` | ~4 MB | 128 MB |
+| Writer buffered | `BufWriter` + uring buffers | - | - | ~16 MB |
+| **Pipeline total** | | | | **~780 MB** |
+
+Plus the pre-loop phase structures above (OSC overlay, DiffRanges, NodeLocationIndex.locations): **~1.5-2.3 GB**. Plus pipeline **~780 MB**. Total projected RSS under streaming: **~2.3-3.1 GB**. Well under 28 GB host limit.
+
 ## Correctness invariants
 
 - **OSM ID ordering.** The main batch loop emits passthrough blobs in file order, rewrite blobs in file order (via the reorder buffer on the rayon mpsc channel), and gap creates before their matching blob's `min_id`. Any parallelization of reader or prefill must preserve file-order output. Phase #3's refactor must keep the reorder buffer intact.
@@ -586,6 +879,9 @@ Unchanged from current 1.8 GB, or slightly higher during phase #2 merge. Host bu
 - **Early-exit via `all_found()`.** Currently lets the sequential pass stop once all needed IDs are resolved. Under parallel prefill, all workers will have already claimed blobs from the schedule by the time the last needed ID is found. Either drop the early-exit (workers complete their claimed blobs; filters at schedule-construction time have already pruned most non-overlapping blobs) or add an atomic "remaining-needed" counter polled every N tuples. Probably not worth the complexity - the `overlaps_needed` filter already prunes aggressively.
 - **`copy_file_range` path** on passthrough blobs ([rewrite.rs:960-970](../src/commands/merge/rewrite.rs#L960)). Under #3 the file offset must still be correct in the replacement schedule. The existing `frame.file_offset` field corresponds to `frame_offset` in the header-only scan - preserve this.
 - **Reader-thread graceful shutdown.** The current reader joins at [rewrite.rs:1063](../src/commands/merge/rewrite.rs#L1063). Under #3 there is no separate reader thread to join; the schedule is consumed by the workers themselves, and shutdown is when all workers exit their claim loop.
+- **Streaming-pipeline invariants (pending).** Under the streaming rewrite, the reorder actor becomes the owner of: file-order output emission, `UpsertCursors`, gap-create ordering (emit gap creates with `id < item.min_id` before the item), type-transition flush (when `last_type != current_item.kind`, flush remaining upserts of prev type), trailing-create flush on channel close (flush all kinds still not flushed, per existing [`rewrite.rs:1440-1453`](../src/commands/merge/rewrite.rs#L1440) match). Empty-base-PBF edge case (`last_type == None` forever) is covered by the existing `None` arm of `types_to_flush`; port it verbatim and write a test.
+- **Backpressure propagates to the scanner (pending).** Every channel in the streaming pipeline must be bounded. If writer stalls, its receiver fills → reorder actor send blocks → classifier-to-reorder send fills → workers stop pulling → reader channel fills → pread workers stop → scanner's dispatch send blocks → scanner stops. Any unbounded channel or `par_iter().collect()` introduction defeats the chain.
+- **Node→way transition barrier (pending, only if prefill fusion lands).** Under Q4 fusion, no way-blob worker may run before the per-worker coord maps are merged into `Arc<loc_map>`. The reorder actor detects `blob.kind` flipping from Node to Way in the seq-ordered stream and publishes the merged map atomically before releasing any way-blob classify work.
 
 ## Open questions
 

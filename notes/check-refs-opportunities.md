@@ -153,7 +153,7 @@ That's a ~10× speedup on every one of the ~11 B insert operations and ~5 B cont
 
 ## Ranked opportunities
 
-### #1 - Replace `RoaringTreemap` with `IdSetDense` (headline) — LANDED (commit `8f0ccbb`, 2026-04-17)
+### #1 - Replace `RoaringTreemap` with `IdSetDense` (headline) - LANDED (commit `8f0ccbb`, 2026-04-17)
 
 Japan bench confirmed the thesis: wall 56.7 s → 33.1 s (−41.6 %). Per-op `way_ref_check` dropped from 44 ns to 7 ns (timer-resolution limited), `node_insert` from 60 ns to 22 ns (same limit). `check_refs` now accounts for only ~33 % real consumer work, down from ~59 %. Decompression is the new biggest-attributed function in hotpath. Cross-validated against osmium on Denmark. See "Measured post-swap" section above for the full table. Planet bench deferred until a quiet-host window.
 
@@ -182,13 +182,13 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 
 **Expected RSS**: ~same or slightly lower (1.5-1.8 GB). Pre-allocating to `MAX_NODE_ID` allocates all ~400 chunks up front (~1.6 GB), versus `RoaringTreemap` growing as containers fill. Peak is comparable.
 
-### #2 - Parallelize as a three-phase renumber-shaped scan — LANDED (commits `053def6`, `fbf591c`, 2026-04-17)
+### #2 - Parallelize as a three-phase renumber-shaped scan - LANDED (commits `053def6`, `fbf591c`, 2026-04-17)
 
 **Landed in three steps** plus one preparatory cleanup:
 
-1. `d536466` — dropped per-element `Instant::now()` brackets (measurement tax we added in the instrumentation pass). Japan 33.1 s → 18.2 s; the tax was never real work.
-2. `053def6` — parallel three-phase scan. Each phase builds a per-kind schedule and runs through `parallel_classify_phase`. Pre-allocation of all three `IdSetDense`s moved to function entry (required for `set_atomic`). `mallopt(M_ARENA_MAX, 2)` prelude added. Deferred relation-relation resolve stays serial post-loop.
-3. `fbf591c` — follow-up: added `build_classify_schedules_split`, a one-pass header walk that emits all three per-kind schedules from a single file read. The naive rewrite called `build_classify_schedule` three times, doubling/tripling the header-chain walk cost at Europe scale (30.5 s of 51.2 s wall on the first parallel run). One-pass brings Europe to 33.6 s.
+1. `d536466` - dropped per-element `Instant::now()` brackets (measurement tax we added in the instrumentation pass). Japan 33.1 s → 18.2 s; the tax was never real work.
+2. `053def6` - parallel three-phase scan. Each phase builds a per-kind schedule and runs through `parallel_classify_phase`. Pre-allocation of all three `IdSetDense`s moved to function entry (required for `set_atomic`). `mallopt(M_ARENA_MAX, 2)` prelude added. Deferred relation-relation resolve stays serial post-loop.
+3. `fbf591c` - follow-up: added `build_classify_schedules_split`, a one-pass header walk that emits all three per-kind schedules from a single file read. The naive rewrite called `build_classify_schedule` three times, doubling/tripling the header-chain walk cost at Europe scale (30.5 s of 51.2 s wall on the first parallel run). One-pass brings Europe to 33.6 s.
 
 **Measured results (commits cumulative through `fbf591c`):**
 
@@ -229,15 +229,15 @@ Swap `.insert(id.cast_unsigned())` → `.set(id)` (`IdSetDense::set` takes `i64`
 | worker scratch | 20 MB |
 | `decompress_blob_raw` | 6 MB |
 
-From 21.5 GB churn at Japan post-swap to 1.8 GB at Europe post-parallel — all the per-op incremental allocation is gone; only the one-shot pre-alloc remains.
+From 21.5 GB churn at Japan post-swap to 1.8 GB at Europe post-parallel - all the per-op incremental allocation is gone; only the one-shot pre-alloc remains.
 
 **Cross-validation:** osmium parity still passes on Denmark across all four check paths (ways-only + nodes/ways/rels in relations) after each step.
 
-**Planet confirmation (UUID `862547e4`, commit `0d71b3b`, 2026-04-17, plantasjen):** **1225 s → 72.5 s = 16.9× speedup.** Plan target was 6–10 min; measured 1 min 12 s, roughly 5–8× under the plan floor. Phase breakdown: SCHEDULE_SCAN_LOOP 16.8 s, NODES parallel 35.4 s, WAYS parallel 20.2 s. Peak RSS 2.17 GB, p95 2.13 GB, 0 major page faults - comfortable on a 27 GB host.
+**Planet confirmation (UUID `862547e4`, commit `0d71b3b`, 2026-04-17, plantasjen):** **1225 s → 72.5 s = 16.9× speedup.** Plan target was 6-10 min; measured 1 min 12 s, roughly 5-8× under the plan floor. Phase breakdown: SCHEDULE_SCAN_LOOP 16.8 s, NODES parallel 35.4 s, WAYS parallel 20.2 s. Peak RSS 2.17 GB, p95 2.13 GB, 0 major page faults - comfortable on a 27 GB host.
 
-**Off-plan discoveries (LANDED 2026-04-18, commit `aa3147c`):** `BlobReader::seek_raw` was going through stdlib `Seek::seek` which always discards the `BufReader` buffer. Fixed via a public `BlobReaderSource` trait whose `BufReader` impl calls `BufReader::seek_relative`. Per-caller deltas in `reference/performance.md` ("seek_raw BufReader-discard fix" section) — Europe ALTW META_SCAN halved (25.9 s → 13.3 s); extract --smart Europe −7.6 % wall.
+**Off-plan discoveries (LANDED 2026-04-18, commit `aa3147c`):** `BlobReader::seek_raw` was going through stdlib `Seek::seek` which always discards the `BufReader` buffer. Fixed via a public `BlobReaderSource` trait whose `BufReader` impl calls `BufReader::seek_relative`. Per-caller deltas in `reference/performance.md` ("seek_raw BufReader-discard fix" section) - Europe ALTW META_SCAN halved (25.9 s → 13.3 s); extract --smart Europe −7.6 % wall.
 
-**Buffer-size tuning is no longer a follow-up win** (measured 2026-04-18). With the seek_raw fix in place, total bytes read on a header walk equals the file size regardless of `BufReader` capacity — the amplification is gone, so capacity now only trades syscall count vs read granularity. Verified: bumping `seekable_from_path` from 256 KB to 16 MB on Europe ALTW external moved META_SCAN from 13.3 s to 14.6 s (slightly worse, within noise) and total wall from 270.7 s to 271.9 s (flat). The original 256 KB constant is the right choice.
+**Buffer-size tuning is no longer a follow-up win** (measured 2026-04-18). With the seek_raw fix in place, total bytes read on a header walk equals the file size regardless of `BufReader` capacity - the amplification is gone, so capacity now only trades syscall count vs read granularity. Verified: bumping `seekable_from_path` from 256 KB to 16 MB on Europe ALTW external moved META_SCAN from 13.3 s to 14.6 s (slightly worse, within noise) and total wall from 270.7 s to 271.9 s (flat). The original 256 KB constant is the right choice.
 
 ### Original #2 plan (preserved for reference)
 
@@ -339,7 +339,7 @@ Host budget: unchanged (1.8 GB current is comfortable; 2.3 GB post-parallelizati
 Surfaced during step #2 measurement work. None were in the original plan.
 Measured cost/benefit where possible; captured as TODO hooks where deferred.
 
-### Schedule-walk duplication — LANDED (commit `fbf591c`)
+### Schedule-walk duplication - LANDED (commit `fbf591c`)
 
 The naive step-#2 rewrite called `build_classify_schedule` three times
 (one per phase), walking the PBF header chain from start to end each
@@ -350,7 +350,7 @@ just to discover blob kinds three times over.
 Fix: `build_classify_schedules_split` walks once, emits per-kind
 schedules with local 0..n seqs. Europe dropped 51.2 s → 33.6 s.
 
-### BufReader seek-discard (codebase-wide) — DEFERRED (TODO.md hook)
+### BufReader seek-discard (codebase-wide) - DEFERRED (TODO.md hook)
 
 While tuning the remaining ~15 s of schedule-walk time at Europe, tried
 bumping `seekable_from_path`'s BufReader capacity from 256 KB to 16 MB
@@ -365,23 +365,23 @@ method, not on the `Seek` trait. The `BlobReader<R: Seek>` generic
 abstraction can't reach it without design work. Reverted in `86761d6`.
 
 **Resolution (2026-04-18, commit `aa3147c`):** the design work is now
-done — public `BlobReaderSource` trait with a default `skip_relative`
+done - public `BlobReaderSource` trait with a default `skip_relative`
 overridden by the `BufReader` impl to call `BufReader::seek_relative`.
 The `BlobReader<R>` seekable bound widened from `R: Read + Seek + Send`
 to `R: BlobReaderSource + Send`. Hot-path methods route through a new
 internal `skip_blob_body` helper. Measured wall deltas in
 `reference/performance.md`. Note that with the seek now correct, the
-buffer-size knob lost its leverage — re-tested 16 MB at the same time
+buffer-size knob lost its leverage - re-tested 16 MB at the same time
 and it gave no win (META_SCAN 13.3 → 14.6 s, total wall flat).
 
-### mmap-based schedule walk — DEFERRED (not tracked)
+### mmap-based schedule walk - DEFERRED (not tracked)
 
 Alternative to the BufReader path: memory-map the PBF file and scan
 header offsets directly from the mapped slice. Eliminates all read
 syscalls, lets the kernel handle readahead with MADV_SEQUENTIAL. At
 35 GB Europe the walk is CPU-bound on 520 K protobuf header parses
 anyway, so the upper bound is probably ~8-10 s (down from current
-14.8 s) — mmap removes I/O orchestration overhead but not the parse
+14.8 s) - mmap removes I/O orchestration overhead but not the parse
 cost. At planet (87 GB, 1.37 M headers) ratio should scale similarly.
 
 Worth exploring if/when:
@@ -394,7 +394,7 @@ Needs careful handling of madvise hints across Linux / macOS and the
 ownership story between the mmap handle and the Arc<File> that
 `parallel_classify_phase` currently consumes.
 
-### Parallel schedule walk — DEFERRED (not tracked)
+### Parallel schedule walk - DEFERRED (not tracked)
 
 Higher-ceiling alternative to mmap: partition the file into N byte
 chunks, dispatch N workers to each scan their chunk's header chain

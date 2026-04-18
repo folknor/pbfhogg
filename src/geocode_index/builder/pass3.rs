@@ -203,7 +203,7 @@ pub(super) struct FusedCellAssignmentParams<'a> {
 /// once per segment. Addr points (single cell per point) trivially
 /// derive coarse from fine without any cover work.
 ///
-/// Stage B runs separately on each of the two bucket trees —
+/// Stage B runs separately on each of the two bucket trees -
 /// parallelised per plan item #3 (256-bucket parallel parse+sort,
 /// serial group+write).
 #[allow(clippy::cast_possible_truncation, clippy::too_many_lines, clippy::cognitive_complexity)]
@@ -243,7 +243,7 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     // fine cell derives its coarse parent via S2 `parent()` and
     // de-duplicates per-segment so each coarse cell is written at most
     // once per segment. Saves Europe's ~4.9 s coarse-streets Stage A
-    // (measured pre-fusion UUID bf8f2038) — the coarse cover_segment
+    // (measured pre-fusion UUID bf8f2038) - the coarse cover_segment
     // pass is entirely eliminated.
 
     // Streets (fused fine + coarse)
@@ -402,7 +402,7 @@ pub(super) fn bucketed_cell_assignment_fused(p: &FusedCellAssignmentParams<'_>) 
     drop(fine_writers);
     drop(coarse_writers);
 
-    // Stage B, twice — once per bucket tree.
+    // Stage B, twice - once per bucket tree.
     crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_FINE_START");
     let fine_count = run_stage_b(
         output_dir, &fine_bucket_dir,
@@ -594,7 +594,7 @@ pub(super) fn assign_admin_cells(polygons: &[AssembledPolygon], admin_level: u8)
     // `AdminCellEntry`s. `par_iter().flat_map_iter().collect()` preserves
     // input ordering so downstream `entries.sort_unstable_by_key(cell_id)`
     // in `write_admin_index` gives a byte-identical result to the sequential
-    // path. Plan item #6 — Europe admin flood-fill was 10.7 s sequential
+    // path. Plan item #6 - Europe admin flood-fill was 10.7 s sequential
     // (UUID bf8f2038); expected ~5× on 12 cores.
     polygons.par_iter().enumerate().flat_map_iter(|(poly_idx, poly)| {
         admin_cells_for_polygon(poly_idx, poly, admin_level).into_iter()

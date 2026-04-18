@@ -31,21 +31,21 @@ active optimization plans):
 
 | Lines | File | Active plan proximity |
 |------:|------|------|
-| ~~3793~~ | ~~`src/commands/extract.rs`~~ — split 2026-04-17, now `src/commands/extract/` (6 files) | ✓ extract smart/complete (strong), multi-extract (recent) |
-| ~~1957~~ | ~~`src/commands/inspect.rs`~~ — split 2026-04-17, now `src/commands/inspect/` (7 files) | — |
-| ~~1758~~ | ~~`src/geocode_index/builder.rs`~~ — split 2026-04-17, now `src/geocode_index/builder/` (8 files) | ✓ build-geocode-index (active plan) |
-| ~~1705~~ | ~~`src/commands/renumber_external.rs`~~ — split 2026-04-17, now `src/commands/renumber_external/` (6 files) | renumber regression (open investigation) |
+| ~~3793~~ | ~~`src/commands/extract.rs`~~ - split 2026-04-17, now `src/commands/extract/` (6 files) | ✓ extract smart/complete (strong), multi-extract (recent) |
+| ~~1957~~ | ~~`src/commands/inspect.rs`~~ - split 2026-04-17, now `src/commands/inspect/` (7 files) | - |
+| ~~1758~~ | ~~`src/geocode_index/builder.rs`~~ - split 2026-04-17, now `src/geocode_index/builder/` (8 files) | ✓ build-geocode-index (active plan) |
+| ~~1705~~ | ~~`src/commands/renumber_external.rs`~~ - split 2026-04-17, now `src/commands/renumber_external/` (6 files) | renumber regression (open investigation) |
 | 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
-| 1506 | `src/osc.rs` | — |
-| 1376 | `src/read/blob.rs` | — |
+| 1506 | `src/osc.rs` | - |
+| 1376 | `src/read/blob.rs` | - |
 | 1316 | `src/write/writer.rs` | write-path work |
-| 1295 | `src/commands/mod.rs` | — |
-| 1225 | `src/blob_index.rs` | — |
+| 1295 | `src/commands/mod.rs` | - |
+| 1225 | `src/blob_index.rs` | - |
 | 1145 | `src/commands/altw/stage4.rs` | ALTW external (active plan proximity) |
 | 1136 | `src/commands/merge/rewrite.rs` | apply-changes (active plan proximity) |
-| 1110 | `src/commands/tags_filter.rs` | — |
-| 1084 | `src/geocode_index/reader.rs` | — |
+| 1110 | `src/commands/tags_filter.rs` | - |
+| 1084 | `src/geocode_index/reader.rs` | - |
 
 Priority ordering for the split work (don't try to batch the whole list
 at once - each split is a separate review surface):
@@ -108,13 +108,13 @@ Surfaced during the optimization-plan reviews above. All six closed on 2026-04-1
 
 - [x] ~~**Geocode Pass 1.5 may violate the `parallel_classify_accumulate` contract**~~ - **DONE (2026-04-17).** Contract comment rewritten to describe three tiers (safe sparse / borderline / unsafe dense) with the geocode Pass 1.5 call site as the borderline exemplar, 1.3 GB worst-case per-worker bitmap bound stated explicitly, and a cross-link to the `notes/geocode-build-opportunities.md` rewrite item. Pass 1.5 call site annotated with the same caveat and the long-term `parallel_classify_phase` target shape.
 
-- [x] ~~**`(0, 0)` coord sentinel collides with Null Island**~~ - **DONE (2026-04-17).** Both sites (`src/geocode_index/builder.rs` way-coord resolution, `src/commands/altw/stage2.rs` `is_resolved`) now carry matching `KNOWN LIMITATION` comments cross-linking to each other and pointing at the presence-bitmap fix shape. Code behavior unchanged — observed frequency too low to justify the extra pass yet.
+- [x] ~~**`(0, 0)` coord sentinel collides with Null Island**~~ - **DONE (2026-04-17).** Both sites (`src/geocode_index/builder.rs` way-coord resolution, `src/commands/altw/stage2.rs` `is_resolved`) now carry matching `KNOWN LIMITATION` comments cross-linking to each other and pointing at the presence-bitmap fix shape. Code behavior unchanged - observed frequency too low to justify the extra pass yet.
 
-- [x] ~~**`IdSetDense::set_atomic` panics on indexdata max_id mismatch**~~ - **DONE (2026-04-17).** `set_atomic` / `set_atomic_if_new` now route through a shared `chunk_for_atomic` helper that produces a detailed panic message naming the offending ID, the pre-allocated upper bound, and the most likely root causes (indexdata mismatch, hard-coded cap overshoot, missing `pre_allocate`). Panic preserved rather than converting to `Result` — the hot path can't afford `Result`, and a diagnostic panic is strictly better than the old opaque `.expect("not pre-allocated")`. `pre_allocate` doc now spells out the contract the callers are expected to uphold.
+- [x] ~~**`IdSetDense::set_atomic` panics on indexdata max_id mismatch**~~ - **DONE (2026-04-17).** `set_atomic` / `set_atomic_if_new` now route through a shared `chunk_for_atomic` helper that produces a detailed panic message naming the offending ID, the pre-allocated upper bound, and the most likely root causes (indexdata mismatch, hard-coded cap overshoot, missing `pre_allocate`). Panic preserved rather than converting to `Result` - the hot path can't afford `Result`, and a diagnostic panic is strictly better than the old opaque `.expect("not pre-allocated")`. `pre_allocate` doc now spells out the contract the callers are expected to uphold.
 
 - [x] ~~**`u16` truncation of way `node_count` in geocode**~~ - **DONE (2026-04-17).** Both `StreetWay.node_count` and `InterpWay.node_count` write sites converted from `.min(u16::MAX)` to `u16::try_from(...)` with a diagnostic error pointing at the 2 000-ref OSM convention cap. Unreachable today, but fails loud if the convention ever shifts.
 
-- [x] ~~**Interpolation way `(start_number = 0, end_number = 0)` is both unresolved-sentinel and valid input**~~ - **DONE (2026-04-17).** `SlimInterpWay` struct doc, the init site, and the resolve site all carry matching `KNOWN LIMITATION` comments describing the sentinel collision with house number 0 and the `resolved: bool` + FORMAT_VERSION-bump fix shape. Behavior unchanged — edge case is too rare to justify the format bump.
+- [x] ~~**Interpolation way `(start_number = 0, end_number = 0)` is both unresolved-sentinel and valid input**~~ - **DONE (2026-04-17).** `SlimInterpWay` struct doc, the init site, and the resolve site all carry matching `KNOWN LIMITATION` comments describing the sentinel collision with house number 0 and the `resolved: bool` + FORMAT_VERSION-bump fix shape. Behavior unchanged - edge case is too rare to justify the format bump.
 
 ## Important: ignored tests
 
@@ -144,7 +144,7 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   raising the soft FD cap unblocked it. README row updated.
 - [ ] **Finish the three planet rows that didn't land on 2026-04-18** -
   `check --ids --full` (argv-passing bug in `overnight.sh`, fixed),
-  `apply-changes` (now needs `--osc-seq 4920` — planet has 8 daily
+  `apply-changes` (now needs `--osc-seq 4920` - planet has 8 daily
   diffs configured), and `build-geocode-index` (OOM-killed in Pass 1.5
   at 1m34s on the first attempt; retry in isolation). All three
   queued in the trimmed `overnight.sh` for the next overnight run.
@@ -501,7 +501,7 @@ single-pass, tag expression and bbox filtering.
   Planet: 204.5 s at `aee7727` (`--bench 3`, UUID `abd74459`); historical
   194 s measured at `cb99106` (also `--bench 3`). 3.3 GB peak anon, zero
   temp disk. The +10 s drift is inside `--bench 3` variance but not
-  comfortably — worth a deliberate bisect if this becomes the critical
+  comfortably - worth a deliberate bisect if this becomes the critical
   path; not today.
   - [ ] **Varint encode lookup table.** 256-entry for single-byte varints
     in the reframe functions. Est. −2 to −3 s wall.

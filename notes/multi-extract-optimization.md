@@ -24,7 +24,7 @@ extracts at Japan scale (7.7 s vs ~21 s).
 Original bottleneck (sequential write phase) was resolved by converting
 to `multi_extract_pread_write` (commit `9f72bcf`).
 
-**Europe phase breakdown (commit `b7cd0e4`, UUID `c1ff6ec9`)** — first
+**Europe phase breakdown (commit `b7cd0e4`, UUID `c1ff6ec9`)** - first
 full breakdown after the 2026-04-17 instrumentation landing
 (commit `1e8d37b` added `MULTI_EXTRACT_START/END`,
 `MULTI_SCHEDULE_SCAN_START/END`, and eight `multi_extract_*` counters):
@@ -43,7 +43,7 @@ full breakdown after the 2026-04-17 instrumentation landing
 Write phases dominate Europe: `NODE_WRITE` (52 %) + `WAY_WRITE` (40 %)
 = 92 % of wall. **Write-path optimization is the high-impact
 opportunity**, not classification. Within write, the obvious lever is
-**raw passthrough for fully-contained node blobs** (item #5 below) —
+**raw passthrough for fully-contained node blobs** (item #5 below) -
 eliminating decode+re-encode on ~90 % of node blobs at Europe could
 shave double-digit seconds from the 413 s `NODE_WRITE` phase.
 
@@ -71,7 +71,7 @@ through repeated doublings on each block.
 `8bc1773f` pre-fix vs `08fefe51` post-fix). No total-wall regression
 at either Japan or Europe (799.9 s at Europe, within single-shot noise
 of the 792.7 s prior-commit baseline `d824d7aa`). Europe phase impact
-not paired-benched — the targeted phase is only 1.7 % of wall, so even
+not paired-benched - the targeted phase is only 1.7 % of wall, so even
 a perfect speedup falls below single-shot noise on total.
 
 Mechanism well-understood; proportionally larger savings are available
@@ -135,7 +135,7 @@ multi-extract (5-20 regions), linear scan is fine.
    NODE_WRITE is 52 % of Europe wall, WAY_WRITE 40 %; polygon safety
    issue still needs resolution first)
 7. **`BlobReader::seek_raw` BufReader-discard fix** (cross-cutting, but
-   measurable 26 s at Europe in MULTI_SCHEDULE_SCAN — see TODO.md
+   measurable 26 s at Europe in MULTI_SCHEDULE_SCAN - see TODO.md
    Performance section)
 8. **Spatial index** (only for N > 50, future)
 

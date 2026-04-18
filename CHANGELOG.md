@@ -5,18 +5,18 @@
 ### Breaking changes
 
 - **`renumber --mode` flag removed.** External join is now the only implementation; the in-memory path is gone.
-- **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Downstream users with custom reader types add `impl BlobReaderSource for MyReader {}` — one line, picks up the correct-but-slow default.
+- **`BlobReader::new_seekable<R>` and `IndexedReader::new<R>` bounds widened** from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Downstream users with custom reader types add `impl BlobReaderSource for MyReader {}` - one line, picks up the correct-but-slow default.
 - **Geocode `FORMAT_VERSION` bumped to 2.** Indexes built with older versions must be rebuilt.
 
 ### Commands
 
-- **renumber**: complete external-join rewrite. Planet 204.5s (3m25s), 3.3 GB peak anon RSS, zero temp disk. Negative input IDs now rejected with a clear error. Orphan refs — way refs and relation members absent from the input — are counted and surfaced in the summary.
+- **renumber**: complete external-join rewrite. Planet 204.5s (3m25s), 3.3 GB peak anon RSS, zero temp disk. Negative input IDs now rejected with a clear error. Orphan refs - way refs and relation members absent from the input - are counted and surfaced in the summary.
 - **add-locations-to-ways `--index-type external`**: major rewrite. `coord_payloads` direct emission replaces the `coord_slots` mmap, rank-bucketed counting sort replaces comparison sort, stage-4 raw passthrough for non-way blobs, file-backed `coords_by_rank` scatter. Planet 1,462s → 661s (-55%).
 - **check --refs**: three-phase parallel scan via `parallel_classify_phase` after swapping `RoaringTreemap` → `IdSetDense`. Planet 1,225s → 70.2s (17.5×); Europe 426.2s → 33.6s (12.7×); Japan 56.7s → 2.1s (27×). Peak RSS 2.17 GB (pre-allocated `IdSetDense` for 14B node IDs).
 - **check --ids --full**: parallel three-phase scan mirroring `check --refs`. Europe 312.6s → 52.7s (5.9×). Planet: 93.2s (no pre-swap baseline). Streaming (non-`--full`) mode unchanged.
 - **extract** (smart / complete / simple): reuse PASS1 blob schedule in subsequent passes. Europe smart 254s → 181s (-29%), complete -17%, simple -15%.
 - **getparents**: skip node-only blobs via `BlobFilter` when `--add-self` doesn't need nodes (~85% of blobs at planet scale).
-- **derive-changes**: streams output to temp files instead of buffering all changes in memory — constant memory regardless of diff size.
+- **derive-changes**: streams output to temp files instead of buffering all changes in memory - constant memory regardless of diff size.
 - **build-geocode-index**: hard-errors instead of silently truncating when per-cell or per-way counts exceed `u16::MAX`. Error names the offending cell/way and points at the `u32` + `FORMAT_VERSION` bump path.
 
 ### Bug fixes
@@ -26,7 +26,7 @@
 - **renumber forward-ref relations.** Fixed via two-pass structure.
 - **Concurrent-process temp file collisions.** Scratch temp file names now include the PID, so two pbfhogg instances running against the same scratch directory no longer clash.
 - **Temp file cleanup on error paths.** Assembly failures previously leaked temp files; cleanup now runs on every exit path via deferred sink cleanup.
-- **Geocode `simplify_ring` Douglas-Peucker divergence.** `dp_count_range` was using unclamped perpendicular distance to the infinite line while `dp_mark` used clamped segment projection — the binary search could converge to a different epsilon and exceed `max_vertices`. Both now use the same clamped projection.
+- **Geocode `simplify_ring` Douglas-Peucker divergence.** `dp_count_range` was using unclamped perpendicular distance to the infinite line while `dp_mark` used clamped segment projection - the binary search could converge to a different epsilon and exceed `max_vertices`. Both now use the same clamped projection.
 
 ### Dependencies
 
@@ -44,7 +44,7 @@
 | check --refs | Planet 87 GB | 70.2s | -94% (17.5×) |
 | check --ids --full | Europe 35 GB | 52.7s | -83% (5.9×) |
 | extract --smart | Europe 35 GB | 181s | -29% |
-| derive-changes | — | streaming | constant memory |
+| derive-changes | - | streaming | constant memory |
 
 ## 0.2.0 - 2026-04-09
 

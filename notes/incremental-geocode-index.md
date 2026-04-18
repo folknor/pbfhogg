@@ -1,7 +1,7 @@
 # Incremental geocode index update
 
 > **Scope.** This plan targets *avoiding* the full rebuild when a daily
-> OSC lands — patch or merge against the existing index instead of
+> OSC lands - patch or merge against the existing index instead of
 > re-running the 20-minute build. Complementary effort in
 > [geocode-build-opportunities.md](geocode-build-opportunities.md)
 > targets the full-rebuild wall itself (20 min → ~10 min). Even with a
@@ -15,19 +15,19 @@ Full geocode index rebuild from planet PBF takes ~1,255s (20.9 min) and
 2026-04-17). The 1,255 s wall is still carrying the
 `has_indexdata` / `check_sorted_and_indexed` regression tax (live in
 `4ce7e93..c0ae9a7`) because the planet rebench queued in `overnight.sh`
-round 2 hasn't landed yet — see
+round 2 hasn't landed yet - see
 [geocode-build-opportunities.md](geocode-build-opportunities.md) for
 the wall-time opportunity stack and rebench status. RSS / phase-peak
 data is unaffected.
 
 The earlier 17.8 GB figure under-reported: brokkr previously suppressed
 short-emitting phase markers from sidecar output, so PASS1_5's transient
-peak never showed up. The peak itself has not changed — only its
+peak never showed up. The peak itself has not changed - only its
 visibility.
 
 A daily diff changes ~5-30M elements, but most geocode-relevant data
 (admin boundaries, street geometries, address points) is stable.
-Rebuilding from scratch every day wastes 99 %+ of the work — that's the
+Rebuilding from scratch every day wastes 99 %+ of the work - that's the
 case for this plan, independent of whether the full-rebuild wall ends
 up at 20 min, 10 min, or 5 min.
 
@@ -41,7 +41,7 @@ interpolation ways and resolves their coordinates through a compact
 rank-indexed coord array, and Pass 3 buckets everything by S2 cell
 (fine + coarse levels) into the final 19-file index. See
 [geocode-build-opportunities.md](geocode-build-opportunities.md#current-architecture-for-reference)
-for the full per-pass architecture — this plan only cares about what
+for the full per-pass architecture - this plan only cares about what
 each pass *contributes* to the index that a diff could invalidate:
 
 - Pass 1 → admin boundary polygons (rare changes)

@@ -138,7 +138,7 @@ pub(super) fn run_pass1_5(
 /// `build_way_schedule_and_max_node_id` and Pass 2a's
 /// `build_classify_schedule(Node)`). At Europe the consolidated walk
 /// costs ~16-17 s once, vs 16.6 s + 26.5 s = 43 s for the two-walk
-/// shape — measured 2026-04-18 on `bf8f2038`.
+/// shape - measured 2026-04-18 on `bf8f2038`.
 ///
 /// Each schedule's `seq` is local to that schedule (node and way are
 /// separate `0..n` ranges, as `parallel_classify_phase`'s ReorderBuffer

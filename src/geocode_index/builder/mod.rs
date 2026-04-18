@@ -284,7 +284,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // pass over streets/addrs/interps at the fine level derives coarse
     // cells on the fly via S2 parent + per-segment dedup, eliminating
     // the duplicate `cover_segment` pass that ran separately at coarse
-    // level. Two Stage B invocations follow — one per bucket tree.
+    // level. Two Stage B invocations follow - one per bucket tree.
     crate::debug::emit_marker("GEOCODE_PASS3_CELLS_START");
     let (fine_count, coarse_count) = pass3::bucketed_cell_assignment_fused(
         &pass3::FusedCellAssignmentParams {

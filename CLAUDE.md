@@ -26,7 +26,7 @@ Audience: library + CLI users deciding whether to upgrade. Not a commit digest.
 
 **Add:** breaking changes (removed flags, widened bounds, format bumps); new capabilities; behavior changes at the same surface (silent truncation → hard error, new warnings); user-visible bug fixes; perf changes large enough to matter (headline numbers, not 5% sub-phase deltas).
 
-**Skip:** internal refactors, module splits, helper extractions; sidecar instrumentation (markers, counters, `hotpath`) — serves brokkr, not users; F-numbered fix rollups; sub-phase timings that don't move the headline; test additions, code-quality cleanups, dead-code removal; doc-file edits (CORRECTNESS.md, DEVIATIONS.md, notes/*.md); private internals.
+**Skip:** internal refactors, module splits, helper extractions; sidecar instrumentation (markers, counters, `hotpath`) - serves brokkr, not users; F-numbered fix rollups; sub-phase timings that don't move the headline; test additions, code-quality cleanups, dead-code removal; doc-file edits (CORRECTNESS.md, DEVIATIONS.md, notes/*.md); private internals.
 
 Test: would a user change what they do after reading this entry? If no, it belongs in `git log`.
 
@@ -54,9 +54,9 @@ Markers are point-in-time bookmarks - the FIFO protocol is `<timestamp_us> <name
 Brokkr is convention-free at the protocol layer. Two optional naming conventions unlock richer views:
 
 - **`FOO_START` / `FOO_END` marker pairs** drive `--durations` (per-span wall time) and anchor `--stop` alias resolution. Emit both markers around any phase you want to time.
-- **`WAIT_<CATEGORY>_START` / `WAIT_<CATEGORY>_END` stall spans** drive `brokkr sidecar <uuid> --stalls`. Wrap blocking points (channel sends, spill waits, backpressure) in marker pairs whose name begins `WAIT_`. `--stalls` sums durations by category and reports each as a fraction of run wall-clock. Categories are free-form — pick names that match the blocking points you want to attribute (`WAIT_WRITER`, `WAIT_PAYLOAD`, `WAIT_SPILL`, etc.). Runs from before the convention simply report "no WAIT_* marker pairs" rather than empty output.
+- **`WAIT_<CATEGORY>_START` / `WAIT_<CATEGORY>_END` stall spans** drive `brokkr sidecar <uuid> --stalls`. Wrap blocking points (channel sends, spill waits, backpressure) in marker pairs whose name begins `WAIT_`. `--stalls` sums durations by category and reports each as a fraction of run wall-clock. Categories are free-form - pick names that match the blocking points you want to attribute (`WAIT_WRITER`, `WAIT_PAYLOAD`, `WAIT_SPILL`, etc.). Runs from before the convention simply report "no WAIT_* marker pairs" rather than empty output.
 
-Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count — derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
+Both conventions are additive. The default phase summary already shows per-phase user/kernel core split, `majflt`/`minflt` deltas, voluntary/involuntary context switches, and peak thread count - derived from `/proc` samples, so older sidecar rows get the enriched view retroactively on next query.
 
 `--bench N` runs N times, stores best. Default `--bench 3`.
 

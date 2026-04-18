@@ -192,7 +192,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     let relation_blobs_total = rel_schedule.len() as u64;
 
     // ------------------------------------------------------------------
-    // Phase 1 — node scan. Workers populate `node_ids` via `set_atomic`.
+    // Phase 1 - node scan. Workers populate `node_ids` via `set_atomic`.
     // ------------------------------------------------------------------
     crate::debug::emit_marker("CHECKREFS_NODES_START");
     {
@@ -227,7 +227,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     crate::debug::emit_mallinfo2("checkrefs_after_nodes");
 
     // ------------------------------------------------------------------
-    // Phase 2 — way scan. Workers read `node_ids` (via `get`, no atomic
+    // Phase 2 - way scan. Workers read `node_ids` (via `get`, no atomic
     // needed now that phase 1 joined), optionally write `way_ids`, and
     // collect per-blob missing-ref vecs.
     // ------------------------------------------------------------------
@@ -280,7 +280,7 @@ pub fn check_refs(path: &Path, check_relations: bool, show_ids: bool, direct_io:
     crate::debug::emit_mallinfo2("checkrefs_after_ways");
 
     // ------------------------------------------------------------------
-    // Phase 3 — relation scan (only when `check_relations`). Workers read
+    // Phase 3 - relation scan (only when `check_relations`). Workers read
     // both `node_ids` and `way_ids`, write `relation_ids`, and collect
     // per-blob missing/deferred vecs.
     // ------------------------------------------------------------------

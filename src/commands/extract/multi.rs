@@ -280,7 +280,7 @@ pub(super) fn try_extract_multi_single_pass(
     //
     // Per-worker scratch `Vec<Vec<i64>>` is cleared (not dropped) between
     // blocks so the inner `Vec<i64>` capacity amortizes across the ~N blobs
-    // each worker processes — the same pattern used by the node classify
+    // each worker processes - the same pattern used by the node classify
     // phase above (see `|| vec![Vec::<i64>::new(); n]` there). Pre-
     // instrumentation Japan 5-region bench showed this phase at 892 ms
     // with the prior `|| ()` + per-block `vec![Vec::new(); n]` allocation.

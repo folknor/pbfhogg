@@ -121,7 +121,7 @@ impl IdSetDense {
     ///
     /// Panics if `id` falls outside the pre-allocated range. This usually
     /// means the caller's `pre_allocate(max_id)` argument underestimated the
-    /// highest ID that would be seen — most commonly because the value was
+    /// highest ID that would be seen - most commonly because the value was
     /// derived from indexdata that understated the real maximum (see the
     /// `pre_allocate` doc for the full list of failure modes). The panic
     /// message includes the offending ID and the pre-allocated upper bound
@@ -129,7 +129,7 @@ impl IdSetDense {
     /// overshoot, or a missing `pre_allocate` call.
     ///
     /// Do NOT "fix" this panic by replacing it with a silent no-op or by
-    /// resizing `self.chunks` here — both would be wrong. A silent no-op
+    /// resizing `self.chunks` here - both would be wrong. A silent no-op
     /// loses data; a resize is unsound because `&self` methods cannot
     /// safely grow the backing `Vec` while other threads hold pointers
     /// into it.
@@ -158,7 +158,7 @@ impl IdSetDense {
     ///
     /// # Panics
     ///
-    /// See [`Self::set_atomic`] — same panic contract and diagnostics.
+    /// See [`Self::set_atomic`] - same panic contract and diagnostics.
     #[allow(clippy::cast_sign_loss)]
     pub fn set_atomic_if_new(&self, id: i64) -> bool {
         let id = id as u64;
@@ -175,7 +175,7 @@ impl IdSetDense {
 
     /// Shared chunk-lookup helper for `set_atomic` / `set_atomic_if_new`.
     /// Produces a detailed panic message when the caller's `pre_allocate`
-    /// budget was exceeded — callers see exactly which ID fell outside the
+    /// budget was exceeded - callers see exactly which ID fell outside the
     /// pre-allocated range, so indexdata/max-id bugs are diagnosable from
     /// a single panic line rather than an opaque "not pre-allocated".
     #[inline]
@@ -201,7 +201,7 @@ impl IdSetDense {
             None => panic!(
                 "{fn_name}: id {id} lands in chunk {cid} (within Vec length {}), \
                  but that chunk's slot is None. This means `pre_allocate()` was \
-                 never called on this IdSetDense — the `set_atomic*` methods \
+                 never called on this IdSetDense - the `set_atomic*` methods \
                  require explicit pre-allocation because they cannot grow under \
                  a shared `&self` borrow.",
                 self.chunks.len(),

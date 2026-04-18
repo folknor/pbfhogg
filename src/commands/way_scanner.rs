@@ -56,7 +56,7 @@ impl GeocodeTagLiterals<'_> {
 }
 
 /// Per-blob resolved string-table indices for the geocode tag literals.
-/// `None` means the literal is absent from this blob's string table —
+/// `None` means the literal is absent from this blob's string table -
 /// e.g. a blob with no building-addr ways may legitimately lack the
 /// `"building"` key string. Resolved once per blob before the way loop.
 #[derive(Default)]
@@ -207,7 +207,7 @@ pub(crate) fn scan_way_geocode_tagged_refs(
     // keys, no way in it can be geocode-relevant (callers can still
     // filter by admin membership via way_id outside this function, but
     // we stream every way's id+refs for them to decide). When none of
-    // our keys are present, skip tag parsing entirely — just emit
+    // our keys are present, skip tag parsing entirely - just emit
     // (way_id, all-false flags, refs).
     let any_key_present = resolved.k_highway.is_some()
         || resolved.k_name.is_some()
@@ -238,7 +238,7 @@ pub(crate) fn scan_way_geocode_tagged_refs(
 
 /// Scan a StringTable protobuf payload to find the indices of the
 /// geocode tag literals (keys + excluded highway values). Returns
-/// `Option<u32>` per literal — `None` means the string wasn't in the
+/// `Option<u32>` per literal - `None` means the string wasn't in the
 /// table. Index 0 is reserved as the "delta coding baseline" by the
 /// PBF spec; returned as 0 if a literal actually matches the first
 /// entry (unlikely in practice but handled correctly).
@@ -255,7 +255,7 @@ fn resolve_tag_indices(
         if field == 1 && wire_type == WIRE_LEN {
             let s = cursor.read_len_delimited()?;
             // Match against each literal. Stop-on-first-match isn't
-            // worth the branch — `eq` on short byte slices is cheap.
+            // worth the branch - `eq` on short byte slices is cheap.
             if s == literals.k_highway && resolved.k_highway.is_none() {
                 resolved.k_highway = Some(idx);
             }
@@ -292,7 +292,7 @@ fn resolve_tag_indices(
 
 /// Parse a single Way message: extract id, iterate keys/vals looking
 /// for the geocode tag keys, extract refs if the way matches any
-/// predicate (or if the caller may want refs for admin-way dispatch —
+/// predicate (or if the caller may want refs for admin-way dispatch -
 /// we stream all ways when no geocode keys are present in the blob's
 /// string table).
 #[allow(clippy::cast_possible_wrap)]
@@ -367,7 +367,7 @@ fn parse_way_tagged_refs(
     let is_building_addr = has_building && has_addr_hn && has_addr_st;
     let is_interp = has_addr_interp && has_addr_st;
 
-    // Always decode refs — the caller's admin-way membership test sits
+    // Always decode refs - the caller's admin-way membership test sits
     // outside this function and needs every way's refs when the id
     // matches. Cheap because refs are already size-capped by the OSM
     // 2000-ref convention.

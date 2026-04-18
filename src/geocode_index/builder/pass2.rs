@@ -6,7 +6,7 @@
 //!
 //! - **Phase 2a** (parallel nodes). Workers decode node blobs via
 //!   [`parallel_classify_phase`]. Coord writes go directly into
-//!   `coord_mmap` from the worker (disjoint ranks, no atomics needed —
+//!   `coord_mmap` from the worker (disjoint ranks, no atomics needed -
 //!   see [`CoordMmapShared`]). Pending `AddrPoint`s flow to the main
 //!   thread via the merge channel; the main thread interns strings
 //!   into the shared `StringPool` and streams to `addr_points.bin` in
@@ -14,9 +14,9 @@
 //!
 //! - **Phase 2b** (parallel ways). Workers decode way blobs, classify
 //!   by tags, resolve coords from the mmap populated by Phase 2a, and
-//!   emit per-blob `WayBlobOut` records — `PendingStreet`,
+//!   emit per-blob `WayBlobOut` records - `PendingStreet`,
 //!   `PendingAddrPoint` (for building centroids), `PendingInterp`, and
-//!   admin way geometry — with owned strings. Main-thread merge interns
+//!   admin way geometry - with owned strings. Main-thread merge interns
 //!   strings, writes records to `street_ways.bin` / `street_nodes.bin`
 //!   / `addr_points.bin` / `interp_nodes.bin`, pushes `SlimInterpWay`
 //!   entries, and inserts into the `way_geom` map. The merge runs
@@ -73,19 +73,19 @@ pub(super) struct SlimInterpWay {
 // Phase 2a: parallel node scan
 // ---------------------------------------------------------------------------
 
-/// Per-blob output from Phase 2a workers: pending `AddrPoint`s only —
+/// Per-blob output from Phase 2a workers: pending `AddrPoint`s only -
 /// coord writes go straight to `coord_mmap` from the worker (see
 /// `CoordMmapShared` below), avoiding the 1.86 GB-on-Germany channel
 /// traffic that the earlier "coord writes in NodeBlobOut" shape carried.
 /// Strings stay owned (`Box<str>`) so the main thread interns them into
-/// the shared `StringPool` at merge time — workers can't touch
+/// the shared `StringPool` at merge time - workers can't touch
 /// `StringPool` directly without serialising on a mutex.
 #[derive(Default)]
 struct NodeBlobOut {
     addr_points: Vec<PendingAddrPoint>,
 }
 
-/// Pending address point — used by both Phase 2a (addr-tagged nodes) and
+/// Pending address point - used by both Phase 2a (addr-tagged nodes) and
 /// Phase 2b (building centroids with addr tags). Owned strings so the
 /// main thread can intern into the shared `StringPool` at merge time.
 struct PendingAddrPoint {
@@ -98,7 +98,7 @@ struct PendingAddrPoint {
 
 /// Sync-safe wrapper around the `coord_mmap`'s raw pointer for Phase 2a
 /// workers. Workers write `(lat_e7, lon_e7)` pairs at disjoint rank
-/// offsets — the disjointness invariant follows from
+/// offsets - the disjointness invariant follows from
 /// `IdSetDense::rank(id)` being a unique index per set ID, combined with
 /// sorted PBF guaranteeing every node ID appears in at most one blob.
 /// No atomics needed because no two workers ever touch the same byte.
@@ -110,7 +110,7 @@ struct PendingAddrPoint {
 ///   the entire lifetime of the `CoordMmapShared` value (callers hold
 ///   the owning `MmapMut` on the stack across the Phase 2a scope).
 /// - Every `rank` value passed to `write_coord` satisfies
-///   `rank * 8 + 8 <= len` — the per-blob `ref_rank_end` and
+///   `rank * 8 + 8 <= len` - the per-blob `ref_rank_end` and
 ///   `IdSetDense::total_count()` together bound this.
 /// - No two concurrent calls to `write_coord` pass the same `rank`.
 struct CoordMmapShared {
@@ -154,7 +154,7 @@ impl CoordMmapShared {
 
 /// Per-blob output from Phase 2b workers. All user strings owned
 /// (`Box<str>`) because the `PrimitiveBlock` is dropped on the worker
-/// before the main thread sees the merge — any `&str` borrows into it
+/// before the main thread sees the merge - any `&str` borrows into it
 /// would expire. Admin geometries are keyed by way ID for insertion
 /// into the `way_geom` FxHashMap. The optional `error` field carries
 /// u16-overflow diagnostics from `u16::try_from` (see
@@ -266,7 +266,7 @@ fn classify_way_into(
 
     // Interpolation ways - defer file writes to merge, keep slim
     // per-blob metadata. INVARIANT check mirrors the sequential
-    // path's `u16::try_from` — worker sets `state.error` on overflow.
+    // path's `u16::try_from` - worker sets `state.error` on overflow.
     if is_interp {
         if coords.len() >= 2 {
             let itype = match interp.unwrap_or("") {
@@ -541,7 +541,7 @@ pub(super) fn run_pass2(
                         node_file_offset: interp_node_offset,
                         node_count: nc,
                         // `(start_number = 0, end_number = 0)` is the unresolved
-                        // sentinel — `resolve_interpolation_endpoints_mmap`
+                        // sentinel - `resolve_interpolation_endpoints_mmap`
                         // overwrites when both endpoints match addr points.
                         // KNOWN LIMITATION on `SlimInterpWay` applies.
                         start_number: 0,

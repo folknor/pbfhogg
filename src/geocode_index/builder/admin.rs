@@ -29,12 +29,12 @@ pub(super) fn assemble_admin_polygons(
 
     let max_verts = config.max_admin_vertices as usize;
 
-    // Per-relation work is independent — ring assembly, Douglas-Peucker
+    // Per-relation work is independent - ring assembly, Douglas-Peucker
     // simplification, and hole attachment all read-only against `way_geom`
     // and the relation itself. `par_iter().flat_map_iter().collect()`
     // preserves input order so the output `Vec<AssembledPolygon>` is
     // byte-identical to the previous sequential path. Europe phase was
-    // 50.6 s at UUID `bf8f2038` — expected ~5× on plantasjen's 12 cores
+    // 50.6 s at UUID `bf8f2038` - expected ~5× on plantasjen's 12 cores
     // (plan item #8 in notes/geocode-build-opportunities.md).
     relations.par_iter().flat_map_iter(|rel| {
         assemble_one_relation(rel, way_geom, max_verts).into_iter()
@@ -43,7 +43,7 @@ pub(super) fn assemble_admin_polygons(
 
 /// Assemble all `AssembledPolygon`s produced by a single relation
 /// (one per outer ring, each carrying any inner rings that fall inside
-/// it). Pure function — no shared mutable state, safe to call from
+/// it). Pure function - no shared mutable state, safe to call from
 /// rayon workers.
 fn assemble_one_relation(
     rel: &RawAdminRelation,

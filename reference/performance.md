@@ -3,13 +3,13 @@
 Consolidated runtime measurements across datasets and commands.
 
 > **TAINTED BENCHMARKS WARNING (2026-04-18).** Bench numbers measured at any
-> commit in `4ce7e93..c0ae9a7` (Apr 9–17 2026) on the affected commands
+> commit in `4ce7e93..c0ae9a7` (Apr 9-17 2026) on the affected commands
 > (`add-locations-to-ways`, `build-geocode-index`, `cat --type`/`--dedupe`,
 > `check-ids`, `diff`, `extract` non-simple, `getid`, `inspect --nodes`/`--tags`,
 > `sort`, `tags-filter` non-invert) carry an unaccounted O(N) all-blobs-scan
 > cost from a `has_indexdata` / `check_sorted_and_indexed` regression that was
 > in effect during that window. Affected entries are marked `[TAINTED]`
-> below — re-measure before relying on them. See `find_tainted_runs.py`
+> below - re-measure before relying on them. See `find_tainted_runs.py`
 > for the full row list.
 
 ## Host: plantasjen
@@ -52,7 +52,7 @@ combined cost: sequential decompress+reframe plus the `has_indexdata` /
 `check_sorted_and_indexed` O(N) all-blobs-scan regression that was live
 through `4ce7e93..c0ae9a7`. The seek-raw fix (`aa3147c`, buffer-preserving
 `BlobReaderSource` header walk) and the short-circuit fix (`ca6711e`)
-together drop the planet run from 497s to 86.5s — a 5.8× improvement at
+together drop the planet run from 497s to 86.5s - a 5.8× improvement at
 the same output shape. Passthrough remains buffered-only; `--direct-io`
 adds alignment overhead without the concurrent read/write pattern that
 makes it faster for merge.
@@ -284,7 +284,7 @@ Per-caller wall deltas (`--bench 1` single-shot, plantasjen, 2026-04-18):
 |---|---|---:|---:|---:|---|---|
 | extract --smart | Europe | 211.2 s | 195.2 s | **−16.0 s, −7.6 %** | `f7c2ccda` | `1bd5bbdf` |
 | add-locations-to-ways --index-type external | Europe | 286.3 s | 270.7 s | **−15.6 s, −5.5 %** | `5233ed39` | `555de261` |
-| add-locations-to-ways --index-type external | Planet | (skipped¹) | 700.6 s | within noise² | — | `e30f7ddc` |
+| add-locations-to-ways --index-type external | Planet | (skipped¹) | 700.6 s | within noise² | - | `e30f7ddc` |
 | tags-filter | Europe | 91.7 s | 93.1 s | within noise (+1.5 %) | `2244b6e4` | `ea9d2440` |
 | renumber | Planet | 218.6 s | 206.7 s | **−11.9 s, −5.4 %**³ | `ae91b114` | `878e7a99` |
 
@@ -295,7 +295,7 @@ the inferred regression-fix-only baseline is the README's 698 s minus
 phase shows the expected per-phase win at 17.5 s post-fix (vs ~30 s
 pre-fix on this code path), the wall delta sits inside `--bench 1`
 variance.
-³ Renumber's −5.4 % is larger than the audit's 1–2 % prediction;
+³ Renumber's −5.4 % is larger than the audit's 1-2 % prediction;
 unclear whether real or noise without `--bench 3` repeat. Not a
 regression in any case.
 
@@ -314,7 +314,7 @@ for cross-reference.
 | getid | `--bench 1` | 43.8 s | `5a44889d` | 66 s | **−22 s** |
 | getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s | +8 s (noise) |
 | check --refs | `--bench 1` | 70.2 s | `64e9a394` | 72 s | −2 s (noise) |
-| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s | — |
+| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s | - |
 | extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s | **−14 s** |
 | cat (indexdata generation) | `--bench 1` | 86.5 s | `5d90623f` | 497 s | **−410 s (5.8×)** |
 | add-locations-to-ways --index-type external | `--bench 3` | 661.2 s | `a406d77e` | 698 s | **−37 s** |
@@ -324,21 +324,21 @@ The headline is the unfiltered `cat` row: the 497 s → 86.5 s drop is
 the user-visible shape of the two header-walk fixes compounding on a
 command that does nothing but walk headers + rewrite BlobHeader. The
 old 497 s measurement was taken at `69a127f` (pre-regression), so this
-isn't only a regression rollback — the post-fix path is substantially
+isn't only a regression rollback - the post-fix path is substantially
 faster than the pre-regression path too, because `seek_raw` was
 shedding buffer on every blob long before the `has_indexdata` bug
 shipped.
 
 `getid` fell 22 s at the same time, which is in the right ballpark for
 the `check_sorted_and_indexed` short-circuit saving ~20 s on
-`has_indexdata`-gated subcommands — a second independent confirmation
+`has_indexdata`-gated subcommands - a second independent confirmation
 of the short-circuit fix at planet scale.
 
 Renumber's +10 s (194 s → 204.5 s) is the only row pointing the wrong
 way. Both are `--bench 3`; the older 194 s was at `cb99106`, this is
 at `aee7727`, so several dozen commits of unrelated churn sit
 in-between. 5 % is inside `--bench 3` variance but not comfortably
-inside — a deliberate bisect would tell us whether something landed
+inside - a deliberate bisect would tell us whether something landed
 that genuinely costs. Not a release blocker and not in the critical
 planet-pipeline path (once-per-schema renumber, not a steady-state
 command), so shelving for now.
@@ -378,15 +378,15 @@ reads ~10× and push subsequent stages' working set out of cache).
 
 Planet wall **700.6 s** (UUID `e30f7ddc`, `--bench 1`), basically
 identical to the pre-regression README baseline of 698 s (within
-single-shot variance). META_SCAN measures 17.5 s post-fix — vs the
+single-shot variance). META_SCAN measures 17.5 s post-fix - vs the
 inferred ~30 s pre-fix on the same code path, so the seek_raw fix
 saves ~12 s in that phase. As a fraction of planet total wall (700 s),
 that's 1.7 %, comfortably inside the noise floor of `--bench 1`.
 
-The audit's 10–15 % wall prediction was based on Europe ratios where
+The audit's 10-15 % wall prediction was based on Europe ratios where
 META_SCAN is 9 % of total (28.5 / 320 s); planet's META_SCAN is only
 2.5 % of total because Stages 1+2+4 dominate (~85 % combined). The
-fix delivered exactly what it should at the phase level — wall just
+fix delivered exactly what it should at the phase level - wall just
 doesn't move much because the targeted phase is small.
 
 Phase breakdown (UUID `e30f7ddc`):
@@ -454,8 +454,8 @@ for dense-monotonic OSM IDs). Step #2 parallelized via `build_classify_schedules
 | Dataset | Pre-swap | Post-swap (seq) | Post-parallel | Cumulative |
 |---------|---------:|----------------:|--------------:|-----------:|
 | Japan   | 56.7 s `09484939` | 33.1 s `1fd77d78` | **2.1 s** `4a347e3b` | 27× |
-| Europe  | 426.2 s `fb042f27` | — | **33.6 s** `70ff6c5d` | 12.7× |
-| Planet  | 1225 s (`7e9c2e9` baseline) | — | **72.5 s** `862547e4` | **16.9×** |
+| Europe  | 426.2 s `fb042f27` | - | **33.6 s** `70ff6c5d` | 12.7× |
+| Planet  | 1225 s (`7e9c2e9` baseline) | - | **72.5 s** `862547e4` | **16.9×** |
 
 Europe phase breakdown post-parallel (UUID `70ff6c5d`):
 
@@ -480,7 +480,7 @@ Planet memory: peak 2.17 GB, p95 2.13 GB, p50 1.13 GB, 0 major page faults.
 Pre-allocated `IdSetDense` for 14 B node IDs (1.6 GB resident for the
 duration of phases 1+2) is the dominant contributor.
 
-Plan target was 6–10 min at planet (from the original
+Plan target was 6-10 min at planet (from the original
 [notes/check-refs-opportunities.md](../notes/check-refs-opportunities.md)
 post-step-#2 projection). Measured 1 min 12 s, ~5-8× under the plan floor.
 
@@ -501,7 +501,7 @@ for seq-ordered cross-blob monotonicity checks.
 | Dataset | Pre-swap | Post-swap (seq) | Post-parallel | Cumulative |
 |---------|---------:|----------------:|--------------:|-----------:|
 | Europe  | 312.6 s `6ca113a8` [TAINTED] | 172.0 s `32d8a631` [TAINTED] | **52.7 s** `31ca231d` [TAINTED] | 5.9× |
-| Planet  | — | — | **93.2 s** `2f52252d` [TAINTED] | n/a (pre-swap not benched) |
+| Planet  | - | - | **93.2 s** `2f52252d` [TAINTED] | n/a (pre-swap not benched) |
 
 Planet phase breakdown (UUID `2f52252d`) [TAINTED]:
 
@@ -865,12 +865,12 @@ cleared-not-dropped between blocks, drained into the return value).
 | Scope | WAY_CLASSIFY pre-fix | WAY_CLASSIFY post-fix | Δ |
 |---|---:|---:|---:|
 | Japan 5-region | 892 ms (`8bc1773f`) | 848 ms (`08fefe51`) | **-44 ms / -5 %** |
-| Europe 5-region | (no paired pre-fix bench) | 13,675 ms (`c1ff6ec9`) | — |
+| Europe 5-region | (no paired pre-fix bench) | 13,675 ms (`c1ff6ec9`) | - |
 
 Japan phase delta is within the 5-10 % range expected from the
 mechanism (fewer growth reallocations per inner `Vec<i64>`). Europe
 was not paired-benched because the targeted phase is only 1.7 % of
-wall — a near-perfect phase speedup would still be within single-shot
+wall - a near-perfect phase speedup would still be within single-shot
 noise on total. No regression on either scale. The fix is of interest
 at planet scale only if multi-extract becomes a recurring workload.
 
@@ -1011,7 +1011,7 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Planet (~87 GB) | 8-10 hours (192 GB RAM) | - | Would OOM on 30 GB host |
 
 Planet (validated): **1,255s (20.9 min), 29.5 GB peak anon RSS** in
-`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`) [TAINTED — wall
+`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`) [TAINTED - wall
 inflated by all-blobs-scan regression; RSS unaffected]. The earlier
 17.8 GB figure under-reported: brokkr previously hid short-emitting phase
 markers from sidecar output, so PASS1_5's transient peak never surfaced.

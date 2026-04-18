@@ -580,15 +580,15 @@ impl BlobHeader {
 /// Provides a fast path for relative skips that preserves any internal buffer
 /// (e.g. `BufReader`'s read-ahead). The default `skip_relative` falls through to
 /// `Seek::seek(SeekFrom::Current(_))`, which is correct but discards any buffer
-/// on `BufReader` — the cause of the ~10× header-walk read amplification this
+/// on `BufReader` - the cause of the ~10× header-walk read amplification this
 /// trait exists to eliminate. Override for buffered readers to keep the buffer
 /// when the target lies within the buffered window.
 ///
 /// Implemented for `BufReader<R: Read + Seek>` (uses `BufReader::seek_relative`),
-/// `File` (default), and `Cursor<T: AsRef<[u8]>>` (default — seeks on `Cursor`
+/// `File` (default), and `Cursor<T: AsRef<[u8]>>` (default - seeks on `Cursor`
 /// are pure cursor-position bumps, no fd cost). Library users who pass a
 /// different reader type to [`BlobReader::new_seekable`] can opt in by writing
-/// `impl BlobReaderSource for MyReader {}` — the default impl is correct but
+/// `impl BlobReaderSource for MyReader {}` - the default impl is correct but
 /// pays the `Seek::seek` discard cost on every header walk.
 pub trait BlobReaderSource: Read + Seek {
     /// Skip relative to the current position. Default impl falls through to

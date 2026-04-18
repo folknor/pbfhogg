@@ -1,14 +1,14 @@
 # ALTW External-Join: Structural Opportunities
 
 > **REGRESSION-WINDOW CAVEAT (updated 2026-04-18).** ALTW wall-time numbers
-> measured at any commit in `4ce7e93..c0ae9a7` (Apr 9–17 2026) carry an
+> measured at any commit in `4ce7e93..c0ae9a7` (Apr 9-17 2026) carry an
 > O(N) all-blobs-scan cost from a `has_indexdata` /
 > `check_sorted_and_indexed` regression that was live during that window.
-> Phase / RSS / counter data from those runs is unaffected — only wall.
+> Phase / RSS / counter data from those runs is unaffected - only wall.
 > A post-fix re-bench of planet landed 2026-04-18 at `aee7727`: **661.2 s
 > `--bench 3`** (UUID `a406d77e`, this is the current baseline), or
 > 700.6 s at `e30f7ddc` `--bench 1` (in performance.md). Inflated bench
-> citations still tagged `[TAINTED — wall]` below for cross-reference;
+> citations still tagged `[TAINTED - wall]` below for cross-reference;
 > the opportunity-ranking arithmetic still rebases cleanly because
 > META_SCAN is ~2.5 % of planet wall (the fix's scope), not enough to
 > move the phase-share story.
@@ -82,13 +82,13 @@ A four-stage serial chain with three disk-materialized intermediates and no stag
 | Dataset | Commit | Wall | Meta | Stage 1 | Stage 2 | Stage 3 | Finalize | Relscan | Stage 4 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Europe | `d3e13ed` (pre-#8) | 333 s | 30.9 s | 36.0 s | 92.9 s | 32.2 s | 18.3 s | 14.3 s | 90.6 s |
-| Europe | `e497e54` (post-#8) [TAINTED — wall] | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
+| Europe | `e497e54` (post-#8) [TAINTED - wall] | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
 | Europe | `555de261` (post-seek_raw fix, `--bench 1`) | **270.7 s** | 13.3 s | 35.3 s | 90.9 s | 32.9 s | **0.17 s** | 3.9 s | 93.0 s |
 | Planet | `4f059b67` (pre-#8) | 867.7 s | - | 148.5 s | 266.6 s | 100.2 s | 46.4 s | - | 231.6 s |
-| Planet | `7904a95` (post-#4/#8/#9L1) [TAINTED — wall] | 698.1 s | 16.9 s | 112.8 s | 235.2 s | 85.7 s | **1.4 s** | 6.0 s | 215.6 s |
+| Planet | `7904a95` (post-#4/#8/#9L1) [TAINTED - wall] | 698.1 s | 16.9 s | 112.8 s | 235.2 s | 85.7 s | **1.4 s** | 6.0 s | 215.6 s |
 | Planet | `aee7727` (post-seek_raw fix, `--bench 3`, **current baseline**) | **661.2 s** | 16.4 s | 124.0 s | 208.0 s | 89.3 s | **1.5 s** | 6.0 s | 215.4 s |
 
-Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet cumulative trajectory `4f059b67 → 7904a95 → aee7727`: **867.7 s → 698.1 s → 661.2 s** (−23.8 % total). The first drop (−19.5 %) folded in #4 / #8 / #9L1; the second (−5.3 %) is the 2026-04-18 seek-raw fix plus a switch to `--bench 3` accounting (bench-1 post-fix at `e30f7ddc` measured 700.6 s, so ~30 s of the apparent win is best-of-3 noise reduction rather than extra speed). Phase-share between commits stays consistent: stage-2-led with stage-4 second, relation scan tiny after #9 L1, router build a rounding error after #8. Stage 1's +11 s from `7904a95 → aee7727` is the one direction-flip to watch — probably bench-3 sampling variance (`7904a95` was `--bench 1`), but worth a `--bench 3` confirmation at `7904a95` or a bisect if someone re-touches stage 1.
+Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet cumulative trajectory `4f059b67 → 7904a95 → aee7727`: **867.7 s → 698.1 s → 661.2 s** (−23.8 % total). The first drop (−19.5 %) folded in #4 / #8 / #9L1; the second (−5.3 %) is the 2026-04-18 seek-raw fix plus a switch to `--bench 3` accounting (bench-1 post-fix at `e30f7ddc` measured 700.6 s, so ~30 s of the apparent win is best-of-3 noise reduction rather than extra speed). Phase-share between commits stays consistent: stage-2-led with stage-4 second, relation scan tiny after #9 L1, router build a rounding error after #8. Stage 1's +11 s from `7904a95 → aee7727` is the one direction-flip to watch - probably bench-3 sampling variance (`7904a95` was `--bench 1`), but worth a `--bench 3` confirmation at `7904a95` or a bisect if someone re-touches stage 1.
 
 ---
 
@@ -176,7 +176,7 @@ Concrete changes:
 
 ### #3 - Fuse stage 1A + 1B via a node-ID scratch spool
 
-**Attempted 2026-04-17 (commit `44913a5`, reverted `ba62fb1`).** Flat-`i64` scratch-spool variant: each Pass A worker opens one scratch file, `write_all_at`s each blob's `blob_node_ids` at a tracked offset, records `(worker_id, file_offset, ref_count)`; Pass B `read_exact_at`s the payload and skips pread + decompress + way-scan. Europe `--bench 1` UUID `b29877e2` [TAINTED — both before and after walls inflated]: wall `291.6 s → 324.2 s` (**+11.2% regression**). Pass A `7.3 s → 15.0 s` (+7.7 s, the scratch-write overhead), Pass B `30.0 s → 44.9 s` (got *worse*, not better), Stage 2 `89 s → 95 s` (likely page-cache contention from the ~2.4 GB scratch competing with stage-2 working set). The implementation used per-blob `write_all_at` / `read_exact_at` - ~9.5 K unbuffered pwrites per worker at ~42 KB average, plus the scratch bytes thrashing page cache that stage 2 also needs. Scratch-spool as a *shape* is not ruled out, but any retry needs (a) a buffered writer per worker with tracked append offset rather than per-blob `pwrite`, (b) evidence the 2.4 GB extra working set won't thrash stage 2, and (c) a delta-varint encoding to shrink the scratch volume. Until that's designed, prefer R4 A1 (ID-bucketed single-pass) or a different seam.
+**Attempted 2026-04-17 (commit `44913a5`, reverted `ba62fb1`).** Flat-`i64` scratch-spool variant: each Pass A worker opens one scratch file, `write_all_at`s each blob's `blob_node_ids` at a tracked offset, records `(worker_id, file_offset, ref_count)`; Pass B `read_exact_at`s the payload and skips pread + decompress + way-scan. Europe `--bench 1` UUID `b29877e2` [TAINTED - both before and after walls inflated]: wall `291.6 s → 324.2 s` (**+11.2% regression**). Pass A `7.3 s → 15.0 s` (+7.7 s, the scratch-write overhead), Pass B `30.0 s → 44.9 s` (got *worse*, not better), Stage 2 `89 s → 95 s` (likely page-cache contention from the ~2.4 GB scratch competing with stage-2 working set). The implementation used per-blob `write_all_at` / `read_exact_at` - ~9.5 K unbuffered pwrites per worker at ~42 KB average, plus the scratch bytes thrashing page cache that stage 2 also needs. Scratch-spool as a *shape* is not ruled out, but any retry needs (a) a buffered writer per worker with tracked append offset rather than per-blob `pwrite`, (b) evidence the 2.4 GB extra working set won't thrash stage 2, and (c) a delta-varint encoding to shrink the scratch volume. Until that's designed, prefer R4 A1 (ID-bucketed single-pass) or a different seam.
 
 
 **Convergence: R2 #3, R3 #2, R5 #2, R6 #1/follow-up.** Independent of #1 and #2; stacks cleanly. Subsumes R1's medium-value "single-ingest way-ref spool" note targeting [stage1.rs:327](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:327) and [:421](/home/folk/Programs/pbfhogg/src/commands/altw/stage1.rs:421). R4 A1 attacks the same bottleneck with a more aggressive mechanism - see "Variant" below. R6's follow-up, after the explicit 30 GB RAM constraint, sharpens which sub-variants are actually viable.
@@ -420,7 +420,7 @@ Building the routing table is a metadata pass over the existing per-worker manif
 
 ### #11 - Replace zero-filled stage-2 coord slices with an explicit presence bitmap
 
-**Attempted 2026-04-17 (commit `631f284`, reverted).** Per-worker `Vec<u64>` bitmap, one bit per local rank; set the bit on coord write, check it in the resolve loop, zero only the bitmap prefix at each bucket boundary. Europe `--bench 1` UUID `85464a37` [TAINTED — both before and after walls inflated]: wall `291.6 s → 293.1 s` (essentially flat, +0.5% single-run). Stage 2 regressed `89.3 s → 95.2 s` (+6 s) - the per-slot bitmap OR in the fill loop and bitmap bit-test in the resolve loop cost more than the saved per-bucket zero-fill (Europe `local_range ≈ 780 K` ≈ 6.2 MB coord-slice zero per bucket, which modern memset moves in a few ms). Europe stage 2 is pread/decompress-bound (cf. #4 landing), so there's no headroom for the bitmap overhead to hide in. The doc's own rating was "likely modest" and that's confirmed. Planet might differ (local_range ~18× bigger), but not worth resurrecting this standalone - the doc's own guidance was "pairs naturally with #4 if stage 2's fill loop is already being edited", and #4 is now landed. If a future seam reshapes the stage-2 inner loop, it can carry a presence bit for free; until then the sentinel-based path is the smaller diff.
+**Attempted 2026-04-17 (commit `631f284`, reverted).** Per-worker `Vec<u64>` bitmap, one bit per local rank; set the bit on coord write, check it in the resolve loop, zero only the bitmap prefix at each bucket boundary. Europe `--bench 1` UUID `85464a37` [TAINTED - both before and after walls inflated]: wall `291.6 s → 293.1 s` (essentially flat, +0.5% single-run). Stage 2 regressed `89.3 s → 95.2 s` (+6 s) - the per-slot bitmap OR in the fill loop and bitmap bit-test in the resolve loop cost more than the saved per-bucket zero-fill (Europe `local_range ≈ 780 K` ≈ 6.2 MB coord-slice zero per bucket, which modern memset moves in a few ms). Europe stage 2 is pread/decompress-bound (cf. #4 landing), so there's no headroom for the bitmap overhead to hide in. The doc's own rating was "likely modest" and that's confirmed. Planet might differ (local_range ~18× bigger), but not worth resurrecting this standalone - the doc's own guidance was "pairs naturally with #4 if stage 2's fill loop is already being edited", and #4 is now landed. If a future seam reshapes the stage-2 inner loop, it can carry a presence bit for free; until then the sentinel-based path is the smaller diff.
 
 **Convergence: R6 M1 only.** Smaller than the structural items above and potentially obsoleted by #5 or #6, but worth recording because the current `coord_slice[..slice_bytes].fill(0)` at [stage2.rs:397](/home/folk/Programs/pbfhogg/src/commands/altw/stage2.rs:397) is correctness-driven, not incidental.
 

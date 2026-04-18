@@ -156,10 +156,28 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // referenced). Same pattern as ALTW pass 0.
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS1_END");
+
+    // -----------------------------------------------------------------------
+    // One header walk produces everything Pass 1.5 and Pass 2a need: the
+    // way schedule (Pass 1.5), the node schedule (Pass 2a), the max node
+    // ID from indexdata (Pass 1.5's `IdSetDense::pre_allocate`), and a
+    // single shared file handle reused by both phases' pread workers.
+    // Previously two separate header walks: Pass 1.5's own walker and
+    // Pass 2a's `build_classify_schedule(Node)` call. Consolidated walker
+    // saves ~26 s at Europe / ~80 s at planet (2026-04-18 bench `bf8f2038`).
+    // -----------------------------------------------------------------------
+    crate::debug::emit_marker("GEOCODE_SCHEDULES_START");
+    let (node_schedule, way_schedule, max_node_id, shared_file) =
+        pass1_5::build_pass2_schedules(&config.input_path)?;
+    crate::debug::emit_marker("GEOCODE_SCHEDULES_END");
+
     crate::debug::emit_marker("GEOCODE_PASS1_5_START");
     eprintln!("Pass 1.5: Referenced node collection...");
 
-    let referenced_nodes = pass1_5::run_pass1_5(&config.input_path, &needed_admin_ways)?;
+    let referenced_nodes = pass1_5::run_pass1_5(
+        &way_schedule, max_node_id, &shared_file, &needed_admin_ways,
+    )?;
+    drop(way_schedule);
     crate::debug::emit_marker("GEOCODE_PASS1_5_END");
 
     // -----------------------------------------------------------------------
@@ -187,7 +205,12 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         street_nodes_mmap,
         addr_points_mmap,
         interp_nodes_mmap,
-    } = pass2::run_pass2(config, needed_admin_ways, referenced_nodes, &mut strings)?;
+    } = pass2::run_pass2(
+        config, &node_schedule, &shared_file,
+        needed_admin_ways, referenced_nodes, &mut strings,
+    )?;
+    drop(node_schedule);
+    drop(shared_file);
     crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
 
     // Ring assembly + simplification

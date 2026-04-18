@@ -23,7 +23,19 @@ Unlike ALTW, the geocode builder is **structurally well-shaped**. There is no ex
 
 One `mallopt(M_ARENA_MAX, 2)` call unlocks Pass 2 parallelization. That is the headline change. Secondary wins live in Pass 1.5 (over-decoding), Pass 3 stage B (sequential bucket merge), and fine/coarse level duplication.
 
-No internal API needs rewriting. `IdSetDense`, `PrimitiveBlock`, `parallel_classify_accumulate`, the mmap'd coord index, and the output file shapes all stay exactly as they are.
+No internal API needs rewriting. `IdSetDense`, `PrimitiveBlock`, `parallel_classify_phase`, the mmap'd coord index, and the output file shapes all stay exactly as they are.
+
+### Landed so far (2026-04-18)
+
+| Commit | Item | Germany wall | Germany Pass 1.5 peak anon |
+|---|---|---:|---:|
+| `c977b97` | instrumentation baseline | 71.1 s | 20.3 GB |
+| `63800d3` | **#7** — Pass 1.5 shared-atomic `IdSetDense` | 65.4 s | **1.75 GB** (−91 %) |
+| `88cf796` | **#1 Phase 2a** — `mallopt` + parallel node scan | **49.0 s** | 1.77 GB |
+
+Cumulative Germany −31 %. Pass 1.5 peak anon dropped from the planet-OOM
+zone to comfortable. Remaining targets (Phase 2a main-thread merge,
+Phase 2b, Pass 3) still to land — see per-item status below.
 
 ## Yardstick
 
@@ -40,19 +52,25 @@ Breakdown ground-truthed by sidecar markers (`1c708509`). Pass 2 still holds ~70
 
 Target after this plan: **~10-12 min wall at planet, RSS reduced from 29.5 GB Pass 1.5 peak to <16 GB.**
 
-## Development baseline (Germany, commit `c977b97`, 2026-04-18, plantasjen)
+## Development baseline (Germany, 2026-04-18, plantasjen)
 
 Germany is the primary iteration dataset: Pass 2 scan is long enough (40+ s)
 for `--bench 1` to resolve parallelization wins above noise, but short enough
-to iterate multiple times per hour. Denmark (~7 s) is the correctness gate
-(`diff -r` against baseline); Europe (~520 s) is pre-landing confirmation;
-planet is publish-only. Baseline measurements at the instrumentation commit:
+to iterate multiple times per hour. Denmark (~5-7 s) is the correctness gate
+(`diff -r` against baseline or query-level comparison via the Reader);
+Europe (~520 s pre-fix, est. ~360 s post-#1) is pre-landing confirmation;
+planet is publish-only.
 
-| Mode | UUID | Wall |
-|---|---|---:|
-| `--bench 1` | `e89b1691` | **71.1 s** |
-| `--hotpath` | `90a746dd` | 72.2 s |
-| `--alloc` | `0cc2ac56` | 70.3 s |
+### Benchmarks
+
+| Commit | Mode | UUID | Wall |
+|---|---|---|---:|
+| `c977b97` (instrumentation baseline) | `--bench 1` | `e89b1691` | 71.1 s |
+| `c977b97` | `--hotpath` | `90a746dd` | 72.2 s |
+| `c977b97` | `--alloc` | `0cc2ac56` | 70.3 s |
+| `63800d3` (post-#7) | `--bench 1` | `572ae7d5` | **65.4 s** (−8 %) |
+| `88cf796` (post-#1 Phase 2a) | `--bench 1` | `e2354bc1` | **49.0 s** (−31 % cumulative) |
+| `88cf796` Denmark smoke | `--bench 1` | `d6684457` | 5.0 s |
 
 ### Phase breakdown (Germany `--hotpath`, UUID `90a746dd`)
 
@@ -106,38 +124,44 @@ bounds in `renumber_external`. Parallelizing Pass 2 without the mallopt
 prelude risks the 25+ GB arena blowup explicitly called out in the
 sequential-choice rationale at [pass2.rs:369-374](../src/geocode_index/builder/pass2.rs#L369).
 
-### Memory peaks (Germany `--bench 1` sidecar, UUID `e89b1691`)
+### Memory peaks (Germany)
 
-| Phase | Peak anon RSS |
-|---|---:|
-| `GEOCODE_PASS1` | 232 MB |
-| `GEOCODE_PASS1_5_SCAN` | **20.3 GB** |
-| `GEOCODE_PASS2_RANK_INDEX` | 2.77 GB |
-| `GEOCODE_PASS2_SCAN_LOOP` | 3.86 GB |
-| `GEOCODE_PASS2_FLUSH_MMAP` | 3.55 GB |
-| `GEOCODE_PASS2_ADMIN_ASSEMBLY` | 505 MB |
-| `GEOCODE_PASS2_INTERP_RESOLVE` | 830 MB |
-| `GEOCODE_PASS3_STAGEB` (fine) | 1.98 GB |
-| `GEOCODE_PASS3_STAGEB` (coarse) | 1.68 GB |
+Pre-#7 (baseline `e89b1691`) and post-#7 (`572ae7d5`) — post-#1 Phase 2a
+(`e2354bc1`) is essentially identical to post-#7 since Phase 2a kept
+Pass 1.5 unchanged and didn't materially move Pass 2 peaks:
 
-**The 20.3 GB Pass 1.5 peak on a 4.7 GB input is the most urgent finding.**
-It scales to the 29.5 GB planet peak and validates item #7's "load-bearing
-for 30 GB hosts, not optional" framing. Per-worker `IdSetDense` chunks
-grow independently because worker-local allocations aren't bounded by the
-final merged set size; Germany's 116 M referenced nodes × 6-8 workers ×
-full planet ID range produces the bloat. Landing item #7 (shared-atomic
-`IdSetDense` populated via `set_atomic`, following the `renumber_external.rs:166-179`
-pattern) should drop Pass 1.5 peak from 20.3 GB to ~3-4 GB on Germany
-(≈ the final `referenced_nodes` size plus decode residency).
+| Phase | Baseline peak anon | Post-#7/#1 peak anon |
+|---|---:|---:|
+| `GEOCODE_PASS1` | 232 MB | 200 MB |
+| `GEOCODE_PASS1_5_SCAN` | **20.3 GB** | **1.77 GB** (−91 %) |
+| `GEOCODE_PASS2_RANK_INDEX` | 2.77 GB | 1.78 GB |
+| `GEOCODE_PASS2_SCAN_LOOP` (post-#7) / Pass 2a+2b (post-#1) | 3.86 GB | 2.88 GB |
+| `GEOCODE_PASS2_ADMIN_ASSEMBLY` | 505 MB | 2.0 GB* |
+| `GEOCODE_PASS3_STAGEB` (fine) | 1.98 GB | 2.18 GB |
 
-**Sequencing implication.** The original plan's step order was
-"instrument → #1 → #3+#4 → #2 → #5+#6 → #7 revisit". The updated sidecar
-data pushes #7 ahead of #1: without the Pass 1.5 shrink, the 27 GB-RAM
-iteration host just OOM-killed the first planet re-bench attempt at 1m34s
-in Pass 1.5 (overnight.sh round 1). #7 is a small diff on a well-understood
-pattern (the `set_atomic` / `rank_if_set` path is already used by
-renumber_external, check_refs, verify_ids) and is the prerequisite for
-any reliable planet iteration on this host.
+\* The post-#1 admin-assembly reading includes whatever residency Phase
+2a's merge closure held at join time; the pre-# baseline didn't see
+parallel decode traffic through the main thread. Not material at Germany
+scale but worth watching on Europe/planet.
+
+**Before item #7 landed:** the 20.3 GB Pass 1.5 peak on a 4.7 GB input
+was the most urgent finding. It scaled to the 29.5 GB planet peak and
+OOM-killed the first 2026-04-18 planet re-bench attempt at 1m34s in
+Pass 1.5. Per-worker `IdSetDense` chunks grew independently because
+worker-local allocations weren't bounded by the final merged set size;
+Germany's 116 M referenced nodes × 6-8 workers × full planet ID range
+produced the bloat. Item #7 replaced the per-worker accumulate pattern
+with a shared pre-allocated `IdSetDense` populated via `set_atomic` —
+same pattern as `renumber_external.rs:166-179`. Measured delta: Pass 1.5
+peak 20.3 GB → 1.75 GB (−91 %), wall 6.6 s → 1.1 s (−82 % bonus from
+no per-worker merge bottleneck, avg cores 6.5 → 21.4).
+
+**Why #7 landed before #1.** The original plan's step order was
+"instrument → #1 → #3+#4 → #2 → #5+#6 → #7 revisit". The updated
+sidecar data pushed #7 ahead: without the Pass 1.5 shrink, the 27 GB-RAM
+iteration host would have continued OOM-killing on every planet run.
+#7 is a small diff on a well-trodden pattern and was the prerequisite
+for any reliable planet iteration on this host. See commit `63800d3`.
 
 ### Shape counts (Germany)
 
@@ -177,35 +201,72 @@ unsafe { libc::mallopt(libc::M_ARENA_MAX, 2); }
 
 Documented in-place: without it, renumber's cross-thread `OwnedBlock` Vec traffic grows to ~26 GB anon on planet. With it, under 1 GB. Scoped to the command, other pbfhogg paths unaffected.
 
-Pass 2's choice at [builder.rs:606-611](../src/geocode_index/builder.rs#L606) describes the same arena fragmentation phenomenon and picks the wrong remedy. The sequential decode bound was never a correctness constraint - it was an RSS constraint, and renumber's `mallopt` answers it directly.
+Pass 2's historical sequential choice (comment preserved in the old
+`pass2.rs:606-611` pre-split) described the same arena fragmentation
+phenomenon and picked the wrong remedy. The sequential decode bound was
+never a correctness constraint — it was an RSS constraint, and renumber's
+`mallopt` answers it directly.
 
-**With `M_ARENA_MAX = 2` set, Pass 2 can be parallelized exactly like renumber's pass 1.**
+**With `M_ARENA_MAX = 2` set, Pass 2 has been parallelised exactly like
+renumber's pass 1.** Phase 2a (nodes) landed `88cf796`. Phase 2b (ways)
+still to come; see item #1 Phase 2b below.
 
 ## Opportunities, ranked
 
 ### #1 - Parallelize Pass 2 (by far the biggest)
 
-Enable via `mallopt(M_ARENA_MAX, 2)` at the top of [`build_geocode_index`](../src/geocode_index/builder.rs#L363). Same scope and placement as renumber.
+Enable via `mallopt(M_ARENA_MAX, 2)` at the top of [`build_geocode_index`](../src/geocode_index/builder/mod.rs#L84). Same scope and placement as renumber.
 
 Split Pass 2 into two parallel sub-phases. Sorted PBF (`Sort.Type_then_ID`) guarantees all node blobs precede all way blobs, so the phase barrier is clean.
 
-**Phase 2a - parallel node scan.** Pattern: [`pass1_parallel_scan`](../src/commands/renumber_external.rs#L615).
-- Work-stealing dispatch over node blobs via `AtomicUsize::fetch_add` on a node-only schedule (build from the existing [`build_classify_schedule`](../src/commands/mod.rs#L429) or equivalent, filter to `ElemKind::Node`).
-- Pre-compute each node blob's `[ref_rank_start, ref_rank_end)` from indexdata `(min_id, max_id)` + `referenced_nodes.count_below` - same machinery as ALTW's [`build_node_blob_mapping`](../src/commands/altw/stage1.rs#L249). These rank ranges are disjoint by node-sort monotonicity.
-- Each worker: pread → decompress → `PrimitiveBlock`. For tuples in sort order, use **counter-based ranking** (`rank = ref_rank_start` at blob entry, increment on `get(id)` hits) to write `coord_mmap[rank*8 ..]` without per-tuple `rank()` calls. Saves ~4 B rank operations at planet.
-- Addr-tagged nodes: emit `AddrPoint` to a **per-worker tmp addr_points slice**.
-- No synchronization on `coord_mmap`: workers write disjoint rank ranges.
+**Phase 2a - parallel node scan — LANDED 2026-04-18 (commit `88cf796`).**
 
-**Phase 2b - parallel way scan.** Pattern: [`stage2d_worker`](../src/commands/renumber_external.rs#L418).
+Workers decode node blobs via
+[`parallel_classify_phase`](../src/commands/mod.rs#L563) with owned-string
+output (`NodeBlobOut`: Vec of `(rank, lat, lon)` coord writes + Vec of
+`PendingAddrPoint` with `Box<str>` for hn/st/pc). Main thread merge
+closure applies coord_mmap writes (disjoint ranks, no races), interns
+strings into the shared `StringPool`, and streams `AddrPoint`s to
+`addr_points.bin` in blob-sequence order. Output is byte-identical to
+the previous sequential path.
+
+Germany measured: Pass 2 scan 42.0 s → ~26 s (−38 %), total wall 65.4 s →
+49.0 s (−25 %). Denmark smoke: 5.0 s, smoke-test passes.
+
+**Follow-up (open): main-thread merge bottleneck.** Phase 2a currently
+pushes 116 M `(u64, i32, i32) = 16 bytes` coord-write tuples (~1.86 GB
+on Germany) through the merge channel — the main thread becomes the
+serialization point. Two candidate fixes:
+
+1. **Direct `coord_mmap` writes from workers.** Wrap the raw pointer
+   in a `Sync`-safe struct (workers hit disjoint rank ranges, so no
+   atomics needed). Est. −5-7 s on Germany; eliminates the 1.86 GB
+   channel traffic entirely.
+2. **Pre-computed per-blob `[ref_rank_start, ref_rank_end)` slices** of
+   `coord_mmap`, threaded through as per-blob worker state. Safer
+   (no `unsafe`) but requires extending `parallel_classify_phase` to
+   accept per-blob state, or writing a custom thread pool like
+   `renumber_external/pass1.rs`.
+
+Option 1 is the simpler change; option 2 is structurally cleaner. Either
+way the win is ~5-7 s on Germany; at planet the ratio should be similar
+(~50-70 s absolute).
+
+**Phase 2b - parallel way scan (open).** Pattern: [`stage2d_worker`](../src/commands/renumber_external/mod.rs#L249).
+
+Way phase is currently sequential at ~8 s on Germany (embedded inside
+Pass 2's ~26 s post-Phase-2a wall). Parallelisation requires:
 - Work-stealing dispatch over way blobs.
 - Each worker: pread → decompress → `PrimitiveBlock`. `coord_mmap` is read-only now; `referenced_nodes.rank_if_set(nid)` per ref resolves coords.
 - Emits to **per-worker tmp slices** of `street_ways.bin`, `street_nodes.bin`, `addr_points.bin` (building centroids), `interp_nodes.bin`, `interp_ways` metadata, and `way_geom` entries for admin.
+- **StringPool.** Each worker holds its own `StringPool` with a worker-local offset space. After join, **sequential merge** into a single final pool and **remap** `name_offset` / `street_offset` / `housenumber_offset` / `postcode_offset` fields in the concatenated tmp files via a `Vec<u32>` per worker mapping worker-local → global offsets. Single pass per record stream. No per-intern mutex.
+- **Output concatenation.** Per-worker tmp files concatenated in worker order. `street_ways.bin` and `interp_ways.bin` carry `node_offset: u64` fields - rewrite those records once during concatenation, adding each worker's prefix offset into `street_nodes.bin` / `interp_nodes.bin`. One sequential pass per way-record stream.
 
-**StringPool.** Each worker holds its own `StringPool` with a worker-local offset space. After join, **sequential merge** into a single final pool and **remap** `name_offset` / `street_offset` / `housenumber_offset` / `postcode_offset` fields in the concatenated tmp files via a `Vec<u32>` per worker mapping worker-local → global offsets. Single pass per record stream. No per-intern mutex.
-
-**Output concatenation.** Per-worker tmp files concatenated in worker order. `street_ways.bin` and `interp_ways.bin` carry `node_offset: u64` fields - rewrite those records once during concatenation, adding each worker's prefix offset into `street_nodes.bin` / `interp_nodes.bin`. One sequential pass per way-record stream.
-
-**Expected win: ~500 s at planet.** Converts the dominant phase from single-core to six-core decompression + decode + writes.
+Lower absolute win than Phase 2a (ways are ~20 % of blob volume in a
+sorted PBF, so ~8 s of Germany's Pass 2) but still measurable and
+scales to ~80-100 s at planet. Much larger diff surface than the
+Phase 2a follow-up above; probably lands as its own commit after the
+coord_mmap write change stabilises Phase 2a's numbers.
 
 ### #2 - Drop `PrimitiveBlock` decode from Pass 1.5
 
@@ -257,13 +318,33 @@ Restructure Pass 3 to **one fused parallel pass**:
 
 **Expected win: 20-60 s at planet.**
 
-### #7 - Shared atomic IdSetDense in Pass 1.5
+### #7 - Shared atomic IdSetDense in Pass 1.5 — LANDED 2026-04-18 (commit `63800d3`)
 
-Pass 1.5 currently uses **per-worker `IdSetDense` accumulation** - each worker holds up to ~1 GB of bitmap chunks during the phase, ~5 GB transient across 6 workers, then merges into a single ~1.5 GB `referenced_nodes`.
+Previously used **per-worker `IdSetDense` accumulation** — each worker
+held unbounded bitmap chunks across the full planet ID range, and 6-8
+workers independently allocated up to ~1 GB each. Pass 1.5 peak anon
+measured 20.3 GB on Germany (4.7 GB input) and 29.5 GB at planet — the
+latter OOM-killed the first 2026-04-18 planet re-bench attempt.
 
-Switch to the pattern renumber uses at [renumber_external.rs:166-179](../src/commands/renumber_external.rs#L166): one shared pre-allocated `IdSetDense`, populated concurrently via `set_atomic`. Drops the per-worker residency entirely.
+Switched to the pattern used by [`renumber_external/pass1.rs`](../src/commands/renumber_external/pass1.rs):
+a single pre-allocated `IdSetDense` shared across workers, populated
+concurrently via `set_atomic` (`AtomicU8::fetch_or` under the hood). A
+new single-header-pass helper `build_way_schedule_and_max_node_id`
+provides both the way-blob schedule and the max node ID needed for
+`pre_allocate(max_node_id)`, avoiding two separate header walks.
+`parallel_classify_accumulate` → `parallel_classify_phase` with unit
+worker state; the classify closure captures `&IdSetDense` and writes
+directly.
 
-**Expected win: not wall; large transient RSS during Pass 1.5.** Originally framed as "~5 GB transient" against a believed-14.59 GB whole-build peak. With brokkr now reporting short-emitting phases, the true Pass 1.5 peak on planet is **29.5 GB** - this item is **load-bearing for 30 GB hosts**, not optional.
+Germany measured deltas:
+- Pass 1.5 peak anon: **20.3 GB → 1.75 GB (−91 %)**.
+- Pass 1.5 wall: **6.6 s → 1.1 s (−82 %)** — unexpected bonus win from
+  removing the per-worker merge bottleneck. Avg cores 6.5 → 21.4.
+- Whole-run wall: 71.1 s → 65.4 s (−8 %).
+
+Planet projection: ~29.5 GB → ~4-5 GB at Pass 1.5 peak (referenced_nodes
+final size plus per-worker PrimitiveBlock decode residency). Unblocks
+reliable planet iteration on 27 GB hosts — the original motivation.
 
 ## Local changes worth keeping on the list
 
@@ -286,14 +367,60 @@ A CSR-style layout (one contiguous offsets array + one contiguous values array, 
 
 ## Plan of attack
 
-1. **Add per-phase `*_ms` counters** (unconditional - not `cfg(feature = "hotpath")`) to ground-truth the wall breakdown assumed above. Measure current planet once to fix the baseline.
-2. **Land #1 first** - `mallopt` + Phase 2a/2b parallelization. This is most of the win. Cross-validate the resulting index byte-for-byte against current `main` on Denmark and Europe; re-run planet to measure.
-3. **Land #3 + #4 together** - Pass 3 stage B parallel + fine/coarse fusion. They touch the same rewrite surface in `bucketed_cell_assignment`; doing them in one pass avoids two rounds of diff churn.
-4. **Land #2** - Pass 1.5 wire-format scanner. Independent; can be interleaved with #3/#4 depending on ergonomics.
-5. **Land #5 + #6** - small cell-assignment parallelizations. Low risk.
-6. **Revisit #7 and interpolation endpoint CSR** once wall-time targets are met; these are RSS hygiene.
+**Landed (2026-04-18):**
 
-Cross-validation: there's no `brokkr verify` for the geocode index. Byte-for-byte comparison of the output directory across builds (`diff -r old_index/ new_index/`) is the ground truth; ordering within non-ordered output streams (`street_ways.bin`, `addr_points.bin`) may differ after parallelization, so fall back to comparing the `Reader`'s query results on a fixed sample of coordinates.
+1. ~~**Add per-phase `*_ms` counters** + hotpath annotations to ground-truth
+   the wall breakdown.~~ Done in `c977b97`. Marker coverage: per-phase
+   START/END pairs on Pass 1 / 1.5 / 2 / 3 plus inner sub-phase markers
+   inside Pass 1.5 (schedule, scan), Pass 2 (rank_index, scan_loop,
+   flush_mmap, admin_assembly, interp_resolve, write), and Pass 3
+   (admin_cells, fine/coarse ×{stagea_streets, stagea_addr, stagea_interp,
+   stageb}, admin_index). `#[hotpath::measure]` on `run_pass1`,
+   `run_pass1_5`, `run_pass2`, `bucketed_cell_assignment`,
+   `assign_admin_cells`, `assemble_admin_polygons`,
+   `resolve_interpolation_endpoints_mmap`, `write_admin_data`,
+   `write_admin_index`, `build_geocode_index` itself. Per-element hot
+   loops (`process_dense_node` / `process_way`) intentionally skipped.
+2. ~~**Land #7** ahead of #1 to unblock planet iteration on 27 GB hosts.~~
+   Done in `63800d3`. Pass 1.5 peak 20.3 GB → 1.75 GB on Germany.
+3. ~~**Land #1 Phase 2a** — `mallopt` + parallel node scan.~~ Done in
+   `88cf796`. Pass 2 scan 42 s → ~26 s on Germany; total wall 65.4 s →
+   49.0 s.
+
+**Next (in order of estimated ROI):**
+
+4. **Item #1 Phase 2a follow-up — direct `coord_mmap` writes from workers.**
+   The main-thread merge closure currently serialises 1.86 GB of
+   coord-write traffic; moving writes into workers via disjoint rank
+   ranges should recover ~5-7 s on Germany (~50-70 s at planet).
+   Smaller scope than Phase 2b; land first.
+5. **Item #1 Phase 2b — parallel way scan.** Per-worker tmp files plus
+   offset-patched concatenation for `street_nodes.bin` /
+   `interp_nodes.bin`, per-worker `StringPool` with sequential remap.
+   Est. ~5 s on Germany (~80-100 s planet). Larger diff surface — land
+   after the Phase 2a follow-up stabilises.
+6. **Items #3 + #4 together** — Pass 3 stage B parallel + fine/coarse
+   fusion. They touch the same rewrite surface in
+   `bucketed_cell_assignment`; doing them in one pass avoids two
+   rounds of diff churn. Est. ~4 s on Germany (~80-140 s planet).
+7. **Item #5 + #6** — small cell-assignment parallelisations (addr
+   points / interpolation / admin flood-fill). Low risk, est. ~1-2 s
+   on Germany, larger at planet.
+8. **Item #2 — Pass 1.5 wire-format scanner.** Pass 1.5 is down to 1.1 s
+   on Germany after item #7, so the expected win is ≤0.5 s — low ROI
+   vs implementation cost. Re-evaluate at planet scale once items #3-#6
+   land; if planet Pass 1.5 stays > 20 s after the RSS fix, reconsider.
+9. **Interpolation endpoint CSR** — RSS hygiene, not wall. Revisit once
+   wall-time targets are met.
+
+Cross-validation: there's no `brokkr verify` for the geocode index.
+Byte-for-byte comparison of the output directory across builds
+(`diff -r old_index/ new_index/`) is the ground truth *for Phase 2a*
+(output order preserved by `parallel_classify_phase`'s reorder buffer).
+Once Phase 2b ships per-worker-tmp-file concatenation, ordering within
+non-ordered output streams (`street_ways.bin`, `addr_points.bin`) will
+differ, so fall back to comparing the `Reader`'s query results on a
+fixed sample of coordinates.
 
 ## Correctness invariants
 
@@ -306,6 +433,14 @@ Cross-validation: there's no `brokkr verify` for the geocode index. Byte-for-byt
 
 ## Open questions
 
-- **Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.** Renumber demonstrates this fits comfortably in renumber's 3.3 GB peak. Geocode has an additional ~16 GB `coord_mmap` live across Phase 2a/2b and a `way_geom` hashmap that grows through Phase 2b. Expect peak ~18-20 GB during Phase 2b - still under 30 GB with margin, but **measure `referenced_count` on Europe first** before assuming this holds at planet. The ALTW-as-renumber reshape (2026-04-16) assumed a similar sizing for *unfiltered* referenced nodes and OOM'd at Europe because the real count was 4-5× the estimate. Geocode's filter keeps its count smaller, but the same measurement discipline applies.
-- **Is the admin-level flood-fill cost uneven enough to matter?** If one polygon (e.g., Russia at admin level 10) dominates, `par_iter` gives only ~2× speedup in practice. If it's measurable and binding, split large-polygon flood-fill into cell-stripe sub-tasks. Leave this decision until after measurement.
-- **StringPool merge order determinism.** For byte-for-byte cross-validation of the output against the sequential build, worker-local pool merge order must be deterministic (e.g. worker 0's strings before worker 1's before …). This is a merge-phase detail; specify it up front.
+- ~~**Pass 2 RSS under `mallopt(M_ARENA_MAX, 2)`.**~~ **Resolved for
+  Phase 2a.** Germany Pass 2 peak anon (post-Phase-2a, commit `88cf796`)
+  measured 2.88 GB — much smaller than the 18-20 GB pre-landing
+  projection. `mallopt(M_ARENA_MAX, 2)` plus the Phase 2a main-thread
+  merge (which absorbs the cross-thread free traffic) keeps the arena
+  bounded. Scaling linearly to planet: ~30 GB coord_mmap + way_geom +
+  decode residency = still the governing number, but the arena is not
+  a separate risk. Revisit this for Phase 2b once per-worker tmp-file
+  residency lands.
+- **Is the admin-level flood-fill cost uneven enough to matter?** If one polygon (e.g., Russia at admin level 10) dominates, `par_iter` gives only ~2× speedup in practice. Germany admin flood-fill (item #6 target) is 1.3 s at the development baseline — small enough that imbalance is probably invisible. Re-measure on planet after #6 lands.
+- **StringPool merge order determinism.** For byte-for-byte cross-validation of the output against the sequential build, worker-local pool merge order must be deterministic (e.g. worker 0's strings before worker 1's before …). Only matters once Phase 2b lands (Phase 2a interns on the main thread, so StringPool ordering matches the sequential path).

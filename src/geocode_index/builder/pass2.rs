@@ -311,10 +311,12 @@ pub(super) struct Pass2Output {
     pub(super) interp_nodes_mmap: memmap2::Mmap,
 }
 
-#[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[allow(clippy::too_many_lines, clippy::cognitive_complexity, clippy::too_many_arguments)]
 #[hotpath::measure]
 pub(super) fn run_pass2(
     config: &BuildConfig,
+    node_schedule: &[(usize, u64, usize)],
+    shared_file: &std::sync::Arc<std::fs::File>,
     needed_admin_ways: crate::commands::id_set_dense::IdSetDense,
     mut referenced_nodes: crate::commands::id_set_dense::IdSetDense,
     strings: &mut StringPool,
@@ -374,16 +376,12 @@ pub(super) fn run_pass2(
     // blobs so the live footprint is much smaller (~tens of MB).
     crate::debug::emit_marker("GEOCODE_PASS2A_START");
     {
-        let (node_schedule, shared_file) = crate::commands::build_classify_schedule(
-            &config.input_path, Some(crate::blob_index::ElemKind::Node),
-        )?;
-
         let referenced_ref = &referenced_nodes;
         let coord_mmap_ref = &mut *coord_mmap;
         let mut merge_err: Option<std::io::Error> = None;
         crate::commands::parallel_classify_phase(
-            &shared_file,
-            &node_schedule,
+            shared_file,
+            node_schedule,
             NodeBlobOut::default,
             |block, state: &mut NodeBlobOut| -> NodeBlobOut {
                 for element in block.elements_skip_metadata() {

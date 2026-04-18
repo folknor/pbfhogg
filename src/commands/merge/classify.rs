@@ -8,8 +8,11 @@ use crate::osc::CompactDiffOverlay;
 use crate::{Element, PrimitiveBlock};
 
 use super::diff_ranges::DiffRanges;
+use super::stats::ClassifyCounters;
 
 use crate::commands::RawBlobFrame;
+
+use std::sync::atomic::Ordering;
 
 /// Estimate a blob's in-flight memory cost for byte-budgeted batch sizing.
 ///
@@ -132,6 +135,7 @@ pub(super) fn classify_only(
     ranges: &DiffRanges,
     diff: &CompactDiffOverlay,
     buf: &mut Vec<u8>,
+    counters: &ClassifyCounters,
 ) -> std::result::Result<ClassifyResult, String> {
     let has_indexdata = frame.index.is_some();
 
@@ -139,14 +143,28 @@ pub(super) fn classify_only(
     if let Some(ref idx) = frame.index
         && !ranges.range_overlaps(idx.kind, idx.min_id, idx.max_id)
     {
+        counters.blobs_fastpath.fetch_add(1, Ordering::Relaxed);
         return Ok(ClassifyResult::Passthrough(*idx, has_indexdata));
     }
 
     // Slow path: decompress + lightweight scan.
+    let t_decompress = std::time::Instant::now();
     decompress_blob_data_into(frame.blob_bytes(), buf).map_err(|e| e.to_string())?;
+    counters.decompress_ns.fetch_add(
+        u64::try_from(t_decompress.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 
-    let scan = if let Some(scan) = blob_index::scan_block_ids(buf) {
+    let t_scan = std::time::Instant::now();
+    let scan = blob_index::scan_block_ids(buf);
+    counters.scan_ns.fetch_add(
+        u64::try_from(t_scan.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+
+    let scan = if let Some(scan) = scan {
         if !ranges.range_overlaps(scan.kind, scan.min_id, scan.max_id) {
+            counters.blobs_scan_pass.fetch_add(1, Ordering::Relaxed);
             return Ok(ClassifyResult::Passthrough(scan, has_indexdata));
         }
         Some(scan)
@@ -155,15 +173,29 @@ pub(super) fn classify_only(
     };
 
     // Range overlaps - full parse + precise check.
+    let t_parse = std::time::Instant::now();
     let raw = std::mem::take(buf);
     let block =
         parse_primitive_block_from_bytes_owned(&Bytes::from(raw)).map_err(|e| e.to_string())?;
+    counters.parse_ns.fetch_add(
+        u64::try_from(t_parse.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
 
     let index = scan.unwrap_or_else(|| fallback_index(&block));
 
-    if !block_overlaps_diff(&block, diff) {
+    let t_precise = std::time::Instant::now();
+    let overlaps = block_overlaps_diff(&block, diff);
+    counters.precise_ns.fetch_add(
+        u64::try_from(t_precise.elapsed().as_nanos()).unwrap_or(u64::MAX),
+        Ordering::Relaxed,
+    );
+
+    if !overlaps {
+        counters.blobs_false_positive.fetch_add(1, Ordering::Relaxed);
         return Ok(ClassifyResult::FalsePositive(index, has_indexdata));
     }
 
+    counters.blobs_rewrite.fetch_add(1, Ordering::Relaxed);
     Ok(ClassifyResult::NeedsRewrite(block, index))
 }

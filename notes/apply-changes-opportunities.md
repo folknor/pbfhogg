@@ -16,7 +16,7 @@ Unlike ALTW, the geocode builder, and check-refs, apply-changes is **already mos
 
 The 12m33s zlib / 8m52s none is the real cost of rewriting 70-90 % of a planet's blobs with locations preserved, not an artefact of a wrong shape.
 
-The wins are **two incremental parallelizations** of the remaining single-threaded stretches: `NodeLocationIndex::prefill_from_base`, and the reader thread. Plus one default-change that is moot in production but worth knowing exists.
+The wins are **two incremental parallelizations** of the remaining single-threaded stretches: `NodeLocationIndex::prefill_from_base`, and the reader thread. Compression-level tuning is out of scope here; production runs with `--compression none`.
 
 No internal API rewrites. `IdSetDense` is not used here (location index is a sparse HashMap keyed by node ID, which is right for the sparse-lookup pattern). `PbfWriter` is used correctly. `parallel_classify_accumulate` and `pass1_parallel_scan` are the patterns to reuse.
 
@@ -26,8 +26,15 @@ Target after this plan: **~6-9 min at planet under `--compression none`**, RSS u
 
 | Command | Wall | Peak RSS | Notes |
 |---|---:|---:|---|
-| `apply-changes --locations-on-ways` (current, `--compression none`) | 8m52s | 1.8 GB | ~80 % blob rewrite ratio on daily OSC |
-| `apply-changes --locations-on-ways` (current, `--compression zlib`) | 12m33s | 1.8 GB | as above with zlib encode (osmium-interop default) |
+| `apply-changes --locations-on-ways` (pre-#2 baseline, `--compression none`) | 154.9 s | 1.8 GB | planet altw + OSC 4913, commit `b7ed0e1`, UUID `b91009ae` |
+| `apply-changes --locations-on-ways` (post-#2, `--compression none`) | **144.4 s** | 1.8 GB | parallel prefill, commit `52c2c4b`, UUID `e81a9316` |
+| `apply-changes --locations-on-ways` (current, `--compression zlib`) | 12m33s | 1.8 GB | historical: zlib encode (osmium-interop default), not re-measured |
+
+The two `--compression none` rows were measured on the same host
+(plantasjen), same dataset, same OSC, different commits. The older
+8m52s / 12m33s numbers from a prior host/commit combination are
+preserved below for historical continuity in the "Thesis" paragraph
+but superseded by the rows above for quantitative comparison.
 
 ## Measured: Europe altw + `--locations-on-ways --compression none`
 
@@ -140,18 +147,92 @@ reader single-threaded), but the proportions shifted:
 
 ### Revised ranked targets (post-measurement)
 
-1. **Classify** (19.8 s @ Europe, 43 % wall) - newly elevated. Was "leave alone" in the inferred plan; measurement says it's the biggest bucket.
-2. **Rewrite throughput** (13.65 s @ Europe, 30 % wall) - consumer blocked on rayon results. Also not originally on the plan's ranked list.
-3. **Prefill** (5.8 s, 13 %) - plan #2 target; confirmed sub-optimal but smaller ceiling than estimated.
-4. **Reader parallelisation** (1.47 s stall, 3 %) - plan #3 target; payoff small on `--compression none` at Europe scale.
-5. **zlib:1 default** - plan #1. Moot in production (uses `none`). Leave for opportunistic pickup.
+1. **Classify** (19.8 s @ Europe, 43 % wall; **70.9 s @ planet, 49 % wall**) - newly elevated. Was "leave alone" in the inferred plan; measurement says it's the biggest bucket.
+2. **Rewrite throughput** (13.65 s @ Europe, 30 % wall; **43.7 s @ planet, 30 % wall**) - consumer blocked on rayon results. Also not originally on the plan's ranked list.
+3. ~~**Prefill** (5.8 s @ Europe, 13 %; 20.5 s @ planet, 13 % pre-#2) - plan #2 target.~~ **Landed 2026-04-18 (commit `52c2c4b`), planet phase 20.5 s -> 6.6 s (-14 s), overall wall -10.5 s.**
+4. **Reader parallelisation** (1.47 s stall @ Europe, 3 %; planet `merge_reader_send_wait_us=14.0 s`, 10 % wall) - plan #3 target; payoff bigger at planet than Europe predicted.
 
-Items #1 and #2 weren't on the ranked opportunities list in the
-inferred plan. Before committing to implementation order, the next
-measurement should separate classify's work into its three fast
-paths (indexdata hit / scan-only / precise decompress) to see whether
-the 19.8 s is dominated by decompress of the 8 % of blobs that get
-rewritten, or by the scan-only path across the 92 % that pass through.
+The top two rows (classify, rewrite) weren't on the ranked
+opportunities list in the inferred plan. Before committing to an
+approach, the next measurement should separate classify's work into
+its three fast paths (indexdata hit / scan-only / precise decompress)
+to see whether the time is dominated by decompress of the 8 % of
+blobs that get rewritten, or by the scan-only path across the 92 %
+that pass through.
+
+## Measured: Planet altw + `--locations-on-ways` (baseline + post-#2)
+
+Commit `b7ed0e1` (baseline) and `52c2c4b` (post-#2), 2026-04-18,
+plantasjen. Planet altw (92.6 GB), OSC seq 4913, `--compression none`
+(production default). `--bench 1`.
+
+| Run | UUID | Commit | Wall |
+|---|---|---|---:|
+| Baseline (sequential prefill) | `b91009ae` | `b7ed0e1` | **154.9 s** |
+| After #2 (parallel prefill)   | `e81a9316` | `52c2c4b` | **144.4 s** |
+
+Wall delta: **-10.5 s (-6.8 %)**.
+
+### Prefill phase delta (from `brokkr sidecar --compare b91009ae e81a9316`)
+
+| Metric | Baseline | Post-#2 | Delta |
+|---|---:|---:|---:|
+| `MERGE_PREFILL` span wall | 20 544 ms (1.0c) | **6 606 ms (5.1c)** | **-13.9 s (-68 %)** |
+| `merge_prefill_ms` counter | 20 544 | 6 606 | -13.9 s |
+| Decode threads | 1 | 22 | - |
+| Blobs decompressed | 42 119 | 42 119 | 0 |
+| Blobs skipped (range overlap) | 9 315 | 9 315 | 0 |
+| Nodes found | 97 392 | 97 392 | 0 |
+
+Prefill phase shrank 14 s; overall wall 10.5 s. The ~3.4 s gap is the
+new path's extra header-only pass (to build the blob schedule)
+plus thread startup overhead. The prior sequential path folded
+header scan and decode into one BlobReader iterator so paid the
+header walk implicitly. Within the 10-20 s ceiling predicted for #2.
+
+### Phase distribution at planet (post-#2, UUID `e81a9316`)
+
+From the sidecar counters. Same shape as Europe's revised ranking
+scaled up.
+
+| Phase | Wall (ms) | % of 144 400 ms wall |
+|---|---:|---:|
+| `merge_osc_parse_ms` | 4 925 | 3.4 % |
+| `merge_prefill_ms` | 6 606 | 4.6 % |
+| `merge_classify_total_ms` | **70 942** | **49.1 %** |
+| `merge_phase2_inline_total_ms` | 166 | 0.1 % |
+| `merge_rewrite_recv_total_ms` | **43 714** | **30.3 %** |
+| `merge_rewrite_spawn_total_ms` | 1 522 | 1.1 % |
+| `merge_output_write_total_ms` | 1 413 | 1.0 % |
+| `merge_final_flush_ms` | 1 593 | 1.1 % |
+
+Classify + rewrite-recv together = **79 % of wall at planet** (vs 73 %
+at Europe). The top-ranked targets (classify, rewrite) are confirmed
+at scale. Prefill has dropped from 13 % (Europe, pre-#2) to 4.6 %
+(planet, post-#2) - no further useful gain available there.
+
+### Shape counters (planet post-#2)
+
+| Counter | Value |
+|---|---:|
+| `merge_reader_frames_sent` | 197 585 |
+| `merge_reader_blocked_sends` | 1 826 (0.92 %) |
+| `merge_blobs_passthrough` | 120 132 |
+| `merge_blobs_rewritten` | 77 453 |
+| `merge_blobs_index_hit` | 104 908 |
+| `merge_bytes_passthrough` | 51.7 GB |
+| `merge_bytes_rewritten` | 67.1 GB (56.5 % rewrite ratio) |
+| `merge_loc_needed` | 6 803 426 |
+| `merge_loc_from_diff` | 2 468 812 |
+| `merge_loc_from_base` | 97 392 |
+| `merge_loc_missing` | 4 237 222 (62 %) |
+
+Note the `merge_loc_missing` ratio: 62 % of nodes referenced by OSC
+ways still aren't in either the base or the OSC. Missing refs fall
+back to `(0, 0)` coords per
+[rewrite.rs:67-70](../src/commands/merge/rewrite.rs#L67). Worth
+spot-checking that this matches osmium's semantics before claiming
+parity on `--locations-on-ways` output.
 
 ## Hotpath: per-function cumulative CPU (Europe altw, 2026-04-18)
 
@@ -270,22 +351,9 @@ highly out-of-order completions - compression workers finish blobs in
 variable time, the reorder buffer queues them until the file-order
 consumer catches up. Not a bottleneck per se, just a shape change.
 
-**Implications for ranking:**
-
-- Confirms `--compression none` is the right production default (plan's
-  existing position).
-- **New rank-#1-adjacent candidate: separate rayon pool for writer
-  compression.** Today the pipelined writer uses the global rayon pool,
-  same pool as classify + rewrite. Isolating the compression pool
-  (dedicated thread pool, N = min(cores, 4)) would let classify keep
-  all cores when compression is under-utilised (current `--compression
-  none` shape) and would prevent zlib runs from slowing classify. Fixes
-  the hidden cross-phase interaction even when the user doesn't opt
-  into `none`. Net: estimated 5-7 s save on Europe under zlib, smaller
-  under none.
-- The zlib:1 default (plan #5) remains opportunistic - lower win than
-  the pool-separation idea above and with the same output-compatibility
-  caveat.
+**Implications for ranking:** confirms `--compression none` is the
+right production default. Compression-level tuning is out of scope
+for this workstream since production already runs with `none`.
 
 ## Current architecture (reference)
 
@@ -314,27 +382,21 @@ For each byte-budgeted batch of raw frames (from `collect_batch`):
 
 ## Opportunities, ranked
 
-### #1 - (Moot in production, listed for completeness) Default to zlib:1 like renumber does
+### #2 - Parallelize `NodeLocationIndex::prefill_from_base` (landed 2026-04-18, commit `52c2c4b`)
 
-[renumber_external.rs:118-126](../src/commands/renumber_external.rs#L118) overrides the compression default when the caller didn't specify:
-
-```rust
-let effective_compression = if compression == Compression::default() {
-    Compression::Zlib(1)
-} else {
-    compression
-};
-```
-
-Renumber's in-place rationale: zlib:6 adds ~22 s of backpressure at planet for ~15 % smaller output, which is a bad trade for transient outputs in a pipeline that rewrites again downstream.
-
-**Production impact: zero.** Production runs with `--compression none`. The compression phase is already fast.
-
-**Off-production impact**: any non-production caller that invokes `apply-changes` without a `--compression` flag currently pays zlib:6 unnecessarily. A zlib:1 default would cut that path's wall by ~150-300 s at planet.
-
-**Keep on the list but de-prioritize.** Not on the critical path for the production pipeline. Land it opportunistically if touching the command for any other reason.
-
-### #2 - Parallelize `NodeLocationIndex::prefill_from_base`
+**Result:** prefill phase 20.5 s -> 6.6 s (-14 s, -68 %), overall wall
+154.9 s -> 144.4 s (-10.5 s, -6.8 %) on planet altw + OSC 4913. See
+"Measured: Planet" section above. Actual landed shape differs
+slightly from the sketch below: schedule construction is inline in
+`prefill_from_base` rather than reusing `build_classify_schedule`,
+because the `overlaps_needed` filter needs per-blob indexdata access
+at schedule-build time and adding that to the shared helper would
+have bloated its signature for one caller. `parallel_classify_accumulate`
+is also not used directly - the parallel path uses
+`extract_node_tuples` on raw decompressed bytes, which is cheaper than
+the full `PrimitiveBlock` construction that helper does. Retained for
+historical context as a record of the planning/measurement/landed
+arc.
 
 [node_locations.rs:112-144](../src/commands/merge/node_locations.rs#L112) is a straight sequential loop over node blobs:
 
@@ -392,19 +454,73 @@ At sequential BufReader + blob-header-parse overhead, realistic throughput is ~5
 
 **Risk**: medium. Largest of the three changes. Touches the main loop structure, not just a helper. Preserve the reorder-buffer + batch-boundary logic carefully.
 
+### #4 - Classify slow-path reduction (next target)
+
+Classify is now the biggest bucket at planet: **70.9 s / 144.4 s = 49 % of wall** (post-#2). It's main-thread wall, not cumulative CPU - the per-batch pipeline is serial on the main thread (classify -> inline-assign -> rewrite-spawn -> rewrite-recv), so classify and rewrite-recv wall add directly. Together they're 79 % of wall.
+
+The classifier runs three paths per blob (see [classify.rs:129](../src/commands/merge/classify.rs#L129)):
+
+1. **Fast path** - indexdata present + range miss -> `Passthrough` without decompress. Should be nanoseconds per call.
+2. **Scan path** - indexdata range overlapped or absent. Decompress, then `scan_block_ids` for a tighter range. If that range misses -> `Passthrough`. Decompress cost only.
+3. **Full parse path** - scan overlapped too (or produced nothing). Full `parse_primitive_block_from_bytes_owned` + `block_overlaps_diff`. If no element matches -> `FalsePositive`; else `NeedsRewrite`.
+
+#### Current blob-count split at planet (UUID `e81a9316`)
+
+| Path | Blobs | % of 197 585 | Counter |
+|---|---:|---:|---|
+| Fast-path passthrough | 104 908* | 53 % | `merge_blobs_index_hit` (conflated, see below) |
+| Scan-path passthrough | 0* | 0 % | n/a (every blob has indexdata; counter reports `blobs_scan_only` for the no-indexdata case only) |
+| FalsePositive (full parse, no match) | 15 224** | 8 % | derived: `blobs_passthrough - blobs_index_hit - blobs_scan_only` |
+| Rewrite (full parse + re-encode) | 77 453 | 39 % | `merge_blobs_rewritten` |
+
+*`merge_blobs_index_hit` today counts *both* "fast-path" *and* "scan-path after indexdata-loose overlap": any `Passthrough` where the original frame had indexdata. The scan-path-through-indexdata-loose count can't be separated without new instrumentation. At planet the two are probably dominated by fast-path (indexdata is tight on PBFs pbfhogg produces), but we don't know.
+
+**`merge_blobs_scan_only` only counts the no-indexdata case (`has_indexdata: false`). At planet every OSM blob carries indexdata, so this is always 0. The counter name is misleading.
+
+**FalsePositive has no explicit counter.** The delta subtraction works today but obscures a distinct path - these blobs pay the full-parse cost for nothing. Worth tracking directly.
+
+#### Instrumentation plan (landing first)
+
+The blob counts above tell us *how many* blobs take each path but not *how much time* each path burns. The conflation above also hides scan-path vs fast-path. Before picking an optimization, add:
+
+- **Per-path blob counters** (explicit, not derived):
+  - `merge_blobs_classify_fastpath` - Passthrough reached before decompress.
+  - `merge_blobs_classify_scan_pass` - Passthrough reached via `scan_block_ids` after decompress.
+  - `merge_blobs_classify_false_positive` - Decompressed + full-parsed + precise check said no.
+  - `merge_blobs_classify_rewrite` - kept as alias of existing `merge_blobs_rewritten` for completeness.
+- **Per-path cumulative CPU** (via atomic counters accumulating `Instant::elapsed()` on rayon workers):
+  - `merge_classify_decompress_ns` - time in `decompress_blob_data_into`.
+  - `merge_classify_scan_ns` - time in `blob_index::scan_block_ids`.
+  - `merge_classify_parse_ns` - time in `parse_primitive_block_from_bytes_owned`.
+  - `merge_classify_precise_ns` - time in `block_overlaps_diff`.
+  - Fast-path is a few-ns range check - not instrumented; the difference between `merge_classify_total_ms × cores` and the sum of the above approximates it.
+
+These are cumulative CPU (nanoseconds summed across rayon workers). Divide by observed parallelism from `merge_classify_total_ms × decode_threads` to back out per-path wall contribution.
+
+Deliberately leaving out scan/parse-body decomposition for now - can add later if the first measurement points somewhere finer.
+
+#### Candidate optimizations (to be picked after measurement)
+
+In decreasing likelihood of landing first:
+
+1. **Lightweight precise-ID scan for FalsePositive** - the 15 k blobs that decompress + full-parse + find no matching element currently pay the same cost as rewrites. A wire-format ID scan (node/way/relation IDs without StringTable parsing, analogous to `extract_node_tuples`) could replace `parse_primitive_block_from_bytes_owned` on this path. Expected win: depends on how much of classify CPU is full-parse time. Instrumentation will tell.
+2. **Defer full parse for rewrites** - the 77 k rewrite blobs currently parse in classify (Phase 1), then hand the `PrimitiveBlock` to rewrite (Phase 3). If the parse happened in Phase 3 instead, classify wall shrinks by whatever the parse share is. Downside: Phase 3 gets more per-blob work; needs proportional rewrite-worker capacity.
+3. **Merge with #3 (parallel reader)** - if the reader disappears and workers pread+classify in one stage, classify stops being a discrete main-thread phase at all. Biggest restructure but tackles classify + rewrite-recv + reader stall simultaneously. Only worth it if (1) and (2) don't close the gap.
+
+Risk: low for #1, medium for #2 (needs the rewrite worker pool to handle the added work without stalling), high for #3 (main-loop restructure; see the existing #3 wrinkles).
+
 ## Overall expected savings
 
 Under `--compression none` at planet:
 
-- #2 alone: ~30-60 s saved. New wall ~11 min.
-- #2 + #3: ~80-160 s saved. New wall **~9-10 min**.
-- #2 + #3 + #1 (if any caller hits the zlib:6 default): #1 doesn't help production. Off-production callers see an additional ~150-300 s on their paths.
+- #2 alone: **landed, measured -10.5 s wall (154.9 s -> 144.4 s on `52c2c4b`).** Pre-measurement estimate was 30-60 s; the actual save was smaller because measured prefill wall at planet (20.5 s) was itself smaller than the pre-measurement 30-60 s upper bound, and #2 takes ~30 % of that rather than eliminating it entirely.
+- #2 + #3: with #3 still to land, remaining headroom comes from classify and rewrite-recv (now the top buckets), plus the reader stall. At planet, `merge_reader_send_wait_us=14.0 s` sets a ceiling on what #3 (reader parallelisation) can contribute to wall-clock, since that's how long the downstream consumer is already blocked by full frame channel waits.
+- Classify (49 % wall) and rewrite-recv (30 % wall) are now the targets with the largest ceilings. No concrete plan in this doc yet; will need a dedicated section once we pick an approach.
 
-Primary target: **~6-7 min at planet in production (`--compression none`)**, from 8m52s. (Or ~9-10 min if osmium-interop zlib output is required, from 12m33s.)
+Updated primary target: **~115-125 s at planet (`--compression none`)** from 144.4 s post-#2, once classify and rewrite-recv are addressed. A naive #3 (parallel reader) alone is probably worth another -5 to -10 s on top of #2.
 
 ## What to leave alone
 
-- **The classify phase.** Already rayon-parallel with correct fast-paths (indexdata-based passthrough without decompress at [classify.rs:139](../src/commands/merge/classify.rs#L139), range-overlap secondary check, precise block-overlap check). No restructure needed.
 - **The rewrite hot path** (`rewrite_block_parallel`, `emit_create_local`, `write_base_*_local` family). Already uses `pre_seed_string_table` to avoid re-interning, `add_way_raw_bytes_with_locations` to forward raw fields 9/10 byte-for-byte, and `add_relation_raw_bytes` to skip re-parsing members. This path is tightly written.
 - **The pipelined writer** (`PbfWriter` + rayon compression + 64 permits). Under `--compression none` the rayon tasks become near-passthrough, but the structure is still correct and sized.
 - **The coalescing passthrough buffer** ([rewrite.rs:812](../src/commands/merge/rewrite.rs#L812)). Collapses consecutive raw-frame writes into single sends. Correct at 70-90 % rewrite ratio (small fraction of bytes, but the collapse still matters for channel send overhead).
@@ -417,12 +533,13 @@ Primary target: **~6-7 min at planet in production (`--compression none`)**, fro
 
 ## Plan of attack
 
-1. **Enable `#[cfg(feature = "hotpath")]` per-phase timers unconditionally** (or at least for the first measurement pass). The inferred breakdown in this doc is a model; measure to ground-truth it before committing to the order of #2 and #3.
-2. **Land #2 first** - parallel `prefill_from_base` via `parallel_classify_accumulate`. Smaller refactor, lower risk. Cross-validate output byte-for-byte on Denmark and Europe. Re-measure planet to confirm ~30-60 s save.
-3. **Land #3** - parallel pread schedule replacing the reader thread. Preserve `copy_file_range` semantics and raw-frame move-ownership. Cross-validate byte-for-byte. Re-measure.
-4. **#1 (zlib:1 default)** is opportunistic - tack it on when touching the command again, or skip if production is the only caller.
+1. ~~**Enable `#[cfg(feature = "hotpath")]` per-phase timers unconditionally**~~ **Done:** per-phase counters are already always-on at planet, measurement on `b7ed0e1`/`52c2c4b` ground-truths the breakdown.
+2. ~~**Land #2 first** - parallel `prefill_from_base`.~~ **Landed 2026-04-18 (`52c2c4b`), planet -10.5 s wall.** Cross-validated on Denmark via `brokkr verify merge --dataset denmark`.
+3. **Land #4 instrumentation** - per-path classify counters + cumulative-ns timers. No behaviour change; one planet bench run to get the decomposition, then pick an optimization.
+4. **Land one of #4's candidate optimizations** - picked by the instrumentation run. Most likely the lightweight precise-ID scan for FalsePositive, or deferred parse for rewrites.
+5. **Land #3** - parallel pread schedule replacing the reader thread. Post-#2 ceiling from `merge_reader_send_wait_us=14.0 s` at planet; may merge with or be subsumed by #4's restructure candidate.
 
-Cross-validation: `brokkr verify apply-changes --dataset denmark` if it exists (check `.review.toml` / brokkr for available verify targets). Otherwise: identical output PBF byte-for-byte after the primary merge batch; tail creates that get out-of-order under the existing implementation would be the same out-of-order set. Element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback.
+Cross-validation: `brokkr verify merge --dataset denmark` (note: name is `merge`, not `apply-changes` - the subcommand in `brokkr verify` predates the rename). Otherwise: identical output PBF byte-for-byte after the primary merge batch; tail creates that get out-of-order under the existing implementation would be the same out-of-order set. Element-level diff (decompress, compare per-blob element lists sorted by ID) is the fallback.
 
 ## Memory budget (planet, post-#2 + #3)
 

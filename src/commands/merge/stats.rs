@@ -184,6 +184,46 @@ impl PhaseTimers {
     }
 }
 
+/// Per-path classify instrumentation. Accumulated across rayon workers by
+/// `classify_only`; emitted as sidecar counters at end of `merge()`.
+///
+/// Blob counts split `Passthrough` into the three paths that produced it
+/// (fast-path vs scan-path vs fall-through-via-parse), disambiguating the
+/// existing `blobs_index_hit`/`blobs_scan_only` which are keyed on
+/// `has_indexdata` rather than which code path fired. FalsePositive is
+/// its own count instead of being derived by subtraction.
+///
+/// Cumulative nanoseconds (summed across all rayon workers) attribute
+/// classify wall to its sub-steps. Not instrumented: the fast-path range
+/// check (ns per call, dominated by atomic-add overhead if measured).
+pub(super) struct ClassifyCounters {
+    // Blob-count per path
+    pub(super) blobs_fastpath: std::sync::atomic::AtomicU64,
+    pub(super) blobs_scan_pass: std::sync::atomic::AtomicU64,
+    pub(super) blobs_false_positive: std::sync::atomic::AtomicU64,
+    pub(super) blobs_rewrite: std::sync::atomic::AtomicU64,
+    // Cumulative CPU per sub-step (summed across workers)
+    pub(super) decompress_ns: std::sync::atomic::AtomicU64,
+    pub(super) scan_ns: std::sync::atomic::AtomicU64,
+    pub(super) parse_ns: std::sync::atomic::AtomicU64,
+    pub(super) precise_ns: std::sync::atomic::AtomicU64,
+}
+
+impl ClassifyCounters {
+    pub(super) fn new() -> Self {
+        Self {
+            blobs_fastpath: std::sync::atomic::AtomicU64::new(0),
+            blobs_scan_pass: std::sync::atomic::AtomicU64::new(0),
+            blobs_false_positive: std::sync::atomic::AtomicU64::new(0),
+            blobs_rewrite: std::sync::atomic::AtomicU64::new(0),
+            decompress_ns: std::sync::atomic::AtomicU64::new(0),
+            scan_ns: std::sync::atomic::AtomicU64::new(0),
+            parse_ns: std::sync::atomic::AtomicU64::new(0),
+            precise_ns: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
 /// Cross-thread stall accumulator. The reader thread bumps `reader_send_us`
 /// when a `try_send` fails and it blocks on the full channel; the main thread
 /// bumps `consumer_recv_us` when `collect_batch` blocks on an empty channel,

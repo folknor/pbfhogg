@@ -30,7 +30,7 @@ use super::classify::{
 };
 use super::diff_ranges::{DiffRanges, UpsertCursors};
 use super::node_locations::NodeLocationIndex;
-use super::stats::{MergeStats, PhaseTimers, StallAccumulator};
+use super::stats::{ClassifyCounters, MergeStats, PhaseTimers, StallAccumulator};
 #[cfg(feature = "hotpath")]
 use super::stats::{PhaseRss, read_rss_kb};
 
@@ -766,6 +766,7 @@ pub fn merge(
 
     let mut phase_timers = PhaseTimers::new();
     let stalls = Arc::new(StallAccumulator::new());
+    let classify_counters = Arc::new(ClassifyCounters::new());
 
     // Step 1: Parse the diff
     crate::debug::emit_marker("MERGE_DIFFPARSE_START");
@@ -892,7 +893,7 @@ pub fn merge(
             .par_iter()
             .map_init(
                 Vec::new,
-                |buf, frame| classify_only(frame, &ranges, &diff, buf),
+                |buf, frame| classify_only(frame, &ranges, &diff, buf, &classify_counters),
             )
             .collect();
         phase_timers.classify_total += phase1_start.elapsed();
@@ -1335,6 +1336,42 @@ pub fn merge(
         crate::debug::emit_counter(
             "merge_writer_call_us",
             stalls.writer_call_us.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+
+        // Classify per-path split: blob counts and cumulative CPU per sub-step
+        // across rayon workers. Divide the ns counters by observed parallelism
+        // (merge_classify_total_ms vs decode_threads) to back out wall share.
+        crate::debug::emit_counter(
+            "merge_blobs_classify_fastpath",
+            classify_counters.blobs_fastpath.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_blobs_classify_scan_pass",
+            classify_counters.blobs_scan_pass.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_blobs_classify_false_positive",
+            classify_counters.blobs_false_positive.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_blobs_classify_rewrite",
+            classify_counters.blobs_rewrite.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_classify_decompress_ns",
+            classify_counters.decompress_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_classify_scan_ns",
+            classify_counters.scan_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_classify_parse_ns",
+            classify_counters.parse_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
+        );
+        crate::debug::emit_counter(
+            "merge_classify_precise_ns",
+            classify_counters.precise_ns.load(std::sync::atomic::Ordering::Relaxed) as i64,
         );
 
         // Locations-on-ways - only populated when the flag is on.

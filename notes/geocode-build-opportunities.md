@@ -1,10 +1,19 @@
 # Geocode index builder - optimization plan
 
-> **TAINTED BENCHMARKS WARNING (2026-04-18).** The 1255 s planet wall below
-> (commit `7e9c2e9`, UUID `1c70850916824749bf1d68ef8970189e`) was measured
-> under the all-blobs-scan regression in `has_indexdata` (live in
-> `4ce7e93..c0ae9a7`). RSS / phase-peak data is unaffected. Re-measure
-> wall before relying on the per-phase totals below.
+> **Scope.** This plan targets wall-time for the *full-rebuild* path —
+> `build-geocode-index` against a cold PBF. Complementary effort in
+> [incremental-geocode-index.md](incremental-geocode-index.md) targets
+> *avoiding* the full rebuild on daily diffs (currently blocked on a
+> format-v2 element-ID change; see that doc for the design sketches).
+>
+> **Rebench status (2026-04-18).** Post-fix planet wall still pending:
+> the first attempt on 2026-04-18 OOM-killed at 1m34s in Pass 1.5 and
+> is queued in `overnight.sh` round 2. Until that lands, the 1255 s
+> planet wall below (commit `7e9c2e9`, UUID
+> `1c70850916824749bf1d68ef8970189e`) carries an unaccounted
+> all-blobs-scan cost from the `has_indexdata` regression live in
+> `4ce7e93..c0ae9a7`. Phase/RSS data is unaffected — only wall.
+> Re-measure wall before relying on per-phase totals.
 
 Target: `pbfhogg build-geocode-index` on planet. Current: 20m55s (1255 s) wall [TAINTED], **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`, 2026-04-17). Phase peaks (anon): PASS1 12 MB, **PASS1_5 29.5 GB**, PASS2 13.9 GB, PASS3 10.4 GB. Earlier numbers in this note (14.59 GB / 17.8 GB) under-reported the peak: brokkr previously hid short-emitting phase markers from sidecar output, so PASS1_5's transient peak never surfaced. The peak itself has not regressed - only its visibility.
 

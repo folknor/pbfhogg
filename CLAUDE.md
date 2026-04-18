@@ -20,6 +20,16 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 - Write substantive engineering-focused commit messages.
 - Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
 
+### What gets added to CHANGELOG.md
+
+Audience: library + CLI users deciding whether to upgrade. Not a commit digest.
+
+**Add:** breaking changes (removed flags, widened bounds, format bumps); new capabilities; behavior changes at the same surface (silent truncation → hard error, new warnings); user-visible bug fixes; perf changes large enough to matter (headline numbers, not 5% sub-phase deltas).
+
+**Skip:** internal refactors, module splits, helper extractions; sidecar instrumentation (markers, counters, `hotpath`) — serves brokkr, not users; F-numbered fix rollups; sub-phase timings that don't move the headline; test additions, code-quality cleanups, dead-code removal; doc-file edits (CORRECTNESS.md, DEVIATIONS.md, notes/*.md); private internals.
+
+Test: would a user change what they do after reading this entry? If no, it belongs in `git log`.
+
 The user can allow things that contravene these rules, for example allowing commits that are pure markdown updates. Do not ask them for this, they will tell you when.
 
 ## 'brokkr' tool

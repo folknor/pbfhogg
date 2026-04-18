@@ -37,18 +37,18 @@ Every command runs on the full planet on normal hardware. Measured on **plantasj
 
 | Command | Wall | Peak anon RSS | Notes |
 |---------|------|---------------|-------|
-| `cat --type way` (raw passthrough) | 44s | **10 MB** | zero decompression, indexdata blob filter |
-| `getid --invert` | 1m23s | 102 MB | raw-frame passthrough for non-intersecting blobs |
-| `cat` (indexdata generation) | 8m17s | ~200 MB | rewrites BlobHeader without re-compressing |
+| `cat --type way` (raw passthrough) | 45s | **10 MB** | zero decompression, indexdata blob filter |
+| `getid` | 44s | 833 MB | multi-blob ID resolution via indexdata |
 | `tags-filter -R highway=primary` | 52s | 688 MB | single-pass (`--omit-referenced`), parallel classify |
-| `getid` | 1m6s | 833 MB | multi-blob ID resolution via indexdata |
-| `check --refs` | **1m12s** | **2.17 GB** | referential integrity over 11.6B elements |
+| `check --refs` | **1m10s** | **2.17 GB** | referential integrity over 11.6B elements |
+| `cat` (indexdata generation) | **1m26s** | ~200 MB | rewrites BlobHeader without re-compressing |
+| `getid --invert` | 1m31s | 102 MB | raw-frame passthrough for non-intersecting blobs |
 | `check --ids --full` | **1m33s** | **2.22 GB** | monotonicity + type-order + per-type duplicate detection over 11.6B elements |
+| `renumber` | 3m25s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
+| `extract --smart` (Europe bbox) | 4m28s | 11.17 GB | three-pass, multipolygon-complete |
+| `add-locations-to-ways --index-type external` | 11m01s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 | `apply-changes` (daily diff, zlib) | 12m33s | ~1.8 GB | 3.4M-change daily diff, 86% rewrite |
-| `renumber` | 3m14s | **3.3 GB** | wire-format rewriters, shared atomic IdSetDense |
-| `extract --smart` (Europe bbox) | 4m42s | 11.17 GB | three-pass, multipolygon-complete |
 | `build-geocode-index` | 20m55s | 29.5 GB | reverse geocoding index, S2 cells (pass-1.5 transient peak) |
-| `add-locations-to-ways --index-type external` | 11m38s | 17.2 GB | rank-bucketed counting sort → per-blob delta-varint coord payloads, ~246 GB temp disk |
 
 Per-command phase breakdowns and optimization history are in [reference/performance.md](reference/performance.md). Note that recorded results always track the latest git head and may not match the released version.
 

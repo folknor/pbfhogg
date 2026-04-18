@@ -1,11 +1,17 @@
 # ALTW External-Join: Structural Opportunities
 
-> **TAINTED BENCHMARKS WARNING (2026-04-18).** ALTW wall-time numbers
-> measured at any commit in `4ce7e93..c0ae9a7` (Apr 9–17 2026) are
-> inflated by an O(N) all-blobs-scan regression in `has_indexdata` /
-> `check_sorted_and_indexed` that was active during that window. Affected
-> bench citations are tagged `[TAINTED]` below. Phase / RSS / counter
-> data is unaffected — only wall.
+> **REGRESSION-WINDOW CAVEAT (updated 2026-04-18).** ALTW wall-time numbers
+> measured at any commit in `4ce7e93..c0ae9a7` (Apr 9–17 2026) carry an
+> O(N) all-blobs-scan cost from a `has_indexdata` /
+> `check_sorted_and_indexed` regression that was live during that window.
+> Phase / RSS / counter data from those runs is unaffected — only wall.
+> A post-fix re-bench of planet landed 2026-04-18 at `aee7727`: **661.2 s
+> `--bench 3`** (UUID `a406d77e`, this is the current baseline), or
+> 700.6 s at `e30f7ddc` `--bench 1` (in performance.md). Inflated bench
+> citations still tagged `[TAINTED — wall]` below for cross-reference;
+> the opportunity-ranking arithmetic still rebases cleanly because
+> META_SCAN is ~2.5 % of planet wall (the fix's scope), not enough to
+> move the phase-share story.
 
 > **Update 2026-04-16.** R6's standalone reshape plan ([`altw-as-renumber.md`](altw-as-renumber.md)) - "replace the four-stage pipeline with an in-RAM coord-table three-pass form mirroring `renumber_external`" - was **implemented and OOM-killed on Europe**. Measured unique-referenced-node count at Europe was 3.6 B (29 GB coord table), projecting to ~10 B / ~80 GB at planet. R6's sizing estimate of ~2 B / ~16 GB at planet was off by ~4-5×.
 >
@@ -76,11 +82,13 @@ A four-stage serial chain with three disk-materialized intermediates and no stag
 | Dataset | Commit | Wall | Meta | Stage 1 | Stage 2 | Stage 3 | Finalize | Relscan | Stage 4 |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
 | Europe | `d3e13ed` (pre-#8) | 333 s | 30.9 s | 36.0 s | 92.9 s | 32.2 s | 18.3 s | 14.3 s | 90.6 s |
-| Europe | `e497e54` (post-#8) [TAINTED] | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
+| Europe | `e497e54` (post-#8) [TAINTED — wall] | **320.5 s** | 28.5 s | 36.9 s | 91.0 s | 33.6 s | **0.163 s** | 21.0 s | 91.7 s |
+| Europe | `555de261` (post-seek_raw fix, `--bench 1`) | **270.7 s** | 13.3 s | 35.3 s | 90.9 s | 32.9 s | **0.17 s** | 3.9 s | 93.0 s |
 | Planet | `4f059b67` (pre-#8) | 867.7 s | - | 148.5 s | 266.6 s | 100.2 s | 46.4 s | - | 231.6 s |
-| Planet | `7904a95` (post-#4/#8/#9L1) [TAINTED] | **698.1 s** | 16.9 s | 112.8 s | 235.2 s | 85.7 s | **1.4 s** | 6.0 s | 215.6 s |
+| Planet | `7904a95` (post-#4/#8/#9L1) [TAINTED — wall] | 698.1 s | 16.9 s | 112.8 s | 235.2 s | 85.7 s | **1.4 s** | 6.0 s | 215.6 s |
+| Planet | `aee7727` (post-seek_raw fix, `--bench 3`, **current baseline**) | **661.2 s** | 16.4 s | 124.0 s | 208.0 s | 89.3 s | **1.5 s** | 6.0 s | 215.4 s |
 
-Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet (commit `7904a95`, UUID `123f70f1`): cumulative `867.7 s → 698.1 s` (−19.5%); finalize/router `46.4 s → 1.4 s` (−97%, #8); stage 1 −24%, stage 2 −12%, stage 3 −14%, stage 4 −7%; relation scan now 6.0 s (#9 L1).
+Europe is stage-4-led; planet is stage-2-led with stage 4 second. Post-#8 Europe: finalize phase replaced by 0.163 s router build (see #8 landed-result note below). Planet cumulative trajectory `4f059b67 → 7904a95 → aee7727`: **867.7 s → 698.1 s → 661.2 s** (−23.8 % total). The first drop (−19.5 %) folded in #4 / #8 / #9L1; the second (−5.3 %) is the 2026-04-18 seek-raw fix plus a switch to `--bench 3` accounting (bench-1 post-fix at `e30f7ddc` measured 700.6 s, so ~30 s of the apparent win is best-of-3 noise reduction rather than extra speed). Phase-share between commits stays consistent: stage-2-led with stage-4 second, relation scan tiny after #9 L1, router build a rounding error after #8. Stage 1's +11 s from `7904a95 → aee7727` is the one direction-flip to watch — probably bench-3 sampling variance (`7904a95` was `--bench 1`), but worth a `--bench 3` confirmation at `7904a95` or a bisect if someone re-touches stage 1.
 
 ---
 

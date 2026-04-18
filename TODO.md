@@ -8,7 +8,7 @@ Four planet-scale command plans are in notes, each with a ranked set of opportun
 
 - [ ] **[notes/geocode-build-opportunities.md](notes/geocode-build-opportunities.md)** - `build-geocode-index`. Current: **1346 s / 14.59 GB RSS** at planet. Target: **~10-12 min / same RSS**. Single-threaded Pass 2 is the dominant phase; `mallopt(M_ARENA_MAX, 2)` + parallel node/way split unlocks it. Plus parallelizing Pass 3 stage B and fusing fine+coarse cell computation.
 
-- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Steps #1 + #2 landed (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s (16.9×)** at UUID `862547e4`, ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) not needed at current numbers. Related codebase-wide TODO: `BlobReader::seek_raw` / `BufReader::seek_relative` (Performance section below).
+- [ ] **[notes/check-refs-opportunities.md](notes/check-refs-opportunities.md)** - `check --refs`. Steps #1 + #2 landed (commits `8f0ccbb`, `053def6`, `fbf591c`, 2026-04-17). Japan 56.7 s → **2.1 s** (27×). Europe 426.2 s → **33.6 s** (12.7×). Planet **1225 s → 72.5 s (16.9×)** at UUID `862547e4`, ~5-8× better than the 6-10 min plan floor. Peak RSS 2.17 GB. Step #3 (selective wire-format parser) not needed at current numbers.
 
 - [ ] **[notes/apply-changes-opportunities.md](notes/apply-changes-opportunities.md)** - `apply-changes --locations-on-ways`. Current: **762 s / 1.8 GB RSS** at planet under production `--compression none`. Target: **~9-10 min / same RSS**. Already mostly well-shaped; two incremental parallelizations remaining - `NodeLocationIndex::prefill_from_base` and the sequential reader thread. No reshape needed.
 
@@ -38,7 +38,7 @@ active optimization plans):
 | 1689 | `src/write/block_builder.rs` | write-path work (Milestone 2) |
 | 1682 | `src/commands/add_locations_to_ways.rs` | ALTW external (active plan proximity) |
 | 1506 | `src/osc.rs` | — |
-| 1376 | `src/read/blob.rs` | `seek_raw` fix lands here soon |
+| 1376 | `src/read/blob.rs` | — |
 | 1316 | `src/write/writer.rs` | write-path work |
 | 1295 | `src/commands/mod.rs` | — |
 | 1225 | `src/blob_index.rs` | — |
@@ -137,15 +137,17 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
 
 ## Open issues
 
-- [ ] **Rerun `add-locations-to-ways --index-type external` planet** - the
-  2026-04-17 overnight hit EMFILE (`rank-W13-047: Too many open files`)
-  during stage-1 shard creation. Stage 1 opens `num_shard_workers *
-  NUM_BUCKETS` (=256) files; the failing worker index 13 implies at
-  least 14 workers × 256 = 3584 FDs. Shell `ulimit -n` is 524288 on this
-  host, so either the pbfhogg process inherited a lower limit or the
-  FD accounting is higher than expected. Verify `/proc/<pid>/limits`
-  for the child and rerun. Row in README still reads 953s / 11m38s from
-  the `3d977a0` baseline.
+- [x] ~~**Rerun `add-locations-to-ways --index-type external` planet**~~ -
+  Done 2026-04-18 at commit `aee7727`, `--bench 3`, UUID `a406d77e`:
+  **661.2 s / 11m01s** with `ulimit -n 8192` in `overnight.sh`. The
+  earlier EMFILE (`rank-W13-047: Too many open files`) was ulimit-driven;
+  raising the soft FD cap unblocked it. README row updated.
+- [ ] **Finish the three planet rows that didn't land on 2026-04-18** -
+  `check --ids --full` (argv-passing bug in `overnight.sh`, fixed),
+  `apply-changes` (now needs `--osc-seq 4920` — planet has 8 daily
+  diffs configured), and `build-geocode-index` (OOM-killed in Pass 1.5
+  at 1m34s on the first attempt; retry in isolation). All three
+  queued in the trimmed `overnight.sh` for the next overnight run.
 - [ ] **Add a planet `diff --format osc` row** somewhere - currently only
   the Denmark 73.1s value at `reference/performance.md:352` exists. The
   new 6245s / 104m planet number wants a home (likely alongside the
@@ -249,17 +251,6 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   a single follow-up commit with the uplifts that are clearly wins.
   No measurement required for call-sites where the analysis is obvious
   (one cache-line touch beats two).
-
-- [x] ~~**`BlobReader::seek_raw` discards BufReader buffer on every call**~~ -
-  **DONE 2026-04-18 (commit `aa3147c`).** Landed via a public
-  `BlobReaderSource` trait with a default `skip_relative` overridden by
-  the `BufReader` impl to call `BufReader::seek_relative`. The audit's
-  stated "specialize `impl BlobReader<BufReader<R>>`" approach didn't
-  compile (Rust forbids inherent method specialization on stable). Per-
-  caller wall deltas in `reference/performance.md`. Library
-  API impact: `new_seekable<R>` and `IndexedReader::new<R>` bounds widen
-  from `R: Read + Seek + Send` to `R: BlobReaderSource + Send` —
-  one-line workaround for downstream library users with non-standard R.
 
 - [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys
@@ -506,8 +497,12 @@ single-pass, tag expression and bbox filtering.
 - [ ] Migration guide from other tools - command mapping table, behavioral
   differences, indexdata workflow explanation. Build on existing
   `reference/osmium-parity.md`.
-- [ ] **`renumber` - minor optimization (current: 194 s / 3m14s, planet).**
-  Planet: 194 s, 3.3 GB peak anon, zero temp disk (commit `cb99106`).
+- [ ] **`renumber` - minor optimization (current: 204.5 s / 3m25s, planet).**
+  Planet: 204.5 s at `aee7727` (`--bench 3`, UUID `abd74459`); historical
+  194 s measured at `cb99106` (also `--bench 3`). 3.3 GB peak anon, zero
+  temp disk. The +10 s drift is inside `--bench 3` variance but not
+  comfortably — worth a deliberate bisect if this becomes the critical
+  path; not today.
   - [ ] **Varint encode lookup table.** 256-entry for single-byte varints
     in the reframe functions. Est. −2 to −3 s wall.
   - [ ] **Skip `way_id_set` if way rank derivable from schedule.** Sorted

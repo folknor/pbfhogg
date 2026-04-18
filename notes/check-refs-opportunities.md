@@ -235,7 +235,9 @@ From 21.5 GB churn at Japan post-swap to 1.8 GB at Europe post-parallel — all 
 
 **Planet confirmation (UUID `862547e4`, commit `0d71b3b`, 2026-04-17, plantasjen):** **1225 s → 72.5 s = 16.9× speedup.** Plan target was 6–10 min; measured 1 min 12 s, roughly 5–8× under the plan floor. Phase breakdown: SCHEDULE_SCAN_LOOP 16.8 s, NODES parallel 35.4 s, WAYS parallel 20.2 s. Peak RSS 2.17 GB, p95 2.13 GB, 0 major page faults - comfortable on a 27 GB host.
 
-**Off-plan discoveries logged in `TODO.md` Performance section:** `BlobReader::seek_raw` goes through stdlib `Seek::seek` which always discards the `BufReader` buffer; fixing this to use `BufReader::seek_relative` is codebase-wide perf work beyond check-refs scope. Buffer-size tuning alone is unsafe without that fix (verified: 16 MB buffer caused a 13× regression when the seek path still discards per blob; reverted in `86761d6`).
+**Off-plan discoveries (LANDED 2026-04-18, commit `aa3147c`):** `BlobReader::seek_raw` was going through stdlib `Seek::seek` which always discards the `BufReader` buffer. Fixed via a public `BlobReaderSource` trait whose `BufReader` impl calls `BufReader::seek_relative`. Per-caller deltas in `reference/performance.md` ("seek_raw BufReader-discard fix" section) — Europe ALTW META_SCAN halved (25.9 s → 13.3 s); extract --smart Europe −7.6 % wall.
+
+**Buffer-size tuning is no longer a follow-up win** (measured 2026-04-18). With the seek_raw fix in place, total bytes read on a header walk equals the file size regardless of `BufReader` capacity — the amplification is gone, so capacity now only trades syscall count vs read granularity. Verified: bumping `seekable_from_path` from 256 KB to 16 MB on Europe ALTW external moved META_SCAN from 13.3 s to 14.6 s (slightly worse, within noise) and total wall from 270.7 s to 271.9 s (flat). The original 256 KB constant is the right choice.
 
 ### Original #2 plan (preserved for reference)
 
@@ -361,9 +363,16 @@ with a larger buffer each flush wastes more prefetched data.
 Proper fix is `BufReader::seek_relative` but that's a BufReader-specific
 method, not on the `Seek` trait. The `BlobReader<R: Seek>` generic
 abstraction can't reach it without design work. Reverted in `86761d6`.
-~10 other callers of `seekable_from_path` (extract, tags_filter, altw,
-renumber_external) are likely paying similar proportional cost;
-investigation logged in `TODO.md` Performance section.
+
+**Resolution (2026-04-18, commit `aa3147c`):** the design work is now
+done — public `BlobReaderSource` trait with a default `skip_relative`
+overridden by the `BufReader` impl to call `BufReader::seek_relative`.
+The `BlobReader<R>` seekable bound widened from `R: Read + Seek + Send`
+to `R: BlobReaderSource + Send`. Hot-path methods route through a new
+internal `skip_blob_body` helper. Measured wall deltas in
+`reference/performance.md`. Note that with the seek now correct, the
+buffer-size knob lost its leverage — re-tested 16 MB at the same time
+and it gave no win (META_SCAN 13.3 → 14.6 s, total wall flat).
 
 ### mmap-based schedule walk — DEFERRED (not tracked)
 

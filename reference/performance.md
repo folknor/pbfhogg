@@ -41,20 +41,21 @@ Consolidated runtime measurements across datasets and commands.
 No `--type` filter. Decompresses each blob to scan IDs/tags, reframes BlobHeader
 with indexdata+tagdata, preserves original compressed bytes. No re-compression.
 
-Commit `69a127f`, plantasjen.
+| Dataset | Size | Time | Notes |
+|---------|------|------|-------|
+| Denmark | 461 MB | **2.8s** | commit `69a127f`, buffered |
+| Europe | 32.4 GB | 112s | commit `69a127f`, `--direct-io`, `--type node,way,relation` (filtered path, +3.8% size) |
+| Planet | 87 GB | **86.5s** | commit `aee7727`, buffered, UUID `5d90623f`, `--bench 1` |
 
-| Dataset | Size | Buffered | `--direct-io` | File size overhead |
-|---------|------|----------|---------------|--------------------|
-| Denmark | 461 MB | **2.8s** | - | - |
-| Europe | 32.4 GB | - | 112s* | +3.8% |
-| Planet | 87 GB | **497s** (8m17s) | 520s (+5%) | +0.5% |
-
-\* Europe used `--type node,way,relation` (filtered path, full decode+re-encode),
-not passthrough. Passthrough not yet measured for europe.
-
-Buffered wins for passthrough - sequential single-file I/O benefits from page
-cache prefetch. `--direct-io` adds alignment overhead without the concurrent
-read/write pattern that makes it faster for merge.
+The historical planet row (497s / 8m17s buffered at `69a127f`) measured a
+combined cost: sequential decompress+reframe plus the `has_indexdata` /
+`check_sorted_and_indexed` O(N) all-blobs-scan regression that was live
+through `4ce7e93..c0ae9a7`. The seek-raw fix (`aa3147c`, buffer-preserving
+`BlobReaderSource` header walk) and the short-circuit fix (`ca6711e`)
+together drop the planet run from 497s to 86.5s — a 5.8× improvement at
+the same output shape. Passthrough remains buffered-only; `--direct-io`
+adds alignment overhead without the concurrent read/write pattern that
+makes it faster for merge.
 
 The `--type` filtered path (full decode+re-encode) **OOMs on planet** (87 GB) on
 30 GB host at ~25% through. Pipelined writer's rayon pool lacks backpressure.
@@ -297,6 +298,58 @@ variance.
 ³ Renumber's −5.4 % is larger than the audit's 1–2 % prediction;
 unclear whether real or noise without `--bench 3` repeat. Not a
 regression in any case.
+
+#### Planet refresh (commit `aee7727`, 2026-04-18, plantasjen)
+
+Post-fix snapshot of every planet-capable command that was re-benched.
+All rows carry the `ca6711e` short-circuit fix and the `aa3147c`
+`BlobReaderSource` header-walk fix. Numbers are the current ground
+truth for the README table; historical README rows (most from before
+the regression window) are retained in the per-command sections below
+for cross-reference.
+
+| Command | Mode | Wall | UUID | README row before | Δ |
+|---|---|---:|---|---:|---:|
+| cat --type way | `--bench 3` | 45.3 s | `2fe62148` | 44 s | +1 s (noise) |
+| getid | `--bench 1` | 43.8 s | `5a44889d` | 66 s | **−22 s** |
+| getid --invert | `--bench 1` | 91.0 s | `40f5bd52` | 83 s | +8 s (noise) |
+| check --refs | `--bench 1` | 70.2 s | `64e9a394` | 72 s | −2 s (noise) |
+| tags-filter -R | `--bench 1` | 51.8 s | `f262f068` | 52 s | — |
+| extract --smart (Europe bbox) | `--bench 1` | 267.5 s | `07dcdae3` | 282 s | **−14 s** |
+| cat (indexdata generation) | `--bench 1` | 86.5 s | `5d90623f` | 497 s | **−410 s (5.8×)** |
+| add-locations-to-ways --index-type external | `--bench 3` | 661.2 s | `a406d77e` | 698 s | **−37 s** |
+| renumber | `--bench 3` | 204.5 s | `abd74459` | 194 s | +10 s (see note) |
+
+The headline is the unfiltered `cat` row: the 497 s → 86.5 s drop is
+the user-visible shape of the two header-walk fixes compounding on a
+command that does nothing but walk headers + rewrite BlobHeader. The
+old 497 s measurement was taken at `69a127f` (pre-regression), so this
+isn't only a regression rollback — the post-fix path is substantially
+faster than the pre-regression path too, because `seek_raw` was
+shedding buffer on every blob long before the `has_indexdata` bug
+shipped.
+
+`getid` fell 22 s at the same time, which is in the right ballpark for
+the `check_sorted_and_indexed` short-circuit saving ~20 s on
+`has_indexdata`-gated subcommands — a second independent confirmation
+of the short-circuit fix at planet scale.
+
+Renumber's +10 s (194 s → 204.5 s) is the only row pointing the wrong
+way. Both are `--bench 3`; the older 194 s was at `cb99106`, this is
+at `aee7727`, so several dozen commits of unrelated churn sit
+in-between. 5 % is inside `--bench 3` variance but not comfortably
+inside — a deliberate bisect would tell us whether something landed
+that genuinely costs. Not a release blocker and not in the critical
+planet-pipeline path (once-per-schema renumber, not a steady-state
+command), so shelving for now.
+
+Three planet rows in the README table (`check --ids --full` 1m33s,
+`apply-changes` 12m33s, `build-geocode-index` 20m55s) were not
+re-benched this round: the first tripped over a script-level
+argv-passing bug, the second needs an explicit `--osc-seq` now that
+eight daily diffs are configured, and the third OOM-killed on the
+first attempt in Pass 1.5. All three are queued for the next overnight
+(`overnight.sh`).
 
 #### Europe ALTW phase breakdown (the cleanest signal)
 

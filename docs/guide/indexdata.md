@@ -32,12 +32,12 @@ pbfhogg cat input.osm.pbf -o indexed.osm.pbf
 
 The passthrough path adds indexdata via decompress+scan without re-compressing blobs. Memory usage is minimal and the file size overhead is under 0.5%.
 
-Indexdata generation timings (commit `69a127f`):
+Indexdata generation timings:
 
-| Dataset | Size | Buffered | `--direct-io` |
-|---------|------|----------|---------------|
-| Planet | 87 GB | **497s** (8m17s) | 520s (+5%) |
-| Denmark | 461 MB | **2.8s** | -- |
+| Dataset | Size | Time | Notes |
+|---------|------|------|-------|
+| Denmark | 461 MB | **2.8s** | commit `69a127f`, buffered |
+| Planet | 87 GB | **86.5s** (1m26s) | commit `aee7727`, buffered, post-regression-fix |
 
 Buffered I/O wins for this workload - sequential single-file passthrough benefits from page cache prefetch. `--direct-io` adds alignment overhead without the concurrent read/write pattern that makes it faster for merge.
 

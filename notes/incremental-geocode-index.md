@@ -1,44 +1,56 @@
 # Incremental geocode index update
 
+> **Scope.** This plan targets *avoiding* the full rebuild when a daily
+> OSC lands — patch or merge against the existing index instead of
+> re-running the 20-minute build. Complementary effort in
+> [geocode-build-opportunities.md](geocode-build-opportunities.md)
+> targets the full-rebuild wall itself (20 min → ~10 min). Even with a
+> working incremental path, the full build remains the bootstrap and
+> the periodic-compaction fallback, so both plans land value.
+
 ## Problem
 
-Full geocode index rebuild from planet PBF takes 1,255s (20.9 min) [TAINTED — wall
-inflated by all-blobs-scan regression in `4ce7e93..c0ae9a7`; RSS unaffected] and
+Full geocode index rebuild from planet PBF takes ~1,255s (20.9 min) and
 **29.5 GB peak anon RSS** in `GEOCODE_PASS1_5` (commit `7e9c2e9`,
-2026-04-17). The earlier 17.8 GB figure under-reported: brokkr previously
-suppressed short-emitting phase markers from sidecar output, so PASS1_5's
-transient peak never showed up. The peak itself has not changed - only its
-visibility. A daily diff changes ~5-30M elements, but most geocode-
-relevant data (admin boundaries, street geometries, address points) is
-stable. Rebuilding from scratch every day wastes 99%+ of the work.
+2026-04-17). The 1,255 s wall is still carrying the
+`has_indexdata` / `check_sorted_and_indexed` regression tax (live in
+`4ce7e93..c0ae9a7`) because the planet rebench queued in `overnight.sh`
+round 2 hasn't landed yet — see
+[geocode-build-opportunities.md](geocode-build-opportunities.md) for
+the wall-time opportunity stack and rebench status. RSS / phase-peak
+data is unaffected.
 
-## Current build pipeline
+The earlier 17.8 GB figure under-reported: brokkr previously suppressed
+short-emitting phase markers from sidecar output, so PASS1_5's transient
+peak never showed up. The peak itself has not changed — only its
+visibility.
 
-4 passes over the PBF, each a full file scan:
+A daily diff changes ~5-30M elements, but most geocode-relevant data
+(admin boundaries, street geometries, address points) is stable.
+Rebuilding from scratch every day wastes 99 %+ of the work — that's the
+case for this plan, independent of whether the full-rebuild wall ends
+up at 20 min, 10 min, or 5 min.
 
-1. **Pass 1: Relations** - collect admin boundary polygons (boundary=
-   administrative with admin_level). Extract way member IDs for geometry
-   assembly. ~17M relations scanned, ~200K admin boundaries collected.
+## Current build pipeline (one-paragraph sketch)
 
-2. **Pass 1.5: Referenced node collection** - scan ways to collect node
-   IDs referenced by admin boundary ways + street ways + interpolation
-   ways. Builds an `IdSetDense` for pass 2 filtering. Planet-scale
-   memory optimization: only stores node IDs that are needed.
+Four full-file passes: Pass 1 collects admin relation boundaries, Pass
+1.5 collects the node IDs referenced by geocode-relevant ways (streets,
+interpolation, admin boundary ways) into an `IdSetDense`, Pass 2 is a
+fused node+way scan that emits address points + street ways +
+interpolation ways and resolves their coordinates through a compact
+rank-indexed coord array, and Pass 3 buckets everything by S2 cell
+(fine + coarse levels) into the final 19-file index. See
+[geocode-build-opportunities.md](geocode-build-opportunities.md#current-architecture-for-reference)
+for the full per-pass architecture — this plan only cares about what
+each pass *contributes* to the index that a diff could invalidate:
 
-3. **Pass 2: Nodes + Ways (fused)** - single scan, two outputs:
-   - Address points: nodes with `addr:housenumber` tag
-   - Street ways: ways with `highway` tag (excluding footway etc.)
-   - Interpolation ways: ways with `addr:interpolation` tag
-   - Node coordinates collected into a compact rank-indexed array
-     (same pattern as ALTW's `IdSetDense` rank + dense array)
-   Admin boundary way coordinates resolved via the rank-indexed array.
-
-4. **Pass 3: S2 cell assignment** - bucket addr points, streets, and
-   interpolation ways by S2 cell. 256 temp-file buckets per cell level.
-   Merge buckets into final cell index files. Interpolation endpoint
-   resolution via spatial join against address points.
-
-Output: 19 binary files (header, cells, entries, data, strings per type).
+- Pass 1 → admin boundary polygons (rare changes)
+- Pass 1.5 → referenced-node ID set (churns with way edits, but the
+  *set* is stable across diffs even when individual IDs change)
+- Pass 2 → address points, street ways, interpolation ways, and the
+  node-coord array (the bulk of what a diff actually mutates)
+- Pass 3 → S2 cell buckets + spatial joins (re-triggered by any
+  geometry change, even if the element itself isn't edited)
 
 ## What changes in a daily diff
 

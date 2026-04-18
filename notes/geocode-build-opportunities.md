@@ -71,6 +71,7 @@ planet is publish-only.
 | `63800d3` (post-#7) | `--bench 1` | `572ae7d5` | **65.4 s** (−8 %) |
 | `88cf796` (post-#1 Phase 2a) | `--bench 1` | `e2354bc1` | **49.0 s** (−31 % cumulative) |
 | `88cf796` Denmark smoke | `--bench 1` | `d6684457` | 5.0 s |
+| `88cf796` **Europe** | `--bench 1` | `bf8f2038` | **344 s / 5m43s** (−34 % vs 524 s pre-regression `dad0dbd`) |
 
 ### Phase breakdown (Germany `--hotpath`, UUID `90a746dd`)
 
@@ -172,6 +173,59 @@ for any reliable planet iteration on this host. See commit `63800d3`.
 - 43 K admin polygons
 - 512 K unique strings (7.5 MB strings data)
 
+### Europe phase breakdown (post-#1 Phase 2a, UUID `bf8f2038`, 344 s total)
+
+| Phase | Wall | % |
+|---|---:|---:|
+| Pass 1 relations | 16.6 s | 5 % |
+| Pass 1.5 schedule + max-node-id walk | 16.6 s | 5 % |
+| Pass 1.5 parallel scan | 6.3 s | 2 % |
+| **Pass 2a schedule walk (node blobs)** | **26.5 s** | **8 %** |
+| Pass 2a parallel node scan | 31.9 s | 9 % |
+| **Pass 2b sequential way scan** | **122.7 s** | **36 %** |
+| **Pass 2 admin assembly (sequential)** | **50.6 s** | **15 %** |
+| Pass 2 interp resolve | 15.5 s | 5 % |
+| Pass 3 admin cells (sequential flood-fill) | 10.7 s | 3 % |
+| Pass 3 fine (stage A streets + addr + stage B) | 26.4 s | 8 % |
+| Pass 3 coarse (stage A streets + addr + stage B) | 18.5 s | 5 % |
+
+Three findings from this breakdown drive the next wave of work (noted in
+the relevant opportunity items below):
+
+1. **Header-walk regression from Phase 2a.** Phase 2a calls
+   `build_classify_schedule(Node)` which walks all 32 GB of Europe blob
+   headers — 26.5 s of re-work. Pass 1.5's `build_way_schedule_and_max_node_id`
+   already does the same walk five seconds earlier and throws away the
+   node offsets. Folding node-schedule extraction into that single walk
+   saves ~26 s on Europe, scaling to ~80-100 s at planet (header-walk
+   cost is approximately file-size-linear). **This is the next easy win
+   — smallest diff, pure consolidation.**
+
+2. **Admin assembly is a sleeping giant at Europe+.** 6.8 s at Germany
+   (10 % of wall) scales to 50.6 s at Europe (15 %) because `assemble_admin_polygons`
+   iterates relations sequentially through ring assembly and Douglas-Peucker
+   simplification. Per-relation work is independent; a `par_iter` over
+   `relations` with a merge at end should give ~5× on plantasjen's 12
+   cores. Wasn't in the original plan's ranked items because Germany
+   hid the cost; Europe surfaces it. Est. ~40 s Europe, ~100-150 s planet.
+
+3. **Pass 2b confirms the plan's ~500-s-at-planet Phase-2b-parallel
+   projection.** 122.7 s sequential ways on Europe = ~73 % of what
+   Germany's Pass 2b extrapolated to predict, scaling to ~1000+ s at
+   planet. This is the biggest remaining single target, but it's also
+   the largest diff (per-worker tmp files + offset-patched
+   concatenation). Land after items #1 Phase 2a follow-up + admin
+   assembly parallelisation have compressed the critical path.
+
+**Combined projection if all three land.** Europe: 344 s − 26 s
+(consolidation) − 40 s (admin assembly parallel ~5×) − 97 s (Phase 2b
+parallel ~5×) ≈ **181 s, roughly 3 min**. Planet (treating each phase's
+wall as roughly file-size-linear from Europe's 35 GB to 87 GB, i.e.
+~2.5×): 828 s baseline − ~70 s consolidation − ~100 s admin parallel
+− ~240 s Phase 2b parallel ≈ **420 s ≈ 7 min** — comfortably inside the
+plan's 10-12 min target. Items #3/#4/#5/#6 then move from
+"must-land-to-hit-target" to "cleanup toward comfortable margin".
+
 ## Current architecture (for reference)
 
 **Pass 1** [(builder.rs:402)](../src/geocode_index/builder.rs#L402). Sequential scan of relation blobs via `ElementReader::for_each_block_pipelined` with `BlobFilter::only_relations()`. Collects `RawAdminRelation` list (admin + postal boundaries) and builds `needed_admin_ways` `IdSetDense` from member way IDs. Output volume is small.
@@ -233,7 +287,19 @@ the previous sequential path.
 Germany measured: Pass 2 scan 42.0 s → ~26 s (−38 %), total wall 65.4 s →
 49.0 s (−25 %). Denmark smoke: 5.0 s, smoke-test passes.
 
-**Follow-up (open): main-thread merge bottleneck.** Phase 2a currently
+**Follow-up A (open, next easy win): header-walk consolidation.** Phase
+2a calls `build_classify_schedule(Node)` which re-walks all blob headers
+to produce the node schedule — 26.5 s on Europe, 2.3 s on Germany.
+Pass 1.5's `build_way_schedule_and_max_node_id` already does exactly
+this walk a few phases earlier and throws away the node-blob offsets.
+Folding node-schedule extraction into that single walk (mirroring
+`build_classify_schedules_split`'s one-pass multi-kind shape) makes the
+walker return `(node_schedule, way_schedule, max_node_id, shared_file)`
+and lets run_pass2 skip the re-walk. Smallest diff of the next-wave
+items; pure consolidation, no semantic change. Est. −26 s Europe, ~−80
+s planet. Land first.
+
+**Follow-up B (open): main-thread merge bottleneck.** Phase 2a currently
 pushes 116 M `(u64, i32, i32) = 16 bytes` coord-write tuples (~1.86 GB
 on Germany) through the merge channel — the main thread becomes the
 serialization point. Two candidate fixes:
@@ -318,6 +384,25 @@ Restructure Pass 3 to **one fused parallel pass**:
 
 **Expected win: 20-60 s at planet.**
 
+### #8 - Parallelize admin polygon assembly
+
+Surfaced by the Europe phase breakdown (not in the original plan).
+[`assemble_admin_polygons`](../src/geocode_index/builder/admin.rs#L23)
+iterates admin relations sequentially, running ring assembly + hole
+attachment + Douglas-Peucker simplification per polygon. Per-relation
+work is independent; Europe shows 50.6 s sequential at 12-15 % of
+wall, scaling to ~125 s at planet where admin polygon count rises
+further.
+
+`par_iter` over `relations` with a collect-into-Vec at end should give
+~5× on plantasjen's 12 cores. The `way_geom` lookups are already
+read-only by this point (populated during Phase 2b), and
+`crate::geo::{assemble_rings, simplify_ring, point_in_ring, signed_area}`
+are pure.
+
+**Expected win: ~40 s Europe, ~100-125 s planet.** Straightforward —
+no new intermediate data structures.
+
 ### #7 - Shared atomic IdSetDense in Pass 1.5 — LANDED 2026-04-18 (commit `63800d3`)
 
 Previously used **per-worker `IdSetDense` accumulation** — each worker
@@ -387,31 +472,45 @@ A CSR-style layout (one contiguous offsets array + one contiguous values array, 
    `88cf796`. Pass 2 scan 42 s → ~26 s on Germany; total wall 65.4 s →
    49.0 s.
 
-**Next (in order of estimated ROI):**
+**Next (in order of estimated ROI, revised after the 2026-04-18 Europe bench):**
 
-4. **Item #1 Phase 2a follow-up — direct `coord_mmap` writes from workers.**
-   The main-thread merge closure currently serialises 1.86 GB of
-   coord-write traffic; moving writes into workers via disjoint rank
-   ranges should recover ~5-7 s on Germany (~50-70 s at planet).
-   Smaller scope than Phase 2b; land first.
-5. **Item #1 Phase 2b — parallel way scan.** Per-worker tmp files plus
-   offset-patched concatenation for `street_nodes.bin` /
+4. **#1 Phase 2a follow-up A — header-walk consolidation.** Next easy
+   win: fold Pass 2a's `build_classify_schedule(Node)` call into Pass
+   1.5's existing `build_way_schedule_and_max_node_id` walker, making
+   it produce `(node_schedule, way_schedule, max_node_id, shared_file)`
+   from a single header pass. Pure refactor, no semantic change. Est.
+   −26 s Europe, ~−80 s planet.
+5. **#8 — parallelise admin polygon assembly.** `par_iter` over admin
+   relations in `assemble_admin_polygons`. Europe shows this phase at
+   50.6 s / 15 % of wall, scaling to ~125 s at planet; with 12 cores
+   this should drop to ~10 s Europe / ~25 s planet. Independent per
+   polygon, no new data structures needed.
+6. **#1 Phase 2a follow-up B — direct `coord_mmap` writes from workers.**
+   Moves 1.86 GB-Germany (roughly 5 GB-Europe, ~15 GB-planet) of
+   coord-write traffic off the main-thread merge channel. Est. −5-7 s
+   Germany, −15-20 s Europe, −50-60 s planet. Smaller scope than the
+   header consolidation but larger than admin assembly; land after both.
+7. **#1 Phase 2b — parallel way scan.** Biggest remaining single target:
+   122.7 s Europe sequential scales to ~330 s planet sequential; with
+   ~5× parallelisation that drops to ~65 s planet. Per-worker tmp
+   files plus offset-patched concatenation for `street_nodes.bin` /
    `interp_nodes.bin`, per-worker `StringPool` with sequential remap.
-   Est. ~5 s on Germany (~80-100 s planet). Larger diff surface — land
-   after the Phase 2a follow-up stabilises.
-6. **Items #3 + #4 together** — Pass 3 stage B parallel + fine/coarse
-   fusion. They touch the same rewrite surface in
-   `bucketed_cell_assignment`; doing them in one pass avoids two
-   rounds of diff churn. Est. ~4 s on Germany (~80-140 s planet).
-7. **Item #5 + #6** — small cell-assignment parallelisations (addr
-   points / interpolation / admin flood-fill). Low risk, est. ~1-2 s
-   on Germany, larger at planet.
-8. **Item #2 — Pass 1.5 wire-format scanner.** Pass 1.5 is down to 1.1 s
-   on Germany after item #7, so the expected win is ≤0.5 s — low ROI
-   vs implementation cost. Re-evaluate at planet scale once items #3-#6
-   land; if planet Pass 1.5 stays > 20 s after the RSS fix, reconsider.
-9. **Interpolation endpoint CSR** — RSS hygiene, not wall. Revisit once
-   wall-time targets are met.
+   Largest diff surface of the remaining work — land last to benefit
+   from whatever measurement / pattern improvements earlier items
+   reveal.
+8. **#3 + #4 together** — Pass 3 stage B parallel + fine/coarse fusion.
+   Europe shows Pass 3 total at ~45 s / 13 % of wall; at planet this
+   will be ~115 s. They touch the same rewrite surface in
+   `bucketed_cell_assignment`.
+9. **#5 + #6** — small cell-assignment parallelisations (addr points /
+   interpolation / admin flood-fill). Lower ROI than earlier items but
+   straightforward.
+10. **#2 — Pass 1.5 wire-format scanner.** Pass 1.5 is down to 1.1 s
+    Germany / 6.3 s Europe after item #7. Expected win is small on
+    both; re-evaluate at planet scale once items #3-#6 land. If
+    planet Pass 1.5 stays noticeably large post-fix, reconsider.
+11. **Interpolation endpoint CSR** — RSS hygiene, not wall. Revisit once
+    wall-time targets are met.
 
 Cross-validation: there's no `brokkr verify` for the geocode index.
 Byte-for-byte comparison of the output directory across builds

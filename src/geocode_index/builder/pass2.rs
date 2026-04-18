@@ -73,14 +73,15 @@ pub(super) struct SlimInterpWay {
 // Phase 2a: parallel node scan
 // ---------------------------------------------------------------------------
 
-/// Per-blob output from Phase 2a workers: coord writes (one per referenced
-/// node) and pending `AddrPoint`s (for nodes with addr:housenumber +
-/// addr:street tags). Strings are owned so the main thread can intern them
-/// into the shared `StringPool` at merge time — workers can't touch
+/// Per-blob output from Phase 2a workers: pending `AddrPoint`s only —
+/// coord writes go straight to `coord_mmap` from the worker (see
+/// `CoordMmapShared` below), avoiding the 1.86 GB-on-Germany channel
+/// traffic that the earlier "coord writes in NodeBlobOut" shape carried.
+/// Strings stay owned (`Box<str>`) so the main thread interns them into
+/// the shared `StringPool` at merge time — workers can't touch
 /// `StringPool` directly without serialising on a mutex.
 #[derive(Default)]
 struct NodeBlobOut {
-    coord_writes: Vec<(u64, i32, i32)>,
     addr_points: Vec<PendingAddrPoint>,
 }
 
@@ -90,6 +91,58 @@ struct PendingAddrPoint {
     hn: Box<str>,
     st: Box<str>,
     pc: Option<Box<str>>,
+}
+
+/// Sync-safe wrapper around the `coord_mmap`'s raw pointer for Phase 2a
+/// workers. Workers write `(lat_e7, lon_e7)` pairs at disjoint rank
+/// offsets — the disjointness invariant follows from
+/// `IdSetDense::rank(id)` being a unique index per set ID, combined with
+/// sorted PBF guaranteeing every node ID appears in at most one blob.
+/// No atomics needed because no two workers ever touch the same byte.
+///
+/// # Safety
+///
+/// The caller must guarantee:
+/// - `ptr` remains valid and pointing at a `len`-byte allocation for
+///   the entire lifetime of the `CoordMmapShared` value (callers hold
+///   the owning `MmapMut` on the stack across the Phase 2a scope).
+/// - Every `rank` value passed to `write_coord` satisfies
+///   `rank * 8 + 8 <= len` — the per-blob `ref_rank_end` and
+///   `IdSetDense::total_count()` together bound this.
+/// - No two concurrent calls to `write_coord` pass the same `rank`.
+struct CoordMmapShared {
+    ptr: *mut u8,
+    len: usize,
+}
+
+// SAFETY: `ptr` is only dereferenced through `write_coord`, which writes
+// 8 bytes at a disjoint offset per call. See the invariants on the
+// struct docs.
+unsafe impl Sync for CoordMmapShared {}
+unsafe impl Send for CoordMmapShared {}
+
+impl CoordMmapShared {
+    /// Write `(lat_e7, lon_e7)` at the 8-byte slot `rank * 8`.
+    ///
+    /// # Safety
+    ///
+    /// See struct-level docs. Caller must ensure no two workers pass the
+    /// same `rank` concurrently, and that `rank * 8 + 8 <= self.len`.
+    unsafe fn write_coord(&self, rank: u64, lat_e7: i32, lon_e7: i32) {
+        #[allow(clippy::cast_possible_truncation)]
+        let off = (rank as usize) * 8;
+        debug_assert!(off + 8 <= self.len,
+            "CoordMmapShared: rank {rank} (offset {off}) out of bounds (len {})", self.len);
+        let lat_bytes = lat_e7.to_le_bytes();
+        let lon_bytes = lon_e7.to_le_bytes();
+        // SAFETY: caller guarantees disjoint ranks and in-bounds `off`
+        // (debug_assert above catches regressions during testing).
+        unsafe {
+            let p = self.ptr.add(off);
+            std::ptr::copy_nonoverlapping(lat_bytes.as_ptr(), p, 4);
+            std::ptr::copy_nonoverlapping(lon_bytes.as_ptr(), p.add(4), 4);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -360,24 +413,31 @@ pub(super) fn run_pass2(
 
     // ---------------- Phase 2a: parallel node scan ----------------
     //
-    // Workers decode node blobs via `parallel_classify_phase`; each returns
-    // a `NodeBlobOut` with the `(rank, lat, lon)` coord writes for
-    // referenced nodes and a `Vec<PendingAddrPoint>` for addr-tagged nodes.
-    // The main thread applies coord_mmap writes (safe: disjoint ranks),
-    // interns strings into the shared `StringPool`, and streams
-    // `AddrPoint`s to `addr_points.bin` in blob-sequence order.
+    // Workers decode node blobs via `parallel_classify_phase`. Two outputs:
     //
-    // Why strings are owned (`Box<str>`) rather than kept as `&str` into
-    // the PrimitiveBlock: `PrimitiveBlock` is dropped inside the worker at
-    // the end of each blob, so any `&str` borrows expire before the main
-    // thread sees them. 3 short strings per addr point × ~Germany-scale
-    // (19.8 M addr points) × ~10-20 byte each ≈ 500-700 MB peak in-flight,
-    // but `parallel_classify_phase` caps the worker→merge channel at 32
-    // blobs so the live footprint is much smaller (~tens of MB).
+    // 1. **Coord writes** land directly in `coord_mmap` from the worker
+    //    via `CoordMmapShared::write_coord`. `IdSetDense::rank(id)` is
+    //    unique per set ID, and sorted PBF guarantees each node ID
+    //    appears in at most one blob, so workers never conflict on the
+    //    same byte. Previously these writes flowed through the merge
+    //    channel as a `Vec<(u64, i32, i32)>` per blob (1.86 GB of
+    //    Germany traffic); moving them to the worker eliminates the
+    //    main-thread serialisation bottleneck.
+    //
+    // 2. **Pending addr points** (addr-tagged nodes) flow to the main
+    //    thread via the merge closure, which interns strings into the
+    //    shared `StringPool` and streams `AddrPoint`s to
+    //    `addr_points.bin` in blob-sequence order. Strings are owned
+    //    (`Box<str>`) because `PrimitiveBlock` is dropped inside the
+    //    worker — `&str` borrows into it would expire before merge.
     crate::debug::emit_marker("GEOCODE_PASS2A_START");
     {
         let referenced_ref = &referenced_nodes;
-        let coord_mmap_ref = &mut *coord_mmap;
+        let coord_shared = CoordMmapShared {
+            ptr: coord_mmap.as_mut_ptr(),
+            len: coord_mmap.len(),
+        };
+        let coord_ref = &coord_shared;
         let mut merge_err: Option<std::io::Error> = None;
         crate::commands::parallel_classify_phase(
             shared_file,
@@ -389,7 +449,9 @@ pub(super) fn run_pass2(
                         let lat_e7 = node.decimicro_lat();
                         let lon_e7 = node.decimicro_lon();
                         if let Some(rank) = referenced_ref.rank_if_set(node.id()) {
-                            state.coord_writes.push((rank, lat_e7, lon_e7));
+                            // SAFETY: disjoint ranks guaranteed by sorted PBF +
+                            // unique rank-per-id in IdSetDense. See CoordMmapShared docs.
+                            unsafe { coord_ref.write_coord(rank, lat_e7, lon_e7); }
                         }
                         let mut hn: Option<&str> = None;
                         let mut st: Option<&str> = None;
@@ -416,12 +478,6 @@ pub(super) fn run_pass2(
             },
             |_seq, out| {
                 if merge_err.is_some() { return; }
-                for (rank, lat, lon) in out.coord_writes {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let off = (rank as usize) * 8;
-                    coord_mmap_ref[off..off + 4].copy_from_slice(&lat.to_le_bytes());
-                    coord_mmap_ref[off + 4..off + 8].copy_from_slice(&lon.to_le_bytes());
-                }
                 for pap in out.addr_points {
                     let hn_off = strings.intern(&pap.hn);
                     let st_off = strings.intern(&pap.st);

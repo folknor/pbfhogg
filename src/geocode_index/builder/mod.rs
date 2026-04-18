@@ -280,40 +280,35 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let admin_cell_entries = pass3::assign_admin_cells(&admin_polygons, config.admin_level);
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_END");
 
-    // Process fine and coarse levels via bucketed distribution
-    let shared = pass3::CellAssignmentParams {
-        output_dir: &config.output_dir,
-        street_ways_mmap: &street_ways_mmap,
-        street_nodes_mmap: &street_nodes_mmap,
-        street_way_count,
-        addr_points_mmap: &addr_points_mmap,
-        addr_point_count,
-        interp_ways: &interp_ways,
-        interp_nodes_mmap: &interp_nodes_mmap,
-        // Overridden per call:
-        cells_file: "", street_entries_file: "", addr_entries_file: "",
-        interp_entries_file: "", level: 0,
-    };
-    crate::debug::emit_marker("GEOCODE_PASS3_FINE_START");
-    let fine_count = pass3::bucketed_cell_assignment(&pass3::CellAssignmentParams {
-        cells_file: FILE_GEO_CELLS,
-        street_entries_file: FILE_STREET_ENTRIES,
-        addr_entries_file: FILE_ADDR_ENTRIES,
-        interp_entries_file: FILE_INTERP_ENTRIES,
-        level: sl,
-        ..shared
-    })?;
-    crate::debug::emit_marker("GEOCODE_PASS3_FINE_END");
-    crate::debug::emit_marker("GEOCODE_PASS3_COARSE_START");
-    let coarse_count = pass3::bucketed_cell_assignment(&pass3::CellAssignmentParams {
-        cells_file: FILE_COARSE_GEO_CELLS,
-        street_entries_file: FILE_COARSE_STREET_ENTRIES,
-        addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
-        interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
-        level: cl,
-        ..shared
-    })?;
-    crate::debug::emit_marker("GEOCODE_PASS3_COARSE_END");
+    // Fused fine + coarse cell assignment (plan item #4). Single Stage A
+    // pass over streets/addrs/interps at the fine level derives coarse
+    // cells on the fly via S2 parent + per-segment dedup, eliminating
+    // the duplicate `cover_segment` pass that ran separately at coarse
+    // level. Two Stage B invocations follow — one per bucket tree.
+    crate::debug::emit_marker("GEOCODE_PASS3_CELLS_START");
+    let (fine_count, coarse_count) = pass3::bucketed_cell_assignment_fused(
+        &pass3::FusedCellAssignmentParams {
+            output_dir: &config.output_dir,
+            street_ways_mmap: &street_ways_mmap,
+            street_nodes_mmap: &street_nodes_mmap,
+            street_way_count,
+            addr_points_mmap: &addr_points_mmap,
+            addr_point_count,
+            interp_ways: &interp_ways,
+            interp_nodes_mmap: &interp_nodes_mmap,
+            fine_level: sl,
+            coarse_level: cl,
+            fine_cells_file: FILE_GEO_CELLS,
+            fine_street_entries_file: FILE_STREET_ENTRIES,
+            fine_addr_entries_file: FILE_ADDR_ENTRIES,
+            fine_interp_entries_file: FILE_INTERP_ENTRIES,
+            coarse_cells_file: FILE_COARSE_GEO_CELLS,
+            coarse_street_entries_file: FILE_COARSE_STREET_ENTRIES,
+            coarse_addr_entries_file: FILE_COARSE_ADDR_ENTRIES,
+            coarse_interp_entries_file: FILE_COARSE_INTERP_ENTRIES,
+        },
+    )?;
+    crate::debug::emit_marker("GEOCODE_PASS3_CELLS_END");
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
     crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");

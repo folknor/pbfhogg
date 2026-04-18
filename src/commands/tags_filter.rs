@@ -777,16 +777,14 @@ fn tags_filter_two_pass(
     // DO NOT add blob-level raw passthrough here (wire-format ID scanner,
     // "all elements in this blob are in the include set -> write blob raw").
     //
-    // This looked promising on paper and is described as an opportunity in
-    // older iterations of notes/raw-group-passthrough.md / TODO.md. It was
-    // measured end-to-end on 2026-04-18 at commit `a5c6854` via a shadow
-    // counter that did the full ID-set classification per blob without
-    // actually passing anything through raw (UUID `8c786794`,
-    // `w/highway=primary` on planet):
+    // Measured end-to-end on 2026-04-18 via a shadow counter that did the
+    // full ID-set classification per blob without actually passing anything
+    // through raw. Commit `a5c6854` (shadow added) reverted in `0ef4107`
+    // (shadow removed), UUID `8c786794`, `w/highway=primary` on planet:
     //
     //   0 / 50,364 pass-2 blobs would have qualified. Zero. Across
-    //   17,529 way blobs (0.34 % element match rate) and 32,835 node
-    //   blobs (0.40 % element match rate).
+    //   17,529 way blobs (0.34 % per-element match rate) and 32,835
+    //   node blobs (0.40 % per-element match rate).
     //
     // The math is hostile in general, not just for highway=primary:
     // ~8,000 elements per blob, any realistic per-element match rate
@@ -799,13 +797,12 @@ fn tags_filter_two_pass(
     //
     // The stricter `all_direct` gate (required when `remove_tags` is set,
     // since raw passthrough cannot strip tags off non-direct matches) is
-    // even tighter than `all_included` and also measured 0 at planet.
+    // tighter than `all_included` and also measured 0 at planet.
     //
-    // So: no ID scanner here. No per-group scanner either. The shadow
-    // counter has been removed; this comment is the pin that keeps the
-    // door shut. See notes/raw-group-passthrough.md for the full
-    // post-mortem. Pread workers are kept for planet safety (no
-    // cross-thread PrimitiveBlock retention), not for passthrough.
+    // So: no ID scanner here. No per-group scanner either. This comment
+    // is the pin that keeps the door shut. Pread workers are kept for
+    // planet safety (no cross-thread PrimitiveBlock retention), not for
+    // passthrough.
     {
     use std::os::unix::fs::FileExt as _;
 

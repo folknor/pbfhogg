@@ -231,19 +231,25 @@ getid --invert (blobs with no ID-range intersection pass through raw,
 Denmark 1.9s → 0.5s, Japan 8.6s → 1.3s). getid include mode skips
 decompression of non-intersecting blobs (planet 71.5s → 32.5s, 2.2x).
 
-The remaining opportunity is extending raw passthrough to other
-re-encoding commands: tags-filter, renumber, time-filter.
-These still fully decode and re-encode via BlockBuilder.
-For tags-filter: blobs where ALL elements match the tag expression
-could be passed through raw (requires blob-level tag index check).
-For renumber/time-filter: every element is modified, so raw passthrough
-does not apply - the win here is write-path throughput instead.
-See [notes/raw-group-passthrough.md](notes/raw-group-passthrough.md).
+The remaining re-encoding commands - tags-filter, renumber, time-filter -
+still fully decode and re-encode via BlockBuilder. Of these:
+
+- **tags-filter** is closed: blob-level raw passthrough was measured on
+  2026-04-18 (shadow counter, commit `a5c6854` reverted in `0ef4107`,
+  UUID `8c786794` at `w/highway=primary` on planet) and 0 / 50,364
+  pass-2 blobs qualified. The load-bearing pin is the comment block
+  at the pass-2 worker in `src/commands/tags_filter.rs`.
+- **renumber / time-filter**: every element is modified, so raw
+  passthrough does not apply - the win here is write-path throughput
+  instead.
 
 Four per-group raw passthrough primitives are committed as scaffolding
 for partial-match blobs (e.g., extract boundary blobs where some groups
 match and some don't). Currently unused - blob-level passthrough handles
-the common case. See `notes/raw-group-passthrough.md` "Infrastructure":
+the common case. Design tradeoffs and the measurement prerequisite live
+in the module doc comment at `src/write/raw_passthrough.rs`. The
+primitives themselves:
+
 - `PrimitiveBlock::raw_group_bytes(index)` - raw PrimitiveGroup bytes
 - `PrimitiveBlock::raw_stringtable_bytes()` - raw StringTable bytes
 - `PrimitiveBlock::block_scalars()` - granularity, lat/lon offset
@@ -290,17 +296,17 @@ knob is pure wall/interop trade-off, not a size trade-off.
 **Do later:**
 
 - [x] ~~**Tags-filter raw passthrough via lightweight ID scanner**~~ -
-  **DISPROVEN 2026-04-18** via shadow counter at commit `a5c6854` (planet
-  `w/highway=primary`, UUID `8c786794`): 0 / 50,364 pass-2 blobs would
-  have qualified. Per-element match rates of 0.34 % (ways) and 0.40 %
-  (nodes) with ~8,000 elements per blob make the all-match gate
-  effectively unreachable; ID-sorted PBFs destroy any geographic tag
-  clustering that might have rescued it. Any filter broad enough to
-  actually match 100 % of elements in 100 % of blobs is already caught
-  by blob-level type/tag-index filtering upstream. The load-bearing
-  pin is the comment block in the pass-2 worker in
-  `src/commands/tags_filter.rs`; the post-mortem is in
-  `notes/raw-group-passthrough.md`.
+  **DISPROVEN 2026-04-18** via shadow counter at commit `a5c6854`
+  (reverted in `0ef4107`, planet `w/highway=primary`, UUID
+  `8c786794`): 0 / 50,364 pass-2 blobs would have qualified.
+  Per-element match rates of 0.34 % (ways) and 0.40 % (nodes) with
+  ~8,000 elements per blob make the all-match gate effectively
+  unreachable; ID-sorted PBFs destroy any geographic tag clustering
+  that might have rescued it. Any filter broad enough to actually
+  match 100 % of elements in 100 % of blobs is already caught by
+  blob-level type/tag-index filtering upstream. The load-bearing pin
+  is the comment block in the pass-2 worker in
+  `src/commands/tags_filter.rs`.
 
 - [ ] **`pread_execute` opens a new `Arc<File>` per call** - simple extract
   calls it 3 times for the same input file. Could share the file handle

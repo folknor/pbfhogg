@@ -142,7 +142,31 @@ multi-extract (5-20 regions), linear scan is fine.
 ## Relationship to other documents
 
 - Columnar node classification → `notes/columnar-integration.md`
-- Raw passthrough → `notes/raw-group-passthrough.md` (blob-level, not
-  per-group; the per-group primitives are unused scaffolding)
 - Known issues (strip-4 verify failure, polygon passthrough safety,
   O(workers × regions) scaling) → TODO.md multi-extract section
+
+### Before building raw passthrough here: measure the qualifying-blob fraction
+
+Item #6 in the priority order above (raw passthrough for contained
+blobs) has a methodology prerequisite. On 2026-04-18 the tags-filter
+raw-passthrough opportunity was disproven via a shadow counter: 0 /
+50,364 pass-2 blobs on planet `w/highway=primary` would have qualified
+under the "all elements in include set" gate (commit `a5c6854` added
+the counter, `0ef4107` removed it; UUID `8c786794`). ~8,000 elements
+per blob times any realistic per-element match rate makes the
+all-match gate vanishingly rare for ID-sorted PBFs.
+
+Multi-extract's geometry is different - region-contained blobs really
+do cluster (each region is a contiguous bbox, blobs span short ID
+ranges, containment is monotonic within a bbox). So the math probably
+comes out the other way here. But *measure it*: add a shadow counter
+in the classify worker that reports per-region `contained_blobs /
+total_blobs` before building the raw-write path. Unsafe gate for
+polygon regions (the existing TODO.md note) is a separate issue -
+confirm both the fraction and the safety gate before shipping.
+
+The load-bearing pin against re-attempting tags-filter passthrough is
+the comment block in the pass-2 worker in
+`src/commands/tags_filter.rs`; the per-group scaffolding in
+`src/write/raw_passthrough.rs` is the design surface if multi-extract
+or anyone else needs partial-blob passthrough later.

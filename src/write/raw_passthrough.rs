@@ -4,7 +4,28 @@
 //! instead of decoding + re-encoding via BlockBuilder. The StringTable is copied
 //! whole. Only partial-match groups need full decode + re-encode.
 //!
-//! See `notes/raw-group-passthrough.md` for the design.
+//! **Status:** primitives are scaffolding (`#[allow(dead_code)]`) with no live
+//! consumer. Blob-level passthrough in extract / cat / getid handles the
+//! 90 %+-interior cases and is the right granularity when it fires.
+//!
+//! **Mixing raw and re-encoded groups in one output blob** is the real design
+//! question any future consumer has to answer. Raw groups carry the original
+//! string-table indices; BlockBuilder issues fresh indices. Two viable shapes:
+//!
+//! 1. *String-table-aligned re-encode*: copy the original StringTable whole,
+//!    re-encode partial groups against those existing indices instead of
+//!    BlockBuilder's own table. Requires a different encode path on the
+//!    write side; preserves one output blob per input blob.
+//! 2. *Split output*: emit raw-only groups and re-encoded groups as separate
+//!    output blobs. Simpler (both paths are already in the writer), doubles
+//!    boundary-blob count - acceptable if boundary blobs are a small
+//!    fraction of the output.
+//!
+//! **Measure first.** The tags-filter blob-level scanner was disproven on
+//! 2026-04-18 (0 / 50,364 planet blobs qualified); the same class of
+//! shadow-counter measurement - "how many blobs would actually qualify
+//! under this gate, on a real workload" - is the prerequisite for building
+//! either of the per-group shapes above.
 
 use protohoggr::{encode_bytes_field_always, encode_varint};
 

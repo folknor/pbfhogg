@@ -506,8 +506,8 @@ impl PrimitiveBlock {
 
     /// Returns the raw protobuf bytes of a PrimitiveGroup by index.
     /// Scaffolding for future per-group raw passthrough - see
-    /// `notes/raw-group-passthrough.md` and `frame_raw_block` in
-    /// `src/write/raw_passthrough.rs`.
+    /// `frame_raw_block` in `src/write/raw_passthrough.rs` for the design
+    /// tradeoffs and the measurement prerequisite.
     #[allow(dead_code)]
     pub(crate) fn raw_group_bytes(&self, index: usize) -> &[u8] {
         self.block.group(index)

@@ -14,47 +14,91 @@ Blob-level raw passthrough is shipped for three commands:
   (planet 71.5s → 32.5s, 2.2x). Not full raw passthrough but same
   principle.
 
-## Tags-filter raw passthrough
+## Tags-filter raw passthrough - DISPROVEN 2026-04-18
 
-Raw passthrough for all-match blobs was attempted but removed:
-`count_in_range >= blob_count` is unsound (extraneous IDs from other
-blobs inflate the count). The correct approach: a lightweight per-blob
-wire-format ID scanner that confirms every element in the blob is in the
-matched set before passing through raw. See TODO.md.
+**Do not re-attempt.** The load-bearing comment lives in
+[`src/commands/tags_filter.rs`](../src/commands/tags_filter.rs) at the
+head of the pass-2 worker; this section is the full post-mortem.
 
-**Investigation (April 2026):** This approach only works for the
-two-pass path (with `--add-referenced-ways`) where pass 1 has already
-collected matched IDs into an `IdSetDense`. The single-pass path
-evaluates tag expressions on the fly - there's no pre-computed ID set
-to check against.
+### History
 
-Even for the two-pass path, blob-level raw passthrough is limited by
-what the `TagIndex` stores. The tag index records which *keys* appear
-in the blob, not which elements have which keys. You can't determine
-from blob-level data alone that ALL elements match a tag expression.
-For `building=*` (key-only match), the tag index says `building` is
-present in the blob, but not whether every element has it - some
-elements may have no `building` tag at all.
+Raw passthrough for all-match blobs was attempted and removed once before:
+the `count_in_range >= blob_count` heuristic was unsound (extraneous IDs
+from other blobs inflate the count). After that, the agreed correct
+approach was a lightweight per-blob wire-format ID scanner that confirms
+every element in the blob is in the pass-1 matched set before passing
+through raw. The design reads:
 
-The per-blob wire-format ID scanner approach would:
-1. After pass 1 builds the matched ID set (IdSetDense)
+1. Pass 1 builds the matched ID set (`IdSetDense`)
 2. For each blob in pass 2: scan wire-format element IDs (field 1 of
    each element message - cheap, skips string table / tags / refs)
-3. If every ID is in the matched set → blob passes through raw
-4. Otherwise → full decode + filter as now
+3. If every ID is in the matched set -> blob passes through raw
+4. Otherwise -> full decode + filter as now
 
 This is lighter than full PrimitiveBlock decode (no string table
-parsing, no tag parsing, no ref/member parsing - just IDs). The win
-depends on what fraction of blobs are 100% matched. For broad filters
-like `building=*`, most way blobs contain a mix of matching and
-non-matching elements, so few blobs would qualify for passthrough.
-For type-specific filters on sorted PBFs (e.g., all-relation
-expressions), blob-level type filtering already skips non-matching
-blobs entirely.
+parsing, no tag parsing, no ref/member parsing - just IDs).
 
-**Verdict:** Low priority. The benefit is bounded by the fraction of
-100%-matched blobs, which is small for typical tag filter expressions.
-The blob-level type + tag key filtering already skips the easy wins.
+Constraints identified during April 2026 investigation:
+- Only works for the two-pass path (default mode, not `-R`), because
+  the single-pass path evaluates tag expressions on the fly with no
+  pre-computed ID set to check against.
+- The blob-level `TagIndex` cannot substitute for the scanner: it records
+  which *keys* appear in the blob, not which elements have which keys.
+  For `building=*` the tag index says `building` is present, but not
+  whether every element has it.
+
+### Shadow-counter measurement (2026-04-18, commit `a5c6854`)
+
+Before building the scanner, we added a shadow counter in the pass-2
+worker that did the full ID-set classification per blob (all_included /
+all_direct gates) without actually passing any blob through raw. Run on
+planet at `w/highway=primary` (UUID `8c786794`, plantasjen):
+
+| Metric | Value |
+|---|---|
+| Pass-2 blobs total | 50,364 |
+| **Blobs that would qualify under `all_included`** | **0** |
+| **Blobs that would qualify under `all_direct`** | **0** |
+| Way blobs | 17,529 |
+| Way elements total | 1,165,589,744 |
+| Way elements included | 3,983,027 (**0.34 %**) |
+| Node blobs | 32,835 |
+| Node elements total | 10,447,738,627 |
+| Node elements included | 42,283,465 (**0.40 %**) |
+
+Zero qualifying blobs out of 50,364. Not one.
+
+### Why it will not work for any other tag filter either
+
+The math is hostile in the general case, not just for
+`w/highway=primary`. A blob holds ~8,000 elements. At any realistic
+per-element match rate - 0.34 % here, or a hypothetical 10 % for a
+broader key like `building=*` - the probability of all ~8,000 elements
+matching is vanishingly small.
+
+PBFs are sorted by ID, not by geography or tag, so matching elements
+are scattered uniformly across every blob rather than clustered into a
+few. Geographic clustering of tags does exist in the source data but
+is destroyed by ID-sort. A filter that *did* match 100 % of elements
+in 100 % of blobs would be a filter that matches every element in the
+PBF, and that case is already served (faster, without an ID scan) by
+blob-level type/tag-index filtering upstream of the pass-2 worker.
+
+The stricter `all_direct` gate (required when `--remove-tags` is set,
+since raw passthrough cannot strip tags off non-direct matches) is
+tighter than `all_included` and also measured 0.
+
+### Resolution
+
+- Shadow counter removed in the same commit that removed it from this
+  note. See the pass-2 worker comment block in
+  [`src/commands/tags_filter.rs`](../src/commands/tags_filter.rs) - it
+  is the load-bearing pin that prevents re-entry.
+- No wire-format ID scanner. No per-group scanner on this command
+  either (per-group would be even more expensive to evaluate per blob
+  for even fewer qualifying cases).
+- Pread workers remain for planet safety (no cross-thread
+  PrimitiveBlock retention), not for passthrough.
 
 ## Per-group raw passthrough primitives (committed, unused)
 
@@ -108,6 +152,6 @@ boundary-to-interior ratio in multi-extract).
 | Opportunity | Status | Priority |
 |---|---|---|
 | Blob-level passthrough (extract, cat, getid) | Shipped | Done |
-| Tags-filter blob-level (ID scanner) | Designed, not implemented | Low |
+| Tags-filter blob-level (ID scanner) | **DISPROVEN 2026-04-18** (0/50,364 blobs qualify at planet) | Closed |
 | Per-group passthrough (boundary blobs) | Scaffolding committed | Low |
 | Renumber/time-filter | Not applicable (every element modified) | N/A |

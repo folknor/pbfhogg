@@ -364,175 +364,6 @@ struct Pass2IdSets<'a> {
     relation_dep_node_ids: &'a IdSetDense,
 }
 
-/// Shadow-mode counters: what fraction of pass-2 blobs would qualify for
-/// raw passthrough if we had a wire-format ID scanner. Measurement only,
-/// no behavior change. `all_included` is the gate for the default path;
-/// `all_direct` is the stricter gate required when `remove_tags` is set
-/// (since non-direct matches must have tags stripped, which raw passthrough
-/// cannot do).
-#[derive(Default, Clone, Copy)]
-struct ShadowStats {
-    blobs_total: u64,
-    elements_total: u64,
-    blobs_all_included: u64,
-    elements_in_all_included: u64,
-    blobs_all_direct: u64,
-    elements_in_all_direct: u64,
-
-    way_blobs: u64,
-    way_blobs_all_included: u64,
-    way_blobs_all_direct: u64,
-    way_elements_total: u64,
-    way_elements_included: u64,
-    way_elements_direct: u64,
-
-    node_blobs: u64,
-    node_blobs_all_included: u64,
-    node_elements_total: u64,
-    node_elements_included: u64,
-
-    relation_blobs: u64,
-    relation_blobs_all_included: u64,
-    relation_blobs_all_direct: u64,
-    relation_elements_total: u64,
-    relation_elements_included: u64,
-    relation_elements_direct: u64,
-}
-
-impl ShadowStats {
-    fn merge(&mut self, o: &ShadowStats) {
-        self.blobs_total += o.blobs_total;
-        self.elements_total += o.elements_total;
-        self.blobs_all_included += o.blobs_all_included;
-        self.elements_in_all_included += o.elements_in_all_included;
-        self.blobs_all_direct += o.blobs_all_direct;
-        self.elements_in_all_direct += o.elements_in_all_direct;
-
-        self.way_blobs += o.way_blobs;
-        self.way_blobs_all_included += o.way_blobs_all_included;
-        self.way_blobs_all_direct += o.way_blobs_all_direct;
-        self.way_elements_total += o.way_elements_total;
-        self.way_elements_included += o.way_elements_included;
-        self.way_elements_direct += o.way_elements_direct;
-
-        self.node_blobs += o.node_blobs;
-        self.node_blobs_all_included += o.node_blobs_all_included;
-        self.node_elements_total += o.node_elements_total;
-        self.node_elements_included += o.node_elements_included;
-
-        self.relation_blobs += o.relation_blobs;
-        self.relation_blobs_all_included += o.relation_blobs_all_included;
-        self.relation_blobs_all_direct += o.relation_blobs_all_direct;
-        self.relation_elements_total += o.relation_elements_total;
-        self.relation_elements_included += o.relation_elements_included;
-        self.relation_elements_direct += o.relation_elements_direct;
-    }
-}
-
-/// One pass over a decoded block's element IDs. Cheap (IDs only, no string
-/// table / tag / ref parsing). Classifies the blob as all-included /
-/// all-direct for raw-passthrough eligibility analysis.
-fn shadow_classify_block(block: &PrimitiveBlock, ids: &Pass2IdSets<'_>) -> ShadowStats {
-    let (mut w_total, mut w_inc, mut w_dir) = (0_u64, 0_u64, 0_u64);
-    let (mut n_total, mut n_inc) = (0_u64, 0_u64);
-    let (mut r_total, mut r_inc, mut r_dir) = (0_u64, 0_u64, 0_u64);
-
-    for element in block.elements_skip_metadata() {
-        match &element {
-            Element::DenseNode(dn) => {
-                n_total += 1;
-                let id = dn.id();
-                if ids.matched_node_ids.get(id)
-                    || ids.way_dep_node_ids.get(id)
-                    || ids.relation_dep_node_ids.get(id)
-                {
-                    n_inc += 1;
-                }
-            }
-            Element::Node(n) => {
-                n_total += 1;
-                let id = n.id();
-                if ids.matched_node_ids.get(id)
-                    || ids.way_dep_node_ids.get(id)
-                    || ids.relation_dep_node_ids.get(id)
-                {
-                    n_inc += 1;
-                }
-            }
-            Element::Way(w) => {
-                w_total += 1;
-                let id = w.id();
-                if ids.included_way_ids.get(id) { w_inc += 1; }
-                if ids.direct_way_ids.get(id) { w_dir += 1; }
-            }
-            Element::Relation(r) => {
-                r_total += 1;
-                let id = r.id();
-                if ids.included_relation_ids.get(id) { r_inc += 1; }
-                if ids.direct_relation_ids.get(id) { r_dir += 1; }
-            }
-        }
-    }
-
-    let mut s = ShadowStats {
-        blobs_total: 1,
-        elements_total: w_total + n_total + r_total,
-        way_elements_total: w_total,
-        way_elements_included: w_inc,
-        way_elements_direct: w_dir,
-        node_elements_total: n_total,
-        node_elements_included: n_inc,
-        relation_elements_total: r_total,
-        relation_elements_included: r_inc,
-        relation_elements_direct: r_dir,
-        ..ShadowStats::default()
-    };
-
-    let elements_total = s.elements_total;
-    let all_inc = w_inc + n_inc + r_inc == elements_total && elements_total > 0;
-
-    // Classify blob by predominant type. In sorted PBFs blobs are single-type.
-    let single_way = w_total > 0 && n_total == 0 && r_total == 0;
-    let single_node = n_total > 0 && w_total == 0 && r_total == 0;
-    let single_relation = r_total > 0 && w_total == 0 && n_total == 0;
-
-    if single_way {
-        s.way_blobs = 1;
-        if w_inc == w_total { s.way_blobs_all_included = 1; }
-        if w_dir == w_total {
-            s.way_blobs_all_direct = 1;
-            s.blobs_all_direct = 1;
-            s.elements_in_all_direct = w_total;
-        }
-    } else if single_node {
-        s.node_blobs = 1;
-        if n_inc == n_total { s.node_blobs_all_included = 1; }
-        // "all_direct" is undefined for node blobs (direct nodes are only
-        // tag-matched nodes; the bulk of included nodes come from way/relation
-        // deps and are not "direct"). A node blob passthrough would still be
-        // safe under remove_tags because refs/metadata are preserved verbatim
-        // and direct-match tags are untouched - but we conservatively gate it
-        // on all_included and skip the all_direct path here.
-    } else if single_relation {
-        s.relation_blobs = 1;
-        if r_inc == r_total { s.relation_blobs_all_included = 1; }
-        if r_dir == r_total {
-            s.relation_blobs_all_direct = 1;
-            s.blobs_all_direct = 1;
-            s.elements_in_all_direct = r_total;
-        }
-    }
-    // Mixed-type blobs (exotic, non-sorted input) are counted in the global
-    // totals but not bucketed per-type.
-
-    if all_inc {
-        s.blobs_all_included = 1;
-        s.elements_in_all_included = elements_total;
-    }
-
-    s
-}
-
 /// Process a single block in Pass 2: write elements whose IDs were collected in Pass 1.
 #[allow(clippy::too_many_lines)]
 fn filter_block_pass2(
@@ -942,10 +773,39 @@ fn tags_filter_two_pass(
     };
 
     // pread-from-workers: parallel decode + filter + write with reorder buffer.
-    // No raw passthrough - tag-based all-match detection requires a per-blob
-    // wire-format ID scanner (see TODO.md "Tags-filter raw passthrough via
-    // lightweight ID scanner"). Pread workers are kept for planet safety
-    // (no cross-thread PrimitiveBlock retention).
+    //
+    // DO NOT add blob-level raw passthrough here (wire-format ID scanner,
+    // "all elements in this blob are in the include set -> write blob raw").
+    //
+    // This looked promising on paper and is described as an opportunity in
+    // older iterations of notes/raw-group-passthrough.md / TODO.md. It was
+    // measured end-to-end on 2026-04-18 at commit `a5c6854` via a shadow
+    // counter that did the full ID-set classification per blob without
+    // actually passing anything through raw (UUID `8c786794`,
+    // `w/highway=primary` on planet):
+    //
+    //   0 / 50,364 pass-2 blobs would have qualified. Zero. Across
+    //   17,529 way blobs (0.34 % element match rate) and 32,835 node
+    //   blobs (0.40 % element match rate).
+    //
+    // The math is hostile in general, not just for highway=primary:
+    // ~8,000 elements per blob, any realistic per-element match rate
+    // (highway=primary at 0.34 %, building=* hypothetically ~10 %),
+    // P(all elements match in a blob) is vanishingly small. PBFs are
+    // sorted by ID rather than by geography or tag, so matching elements
+    // are scattered across every blob rather than clustered into a few.
+    // A filter that did match every element would already be caught by
+    // blob-level type/tag-index filtering upstream of this code.
+    //
+    // The stricter `all_direct` gate (required when `remove_tags` is set,
+    // since raw passthrough cannot strip tags off non-direct matches) is
+    // even tighter than `all_included` and also measured 0 at planet.
+    //
+    // So: no ID scanner here. No per-group scanner either. The shadow
+    // counter has been removed; this comment is the pin that keeps the
+    // door shut. See notes/raw-group-passthrough.md for the full
+    // post-mortem. Pread workers are kept for planet safety (no
+    // cross-thread PrimitiveBlock retention), not for passthrough.
     {
     use std::os::unix::fs::FileExt as _;
 
@@ -962,12 +822,10 @@ fn tags_filter_two_pass(
         .map(|(i, &(data_offset, data_size))| (i, data_offset, data_size))
         .collect();
 
-    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats, ShadowStats)>);
+    type WorkerResult = (usize, crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>);
     let (desc_tx, desc_rx) = std::sync::mpsc::sync_channel::<(usize, u64, usize)>(16);
     let desc_rx = std::sync::Arc::new(std::sync::Mutex::new(desc_rx));
     let (result_tx, result_rx) = std::sync::mpsc::sync_channel::<WorkerResult>(32);
-
-    let mut shadow_total = ShadowStats::default();
 
     std::thread::scope(|scope| -> Result<()> {
         scope.spawn(move || {
@@ -998,7 +856,7 @@ fn tags_filter_two_pass(
                         }
                     };
 
-                    let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats, ShadowStats)> = (|| {
+                    let r: crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)> = (|| {
                         read_buf.resize(data_size, 0);
                         file.read_exact_at(&mut read_buf, data_offset)
                             .map_err(|e| crate::error::new_error(crate::error::ErrorKind::Io(e)))?;
@@ -1007,7 +865,6 @@ fn tags_filter_two_pass(
                         let block = crate::block::PrimitiveBlock::from_vec_pooled_with_scratch(
                             buf, &worker_pool, &mut st_scratch, &mut gr_scratch,
                         )?;
-                        let shadow = shadow_classify_block(&block, ids_ref);
                         output_blocks.clear();
                         let block_stats = filter_block_pass2(
                             &block, ids_ref, remove_tags, &mut bb, &mut output_blocks,
@@ -1019,7 +876,7 @@ fn tags_filter_two_pass(
                                 crate::error::ErrorKind::Io(std::io::Error::other(e))
                             )
                         })?;
-                        Ok((std::mem::take(&mut output_blocks), block_stats, shadow))
+                        Ok((std::mem::take(&mut output_blocks), block_stats))
                     })();
                     if tx.send((s, r)).is_err() { break; }
                 }
@@ -1030,13 +887,12 @@ fn tags_filter_two_pass(
 
         // Consumer: merge results via reorder buffer for file-order output.
         let mut reorder: crate::reorder_buffer::ReorderBuffer<
-            crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats, ShadowStats)>
+            crate::error::Result<(Vec<OwnedBlock>, TagsFilterStats)>
         > = crate::reorder_buffer::ReorderBuffer::with_capacity(32);
 
-        let mut drain_ready = |reorder: &mut crate::reorder_buffer::ReorderBuffer<_>,
-                               shadow_total: &mut ShadowStats| -> Result<()> {
+        let mut drain_ready = |reorder: &mut crate::reorder_buffer::ReorderBuffer<_>| -> Result<()> {
             while let Some(r) = reorder.pop_ready() {
-                let (blocks, block_stats, shadow): (Vec<OwnedBlock>, TagsFilterStats, ShadowStats) = r?;
+                let (blocks, block_stats): (Vec<OwnedBlock>, TagsFilterStats) = r?;
                 stats.nodes_matched += block_stats.nodes_matched;
                 stats.nodes_from_ways += block_stats.nodes_from_ways;
                 stats.nodes_from_relations += block_stats.nodes_from_relations;
@@ -1044,7 +900,6 @@ fn tags_filter_two_pass(
                 stats.ways_from_relations += block_stats.ways_from_relations;
                 stats.relations_matched += block_stats.relations_matched;
                 stats.relations_from_relations += block_stats.relations_from_relations;
-                shadow_total.merge(&shadow);
                 for (block_bytes, index, tagdata) in blocks {
                     writer.write_primitive_block_owned(block_bytes, index, tagdata.as_deref())?;
                 }
@@ -1054,41 +909,12 @@ fn tags_filter_two_pass(
 
         for (s, item) in result_rx {
             reorder.push(s, item);
-            drain_ready(&mut reorder, &mut shadow_total)?;
+            drain_ready(&mut reorder)?;
         }
-        drain_ready(&mut reorder, &mut shadow_total)?;
+        drain_ready(&mut reorder)?;
 
         Ok(())
     })?;
-
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_blobs_total", shadow_total.blobs_total as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_elements_total", shadow_total.elements_total as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_blobs_all_included", shadow_total.blobs_all_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_elements_in_all_included", shadow_total.elements_in_all_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_blobs_all_direct", shadow_total.blobs_all_direct as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_elements_in_all_direct", shadow_total.elements_in_all_direct as i64);
-
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_blobs", shadow_total.way_blobs as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_blobs_all_included", shadow_total.way_blobs_all_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_blobs_all_direct", shadow_total.way_blobs_all_direct as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_elements_total", shadow_total.way_elements_total as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_elements_included", shadow_total.way_elements_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_way_elements_direct", shadow_total.way_elements_direct as i64);
-
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_node_blobs", shadow_total.node_blobs as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_node_blobs_all_included", shadow_total.node_blobs_all_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_node_elements_total", shadow_total.node_elements_total as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_node_elements_included", shadow_total.node_elements_included as i64);
-
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_blobs", shadow_total.relation_blobs as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_blobs_all_included", shadow_total.relation_blobs_all_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_blobs_all_direct", shadow_total.relation_blobs_all_direct as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_elements_total", shadow_total.relation_elements_total as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_elements_included", shadow_total.relation_elements_included as i64);
-        crate::debug::emit_counter("tagsfilter_pass2_shadow_relation_elements_direct", shadow_total.relation_elements_direct as i64);
-    }
     }
 
     writer.flush()?;

@@ -289,13 +289,18 @@ knob is pure wall/interop trade-off, not a size trade-off.
 
 **Do later:**
 
-- [ ] **Tags-filter raw passthrough via lightweight ID scanner** - the
-  `count_in_range >= blob_count` check was unsound (extraneous IDs from
-  other blobs inflate count). The correct approach: a cheap wire-format
-  ID-only scanner per blob that verifies every element ID is in the
-  included set without full PrimitiveBlock decode. If all match, raw
-  passthrough. Only worth implementing if broad filters (e.g.,
-  `building=*`) are a common use case. Flagged by 3/6 reviewers.
+- [x] ~~**Tags-filter raw passthrough via lightweight ID scanner**~~ -
+  **DISPROVEN 2026-04-18** via shadow counter at commit `a5c6854` (planet
+  `w/highway=primary`, UUID `8c786794`): 0 / 50,364 pass-2 blobs would
+  have qualified. Per-element match rates of 0.34 % (ways) and 0.40 %
+  (nodes) with ~8,000 elements per blob make the all-match gate
+  effectively unreachable; ID-sorted PBFs destroy any geographic tag
+  clustering that might have rescued it. Any filter broad enough to
+  actually match 100 % of elements in 100 % of blobs is already caught
+  by blob-level type/tag-index filtering upstream. The load-bearing
+  pin is the comment block in the pass-2 worker in
+  `src/commands/tags_filter.rs`; the post-mortem is in
+  `notes/raw-group-passthrough.md`.
 
 - [ ] **`pread_execute` opens a new `Arc<File>` per call** - simple extract
   calls it 3 times for the same input file. Could share the file handle

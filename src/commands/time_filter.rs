@@ -22,12 +22,12 @@ use super::elements_pbf::{
     OwnedElement, owned_to_metadata, read_dense_node, read_node, read_way, read_relation,
 };
 use super::{
-    BATCH_SIZE, HeaderOverrides, Result, dense_node_metadata, drain_batch_results,
-    element_metadata, ensure_node_capacity_local, ensure_relation_capacity_local,
-    ensure_way_capacity_local, flush_local, for_each_primitive_block_batch_budgeted,
-    require_sorted, warn_locations_on_ways_loss, writer_from_header,
+    BATCH_SIZE, HeaderOverrides, Result, dense_node_metadata, element_metadata,
+    for_each_primitive_block_batch_budgeted, require_sorted, warn_locations_on_ways_loss,
+    writer_from_header,
 };
 use crate::block_builder::{BlockBuilder, MemberData};
+use crate::write::buf_pool::BlockBufPool;
 use crate::writer::{Compression, PbfWriter};
 use crate::{DenseNode, Element, ElementReader, Node, PrimitiveBlock, Relation, Way};
 
@@ -220,6 +220,14 @@ fn time_filter_snapshot(
         dropped_no_snapshot_version: 0,
     };
 
+    // Shared free-list pool of Vec<u8> block buffers (cleared + retained
+    // capacity). Workers pull via BlockBuilder::take_owned_swap; writer
+    // returns via write_primitive_block_owned_pooled at the end of its
+    // rayon compression closure. Without this the snapshot path was
+    // allocating a fresh ~500 KB Vec per block - 18 GB of churn on Japan,
+    // and the dominant anon-RSS ceiling at Europe/planet.
+    let pool = std::sync::Arc::new(BlockBufPool::new());
+
     crate::debug::emit_marker("TIMEFILTER_SNAPSHOT_START");
     // Byte-bounded batches cap in-flight decoded-block bytes directly,
     // which is the dominant anon-RSS source at scale. Europe iter 2
@@ -229,7 +237,7 @@ fn time_filter_snapshot(
     // working set predictable regardless of input blob size.
     const SNAPSHOT_BATCH_MAX_BYTES: usize = 128 * 1024 * 1024;
     let mut process = |batch: &[PrimitiveBlock]| -> Result<()> {
-        process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats)
+        process_snapshot_batch(batch, cutoff_timestamp, writer, &mut stats, &pool)
     };
     for_each_primitive_block_batch_budgeted(
         reader.into_blocks_pipelined(),
@@ -247,6 +255,7 @@ fn process_snapshot_batch(
     cutoff_timestamp: i64,
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut TimeFilterStats,
+    pool: &std::sync::Arc<BlockBufPool>,
 ) -> Result<()> {
     type BatchResult = std::result::Result<(Vec<OwnedBlockTriple>, TimeFilterStats), String>;
     let results: Vec<BatchResult> = batch
@@ -256,24 +265,88 @@ fn process_snapshot_batch(
             |bb, block| {
                 let mut output: Vec<OwnedBlockTriple> = Vec::new();
                 let block_stats =
-                    filter_block_snapshot(block, cutoff_timestamp, bb, &mut output)?;
-                flush_local(bb, &mut output)?;
+                    filter_block_snapshot(block, cutoff_timestamp, bb, &mut output, pool)?;
+                flush_local_pooled(bb, &mut output, pool)?;
                 Ok((output, block_stats))
             },
         )
         .collect();
 
-    drain_batch_results(results, writer, |s: TimeFilterStats| {
-        stats.versions_seen += s.versions_seen;
-        stats.versions_before_cutoff += s.versions_before_cutoff;
-        stats.elements_written += s.elements_written;
-        stats.dropped_deleted += s.dropped_deleted;
-        stats.dropped_no_snapshot_version += s.dropped_no_snapshot_version;
-    })?;
+    // Pooled drain: forwards each OwnedBlock to the writer's pool-aware
+    // emit path, which returns `bytes` to the pool at the end of the
+    // rayon compression closure. Stats are accumulated as in
+    // drain_batch_results.
+    for result in results {
+        let (blocks, block_stats) =
+            result.map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        stats.versions_seen += block_stats.versions_seen;
+        stats.versions_before_cutoff += block_stats.versions_before_cutoff;
+        stats.elements_written += block_stats.elements_written;
+        stats.dropped_deleted += block_stats.dropped_deleted;
+        stats.dropped_no_snapshot_version += block_stats.dropped_no_snapshot_version;
+        for (bytes, index, tagdata) in blocks {
+            writer.write_primitive_block_owned_pooled(
+                bytes,
+                index,
+                tagdata.as_deref(),
+                std::sync::Arc::clone(pool),
+            )?;
+        }
+    }
     Ok(())
 }
 
 type OwnedBlockTriple = crate::block_builder::OwnedBlock;
+
+/// Pool-aware counterpart to `super::flush_local`. Uses
+/// `BlockBuilder::take_owned_swap` so the next encode reuses a pool-sourced
+/// buffer instead of allocating fresh.
+fn flush_local_pooled(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlockTriple>,
+    pool: &BlockBufPool,
+) -> std::result::Result<(), String> {
+    let swap = pool.get();
+    if let Some(triple) = bb.take_owned_swap(swap).map_err(|e| e.to_string())? {
+        output.push(triple);
+    }
+    Ok(())
+}
+
+/// Pool-aware capacity-ensure helpers. Same predicate as the non-pooled
+/// versions in `commands/mod.rs`, but route through `flush_local_pooled`.
+fn ensure_node_capacity_pooled(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlockTriple>,
+    pool: &BlockBufPool,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_node() {
+        flush_local_pooled(bb, output, pool)?;
+    }
+    Ok(())
+}
+
+fn ensure_way_capacity_pooled(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlockTriple>,
+    pool: &BlockBufPool,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_way() {
+        flush_local_pooled(bb, output, pool)?;
+    }
+    Ok(())
+}
+
+fn ensure_relation_capacity_pooled(
+    bb: &mut BlockBuilder,
+    output: &mut Vec<OwnedBlockTriple>,
+    pool: &BlockBufPool,
+) -> std::result::Result<(), String> {
+    if !bb.can_add_relation() {
+        flush_local_pooled(bb, output, pool)?;
+    }
+    Ok(())
+}
 
 #[hotpath::measure]
 fn filter_block_snapshot(
@@ -281,6 +354,7 @@ fn filter_block_snapshot(
     cutoff_timestamp: i64,
     bb: &mut BlockBuilder,
     output: &mut Vec<OwnedBlockTriple>,
+    pool: &BlockBufPool,
 ) -> std::result::Result<TimeFilterStats, String> {
     let mut stats = TimeFilterStats {
         versions_seen: 0,
@@ -307,7 +381,7 @@ fn filter_block_snapshot(
                     stats.dropped_deleted += 1;
                     continue;
                 }
-                ensure_node_capacity_local(bb, output)?;
+                ensure_node_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
                 let meta = dense_node_metadata(dn);
@@ -328,7 +402,7 @@ fn filter_block_snapshot(
                     stats.dropped_deleted += 1;
                     continue;
                 }
-                ensure_node_capacity_local(bb, output)?;
+                ensure_node_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
                 let meta = element_metadata(&n.info());
@@ -349,7 +423,7 @@ fn filter_block_snapshot(
                     stats.dropped_deleted += 1;
                     continue;
                 }
-                ensure_way_capacity_local(bb, output)?;
+                ensure_way_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
                 refs_buf.clear();
@@ -371,7 +445,7 @@ fn filter_block_snapshot(
                     stats.dropped_deleted += 1;
                     continue;
                 }
-                ensure_relation_capacity_local(bb, output)?;
+                ensure_relation_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());
                 members_buf.clear();

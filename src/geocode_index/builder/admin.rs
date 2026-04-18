@@ -25,76 +25,97 @@ pub(super) fn assemble_admin_polygons(
     way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
     config: &BuildConfig,
 ) -> Vec<AssembledPolygon> {
-    let mut result = Vec::new();
+    use rayon::prelude::*;
+
     let max_verts = config.max_admin_vertices as usize;
 
-    for rel in relations {
-        let outer_segs: Vec<&[(i32, i32)]> = rel.outer_way_ids.iter()
-            .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
+    // Per-relation work is independent — ring assembly, Douglas-Peucker
+    // simplification, and hole attachment all read-only against `way_geom`
+    // and the relation itself. `par_iter().flat_map_iter().collect()`
+    // preserves input order so the output `Vec<AssembledPolygon>` is
+    // byte-identical to the previous sequential path. Europe phase was
+    // 50.6 s at UUID `bf8f2038` — expected ~5× on plantasjen's 12 cores
+    // (plan item #8 in notes/geocode-build-opportunities.md).
+    relations.par_iter().flat_map_iter(|rel| {
+        assemble_one_relation(rel, way_geom, max_verts).into_iter()
+    }).collect()
+}
+
+/// Assemble all `AssembledPolygon`s produced by a single relation
+/// (one per outer ring, each carrying any inner rings that fall inside
+/// it). Pure function — no shared mutable state, safe to call from
+/// rayon workers.
+fn assemble_one_relation(
+    rel: &RawAdminRelation,
+    way_geom: &FxHashMap<i64, Vec<(i32, i32)>>,
+    max_verts: usize,
+) -> Vec<AssembledPolygon> {
+    let outer_segs: Vec<&[(i32, i32)]> = rel.outer_way_ids.iter()
+        .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
+        .collect();
+    let outer_rings = crate::geo::assemble_rings(&outer_segs);
+    if outer_rings.is_empty() { return Vec::new(); }
+
+    let inner_segs: Vec<&[(i32, i32)]> = rel.inner_way_ids.iter()
+        .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
+        .collect();
+    let inner_rings = crate::geo::assemble_rings(&inner_segs);
+
+    let mut result = Vec::with_capacity(outer_rings.len());
+    for outer_ring in &outer_rings {
+        let outer_f64: Vec<(f64, f64)> = outer_ring.iter()
+            .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
             .collect();
-        let outer_rings = crate::geo::assemble_rings(&outer_segs);
-        if outer_rings.is_empty() { continue; }
 
-        let inner_segs: Vec<&[(i32, i32)]> = rel.inner_way_ids.iter()
-            .filter_map(|wid| way_geom.get(wid).map(Vec::as_slice))
-            .collect();
-        let inner_rings = crate::geo::assemble_rings(&inner_segs);
+        let simplified = if max_verts > 0 {
+            crate::geo::simplify_ring(&outer_f64, max_verts)
+        } else { outer_f64.clone() };
 
-        for outer_ring in &outer_rings {
-            let outer_f64: Vec<(f64, f64)> = outer_ring.iter()
-                .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
-                .collect();
+        if simplified.len() < 3 { continue; }
 
-            let simplified = if max_verts > 0 {
-                crate::geo::simplify_ring(&outer_f64, max_verts)
-            } else { outer_f64.clone() };
+        #[allow(clippy::cast_possible_truncation)]
+        let area = crate::geo::signed_area(outer_ring).abs() as f32;
 
-            if simplified.len() < 3 { continue; }
-
+        let mut vertices = Vec::new();
+        for &(lon_deg, lat_deg) in &simplified {
             #[allow(clippy::cast_possible_truncation)]
-            let area = crate::geo::signed_area(outer_ring).abs() as f32;
-
-            let mut vertices = Vec::new();
-            for &(lon_deg, lat_deg) in &simplified {
-                #[allow(clippy::cast_possible_truncation)]
-                vertices.push(NodeCoord {
-                    lat_e7: (lat_deg * 1e7) as i32,
-                    lon_e7: (lon_deg * 1e7) as i32,
-                });
-            }
-
-            // Add inner rings (holes) that fall inside this outer ring
-            for hole in &inner_rings {
-                if hole.is_empty() { continue; }
-                let hp = (hole[0].1 as f64 * 1e-7, hole[0].0 as f64 * 1e-7);
-                if !crate::geo::point_in_ring(hp.0, hp.1, &simplified) { continue; }
-
-                let hole_f64: Vec<(f64, f64)> = hole.iter()
-                    .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
-                    .collect();
-                let sh = if max_verts > 0 {
-                    crate::geo::simplify_ring(&hole_f64, max_verts)
-                } else { hole_f64 };
-
-                if sh.len() >= 3 {
-                    vertices.push(RING_SENTINEL);
-                    for &(lon_deg, lat_deg) in &sh {
-                        #[allow(clippy::cast_possible_truncation)]
-                        vertices.push(NodeCoord {
-                            lat_e7: (lat_deg * 1e7) as i32,
-                            lon_e7: (lon_deg * 1e7) as i32,
-                        });
-                    }
-                }
-            }
-
-            result.push(AssembledPolygon {
-                admin_level: rel.admin_level,
-                name_offset: rel.name_offset,
-                country_code_offset: rel.country_code_offset,
-                area, vertices,
+            vertices.push(NodeCoord {
+                lat_e7: (lat_deg * 1e7) as i32,
+                lon_e7: (lon_deg * 1e7) as i32,
             });
         }
+
+        // Add inner rings (holes) that fall inside this outer ring
+        for hole in &inner_rings {
+            if hole.is_empty() { continue; }
+            let hp = (hole[0].1 as f64 * 1e-7, hole[0].0 as f64 * 1e-7);
+            if !crate::geo::point_in_ring(hp.0, hp.1, &simplified) { continue; }
+
+            let hole_f64: Vec<(f64, f64)> = hole.iter()
+                .map(|&(lat, lon)| (lon as f64 * 1e-7, lat as f64 * 1e-7))
+                .collect();
+            let sh = if max_verts > 0 {
+                crate::geo::simplify_ring(&hole_f64, max_verts)
+            } else { hole_f64 };
+
+            if sh.len() >= 3 {
+                vertices.push(RING_SENTINEL);
+                for &(lon_deg, lat_deg) in &sh {
+                    #[allow(clippy::cast_possible_truncation)]
+                    vertices.push(NodeCoord {
+                        lat_e7: (lat_deg * 1e7) as i32,
+                        lon_e7: (lon_deg * 1e7) as i32,
+                    });
+                }
+            }
+        }
+
+        result.push(AssembledPolygon {
+            admin_level: rel.admin_level,
+            name_offset: rel.name_offset,
+            country_code_offset: rel.country_code_offset,
+            area, vertices,
+        });
     }
     result
 }

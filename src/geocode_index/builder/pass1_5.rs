@@ -6,12 +6,12 @@
 //! page cache working set from ~83 GB (all 10.4B nodes) to ~16 GB (~2B
 //! referenced). Same pattern as ALTW pass 0.
 
+use std::os::unix::fs::FileExt as _;
 use std::path::Path;
-
-use crate::Element;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use super::Result;
-use super::pass2::EXCLUDED_HIGHWAYS;
 
 #[hotpath::measure]
 pub(super) fn run_pass1_5(
@@ -29,59 +29,100 @@ pub(super) fn run_pass1_5(
     //
     // `pre_allocate(max_node_id)` requires `max_node_id` to cover every ID
     // the classify closure will call `set_atomic` on. We get it from
-    // `build_pass2_schedules` below, which reads indexdata from node blobs.
+    // `build_pass2_schedules` above, which reads indexdata from node blobs.
     // If a node blob lacks indexdata (-- force path only), the upper bound
     // is under-reported and `set_atomic` would panic via its diagnostic
     // path.
     let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
     referenced_nodes.pre_allocate(max_node_id);
 
+    // Custom worker pool that bypasses PrimitiveBlock construction
+    // entirely (plan item #2). Workers pread the blob bytes, decompress,
+    // and call `scan_way_geocode_tagged_refs` which walks the wire-format
+    // way records directly: resolve geocode tag literals once per blob
+    // against the raw string table, then for each Way parse only id,
+    // keys, vals, and refs - no StringTable UTF-8 validation, no
+    // group_ranges allocation, no full PrimitiveBlock materialisation.
     crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_START");
     {
         let referenced_ref = &referenced_nodes;
-        crate::commands::parallel_classify_phase(
-            shared_file,
-            way_schedule,
-            || (),
-            |block, _state: &mut ()| {
-                for element in block.elements_skip_metadata() {
-                    if let Element::Way(way) = element {
-                        let mut highway = false;
-                        let mut name = false;
-                        let mut hn = false;
-                        let mut addr_st = false;
-                        let mut building = false;
-                        let mut interp = false;
-                        let mut highway_val: Option<&str> = None;
+        let literals = crate::commands::way_scanner::GeocodeTagLiterals::standard();
+        let literals_ref = &literals;
+        let needed_admin_ways_ref = needed_admin_ways;
 
-                        for (k, _v) in way.tags() {
-                            match k {
-                                "highway" => { highway = true; highway_val = Some(_v); }
-                                "name" => name = true,
-                                "addr:housenumber" => hn = true,
-                                "addr:street" => addr_st = true,
-                                "building" => building = true,
-                                "addr:interpolation" => interp = true,
-                                _ => {}
-                            }
-                        }
+        // Work-stealing dispatch over way blobs via AtomicUsize::fetch_add.
+        let next_idx = AtomicUsize::new(0);
+        let next_ref = &next_idx;
+        // First error observed across all workers. Workers drain until
+        // the schedule is empty or the shared slot is populated.
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let first_err_ref = &first_err;
 
-                        let is_street = highway && name
-                            && !EXCLUDED_HIGHWAYS.contains(&highway_val.unwrap_or(""));
-                        let is_building_addr = building && hn && addr_st;
-                        let is_interp = interp && addr_st;
-                        let is_admin = needed_admin_ways.get(way.id());
+        let decode_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4);
 
-                        if is_street || is_building_addr || is_interp || is_admin {
-                            for r in way.refs() {
-                                referenced_ref.set_atomic(r);
-                            }
+        std::thread::scope(|scope| {
+            for _ in 0..decode_threads {
+                let file = std::sync::Arc::clone(shared_file);
+                scope.spawn(move || {
+                    let mut read_buf: Vec<u8> = Vec::new();
+                    let mut decompress_buf: Vec<u8> = Vec::new();
+                    let mut refs_buf: Vec<i64> = Vec::new();
+                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+                    loop {
+                        // Exit early if another worker has reported an error.
+                        if first_err_ref.lock().unwrap_or_else(
+                            std::sync::PoisonError::into_inner).is_some()
+                        { return; }
+
+                        let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= way_schedule.len() { break; }
+                        let (_seq, offset, size) = way_schedule[idx];
+
+                        let result = (|| -> std::result::Result<(), String> {
+                            read_buf.resize(size, 0);
+                            file.read_exact_at(&mut read_buf, offset)
+                                .map_err(|e| format!("pread at {offset}: {e}"))?;
+                            decompress_buf.clear();
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                                .map_err(|e| e.to_string())?;
+                            crate::commands::way_scanner::scan_way_geocode_tagged_refs(
+                                &decompress_buf,
+                                literals_ref,
+                                &mut refs_buf,
+                                &mut group_starts,
+                                |way_id, flags, refs| {
+                                    let is_admin = needed_admin_ways_ref.get(way_id);
+                                    if flags.is_street || flags.is_building_addr
+                                        || flags.is_interp || is_admin
+                                    {
+                                        for &r in refs {
+                                            referenced_ref.set_atomic(r);
+                                        }
+                                    }
+                                },
+                            ).map_err(|e| e.to_string())?;
+                            Ok(())
+                        })();
+
+                        if let Err(e) = result {
+                            let mut slot = first_err_ref.lock().unwrap_or_else(
+                                std::sync::PoisonError::into_inner);
+                            if slot.is_none() { *slot = Some(e); }
+                            return;
                         }
                     }
-                }
-            },
-            |_seq, ()| {},
-        )?;
+                });
+            }
+        });
+
+        if let Some(e) = first_err.into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(e.into());
+        }
     }
     crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_END");
     Ok(referenced_nodes)

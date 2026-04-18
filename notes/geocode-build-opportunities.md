@@ -359,18 +359,63 @@ Parallelize with rayon:
 
 **Expected win: ~40-80 s at planet.** No correctness ambiguity - ordering preserved by construction.
 
-### #4 - Fuse fine + coarse cell computation
+### #4 - Fuse fine + coarse cell computation — LANDED 2026-04-18 (commit `0d5a6dd`), **needs another pass**
 
-[`bucketed_cell_assignment`](../src/geocode_index/builder.rs#L1262) runs twice ([builder.rs:757](../src/geocode_index/builder.rs#L757), [builder.rs:765](../src/geocode_index/builder.rs#L765)), once per S2 level. The expensive operation is `cover_segment`, called per street/interp segment per level.
+Shipped as `bucketed_cell_assignment_fused` in
+[`pass3.rs`](../src/geocode_index/builder/pass3.rs). `CellID(fine_cid).parent(coarse_level)`
+derives the coarse cell from each emitted fine cell; a 4-entry stack
+set dedupes coarse cells per segment. Two bucket trees populated in one
+Stage A pass; Stage B runs twice (one per tree) via the extracted
+`run_stage_b` helper.
 
-A level-14 S2 cell is the unique parent of its level-17 children (the two levels differ by 3 cell-ID bits). If `cover_segment` at level 17 produces cell set `S17`, the correct level-14 cover is `{ parent(c) : c ∈ S17 }` deduplicated - `cover_segment` at a coarser level can only find cells already hit (as parents) by a finer-level cover.
+**Measured: Europe 188.4 s → 185.6 s (−2.8 s, −1.5 %).**
+Sub-phase breakdown (`9c4878a2` vs `29364939`):
 
-Restructure Pass 3 to **one fused parallel pass**:
-- rayon flat_map over segments emits both `(cell_17, way_idx, seg_idx)` and, for each distinct parent of those level-17 cells, `(parent_cell_14, way_idx, seg_idx)`. Per-segment dedup of parents via a small stack set (segments usually touch 1-4 level-17 cells ⇒ 1-2 distinct parents).
-- Distribute to two separate bucket trees: `.buckets-level17/` and `.buckets-level14/`.
-- Stage B (parallelized per #3) runs on both tree sets independently; reuse the same worker pool.
+| Sub-phase | Pre-fusion (fine + coarse passes) | Post-fusion (single pass) | Δ |
+|---|---:|---:|---:|
+| Streets | 7.2 s + 5.2 s = 12.4 s | 11.6 s | −0.85 s |
+| Addr | 2.6 s + 2.7 s = 5.3 s | 3.8 s | **−1.5 s** |
+| Interp | ~0 + ~0 | ~0 | — |
+| Stage A total | ~17.7 s | ~15.4 s | −2.3 s |
 
-**Expected win: ~40-60 s at planet.** Halves the Stage A `cover_segment` workload.
+**Much smaller than the 40-60 s at planet prediction.** Three findings
+from the post-measurement analysis that the prediction missed:
+
+1. **Sequential "coarse Stage A" was not mostly `cover_segment`.** The
+   5.2 s coarse streets span included bucket-writer I/O, LatLng→CellID
+   setup, and per-emitted-cell dedup hashtable work — most of which
+   fusion preserves (we still write to the coarse bucket tree, still
+   dedup per-segment). Only the "step intermediate points and compute
+   LatLng per step" portion is actually removed.
+2. **Fused pass is slower per call** (streets: 7.2 s fine-only → 11.6 s
+   fused, +60 %). It writes to two bucket trees per emitted cell and
+   tracks an extra stack-set dedup. Avg cores dropped 8.1 → 6.2 —
+   heavier per-iteration body reduced parallel efficiency under the
+   same rayon schedule.
+3. **Addr fusion is the real win** (5.3 → 3.8 s, −28 %). Single-point
+   cells trivially derive coarse from fine's `CellID` via one extra
+   `.parent()` call — no extra cover-segment work, no extra dedup
+   state. The streets/interp fusion carries the complexity but only
+   the addr path captures the predicted-style win.
+
+**Proposal for the next pass at #4:** revisit whether the streets/interp
+fusion pays its complexity. Options:
+
+- **Partial revert: keep addr fusion, unwind streets/interp fusion.**
+  The 3-line addr-derivation trick (`coarse_cid = CellID(fine_cid).parent()`)
+  is the whole win; the streets/interp side adds ~80 lines for a
+  marginal 0.85 s Europe gain.
+- **Different streets/interp shape.** Have workers produce `Vec<u64>`
+  (just fine cells per segment), have the serial distribute step
+  compute coarse parents and write both trees. Moves the derivation
+  off the hot parallel path but increases intermediate Vec allocation.
+- **Accept and move on.** Planet projection is ~7 s saved (file-size-linear
+  scaling from Europe's 2.8 s) — smaller than hoped, but still positive
+  and the code is shipped and tested.
+
+No urgent action; the current implementation is correct and delivers a
+real if modest wall win. Revisit when the other plan items close out
+and planet confirms the overall shape.
 
 ### #5 - Parallelize addr-point and interpolation cell assignment
 

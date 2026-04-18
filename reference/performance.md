@@ -1007,18 +1007,45 @@ in RAM). Numbers from the HN thread (2026-03-21):
 | Dataset | traccar-geocoder | pbfhogg | Notes |
 |---------|-----------------|---------|-------|
 | Australia/Oceania (~1.1 GB) | ~15 min (KomoD) | - | Not tested |
-| Germany (4.5 GB) | - | **9.8 min** | After optimization (was 30 min) |
-| Planet (~87 GB) | 8-10 hours (192 GB RAM) | - | Would OOM on 30 GB host |
+| Germany (4.5 GB) | - | **30.9 s** | After 2026-04-18 optimization arc (was 30 min, then 9.8 min) |
+| Planet (~87 GB) | 8-10 hours (192 GB RAM) | **7m12s** (27 GB host) | After 2026-04-18 optimization arc |
 
-Planet (validated): **1,255s (20.9 min), 29.5 GB peak anon RSS** in
-`GEOCODE_PASS1_5` (commit `7e9c2e9`, sidecar `1c708509`) [TAINTED - wall
-inflated by all-blobs-scan regression; RSS unaffected]. The earlier
-17.8 GB figure under-reported: brokkr previously hid short-emitting phase
-markers from sidecar output, so PASS1_5's transient peak never surfaced.
-The peak itself has not changed - only its visibility. Our index is larger due to segment-level indexing (6 bytes
-vs 4 per entry), dual fine+coarse cell indices, and u64 node offsets. Our
-builder currently holds all intermediate data in RAM - planet requires
-streaming to temp files (not yet implemented).
+Planet (validated, commit `82db8ed`, UUID `b4b25c05`, 2026-04-18,
+plantasjen, `--bench 1`): **432.9 s (7m12s), ~25 GB peak anon RSS** in
+`GEOCODE_PASS3_STAGEB_FINE`. Against the historical
+`7e9c2e9` baseline of 1,255 s / 29.5 GB peak at `GEOCODE_PASS1_5`
+[TAINTED - wall inflated by all-blobs-scan regression; RSS unaffected],
+that's **-65.5 % wall** and **-14 % peak anon** (the governing peak
+moved from Pass 1.5 to Pass 3 Stage B, Pass 1.5 itself dropped from
+29.5 GB to 3.0 GB via the shared-atomic `IdSetDense` swap).
+
+Our index is larger due to segment-level indexing (6 bytes vs 4 per
+entry), dual fine+coarse cell indices, and u64 node offsets. All
+intermediate data is still held in RAM during the build - planet fits
+comfortably on a 27 GB host after this arc, though a streaming-temp-file
+refactor would be needed for smaller hosts.
+
+### Planet phase breakdown (`82db8ed`, UUID `b4b25c05`)
+
+| Phase | Wall | Avg cores | Peak anon |
+|---|---:|---:|---:|
+| Pass 1 (relations) | 36.6 s | 0.5 | 1.25 GB |
+| Schedules (one-walk) | 16.5 s | 0.2 | 1.31 GB |
+| Pass 1.5 scan | 17.6 s | **20.3** | 3.03 GB |
+| Pass 2a parallel nodes | 66.5 s | 13.2 | 12.16 GB |
+| Pass 2b parallel ways | 124.4 s | 4.9 | 13.99 GB |
+| Pass 2 admin assembly | 10.0 s | **21.9** | 6.05 GB |
+| Pass 2 interp resolve (sequential) | 30.6 s | 1.0 | 9.04 GB |
+| Pass 3 admin cells | 4.8 s | 17.4 | 6.00 GB |
+| Pass 3 fine Stage A | ~50 s | 5.4 | 5.97 GB |
+| Pass 3 fine Stage B | 39.4 s | 3.5 | **22.53 GB** (governing peak) |
+| Pass 3 coarse Stage B | 13.0 s | 5.3 | 14.57 GB |
+| Misc (flush/mmap/write/admin index/cleanup) | ~22 s | - | - |
+
+Pass 2b dominates at 124 s / 29 % of wall. Pass 2 interp resolve is the
+only sequential-by-design phase left (30.6 s / 7 %); parallelising it
+is an unclaimed follow-up worth ~25 s at planet if driven under 7 min
+becomes a goal.
 
 traccar's index is more compact (18 GB planet) because it uses f32 coords,
 u8 node counts, u32 offsets everywhere, whole-way indexing (4 bytes/entry),

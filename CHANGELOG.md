@@ -18,6 +18,7 @@
 - **getparents**: skip node-only blobs via `BlobFilter` when `--add-self` doesn't need nodes (~85% of blobs at planet scale).
 - **derive-changes**: streams output to temp files instead of buffering all changes in memory - constant memory regardless of diff size.
 - **build-geocode-index**: hard-errors instead of silently truncating when per-cell or per-way counts exceed `u16::MAX`. Error names the offending cell/way and points at the `u32` + `FORMAT_VERSION` bump path.
+- **build-geocode-index**: parallel Pass 2 (nodes + ways) and parallel Pass 3 cell assignment; Pass 1.5 switched to shared-atomic `IdSetDense`. Planet 1,255s → 432.9s (7m12s, -65%); Europe 344s → 183.4s (-47%); Germany 71s → 31s (-57%). Pass 1.5 peak anon 29.5 GB → 3.0 GB (-90%); now fits comfortably on 27 GB hosts with governing peak at ~25 GB (Pass 3 Stage B).
 
 ### Bug fixes
 
@@ -39,6 +40,7 @@
 | Operation | Dataset | Time | vs 0.2.0 |
 |-----------|---------|------|----------|
 | cat (indexdata generation) | Planet 87 GB | 86.5s | -83% (5.8×) |
+| build-geocode-index | Planet 87 GB | 432.9s | -65% (2.9×) |
 | renumber | Planet 87 GB | 204.5s | new architecture |
 | add-locations-to-ways external | Planet 87 GB | 661s | -55% |
 | check --refs | Planet 87 GB | 70.2s | -94% (17.5×) |

@@ -2,10 +2,15 @@
 
 Rust library and CLI tool for reading and writing OpenStreetMap PBF files.
 
-## Memory rules
+## Rules
+
+### General rules
+Dont use gremlins! Em-dash, en-dash, strange quotes, whatever - they're all verboten!
+
+### Memory rules
 Do not use your Memory functionality. Update CLAUDE.md instead. This project is developed across several hosts and several users. Memories do not transfer across hosts or users. CLAUDE.md does.
 
-## Bash rules
+### Bash rules
 - Never use sed, find, awk, head, tail, or complex bash commands
 - Never chain commands with &&
 - Never chain commands with ;
@@ -14,13 +19,13 @@ Do not use your Memory functionality. Update CLAUDE.md instead. This project is 
 - Never read or write from /tmp. All data lives in the project.
 - Never run raw cargo, curl, pkill. Use `brokkr`.
 
-## git commit rules
+### git commit rules
 - Never commit markdown changes and/or results.db alone. Bundle them with upcoming code commits.
 - When committing other changes: always tag along brokkrs 'results.db' and markdown files if dirty.
 - Write substantive engineering-focused commit messages.
 - Remember to update CHANGELOG.md for relevant commits (but not general small performance improvements.)
 
-### What gets added to CHANGELOG.md
+#### What gets added to CHANGELOG.md
 
 Audience: library + CLI users deciding whether to upgrade. Not a commit digest.
 

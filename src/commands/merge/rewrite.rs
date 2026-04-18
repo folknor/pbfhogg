@@ -24,6 +24,8 @@ use crate::commands::{
     require_indexdata, writer_from_header_bytes, HeaderOverrides, RawBlobFrame,
     BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
 };
+use crate::blob::parse_blob_header_with_index;
+use crate::reorder_buffer::ReorderBuffer;
 
 use super::classify::{
     classify_only, BatchSlot, ClassifyResult, RewriteJob,
@@ -292,14 +294,105 @@ fn read_header(
     }
 }
 
-/// Spawn a reader thread that streams raw data frames over a bounded channel.
-/// Skips the OSMHeader blob and any non-OsmData blobs.
+/// Schedule entry for a single OsmData blob: where it lives in the input file
+/// plus any header-derived metadata needed downstream (indexdata, tagdata).
+/// Workers pread the frame bytes using `frame_offset` + `blob_offset +
+/// data_size`, so the OsmHeader blob and any non-OsmData blobs are filtered
+/// out at schedule-build time rather than re-checked per worker.
+#[derive(Clone)]
+struct ReaderScheduleEntry {
+    frame_offset: u64,
+    blob_offset: usize,
+    data_size: usize,
+    index: Option<BlobIndex>,
+    tagdata: Option<Box<[u8]>>,
+}
+
+impl ReaderScheduleEntry {
+    fn frame_len(&self) -> usize {
+        self.blob_offset + self.data_size
+    }
+}
+
+/// Header-only walk of the base PBF to build a per-blob pread schedule.
+/// Runs on the manager thread before workers start, so the cost (one
+/// sequential BufReader pass skipping blob bodies) is not charged to
+/// per-worker wall.
+fn build_reader_schedule(
+    base_pbf: &Path,
+    direct_io: bool,
+) -> std::result::Result<(Vec<ReaderScheduleEntry>, Arc<std::fs::File>), String> {
+    use std::io::Read as _;
+
+    let mut reader = FileReader::open(base_pbf, direct_io).map_err(|e| e.to_string())?;
+    let mut file_offset: u64 = 0;
+    let mut schedule: Vec<ReaderScheduleEntry> = Vec::new();
+    let mut past_header = false;
+
+    loop {
+        let frame_start = file_offset;
+
+        let mut len_buf = [0u8; 4];
+        match reader.read_exact(&mut len_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.to_string()),
+        }
+        let header_len = u32::from_be_bytes(len_buf) as usize;
+
+        let mut header_bytes = vec![0u8; header_len];
+        reader.read_exact(&mut header_bytes).map_err(|e| e.to_string())?;
+
+        let (blob_type, data_size, raw_index, tagdata) =
+            parse_blob_header_with_index(&header_bytes).map_err(|e| e.to_string())?;
+        let index = raw_index.and_then(|ref data| BlobIndex::deserialize(data));
+
+        let blob_offset = 4 + header_len;
+        file_offset = frame_start + (blob_offset + data_size) as u64;
+
+        reader.skip(data_size as u64).map_err(|e| e.to_string())?;
+
+        if blob_type == BlobKind::OsmHeader {
+            past_header = true;
+            continue;
+        }
+        if !past_header || blob_type != BlobKind::OsmData {
+            continue;
+        }
+
+        schedule.push(ReaderScheduleEntry {
+            frame_offset: frame_start,
+            blob_offset,
+            data_size,
+            index,
+            tagdata,
+        });
+    }
+
+    drop(reader);
+    let shared_file = Arc::new(
+        std::fs::File::open(base_pbf)
+            .map_err(|e| format!("failed to open {}: {e}", base_pbf.display()))?,
+    );
+    Ok((schedule, shared_file))
+}
+
+/// Parallel reader: header-only schedule scan + N pread workers + a reorder
+/// pump that re-establishes file order before delivering frames to the main
+/// loop.
 ///
-/// The `stalls` accumulator receives per-send wait time whenever the bounded
-/// channel is full and the reader must block; this drives `WAIT_READER_SEND`
-/// attribution in `brokkr sidecar --stalls` and the `merge_reader_send_wait_us`
-/// sidecar counter.
-fn spawn_reader_thread(
+/// Replaces the old sequential reader-thread. The workers pread their assigned
+/// schedule entries (dispatched via a work-stealing `AtomicUsize`) and send
+/// `(seq, RawBlobFrame)` into an internal channel; a reorder pump on the
+/// manager thread re-orders via `ReorderBuffer` and forwards to the external
+/// `frame_rx` that the main loop already reads from. Main-loop semantics are
+/// unchanged.
+///
+/// The `stalls` accumulator captures wait time on the external `ordered_tx`
+/// (i.e. when the main loop's consumption can't keep up), matching the prior
+/// `merge_reader_send_wait_us` attribution.
+#[allow(clippy::too_many_lines)]
+fn spawn_parallel_reader(
     base_pbf: &Path,
     direct_io: bool,
     stalls: Arc<StallAccumulator>,
@@ -308,57 +401,144 @@ fn spawn_reader_thread(
     mpsc::Receiver<RawBlobFrame>,
 ) {
     let base_path = base_pbf.to_path_buf();
-    let (frame_tx, frame_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
+    let (ordered_tx, ordered_rx) = mpsc::sync_channel::<RawBlobFrame>(READER_CHANNEL_SIZE);
+
     let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
+        use std::os::unix::fs::FileExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        crate::debug::emit_marker("MERGE_READER_SCHEDULE_START");
+        let (schedule, shared_file) = build_reader_schedule(&base_path, direct_io)?;
+        crate::debug::emit_marker("MERGE_READER_SCHEDULE_END");
+
+        let schedule_len = schedule.len();
+        let schedule = Arc::new(schedule);
         crate::debug::emit_marker("MERGE_READER_START");
-        let mut reader = FileReader::open(&base_path, direct_io).map_err(|e| e.to_string())?;
-        let mut file_offset: u64 = 0;
-        let mut past_header = false;
+
+        let decode_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4);
+
+        let (worker_tx, worker_rx) =
+            mpsc::sync_channel::<(usize, RawBlobFrame)>(decode_threads * 4);
+
+        let next_idx = AtomicUsize::new(0);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+
         let mut frames_sent: u64 = 0;
         let mut blocked_sends: u64 = 0;
-        while let Some(frame) =
-            read_raw_frame(&mut reader, &mut file_offset).map_err(|e| e.to_string())?
-        {
-            if frame.blob_type == BlobKind::OsmHeader {
-                past_header = true;
-                continue;
+
+        std::thread::scope(|scope| {
+            for _ in 0..decode_threads {
+                let tx = worker_tx.clone();
+                let schedule = Arc::clone(&schedule);
+                let file = Arc::clone(&shared_file);
+                let next_idx = &next_idx;
+                let first_err = &first_err;
+                scope.spawn(move || {
+                    let mut read_buf: Vec<u8> = Vec::new();
+                    loop {
+                        if first_err
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some()
+                        {
+                            return;
+                        }
+                        let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                        if idx >= schedule.len() {
+                            break;
+                        }
+                        let entry = schedule[idx].clone();
+                        let frame_len = entry.frame_len();
+                        read_buf.resize(frame_len, 0);
+                        let pread_res = file
+                            .read_exact_at(&mut read_buf, entry.frame_offset)
+                            .map_err(|e| {
+                                format!("pread at {}: {e}", entry.frame_offset)
+                            });
+                        if let Err(e) = pread_res {
+                            let mut slot = first_err
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            return;
+                        }
+                        let frame = RawBlobFrame {
+                            frame_bytes: std::mem::take(&mut read_buf),
+                            blob_type: BlobKind::OsmData,
+                            blob_offset: entry.blob_offset,
+                            index: entry.index,
+                            tagdata: entry.tagdata,
+                            file_offset: entry.frame_offset,
+                        };
+                        if tx.send((idx, frame)).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
-            if !past_header || frame.blob_type != BlobKind::OsmData {
-                continue;
-            }
-            // Fast path: try a non-blocking send. Only pay the marker +
-            // atomic-increment cost when the channel is actually full.
-            match frame_tx.try_send(frame) {
-                Ok(()) => {}
-                Err(mpsc::TrySendError::Full(frame)) => {
-                    crate::debug::emit_marker("WAIT_READER_SEND_START");
-                    let t0 = std::time::Instant::now();
-                    let res = frame_tx.send(frame);
-                    let elapsed_us = u64::try_from(t0.elapsed().as_micros())
-                        .unwrap_or(u64::MAX);
-                    stalls.reader_send_us.fetch_add(
-                        elapsed_us,
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    crate::debug::emit_marker("WAIT_READER_SEND_END");
-                    blocked_sends += 1;
-                    if res.is_err() {
-                        break;
+            drop(worker_tx);
+
+            // Reorder pump: re-establish file order before delivering frames.
+            // Pending depth is bounded by `decode_threads` since that's the
+            // max number of in-flight preads.
+            let mut reorder: ReorderBuffer<RawBlobFrame> =
+                ReorderBuffer::with_capacity(decode_threads * 2);
+            while let Ok((seq, frame)) = worker_rx.recv() {
+                reorder.push(seq, frame);
+                while let Some(frame) = reorder.pop_ready() {
+                    match ordered_tx.try_send(frame) {
+                        Ok(()) => {
+                            frames_sent += 1;
+                        }
+                        Err(mpsc::TrySendError::Full(frame)) => {
+                            crate::debug::emit_marker("WAIT_READER_SEND_START");
+                            let t0 = std::time::Instant::now();
+                            let res = ordered_tx.send(frame);
+                            let elapsed_us =
+                                u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX);
+                            stalls
+                                .reader_send_us
+                                .fetch_add(elapsed_us, Ordering::Relaxed);
+                            crate::debug::emit_marker("WAIT_READER_SEND_END");
+                            blocked_sends += 1;
+                            if res.is_err() {
+                                return;
+                            }
+                            frames_sent += 1;
+                        }
+                        Err(mpsc::TrySendError::Disconnected(_)) => return,
                     }
                 }
-                Err(mpsc::TrySendError::Disconnected(_)) => break,
             }
-            frames_sent += 1;
+        });
+
+        if let Some(e) = first_err
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(e);
         }
+
         #[allow(clippy::cast_possible_wrap)]
         {
             crate::debug::emit_counter("merge_reader_frames_sent", frames_sent as i64);
             crate::debug::emit_counter("merge_reader_blocked_sends", blocked_sends as i64);
+            crate::debug::emit_counter(
+                "merge_reader_decode_threads",
+                decode_threads as i64,
+            );
+            crate::debug::emit_counter("merge_reader_schedule_len", schedule_len as i64);
         }
         crate::debug::emit_marker("MERGE_READER_END");
         Ok(())
     });
-    (handle, frame_rx)
+
+    (handle, ordered_rx)
 }
 
 /// Collect a byte-budgeted batch of raw frames from the reader channel.
@@ -847,10 +1027,14 @@ pub fn merge(
     phase_timers.writer_setup = writer_setup_start.elapsed();
     crate::debug::emit_marker("MERGE_WRITER_SETUP_END");
 
-    // Step 5: Spawn reader thread with read-ahead
+    // Step 5: Spawn parallel reader (header-only schedule + pread worker pool
+    // + reorder pump). Replaces the sequential reader-thread: at planet, the
+    // old reader capped at ~1400 frames/s, which in turn capped classify
+    // batches at ~12 blobs/batch and left rayon cores idle. See
+    // notes/apply-changes-opportunities.md plan item #3.
     crate::debug::emit_marker("MERGE_LOOP_START");
     let (reader_thread, frame_rx) =
-        spawn_reader_thread(base_pbf, direct_io, Arc::clone(&stalls));
+        spawn_parallel_reader(base_pbf, direct_io, Arc::clone(&stalls));
 
     // Open second handle for copy_file_range.
     // The main thread owns the primary FileReader; this handle provides the fd

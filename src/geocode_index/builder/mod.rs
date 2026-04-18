@@ -162,6 +162,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     #[cfg(feature = "hotpath")]
     let pass2_start = std::time::Instant::now();
 
+    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_START");
     let pass2::Pass2Output {
         addr_point_count,
         street_way_count,
@@ -174,11 +175,14 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         addr_points_mmap,
         interp_nodes_mmap,
     } = pass2::run_pass2(config, needed_admin_ways, referenced_nodes, &mut strings)?;
+    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_END");
 
     // Ring assembly + simplification
+    crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_START");
     let admin_polygons = admin::assemble_admin_polygons(&admin_relations, &way_geom, config);
     drop(way_geom);
     eprintln!("  {} admin polygons assembled", admin_polygons.len());
+    crate::debug::emit_marker("GEOCODE_PASS2_ADMIN_ASSEMBLY_END");
 
     #[cfg(feature = "hotpath")]
     let pass2_ms = pass2_start.elapsed().as_millis();
@@ -186,12 +190,15 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // -----------------------------------------------------------------------
     // Interpolation endpoint resolution (reads from mmap'd addr_points.bin)
     // -----------------------------------------------------------------------
+    crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_START");
     let resolved = interp::resolve_interpolation_endpoints_mmap(
         &mut interp_ways, &addr_points_mmap, &interp_nodes_mmap, &strings, config.street_level,
     );
     eprintln!("  {resolved}/{} interpolation ways resolved", interp_ways.len());
+    crate::debug::emit_marker("GEOCODE_PASS2_INTERP_RESOLVE_END");
 
     // Write interp_ways.bin now (after resolution has set start/end numbers)
+    crate::debug::emit_marker("GEOCODE_PASS2_WRITE_START");
     {
         let mut iw_out = BufWriter::new(
             std::fs::File::create(config.output_dir.join(FILE_INTERP_WAYS))?,
@@ -213,6 +220,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     // Write admin + strings data files
     admin::write_admin_data(&config.output_dir, &admin_polygons)?;
     std::fs::write(config.output_dir.join(FILE_STRINGS), &strings.data)?;
+    crate::debug::emit_marker("GEOCODE_PASS2_WRITE_END");
 
     // -----------------------------------------------------------------------
     crate::debug::emit_marker("GEOCODE_PASS2_END");
@@ -232,7 +240,9 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
     let interp_way_count = interp_ways.len();
 
     // Admin cells are small enough to stay in memory
+    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_START");
     let admin_cell_entries = pass3::assign_admin_cells(&admin_polygons, config.admin_level);
+    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_CELLS_END");
 
     // Process fine and coarse levels via bucketed distribution
     let shared = pass3::CellAssignmentParams {
@@ -248,6 +258,7 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         cells_file: "", street_entries_file: "", addr_entries_file: "",
         interp_entries_file: "", level: 0,
     };
+    crate::debug::emit_marker("GEOCODE_PASS3_FINE_START");
     let fine_count = pass3::bucketed_cell_assignment(&pass3::CellAssignmentParams {
         cells_file: FILE_GEO_CELLS,
         street_entries_file: FILE_STREET_ENTRIES,
@@ -256,6 +267,8 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         level: sl,
         ..shared
     })?;
+    crate::debug::emit_marker("GEOCODE_PASS3_FINE_END");
+    crate::debug::emit_marker("GEOCODE_PASS3_COARSE_START");
     let coarse_count = pass3::bucketed_cell_assignment(&pass3::CellAssignmentParams {
         cells_file: FILE_COARSE_GEO_CELLS,
         street_entries_file: FILE_COARSE_STREET_ENTRIES,
@@ -264,7 +277,10 @@ pub fn build_geocode_index(config: &BuildConfig) -> Result<BuildStats> {
         level: cl,
         ..shared
     })?;
+    crate::debug::emit_marker("GEOCODE_PASS3_COARSE_END");
+    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_START");
     let admin_count = admin::write_admin_index(&config.output_dir, &mut { admin_cell_entries })?;
+    crate::debug::emit_marker("GEOCODE_PASS3_ADMIN_INDEX_END");
 
     eprintln!("  {fine_count} fine cells, {coarse_count} coarse cells, {admin_count} admin cells");
 

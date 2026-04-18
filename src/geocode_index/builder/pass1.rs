@@ -20,6 +20,7 @@ pub(super) struct RawAdminRelation {
 /// Scan relation blobs and build:
 /// - the list of admin/postal boundary relations we care about,
 /// - the set of way IDs those relations reference (outer + inner members).
+#[hotpath::measure]
 pub(super) fn run_pass1(
     input_path: &Path,
     direct_io: bool,

@@ -99,6 +99,7 @@ pub(super) fn assemble_admin_polygons(
     result
 }
 
+#[hotpath::measure]
 pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Result<()> {
     let mut poly_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_POLYGONS))?);
     let mut vert_out = BufWriter::new(std::fs::File::create(dir.join(FILE_ADMIN_VERTICES))?);
@@ -126,6 +127,7 @@ pub(super) fn write_admin_data(dir: &Path, polygons: &[AssembledPolygon]) -> Res
 }
 
 #[allow(clippy::cast_possible_truncation)]
+#[hotpath::measure]
 pub(super) fn write_admin_index(dir: &Path, entries: &mut [super::pass3::AdminCellEntry]) -> Result<u32> {
     entries.sort_unstable_by_key(|e| e.cell_id);
     let mut cell_ids: Vec<u64> = entries.iter().map(|e| e.cell_id).collect();

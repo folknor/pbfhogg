@@ -213,6 +213,7 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
     // Stage A: Chunked parallel compute + single-threaded distribute
 
     // Streets
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_START");
     let mut chunk_start = 0u32;
     while chunk_start < street_way_count {
         let chunk_end = (chunk_start + STREET_CHUNK as u32).min(street_way_count);
@@ -253,8 +254,10 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
         }
         chunk_start = chunk_end;
     }
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_STREETS_END");
 
     // Address points
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_START");
     let addr_count = addr_point_count as usize;
     let mut chunk_start = 0usize;
     while chunk_start < addr_count {
@@ -270,8 +273,10 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
         }
         chunk_start = chunk_end;
     }
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_ADDR_END");
 
     // Interpolation - collect per-way entries, then distribute with proper error propagation
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_START");
     for (way_idx, iw) in interp_ways.iter().enumerate() {
         let nc = iw.node_count as usize;
         if nc < 2 { continue; }
@@ -295,6 +300,8 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
         }
     }
 
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEA_INTERP_END");
+
     // Flush and drop all bucket writers
     for writer in bucket_writers.iter_mut().flatten() {
         writer.flush()?;
@@ -302,6 +309,7 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
     drop(bucket_writers);
 
     // Stage B: Process buckets in order, write merged output
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_START");
 
     let mut cells_out = BufWriter::new(std::fs::File::create(output_dir.join(cells_file))?);
     let mut street_out = BufWriter::new(std::fs::File::create(output_dir.join(street_entries_file))?);
@@ -441,6 +449,7 @@ pub(super) fn bucketed_cell_assignment(p: &CellAssignmentParams<'_>) -> Result<u
     street_out.flush()?;
     addr_out.flush()?;
     interp_out.flush()?;
+    crate::debug::emit_marker("GEOCODE_PASS3_STAGEB_END");
 
     // Clean up bucket directory
     std::fs::remove_dir_all(&bucket_dir).ok();

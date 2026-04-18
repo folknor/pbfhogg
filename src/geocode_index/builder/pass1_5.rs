@@ -13,28 +13,32 @@ use crate::Element;
 use super::Result;
 use super::pass2::EXCLUDED_HIGHWAYS;
 
+#[hotpath::measure]
 pub(super) fn run_pass1_5(
     input_path: &Path,
     needed_admin_ways: &crate::commands::id_set_dense::IdSetDense,
 ) -> Result<crate::commands::id_set_dense::IdSetDense> {
     let mut referenced_nodes = crate::commands::id_set_dense::IdSetDense::new();
     {
+        crate::debug::emit_marker("GEOCODE_PASS1_5_SCHEDULE_START");
         let (schedule, shared_file) = crate::commands::build_classify_schedule(
             input_path, Some(crate::blob_index::ElemKind::Way),
         )?;
+        crate::debug::emit_marker("GEOCODE_PASS1_5_SCHEDULE_END");
 
         // CAVEAT: per-worker `IdSetDense` accumulation sits on the "borderline"
         // side of the `parallel_classify_accumulate` contract (see that fn's
         // docs). A worker can touch node IDs across the full planet range,
         // so the worst-case per-worker bitmap is ~1.3 GB at planet scale
-        // (10.4 B node IDs × 1 bit). Measured peak RSS is 14.59 GB at
-        // planet — tight but workable.
+        // (10.4 B node IDs × 1 bit). Measured peak RSS is 29.5 GB at
+        // planet — the per-worker bitmap transience is the main contributor.
         //
         // The correct long-term shape is
         // [`parallel_classify_phase`]: per-blob `Vec<i64>` merged immediately
         // into the shared `referenced_nodes`, bounding memory by blob size
         // (~8 000 elements) rather than by total accumulated unique IDs.
         // Tracked in `notes/geocode-build-opportunities.md`.
+        crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_START");
         crate::commands::parallel_classify_accumulate(
             &shared_file,
             &schedule,
@@ -78,6 +82,7 @@ pub(super) fn run_pass1_5(
                 referenced_nodes.merge(worker_node_ids);
             },
         )?;
+        crate::debug::emit_marker("GEOCODE_PASS1_5_SCAN_END");
     }
     Ok(referenced_nodes)
 }

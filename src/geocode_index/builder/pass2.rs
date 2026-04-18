@@ -310,6 +310,7 @@ pub(super) struct Pass2Output {
 }
 
 #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+#[hotpath::measure]
 pub(super) fn run_pass2(
     config: &BuildConfig,
     needed_admin_ways: crate::commands::id_set_dense::IdSetDense,
@@ -322,7 +323,9 @@ pub(super) fn run_pass2(
     // index by rank. Writes are sequential (sorted PBF → monotonic ranks). Reads
     // during way processing have good locality (contiguous pages, not scattered).
     // Planet: ~16 GB contiguous vs ~83 GB scattered page cache.
+    crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_START");
     referenced_nodes.build_rank_index();
+    crate::debug::emit_marker("GEOCODE_PASS2_RANK_INDEX_END");
     let referenced_count = referenced_nodes.total_count();
     eprintln!("  {referenced_count} referenced nodes, compact index = {} MB",
         referenced_count * 8 / 1_000_000);
@@ -365,6 +368,7 @@ pub(super) fn run_pass2(
         first_addr_lon_e7: 0,
     };
 
+    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_LOOP_START");
     {
         // Sequential reader to avoid PrimitiveBlock cross-thread alloc/free
         // retention (25+ GB at Europe/planet scale). The fused node+way scan
@@ -403,6 +407,7 @@ pub(super) fn run_pass2(
             }
         } // for blob_result
     }
+    crate::debug::emit_marker("GEOCODE_PASS2_SCAN_LOOP_END");
 
     let Pass2State {
         addr_point_count, street_way_count,
@@ -410,6 +415,7 @@ pub(super) fn run_pass2(
         ..
     } = state;
 
+    crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_START");
     // Flush and drop writers before mmap
     street_ways_out.flush()?;
     street_nodes_out.flush()?;
@@ -443,6 +449,7 @@ pub(super) fn run_pass2(
     let street_nodes_mmap = mmap_file(FILE_STREET_NODES)?;
     let addr_points_mmap = mmap_file(FILE_ADDR_POINTS)?;
     let interp_nodes_mmap = mmap_file(FILE_INTERP_NODES)?;
+    crate::debug::emit_marker("GEOCODE_PASS2_FLUSH_MMAP_END");
 
     Ok(Pass2Output {
         addr_point_count,

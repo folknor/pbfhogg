@@ -1,5 +1,14 @@
 # BlobReader::seek_raw audit (2026-04-17)
 
+> **RESOLVED 2026-04-18 (commit `aa3147c`).** Fix shape did not match the
+> audit's "specialize `impl BlobReader<BufReader<R>>`" recommendation —
+> Rust doesn't allow inherent method specialization on stable. Landed
+> shape is a public `BlobReaderSource` trait with a default
+> `skip_relative` overridden by the `BufReader` impl to call
+> `BufReader::seek_relative`. See
+> [`notes/seek-raw-fix-implementation.md`](seek-raw-fix-implementation.md)
+> for the implementation, design rationale, and per-caller bench deltas.
+
 Source-of-truth for the cross-cutting `BlobReader::seek_raw` BufReader-discard
 fix. Three Explore agents produced parallel findings; this doc consolidates
 the fix-shape recommendation, bench coverage, and the minimum-cost validation

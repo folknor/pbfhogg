@@ -66,6 +66,38 @@ Complete rewrite of the `renumber` command using an external-join architecture. 
 
 ### Library
 
+- **`BlobReaderSource` trait + `BufReader::seek_relative`-based header-walk
+  fast path.** `BlobReader::seek_raw` was calling `Seek::seek` directly,
+  which on `BufReader<File>` always invokes `discard_buffer()` (stdlib
+  `Seek::seek` semantics, not `BufReader`-specific). Every header-walking
+  caller paid ~10× file-size read amplification at the default 256 KB buffer
+  on every blob-body skip; bumping the buffer to 16 MB without fixing the
+  seek caused a 13× regression (Europe 14.8 → 426 s, reverted in `86761d6`).
+  The new public `BlobReaderSource` trait abstracts the source with a
+  `skip_relative(offset)` method whose default falls back to `Seek::seek`
+  (correct, slow) and is overridden for `BufReader<R: Read + Seek>` to call
+  `BufReader::seek_relative` (preserves the buffer when the target is in-
+  range). `File` and `Cursor<T: AsRef<[u8]>>` use the default — `File` has
+  no buffer to preserve, and `Cursor::seek` is a pure cursor-position bump.
+  Hot-path call sites (`next_header_skip_blob`, `next_header_with_data_offset`)
+  route through a new internal `skip_blob_body` helper. Public `seek_raw`
+  is unchanged for the `SeekFrom::Start` / `SeekFrom::End` paths.
+  - **Library API impact:** `BlobReader::new_seekable<R>`'s bound widens
+    from `R: Read + Seek + Send` to `R: BlobReaderSource + Send`. Same for
+    `IndexedReader::new<R>`. Downstream library users with non-standard
+    `R` types add `impl BlobReaderSource for MyReader {}` (one line, picks
+    up the correct-but-slow default).
+  - **Measured wall deltas (Europe/planet, `--bench 1` single-shot,
+    plantasjen):** extract --smart Europe `211.2 s → 195.2 s` (−7.6 %);
+    ALTW external Europe `286.3 s → 270.7 s` (−5.5 %, with META_SCAN
+    phase `25.9 s → 13.3 s` = −49 %); ALTW external planet `~678 s →
+    700.6 s` (within `--bench 1` noise — META_SCAN is only 2.5 % of
+    planet wall, so the wall delta is in the noise even though the
+    targeted phase improved); tags-filter Europe `91.7 s → 93.1 s`
+    (within noise); renumber planet `218.6 s → 206.7 s` (−5.4 %, larger
+    than the audit's 1–2 % prediction but within `--bench 1` variance).
+    Full caller table + Europe phase breakdown in
+    `notes/seek-raw-fix-implementation.md`.
 - `IdSetDense`: rank-indexed lookup (`resolve()`), denser 64B rank blocks, atomic set support, negative-ID guard. Migrated all `IdSet` (BTreeSet) call sites to `IdSetDense` for O(1) lookups.
 - `PbfWriter`: rayon dispatch bounded by permit pool to prevent unbounded in-flight blob accumulation.
 - `external_radix`: shared `ScratchDir` + `BucketWriters` module extracted for reuse across external-join commands.

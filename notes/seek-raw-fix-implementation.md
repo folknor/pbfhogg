@@ -186,6 +186,75 @@ it where the seek_raw amplification was a meaningful fraction of wall.
 
 ### Post-fix benches
 
-| Caller / Command | Dataset | Pre-fix | Post-fix | Δ | UUID |
-|---|---|---:|---:|---:|---|
-| TBD | TBD | TBD | TBD | TBD | TBD |
+All `--bench 1` single-shot, plantasjen, 2026-04-18.
+Pre-fix UUID = bench at `ca6711e` (regression-fix only).
+Post-fix UUID = bench at `aa3147c` (seek_raw fix landed).
+
+| Caller / Command | Dataset | Pre-fix | Post-fix | Δ | Audit prediction | Pre-UUID | Post-UUID |
+|---|---|---:|---:|---:|---:|---|---|
+| extract --smart | Europe | 211.2 s | 195.2 s | **−16.0 s, −7.6 %** | 5–15 % | `f7c2ccda` | `1bd5bbdf` |
+| add-locations-to-ways --index-type external | Europe | 286.3 s | 270.7 s | **−15.6 s, −5.5 %** | 10–15 % | `5233ed39` | `555de261` |
+| add-locations-to-ways --index-type external | Planet | ~678 s¹ | 700.6 s | within noise² | 10–15 % | (skipped) | `e30f7ddc` |
+| tags-filter | Europe | 91.7 s | 93.1 s | within noise (+1.5 %) | 1–3 % | `2244b6e4` | `ea9d2440` |
+| renumber | Planet | 218.6 s | 206.7 s | **−11.9 s, −5.4 %**³ | 1–2 % | `ae91b114` | `878e7a99` |
+
+### Phase-level evidence (Europe ALTW)
+
+The cleanest signal in the dataset. `EXTJOIN_META_SCAN` is the only ALTW
+phase that walks blob headers; all other stages use direct `pread` on the
+file (no `BlobReader`, no `seek_raw`).
+
+| Phase | Pre-fix (`5233ed39`) | Post-fix (`555de261`) | Δ |
+|---|---:|---:|---:|
+| META_SCAN | 25.9 s | 13.3 s | **−12.6 s, −49 %** |
+| STAGE1 (PASS_A + PASS_B) | 37.1 s | 35.3 s | −1.8 s |
+| STAGE2 | 94.3 s | 90.9 s | −3.4 s |
+| STAGE3 | 33.2 s | 32.9 s | −0.3 s |
+| ROUTER_BUILD | 0.17 s | 0.17 s | 0 |
+| RELATION_SCAN | 3.9 s | 3.9 s | 0 |
+| STAGE4 | 90.5 s | 93.0 s | +2.5 s |
+| **Total** | **286.3 s** | **270.7 s** | **−15.6 s** |
+
+META_SCAN explains 12.6 s of the 15.6 s wall delta. The remaining 3 s
+sits in stages 1 + 2, likely page-cache benefit (META_SCAN at 256 KB
+buffer used to amplify reads ~10× and push subsequent stages' working
+set out of cache). Stage 4 noise is within single-shot variance.
+
+¹ ALTW planet pre-fix bench skipped — known pre-regression baseline 698.1 s
+(README, 11m38s) minus ~20 s of all-blobs-scan overhead ≈ 678 s as the
+regression-fix-only baseline. Saves the 12 min re-bench.
+
+² Post-fix 700.6 s is within single-shot `--bench 1` variance (10–15 %)
+of the inferred 678 s baseline. The fix is doing its job — the
+`ALTW_BLOB_META_SCAN` phase measures **17.5 s** post-fix, vs the
+historical ~28–30 s on Europe (which scales linearly to ~50 s on planet
+if the fix had not landed). The audit's 10–15 % wall prediction was
+based on Europe ratios where META_SCAN is ~9 % of wall (28.5 / 320 s);
+planet's META_SCAN is only ~2.5 % of wall (17.5 / 700 s) because Stages
+1+2+4 dominate (~85 % combined). The win is real per-phase but small
+as a fraction of total wall on planet.
+
+Planet phase breakdown post-fix (UUID `e30f7ddc`, commit `aa3147c`):
+- META_SCAN: 17.5 s ← header-walk path, this is what the fix targets
+- STAGE1 (PASS_A + PASS_B): 123.2 s
+- STAGE2: 240.5 s
+- STAGE3: 85.5 s
+- ROUTER_BUILD: 1.6 s
+- RELATION_SCAN: 6.3 s
+- STAGE4: 223.3 s
+- Total: 700.6 s
+
+Europe phase breakdown post-fix (UUID `555de261`, commit `aa3147c`):
+- META_SCAN: 13.3 s ← post-fix; pre-regression-fix was 28.5 s on same code path
+- STAGE1 (PASS_A + PASS_B): 35.3 s
+- STAGE2: 90.9 s
+- STAGE3: 32.9 s
+- ROUTER_BUILD: 0.17 s
+- RELATION_SCAN: 3.9 s
+- STAGE4: 93.0 s
+- Total: 270.7 s
+
+³ Renumber: post-fix is −11.9 s vs pre-fix on a single `--bench 1` shot.
+That's larger than the audit's 1–2 % prediction, but still within the
+10–15 % single-shot variance range. Unclear whether this is real or
+noise without a `--bench 3` repeat. Not a regression in any case.

@@ -250,46 +250,16 @@ is declared. Requires `debug_assertions` to be enabled in the test profile. Nigh
   No measurement required for call-sites where the analysis is obvious
   (one cache-line touch beats two).
 
-- [ ] **`BlobReader::seek_raw` discards BufReader buffer on every call** -
-  latent codebase-wide perf issue surfaced while tuning `check_refs`
-  schedule walk at Europe scale.
-  [`blob.rs:966`](src/read/blob.rs#L966) calls `self.reader.seek(pos)` which
-  for `BufReader<File>` always invokes `discard_buffer()` after the seek
-  (stdlib semantics - `Seek::seek` is not the buffer-preserving path).
-  `BufReader::seek_relative` exists specifically to keep the buffer when
-  the target is in-range, but it's a BufReader-specific method, not on the
-  `Seek` trait, so generic `impl<R: Seek> BlobReader<R>` can't reach it.
-
-  Observed blast radius (check_refs, Europe 35 GB, 520 K blobs): every
-  `next_header_with_data_offset` call does a 4-byte len read, a ~150-byte
-  header read, then a `seek_raw(SeekFrom::Current(+data_size))` to skip
-  the body. At the default 256 KB buffer the amplification is ~10× the
-  file size (~350 GB of reads, page-cache-served, 14.8 s wall on Europe).
-  At 16 MB buffer the amplification is ~670× - measured 14.8 → 426 s
-  regression when bumping the buffer size without fixing the seek
-  (reverted in `86761d6`). The current 256 KB buffer is masking the bug,
-  not avoiding it.
-
-  Other callers of `BlobReader::seekable_from_path` all do the same
-  header-walk-then-skip-body pattern and likely pay similar proportional
-  cost: `build_classify_schedule` / `build_classify_schedules_split`
-  ([`commands/mod.rs`](src/commands/mod.rs)), `tags_filter`, `extract`
-  (×3), `altw/blob_meta`, `renumber_external`. Most don't bench on
-  Europe today in a way that would have surfaced it.
-
-  Fix options:
-  - Specialize `impl BlobReader<BufReader<R>>` with a `seek_relative`-based
-    seek. Cleanest; limited to the BufReader case.
-  - Add a `SeekRelative` trait with impls for `BufReader` (fast path) and
-    `File` (trivial forward to `seek`). Lets the generic abstraction stay
-    one layer deep across all reader types.
-  - Open-code the in-buffer cursor bump inside `seek_raw`. Fragile
-    (duplicates stdlib logic); not recommended.
-
-  Investigation scope: profile each caller's header-walk share of wall
-  at Europe / planet, estimate expected win per caller, pick the fix
-  shape, land once. Probably worth elevating to a dedicated notes doc
-  if two or more callers show >10 % of wall in header-walk work.
+- [x] ~~**`BlobReader::seek_raw` discards BufReader buffer on every call**~~ -
+  **DONE 2026-04-18 (commit `aa3147c`).** Landed via a public
+  `BlobReaderSource` trait with a default `skip_relative` overridden by
+  the `BufReader` impl to call `BufReader::seek_relative`. The audit's
+  stated "specialize `impl BlobReader<BufReader<R>>`" approach didn't
+  compile (Rust forbids inherent method specialization on stable). Per-
+  caller wall deltas in `notes/seek-raw-fix-implementation.md`. Library
+  API impact: `new_seekable<R>` and `IndexedReader::new<R>` bounds widen
+  from `R: Read + Seek + Send` to `R: BlobReaderSource + Send` —
+  one-line workaround for downstream library users with non-standard R.
 
 - [ ] **Rayon alternatives for slice-based parallelism** - Wild linker discussion
   ([davidlattimore/wild#1072](https://github.com/davidlattimore/wild/discussions/1072)) surveys

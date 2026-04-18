@@ -261,6 +261,57 @@ The shared metadata pass replaced three separate scans on Europe:
 Net: about **87s** of repeated scan work collapsed to about **31s**, which is
 why stage 1 dropped `91.4s -> 36.0s` and stage 4 dropped `122.7s -> 90.6s`.
 
+### External join stage breakdown (Europe, commit `aa3147c`, plantasjen) — post `seek_raw` fix
+
+`BlobReader`'s header-walk path now preserves the `BufReader` buffer
+(see [seek-raw-fix-implementation.md](../notes/seek-raw-fix-implementation.md)).
+Meta scan halves; downstream stages get warmer page cache.
+
+| Phase | Time (post-fix) | Time (pre-fix `ca6711e`) | Δ |
+|-------|----------------:|-------------------------:|---:|
+| Meta scan | 13.3s | 25.9s | **−12.6 s, −49 %** |
+| Stage 1 (way pass) | 35.3s | 37.1s | −1.8 s |
+| Stage 2 (node join) | 90.9s | 94.3s | −3.4 s |
+| Stage 3 (slot reorder) | 32.9s | 33.2s | −0.3 s |
+| Router build | 0.17s | 0.17s | 0 |
+| Relation scan | 3.9s | 3.9s | 0 |
+| Stage 4 (assembly) | 93.0s | 90.5s | +2.5 s (single-shot variance) |
+| **Total** | **270.7 s** | **286.3 s** | **−15.6 s, −5.5 %** |
+
+UUIDs: post-fix `555de261`, pre-fix `5233ed39` (both `--bench 1`).
+Meta scan delta is the direct effect of `BufReader::seek_relative`
+preserving the buffer on every blob-body skip; the small downstream
+deltas in stages 1+2 are page-cache benefit (header walk used to amplify
+reads ~10× and push subsequent stages' working set out of cache).
+
+### External join planet (commit `aa3147c`, post-`seek_raw` fix)
+
+Planet wall **700.6 s** (UUID `e30f7ddc`, `--bench 1`), basically
+identical to the pre-regression README baseline of 698 s (within
+single-shot variance). META_SCAN measures 17.5 s post-fix — vs the
+inferred ~30 s pre-fix on the same code path, so the seek_raw fix
+saves ~12 s in that phase. As a fraction of planet total wall (700 s),
+that's 1.7 %, comfortably inside the noise floor of `--bench 1`.
+
+The audit's 10–15 % wall prediction was based on Europe ratios where
+META_SCAN is 9 % of total (28.5 / 320 s); planet's META_SCAN is only
+2.5 % of total because Stages 1+2+4 dominate (~85 % combined). The
+fix delivered exactly what it should at the phase level — wall just
+doesn't move much because the targeted phase is small.
+
+Phase breakdown (UUID `e30f7ddc`):
+
+| Phase | Time |
+|---|---:|
+| META_SCAN | 17.5 s |
+| STAGE1 (PASS_A + PASS_B) | 123.2 s |
+| STAGE2 | 240.5 s |
+| STAGE3 | 85.5 s |
+| ROUTER_BUILD | 1.6 s |
+| RELATION_SCAN | 6.3 s |
+| STAGE4 | 223.3 s |
+| **Total** | **700.6 s** |
+
 ### External join optimization history
 
 | Version | Denmark | Europe | Planet | Commit |

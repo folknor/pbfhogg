@@ -88,41 +88,44 @@ impl NodeLocationIndex {
 
     /// Pre-scan the base PBF to fill all remaining needed node coordinates.
     ///
-    /// Uses indexdata to skip non-node blobs and blobs whose ID ranges don't
-    /// overlap needed IDs. Matching blobs use the node scanner (no
-    /// PrimitiveBlock construction). Exits early once all needed IDs are found.
+    /// Two phases: (1) header-only walk to build a schedule of node blobs that
+    /// overlap `needed_set`, skipping non-node blobs and range-disjoint node
+    /// blobs; (2) parallel pread + decompress + `extract_node_tuples` across
+    /// the schedule, accumulating into per-worker maps, merged at the end.
     /// Returns `(nodes_found, blobs_scanned)`.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub(super) fn prefill_from_base(
         &mut self,
         base_pbf: &Path,
-        direct_io: bool,
+        _direct_io: bool,
     ) -> super::Result<(u64, u64)> {
+        use std::os::unix::fs::FileExt as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
         if self.all_found() {
             return Ok((0, 0));
         }
 
-        let mut reader = crate::blob::BlobReader::open(base_pbf, direct_io)?;
-        reader.set_parse_indexdata(true);
+        // Phase A: header-only walk. Build a schedule of (data_offset,
+        // data_size) for node blobs that overlap `needed_set`.
+        let mut scanner = crate::blob::BlobReader::seekable_from_path(base_pbf)?;
+        scanner.set_parse_indexdata(true);
+        scanner
+            .next_header_skip_blob()
+            .ok_or_else(|| crate::error::new_error(crate::error::ErrorKind::MissingHeader))??;
 
-        let mut buf: Vec<u8> = Vec::new();
-        let mut tuples = Vec::new();
-        let mut group_starts = Vec::new();
-        let mut nodes_found: u64 = 0;
-        let mut blobs_scanned: u64 = 0;
+        let mut schedule: Vec<(u64, usize)> = Vec::new();
         let mut blobs_skipped_non_node: u64 = 0;
         let mut blobs_skipped_range: u64 = 0;
-        let mut early_exit = false;
-
-        for blob_result in &mut reader {
-            let blob = blob_result?;
-            if !matches!(blob.get_type(), crate::blob::BlobType::OsmData) {
+        while let Some(result_item) = scanner.next_header_with_data_offset() {
+            let (hdr, _frame_offset, data_offset, data_size) = result_item?;
+            if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) {
                 continue;
             }
-            if let Some(idx) = blob.index() {
-                // Skip non-node blobs and node blobs outside needed range
+            if let Some(idx) = hdr.index() {
                 if idx.kind != ElemKind::Node {
-                    // Sorted PBF: once past nodes, no more node blobs
+                    // Sorted PBF: once past nodes, no more node blobs.
                     blobs_skipped_non_node += 1;
                     break;
                 }
@@ -131,23 +134,131 @@ impl NodeLocationIndex {
                     continue;
                 }
             }
-            blob.decompress_into(&mut buf)?;
-            tuples.clear();
-            group_starts.clear();
-            if crate::commands::node_scanner::extract_node_tuples(
-                &buf, &mut tuples, &mut group_starts,
-            ).is_ok() {
-                for t in &tuples {
-                    if self.needed_set.remove(&t.id) {
-                        self.locations.insert(t.id, (t.lat, t.lon));
-                        nodes_found += 1;
-                    }
-                }
+            schedule.push((data_offset, data_size));
+        }
+        drop(scanner);
+
+        let blobs_scanned = schedule.len() as u64;
+        if schedule.is_empty() {
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                crate::debug::emit_counter("merge_prefill_nodes_found", 0);
+                crate::debug::emit_counter("merge_prefill_blobs_scanned", 0);
+                crate::debug::emit_counter(
+                    "merge_prefill_blobs_skipped_non_node",
+                    blobs_skipped_non_node as i64,
+                );
+                crate::debug::emit_counter(
+                    "merge_prefill_blobs_skipped_range",
+                    blobs_skipped_range as i64,
+                );
+                crate::debug::emit_counter("merge_prefill_early_exit", 0);
             }
-            blobs_scanned += 1;
-            if self.all_found() {
-                early_exit = true;
-                break;
+            return Ok((0, 0));
+        }
+
+        let shared_file = std::sync::Arc::new(
+            std::fs::File::open(base_pbf)
+                .map_err(|e| format!("failed to open {}: {e}", base_pbf.display()))?,
+        );
+
+        // Phase B: parallel pread + decompress + extract_node_tuples. Workers
+        // accumulate into per-worker maps; merge at the end into
+        // self.locations and drain from self.needed_set.
+        let decode_threads = std::thread::available_parallelism()
+            .map(|n| n.get().saturating_sub(2).max(1))
+            .unwrap_or(4);
+
+        let mut worker_maps: Vec<FxHashMap<i64, (i32, i32)>> = (0..decode_threads)
+            .map(|_| FxHashMap::default())
+            .collect();
+
+        let next_idx = AtomicUsize::new(0);
+        let first_err: Mutex<Option<String>> = Mutex::new(None);
+        let schedule_ref = &schedule;
+        let next_ref = &next_idx;
+        let first_err_ref = &first_err;
+        let needed_set_ref = &self.needed_set;
+
+        std::thread::scope(|scope| {
+            for local_map in &mut worker_maps {
+                let file = std::sync::Arc::clone(&shared_file);
+                scope.spawn(move || {
+                    let mut read_buf: Vec<u8> = Vec::new();
+                    let mut decompress_buf: Vec<u8> = Vec::new();
+                    let mut tuples: Vec<crate::commands::node_scanner::NodeTuple> =
+                        Vec::new();
+                    let mut group_starts: Vec<(usize, usize)> = Vec::new();
+
+                    loop {
+                        if first_err_ref
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .is_some()
+                        {
+                            return;
+                        }
+                        let idx = next_ref.fetch_add(1, Ordering::Relaxed);
+                        if idx >= schedule_ref.len() {
+                            break;
+                        }
+                        let (data_offset, data_size) = schedule_ref[idx];
+
+                        let result: std::result::Result<(), String> = (|| {
+                            read_buf.resize(data_size, 0);
+                            file.read_exact_at(&mut read_buf, data_offset)
+                                .map_err(|e| format!("pread at {data_offset}: {e}"))?;
+                            decompress_buf.clear();
+                            crate::blob::decompress_blob_raw(&read_buf, &mut decompress_buf)
+                                .map_err(|e| e.to_string())?;
+                            tuples.clear();
+                            group_starts.clear();
+                            // Match sequential behaviour: swallow extract errors.
+                            if crate::commands::node_scanner::extract_node_tuples(
+                                &decompress_buf,
+                                &mut tuples,
+                                &mut group_starts,
+                            )
+                            .is_ok()
+                            {
+                                for t in &tuples {
+                                    if needed_set_ref.contains(&t.id) {
+                                        local_map.insert(t.id, (t.lat, t.lon));
+                                    }
+                                }
+                            }
+                            Ok(())
+                        })();
+
+                        if let Err(e) = result {
+                            let mut slot = first_err_ref
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot.is_none() {
+                                *slot = Some(e);
+                            }
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        if let Some(e) = first_err
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            return Err(e.into());
+        }
+
+        // Merge worker maps into self.locations and drain from self.needed_set.
+        let mut nodes_found: u64 = 0;
+        for map in worker_maps {
+            for (id, coords) in map {
+                if self.needed_set.remove(&id) {
+                    self.locations.insert(id, coords);
+                    nodes_found += 1;
+                }
             }
         }
 
@@ -163,9 +274,10 @@ impl NodeLocationIndex {
                 "merge_prefill_blobs_skipped_range",
                 blobs_skipped_range as i64,
             );
+            crate::debug::emit_counter("merge_prefill_early_exit", 0);
             crate::debug::emit_counter(
-                "merge_prefill_early_exit",
-                i64::from(early_exit),
+                "merge_prefill_decode_threads",
+                decode_threads as i64,
             );
         }
 

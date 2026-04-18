@@ -22,7 +22,7 @@ use crate::commands::{
     ensure_relation_capacity_local, ensure_way_capacity, ensure_way_capacity_local,
     flush_block, flush_local, flush_passthrough_buf, read_raw_frame,
     require_indexdata, writer_from_header_bytes, HeaderOverrides, RawBlobFrame,
-    BATCH_BYTE_BUDGET, BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
+    BATCH_MAX_BLOBS, BATCH_MIN_BLOBS,
 };
 use crate::blob::parse_blob_header_with_index;
 use crate::reorder_buffer::ReorderBuffer;
@@ -39,6 +39,14 @@ use super::stats::{PhaseRss, read_rss_kb};
 use super::Result;
 
 const READER_CHANNEL_SIZE: usize = 128;
+
+/// Merge-specific batch byte budget. Larger than the shared `BATCH_BYTE_BUDGET`
+/// (128 MB) so that per-batch `par_iter` has enough overlap blobs to saturate
+/// rayon workers. At planet the shared budget capped batches at ~12 blobs/~6
+/// overlap, limiting classify parallelism to ~4.15 cores of 22 available.
+/// 512 MB raises the cap to ~25 overlap blobs per batch without changing
+/// other commands' memory profile.
+const MERGE_BATCH_BYTE_BUDGET: usize = 512 * 1024 * 1024;
 
 /// Accumulated locations-on-ways statistics (populated during pre-scan).
 #[derive(Default)]
@@ -602,7 +610,7 @@ fn collect_batch(
     batch.clear();
     let mut batch_bytes: usize = 0;
     while batch.len() < BATCH_MAX_BLOBS {
-        if batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= BATCH_BYTE_BUDGET {
+        if batch.len() >= BATCH_MIN_BLOBS && batch_bytes >= MERGE_BATCH_BYTE_BUDGET {
             break;
         }
         match frame_rx.try_recv() {

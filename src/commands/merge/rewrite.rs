@@ -4,6 +4,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 use crate::blob::{decode_blob_to_headerblock, BlobKind};
@@ -1119,50 +1120,15 @@ pub fn merge(
         }
         batch_count += 1;
 
-        // Phase 1: Parallel classify via rayon::scope + per-blob spawn +
-        // mpsc + ReorderBuffer, instead of `batch.par_iter().collect()`.
-        //
-        // The par_iter().collect() variant uses rayon's recursive split, which
-        // interacts poorly with heterogeneous per-blob cost: the batch contains
-        // a few ~2 ms slow-path blobs mixed with many ns-cost fastpath blobs;
-        // the recursive split can group slow blobs onto the same sub-range
-        // and leave cores idle behind the tail. This variant dispatches each
-        // blob as its own rayon task, letting work-stealing pick them up
-        // flat; results come back via mpsc and are reordered into file order
-        // via ReorderBuffer. See "Cheap disambiguation experiment" in
-        // notes/apply-changes-opportunities.md.
+        // Phase 1: Parallel classify
         let phase1_start = std::time::Instant::now();
-        let batch_len = batch.len();
-        let classify_results: Vec<std::result::Result<ClassifyResult, String>> = {
-            let (tx, rx) = mpsc::sync_channel::<
-                (usize, std::result::Result<ClassifyResult, String>),
-            >(batch_len.max(1));
-            let ranges_ref: &DiffRanges = &ranges;
-            let counters_ref: &ClassifyCounters = &classify_counters;
-            rayon::scope(|scope| {
-                for (idx, frame) in batch.iter().enumerate() {
-                    let tx = tx.clone();
-                    scope.spawn(move |_| {
-                        let mut buf = Vec::new();
-                        let result =
-                            classify_only(frame, ranges_ref, &mut buf, counters_ref);
-                        tx.send((idx, result)).ok();
-                    });
-                }
-            });
-            drop(tx);
-            let mut reorder: ReorderBuffer<
-                std::result::Result<ClassifyResult, String>,
-            > = ReorderBuffer::with_capacity(batch_len);
-            for (seq, result) in rx.try_iter() {
-                reorder.push(seq, result);
-            }
-            let mut results = Vec::with_capacity(batch_len);
-            while let Some(r) = reorder.pop_ready() {
-                results.push(r);
-            }
-            results
-        };
+        let classify_results: Vec<std::result::Result<ClassifyResult, String>> = batch
+            .par_iter()
+            .map_init(
+                Vec::new,
+                |buf, frame| classify_only(frame, &ranges, buf, &classify_counters),
+            )
+            .collect();
         phase_timers.classify_total += phase1_start.elapsed();
         #[cfg(feature = "hotpath")]
         {

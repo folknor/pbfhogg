@@ -605,17 +605,22 @@ Replace `collect_batch` + `par_iter().collect()` + the per-batch slot-drain with
 
 **Scope.** Net delete of ~300 lines from rewrite.rs; net add of ~400 lines split across a new `streaming.rs` + reorder actor. Not a prototype - commit, measure, keep or revert.
 
-### Cheap disambiguation experiment (run this first)
+### Cheap disambiguation experiment (attempted, reverted 2026-04-18)
 
-Before committing to the full rewrite, confirm the batch barrier is the real cause of the plateau. One commit, one bench, keep or revert:
+Attempted implementation: `rayon::scope` + per-blob `scope.spawn` + `mpsc::sync_channel(batch_len)` + `ReorderBuffer` replacing `batch.par_iter().collect()`. Keeps phase 2/3/4 unchanged. Committed as `<pending-sha>`.
 
-- Keep the outer loop, `collect_batch`, phase 2, phase 3, phase 4.
-- **Replace `par_iter().collect()` with `rayon::spawn` per blob + `mpsc::channel` + `ReorderBuffer`.** Keep batches intact otherwise.
-- Bench.
+**Result: reverted.** Denmark verify passed (correctness OK), but planet `--bench 1` never completed: killed at 10 min wall (vs ~140 s baseline) with last marker `WAIT_REWRITE_RESULT_END` and only 5.6 GB / 92 GB read, 5.4 GB written. Child RSS was 1.2 GB, 50 threads. Not a deadlock - the process was making forward progress, just pathologically slowly.
 
-**Predicted outcome (both reviewers):** classify wall drops from 72.5 s to `~270 s / 22 + reorder overhead ≈ 12-15 s`. If that happens, the plateau was the `par_iter().collect()` barrier and the full streaming rewrite is justified. If it doesn't drop meaningfully, the CPU time isn't scaling across cores for a different reason (memory bandwidth saturation, zstd lock contention, buffer allocator, etc.) and we need to dig into that before any structural change.
+**Likely cause (not proven):** per-batch `rayon::scope` overhead at scale. Planet has ~11 k batches; 18-way scope.spawn + waiting-for-all-to-complete + channel allocation + ReorderBuffer allocation per batch. Even a few ms of per-batch overhead puts the total minutes over baseline. The `rayon::scope` barrier semantics also still wait for the tail task per batch - the shape isn't meaningfully different from `par_iter().collect()` in that respect.
 
-**This experiment is ~70 % of the structural work for the full rewrite**, so if it confirms the hypothesis the full rewrite gets cheaper from there.
+**What this tells us:** the "cheap" experiment as reviewers sketched it (swap dispatch shape, keep batch loop) doesn't cleanly isolate the batch-barrier hypothesis at planet scale. A better experiment would be:
+
+- Pre-allocate the reorder buffer + channel **once**, outside the batch loop, reused across batches.
+- Or: abandon the "keep batches" constraint and go straight to the streaming rewrite - the real payoff shape anyway.
+
+**Doesn't disprove the plateau hypothesis** - it just means this particular minimal-change form doesn't prove it either way. The CPU-budget math (270 s / 22 = 12.3 s classify wall floor) still stands as the streaming pipeline's theoretical target.
+
+**Sequencing takeaway:** skip the cheap experiment; go direct to the streaming pipeline. Accept that we can't cheaply disambiguate "batch barrier vs non-scaling CPU" before committing to the restructure. Mitigation: instrument the streaming pipeline with per-phase counters (already planned) so we can detect non-scaling CPU early and pivot if the 40-55 s target turns out unreachable.
 
 ### Follow-up wins (order by when they make sense)
 
@@ -671,7 +676,7 @@ If pursued: either a wire-format exact-overlap scanner on decompressed bytes (sk
 
 ### Recommended sequence (both reviewers agree)
 
-1. **Cheap disambiguation experiment.** `rayon::spawn` + `mpsc` + `ReorderBuffer` replacing `par_iter().collect()`, keep batches. One commit, one bench. If classify wall falls toward ~12-15 s, proceed. If not, pause and investigate non-scaling CPU (memory bandwidth, lock contention, allocator).
+1. ~~**Cheap disambiguation experiment.**~~ Attempted 2026-04-18 and reverted (10 min+ regression at planet while Denmark verify passed). See "Cheap disambiguation experiment" subsection for post-mortem. Skipping this step and going direct to streaming.
 2. **Full streaming pipeline + fuse classify+rewrite.** Same commit architecturally - don't land them separately. Expected 40-55 s wall.
 3. **Worker-emits-framed-bytes.** Small, high-confidence commit after the streaming rewrite. Removes the `PIPELINE_DISPATCH_PERMITS=64` cap on concurrent compressor tasks; frees the writer's second rayon dispatch. See the Q2 follow-up subsection.
 4. **Prefill fusion into the streaming pipeline's node phase.** Clean local change once streaming is in place. Deletes the prefill phase entirely (~5 s today, ~30 s+ at weekly scale). See the Q4 follow-up subsection.
@@ -826,7 +831,7 @@ Both reviewers: **streaming pipeline is still the right first move at weekly sca
 4. ~~**Skip `scan_block_ids` when indexdata was present**~~ **Landed 2026-04-18 (`da1c45e`)**, saved 10.7 s CPU but only ~2 s wall (mostly lost to variance).
 5. ~~**Bump classify batch size**~~ **Landed 2026-04-18 (`bfac63b`) - 512 MB merge batch budget.** Raised average batch from ~13 to ~18 overlap blobs but classify wall was unchanged (72.5 s vs 70.3 s). **Diagnosis from external review: the plateau is structural to the batch barrier, not fixable with batch-size knobs** - see "External review synthesis" section.
 6. ~~**Parallel reader (#3)**~~ **Landed 2026-04-18 (`c97d6b5` streaming variant)**. Net-zero wall change vs sequential reader. Kept as infrastructure for the streaming pipeline below.
-7. **Cheap disambiguation experiment (next).** Replace `par_iter().collect()` with `rayon::spawn` per blob + `mpsc` + `ReorderBuffer`, keeping batches intact otherwise. One commit, one bench. Predicted outcome: classify wall drops from 72.5 s toward 12-15 s. Confirms (or disproves) the batch-barrier diagnosis before the full rewrite. See "Cheap disambiguation experiment" subsection.
+7. ~~**Cheap disambiguation experiment**~~ **Attempted + reverted 2026-04-18.** `rayon::scope` + per-batch spawn + mpsc + ReorderBuffer regressed from ~140 s to 10 min+ at planet (Denmark verify passed). See "Cheap disambiguation experiment" subsection for post-mortem. Doesn't disprove the plateau hypothesis, but rules out this form of cheap check. **Going direct to streaming pipeline instead.**
 8. **Streaming pipeline + fuse classify+rewrite.** Delete the batch loop; replace with reader -> classifier-pool (fused decompress + precise + rewrite) -> reorder/gap-create actor -> writer. Main thread off the critical path. Estimated **40-55 s wall at planet daily** (from 140 s). See "Primary rewrite: streaming pipeline" subsection for risk inventory and CPU-budget walk.
 9. **Worker-emits-framed-bytes.** Small high-confidence commit after the streaming rewrite: change worker output from `Vec<OwnedBlock>` to `Vec<Vec<u8>>` framed via [`frame_blob_pipelined`](../src/write/writer.rs#L1102) on the worker. Frees the `PIPELINE_DISPATCH_PERMITS=64` cap; removes the writer's second rayon dispatch. See Q2 follow-up subsection.
 10. **Prefill fusion into streaming pipeline's node phase.** Classifier workers opportunistically extract coords for `needed_set` IDs while decompressing node blobs; reorder actor barriers the node→way transition and finalises `Arc<loc_map>`. Deletes prefill phase. Estimated **-5 s daily, -30 s+ weekly**. See Q4 follow-up subsection.

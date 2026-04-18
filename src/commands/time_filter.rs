@@ -86,6 +86,13 @@ pub fn time_filter(
     // which is load-bearing: the pending-group state machine below depends on
     // sorted traversal to know when a group ends. Re-encode and group
     // selection remain sequential on this thread.
+    //
+    // Hot-path timing lives in `#[cfg_attr(feature = "hotpath",
+    // hotpath::measure)]` on the inner helpers - run with `--hotpath` for a
+    // per-function breakdown. Release builds pay zero cost for that
+    // attribute. Don't re-add per-element Instant::now() here: Japan scale
+    // is 344 M elements and the time-source overhead alone doubled wall in
+    // an earlier iteration of this instrumentation.
     reader.for_each_pipelined(|element| {
         if flush_error.is_err() {
             return;
@@ -128,9 +135,18 @@ pub fn time_filter(
     }
     writer.flush()?;
     crate::debug::emit_marker("TIMEFILTER_END");
+    #[allow(clippy::cast_possible_wrap)]
+    {
+        crate::debug::emit_counter("timefilter_versions_seen", stats.versions_seen as i64);
+        crate::debug::emit_counter("timefilter_versions_before_cutoff", stats.versions_before_cutoff as i64);
+        crate::debug::emit_counter("timefilter_elements_written", stats.elements_written as i64);
+        crate::debug::emit_counter("timefilter_dropped_deleted", stats.dropped_deleted as i64);
+        crate::debug::emit_counter("timefilter_dropped_no_snapshot_version", stats.dropped_no_snapshot_version as i64);
+    }
     Ok(stats)
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn flush_group(
     group: PendingGroup,
     bb: &mut BlockBuilder,
@@ -152,6 +168,7 @@ fn flush_group(
     Ok(())
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn write_owned_element(
     bb: &mut BlockBuilder,
     writer: &mut crate::writer::PbfWriter<crate::file_writer::FileWriter>,
@@ -215,6 +232,7 @@ fn relation_timestamp(r: &Relation<'_>) -> i64 {
     r.info().milli_timestamp().unwrap_or(0) / 1000
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn clone_owned_element(element: &Element<'_>) -> OwnedElement {
     match element {
         Element::DenseNode(dn) => OwnedElement::Node(read_dense_node(dn)),

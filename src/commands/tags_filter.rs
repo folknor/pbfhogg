@@ -482,6 +482,33 @@ fn filter_block_pass2(
 // Two-pass filter (default mode, include references)
 // ---------------------------------------------------------------------------
 
+/// Classify-phase blob filter. Returns `(skip, tag_skip)`: `skip=true` means
+/// the caller should skip the blob; `tag_skip=true` means the skip was driven
+/// by the tag-index filter (the caller should bump its tag-skip counter).
+fn classify_blob_filter_check(
+    hdr: &crate::blob::BlobHeader,
+    filter: Option<&BlobFilter>,
+) -> (bool, bool) {
+    let Some(filter) = filter else { return (false, false); };
+    if let Some(idx) = hdr.index() {
+        let dominated = matches!(
+            idx.kind,
+            crate::blob_index::ElemKind::Node if !filter.want_nodes
+        ) || matches!(
+            idx.kind,
+            crate::blob_index::ElemKind::Way if !filter.want_ways
+        ) || matches!(
+            idx.kind,
+            crate::blob_index::ElemKind::Relation if !filter.want_relations
+        );
+        if dominated { return (true, false); }
+    }
+    if filter.has_tag_filter() && let Some(tag_idx) = hdr.tag_index() && !filter.wants_tag_index(&tag_idx) {
+        return (true, true);
+    }
+    (false, false)
+}
+
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_lines)]
@@ -549,30 +576,10 @@ fn tags_filter_two_pass(
     while let Some(result_item) = scanner.next_header_with_data_offset() {
         let (hdr, _frame_offset, data_offset, data_size) = result_item?;
         if !matches!(hdr.blob_type(), crate::blob::BlobType::OsmData) { continue; }
-        if let Some(ref filter) = expr_filter {
-            if let Some(idx) = hdr.index() {
-                // Skip blob types not needed by the expression.
-                let dominated = matches!(
-                    idx.kind,
-                    crate::blob_index::ElemKind::Node if !filter.want_nodes
-                ) || matches!(
-                    idx.kind,
-                    crate::blob_index::ElemKind::Way if !filter.want_ways
-                ) || matches!(
-                    idx.kind,
-                    crate::blob_index::ElemKind::Relation if !filter.want_relations
-                );
-                if dominated { continue; }
-            }
-            // Skip blobs whose tag index proves they lack required tag keys.
-            if filter.has_tag_filter() {
-                if let Some(tag_idx) = hdr.tag_index() {
-                    if !filter.wants_tag_index(&tag_idx) {
-                        blobs_skipped_by_tag += 1;
-                        continue;
-                    }
-                }
-            }
+        let (skip, tag_skip) = classify_blob_filter_check(&hdr, expr_filter.as_ref());
+        if skip {
+            if tag_skip { blobs_skipped_by_tag += 1; }
+            continue;
         }
         schedule.push((seq, data_offset, data_size));
         seq += 1;

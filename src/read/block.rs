@@ -372,7 +372,12 @@ impl PrimitiveBlock {
     ///
     /// Returns `ErrorKind::StringtableUtf8` if any stringtable entry contains invalid
     /// UTF-8 bytes. Returns `ErrorKind::WireFormat` if the protobuf wire format is invalid.
+    // Takes `Bytes` by value to compose with `and_then(PrimitiveBlock::new)`
+    // at decompress-boundary callers. The body copies via `to_vec()` so
+    // ownership is not strictly needed internally, but the by-value signature
+    // is the idiomatic shape at those call sites.
     #[hotpath::measure]
+    #[allow(clippy::needless_pass_by_value)]
     pub fn new(buffer: Bytes) -> Result<PrimitiveBlock> {
         Self::from_vec(buffer.to_vec())
     }

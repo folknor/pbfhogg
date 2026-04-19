@@ -112,7 +112,7 @@ pub(super) fn stage3_slot_reorder(
     slot_buckets: &SlotBucketRef,
     slot_bucket_count: usize,
     total_slots: u64,
-    integrated: IntegratedInputs<'_>,
+    integrated: &IntegratedInputs<'_>,
 ) -> Result<IntegratedResult> {
     // Floor division: every bucket is `range_size` slots wide except
     // the LAST, which extends to `total_slots` and may be wider. This
@@ -153,7 +153,10 @@ pub(super) fn stage3_slot_reorder(
     let s3_bytes_read_ref = &s3_bytes_read;
     let s3_scatter_stores_ref = &s3_scatter_stores;
     let s3_max_worker_buf_ref = &s3_max_worker_buf_bytes;
+    // Only referenced under feature = "linux-direct-io".
+    #[allow(unused_variables)]
     let s3_fadvise_calls_ref = &s3_fadvise_calls;
+    #[allow(unused_variables)]
     let s3_fadvise_bytes_ref = &s3_fadvise_bytes;
     let err_ref = &s3_error;
     let entry_counts = &slot_buckets.entry_counts;
@@ -162,7 +165,7 @@ pub(super) fn stage3_slot_reorder(
     let s3_integ_straddler_copy_ref = &s3_integ_straddler_copy_ms;
     let s3_integ_worker_tmp_bytes_ref = &s3_integ_worker_tmp_bytes;
 
-    let ctx = &integrated;
+    let ctx = integrated;
 
     let worker_manifests: Vec<Vec<ManifestEntry>> = std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(num_workers);

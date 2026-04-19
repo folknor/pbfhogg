@@ -76,7 +76,10 @@ fn prepare_bucket(
     loader.data_buf.clear();
     let mut open_calls: u64 = 0;
     let mut stat_calls: u64 = 0;
+    // fadvise_* only mutated under feature = "linux-direct-io".
+    #[allow(unused_mut)]
     let mut fadvise_calls: u64 = 0;
+    #[allow(unused_mut)]
     let mut fadvise_bytes: u64 = 0;
     for worker_id in 0..num_shard_workers {
         let path = scratch.path.join(format!("rank-W{worker_id}-{bucket_idx:03}"));
@@ -217,7 +220,7 @@ pub(super) fn stage2_node_join(
     slot_bucket_count: usize,
     total_slots: u64,
     unique_nodes: u64,
-    input_pbf: Arc<std::fs::File>,
+    input_pbf: &Arc<std::fs::File>,
     node_id_set: &IdSetDense,
     node_blob_mapping: &[NodeBlobInfo],
 ) -> Result<u64> {
@@ -312,7 +315,7 @@ pub(super) fn stage2_node_join(
 
     std::thread::scope(|scope| {
         for _ in 0..num_workers {
-            let pbf_file = Arc::clone(&input_pbf);
+            let pbf_file = Arc::clone(input_pbf);
             scope.spawn(move || {
                 use std::sync::atomic::Ordering::Relaxed;
 

@@ -76,7 +76,7 @@ pub(super) fn extract_complete_ways(input: &Path, output: &Path, region: &Region
             extract_block_pass2(block, &ids, clean, bb, output_blocks)
         })?;
     } else {
-        pread_write_pass_with_schedule(input, pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
+        pread_write_pass_with_schedule(input, &pass1_blob_schedule, &mut writer, &mut stats, |block, bb, output_blocks| {
             extract_block_pass2(block, &ids, clean, bb, output_blocks)
         })?;
     }

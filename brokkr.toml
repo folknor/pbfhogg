@@ -3,6 +3,13 @@ project = "pbfhogg"
 # Env variables that match these are captured by brokkr during runs and stored in the database.
 capture_env = ["PBFHOGG*", "MALLOC*"]
 
+# Cargo feature set a downstream library consumer would build with. brokkr
+# check runs clippy a second time with --no-default-features --features <these>
+# so feature-gated proc-macro expansions (e.g. #[hotpath::measure] swallowing
+# function bodies under hotpath) can't silently mask lints library users hit.
+[check]
+consumer_features = ["commands"]
+
 # ---------------------------------------------------------------------------
 # Per-machine configuration, keyed by hostname.
 # Unknown hostnames fall back to defaults: data="data", scratch="data/scratch".

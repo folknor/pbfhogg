@@ -369,6 +369,27 @@ fn ensure_relation_capacity_pooled(
     Ok(())
 }
 
+/// Snapshot-gate: returns `Some(())` if the element survives both the cutoff
+/// timestamp check and the visibility check. Updates `stats` for the drop
+/// counters along the way. Returning `None` means the caller should `continue`.
+fn snapshot_gate(
+    ts: i64,
+    visible: bool,
+    cutoff_timestamp: i64,
+    stats: &mut TimeFilterStats,
+) -> Option<()> {
+    if ts > cutoff_timestamp {
+        stats.dropped_no_snapshot_version += 1;
+        return None;
+    }
+    stats.versions_before_cutoff += 1;
+    if !visible {
+        stats.dropped_deleted += 1;
+        return None;
+    }
+    Some(())
+}
+
 #[hotpath::measure]
 fn filter_block_snapshot(
     block: &PrimitiveBlock,
@@ -392,16 +413,7 @@ fn filter_block_snapshot(
         stats.versions_seen += 1;
         match &element {
             Element::DenseNode(dn) => {
-                let ts = dense_timestamp(dn);
-                if ts > cutoff_timestamp {
-                    stats.dropped_no_snapshot_version += 1;
-                    continue;
-                }
-                stats.versions_before_cutoff += 1;
-                if !dense_visible(dn) {
-                    stats.dropped_deleted += 1;
-                    continue;
-                }
+                let Some(()) = snapshot_gate(dense_timestamp(dn), dense_visible(dn), cutoff_timestamp, &mut stats) else { continue; };
                 ensure_node_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(dn.tags());
@@ -413,16 +425,7 @@ fn filter_block_snapshot(
                 stats.elements_written += 1;
             }
             Element::Node(n) => {
-                let ts = node_timestamp(n);
-                if ts > cutoff_timestamp {
-                    stats.dropped_no_snapshot_version += 1;
-                    continue;
-                }
-                stats.versions_before_cutoff += 1;
-                if !node_visible(n) {
-                    stats.dropped_deleted += 1;
-                    continue;
-                }
+                let Some(()) = snapshot_gate(node_timestamp(n), node_visible(n), cutoff_timestamp, &mut stats) else { continue; };
                 ensure_node_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(n.tags());
@@ -434,16 +437,7 @@ fn filter_block_snapshot(
                 stats.elements_written += 1;
             }
             Element::Way(w) => {
-                let ts = way_timestamp(w);
-                if ts > cutoff_timestamp {
-                    stats.dropped_no_snapshot_version += 1;
-                    continue;
-                }
-                stats.versions_before_cutoff += 1;
-                if !way_visible(w) {
-                    stats.dropped_deleted += 1;
-                    continue;
-                }
+                let Some(()) = snapshot_gate(way_timestamp(w), way_visible(w), cutoff_timestamp, &mut stats) else { continue; };
                 ensure_way_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(w.tags());
@@ -456,16 +450,7 @@ fn filter_block_snapshot(
                 stats.elements_written += 1;
             }
             Element::Relation(r) => {
-                let ts = relation_timestamp(r);
-                if ts > cutoff_timestamp {
-                    stats.dropped_no_snapshot_version += 1;
-                    continue;
-                }
-                stats.versions_before_cutoff += 1;
-                if !relation_visible(r) {
-                    stats.dropped_deleted += 1;
-                    continue;
-                }
+                let Some(()) = snapshot_gate(relation_timestamp(r), relation_visible(r), cutoff_timestamp, &mut stats) else { continue; };
                 ensure_relation_capacity_pooled(bb, output, pool)?;
                 tags_buf.clear();
                 tags_buf.extend(r.tags());

@@ -296,7 +296,7 @@ pub fn external_join(
         slot_bucket_count,
         total_slots,
         unique_nodes,
-        input_pbf,
+        &input_pbf,
         &node_id_set,
         &node_blob_mapping,
     )?;
@@ -367,7 +367,7 @@ pub fn external_join(
         &slot_bucket_ref,
         slot_bucket_count,
         total_slots,
-        integrated_inputs,
+        &integrated_inputs,
     )?;
     let (s3_minflt_after, s3_majflt_after) = crate::debug::read_page_faults();
     for i in 0..slot_bucket_count {

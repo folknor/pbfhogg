@@ -350,7 +350,7 @@ where
     let schedule = build_blob_schedule(input)?;
     crate::debug::emit_marker("PREAD_WRITE_BLOB_SCHEDULE_END");
     crate::debug::emit_mallinfo2("MI_POST_BLOB_SCHEDULE");
-    pread_write_pass_with_schedule(input, schedule, writer, stats, block_fn)
+    pread_write_pass_with_schedule(input, &schedule, writer, stats, block_fn)
 }
 
 /// Variant of [`pread_write_pass`] that takes a pre-built blob schedule
@@ -361,7 +361,7 @@ where
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 pub(super) fn pread_write_pass_with_schedule<F>(
     input: &Path,
-    schedule: Vec<BlobDesc>,
+    schedule: &[BlobDesc],
     writer: &mut PbfWriter<crate::file_writer::FileWriter>,
     stats: &mut ExtractStats,
     block_fn: F,
@@ -370,7 +370,7 @@ where
     F: Fn(&PrimitiveBlock, &mut BlockBuilder, &mut Vec<OwnedBlock>) -> std::result::Result<ExtractStats, String> + Send + Sync,
 {
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_START");
-    pread_execute(input, &schedule, writer, stats, block_fn)?;
+    pread_execute(input, schedule, writer, stats, block_fn)?;
     crate::debug::emit_marker("PREAD_WRITE_EXECUTE_END");
     crate::debug::emit_mallinfo2("MI_POST_EXECUTE");
     crate::debug::emit_marker("PREAD_WRITE_FLUSH_START");

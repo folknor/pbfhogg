@@ -4,6 +4,7 @@
 mod format;
 #[cfg(feature = "commands")]
 mod json;
+pub mod node_stats;
 mod report;
 mod scan;
 mod show_element;

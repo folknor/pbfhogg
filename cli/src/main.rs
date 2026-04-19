@@ -2077,7 +2077,7 @@ fn run_inspect(
 
     // --nodes only: run node stats without full inspect
     if nodes && !indexed && !extended && !id_ranges && !locations && !anomalies && blocks.is_none() && get.is_none() {
-        let report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
+        let report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force)?;
         report.print_report();
         return Ok(());
     }
@@ -2155,7 +2155,7 @@ fn run_inspect(
 
     // --nodes combined with other flags: run node stats and print
     if nodes {
-        let node_report = pbfhogg::node_stats::node_stats(path, direct_io, force)?;
+        let node_report = pbfhogg::inspect::node_stats::node_stats(path, direct_io, force)?;
         node_report.print_report();
     }
 

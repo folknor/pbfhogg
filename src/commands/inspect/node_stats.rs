@@ -2,7 +2,8 @@ use std::path::Path;
 
 use crate::elements::Element;
 
-use super::{require_indexdata, Result};
+use crate::commands::require_indexdata;
+use crate::BoxResult as Result;
 
 const BLOCK_SIZE: usize = 128;
 

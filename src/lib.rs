@@ -181,7 +181,7 @@ pub use commands::HeaderOverrides;
 #[doc(hidden)]
 pub use commands::{
     add_locations_to_ways, cat, derive_changes, diff, getid, getparents, inspect, merge,
-    merge_changes, merge_pbf, node_stats, renumber, renumber_external, sort,
+    merge_changes, merge_pbf, renumber, renumber_external, sort,
     tags_count, tags_filter, tags_filter_osc, time_filter,
 };
 #[cfg(feature = "commands")]

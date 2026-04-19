@@ -43,6 +43,7 @@ Dispatched on `header.has_historical_information()`:
 | iter 3 | europe 35 GB | `--bench 1` | **94.7 s** | `8b676229` | budgeted batch 128 MB, peak anon **18.1 GB** (-10 %) |
 | iter 4 (pool landed) | europe 35 GB | `--bench 1 --force` | **94.3 s** | dirty | Vec pool + pre-grow 512 KB, peak anon **18.3 GB** (no-op vs iter 3) |
 | iter 5 (pool works) | europe 35 GB | `--bench 1` | **92.6 s** | `6683cb05` | thread_local BlockBuilder; peak anon **16.9 GB** (-15.5 % vs iter 2); alloc churn -87 % |
+| iter 6 (reverted) | europe 35 GB | `--bench 1 --force` | 112.2 s (+21 %) | dirty | raw-frame passthrough + pread workers - **regressed**, reverted |
 
 Throughput at iter 2: ~370 MB/s input. `writer_reorder_high_water`
 jumped 4 → 64 (compression pool saturated).
@@ -198,6 +199,67 @@ but comfortably within striking distance of opportunity #2 (raw blob
 passthrough for all-survive blocks) or finer in-flight-bytes
 tuning.
 
+## Iter 6 notes (2026-04-19): raw-frame passthrough *reverted*
+
+Attempted raw-frame passthrough for all-survive blobs following the
+`extract --strategy simple` pattern in
+[`src/commands/extract/common.rs`](../src/commands/extract/common.rs):
+header-only schedule scan + pread-from-workers + scan-first-then-
+dispatch, with workers emitting `WorkerOutcome::Passthrough` (frame
+offset + size) when every element has `timestamp <= cutoff &&
+visible`. Consumer preads the raw frame for passthrough items and
+writes via `PbfWriter::write_raw_owned`, skipping BlockBuilder
+re-encode and frame_blob_into compression entirely.
+
+**Result on the benched workload: net regression, reverted.**
+
+|                        | japan          | europe          |
+|------------------------|----------------|-----------------|
+| wall vs iter 5         | 6.8 s -> 8.1 s | 92.6 s -> 112.2 s |
+| all-survive blobs      | 309 / 43,035   | 3,291 / 522,168  |
+| passthrough rate       | **0.72 %**     | **0.63 %**      |
+
+**Two independent reasons it lost:**
+
+1. **Passthrough rate is a floor-level fraction at this cutoff**
+   (2024-01-01 on a 2026-02 snapshot). Elements within a blob share
+   nearby IDs, i.e. similar creation eras, but their *last-edit*
+   timestamps are independent enough that any single post-cutoff
+   edit disqualifies the whole blob. Break-even was ~14 %
+   passthrough (scan cost vs savings); we got 0.7 %. Mathematically:
+   with 77 % element-survive rate and 8,000 elements/blob, P(all
+   survive) is effectively zero unless time-of-edit is strongly
+   correlated across nearby IDs - and for OSM snapshots with active
+   recent editing across the graph, it is not.
+2. **The I/O architecture change itself lost wall.** iter 5 uses
+   `ElementReader::into_blocks_pipelined` (3-stage pipeline: IO ->
+   rayon decode -> reorder, with async I/O overlapping decode).
+   iter 6's pread-from-workers pattern does synchronous pread per
+   blob per worker. Even with passthrough savings at 0 %, the I/O
+   swap alone cost wall on Europe. The pipelined reader is a
+   well-tuned piece we should not give up without a compensating
+   win.
+
+**When passthrough *would* pay:** very recent cutoffs (e.g.,
+"filter out edits from the last week" on a multi-year-old
+snapshot) where many low-ID blobs contain exclusively pre-cutoff
+edits. At that regime passthrough rate could push into the tens of
+percent and clear the break-even bar. Not the workload anyone
+benches us on, and not something the current CLI configures, so
+there's no justification to carry the code.
+
+**Lesson:** both of the notes/raw-group-passthrough.md pattern's
+lessons apply in reverse here. (a) The shadow-counter methodology
+would have caught this before the refactor - we could have
+instrumented iter 5 to count all-survive blobs without switching
+I/O paths and seen the 0.7 % fraction directly. (b) Even if
+passthrough had paid, landing it on a different I/O architecture
+than the winning one was a hidden cost. Next time: measure first
+with instrumentation on the existing architecture before rewriting
+the I/O path.
+
+Reverted in-place; no commit landed iter 6.
+
 ## Remaining opportunities (ranked)
 
 ### 1. Pool `take_owned` output Vecs - LANDED iter 4
@@ -234,32 +296,19 @@ handle ~500 KB blocks well already). Landing shape: modest
 multi-commit arc - pool primitive, BlockBuilder emit-into-pool hook,
 writer drop-point hook, plumb through `time_filter_snapshot`.
 
-### 2. Raw blob passthrough for all-survive blocks
+### 3. Raw blob passthrough for all-survive blocks - ATTEMPTED + REVERTED iter 6
 
-Time-filter **drops** elements (it doesn't rewrite them), so an
-all-survive blob could be passed through as a raw compressed frame
-with zero re-encode. Unlike tags-filter, where the per-element match
-rate is fundamentally hostile at ~8,000 elements/blob (see
-[`src/commands/tags_filter.rs`](../src/commands/tags_filter.rs) pass-2
-worker comment), time-filter's filter passes or rejects elements
-based on a single scalar predicate (`timestamp <= cutoff` AND
-`visible`) that correlates *strongly* across adjacent elements in an
-ID-sorted blob - nearby IDs tend to share editing eras. At
-permissive cutoffs (e.g. filter out the last week of edits on a
-2-year-old snapshot) most blobs are 100 % survive. At narrow cutoffs
-the fraction collapses.
+See the iter-6 post-mortem above. **Measured 0.63 % passthrough on
+Europe at cutoff 2024-01-01 - far below the ~14 % break-even bar**.
+The theoretical correlation between adjacent IDs (nearby elements
+share editing eras) does not survive contact with an active graph:
+any single post-cutoff edit in a blob disqualifies the whole blob,
+and at 8,000 elements/blob and realistic edit activity, P(all
+survive) collapses. Passthrough is viable only at very recent
+cutoffs (e.g. "filter out edits from the last week"); not a common
+workload, no justification to carry the code.
 
-Measure first: add a shadow counter in `filter_block_snapshot` that
-reports `(blobs_all_survive, blobs_mixed, blobs_all_drop)`. If
-all-survive fraction is > 30 % on a representative cutoff, raw
-passthrough is worth the code.
-
-This is the notes/raw-group-passthrough.md methodology applied here.
-The passthrough code itself would share `frame_raw_block` in
-`src/write/raw_passthrough.rs` once a consumer justifies the
-scaffolding.
-
-### 3. Parallel history-input path
+### 2. Parallel history-input path
 
 Sequential state machine, avg cores 2.4 at iter 1. No history PBFs
 currently in the dataset inventory so the wall doesn't show up in
